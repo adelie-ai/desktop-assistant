@@ -1,21 +1,53 @@
-//! Startup embedding-backend health probe (#499).
+//! Embedding-backend health: the startup probe, and the live capability it
+//! seeds.
 //!
 //! `EmbeddingsSettingsView.available` is a shallow connector-string check, not
 //! a probe: a misconfigured embedder (for example a text-generation model that
 //! answers every embed with HTTP 501) reads as healthy and silently disables
-//! all vector search behind a green status. This module performs one tiny embed
-//! at startup so a broken backend is caught, classified, and surfaced as a real
-//! degraded-health state instead.
+//! all vector search behind a green status. [`probe_embedding_backend`]
+//! performs one tiny embed at startup so a broken backend is caught,
+//! classified, and surfaced as a real degraded-health state instead.
 //!
 //! The probe is model-agnostic: it catches *any* backend that cannot produce a
 //! vector, regardless of the model's name. It is the primary safety net; the
 //! name-based generation-model denylist in [`crate::config`] is only a faster,
 //! clearer secondary guard for the common misconfiguration.
+//!
+//! # Live capability, not a boot-time latch
+//!
+//! Why: the probe's verdict is a snapshot of one moment, and the moment it
+//! samples is daemon startup — exactly when a co-hosted Ollama is most likely to
+//! be restarting or cold-loading a GGUF. Treating that snapshot as final made a
+//! momentary outage permanent: vector search, the embedding backfill loop,
+//! dreaming, consolidation and the whole knowledge-maintenance handler stayed
+//! off until someone restarted the daemon.
+//!
+//! So the probe seeds an [`EmbeddingCapability`] — a shared, mutable
+//! [`EmbeddingHealth`] — instead of deciding anything permanently:
+//!
+//! - the client stays wired whenever a backend is *configured*, so the
+//!   background loops and the maintenance handler exist and can recover;
+//! - [`HealthGatedEmbeddingClient`] gates every embed on the current health and
+//!   feeds each outcome back into it, so a live failure degrades the capability
+//!   and a live success restores it;
+//! - [`recheck_degraded_backend`] re-probes on an interval *while degraded*, so
+//!   a backend that came back is noticed with no traffic and no restart;
+//! - the same handle backs `GetConfig`, so a client can see the current state
+//!   and its reason rather than a stale boot verdict.
+//!
+//! That is this codebase's capability model applied to embeddings: "is the
+//! capability present?" ([`EmbeddingHealth::Disabled`] vs the rest) is a
+//! separate question from "did my call succeed?" ([`EmbeddingHealth::Ok`] vs
+//! [`EmbeddingHealth::Unavailable`]), and the reason a feature is off is
+//! surfaced rather than swallowed.
 
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use desktop_assistant_core::CoreError;
 use desktop_assistant_core::ports::embedding::EmbeddingClient;
 use desktop_assistant_core::ports::inbound::EmbeddingHealth;
+use tokio::sync::oneshot;
 
 /// The text embedded by the startup probe. Deliberately tiny — one short word
 /// is enough to confirm the backend produces a vector.
@@ -38,6 +70,30 @@ const PROBE_ATTEMPTS: u32 = 2;
 /// Short pause between timed-out attempts, giving a cold backend a moment to
 /// finish loading the model before the next embed.
 const PROBE_BACKOFF: Duration = Duration::from_millis(500);
+
+/// Reason recorded when the backend answers but produces no usable vector.
+const NO_VECTORS_REASON: &str = "embedding backend returned no vectors";
+
+/// Upper bound, in characters, on a stored [`EmbeddingHealth::Unavailable`]
+/// reason. Backend errors quote the raw HTTP response body, which a base URL
+/// pointing at the wrong service can make arbitrarily large, and the reason then
+/// rides in every `GetConfig` payload for as long as the backend is degraded.
+/// Bounded here, once, rather than at each producer.
+const MAX_REASON_CHARS: usize = 512;
+
+/// Bound the reason carried by an [`EmbeddingHealth`], on a character boundary
+/// so multi-byte text cannot panic the truncation.
+fn bounded(health: EmbeddingHealth) -> EmbeddingHealth {
+    let EmbeddingHealth::Unavailable { reason } = health else {
+        return health;
+    };
+    let Some((split, _)) = reason.char_indices().nth(MAX_REASON_CHARS) else {
+        return EmbeddingHealth::Unavailable { reason };
+    };
+    EmbeddingHealth::Unavailable {
+        reason: format!("{}... (truncated)", &reason[..split]),
+    }
+}
 
 /// Perform one tiny embed to verify the backend actually produces vectors, and
 /// classify the outcome into an [`EmbeddingHealth`]. Uses generous, cold-load
@@ -83,7 +139,7 @@ pub async fn probe_embedding_backend_with(
                 // The backend answered but produced no usable vector; retrying a
                 // definitively-wrong backend will not help.
                 return EmbeddingHealth::Unavailable {
-                    reason: "embedding backend returned no vectors".to_string(),
+                    reason: NO_VECTORS_REASON.to_string(),
                 };
             }
             Ok(Err(err)) => {
@@ -128,16 +184,229 @@ pub fn embedding_view_health(configured: bool, probe: Option<EmbeddingHealth>) -
 
 /// Whether to keep the embedding client wired given the resolved startup health.
 ///
-/// Only a healthy ([`Ok`](EmbeddingHealth::Ok)) probe keeps it; every other
-/// state ([`Disabled`](EmbeddingHealth::Disabled),
-/// [`Unavailable`](EmbeddingHealth::Unavailable),
-/// [`Unknown`](EmbeddingHealth::Unknown)) drops it, so every downstream vector
-/// path (query embedding, stale-embedding invalidation, background backfill)
-/// takes the disabled -> full-text-search route uniformly instead of churning
-/// against a backend that cannot embed. Extracted so this honest-fallback
-/// guarantee is unit-pinned rather than buried in `main`.
+/// Only an *absent* backend ([`Disabled`](EmbeddingHealth::Disabled) — nothing
+/// configured) drops it. A failed probe
+/// ([`Unavailable`](EmbeddingHealth::Unavailable)) and an undetermined one
+/// ([`Unknown`](EmbeddingHealth::Unknown)) both keep it, because the probe
+/// samples exactly the moment a co-hosted backend is most likely to be
+/// restarting or cold-loading; dropping the client there would latch off the
+/// backfill loop, dreaming, consolidation and the knowledge-maintenance handler
+/// for the whole process lifetime. Whether a *call* may be made right now is a
+/// separate, live question answered by [`EmbeddingCapability`], which
+/// [`HealthGatedEmbeddingClient`] enforces on every embed.
 pub(crate) fn keep_embedding_client(health: &EmbeddingHealth) -> bool {
-    matches!(health, EmbeddingHealth::Ok)
+    !matches!(health, EmbeddingHealth::Disabled)
+}
+
+/// Whether the startup stale-embedding sweep may run.
+///
+/// The sweep is destructive — it NULLs every stored vector whose model stamp
+/// differs from the current one — so it needs proof of both facts it rests on:
+/// the backend really embeds (`health`), and the model identity came from the
+/// backend rather than from the configured name as a fallback
+/// (`model_resolved`). Keeping the client wired through a failed probe means
+/// this decision can no longer ride on the client merely existing; a guessed
+/// identity would wipe good vectors that only *look* stale.
+pub(crate) fn sweep_stale_embeddings(model_resolved: bool, health: &EmbeddingHealth) -> bool {
+    model_resolved && matches!(health, EmbeddingHealth::Ok)
+}
+
+/// The live health of the embedding backend, shared between the daemon's vector
+/// paths, the background re-check loop and `GetConfig`.
+///
+/// Cheap to read (an `RwLock` read plus a clone of a small enum) and written
+/// only on a *change* of state, so the hot embed path can consult it per call.
+/// A poisoned lock is recovered rather than propagated: a panic elsewhere must
+/// not turn health reporting into a second failure.
+#[derive(Debug)]
+pub struct EmbeddingCapability {
+    health: RwLock<EmbeddingHealth>,
+}
+
+impl EmbeddingCapability {
+    /// Seed the capability with the startup probe's verdict.
+    pub fn new(initial: EmbeddingHealth) -> Self {
+        Self {
+            health: RwLock::new(bounded(initial)),
+        }
+    }
+
+    /// The health as of now.
+    pub fn health(&self) -> EmbeddingHealth {
+        self.health
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// `Some(reason)` when the backend must not be called right now, carrying
+    /// why so a caller can say what is wrong instead of failing opaquely.
+    ///
+    /// [`Unknown`](EmbeddingHealth::Unknown) is deliberately callable: a
+    /// configured-but-undetermined backend is attempted optimistically, and the
+    /// attempt itself settles the question.
+    pub fn unavailable_reason(&self) -> Option<String> {
+        match self.health() {
+            EmbeddingHealth::Unavailable { reason } => Some(reason),
+            EmbeddingHealth::Disabled => Some("no embedding backend configured".to_string()),
+            EmbeddingHealth::Ok | EmbeddingHealth::Unknown => None,
+        }
+    }
+
+    /// Record that the backend produced a real vector.
+    pub fn record_ok(&self) {
+        self.set(EmbeddingHealth::Ok);
+    }
+
+    /// Record that the backend failed to produce a vector, carrying why.
+    pub fn record_failure(&self, reason: impl Into<String>) {
+        self.set(EmbeddingHealth::Unavailable {
+            reason: reason.into(),
+        });
+    }
+
+    /// Store `next`, logging only genuine transitions so a backend that is down
+    /// for an hour costs one line rather than one per embed.
+    fn set(&self, next: EmbeddingHealth) {
+        let next = bounded(next);
+        let mut guard = self
+            .health
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *guard == next {
+            return;
+        }
+        match &next {
+            EmbeddingHealth::Ok => {
+                tracing::info!("embedding backend healthy; vector search live")
+            }
+            EmbeddingHealth::Unavailable { reason } => tracing::warn!(
+                "embedding backend unavailable; vector search degraded to full-text search: {reason}"
+            ),
+            EmbeddingHealth::Disabled | EmbeddingHealth::Unknown => {}
+        }
+        *guard = next;
+    }
+}
+
+/// [`EmbeddingClient`] decorator that gates every embed on the live
+/// [`EmbeddingCapability`] and reports each outcome back into it.
+///
+/// Gating and observing belong together: the gate is only honest if something
+/// keeps the health current, and the cheapest source of truth is the traffic
+/// already flowing through the client. While the backend is
+/// [`Unavailable`](EmbeddingHealth::Unavailable) the call is declined without
+/// touching the network, so query embedding, the backfill loop and dreaming take
+/// their existing degraded routes instead of churning against a dead backend —
+/// and [`recheck_degraded_backend`] is what lifts the gate again.
+///
+/// Trade-off: one failed embed closes the gate for everyone until the next
+/// re-check, so a fault local to a single request costs up to
+/// [`RECHECK_INTERVAL`] of full-text-only search. That is accepted rather than
+/// debounced, because the backends this daemon drives fail as a unit (a
+/// connection refused, a model not loaded, a non-embedding model answering 501)
+/// and per-input rejection is already designed out upstream — the backfill asks
+/// its backend to truncate oversized text rather than reject it. Distinguishing
+/// the two would mean reading error strings, which this codebase does not do.
+pub struct HealthGatedEmbeddingClient {
+    inner: Arc<dyn EmbeddingClient>,
+    capability: Arc<EmbeddingCapability>,
+}
+
+impl HealthGatedEmbeddingClient {
+    /// Wrap `inner`, gating on and reporting into `capability`.
+    pub fn new(inner: Arc<dyn EmbeddingClient>, capability: Arc<EmbeddingCapability>) -> Self {
+        Self { inner, capability }
+    }
+}
+
+#[async_trait::async_trait]
+impl EmbeddingClient for HealthGatedEmbeddingClient {
+    async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, CoreError> {
+        if let Some(reason) = self.capability.unavailable_reason() {
+            return Err(CoreError::Llm(format!(
+                "embedding backend unavailable: {reason}"
+            )));
+        }
+
+        // An empty batch legitimately yields no vectors, so it says nothing
+        // about the backend's health and must not be read as a failure.
+        let observable = !texts.is_empty();
+        let result = self.inner.embed(texts).await;
+        match &result {
+            Ok(vectors) if observable => {
+                if vectors.iter().any(|vector| !vector.is_empty()) {
+                    self.capability.record_ok();
+                } else {
+                    // HTTP 200 with nothing usable: the call succeeded, the
+                    // capability did not.
+                    self.capability.record_failure(NO_VECTORS_REASON);
+                }
+            }
+            Ok(_) => {}
+            Err(error) => self.capability.record_failure(error.to_string()),
+        }
+        result
+    }
+
+    async fn model_identifier(&self) -> Result<String, CoreError> {
+        self.inner.model_identifier().await
+    }
+}
+
+/// How often a *degraded* embedding backend is re-probed. Long enough that a
+/// backend that is down for a while costs nothing much, short enough that a
+/// restarting Ollama is picked up well within a user's patience.
+pub const RECHECK_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Re-probe the backend while it reads
+/// [`Unavailable`](EmbeddingHealth::Unavailable), so recovery needs neither
+/// traffic nor a daemon restart.
+///
+/// Takes the *undecorated* client: the gate in [`HealthGatedEmbeddingClient`]
+/// would otherwise decline exactly the call that could lift it. While the
+/// capability reads healthy the loop makes no calls at all, so the happy path
+/// costs one timer wake-up per `interval`.
+///
+/// Runs until `shutdown` fires or its sender is dropped, including *during* a
+/// probe: a probe of an unresponsive backend can take
+/// `PROBE_ATTEMPTS * PROBE_TIMEOUT`, which is far too long to make daemon
+/// shutdown wait.
+pub async fn recheck_degraded_backend(
+    client: Arc<dyn EmbeddingClient>,
+    capability: Arc<EmbeddingCapability>,
+    interval: Duration,
+    shutdown: oneshot::Receiver<()>,
+) {
+    let mut shutdown = shutdown;
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = &mut shutdown => {
+                tracing::debug!("embedding health re-check: shutdown signal received");
+                return;
+            }
+        }
+
+        if !matches!(capability.health(), EmbeddingHealth::Unavailable { .. }) {
+            continue;
+        }
+
+        let health = tokio::select! {
+            health = probe_embedding_backend(client.as_ref()) => health,
+            _ = &mut shutdown => {
+                tracing::debug!("embedding health re-check: shutdown signal received mid-probe");
+                return;
+            }
+        };
+        match health {
+            EmbeddingHealth::Ok => capability.record_ok(),
+            EmbeddingHealth::Unavailable { reason } => capability.record_failure(reason),
+            // The probe never returns these; the caller sets them when there is
+            // no backend to probe.
+            EmbeddingHealth::Disabled | EmbeddingHealth::Unknown => {}
+        }
+    }
 }
 
 #[cfg(test)]
@@ -164,6 +433,10 @@ mod tests {
         cold_delay: Duration,
         /// Number of leading calls that "cold-load" (sleep `cold_delay`).
         slow_calls: usize,
+        /// With `fail_reason` set, `Some(n)` fails only the first `n` calls and
+        /// succeeds from call `n` on — a backend that is down when the daemon
+        /// boots and comes back a moment later. `None` fails every call.
+        recover_after: Option<usize>,
         /// Total calls observed, so a test can assert a retry actually re-called.
         calls: AtomicUsize,
     }
@@ -176,8 +449,10 @@ mod tests {
                 tokio::time::sleep(self.cold_delay).await;
             }
             match &self.fail_reason {
-                Some(reason) => Err(CoreError::Llm(reason.clone())),
-                None => Ok(self.vectors.clone()),
+                Some(reason) if self.recover_after.is_none_or(|until| n < until) => {
+                    Err(CoreError::Llm(reason.clone()))
+                }
+                _ => Ok(self.vectors.clone()),
             }
         }
 
@@ -366,15 +641,450 @@ mod tests {
     }
 
     #[test]
-    fn keep_embedding_client_only_on_ok() {
-        // Pin the honest-FTS wiring: only a healthy probe keeps the embedding
-        // client. Every other state drops it so downstream vector paths take the
-        // disabled -> full-text-search route uniformly.
+    fn failed_boot_probe_keeps_embedding_client_wired() {
+        // The client stays wired whenever a backend is configured, whatever the
+        // boot probe said. Dropping it on a failed probe is what disabled the
+        // backfill loop, dreaming, consolidation and the whole knowledge
+        // maintenance handler for the process lifetime.
+        assert!(
+            keep_embedding_client(&EmbeddingHealth::Unavailable {
+                reason: "connection refused".to_string(),
+            }),
+            "a failed boot probe must not latch the embedding client off"
+        );
         assert!(keep_embedding_client(&EmbeddingHealth::Ok));
+        assert!(keep_embedding_client(&EmbeddingHealth::Unknown));
+    }
+
+    #[test]
+    fn stale_embedding_sweep_needs_a_healthy_backend_and_a_resolved_model() {
+        // Keeping the client wired through a failed probe must not let the
+        // destructive startup sweep run on a guessed model identity: a backend
+        // that was down at boot leaves the configured name (no digest) as the
+        // "current" model, and sweeping on that wipes every good vector.
+        assert!(!sweep_stale_embeddings(
+            false,
+            &EmbeddingHealth::Unavailable {
+                reason: "connection refused".to_string(),
+            }
+        ));
+        assert!(
+            !sweep_stale_embeddings(false, &EmbeddingHealth::Ok),
+            "an unresolved model identity must not drive the sweep"
+        );
+        assert!(
+            !sweep_stale_embeddings(
+                true,
+                &EmbeddingHealth::Unavailable {
+                    reason: "HTTP 501".to_string(),
+                }
+            ),
+            "a backend that cannot embed must not drive the sweep"
+        );
+        assert!(!sweep_stale_embeddings(true, &EmbeddingHealth::Unknown));
+        assert!(!sweep_stale_embeddings(true, &EmbeddingHealth::Disabled));
+        assert!(sweep_stale_embeddings(true, &EmbeddingHealth::Ok));
+    }
+
+    #[test]
+    fn absent_embedding_backend_still_drops_the_client() {
+        // Absent is not degraded: with no backend configured at all there is
+        // nothing to wire and nothing to re-probe.
         assert!(!keep_embedding_client(&EmbeddingHealth::Disabled));
-        assert!(!keep_embedding_client(&EmbeddingHealth::Unknown));
-        assert!(!keep_embedding_client(&EmbeddingHealth::Unavailable {
-            reason: "HTTP 501".to_string(),
-        }));
+    }
+
+    // --- Live capability -------------------------------------------------
+
+    /// Poll `capability` until its health satisfies `wanted`, bounded so a
+    /// regression fails the test rather than hanging the suite.
+    async fn await_health(
+        capability: &EmbeddingCapability,
+        wanted: impl Fn(&EmbeddingHealth) -> bool,
+    ) -> bool {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !wanted(&capability.health()) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    fn unavailable(reason: &str) -> EmbeddingHealth {
+        EmbeddingHealth::Unavailable {
+            reason: reason.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn degraded_backend_recovers_without_daemon_restart() {
+        // The headline regression: Ollama is restarting when the daemon boots,
+        // so the probe classifies Unavailable. Once the backend answers again
+        // the capability must return to Ok on its own — no manual restart.
+        let capability = Arc::new(EmbeddingCapability::new(unavailable("connection refused")));
+        let client: Arc<dyn EmbeddingClient> = Arc::new(MockEmbedder {
+            fail_reason: Some("connection refused".to_string()),
+            vectors: vec![vec![0.1, 0.2]],
+            recover_after: Some(1),
+            ..Default::default()
+        });
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let task = tokio::spawn(recheck_degraded_backend(
+            Arc::clone(&client),
+            Arc::clone(&capability),
+            Duration::from_millis(5),
+            shutdown_rx,
+        ));
+
+        assert!(
+            await_health(&capability, |health| *health == EmbeddingHealth::Ok).await,
+            "a backend that came back must re-probe healthy without a restart, health was {:?}",
+            capability.health()
+        );
+
+        let _ = shutdown_tx.send(());
+        task.await.expect("recheck task should exit cleanly");
+    }
+
+    #[tokio::test]
+    async fn recheck_keeps_a_still_broken_backend_degraded() {
+        // Recovery must be evidence-based: a backend that is still refusing
+        // stays Unavailable, and the re-check replaces the stale boot reason
+        // with what the backend says now.
+        let capability = Arc::new(EmbeddingCapability::new(unavailable(
+            "embedding probe timed out",
+        )));
+        let client: Arc<dyn EmbeddingClient> = Arc::new(MockEmbedder {
+            fail_reason: Some("HTTP 501 Not Implemented".to_string()),
+            vectors: Vec::new(),
+            ..Default::default()
+        });
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let task = tokio::spawn(recheck_degraded_backend(
+            Arc::clone(&client),
+            Arc::clone(&capability),
+            Duration::from_millis(5),
+            shutdown_rx,
+        ));
+
+        assert!(
+            await_health(&capability, |health| matches!(
+                health,
+                EmbeddingHealth::Unavailable { reason } if reason.contains("501")
+            ))
+            .await,
+            "a still-broken backend must stay Unavailable with the fresh reason, health was {:?}",
+            capability.health()
+        );
+
+        let _ = shutdown_tx.send(());
+        task.await.expect("recheck task should exit cleanly");
+    }
+
+    #[tokio::test]
+    async fn recheck_leaves_a_healthy_backend_unprobed() {
+        // No churn on the happy path: while the capability reads Ok the loop
+        // must not spend calls on the backend.
+        let capability = Arc::new(EmbeddingCapability::new(EmbeddingHealth::Ok));
+        let client = Arc::new(MockEmbedder {
+            fail_reason: None,
+            vectors: vec![vec![0.1]],
+            ..Default::default()
+        });
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let task = tokio::spawn(recheck_degraded_backend(
+            Arc::clone(&client) as Arc<dyn EmbeddingClient>,
+            Arc::clone(&capability),
+            Duration::from_millis(2),
+            shutdown_rx,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let _ = shutdown_tx.send(());
+        task.await.expect("recheck task should exit cleanly");
+
+        assert_eq!(
+            client.calls.load(Ordering::SeqCst),
+            0,
+            "a healthy backend must not be re-probed"
+        );
+    }
+
+    #[tokio::test]
+    async fn recheck_stops_on_shutdown() {
+        // The loop is a long-running spawned task: it must be cancellable so
+        // daemon shutdown does not hang or leak it.
+        let capability = Arc::new(EmbeddingCapability::new(unavailable("down")));
+        let client: Arc<dyn EmbeddingClient> = Arc::new(MockEmbedder::default());
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let task = tokio::spawn(recheck_degraded_backend(
+            client,
+            capability,
+            Duration::from_secs(3600),
+            shutdown_rx,
+        ));
+
+        let _ = shutdown_tx.send(());
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("recheck must stop promptly on shutdown")
+            .expect("recheck task should exit cleanly");
+    }
+
+    #[test]
+    fn recorded_failure_reason_is_bounded() {
+        // Malformed backend: a base URL pointing at the wrong service answers
+        // with a whole document, and that body becomes the error text. The
+        // stored reason must stay a bounded, safely-split string — it is
+        // surfaced in every `GetConfig` payload while the backend is degraded.
+        let capability = EmbeddingCapability::new(EmbeddingHealth::Ok);
+        // Multi-byte throughout, so a byte-wise cut would split a character.
+        capability.record_failure("é".repeat(MAX_REASON_CHARS * 4));
+        match capability.health() {
+            EmbeddingHealth::Unavailable { reason } => {
+                assert!(
+                    reason.chars().count() <= MAX_REASON_CHARS + "... (truncated)".len(),
+                    "reason must be bounded, got {} chars",
+                    reason.chars().count()
+                );
+                assert!(reason.ends_with("... (truncated)"));
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn short_failure_reason_is_kept_verbatim() {
+        // Boundary: a reason at the cap is stored untouched, so the common case
+        // never gains a misleading "truncated" marker.
+        let capability = EmbeddingCapability::new(EmbeddingHealth::Ok);
+        let reason = "x".repeat(MAX_REASON_CHARS);
+        capability.record_failure(reason.clone());
+        assert_eq!(
+            capability.health(),
+            EmbeddingHealth::Unavailable { reason },
+            "a reason at the cap must be kept verbatim"
+        );
+    }
+
+    #[tokio::test]
+    async fn recheck_stops_on_shutdown_mid_probe() {
+        // Worst case for shutdown: the backend accepted the connection and then
+        // went silent, so the probe is inside its multi-attempt timeout budget.
+        // Shutdown must still be prompt rather than waiting minutes for a
+        // backend that is never going to answer.
+        let capability = Arc::new(EmbeddingCapability::new(unavailable("down")));
+        let client: Arc<dyn EmbeddingClient> = Arc::new(MockEmbedder {
+            fail_reason: None,
+            vectors: vec![vec![0.1]],
+            cold_delay: Duration::from_secs(3600),
+            slow_calls: usize::MAX,
+            ..Default::default()
+        });
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let task = tokio::spawn(recheck_degraded_backend(
+            client,
+            Arc::clone(&capability),
+            Duration::from_millis(5),
+            shutdown_rx,
+        ));
+
+        // Let the loop get into the probe before asking it to stop.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let _ = shutdown_tx.send(());
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("recheck must stop promptly even mid-probe")
+            .expect("recheck task should exit cleanly");
+    }
+
+    // --- Health-gated embedding client -----------------------------------
+
+    #[tokio::test]
+    async fn gated_embed_fails_fast_while_backend_is_unavailable() {
+        // While the capability reads Unavailable the vector paths are gated off,
+        // so callers take the honest full-text route instead of churning
+        // against a backend that cannot embed.
+        let capability = Arc::new(EmbeddingCapability::new(unavailable("connection refused")));
+        let inner = Arc::new(MockEmbedder {
+            fail_reason: None,
+            vectors: vec![vec![0.1]],
+            ..Default::default()
+        });
+        let gated = HealthGatedEmbeddingClient::new(
+            Arc::clone(&inner) as Arc<dyn EmbeddingClient>,
+            Arc::clone(&capability),
+        );
+
+        let err = gated
+            .embed(vec!["hello".to_string()])
+            .await
+            .expect_err("a gated-off backend must not be called");
+        assert!(
+            err.to_string().contains("connection refused"),
+            "the gate must say why it declined, got: {err}"
+        );
+        assert_eq!(
+            inner.calls.load(Ordering::SeqCst),
+            0,
+            "the gate must not reach the backend while it is Unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn gated_embed_marks_backend_unavailable_on_error() {
+        // A live failure has to move the shared health, not just this one call:
+        // that is what makes the state an honest capability instead of a
+        // boot-time latch.
+        let capability = Arc::new(EmbeddingCapability::new(EmbeddingHealth::Ok));
+        let gated = HealthGatedEmbeddingClient::new(
+            Arc::new(MockEmbedder {
+                fail_reason: Some("HTTP 501 Not Implemented".to_string()),
+                vectors: Vec::new(),
+                ..Default::default()
+            }) as Arc<dyn EmbeddingClient>,
+            Arc::clone(&capability),
+        );
+
+        gated
+            .embed(vec!["hello".to_string()])
+            .await
+            .expect_err("a failing backend must surface the error");
+        match capability.health() {
+            EmbeddingHealth::Unavailable { reason } => assert!(
+                reason.contains("501"),
+                "the live health must carry the failure reason, got: {reason}"
+            ),
+            other => panic!("a failed embed must degrade the live health, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn gated_embed_restores_health_after_a_successful_embed() {
+        // A configured-but-unprobed backend is attempted optimistically, and a
+        // real vector promotes the capability to Ok.
+        let capability = Arc::new(EmbeddingCapability::new(EmbeddingHealth::Unknown));
+        let gated = HealthGatedEmbeddingClient::new(
+            Arc::new(MockEmbedder {
+                fail_reason: None,
+                vectors: vec![vec![0.1, 0.2, 0.3]],
+                ..Default::default()
+            }) as Arc<dyn EmbeddingClient>,
+            Arc::clone(&capability),
+        );
+
+        let vectors = gated
+            .embed(vec!["hello".to_string()])
+            .await
+            .expect("a healthy backend must embed");
+        assert_eq!(vectors, vec![vec![0.1, 0.2, 0.3]]);
+        assert_eq!(
+            capability.health(),
+            EmbeddingHealth::Ok,
+            "a real vector must promote the live health to Ok"
+        );
+    }
+
+    #[tokio::test]
+    async fn gated_embed_marks_backend_unavailable_on_empty_vectors() {
+        // HTTP 200 with no usable vector is the #499 false-green: the transport
+        // call succeeded but the capability is broken. Health must degrade even
+        // though the call returned Ok.
+        let capability = Arc::new(EmbeddingCapability::new(EmbeddingHealth::Ok));
+        let gated = HealthGatedEmbeddingClient::new(
+            Arc::new(MockEmbedder {
+                fail_reason: None,
+                vectors: vec![Vec::new()],
+                ..Default::default()
+            }) as Arc<dyn EmbeddingClient>,
+            Arc::clone(&capability),
+        );
+
+        gated
+            .embed(vec!["hello".to_string()])
+            .await
+            .expect("an empty-vector answer is still a transport success");
+        match capability.health() {
+            EmbeddingHealth::Unavailable { reason } => assert!(
+                reason.contains("no vectors"),
+                "an empty embedding must degrade the live health, got: {reason}"
+            ),
+            other => panic!("expected Unavailable on empty vectors, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn gated_embed_of_an_empty_batch_does_not_change_health() {
+        // Empty input: an empty batch legitimately yields no vectors, so it must
+        // not be read as a broken backend.
+        let capability = Arc::new(EmbeddingCapability::new(EmbeddingHealth::Ok));
+        let gated = HealthGatedEmbeddingClient::new(
+            Arc::new(MockEmbedder {
+                fail_reason: None,
+                vectors: Vec::new(),
+                ..Default::default()
+            }) as Arc<dyn EmbeddingClient>,
+            Arc::clone(&capability),
+        );
+
+        gated
+            .embed(Vec::new())
+            .await
+            .expect("an empty batch must be passed through");
+        assert_eq!(
+            capability.health(),
+            EmbeddingHealth::Ok,
+            "an empty batch must leave the live health untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn gated_model_identifier_passes_through() {
+        let capability = Arc::new(EmbeddingCapability::new(EmbeddingHealth::Ok));
+        let gated = HealthGatedEmbeddingClient::new(
+            Arc::new(MockEmbedder::default()) as Arc<dyn EmbeddingClient>,
+            Arc::clone(&capability),
+        );
+        assert_eq!(
+            gated
+                .model_identifier()
+                .await
+                .expect("model identifier should pass through"),
+            "mock-embedder"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_gated_embeds_converge_on_one_health() {
+        // Many turns can embed at once. Concurrent outcome reporting must not
+        // deadlock or leave the shared health torn.
+        let capability = Arc::new(EmbeddingCapability::new(EmbeddingHealth::Ok));
+        let gated = Arc::new(HealthGatedEmbeddingClient::new(
+            Arc::new(MockEmbedder {
+                fail_reason: Some("connection refused".to_string()),
+                vectors: Vec::new(),
+                ..Default::default()
+            }) as Arc<dyn EmbeddingClient>,
+            Arc::clone(&capability),
+        ));
+
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let gated = Arc::clone(&gated);
+            handles.push(tokio::spawn(async move {
+                let _ = gated.embed(vec!["hello".to_string()]).await;
+            }));
+        }
+        for handle in handles {
+            handle.await.expect("embed task should not panic");
+        }
+
+        match capability.health() {
+            EmbeddingHealth::Unavailable { reason } => assert!(
+                reason.contains("connection refused"),
+                "concurrent failures must converge on one degraded health, got: {reason}"
+            ),
+            other => panic!("concurrent failures must degrade the health, got {other:?}"),
+        }
     }
 }

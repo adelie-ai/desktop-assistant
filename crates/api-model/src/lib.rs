@@ -1134,9 +1134,11 @@ pub struct EmbeddingsSettingsView {
     /// Capability-detected runtime health of the embedding backend (#499).
     ///
     /// `available` remains a shallow connector check (true whenever a backend
-    /// is configured); `health` carries the real state from the daemon's
-    /// startup probe so clients can tell "off by design" from "configured but
-    /// broken -> vector search degraded to full-text".
+    /// is configured); `health` carries the daemon's live state for the backend
+    /// so clients can tell "off by design" from "configured but broken ->
+    /// vector search degraded to full-text". It is a snapshot of the moment the
+    /// view was built, not a verdict fixed at daemon startup: a backend that
+    /// recovers reports `ok` again without a restart.
     ///
     /// Additive and backward-compatible: `#[serde(default)]` means a payload
     /// from an older daemon that omits the field still deserializes (as
@@ -1153,10 +1155,11 @@ pub struct EmbeddingsSettingsView {
 ///
 /// - `disabled` = no embedding backend is configured (absent by design); vector
 ///   search is off and search uses full-text only.
-/// - `ok` = the startup probe produced a real embedding; vector search is live.
-/// - `unavailable` = a backend is configured but the probe failed (or the model
-///   was rejected as a non-embedding model), so vector search has degraded to
-///   full-text search.
+/// - `ok` = the backend is producing real embeddings; vector search is live.
+/// - `unavailable` = a backend is configured but cannot embed right now (the
+///   probe or a live embed failed, or the model was rejected as a non-embedding
+///   model), so vector search has degraded to full-text search. The daemon
+///   keeps re-probing while in this state, so it can return to `ok` on its own.
 /// - `unknown` = the backend's health was not determined: the field was absent
 ///   (an older daemon that predates `health`), the backend is configured but was
 ///   not probed, or the payload carried a status tag this client does not know.
