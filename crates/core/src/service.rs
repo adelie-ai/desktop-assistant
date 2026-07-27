@@ -5724,11 +5724,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_step2_trims_oldest_pairs_when_no_large_results() {
-        // Step 2 of the ladder: when no tool result is large enough to be
-        // worth truncating but multiple tool-pair groups exist, drop the
-        // oldest groups via `trim_tool_pairs`. The most recent group must
-        // survive.
+    async fn recovery_step2_compacts_oldest_pairs_without_deleting_history() {
+        // Step 2 of the ladder (#733): when no tool result is large enough to be
+        // worth truncating but multiple tool-pair groups exist, the oldest
+        // groups' RESULTS are replaced by a notice. Nothing is deleted, so the
+        // turn's terminal persist cannot shorten the user's transcript.
         use std::sync::atomic::AtomicU64;
 
         let call_count = Arc::new(AtomicU32::new(0));
@@ -5752,20 +5752,23 @@ mod tests {
             .await
             .unwrap();
         let mut stored = handler.get_conversation(&conv.id).await.unwrap();
-        // Four tool-pair groups, all with tiny results (below
-        // MIN_TRUNCATION_TOKENS in estimated tokens) so step 1 declines.
+        // Four tool-pair groups, each result mid-sized: above the byte floor
+        // that makes a notice worthwhile, below MIN_TRUNCATION_TOKENS in
+        // estimated tokens so step 1 declines.
+        let result_body = "r".repeat(2048);
         for i in 1..=4 {
             stored
                 .messages
                 .push(Message::assistant_with_tool_calls(vec![ToolCall::new(
                     format!("c{i}"),
-                    "tiny",
-                    "{}",
+                    "reader",
+                    format!(r#"{{"path":"/tmp/{i}"}}"#),
                 )]));
             stored
                 .messages
-                .push(Message::tool_result(format!("c{i}"), format!("res-{i}")));
+                .push(Message::tool_result(format!("c{i}"), &result_body));
         }
+        let before = stored.messages.len();
         handler.store.update(stored).await.unwrap();
 
         let result = handler
@@ -5775,18 +5778,37 @@ mod tests {
         assert_eq!(result, "ok");
 
         let after = handler.get_conversation(&conv.id).await.unwrap();
-        // The most recent group must remain intact, regardless of how many
-        // older groups got trimmed.
-        let kept_recent = after
+        // The most recent group must remain intact.
+        let recent = after
             .messages
             .iter()
-            .any(|m| m.tool_call_id.as_deref() == Some("c4"));
-        assert!(kept_recent, "the most recent tool group must survive");
-        let dropped_oldest = !after
+            .find(|m| m.tool_call_id.as_deref() == Some("c4"))
+            .expect("the most recent tool group must survive");
+        assert_eq!(recent.content, result_body);
+        // The oldest group is compacted, not deleted: the call and its
+        // arguments are still there, and so is a result row with a notice.
+        let oldest_call = after
             .messages
             .iter()
-            .any(|m| m.tool_call_id.as_deref() == Some("c1"));
-        assert!(dropped_oldest, "the oldest tool group must be trimmed");
+            .find(|m| m.tool_calls.iter().any(|c| c.id == "c1"))
+            .expect("the oldest tool call must survive in the transcript");
+        assert_eq!(oldest_call.tool_calls[0].arguments, r#"{"path":"/tmp/1"}"#);
+        let oldest_result = after
+            .messages
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("c1"))
+            .expect("the oldest tool result row must survive in the transcript");
+        assert!(
+            oldest_result
+                .content
+                .contains(&format!("{} bytes", result_body.len())),
+            "the compacted result must say what was dropped, got {:?}",
+            oldest_result.content
+        );
+        assert!(
+            after.messages.len() > before,
+            "the turn only appends (prompt + reply); no history row may vanish"
+        );
     }
 
     #[tokio::test]

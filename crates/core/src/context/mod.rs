@@ -1641,165 +1641,257 @@ mod tests {
         }
     }
 
-    // --- trim_tool_pairs tests ---
+    // --- Overflow recovery rung 2: compact in place, never delete (#733) ---
 
-    #[test]
-    fn trim_tool_pairs_removes_oldest_half() {
-        let mut messages = vec![
-            Message::new(Role::User, "hello"),
-            // Group 1
-            Message::assistant_with_tool_calls(vec![ToolCall::new("c1", "tool_a", "{}")]),
-            Message::tool_result("c1", "result_1"),
-            // Group 2
-            Message::assistant_with_tool_calls(vec![ToolCall::new("c2", "tool_a", "{}")]),
-            Message::tool_result("c2", "result_2"),
-            // Group 3
-            Message::assistant_with_tool_calls(vec![ToolCall::new("c3", "tool_a", "{}")]),
-            Message::tool_result("c3", "result_3"),
-            // Group 4
-            Message::assistant_with_tool_calls(vec![ToolCall::new("c4", "tool_a", "{}")]),
-            Message::tool_result("c4", "result_4"),
-        ];
-
-        // compacted_through = 0 → nothing was summarized, so the marker
-        // adjustment is 0 even though 4 messages are removed.
-        let trimmed = trim_tool_pairs(&mut messages, 0);
-        // 4 groups, remove oldest half (2 groups = 4 messages)
-        assert_eq!(trimmed.total_removed, 4);
-        assert_eq!(trimmed.removed_before_marker, 0);
-        // Should keep: user + group3 + group4
-        assert_eq!(messages.len(), 5);
-        assert_eq!(messages[0].role, Role::User);
-        assert_eq!(messages[1].tool_calls[0].id, "c3");
+    /// A tool result big enough to be worth replacing with a notice, but below
+    /// the rung-1 truncation floor (`MIN_TRUNCATION_TOKENS`) so rung 1 declines
+    /// and recovery reaches rung 2.
+    fn mid_sized_result(marker: char) -> String {
+        marker.to_string().repeat(2048)
     }
 
-    #[test]
-    fn trim_tool_pairs_keeps_single_group() {
-        let mut messages = vec![
-            Message::new(Role::User, "hello"),
-            Message::assistant_with_tool_calls(vec![ToolCall::new("c1", "tool_a", "{}")]),
-            Message::tool_result("c1", "result"),
-        ];
-
-        let trimmed = trim_tool_pairs(&mut messages, 0);
-        assert_eq!(trimmed.total_removed, 0);
-        assert_eq!(trimmed.removed_before_marker, 0);
-        assert_eq!(messages.len(), 3);
-    }
-
-    // --- DA-11: marker-aware trim so recovery doesn't corrupt compacted_through ---
-
-    #[test]
-    fn trim_counts_only_removals_before_the_marker() {
-        // Marker at index 4: messages 0..4 (the user msg + group 1 + group 2's
-        // first message) are summarized. The two removed groups (1 and 2) span
-        // indices 1..5; of those, indices 1,2,3 lie at < 4, so the marker must
-        // drop by exactly 3 — NOT by the full 4 removed.
-        let mut messages = vec![
-            Message::new(Role::User, "hello"), // 0
-            // Group 1 (indices 1,2) — fully before marker(4)
-            Message::assistant_with_tool_calls(vec![ToolCall::new("c1", "t", "{}")]), // 1
-            Message::tool_result("c1", "r1"),                                         // 2
-            // Group 2 (indices 3,4) — straddles the marker(4): index 3 < 4, 4 not
-            Message::assistant_with_tool_calls(vec![ToolCall::new("c2", "t", "{}")]), // 3
-            Message::tool_result("c2", "r2"),                                         // 4
-            // Group 3 (indices 5,6) — kept (most-recent half)
-            Message::assistant_with_tool_calls(vec![ToolCall::new("c3", "t", "{}")]), // 5
-            Message::tool_result("c3", "r3"),                                         // 6
-            // Group 4 (indices 7,8) — kept
-            Message::assistant_with_tool_calls(vec![ToolCall::new("c4", "t", "{}")]), // 7
-            Message::tool_result("c4", "r4"),                                         // 8
-        ];
-        let compacted_through = 4;
-        let trimmed = trim_tool_pairs(&mut messages, compacted_through);
-        assert_eq!(trimmed.total_removed, 4, "two oldest groups removed");
-        assert_eq!(
-            trimmed.removed_before_marker, 3,
-            "indices 1,2 (group1) + index 3 (group2's first msg) lie at < compacted_through(4)"
-        );
-    }
-
-    #[test]
-    fn trim_marker_adjustment_zero_when_all_removals_after_marker() {
-        // Marker at 1: only the leading user message is summarized. Every
-        // removed tool group lies at indices >= 1, so the marker must NOT move,
-        // or already-summarized messages would be re-summarized (the DA-11 bug).
-        let mut messages = vec![
-            Message::new(Role::User, "hello"), // 0
-            Message::assistant_with_tool_calls(vec![ToolCall::new("c1", "t", "{}")]), // 1
-            Message::tool_result("c1", "r1"),  // 2
-            Message::assistant_with_tool_calls(vec![ToolCall::new("c2", "t", "{}")]), // 3
-            Message::tool_result("c2", "r2"),  // 4
-            Message::assistant_with_tool_calls(vec![ToolCall::new("c3", "t", "{}")]), // 5
-            Message::tool_result("c3", "r3"),  // 6
-            Message::assistant_with_tool_calls(vec![ToolCall::new("c4", "t", "{}")]), // 7
-            Message::tool_result("c4", "r4"),  // 8
-        ];
-        let trimmed = trim_tool_pairs(&mut messages, 1);
-        assert_eq!(trimmed.total_removed, 4);
-        assert_eq!(
-            trimmed.removed_before_marker, 0,
-            "removals at indices >= compacted_through must not move the marker"
-        );
-    }
-
-    #[tokio::test]
-    async fn recover_step2_does_not_drag_marker_back_for_post_marker_trims() {
-        // End-to-end (DA-11 / #298): a conversation whose tool results are all
-        // small (so step 1 doesn't fire) and whose summary marker sits before
-        // the trimmed groups. Step 2 must trim but leave `compacted_through`
-        // pointing at the same logical boundary, not re-summarize already-
-        // summarized messages.
+    /// Conversation with `groups` (assistant-with-tool_calls, tool_result)
+    /// groups, each result mid-sized. Group `n` uses call id `cN`.
+    fn conv_with_tool_groups(groups: usize) -> Conversation {
         let mut conv = Conversation::new("c1", "t");
-        conv.messages = vec![
-            Message::new(Role::User, "hello"), // 0 — summarized
-            // Group 1 (1,2)
-            Message::assistant_with_tool_calls(vec![ToolCall::new("c1", "t", "{}")]),
-            Message::tool_result("c1", "small"),
-            // Group 2 (3,4)
-            Message::assistant_with_tool_calls(vec![ToolCall::new("c2", "t", "{}")]),
-            Message::tool_result("c2", "small"),
-            // Group 3 (5,6) — kept
-            Message::assistant_with_tool_calls(vec![ToolCall::new("c3", "t", "{}")]),
-            Message::tool_result("c3", "small"),
-            // Group 4 (7,8) — kept
-            Message::assistant_with_tool_calls(vec![ToolCall::new("c4", "t", "{}")]),
-            Message::tool_result("c4", "small"),
-        ];
-        // Only the leading user message is summarized; every removed group lies
-        // after the marker. Pre-fix this dropped to 0 (4 - 4, saturating);
-        // post-fix it must stay at 1.
-        conv.compacted_through = 1;
+        conv.messages.push(Message::new(Role::User, "hello"));
+        for n in 1..=groups {
+            conv.messages
+                .push(Message::assistant_with_tool_calls(vec![ToolCall::new(
+                    format!("c{n}"),
+                    "read_file",
+                    format!(r#"{{"path":"/tmp/{n}"}}"#),
+                )]));
+            conv.messages
+                .push(Message::tool_result(format!("c{n}"), mid_sized_result('r')));
+        }
+        conv
+    }
 
-        let mut target_window = MAX_CONTEXT_MESSAGES;
+    async fn run_recovery(conv: &mut Conversation, target_window: &mut usize) {
         recover_from_overflow(
-            &mut conv,
+            conv,
             Some(100_000),
             Some(8_000),
-            &mut target_window,
+            target_window,
             &FailingLlm,
             &default_estimate,
         )
         .await;
+    }
 
-        assert_eq!(conv.messages.len(), 5, "two oldest groups trimmed");
+    #[tokio::test]
+    async fn overflow_recovery_rung2_keeps_every_message_row() {
+        let mut conv = conv_with_tool_groups(4);
+        let before = conv.messages.len();
+        let mut target_window = MAX_CONTEXT_MESSAGES;
+        run_recovery(&mut conv, &mut target_window).await;
+
         assert_eq!(
-            conv.compacted_through, 1,
-            "marker must not move when trimmed groups lie after it"
+            conv.messages.len(),
+            before,
+            "rung 2 must not delete rows from the stored transcript"
+        );
+        for n in 1..=4 {
+            let id = format!("c{n}");
+            assert!(
+                conv.messages
+                    .iter()
+                    .any(|m| m.tool_call_id.as_deref() == Some(id.as_str())),
+                "the result row for {id} must still exist"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn overflow_recovery_rung2_leaves_a_notice_in_place_of_the_dropped_output() {
+        let mut conv = conv_with_tool_groups(4);
+        let original_bytes = mid_sized_result('r').len();
+        let mut target_window = MAX_CONTEXT_MESSAGES;
+        run_recovery(&mut conv, &mut target_window).await;
+
+        let oldest = conv
+            .messages
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("c1"))
+            .expect("oldest result row");
+        assert!(
+            oldest.content.contains(&format!("{original_bytes} bytes")),
+            "the notice must say how much was dropped, got {:?}",
+            oldest.content
+        );
+        assert!(
+            !oldest.content.contains(&mid_sized_result('r')),
+            "the bulk must actually be gone"
+        );
+        assert_eq!(oldest.role, Role::Tool, "the role must be preserved");
+        assert!(
+            oldest.content.len() < original_bytes,
+            "the notice must be smaller than what it replaced"
         );
     }
 
-    #[test]
-    fn trim_tool_pairs_no_groups() {
-        let mut messages = vec![
+    #[tokio::test]
+    async fn overflow_recovery_rung2_preserves_the_tool_call_audit_trail() {
+        let mut conv = conv_with_tool_groups(4);
+        let mut target_window = MAX_CONTEXT_MESSAGES;
+        run_recovery(&mut conv, &mut target_window).await;
+
+        let call = conv
+            .messages
+            .iter()
+            .find(|m| m.tool_calls.iter().any(|c| c.id == "c1"))
+            .expect("the oldest assistant tool-call message must survive");
+        let tc = &call.tool_calls[0];
+        assert_eq!(tc.name, "read_file", "the tool name must survive");
+        assert_eq!(
+            tc.arguments, r#"{"path":"/tmp/1"}"#,
+            "the arguments must survive so the user can see what ran"
+        );
+    }
+
+    #[tokio::test]
+    async fn overflow_recovery_rung2_keeps_the_most_recent_tool_result_intact() {
+        let mut conv = conv_with_tool_groups(4);
+        let mut target_window = MAX_CONTEXT_MESSAGES;
+        run_recovery(&mut conv, &mut target_window).await;
+
+        let newest = conv
+            .messages
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("c4"))
+            .expect("newest result row");
+        assert_eq!(
+            newest.content,
+            mid_sized_result('r'),
+            "the most recent tool interaction must stay intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn overflow_recovery_rung2_does_not_move_the_compaction_marker() {
+        // Nothing is removed, so the summary boundary still points at the same
+        // logical message — the DA-11 / #298 hazard cannot arise.
+        let mut conv = conv_with_tool_groups(4);
+        conv.compacted_through = 4;
+        let mut target_window = MAX_CONTEXT_MESSAGES;
+        run_recovery(&mut conv, &mut target_window).await;
+
+        assert_eq!(
+            conv.compacted_through, 4,
+            "an in-place compaction must leave the summary marker alone"
+        );
+    }
+
+    #[tokio::test]
+    async fn overflow_recovery_rung2_does_not_recompact_an_already_compacted_result() {
+        let mut conv = conv_with_tool_groups(4);
+        let mut target_window = MAX_CONTEXT_MESSAGES;
+        run_recovery(&mut conv, &mut target_window).await;
+        let after_first = conv
+            .messages
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("c1"))
+            .expect("oldest result row")
+            .content
+            .clone();
+
+        run_recovery(&mut conv, &mut target_window).await;
+        let after_second = conv
+            .messages
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("c1"))
+            .expect("oldest result row")
+            .content
+            .clone();
+        assert_eq!(
+            after_first, after_second,
+            "a notice must never be compacted a second time"
+        );
+        assert!(
+            after_second.contains(&format!("{} bytes", mid_sized_result('r').len())),
+            "the notice must keep naming the ORIGINAL size, not its own, got {after_second:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn overflow_recovery_rung2_skips_results_too_small_to_be_worth_a_notice() {
+        // Every result is tiny: replacing one would GROW the prompt, so rung 2
+        // must decline and recovery must escalate to rung 3.
+        let mut conv = Conversation::new("c1", "t");
+        conv.messages.push(Message::new(Role::User, "hello"));
+        for n in 1..=4 {
+            conv.messages
+                .push(Message::assistant_with_tool_calls(vec![ToolCall::new(
+                    format!("c{n}"),
+                    "t",
+                    "{}",
+                )]));
+            conv.messages
+                .push(Message::tool_result(format!("c{n}"), "ok"));
+        }
+        let before = conv.messages.clone();
+        let mut target_window = MAX_CONTEXT_MESSAGES;
+        run_recovery(&mut conv, &mut target_window).await;
+
+        assert_eq!(conv.messages, before, "tiny results must be left alone");
+        assert!(
+            target_window < MAX_CONTEXT_MESSAGES,
+            "recovery must escalate to rung 3 when rung 2 declines"
+        );
+    }
+
+    #[tokio::test]
+    async fn overflow_recovery_rung2_keeps_a_lone_tool_group() {
+        // One group is the most recent interaction; there is nothing older to
+        // compact, so rung 2 declines and rung 3 takes over.
+        let mut conv = conv_with_tool_groups(1);
+        let before = conv.messages.clone();
+        let mut target_window = MAX_CONTEXT_MESSAGES;
+        run_recovery(&mut conv, &mut target_window).await;
+
+        assert_eq!(
+            conv.messages, before,
+            "the only tool group must survive untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn overflow_recovery_rung2_handles_a_group_whose_call_has_no_result() {
+        // Malformed shape: an assistant tool-call message with no result after
+        // it (a turn abandoned mid-dispatch). Recovery must not panic and must
+        // not fabricate a result.
+        let mut conv = conv_with_tool_groups(2);
+        conv.messages
+            .push(Message::assistant_with_tool_calls(vec![ToolCall::new(
+                "c3", "t", "{}",
+            )]));
+        let before = conv.messages.len();
+        let mut target_window = MAX_CONTEXT_MESSAGES;
+        run_recovery(&mut conv, &mut target_window).await;
+
+        assert_eq!(conv.messages.len(), before);
+        assert!(
+            !conv
+                .messages
+                .iter()
+                .any(|m| m.tool_call_id.as_deref() == Some("c3")),
+            "recovery must not invent a result for an unanswered call"
+        );
+    }
+
+    #[tokio::test]
+    async fn overflow_recovery_rung2_is_skipped_when_there_are_no_tool_groups() {
+        let mut conv = Conversation::new("c1", "t");
+        conv.messages = vec![
             Message::new(Role::User, "hello"),
             Message::new(Role::Assistant, "hi there"),
         ];
+        let before = conv.messages.clone();
+        let mut target_window = MAX_CONTEXT_MESSAGES;
+        run_recovery(&mut conv, &mut target_window).await;
 
-        let trimmed = trim_tool_pairs(&mut messages, 0);
-        assert_eq!(trimmed.total_removed, 0);
-        assert_eq!(trimmed.removed_before_marker, 0);
-        assert_eq!(messages.len(), 2);
+        assert_eq!(conv.messages, before);
     }
 
     // --- Window/compaction tests ---
