@@ -607,10 +607,10 @@ async fn insert_message(
 /// tsvector cost is paid only for genuinely changed rows.
 ///
 /// `idempotency_key` is bound alongside the content so the key travels with its
-/// message (#570). Reconciliation is by ordinal SLOT, so an overflow trim
-/// (`recover_from_overflow` -> `trim_tool_pairs`) can shift a keyed user row
-/// into a slot the prior occupant held; without rebinding the key here that row
-/// would inherit the prior occupant's key column — losing the user's key and
+/// message (#570). Reconciliation is by ordinal SLOT, so any caller that hands
+/// back a list with an earlier message removed shifts a keyed user row into a
+/// slot the prior occupant held; without rebinding the key here that row would
+/// inherit the prior occupant's key column — losing the user's key and
 /// stranding a stale one on a non-user row (the USER-rows-only invariant in
 /// migration 031). This runs only when the slot's content already differs, so
 /// stable slots take no extra write.

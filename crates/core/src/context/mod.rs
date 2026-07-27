@@ -10,8 +10,10 @@
 //!   estimated cost exceeds the threshold.
 //! - **Recovery** ([`recover_from_overflow`]): When the provider rejects a
 //!   turn with [`crate::CoreError::ContextOverflow`], runs a structured
-//!   recovery ladder (truncate the largest tool result → trim oldest tool
-//!   pairs → summarise-and-shrink) before the dispatch loop retries.
+//!   recovery ladder (truncate the largest tool result → compact the oldest
+//!   tool results → summarise-and-shrink) before the dispatch loop retries.
+//!   Every rung rewrites message content; none removes a message, because the
+//!   list it works on is the one the turn persists.
 //! - **Summarisation** ([`generate_context_summary`]): Asks the LLM for a
 //!   bullet-point summary of dropped messages and merges it with any
 //!   existing rolling summary, so windowed-out history is not lost.
@@ -1049,33 +1051,50 @@ fn find_largest_tool_result_above(
         .map(|(i, _)| i)
 }
 
-/// Outcome of [`trim_tool_pairs`].
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct TrimResult {
-    /// Total messages removed from the list.
-    total_removed: usize,
-    /// How many of the removed messages lay at indices `< compacted_through`,
-    /// i.e. inside the already-summarized prefix. The caller decrements
-    /// `compacted_through` by exactly this — never by `total_removed` — so the
-    /// marker keeps pointing at the same logical boundary (DA-11 / #298).
-    removed_before_marker: usize,
+/// Text left in place of a tool result that overflow recovery dropped.
+///
+/// The prefix is deliberately distinct from
+/// [`planning::COMPACTION_POINTER_PREFIX`]: that one promises the content was
+/// distilled into a scratchpad note and can be looked up. This one promises
+/// nothing of the sort — the output is gone and the tool has to be re-run.
+fn overflow_compaction_notice(original_bytes: usize) -> String {
+    format!(
+        "<earlier tool output omitted: {original_bytes} bytes were dropped to fit the \
+         model's context window. The call above and its arguments are unchanged; \
+         re-run the tool if you need this output again.>"
+    )
 }
 
-/// Remove the oldest assistant(tool_calls)+tool_result groups from a message
-/// list to reduce context size. Keeps the first user message and the most
-/// recent tool interaction intact.
+/// Outcome of [`compact_oldest_tool_groups`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct CompactionResult {
+    /// Tool results replaced by a notice.
+    compacted: usize,
+    /// Message-content bytes the replacement freed.
+    freed_bytes: usize,
+}
+
+/// Shrink the oldest assistant(tool_calls)+tool_result groups by replacing
+/// their RESULTS with [`overflow_compaction_notice`], keeping every message.
 ///
-/// `compacted_through` is the caller's summary boundary: messages at indices
-/// `< compacted_through` have already been folded into the rolling context
-/// summary. Removing them shifts the boundary, but removing messages *after* it
-/// does not — so the returned [`TrimResult::removed_before_marker`] counts only
-/// the removals inside the summarized prefix. The previous code decremented
-/// `compacted_through` by the *total* removed, which re-summarized
-/// already-summarized messages whenever a removed group lay past the marker
-/// (DA-11 / #298).
-fn trim_tool_pairs(messages: &mut Vec<Message>, compacted_through: usize) -> TrimResult {
-    // Find ranges of (assistant-with-tool-calls, tool_result, ..., tool_result)
-    // groups and remove roughly the oldest half.
+/// Why replace rather than remove: this list is the live `conv`, and the turn
+/// writes it back at the end — a positional diff that UPDATEs each ordinal and
+/// deletes the tail. Draining groups here therefore deleted them from the
+/// user's stored transcript, with no summary, no marker and no way back
+/// (#733). Replacing content frees the same prompt tokens while the record of
+/// what ran, with what arguments, stays where the user left it. The message
+/// count is unchanged, so the caller's `compacted_through` boundary still
+/// points at the same message and needs no adjustment.
+///
+/// Only results at or above [`planning::COMPACTION_MIN_EVICT_BYTES`] are worth
+/// replacing; below that the notice can be larger than what it replaces. The
+/// most recent group is never touched, and a group whose results are all
+/// already compacted contributes nothing — so repeated recoveries walk
+/// backwards through history and then hand off to the next rung instead of
+/// spinning on the same messages.
+fn compact_oldest_tool_groups(messages: &mut [Message]) -> CompactionResult {
+    // Ranges of (assistant-with-tool-calls, tool_result, ..., tool_result)
+    // that still hold something worth compacting, oldest first.
     let mut groups: Vec<std::ops::Range<usize>> = Vec::new();
     let mut i = 0;
     while i < messages.len() {
@@ -1085,33 +1104,51 @@ fn trim_tool_pairs(messages: &mut Vec<Message>, compacted_through: usize) -> Tri
             while i < messages.len() && messages[i].role == Role::Tool {
                 i += 1;
             }
-            groups.push(start..i);
+            if messages[start..i].iter().any(is_worth_compacting) {
+                groups.push(start..i);
+            }
         } else {
             i += 1;
         }
     }
 
     if groups.len() <= 1 {
-        // Nothing safe to remove — keep the most recent group
-        return TrimResult::default();
+        // The most recent tool interaction stays intact: it is the one the
+        // model is still working from.
+        return CompactionResult::default();
     }
 
-    // Remove the oldest half of groups
-    let remove_count = groups.len() / 2;
-    let groups_to_remove: Vec<_> = groups[..remove_count].to_vec();
-
-    // Remove in reverse order to keep indices stable. Count, separately, how
-    // many removed messages sat inside the already-summarized prefix
-    // (`index < compacted_through`) — that, not the total, is the marker shift.
-    let mut result = TrimResult::default();
-    for range in groups_to_remove.into_iter().rev() {
-        result.total_removed += range.len();
-        result.removed_before_marker +=
-            range.clone().filter(|idx| *idx < compacted_through).count();
-        messages.drain(range);
+    // The oldest half, so each recovery leaves the newer material alone.
+    let compact_count = groups.len() / 2;
+    let mut result = CompactionResult::default();
+    for range in groups.into_iter().take(compact_count) {
+        for msg in &mut messages[range] {
+            if !is_worth_compacting(msg) {
+                continue;
+            }
+            let notice = overflow_compaction_notice(msg.content.len());
+            // Never trade a result for something bigger, whatever the floor
+            // above happens to be set to.
+            let Some(freed) = msg
+                .content
+                .len()
+                .checked_sub(notice.len())
+                .filter(|f| *f > 0)
+            else {
+                continue;
+            };
+            result.freed_bytes += freed;
+            result.compacted += 1;
+            msg.content = notice;
+        }
     }
 
     result
+}
+
+/// A tool result big enough that replacing it with a notice frees space.
+fn is_worth_compacting(msg: &Message) -> bool {
+    msg.role == Role::Tool && msg.content.len() >= planning::COMPACTION_MIN_EVICT_BYTES
 }
 
 /// Compute the window-start index, snapped forward to a `Role::User` boundary.
@@ -1258,15 +1295,17 @@ pub(crate) async fn generate_context_summary<L: LlmClient>(
 /// The ladder runs steps in order until one frees space:
 ///   1. Truncate the largest tool result with a chunking notice (preserves
 ///      the tool_call/result pair so the model sees what it tried).
-///   2. If no tool result is large enough to be worth truncating, trim the
-///      oldest tool-pair groups via [`trim_tool_pairs`].
-///   3. If nothing to trim, summarise-and-shrink the active window
+///   2. If no tool result is large enough to be worth truncating, shrink the
+///      oldest tool-pair groups in place via [`compact_oldest_tool_groups`].
+///   3. If nothing is worth compacting, summarise-and-shrink the active window
 ///      (delegates to the same logic that path A uses on the success branch).
 ///
 /// Why this order: step 1 is the cleanest because it preserves history;
-/// step 3 is the last resort. The retry counter in `send_prompt` bounds
-/// total attempts across all steps so a persistently-oversized request
-/// can't loop indefinitely.
+/// step 3 is the last resort. No step deletes a message — the caller writes
+/// this same `conv` back at the end of the turn, so a removal here would be a
+/// removal from the user's stored transcript. The retry counter in
+/// `send_prompt` bounds total attempts across all steps so a
+/// persistently-oversized request can't loop indefinitely.
 pub(crate) async fn recover_from_overflow<L: LlmClient>(
     conv: &mut Conversation,
     prompt_tokens: Option<u64>,
@@ -1292,19 +1331,16 @@ pub(crate) async fn recover_from_overflow<L: LlmClient>(
         return;
     }
 
-    // Step 2: trim oldest tool-pair groups. Decrement `compacted_through` only
-    // by the removals inside the already-summarized prefix — not the total —
-    // so trimming groups that lie *after* the marker doesn't drag it backwards
-    // and re-summarize messages already folded into the summary (DA-11 / #298).
-    let trimmed = trim_tool_pairs(&mut conv.messages, conv.compacted_through);
-    if trimmed.total_removed > 0 {
-        conv.compacted_through = conv
-            .compacted_through
-            .saturating_sub(trimmed.removed_before_marker);
+    // Step 2: shrink the oldest tool results in place. No message is removed,
+    // so `compacted_through` still points at the same message and the stored
+    // transcript keeps every row (#733). If nothing was worth compacting the
+    // step frees nothing and recovery falls through to step 3.
+    let compacted = compact_oldest_tool_groups(&mut conv.messages);
+    if compacted.freed_bytes > 0 {
         tracing::warn!(
-            removed = trimmed.total_removed,
-            removed_before_marker = trimmed.removed_before_marker,
-            "context overflow — trimmed oldest tool pairs (step 2)"
+            compacted = compacted.compacted,
+            freed_bytes = compacted.freed_bytes,
+            "context overflow — compacted oldest tool results (step 2)"
         );
         return;
     }

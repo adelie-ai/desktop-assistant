@@ -357,7 +357,7 @@ async fn mid_history_removal_round_trips() {
         .await;
         let before = message_ids(&fx.pool, "conv-mid").await;
 
-        // Remove a message from the middle (compaction's trim_tool_pairs shape).
+        // Remove a message from the middle, so every later row shifts a slot.
         conv.messages.remove(3);
         with_user_id(UserId::new("u1"), async {
             store.update(conv.clone()).await.expect("update");
@@ -572,9 +572,9 @@ async fn user_message_without_key_loads_as_none() {
 
 /// The key travels with its message across an ordinal shift. `update` reconciles
 /// `conv.messages` against persisted rows by ordinal SLOT, so when an earlier
-/// message is removed (the `recover_from_overflow` -> `trim_tool_pairs` shape,
-/// which drains the oldest and shifts the rest into lower slots) a keyed user
-/// row is UPDATEd into a slot the prior occupant held. `update_message` must
+/// message is removed — anything that drops a message and shifts the rest into
+/// lower slots — a keyed user row is UPDATEd into a slot the prior occupant
+/// held. `update_message` must
 /// carry `idempotency_key` or the user's key would be lost and the prior
 /// occupant's stale key would strand on the row now in the old slot — violating
 /// the USER-rows-only invariant migration 031 documents.

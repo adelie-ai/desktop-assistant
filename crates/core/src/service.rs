@@ -1429,10 +1429,11 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                         &estimate,
                     )
                     .await;
-                    // Overflow recovery can drain messages (trim_tool_pairs),
-                    // which invalidates the step stack's absolute watermarks.
-                    // Drop the frames so no later complete_step evicts the wrong
-                    // range — the plan todos persist on the scratchpad regardless.
+                    // Overflow recovery rewrites the message log the step
+                    // stack's absolute watermarks point into. Drop the frames so
+                    // no later complete_step evicts a range recovery has already
+                    // compacted — the plan todos persist on the scratchpad
+                    // regardless.
                     step_stack.clear();
                     continue;
                 }
@@ -7856,9 +7857,9 @@ mod tests {
         .with_scratchpad_write(write)
         .with_scratchpad_list(list);
 
-        // Prime several small tool-pair groups so: (a) is_first_message is
-        // false (no title call), and (b) overflow-recovery step 2 trims the
-        // oldest pairs, actually draining messages and shifting watermarks.
+        // Prime several tool-pair groups so `is_first_message` is false (no
+        // title call) and the overflow recovery has real history to work on
+        // beneath the step frame's watermark.
         let conv = handler
             .create_conversation("Test".into(), vec![])
             .await
