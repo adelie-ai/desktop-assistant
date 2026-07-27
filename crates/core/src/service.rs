@@ -39,19 +39,93 @@ use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 use tokio_util::sync::CancellationToken;
 
-/// Return `Err(CoreError::Cancelled)` if the current task's cancellation
-/// token (installed by [`crate::ports::llm::with_cancellation_token`]) has
-/// been tripped. `None` (no token installed) is treated as "never
-/// cancelled" so legacy call sites — tests, dreaming jobs, anything that
-/// doesn't route through `send_prompt_with_override` — keep their
-/// pre-#109 behaviour.
+/// Whether the current task's cancellation token (installed by
+/// [`crate::ports::llm::with_cancellation_token`]) has been tripped. `None`
+/// (no token installed) is treated as "never cancelled" so legacy call sites —
+/// tests, dreaming jobs, anything that doesn't route through
+/// `send_prompt_with_override` — keep their pre-#109 behaviour.
+fn is_cancelled() -> bool {
+    current_cancellation_token().is_some_and(|token| token.is_cancelled())
+}
+
+/// Return `Err(CoreError::Cancelled)` at a checkpoint with nothing to save.
+///
+/// Checkpoints inside a turn body must NOT use this: they hold a transcript
+/// that has to reach storage first (see
+/// [`ConversationHandler::persist_abandoned_turn`]).
 fn bail_if_cancelled() -> Result<(), CoreError> {
-    if let Some(token) = current_cancellation_token()
-        && token.is_cancelled()
-    {
+    if is_cancelled() {
         return Err(CoreError::Cancelled);
     }
     Ok(())
+}
+
+/// Stored in place of a result for a tool call the turn recorded but never
+/// dispatched, so the pairing below survives an abandoned turn.
+const UNDISPATCHED_TOOL_RESULT: &str = "<not executed: the turn ended before this tool call ran>";
+
+/// Give every recorded tool call a result, inserting
+/// [`UNDISPATCHED_TOOL_RESULT`] for any the turn never dispatched. Returns how
+/// many placeholders were inserted.
+///
+/// Why: providers reject an assistant message whose tool calls have no matching
+/// results — the same orphan hazard `context::window_start` avoids at the
+/// window boundary. A turn abandoned between two calls of one round leaves
+/// exactly that shape, so storing it verbatim would make every later request in
+/// the conversation invalid. Each placeholder goes at the end of its own
+/// group's result run, because providers require the results to follow their
+/// call immediately, not merely to exist somewhere later.
+fn close_unanswered_tool_calls(messages: &mut Vec<Message>) -> usize {
+    let mut inserts: Vec<(usize, String)> = Vec::new();
+    let mut i = 0;
+    while i < messages.len() {
+        if messages[i].role == Role::Assistant && !messages[i].tool_calls.is_empty() {
+            let start = i;
+            i += 1;
+            while i < messages.len() && messages[i].role == Role::Tool {
+                i += 1;
+            }
+            let answered: Vec<&str> = messages[start + 1..i]
+                .iter()
+                .filter_map(|m| m.tool_call_id.as_deref())
+                .collect();
+            for call in &messages[start].tool_calls {
+                if !answered.contains(&call.id.as_str()) {
+                    inserts.push((i, call.id.clone()));
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+
+    let added = inserts.len();
+    // Back to front, so an earlier insertion point is still valid when it is
+    // reached. Ties keep their original order.
+    for (at, call_id) in inserts.into_iter().rev() {
+        messages.insert(at, Message::tool_result(call_id, UNDISPATCHED_TOOL_RESULT));
+    }
+    added
+}
+
+/// The line an abandoned turn leaves behind, so the transcript records where
+/// the work stopped rather than simply ending. `executed` counts the tool
+/// results this turn already holds; `unanswered` the calls it never dispatched.
+fn cancelled_turn_notice(executed: usize, unanswered: usize) -> String {
+    let mut notice = match executed {
+        0 => "[Turn cancelled. No tool call had finished".to_string(),
+        1 => "[Turn cancelled after 1 tool call, whose effects stand".to_string(),
+        n => format!("[Turn cancelled after {n} tool calls, whose effects stand"),
+    };
+    match unanswered {
+        0 => notice.push('.'),
+        1 => notice.push_str("; 1 further call was requested and never ran."),
+        n => notice.push_str(&format!(
+            "; {n} further calls were requested and never ran."
+        )),
+    }
+    notice.push(']');
+    notice
 }
 
 /// Return the per-turn cancellation token, falling back to a fresh
@@ -729,6 +803,50 @@ impl<S, L, T> ConversationHandler<S, L, T> {
     }
 }
 
+impl<S: ConversationStore, L, T> ConversationHandler<S, L, T> {
+    /// Write the turn's transcript before abandoning it, and mark where it
+    /// stopped. `turn_start` is the index of this turn's user message in
+    /// `conv.messages`.
+    ///
+    /// Why: `conv` accumulates this turn's assistant tool-call messages and
+    /// tool results in memory, and the only other writes are terminal. Without
+    /// this, cancelling a turn that has already written a file or sent a mail
+    /// leaves no record that any of it happened — not in the user's transcript,
+    /// and not in what the next turn's model sees, which is how a
+    /// non-idempotent side effect gets repeated. The per-conversation turn lock
+    /// is held at every cancellation checkpoint, so this write cannot race a
+    /// concurrent turn on the same conversation.
+    ///
+    /// Partial assistant text is still dropped: what is saved is the record of
+    /// work that actually ran, not half a sentence the user asked us to abandon.
+    ///
+    /// Best-effort by design — a storage failure is logged, never returned.
+    /// Cancellation is the outcome the caller asked for and must not be
+    /// replaced by a persistence error.
+    async fn persist_abandoned_turn(&self, conv: &Conversation, turn_start: usize) {
+        let mut snapshot = conv.clone();
+        let executed = snapshot
+            .messages
+            .get(turn_start.min(snapshot.messages.len())..)
+            .map_or(0, |turn| {
+                turn.iter().filter(|m| m.role == Role::Tool).count()
+            });
+        let unanswered = close_unanswered_tool_calls(&mut snapshot.messages);
+        snapshot.messages.push(Message::new(
+            Role::Assistant,
+            cancelled_turn_notice(executed, unanswered),
+        ));
+        snapshot.updated_at = now_timestamp();
+        if let Err(e) = self.store.update(snapshot).await {
+            tracing::warn!(
+                conversation_id = %conv.id.0,
+                error = %e,
+                "failed to persist the abandoned turn's transcript"
+            );
+        }
+    }
+}
+
 impl<S, L: LlmClient, T> ConversationHandler<S, L, T> {
     /// Returns the backend-tasks LLM if configured, otherwise the primary LLM.
     fn task_llm(&self) -> &L {
@@ -902,6 +1020,10 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         // in this turn stay `None`.
         let mut user_msg = Message::new(Role::User, &prompt);
         user_msg.idempotency_key = crate::ports::llm::current_idempotency_key();
+        // Where this turn begins in the log — read back by
+        // `persist_abandoned_turn` to count what ran before an abandoned turn
+        // stopped, without mistaking an earlier turn's tool work for this one's.
+        let turn_start = conv.messages.len();
         conv.messages.push(user_msg);
         // Capture the prompt as the active-task anchor for this turn. It is
         // re-injected in `assemble_turn` when conditions indicate
@@ -909,13 +1031,12 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         conv.active_task = Some(prompt.clone());
         // Persist the user prompt eagerly, before any cancellable work (#585).
         // Otherwise the prompt lives only in memory until the terminal
-        // `store.update`, and every cancellation checkpoint returns
-        // `Err(Cancelled)` without saving — so a cancel/crash mid-turn would
-        // lose the user's message. Writing it now — inside the turn-lock, so no
+        // `store.update`, so a crash before the first checkpoint would lose the
+        // user's message. Writing it now — inside the turn-lock, so no
         // read-modify-write race (#282) — guarantees the prompt survives even if
-        // the turn is abandoned; the eventual terminal update overwrites this
-        // row with the full turn (prompt + reply). The clone is the cost of
-        // keeping `conv` for the rest of the turn (one extra write per turn).
+        // the turn is abandoned; later writes overwrite this row with whatever
+        // the turn accumulated. The clone is the cost of keeping `conv` for the
+        // rest of the turn (one extra write per turn).
         self.store.update(conv.clone()).await?;
 
         // Effective window size for this turn. May shrink further if the
@@ -1086,13 +1207,17 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         let mut step_stack = self.build_step_stack(conversation_id).await;
 
         for round in 0..MAX_TOOL_ROUNDS {
-            // Between-turns cancellation checkpoint (issue #109): if the
+            // Between-rounds cancellation checkpoint (issue #109): if the
             // caller cancelled while the previous tool round was
             // executing, surface `Cancelled` before we dispatch the next
             // LLM call. This is the contract tested by
             // `send_prompt_returns_cancelled_when_token_fires_between_turns`
             // and `cancellation_during_tool_dispatch_aborts_before_next_llm_call`.
-            bail_if_cancelled()?;
+            // The round that just finished is saved first (#731).
+            if is_cancelled() {
+                self.persist_abandoned_turn(&conv, turn_start).await;
+                return Err(CoreError::Cancelled);
+            }
 
             // Build the tool set: core + dynamically activated.
             // When hosted search has been demoted, use the full core set
@@ -1316,11 +1441,14 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                     // stop — surface it verbatim instead of converting
                     // to a friendly "LLM backend error" string. The
                     // partial assistant message is dropped on purpose:
-                    // the user asked us to abandon this turn.
+                    // the user asked us to abandon this turn. The tool
+                    // rounds that already completed are not — they record
+                    // work that really happened (#731).
                     tracing::info!(
                         conversation_id = %conversation_id.0,
                         "send_prompt cancelled mid-stream"
                     );
+                    self.persist_abandoned_turn(&conv, turn_start).await;
                     return Err(CoreError::Cancelled);
                 }
                 Err(e) => {
@@ -1344,8 +1472,12 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
             // (the cooperative-shutdown contract). In that case the
             // adapter returns `Ok(...)` with whatever it had streamed
             // so far, but we want to surface `Cancelled` to the caller
-            // — the partial text is discarded.
-            bail_if_cancelled()?;
+            // — the partial text is discarded, the completed tool rounds
+            // are saved (#731).
+            if is_cancelled() {
+                self.persist_abandoned_turn(&conv, turn_start).await;
+                return Err(CoreError::Cancelled);
+            }
 
             // Token-pressure check: if the provider reports input tokens
             // above COMPACTION_TOKEN_RATIO of its context window, shrink the
@@ -1488,9 +1620,14 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 // Per-tool cancellation checkpoint (issue #109): if the
                 // caller cancelled between tool dispatches we must stop
                 // here rather than fire more tool side-effects. The
-                // between-turns check above protects the next LLM
-                // round; this one protects the inner per-tool loop.
-                bail_if_cancelled()?;
+                // between-rounds check above protects the next LLM
+                // round; this one protects the inner per-tool loop. The
+                // side effects already committed by the tools that ran are
+                // recorded before we go (#731).
+                if is_cancelled() {
+                    self.persist_abandoned_turn(&conv, turn_start).await;
+                    return Err(CoreError::Cancelled);
+                }
 
                 // Parse the model-supplied argument JSON. An empty string is
                 // tolerated as "no arguments" (some providers emit it for
@@ -1684,6 +1821,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                                 ok: false,
                                 output: "cancelled".to_string(),
                             });
+                            self.persist_abandoned_turn(&conv, turn_start).await;
                             return Err(CoreError::Cancelled);
                         }
                         Err(e) => {
@@ -1830,7 +1968,12 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
             max_rounds = MAX_TOOL_ROUNDS,
             "tool-round budget exhausted — winding down and persisting the turn"
         );
-        bail_if_cancelled()?;
+        // Cancelled while the budget ran out: skip the wind-down call, but the
+        // 200 rounds of tool work still belong in the transcript (#731).
+        if is_cancelled() {
+            self.persist_abandoned_turn(&conv, turn_start).await;
+            return Err(CoreError::Cancelled);
+        }
 
         // Recompute the light task anchors so the wind-down prompt carries the
         // same [Current task]/[Plan] context the loop rounds did.
@@ -7505,6 +7648,73 @@ mod tests {
                 .any(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some("call-1")),
             "the unanswered call must be closed out: {:?}",
             persisted.messages
+        );
+    }
+
+    /// Unanswered calls are closed in the order the assistant requested them,
+    /// each directly after its own group — the position providers require.
+    #[test]
+    fn unanswered_tool_calls_are_closed_in_call_order() {
+        let mut messages = vec![
+            Message::new(Role::User, "go"),
+            Message::assistant_with_tool_calls(vec![
+                ToolCall::new("c1", "a", "{}"),
+                ToolCall::new("c2", "b", "{}"),
+                ToolCall::new("c3", "c", "{}"),
+            ]),
+            Message::tool_result("c1", "ran"),
+        ];
+        assert_eq!(close_unanswered_tool_calls(&mut messages), 2);
+        let ids: Vec<&str> = messages
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .filter_map(|m| m.tool_call_id.as_deref())
+            .collect();
+        assert_eq!(ids, vec!["c1", "c2", "c3"]);
+        assert_eq!(messages[3].content, UNDISPATCHED_TOOL_RESULT);
+    }
+
+    /// A complete group is left exactly as it was — no duplicate results.
+    #[test]
+    fn close_unanswered_tool_calls_leaves_a_complete_group_alone() {
+        let mut messages = vec![
+            Message::assistant_with_tool_calls(vec![ToolCall::new("c1", "a", "{}")]),
+            Message::tool_result("c1", "ran"),
+            Message::new(Role::Assistant, "done"),
+        ];
+        let before = messages.clone();
+        assert_eq!(close_unanswered_tool_calls(&mut messages), 0);
+        assert_eq!(messages, before);
+    }
+
+    /// An earlier group's gap is closed in place, not at the end of the log.
+    #[test]
+    fn close_unanswered_tool_calls_repairs_an_earlier_group_in_place() {
+        let mut messages = vec![
+            Message::assistant_with_tool_calls(vec![ToolCall::new("c1", "a", "{}")]),
+            Message::assistant_with_tool_calls(vec![ToolCall::new("c2", "b", "{}")]),
+            Message::tool_result("c2", "ran"),
+        ];
+        assert_eq!(close_unanswered_tool_calls(&mut messages), 1);
+        assert_eq!(messages[1].tool_call_id.as_deref(), Some("c1"));
+        assert_eq!(messages[1].content, UNDISPATCHED_TOOL_RESULT);
+    }
+
+    /// The marker says what really happened in each of its three shapes.
+    #[test]
+    fn cancelled_turn_notice_names_what_ran_and_what_did_not() {
+        assert_eq!(
+            cancelled_turn_notice(0, 0),
+            "[Turn cancelled. No tool call had finished.]"
+        );
+        assert_eq!(
+            cancelled_turn_notice(1, 0),
+            "[Turn cancelled after 1 tool call, whose effects stand.]"
+        );
+        assert_eq!(
+            cancelled_turn_notice(3, 2),
+            "[Turn cancelled after 3 tool calls, whose effects stand; \
+             2 further calls were requested and never ran.]"
         );
     }
 
