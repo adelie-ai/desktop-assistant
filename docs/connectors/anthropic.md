@@ -33,11 +33,25 @@ breakpoint marks where the cache boundary sits.  Everything up to the breakpoint
 must match exactly for a cache hit; any change in that prefix invalidates the
 cache.
 
+The API accepts **at most four `cache_control` breakpoints per request** and
+returns a 400 `invalid_request_error` beyond that, so breakpoints are a budget,
+not a free annotation.
+
 ### What we cache explicitly
 
-**System prompt** -- The system prompt is sent as a structured block with
-`cache_control: {"type": "ephemeral"}`.  It is static for the lifetime of a
-conversation, so this is always a cache hit after the first turn.
+**The leading system block** -- and only that one.  `convert_messages` hoists
+every `Role::System` domain message into the request's `system` array in order,
+then stamps `cache_control: {"type": "ephemeral"}` on the first entry alone.
+
+That first entry is the context assembler's system instruction, static for the
+lifetime of a conversation, so it is a cache hit after the first turn.  The
+entries behind it are the assembler's per-turn `[..]` blocks -- `[Now]`,
+`[Summary of earlier conversation]`, `[Current task]`, `[Working state]`,
+`[Plan]`, `[Pinned]`, `[Scratchpad]` -- which it re-surfaces with fresh content
+every round (see `crates/core/src/context/mod.rs`, `surfaced_blocks`).  Marking
+those is wrong twice over: their prefix differs each turn, so the entry is
+written and never read, and a turn that surfaces five or more of them exceeds
+the four-breakpoint limit and is rejected outright.
 
 ### What we rely on automatic caching for
 
@@ -61,6 +75,8 @@ immediately invalidated when the tool list changes, wasting cache write costs.
 | Approach | Problem |
 |----------|---------|
 | Cache breakpoint on last tool | Tool list changes on activation, invalidating the entire message cache that follows |
+| Breakpoint on every system block | The assembler surfaces up to eight; past four the API rejects the request with a 400, and the per-turn blocks were never cacheable anyway |
+| Truncate at four breakpoints in the connector | Keeps the request legal but still marks volatile blocks, paying cache-write cost for entries that are never read |
 | Static core tools + `execute_tool` wrapper | Keeps tools array stable, but loses structured `tool_use` content blocks; adds indirection; the LLM must format calls through a generic wrapper instead of calling tools directly |
 | Move activated tools into conversation messages only | Same structured calling loss; also changes the tool discovery contract between service and LLM layers |
 
