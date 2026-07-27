@@ -17,6 +17,7 @@ mod backend_reasoning;
 mod classifying_llm;
 mod config;
 mod connections;
+mod embedding_client;
 mod embedding_probe;
 mod knowledge_service;
 mod maintenance_service;
@@ -1052,71 +1053,8 @@ async fn main() -> Result<()> {
         resolved_emb.is_default
     );
 
-    let mut embedding_client: Option<Arc<dyn EmbeddingClient>> = if !resolved_emb.available {
-        tracing::info!(
-            "embeddings unavailable (connector={})",
-            resolved_emb.connector
-        );
-        None
-    } else {
-        Some(match resolved_emb.connector.as_str() {
-            "ollama" => {
-                tracing::info!("using Ollama embedding backend");
-                Arc::new(desktop_assistant_llm_ollama::OllamaClient::new(
-                    resolved_emb.base_url.clone(),
-                    resolved_emb.model.clone(),
-                ))
-            }
-            "bedrock" | "aws-bedrock" => {
-                tracing::info!("using Bedrock embedding backend");
-                Arc::new(
-                    desktop_assistant_llm_bedrock::BedrockClient::new(String::new())
-                        .with_model(resolved_emb.model.clone())
-                        .with_base_url(resolved_emb.base_url.clone()),
-                )
-            }
-            "azure" => {
-                // Azure serves embeddings on `/openai/v1/embeddings` (or the
-                // classic deployments path). The legacy `[embeddings]` block
-                // carries no surface/auth extras, so this uses the connector's
-                // defaults (v1 GA, api-key auth); the deployment is the model.
-                tracing::info!("using Azure embedding backend");
-                Arc::new(
-                    desktop_assistant_llm_azure::AzureClient::new(resolved_emb.api_key.clone())
-                        .with_model(resolved_emb.model.clone())
-                        .with_base_url(resolved_emb.base_url.clone()),
-                )
-            }
-            "google" => {
-                // Google embeddings target Vertex `:predict` or the Gemini API
-                // `:embedContent`. The legacy `[embeddings]` block carries no
-                // project/location/auth extras, so this uses the connector's
-                // defaults; set the host only when explicitly configured so the
-                // client can compose the Vertex host from its default location.
-                tracing::info!("using Google embedding backend");
-                let mut client =
-                    desktop_assistant_llm_google::GoogleClient::new(resolved_emb.api_key.clone())
-                        .with_model(resolved_emb.model.clone());
-                if !resolved_emb.base_url.trim().is_empty() {
-                    client = client.with_base_url(resolved_emb.base_url.clone());
-                }
-                Arc::new(client)
-            }
-            _ => {
-                tracing::info!("using OpenAI-compatible embedding backend");
-                // `resolved_emb.api_key` is now resolved by
-                // `resolve_embeddings_config` itself (purpose path uses the
-                // purpose's connection's secret/env; legacy path reuses the
-                // shared LLM key when connectors match, else falls back to
-                // `<CONNECTOR>_API_KEY`).
-                Arc::new(
-                    desktop_assistant_llm_openai::OpenAiClient::new(resolved_emb.api_key.clone())
-                        .with_model(resolved_emb.model.clone())
-                        .with_base_url(resolved_emb.base_url.clone()),
-                )
-            }
-        })
-    };
+    let mut embedding_client: Option<Arc<dyn EmbeddingClient>> =
+        embedding_client::build_embedding_client(&resolved_emb);
 
     // Resolve model identifier once at startup (includes digest for Ollama).
     let embedding_model_id: String = if let Some(client) = &embedding_client {
