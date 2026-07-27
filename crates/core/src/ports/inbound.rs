@@ -416,6 +416,13 @@ pub enum ConnectionAvailability {
 ///
 /// Mirrors `crates/daemon/src/connections.rs::ConnectionConfig` but is
 /// decoupled so the core crate has no dependency on the daemon.
+///
+/// `api_key_env` names the environment variable a connection reads its API key
+/// from. An implementation resolves that name against its own process
+/// environment, so it constrains an inbound value to the connector's own
+/// documented key variables and rejects anything else. Credentials themselves
+/// never travel in this payload — see
+/// [`ConnectionsService::set_connection_secret`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionConfigPayload {
     Anthropic {

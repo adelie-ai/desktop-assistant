@@ -80,7 +80,9 @@ use anyhow::Context;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
-use crate::connections::{ConnectionConfig, ConnectionId, ConnectionsError, ConnectionsMap};
+use crate::connections::{
+    ConnectionConfig, ConnectionId, ConnectionsError, ConnectionsMap, Connector,
+};
 // `PurposeKind`, `BudgetSource` are only referenced by the test module
 // inside this file. Bring them in unconditionally so test discovery
 // works without an extra `#[cfg(test)] use` block; the warnings on
@@ -866,6 +868,37 @@ pub(super) fn default_api_key_env(connector: &str) -> String {
         "{}_API_KEY",
         normalized_connector_key_prefix(connector).to_ascii_uppercase()
     )
+}
+
+/// Azure OpenAI's conventional key variable.
+///
+/// The connector key `azure` derives `AZURE_API_KEY` from the generic rule in
+/// [`default_api_key_env`], but Azure's own documentation names
+/// `AZURE_OPENAI_API_KEY`, so that is what an Azure connection falls back to
+/// when it sets no explicit `api_key_env`.
+pub(super) const AZURE_DEFAULT_API_KEY_ENV: &str = "AZURE_OPENAI_API_KEY";
+
+/// Environment-variable names a connection payload arriving over the API may
+/// name in `api_key_env`, for `connector`.
+///
+/// Why: the resolver reads this variable out of the daemon's own process
+/// environment and the connector sends the value to the connection's
+/// `base_url` as a bearer token. An unconstrained name therefore turns "may
+/// edit a connection" into "may read any variable the daemon was started with"
+/// — the deployment's database password among them. The permitted set is the
+/// connector's derived `<CONNECTOR>_API_KEY` plus its documented exception, so
+/// the only variables a client can point a connection at are the ones that
+/// hold that connector's own key.
+///
+/// This constrains the API boundary only. `daemon.toml` is operator-owned and
+/// may still name any variable; `api_surface` applies this list to
+/// client-supplied payloads.
+pub(super) fn allowed_api_key_envs(connector: Connector) -> Vec<String> {
+    let mut allowed = vec![default_api_key_env(connector.as_str())];
+    if connector == Connector::Azure {
+        allowed.push(AZURE_DEFAULT_API_KEY_ENV.to_string());
+    }
+    allowed
 }
 
 pub(super) fn default_model_env(connector: &str) -> String {

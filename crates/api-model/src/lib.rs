@@ -1328,6 +1328,14 @@ pub struct WsAuthSettingsView {
 /// connector type) but lives here so clients don't need to depend on the
 /// daemon crate. Credentials are represented as `has_credentials` booleans
 /// on the view; raw secret values are never serialized back through the API.
+///
+/// `api_key_env` names the environment variable the daemon reads a
+/// connection's key from. Sent to the daemon it is constrained to the
+/// connector's own documented key variables (`<CONNECTOR>_API_KEY`, plus
+/// `AZURE_OPENAI_API_KEY` for Azure); re-sending the name a connection already
+/// reads is also accepted, so an operator's custom variable survives an edit.
+/// Any other name is refused — the daemon will not read an arbitrary variable
+/// out of its own environment on a client's say-so.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 pub enum ConnectionConfigView {
