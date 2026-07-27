@@ -26,11 +26,7 @@ pub fn build_embedding_client(view: &EmbeddingsSettingsView) -> Option<Arc<dyn E
         }
         "bedrock" | "aws-bedrock" => {
             tracing::info!("using Bedrock embedding backend");
-            Arc::new(
-                desktop_assistant_llm_bedrock::BedrockClient::new(String::new())
-                    .with_model(view.model.clone())
-                    .with_base_url(view.base_url.clone()),
-            )
+            Arc::new(build_bedrock(view))
         }
         "azure" => {
             // Azure serves embeddings on `/openai/v1/embeddings` (or the
@@ -71,4 +67,47 @@ pub fn build_embedding_client(view: &EmbeddingsSettingsView) -> Option<Arc<dyn E
             )
         }
     })
+}
+
+/// Build the Bedrock embedding client. Split out from the dispatcher above so
+/// it can be inspected concretely - `Arc<dyn EmbeddingClient>` cannot be
+/// downcast, and the thing worth pinning is which credential material survives
+/// construction.
+fn build_bedrock(view: &EmbeddingsSettingsView) -> desktop_assistant_llm_bedrock::BedrockClient {
+    desktop_assistant_llm_bedrock::BedrockClient::new(String::new())
+        .with_model(view.model.clone())
+        .with_base_url(view.base_url.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bedrock_view() -> EmbeddingsSettingsView {
+        EmbeddingsSettingsView {
+            connector: "bedrock".to_string(),
+            model: "amazon.titan-embed-text-v2:0".to_string(),
+            base_url: "us-east-1".to_string(),
+            api_key: "AKIAEXAMPLE/secret".to_string(),
+            has_api_key: true,
+            available: true,
+            is_default: false,
+        }
+    }
+
+    /// The credential is resolved all the way into the view and must reach the
+    /// client. Dropping it does not fail here: the AWS SDK falls back to its
+    /// default provider chain, hunts for instance metadata that a pod does not
+    /// have, and reports a transport error a second later (#718).
+    #[test]
+    fn bedrock_embedding_client_carries_the_resolved_credential() {
+        let view = bedrock_view();
+        let client = build_bedrock(&view);
+        assert_eq!(
+            client.__api_key_for_test(),
+            view.api_key,
+            "the embedding client must be built with the same credential as the \
+             generation client, which registry.rs passes as BedrockClient::new(resolved.api_key)"
+        );
+    }
 }

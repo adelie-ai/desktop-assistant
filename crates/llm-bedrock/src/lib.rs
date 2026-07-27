@@ -174,6 +174,25 @@ impl BedrockClient {
         self
     }
 
+    /// Test-only: the credential this client was built with. Exists so the
+    /// daemon can pin that its embedding client is constructed with the same
+    /// credential material as its generation client (#718) - a client built
+    /// without one does not fail at construction, it fails much later as an
+    /// opaque transport error when the AWS SDK gives up hunting for ambient
+    /// credentials.
+    #[doc(hidden)]
+    pub fn __api_key_for_test(&self) -> &str {
+        &self.api_key
+    }
+
+    /// Test-only: the AWS profile this client was built with, if any. Bedrock
+    /// accepts a profile as an alternative to a key, so both have to survive
+    /// construction.
+    #[doc(hidden)]
+    pub fn __aws_profile_for_test(&self) -> Option<&str> {
+        self.aws_profile.as_deref()
+    }
+
     /// Test-only: prime the `list_models()` cache so the cache-TTL test
     /// can exercise hit/miss behavior without reaching AWS. The
     /// `fetched_at` timestamp is stamped using the configured clock.
