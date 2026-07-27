@@ -444,6 +444,97 @@ mod tests {
         assert!(result.is_none());
     }
 
+    /// The `/login` door's end of the tenant boundary (#726): the token it hands
+    /// back must name the account it authenticated, because that `sub` is the
+    /// `user_id` every later write is filed under.
+    mod ws_login_subject {
+        use std::path::PathBuf;
+        use std::sync::Arc;
+
+        use desktop_assistant_ws as ws;
+        use ws::WsLoginService;
+
+        use crate::config;
+        use crate::settings_service::DaemonSettingsService;
+        use crate::transports::{WsBasicLogin, WsLoginMode};
+
+        const LOGIN_USER: &str = "api-user";
+        const LOGIN_PASSWORD: &str = "correct-horse";
+
+        /// A login door in the deployed container shape: static password, with
+        /// an operator-configured username that is deliberately not the OS
+        /// account the daemon runs as.
+        fn login() -> WsBasicLogin<DaemonSettingsService> {
+            WsBasicLogin::new(
+                Arc::new(DaemonSettingsService::new(PathBuf::from(
+                    "/nonexistent/desktop-assistant-ws-login-726.toml",
+                ))),
+                LOGIN_USER.to_string(),
+                WsLoginMode::StaticPassword(LOGIN_PASSWORD.to_string()),
+            )
+        }
+
+        /// Drive `future` to completion on a fresh current-thread runtime, so
+        /// the `XDG_DATA_HOME` guard is never held across an `.await`.
+        fn run_async<F: std::future::Future>(future: F) -> F::Output {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build current-thread runtime")
+                .block_on(future)
+        }
+
+        #[test]
+        fn login_token_subject_is_the_configured_login_user_not_the_daemon_os_user() {
+            let sub = config::with_isolated_xdg_data_home("ws-login-subject", || {
+                let token = run_async(login().issue_token_for_subject(LOGIN_USER))
+                    .expect("issuing a token for the authenticated user should succeed");
+                config::ws_jwt_sub(&token).expect("issued token must validate and carry a sub")
+            });
+
+            assert_eq!(
+                sub, LOGIN_USER,
+                "the token's sub is the storage user_id; it must be the account /login authenticated"
+            );
+        }
+
+        /// Cross-tenant guard: the door only mints for the identity it can
+        /// authenticate. Anything else fails loudly rather than silently
+        /// meaning someone else.
+        #[test]
+        fn login_refuses_to_mint_a_token_for_a_subject_it_did_not_authenticate() {
+            // Map to a token-free outcome before asserting: a failure message
+            // must never print the bearer token itself.
+            let issued = config::with_isolated_xdg_data_home("ws-login-subject-mismatch", || {
+                run_async(login().issue_token_for_subject("someone-else")).is_ok()
+            });
+
+            assert!(
+                !issued,
+                "a subject other than the configured login user must not be issued a token"
+            );
+        }
+
+        /// The gate that makes honouring the requested subject safe: basic auth
+        /// accepts only the configured username, so the subject reaching
+        /// `issue_token_for_subject` is always an authenticated one.
+        #[test]
+        fn basic_auth_rejects_a_username_other_than_the_configured_one() {
+            assert!(
+                run_async(login().authenticate_basic(LOGIN_USER, LOGIN_PASSWORD)),
+                "the configured user with the right password must authenticate"
+            );
+            assert!(
+                !run_async(login().authenticate_basic("someone-else", LOGIN_PASSWORD)),
+                "a different username must not authenticate, even with the right password"
+            );
+            assert!(
+                !run_async(login().authenticate_basic(LOGIN_USER, "wrong")),
+                "the configured user with a wrong password must not authenticate"
+            );
+        }
+    }
+
     mod peer_cred_uds_auth {
         use std::sync::Arc;
 

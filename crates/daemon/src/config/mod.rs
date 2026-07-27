@@ -1193,6 +1193,42 @@ pub(crate) fn xdg_data_home_test_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poison| poison.into_inner())
 }
 
+/// Run `body` with `XDG_DATA_HOME` pointed at a fresh, uniquely-named temp dir,
+/// then restore the environment and delete the dir. `tag` only names the temp
+/// dir, to keep a leaked one attributable.
+///
+/// Why here: the JWT signing key and the 0600 secret files both resolve their
+/// directory from that one global, so a test that mints a token must repoint it
+/// or it writes into the developer's real `~/.local/share`. Every such test also
+/// has to hold [`xdg_data_home_test_lock`] and mutate the environment through an
+/// `unsafe` block; sharing one helper keeps that `unsafe` in a single reviewed
+/// place instead of once per test module.
+///
+/// `body` is synchronous on purpose: the guard is a `std::sync::MutexGuard`, so
+/// an async caller must drive its future to completion inside `body` (a
+/// current-thread runtime's `block_on`) rather than holding the guard across an
+/// `.await`.
+#[cfg(test)]
+pub(crate) fn with_isolated_xdg_data_home<T>(tag: &str, body: impl FnOnce() -> T) -> T {
+    let _guard = xdg_data_home_test_lock();
+    let test_dir = std::env::temp_dir().join(format!("da-test-{tag}-{}", uuid::Uuid::new_v4()));
+    let data_home = test_dir.join("data");
+    std::fs::create_dir_all(&data_home).expect("create isolated XDG_DATA_HOME");
+    // SAFETY: serialised against every other XDG_DATA_HOME test via the lock
+    // held above; the temp dir is unique per run (UUID-suffixed) so concurrent
+    // test binaries cannot collide either.
+    unsafe {
+        std::env::set_var("XDG_DATA_HOME", &data_home);
+    }
+    let out = body();
+    // SAFETY: same scope as the matching `set_var` above; still under the lock.
+    unsafe {
+        std::env::remove_var("XDG_DATA_HOME");
+    }
+    std::fs::remove_dir_all(&test_dir).ok();
+    out
+}
+
 #[cfg(test)]
 mod tests {
     // --- save_daemon_config must not leave a config world-readable ---------
