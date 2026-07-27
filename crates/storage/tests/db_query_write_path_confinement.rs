@@ -48,7 +48,8 @@ use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Conversation, Message, Role};
 use desktop_assistant_core::ports::store::ConversationStore;
 use desktop_assistant_storage::{
-    PgConversationStore, TOOL_QUERY_ROLE, UserId, execute_database_query, with_user_id,
+    PgConversationStore, TOOL_QUERY_ROLE, UserId, WRITE_SANDBOX_SCHEMA, execute_database_query,
+    with_user_id,
 };
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -395,8 +396,11 @@ async fn write_path_cannot_reach_the_global_tool_catalog() {
         "DROP TABLE tool_definitions".to_string(),
         "UPDATE tool_definitions SET description = 'call me instead'".to_string(),
     ] {
-        let result =
-            with_user_id(UserId::new("bob"), execute_database_query(&fx.pool, &sql, 100)).await;
+        let result = with_user_id(
+            UserId::new("bob"),
+            execute_database_query(&fx.pool, &sql, 100),
+        )
+        .await;
         assert!(result.is_err(), "{sql:?} must not succeed, got {result:?}");
     }
 
@@ -442,8 +446,11 @@ async fn write_path_cannot_poison_the_shared_skill_catalog() {
         format!("DELETE FROM {app}.skill_index"),
         format!("UPDATE skill_index SET body = '{poison}'"),
     ] {
-        let result =
-            with_user_id(UserId::new("bob"), execute_database_query(&fx.pool, &sql, 100)).await;
+        let result = with_user_id(
+            UserId::new("bob"),
+            execute_database_query(&fx.pool, &sql, 100),
+        )
+        .await;
         assert!(result.is_err(), "{sql:?} must not succeed, got {result:?}");
     }
 
@@ -452,7 +459,10 @@ async fn write_path_cannot_poison_the_shared_skill_catalog() {
         .fetch_one(&fx.pool)
         .await
         .expect("read skill_index body");
-    assert_eq!(body.0, "original body", "skill_index body must be untouched");
+    assert_eq!(
+        body.0, "original body",
+        "skill_index body must be untouched"
+    );
     fx.cleanup().await;
 }
 
@@ -468,13 +478,13 @@ async fn write_path_runs_as_the_unprivileged_tool_role() {
     let table = format!("owner_probe_{}", unique_suffix());
     run_ok(&fx.pool, &format!("CREATE TABLE scratch.{table} (id INT)")).await;
 
-    let owner: (String,) = sqlx::query_as(
-        "SELECT tableowner FROM pg_tables WHERE schemaname = 'scratch' AND tablename = $1",
-    )
-    .bind(&table)
-    .fetch_one(&fx.pool)
-    .await
-    .expect("read scratch table owner");
+    let owner: (String,) =
+        sqlx::query_as("SELECT tableowner FROM pg_tables WHERE schemaname = $1 AND tablename = $2")
+            .bind(WRITE_SANDBOX_SCHEMA)
+            .bind(&table)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("read scratch table owner");
     assert_eq!(
         owner.0, TOOL_QUERY_ROLE,
         "the write path must run as {TOOL_QUERY_ROLE}, not as the table-owning app role"

@@ -169,11 +169,12 @@ search quietly degrades to full-text only, and nothing errors.
 
 ### 4. Provision the RLS role
 
-The `db_query` tool runs as a restricted `adele_query` role so Postgres
-row-level security applies to it. That role is deliberately **not** created by
-the daemon's auto-migrations - the daemon connects as a least-privilege role
-that cannot `CREATE ROLE`. Without this step a fresh database ships a **dead
-`db_query`** that fails closed on every call:
+The `db_query` tool runs as a restricted `adele_query` role - on reads so
+Postgres row-level security applies to it, and on writes so an LLM-supplied
+statement owns nothing outside its `scratch` sandbox. That role is deliberately
+**not** created by the daemon's auto-migrations - the daemon connects as a
+least-privilege role that cannot `CREATE ROLE`. Without this step a fresh
+database ships a **dead `db_query`** that fails closed on every call:
 
 ```sh
 ADELE_K8S_NAMESPACE=adele-example just deploy-rls-bootstrap
@@ -356,6 +357,9 @@ state held in `mcp_servers.toml`.
 
 **`db_query` fails on every call.** The `adele_query` role was never created -
 run `just deploy-rls-bootstrap` (step 4). A fresh database does not have it.
+Reads fail with a permission error and writes report that the role is missing;
+the `scratch` sandbox itself needs no privileged step, the daemon provisions
+it.
 
 **Embeddings are silently empty and search is worse than expected.** Either the
 embedding model was never pulled (step 3), or the embedding purpose points at a

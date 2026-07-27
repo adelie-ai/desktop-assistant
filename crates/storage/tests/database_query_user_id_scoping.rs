@@ -19,16 +19,19 @@
 //!   their own rows. An attempt to provide a different `user_id` value
 //!   in the WHERE is overridden — the grafted predicate is AND'd in,
 //!   so the intersection is empty.
-//! - INSERT / UPDATE / DELETE / DROP / TRUNCATE / COPY / GRANT and the
-//!   like are rejected at the parser level for any reference to a
-//!   personal-data table (qualified or not), and for any compound
-//!   statement.
+//! - INSERT / UPDATE / DELETE / DROP / TRUNCATE and the like are
+//!   rejected at the parser level for any reference to a personal-data
+//!   table (qualified or not), and for any compound statement.
 //! - Unqualified writes against the `scratch` schema continue to work
 //!   (the prior contract for ad-hoc relational work the LLM uses for
 //!   intermediate joins, staging tables, materialized views, etc.).
 //! - Reads against the Postgres system catalogs and the
 //!   `tool_definitions` table (system-wide registry, see
 //!   `audit_user_id_scoping.rs`) pass through without grafting.
+//!
+//! The write path's own contract — a statement-kind allowlist, every
+//! referenced object confined to `scratch`, and the un-privileged role it
+//! runs as — lives in `db_query_write_path_confinement.rs`.
 //!
 //! ## Running locally
 //!
@@ -421,7 +424,7 @@ async fn unqualified_drop_in_scratch_namespace_succeeds_but_does_not_touch_publi
     // schema for staging tables, intermediate joins, and other
     // ad-hoc relational work. An unqualified `CREATE TABLE foo` or
     // `DROP TABLE foo` resolves to `scratch.foo` because the write
-    // path's transaction sets `search_path TO scratch, public`. The
+    // path's transaction pins `search_path` to `scratch`. The
     // production `public.conversations` row count must not change as
     // a side effect of any of these operations.
     with_fixture(
@@ -521,17 +524,16 @@ async fn non_select_statement_against_personal_data_is_rejected() {
     // An INSERT, UPDATE, or DELETE that *names* a personal-data
     // table must be rejected — regardless of qualification. The
     // read path is the only path the LLM may use to touch
-    // personal-data tables; writes go to scratch (or to custom user
-    // schemas), never to `public.*` personal data.
+    // personal-data tables; writes go to `scratch`, never to
+    // `public.*` personal data.
     with_fixture(
         "non_select_statement_against_personal_data_is_rejected",
         |fx| async move {
             seed_two_users(&fx.pool).await;
 
-            // Unqualified INSERT — resolves to scratch via search_path
-            // normally, but the parser flags it because `conversations`
-            // is a reserved personal-data table name regardless of
-            // schema.
+            // Unqualified INSERT — would resolve inside `scratch`, but
+            // the parser flags it because `conversations` is a reserved
+            // personal-data table name regardless of schema.
             let r = execute_database_query(
                 &fx.pool,
                 "INSERT INTO conversations (id, title) VALUES ('x', 'y')",

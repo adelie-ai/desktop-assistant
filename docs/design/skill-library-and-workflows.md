@@ -334,8 +334,9 @@ scheduled mutating run ships, independent of the routine runner:
 
 Additional posture: destructive tools stay off unattended allowlists by default; an
 optional owner-maintained destructive-tool list (config, not model-writable) forces
-an approval marker; `builtin_db_query` is already SELECT-only (not a write-forge
-vector) but stays out of workflow-running contexts for hygiene; the anti-forge
+an approval marker; `builtin_db_query` can only write inside its `scratch`
+sandbox (not a write-forge vector) but stays out of workflow-running contexts for
+hygiene; the anti-forge
 guarantees are that blessing is writable only via `Command::BlessSkill`, is kept out
 of the model-writable scratchpad, and is pinned to the attachment-covering hash.
 

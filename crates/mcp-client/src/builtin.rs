@@ -206,12 +206,17 @@ impl BuiltinToolService {
     ///   with the grafted one, so the intersection is empty.
     /// - **Compound statements rejected.** `SELECT 1; DROP TABLE …`
     ///   produces two statements at parse time and is refused.
-    /// - **Writes confined to scratch.** DDL/DML that names a
-    ///   personal-data table (qualified or otherwise) is rejected; the
-    ///   write path's `search_path TO scratch, public` then carries
-    ///   unqualified writes into the per-database `scratch` schema
-    ///   only, so the LLM can still set up staging tables and
-    ///   intermediate joins.
+    /// - **Writes confined to scratch.** The write path is an
+    ///   allowlist in both dimensions: the statement kind must be one
+    ///   of INSERT / UPDATE / DELETE / TRUNCATE / CREATE
+    ///   TABLE|VIEW|INDEX / ALTER TABLE / DROP TABLE|VIEW|INDEX /
+    ///   COMMENT (anything else, `CREATE FUNCTION` and `CREATE
+    ///   SCHEMA` included, is refused), and every object it names —
+    ///   target, source query, subquery, CTE or function, at any
+    ///   depth — must be unqualified or `scratch`-qualified. The
+    ///   statement then runs as the un-privileged `adele_query` role
+    ///   with `search_path` pinned to `scratch` alone, so neither a
+    ///   qualified name nor an unqualified one can reach `public`.
     ///
     /// Pre-#141 this docstring contained a single-line "read-only"
     /// claim — which the implementation did not enforce. The audit
@@ -432,22 +437,22 @@ impl BuiltinToolService {
                 TOOL_DB_QUERY,
                 "Execute a SQL query against the assistant's PostgreSQL database. \
                  Use this to inspect your own conversations, messages, knowledge base \
-                 entries, tool definitions, and other stored data. You can also modify \
-                 data directly — use this to debug issues, fix inconsistencies, or \
-                 rework entries that lack a dedicated tool.\n\n\
-                 A `scratch` schema is available for temporary relational work (staging \
-                 tables, intermediate joins, materialized views, etc.). Write queries \
-                 default to the scratch schema via search_path; the main data in the \
-                 `public` schema is always readable. To modify public tables directly, \
-                 use fully-qualified names (e.g. `UPDATE public.knowledge_base ...`).\n\n\
-                 You may also `CREATE SCHEMA` your own named schemas for durable \
-                 tracking, and define tables, views, functions, and procedures in \
-                 them; helper scripts that load or maintain data are fine too — see \
-                 the database design section of your system prompt for conventions \
-                 (naming, COMMENT ON, what not to touch in public).\n\n\
-                 SELECT/WITH/TABLE/VALUES/EXPLAIN run in a read-only transaction. \
-                 Other statements (CREATE, INSERT, UPDATE, DELETE, etc.) run in a \
-                 normal transaction and are committed.",
+                 entries, tool definitions, and other stored data.\n\n\
+                 Reads: SELECT/WITH/TABLE/VALUES/EXPLAIN run in a read-only \
+                 transaction and are automatically scoped to the current user. Every \
+                 schema is readable.\n\n\
+                 Writes: confined to the `scratch` schema, which is your staging area \
+                 for intermediate joins, working sets and materializations. Unqualified \
+                 writes land there; `scratch.<name>` is equivalent. Permitted \
+                 statements are INSERT, UPDATE, DELETE, TRUNCATE, CREATE TABLE / VIEW / \
+                 MATERIALIZED VIEW / INDEX, ALTER TABLE, DROP TABLE / VIEW / INDEX, and \
+                 COMMENT ON; they run in a normal transaction and are committed.\n\n\
+                 Refused: any write that names an object outside `scratch` (including \
+                 in a subquery, CTE or source SELECT — read application data in a \
+                 separate SELECT instead), and every other statement kind, such as \
+                 CREATE SCHEMA, CREATE FUNCTION, GRANT and COPY. See the database \
+                 design section of your system prompt for conventions (naming, COMMENT \
+                 ON, what belongs in the knowledge base instead).",
                 serde_json::json!({
                     "type": "object",
                     "properties": {
