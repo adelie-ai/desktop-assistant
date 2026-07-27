@@ -1709,8 +1709,9 @@ fn constrain_api_key_env(
     if !unchanged && !allowed.iter().any(|a| a == requested) {
         return Err(format!(
             "api_key_env {requested:?} is not permitted for the {connector} connector; \
-             use one of {allowed:?}, or store the credential with set_connection_secret",
+             use {allowed}, or store the credential with set_connection_secret",
             connector = conn.connector_type(),
+            allowed = allowed.join(" or "),
         ));
     }
 
@@ -2849,9 +2850,14 @@ mod tests {
                 )
                 .await
                 .unwrap_err();
+            let err = format!("{err}");
             assert!(
-                format!("{err}").contains("api_key_env"),
+                err.contains("api_key_env"),
                 "rejecting {name} should name the offending field; got: {err}"
+            );
+            assert!(
+                err.contains("OPENAI_API_KEY"),
+                "rejecting {name} should say what is permitted instead; got: {err}"
             );
         }
 
