@@ -16,12 +16,12 @@ The WebSocket handshake requires a bearer token:
 - Header: `Authorization: Bearer <jwt>`
 - Missing or invalid token: HTTP `401 Unauthorized` during handshake
 
-For local clients, JWTs are typically minted via D-Bus:
+Local clients need no token: the UDS door (which the D-Bus bridge also goes
+through) authenticates by kernel peer credentials, and the identity is the
+connecting peer's OS user. A JWT is a network-door concern, so `/login` is the
+way to get one.
 
-- `org.desktopAssistant.Settings.GenerateWsJwt(subject)`
-- Subject resolves to current OS username on the user bus.
-
-For remote clients (no D-Bus), use `/login` with HTTP Basic auth to mint a bearer JWT:
+Use `/login` with HTTP Basic auth to mint a bearer JWT:
 
 ```http
 POST /login HTTP/1.1
@@ -44,6 +44,15 @@ Successful response:
   and uses the current OS username (ignores `DESKTOP_ASSISTANT_WS_LOGIN_USERNAME`).
 - Container/remote mode: validates against daemon env credentials
   (`DESKTOP_ASSISTANT_WS_LOGIN_USERNAME`, `DESKTOP_ASSISTANT_WS_LOGIN_PASSWORD`).
+
+`/login` authenticates exactly one account, and the `subject` in the response is
+the account it authenticated — the same value carried in the token's `sub` claim.
+That subject is the user identity the daemon files the connection's data under:
+conversations, knowledge entries and scratchpad notes are all scoped by it. So in
+container mode the tenant is whatever `DESKTOP_ASSISTANT_WS_LOGIN_USERNAME` names,
+and changing that value moves subsequent writes to a different partition. A
+request for any other username is rejected (`401`), never issued a token under a
+different name.
 
 ## Message Model
 

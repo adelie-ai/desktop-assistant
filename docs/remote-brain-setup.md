@@ -133,6 +133,12 @@ ways to get one:
   gets an HS256 JWT.
 - **OIDC (production / multi-tenant):** point `[ws_auth.oidc]` at your issuer.
 
+`DESKTOP_ASSISTANT_WS_LOGIN_USERNAME` is not just a credential: it is the user
+identity the daemon files that client's conversations, knowledge entries and
+scratchpad notes under. Pick it to match whatever name you want the data to live
+beneath, and treat a later change to it as a change of tenant — previously stored
+data stays under the old name.
+
 TLS is **off** here (`DESKTOP_ASSISTANT_WS_TLS=false`) because the LAN/tailnet
 already provides transport encryption and it avoids shipping a self-signed CA.
 **Do not** expose this to the public internet as-is — put it behind Tailscale or

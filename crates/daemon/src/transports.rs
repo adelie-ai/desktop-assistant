@@ -182,6 +182,15 @@ pub(crate) fn resolve_uds_socket_path(config_socket: Option<&str>) -> Option<std
     uds::default_desktop_socket_path()
 }
 
+/// The WebSocket `/login` door: HTTP Basic against a single configured
+/// account, exchanged for an HS256 bearer token.
+///
+/// One account, so one identity. `username` is both the only credential this
+/// door accepts and the `sub` it stamps on the token it returns — and that
+/// `sub` is the `UserId` every conversation, knowledge entry and scratchpad
+/// note the connection writes is scoped by. On a desktop that account is the
+/// daemon's OS user; in a container it is whatever
+/// `DESKTOP_ASSISTANT_WS_LOGIN_USERNAME` names, which is then the tenant.
 pub(crate) struct WsBasicLogin<S: SettingsService + 'static> {
     settings: Arc<S>,
     username: String,
@@ -233,6 +242,22 @@ impl<S: SettingsService + 'static> ws::WsLoginService for WsBasicLogin<S> {
     }
 
     async fn issue_token_for_subject(&self, subject: &str) -> std::result::Result<String, String> {
+        // Defense in depth. `authenticate_basic` already accepts only
+        // `self.username`, so the handler cannot reach here with anything else;
+        // re-checking keeps that true if a future caller separates the two
+        // steps. The token's `sub` becomes the storage `user_id`, so minting one
+        // for an unauthenticated identity would hand out another tenant's
+        // partition — fail loudly instead.
+        if subject != self.username {
+            tracing::warn!(
+                "ws login: refusing to issue a token for subject {subject:?}; \
+                 only the configured login user is authenticated here"
+            );
+            return Err(
+                "login cannot issue a token for a subject it did not authenticate".to_string(),
+            );
+        }
+
         self.settings
             .generate_ws_jwt(Some(subject.to_string()))
             .await

@@ -161,8 +161,21 @@ impl SettingsService for DaemonSettingsService {
             .map_err(|error| CoreError::SystemService(error.to_string()))
     }
 
-    async fn generate_ws_jwt(&self, _subject: Option<String>) -> Result<String, CoreError> {
-        config::generate_ws_jwt(Some(config::current_username()))
+    /// Mint an HS256 WebSocket bearer token for `subject`.
+    ///
+    /// The `sub` claim is the caller's `subject` verbatim; `None` (or blank)
+    /// falls back to the daemon's own OS user. Why it matters: the WS door maps
+    /// `sub` to the `UserId` that scopes every subsequent storage query
+    /// (`WsSettingsAuth::extract_user_id`), so the subject *is* the tenant the
+    /// connection writes as. Substituting the daemon's OS account would file a
+    /// remote client's data under the wrong partition while `/login` reported
+    /// the name it asked for.
+    ///
+    /// Authenticating the subject is the caller's job — the door that mints for
+    /// a remote client is `WsBasicLogin`, which only ever passes an identity its
+    /// own basic-auth check accepted.
+    async fn generate_ws_jwt(&self, subject: Option<String>) -> Result<String, CoreError> {
+        config::generate_ws_jwt(subject)
             .map_err(|error| CoreError::SystemService(error.to_string()))
     }
 
