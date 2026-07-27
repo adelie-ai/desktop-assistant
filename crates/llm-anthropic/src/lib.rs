@@ -208,12 +208,19 @@ impl CacheControl {
     }
 }
 
+/// One entry of the request's `system` array.
+///
+/// `cache_control` is present only on the block that carries the prompt-cache
+/// breakpoint; see [`convert_messages`] for which block that is and why. It is
+/// omitted from the wire entirely when absent, because every marker sent counts
+/// against the API's four-breakpoint budget.
 #[derive(Serialize)]
 struct SystemBlock {
     #[serde(rename = "type")]
     block_type: &'static str,
     text: String,
-    cache_control: CacheControl,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
 }
 
 /// Anthropic extended-thinking configuration block.
@@ -355,10 +362,33 @@ struct MessagesRequestWithToolSearch {
     thinking: Option<ThinkingConfig>,
 }
 
-/// Convert domain messages into Anthropic API messages, extracting the system prompt.
+/// Convert domain messages into Anthropic API messages, extracting the system
+/// prompt.
 ///
-/// The system prompt is returned as a `Vec<SystemBlock>` with an ephemeral cache
-/// breakpoint so the Anthropic API caches it across turns.
+/// Every `Role::System` message is hoisted, in order, into the returned
+/// `Vec<SystemBlock>`; the rest become entries of the `messages` array.
+///
+/// # Cache breakpoints
+///
+/// Exactly one ephemeral `cache_control` breakpoint is emitted, on the *leading*
+/// system block. Two reasons, and either alone is sufficient:
+///
+/// - **Correctness.** Caching is a prefix match, so a breakpoint only pays off
+///   when everything ahead of it is byte-identical next turn. The leading block
+///   is the assembler's system instruction, which is stable for the lifetime of
+///   a conversation. Every system block after it is a per-turn `[..]` block the
+///   assembler re-surfaces with fresh content each round (a timestamp, a plan,
+///   a pin), so a breakpoint there is written and never read, paying the
+///   cache-write premium for nothing.
+/// - **Acceptance.** The Messages API rejects a request carrying more than four
+///   `cache_control` markers with a 400. The assembler can surface eight system
+///   blocks in a single turn, so marking each one made the whole feature
+///   combination unusable. Marking only the leading block keeps the count at one
+///   however many blocks arrive.
+///
+/// The same reasoning excludes the tool list: runtime tool search mutates it, so
+/// a breakpoint there would be invalidated on activation. See
+/// `docs/connectors/anthropic.md`.
 fn convert_messages(messages: &[Message]) -> (Vec<SystemBlock>, Vec<AnthropicMessage>) {
     let mut system_blocks: Vec<SystemBlock> = Vec::new();
     let mut api_messages: Vec<AnthropicMessage> = Vec::new();
@@ -369,7 +399,7 @@ fn convert_messages(messages: &[Message]) -> (Vec<SystemBlock>, Vec<AnthropicMes
                 system_blocks.push(SystemBlock {
                     block_type: "text",
                     text: msg.content.clone(),
-                    cache_control: CacheControl::ephemeral(),
+                    cache_control: None,
                 });
             }
             Role::User => {
@@ -417,6 +447,12 @@ fn convert_messages(messages: &[Message]) -> (Vec<SystemBlock>, Vec<AnthropicMes
                 });
             }
         }
+    }
+
+    // The one breakpoint: the stable prefix. Volatile per-turn blocks follow it
+    // unmarked, so the count never approaches the API's limit of four.
+    if let Some(stable_prefix) = system_blocks.first_mut() {
+        stable_prefix.cache_control = Some(CacheControl::ephemeral());
     }
 
     (system_blocks, api_messages)
@@ -1088,7 +1124,14 @@ mod tests {
         let (system, api_msgs) = convert_messages(&messages);
         assert_eq!(system.len(), 1);
         assert_eq!(system[0].text, "you are helpful");
-        assert_eq!(system[0].cache_control.cache_type, "ephemeral");
+        assert_eq!(
+            system[0]
+                .cache_control
+                .as_ref()
+                .expect("the leading system block carries the cache breakpoint")
+                .cache_type,
+            "ephemeral"
+        );
         assert_eq!(api_msgs.len(), 1); // system not in messages array
         assert_eq!(api_msgs[0].role, "user");
     }
@@ -1264,7 +1307,7 @@ mod tests {
             system: vec![SystemBlock {
                 block_type: "text",
                 text: "system prompt".into(),
-                cache_control: CacheControl::ephemeral(),
+                cache_control: Some(CacheControl::ephemeral()),
             }],
             messages: vec![],
             stream: true,
@@ -1287,7 +1330,7 @@ mod tests {
             system: vec![SystemBlock {
                 block_type: "text",
                 text: "be helpful".into(),
-                cache_control: CacheControl::ephemeral(),
+                cache_control: Some(CacheControl::ephemeral()),
             }],
             messages: vec![],
             stream: true,
@@ -1381,9 +1424,6 @@ mod tests {
         assert_eq!(system[0].text, "main instruction");
         assert_eq!(system[1].text, "context summary");
         assert_eq!(system[2].text, "message summary");
-        for block in &system {
-            assert_eq!(block.cache_control.cache_type, "ephemeral");
-        }
         assert_eq!(api_msgs.len(), 1);
         assert_eq!(api_msgs[0].role, "user");
     }
