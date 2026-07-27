@@ -810,6 +810,10 @@ pub struct EmbeddingsSettingsView {
     /// core view that omits this field).
     pub api_key: String,
     pub has_api_key: bool,
+    /// AWS profile resolved for the connection this purpose binds to, when the
+    /// operator authenticates Bedrock by profile rather than by key. Bedrock
+    /// accepts either, so both have to reach the client.
+    pub aws_profile: Option<String>,
     pub available: bool,
     pub is_default: bool,
 }
