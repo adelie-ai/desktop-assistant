@@ -1388,6 +1388,161 @@ mod tests {
         assert_eq!(api_msgs[0].role, "user");
     }
 
+    // --- cache breakpoint placement (issue #734) -------------------------
+
+    /// The Anthropic Messages API rejects a request carrying more than four
+    /// `cache_control` markers, so the tests below assert against the count on
+    /// the wire rather than the Rust field.
+    const API_CACHE_BREAKPOINT_LIMIT: usize = 4;
+
+    /// Indices of the system blocks that carry a `cache_control` marker once
+    /// serialized — i.e. the breakpoints the provider actually receives.
+    fn marked_breakpoint_indices(system: &[SystemBlock]) -> Vec<usize> {
+        let json = serde_json::to_value(system).expect("system blocks must serialize");
+        json.as_array()
+            .expect("system serializes to an array")
+            .iter()
+            .enumerate()
+            .filter(|(_, block)| block.get("cache_control").is_some())
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// The per-turn `[..]` blocks the context assembler surfaces after the
+    /// system instruction, in the order `surfaced_blocks` emits them.
+    fn assembler_shaped_system_messages() -> Vec<Message> {
+        vec![
+            Message::new(Role::System, "system instruction"),
+            Message::new(Role::System, "[Now] Sunday, 26 July 2026, 14:05"),
+            Message::new(Role::System, "[Summary of earlier conversation]\nolder"),
+            Message::new(Role::System, "[Current task] ship the fix"),
+            Message::new(Role::System, "[Working state] 2 notes, 3 open to-dos"),
+            Message::new(Role::System, "[Plan]\n1. write the test"),
+            Message::new(Role::System, "[Pinned]\nthe port is 9379"),
+            Message::new(Role::System, "[Scratchpad] findings, decisions"),
+        ]
+    }
+
+    #[test]
+    fn cache_breakpoint_marks_only_the_leading_stable_system_block() {
+        let (system, _) = convert_messages(&assembler_shaped_system_messages());
+        assert_eq!(system.len(), 8, "every system message is still hoisted");
+        assert_eq!(
+            marked_breakpoint_indices(&system),
+            vec![0],
+            "only the stable system instruction is a cache breakpoint"
+        );
+    }
+
+    #[test]
+    fn volatile_surfaced_blocks_carry_no_cache_breakpoint() {
+        let (system, _) = convert_messages(&assembler_shaped_system_messages());
+        for (i, block) in system.iter().enumerate().skip(1) {
+            let json = serde_json::to_value(block).expect("block must serialize");
+            assert!(
+                json.get("cache_control").is_none(),
+                "per-turn block {i} ({}) changes every round and must not be marked",
+                block.text
+            );
+        }
+    }
+
+    #[test]
+    fn cache_breakpoints_at_four_system_blocks_stay_within_api_limit() {
+        let messages: Vec<Message> = (0..API_CACHE_BREAKPOINT_LIMIT)
+            .map(|i| Message::new(Role::System, format!("block {i}")))
+            .collect();
+        let (system, _) = convert_messages(&messages);
+        assert_eq!(system.len(), API_CACHE_BREAKPOINT_LIMIT);
+        assert!(
+            marked_breakpoint_indices(&system).len() <= API_CACHE_BREAKPOINT_LIMIT,
+            "at the boundary the request must still be accepted by the API"
+        );
+    }
+
+    #[test]
+    fn cache_breakpoints_beyond_four_system_blocks_stay_within_api_limit() {
+        let messages: Vec<Message> = (0..9)
+            .map(|i| Message::new(Role::System, format!("block {i}")))
+            .collect();
+        let (system, _) = convert_messages(&messages);
+        assert_eq!(system.len(), 9);
+        let marked = marked_breakpoint_indices(&system);
+        assert!(
+            marked.len() <= API_CACHE_BREAKPOINT_LIMIT,
+            "nine system blocks produced {} breakpoints; the API rejects more than {API_CACHE_BREAKPOINT_LIMIT}",
+            marked.len()
+        );
+    }
+
+    #[test]
+    fn no_system_message_emits_no_cache_breakpoint() {
+        let (system, api_msgs) = convert_messages(&[Message::new(Role::User, "hi")]);
+        assert!(system.is_empty());
+        assert!(marked_breakpoint_indices(&system).is_empty());
+        assert_eq!(api_msgs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn request_payload_never_exceeds_four_cache_breakpoints() {
+        use std::sync::{Arc, Mutex};
+
+        let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let sink = Arc::clone(&captured);
+
+        let server = httpmock::MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/v1/messages")
+                .is_true(move |req| {
+                    *sink.lock().expect("capture mutex not poisoned") = Some(req.body_string());
+                    true
+                });
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(STUB_SSE_BODY);
+        });
+
+        let client = AnthropicClient::new("key".into()).with_base_url(server.url(""));
+        let mut messages = assembler_shaped_system_messages();
+        messages.push(Message::new(Role::User, "hi"));
+
+        let _ = client
+            .stream_completion(
+                messages,
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await;
+        m.assert_calls(1);
+
+        let body = captured
+            .lock()
+            .expect("capture mutex not poisoned")
+            .clone()
+            .expect("mock recorded a request body");
+        let payload: serde_json::Value =
+            serde_json::from_str(&body).expect("request body is valid JSON");
+        let system = payload["system"]
+            .as_array()
+            .expect("system is an array of blocks");
+        let breakpoints = system
+            .iter()
+            .filter(|block| block.get("cache_control").is_some())
+            .count();
+        assert!(
+            breakpoints <= API_CACHE_BREAKPOINT_LIMIT,
+            "recorded payload carried {breakpoints} cache breakpoints across {} system blocks; \
+             the API rejects more than {API_CACHE_BREAKPOINT_LIMIT}",
+            system.len()
+        );
+        assert_eq!(
+            breakpoints, 1,
+            "only the stable system instruction should be cached"
+        );
+    }
+
     #[test]
     fn request_without_system_omits_field() {
         let req = MessagesRequest {
