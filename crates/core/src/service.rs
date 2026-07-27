@@ -7010,10 +7010,552 @@ mod tests {
         );
     }
 
+    // --- Turn-transcript durability on abnormal exits (#731) ---
+
+    /// Tool executor that trips the ambient cancellation token as `cancel_on`
+    /// runs, then returns that tool's result normally — the shape of a user
+    /// pressing Cancel while a side-effecting tool is in flight.
+    struct CancellingToolExecutor {
+        tools: Vec<ToolDefinition>,
+        cancel_on: String,
+        results: HashMap<String, String>,
+    }
+
+    impl ToolExecutor for CancellingToolExecutor {
+        async fn core_tools(&self) -> Vec<ToolDefinition> {
+            self.tools.clone()
+        }
+
+        async fn search_tools(&self, _query: &str) -> Result<Vec<ToolDefinition>, CoreError> {
+            Ok(vec![])
+        }
+
+        async fn tool_definition(&self, name: &str) -> Result<Option<ToolDefinition>, CoreError> {
+            Ok(self.tools.iter().find(|t| t.name == name).cloned())
+        }
+
+        async fn execute_tool(
+            &self,
+            name: &str,
+            _arguments: serde_json::Value,
+        ) -> Result<String, CoreError> {
+            if name == self.cancel_on
+                && let Some(token) = current_cancellation_token()
+            {
+                token.cancel();
+            }
+            self.results
+                .get(name)
+                .cloned()
+                .ok_or_else(|| CoreError::ToolExecution(format!("unknown tool: {name}")))
+        }
+    }
+
+    /// LLM that plays a script of responses and then reports the turn
+    /// cancelled — the shape of a connector surfacing the user's cancel
+    /// mid-stream.
+    struct ScriptThenCancelLlm {
+        responses: Mutex<Vec<LlmResponse>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for ScriptThenCancelLlm {
+        async fn stream_completion(
+            &self,
+            _messages: Vec<Message>,
+            _tools: &[ToolDefinition],
+            _reasoning: ReasoningConfig,
+            mut on_chunk: ChunkCallback,
+        ) -> Result<LlmResponse, CoreError> {
+            let next = {
+                let mut responses = self.responses.lock().unwrap();
+                if responses.is_empty() {
+                    None
+                } else {
+                    Some(responses.remove(0))
+                }
+            };
+            match next {
+                Some(response) => {
+                    if !response.text.is_empty() {
+                        on_chunk(response.text.clone());
+                    }
+                    Ok(response)
+                }
+                None => Err(CoreError::Cancelled),
+            }
+        }
+    }
+
+    /// Store whose `update` fails once `allow` writes have landed, so the eager
+    /// prompt persist succeeds and a later cancel-path persist does not.
+    struct FailUpdatesAfterStore {
+        inner: MockStore,
+        allow: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ConversationStore for FailUpdatesAfterStore {
+        async fn create(&self, conv: Conversation) -> Result<(), CoreError> {
+            self.inner.create(conv).await
+        }
+        async fn get(&self, id: &ConversationId) -> Result<Conversation, CoreError> {
+            self.inner.get(id).await
+        }
+        async fn list(&self) -> Result<Vec<ConversationSummary>, CoreError> {
+            self.inner.list().await
+        }
+        async fn update(&self, conv: Conversation) -> Result<(), CoreError> {
+            if self.allow.load(Ordering::SeqCst) == 0 {
+                return Err(CoreError::Llm("update boom".to_string()));
+            }
+            self.allow.fetch_sub(1, Ordering::SeqCst);
+            self.inner.update(conv).await
+        }
+        async fn delete(&self, id: &ConversationId) -> Result<(), CoreError> {
+            self.inner.delete(id).await
+        }
+        async fn archive(&self, id: &ConversationId) -> Result<(), CoreError> {
+            self.inner.archive(id).await
+        }
+        async fn unarchive(&self, id: &ConversationId) -> Result<(), CoreError> {
+            self.inner.unarchive(id).await
+        }
+        async fn create_summary(
+            &self,
+            conversation_id: &ConversationId,
+            summary: String,
+            start_ordinal: usize,
+            end_ordinal: usize,
+        ) -> Result<String, CoreError> {
+            self.inner
+                .create_summary(conversation_id, summary, start_ordinal, end_ordinal)
+                .await
+        }
+        async fn expand_summary(&self, summary_id: &str) -> Result<(), CoreError> {
+            self.inner.expand_summary(summary_id).await
+        }
+    }
+
+    /// The tool set and canned results shared by the cancel-path turns: a
+    /// side-effecting write followed by a slow fetch.
+    fn cancel_scenario_tools() -> (Vec<ToolDefinition>, HashMap<String, String>) {
+        let tools = vec![
+            ToolDefinition::new(
+                "fileio_write",
+                "Write a file",
+                serde_json::json!({"type": "object"}),
+            ),
+            ToolDefinition::new(
+                "web_fetch",
+                "Fetch a page",
+                serde_json::json!({"type": "object"}),
+            ),
+        ];
+        let mut results = HashMap::new();
+        results.insert(
+            "fileio_write".to_string(),
+            "wrote 42 bytes to /tmp/report.txt".to_string(),
+        );
+        results.insert("web_fetch".to_string(), "<html/>".to_string());
+        (tools, results)
+    }
+
+    /// Drive a turn whose single round calls two tools and is cancelled while
+    /// the first one runs, so the loop bails at the per-tool checkpoint with the
+    /// second call never dispatched. Returns the turn's result and whatever
+    /// survived in storage.
+    async fn run_turn_cancelled_between_tool_dispatches()
+    -> (Result<String, CoreError>, Conversation) {
+        let (tools, results) = cancel_scenario_tools();
+        let responses = vec![LlmResponse::with_tool_calls(
+            "",
+            vec![
+                ToolCall::new("call-1", "fileio_write", r#"{"path":"/tmp/report.txt"}"#),
+                ToolCall::new("call-2", "web_fetch", r#"{"url":"https://example.com"}"#),
+            ],
+        )];
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            ToolCallingLlm::new(responses),
+            CancellingToolExecutor {
+                tools,
+                cancel_on: "fileio_write".to_string(),
+                results,
+            },
+            id_gen(),
+        );
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+
+        let result = crate::ports::llm::with_cancellation_token(
+            CancellationToken::new(),
+            handler.send_prompt(
+                &conv.id,
+                "write the report then fetch the page".into(),
+                noop_callback(),
+                noop_status(),
+            ),
+        )
+        .await;
+        let persisted = handler.get_conversation(&conv.id).await.unwrap();
+        (result, persisted)
+    }
+
+    /// AC (#731): a turn cancelled between tool dispatches keeps the record of
+    /// the side-effecting tool that already ran — the assistant's tool-call
+    /// message and the completed tool's result are both in storage.
+    #[tokio::test]
+    async fn cancel_between_tool_dispatches_persists_the_completed_tool_transcript() {
+        let (result, persisted) = run_turn_cancelled_between_tool_dispatches().await;
+        assert!(
+            matches!(result, Err(CoreError::Cancelled)),
+            "the turn must still surface Cancelled, got {result:?}"
+        );
+
+        assert!(
+            persisted
+                .messages
+                .iter()
+                .any(|m| m.role == Role::User && m.content.contains("write the report")),
+            "the user prompt must survive: {:?}",
+            persisted.messages
+        );
+        let call_msg = persisted
+            .messages
+            .iter()
+            .find(|m| !m.tool_calls.is_empty())
+            .expect("the assistant tool-call message must be persisted");
+        assert_eq!(
+            call_msg.tool_calls.len(),
+            2,
+            "both requested calls must be recorded: {:?}",
+            call_msg.tool_calls
+        );
+        let executed = persisted
+            .messages
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("call-1"))
+            .expect("the executed tool's result must be persisted");
+        assert!(
+            executed.content.contains("/tmp/report.txt"),
+            "the executed tool's result must be stored verbatim, got {:?}",
+            executed.content
+        );
+    }
+
+    /// AC (#731): the stored turn stays provider-valid — every tool call in the
+    /// persisted transcript has a matching tool result, including the one the
+    /// cancel pre-empted, so the NEXT turn's request is not rejected for an
+    /// unanswered tool call.
+    #[tokio::test]
+    async fn cancelled_turn_keeps_every_tool_call_paired_with_a_result() {
+        let (_result, persisted) = run_turn_cancelled_between_tool_dispatches().await;
+        let ids: Vec<String> = persisted
+            .messages
+            .iter()
+            .flat_map(|m| m.tool_calls.iter().map(|c| c.id.clone()))
+            .collect();
+        assert_eq!(ids, vec!["call-1".to_string(), "call-2".to_string()]);
+        for id in ids {
+            assert!(
+                persisted
+                    .messages
+                    .iter()
+                    .any(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some(&id)),
+                "tool call {id} has no result in the stored turn: {:?}",
+                persisted.messages
+            );
+        }
+    }
+
+    /// AC (#731): the transcript says where the turn stopped, so the user and
+    /// the next turn's model can both tell a cancelled turn from a finished one.
+    #[tokio::test]
+    async fn cancelled_turn_records_where_it_stopped() {
+        let (_result, persisted) = run_turn_cancelled_between_tool_dispatches().await;
+        let last = persisted
+            .messages
+            .last()
+            .expect("the cancelled turn must persist something");
+        assert!(
+            last.content.to_lowercase().contains("cancel"),
+            "the last stored message must mark the cancellation, got {:?}",
+            last.content
+        );
+    }
+
+    /// AC (#731): cancelling between tool ROUNDS (the top-of-loop checkpoint)
+    /// persists the round that completed, verbatim and with nothing invented.
+    #[tokio::test]
+    async fn cancel_between_tool_rounds_persists_the_completed_round() {
+        let (tools, results) = cancel_scenario_tools();
+        let responses = vec![LlmResponse::with_tool_calls(
+            "",
+            vec![ToolCall::new(
+                "call-1",
+                "fileio_write",
+                r#"{"path":"/tmp/report.txt"}"#,
+            )],
+        )];
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            ToolCallingLlm::new(responses),
+            CancellingToolExecutor {
+                tools,
+                cancel_on: "fileio_write".to_string(),
+                results,
+            },
+            id_gen(),
+        );
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+
+        let result = crate::ports::llm::with_cancellation_token(
+            CancellationToken::new(),
+            handler.send_prompt(
+                &conv.id,
+                "write the report".into(),
+                noop_callback(),
+                noop_status(),
+            ),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(CoreError::Cancelled)),
+            "got {result:?}"
+        );
+
+        let persisted = handler.get_conversation(&conv.id).await.unwrap();
+        let executed = persisted
+            .messages
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("call-1"))
+            .expect("the completed round's tool result must be persisted");
+        assert_eq!(
+            executed.content, "wrote 42 bytes to /tmp/report.txt",
+            "a completed tool result must be stored verbatim"
+        );
+    }
+
+    /// AC (#731): a cancel that arrives while the LLM is streaming still
+    /// persists the tool rounds that already completed, and still keeps the
+    /// partial assistant text out of history.
+    #[tokio::test]
+    async fn cancel_mid_stream_persists_earlier_tool_rounds() {
+        let (tools, results) = cancel_scenario_tools();
+        // One scripted round, then the connector surfaces Cancelled.
+        let llm = ScriptThenCancelLlm {
+            responses: Mutex::new(vec![LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new(
+                    "call-1",
+                    "fileio_write",
+                    r#"{"path":"/tmp/report.txt"}"#,
+                )],
+            )]),
+        };
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            llm,
+            MockToolExecutor::new(tools, results),
+            id_gen(),
+        );
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+
+        let result = handler
+            .send_prompt(
+                &conv.id,
+                "write the report".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(CoreError::Cancelled)),
+            "got {result:?}"
+        );
+
+        let persisted = handler.get_conversation(&conv.id).await.unwrap();
+        let executed = persisted
+            .messages
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("call-1"))
+            .expect("the completed round's tool result must be persisted");
+        assert!(executed.content.contains("/tmp/report.txt"));
+    }
+
+    /// AC (#731), boundary: cancelling before any tool ran keeps the prompt and
+    /// records the stop, and invents no tool messages.
+    #[tokio::test]
+    async fn cancel_before_any_tool_ran_persists_the_prompt_and_the_stop() {
+        let llm = ScriptThenCancelLlm {
+            responses: Mutex::new(vec![]),
+        };
+        let handler = ConversationHandler::new(MockStore::new(), llm, id_gen());
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+
+        let result = handler
+            .send_prompt(
+                &conv.id,
+                "do the thing".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(CoreError::Cancelled)),
+            "got {result:?}"
+        );
+
+        let persisted = handler.get_conversation(&conv.id).await.unwrap();
+        assert!(
+            persisted
+                .messages
+                .iter()
+                .any(|m| m.role == Role::User && m.content == "do the thing"),
+            "the prompt must survive: {:?}",
+            persisted.messages
+        );
+        assert!(
+            !persisted.messages.iter().any(|m| m.role == Role::Tool),
+            "no tool messages may be invented when no tool ran: {:?}",
+            persisted.messages
+        );
+        assert!(
+            persisted
+                .messages
+                .last()
+                .is_some_and(|m| m.content.to_lowercase().contains("cancel")),
+            "the stop must be recorded: {:?}",
+            persisted.messages
+        );
+    }
+
+    /// AC (#731): cancelling while a client-local tool is suspended persists the
+    /// assistant's tool-call message and closes the unanswered call, so the
+    /// record of what the turn asked for survives.
+    #[tokio::test]
+    async fn cancel_while_client_tool_suspended_persists_the_tool_transcript() {
+        use crate::ports::client_tools::with_client_tools;
+
+        let responses = vec![LlmResponse::with_tool_calls(
+            "",
+            vec![ToolCall::new(
+                "call-1",
+                "fs_read",
+                r#"{"path":"/etc/hosts"}"#,
+            )],
+        )];
+        let handler = make_tool_handler(responses, vec![], HashMap::new());
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+
+        let executed = Arc::new(Mutex::new(Vec::new()));
+        let port: Arc<dyn crate::ports::client_tools::ClientToolPort> =
+            Arc::new(FakeClientToolPort::failing(
+                vec![ToolDefinition::new(
+                    "fs_read",
+                    "Read a file on the client",
+                    serde_json::json!({"type": "object"}),
+                )],
+                Arc::clone(&executed),
+                CoreError::Cancelled,
+            ));
+
+        let result = with_client_tools(
+            port,
+            handler.send_prompt(
+                &conv.id,
+                "Read /etc/hosts".into(),
+                noop_callback(),
+                noop_status(),
+            ),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(CoreError::Cancelled)),
+            "got {result:?}"
+        );
+
+        let persisted = handler.get_conversation(&conv.id).await.unwrap();
+        assert!(
+            persisted
+                .messages
+                .iter()
+                .any(|m| m.tool_calls.iter().any(|c| c.id == "call-1")),
+            "the assistant's tool-call message must be persisted: {:?}",
+            persisted.messages
+        );
+        assert!(
+            persisted
+                .messages
+                .iter()
+                .any(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some("call-1")),
+            "the unanswered call must be closed out: {:?}",
+            persisted.messages
+        );
+    }
+
+    /// AC (#731), failure path: a storage error on the cancel-path persist must
+    /// not mask the user's cancellation with a storage error.
+    #[tokio::test]
+    async fn cancel_persist_failure_still_surfaces_cancelled() {
+        let (tools, results) = cancel_scenario_tools();
+        let responses = vec![LlmResponse::with_tool_calls(
+            "",
+            vec![
+                ToolCall::new("call-1", "fileio_write", "{}"),
+                ToolCall::new("call-2", "web_fetch", "{}"),
+            ],
+        )];
+        // One update allowed: the eager prompt persist. The cancel-path persist
+        // then fails.
+        let store = FailUpdatesAfterStore {
+            inner: MockStore::new(),
+            allow: std::sync::atomic::AtomicUsize::new(1),
+        };
+        let handler = ConversationHandler::with_tools(
+            store,
+            ToolCallingLlm::new(responses),
+            CancellingToolExecutor {
+                tools,
+                cancel_on: "fileio_write".to_string(),
+                results,
+            },
+            id_gen(),
+        );
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+
+        let result = crate::ports::llm::with_cancellation_token(
+            CancellationToken::new(),
+            handler.send_prompt(&conv.id, "go".into(), noop_callback(), noop_status()),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(CoreError::Cancelled)),
+            "a failed cancel-path persist must not replace Cancelled, got {result:?}"
+        );
+    }
+
     /// `step_stack.clear()` after overflow recovery (issue #240 / #441): a
-    /// `begin_step` then an in-turn ContextOverflow recovery (which can drain
-    /// messages and invalidate the frame's absolute watermark) must drop the
-    /// step frames, so a later `complete_step` finds NO active step and does not
+    /// `begin_step` then an in-turn ContextOverflow recovery (which rewrites the
+    /// message log beneath the frame's absolute watermark) must drop the step
+    /// frames, so a later `complete_step` finds NO active step and does not
     /// evict via a stale watermark. Without the `clear()`, `complete_step` would
     /// pop the frame and act on the now-invalid watermark.
     #[tokio::test]
