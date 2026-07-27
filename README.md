@@ -111,7 +111,10 @@ CREATE EXTENSION IF NOT EXISTS vector;
 url = "postgres://desktop_assistant:your_password_here@localhost/desktop_assistant"
 ```
 
-Migrations run automatically on startup.
+Migrations run automatically on startup. Each one is applied at most once and
+recorded in a `schema_migrations` table, and the run is serialized by a Postgres
+advisory lock, so restarts are cheap however long the history gets and two
+daemons pointed at one database queue rather than race.
 
 ## Quick start
 

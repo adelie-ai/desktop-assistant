@@ -3,8 +3,10 @@
 -- `[Scratchpad]` index. Generalizes the reserved `goal` key from one hard-coded
 -- note to a model-controlled flag, bounded by MAX_PINNED_NOTES.
 --
--- The migration runner (pool.rs) re-executes every migration on every startup
--- with no version table, so every statement here MUST be idempotent.
+-- The migration runner (pool.rs) applies each migration at most once, tracked
+-- in the `schema_migrations` ledger, but every statement here MUST still be
+-- idempotent: a database migrated before that ledger existed replays the whole
+-- set once on its first boot under it.
 
 ALTER TABLE scratchpads ADD COLUMN IF NOT EXISTS pinned BOOLEAN NOT NULL DEFAULT FALSE;
 

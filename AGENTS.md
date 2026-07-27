@@ -59,6 +59,12 @@ The bar is high and the soundness argument must be written down in a `// SAFETY:
 ## Storage & migrations
 
 - Migrations are append-only and ordinally numbered. Two concurrent PRs cannot share an ordinal — coordinate before opening, or rebase to take the next number. This is the one place parallel worktrees genuinely conflict; the conflict is invisible until both PRs merge, so check before pushing.
+- A new `.sql` file is only run once it is registered in the `MIGRATIONS` list in `crates/storage/src/pool.rs` (`migration!("039_thing.sql")`, in ordinal order). The runner applies each entry **at most once**, recording its file name in the `schema_migrations` ledger, and serializes the whole run behind a `pg_advisory_lock` so two daemons booting against one database queue instead of racing.
+- Consequences of that ledger, all of them load-bearing:
+  - **Never edit or rename a migration that has shipped.** Databases that recorded it will not run it again, so the edit reaches only fresh installs and the two silently diverge. Fix a shipped migration with a new one.
+  - **Every migration must still be idempotent.** A database migrated before the ledger existed has no record of anything, so its first boot under this runner replays the whole set once.
+  - **A migration is applied and recorded in one transaction**, so nothing that cannot run inside a transaction block (`CREATE INDEX CONCURRENTLY`, `VACUUM`) belongs in one.
+  - Behaviour that used to come free from re-running every file on every boot no longer does. Migration 029's RLS policy list is the example: a later migration that adds a user-scoped table must enable RLS itself.
 - Schema changes that touch personal-data tables must respect the multi-tenant boundary (`user_id` scoping). See the multi-tenant schema work (#102) as the reference shape.
 
 ## Daemon entry points & operations

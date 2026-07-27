@@ -666,6 +666,10 @@ const GLOBAL_TABLES: &[&str] = &[
     // capacity knowledge, not personal data (migrations 025/028, likewise
     // documented as deliberately global).
     "context_window_observations",
+    // Which migration files have been applied to this schema (#730). Schema
+    // bookkeeping written by the migration runner itself, identical for every
+    // tenant and never touched by a request path.
+    "schema_migrations",
     // Host-global skill/workflow catalog, disk-sourced and keyed by skill
     // identity — a shared catalog mirroring `tool_definitions`, not personal
     // data (#573, migration 033_skill_index). Added here because #601 landed the

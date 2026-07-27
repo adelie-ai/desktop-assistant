@@ -29,6 +29,12 @@
 -- proportional to history size — run during a quiet window on large installs
 -- (same caveat #71/013 carried). Existing oversized rows are safe: the new
 -- expression skips/bounds them, so the rewrite itself cannot hit the limit.
+--
+-- That rewrite happens on the ONE boot that applies this file. It is also why
+-- the runner has a `schema_migrations` ledger (#730): replaying this file on
+-- every boot rewrote the heap every time and permanently consumed one of the
+-- table's 1600 `pg_attribute` slots per boot, since DROP COLUMN does not
+-- reclaim the slot.
 
 ALTER TABLE messages DROP COLUMN IF EXISTS tsv;
 
