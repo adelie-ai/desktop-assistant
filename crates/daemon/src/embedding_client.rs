@@ -44,9 +44,14 @@ pub fn build_embedding_client(view: &EmbeddingsSettingsView) -> Option<Arc<dyn E
     // is a provider transport error seconds later, which reads as a network
     // fault rather than as configuration.
     if credential_missing(view) {
+        // Deliberately not phrased as "calls will fail": a self-hosted
+        // OpenAI-compatible endpoint is legitimately keyless, and a warning
+        // that asserts a failure which does not happen is one operators learn
+        // to scroll past.
         tracing::warn!(
-            "no credential resolved for the {} embedding backend; embedding calls will fail. \
-             Check the secret configured for the connection the embedding purpose binds to.",
+            "no credential resolved for the {} embedding backend. If it requires \
+             authentication, embedding calls will fail - check the secret configured for \
+             the connection the embedding purpose binds to.",
             view.connector
         );
     }
