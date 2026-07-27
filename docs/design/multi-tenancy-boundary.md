@@ -1,6 +1,6 @@
 # Multi-tenancy boundary: config, credentials, and tool execution
 
-Status: proposed. Epic: #680. Related: #531 (runner axis), #538 (built-in MCP in
+Status: accepted. Epic: #680. Work: #689 (operator/tenant split), #690 (MCP denylist), #692 (per-user data root), #693 (daemon linking, deferred), #686 (restart-required reporting). Related: #531 (runner axis), #538 (built-in MCP in
 clients), #490 (composable image), #260 (client-tool session scoping), #583
 (handler lifecycle), #413 (scheduled routines)
 
@@ -228,6 +228,32 @@ host-affine ones - and the remote-daemon link itself, which has an unused KCM to
 
 That is a separate effort. Until it lands, a surface that cannot host a tool reports
 the capability as unavailable and names the runner that would provide it.
+
+## The pattern recurs
+
+The framing above - that the operating system *was* the multi-tenancy, and that lifting the
+daemon into a shared service removed the enforcer while leaving every assumption that
+depended on it - turned out not to be specific to tenancy.
+
+The same shape has since appeared twice more:
+
+**Machine identity.** When the daemon ran on your machine, "the home directory" was
+unambiguous because there was only one. In a cluster serving several clients on several
+machines, the daemon's own hostname identifies a pod and means nothing to a user. Co-location
+*was* the machine scope, and it dissolved the same way.
+
+**Working environment.** One person may run several OS accounts on one machine, each a
+separate environment with its own paths and checkouts, all connecting as the same assistant
+user. Being the only account on the machine *was* the environment identity.
+
+In each case the assumption is still in the data, unstated, because at the time it was
+written there was only one possible value. The general lesson is worth carrying: when a
+deployment change removes something that was previously implicit, the code does not break -
+it keeps working against an assumption that has quietly stopped being true, and the failure
+shows up much later as data that cannot be interpreted.
+
+The memory-architecture consequences are tracked in #694, with the scoping work in #894.
+They are not part of this epic, but they share its root cause.
 
 ## Rejected alternatives
 
