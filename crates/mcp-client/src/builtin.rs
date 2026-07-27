@@ -735,25 +735,20 @@ impl BuiltinToolService {
         defs
     }
 
+    /// Whether `name` is a built-in tool, i.e. whether the caller must dispatch
+    /// it to [`Self::execute_tool`] instead of looking for an MCP server that
+    /// owns it. This is the gate `McpToolExecutor` consults first.
+    ///
+    /// Derived from [`Self::ALL_TOOL_NAMES`] rather than restating the set, so
+    /// the two cannot drift: a builtin that is advertised but not claimed here
+    /// is routed to MCP and fails every call with "unknown tool".
+    ///
+    /// Capability-gated tools are claimed whether or not their closure is
+    /// wired. Absence is expressed by not advertising the tool, and a call that
+    /// arrives anyway gets the tool's own "not configured" error rather than
+    /// being routed somewhere it does not belong.
     pub fn supports_tool(name: &str) -> bool {
-        matches!(
-            name,
-            TOOL_KB_WRITE
-                | TOOL_KB_SEARCH
-                | TOOL_KB_DELETE
-                | TOOL_KB_LIST
-                | TOOL_SEARCH
-                | TOOL_NOTIFY
-                | TOOL_SYS_PROPS
-                | TOOL_DB_QUERY
-                | TOOL_MCP_CONTROL
-                | TOOL_CONV_SEARCH
-                | TOOL_SCRATCHPAD_WRITE
-                | TOOL_SCRATCHPAD_SEARCH
-                | TOOL_SCRATCHPAD_DELETE
-                | TOOL_SKILL_SEARCH
-                | TOOL_SKILL_GET
-        )
+        Self::ALL_TOOL_NAMES.contains(&name)
     }
 
     /// The builtin provider groups (Phase 1): a stable group id plus the authored
@@ -801,9 +796,17 @@ impl BuiltinToolService {
         ),
     ];
 
-    /// Every builtin tool name, including the capability-gated `builtin_notify`
-    /// (absent at runtime when no notifier is wired). The exhaustiveness guard
-    /// walks this so a NEW builtin without a provider mapping fails the build.
+    /// Every builtin tool name - the one list the routing surfaces are held to.
+    ///
+    /// [`Self::supports_tool`] answers straight out of it, and the tests hold
+    /// [`Self::tool_definitions`], [`Self::execute_tool`] and
+    /// [`Self::provider_group`] to it, so a new builtin cannot be advertised
+    /// without being routable, classified, and dispatchable.
+    ///
+    /// The capability-gated tools (`builtin_notify`, `builtin_scratchpad_pin`,
+    /// the skill tools) are listed here even though a given runtime may not
+    /// advertise them: routing is by name, and an unwired tool answers with its
+    /// own "not configured" error.
     pub const ALL_TOOL_NAMES: &'static [&'static str] = &[
         TOOL_KB_WRITE,
         TOOL_KB_SEARCH,
@@ -818,6 +821,7 @@ impl BuiltinToolService {
         TOOL_SCRATCHPAD_WRITE,
         TOOL_SCRATCHPAD_SEARCH,
         TOOL_SCRATCHPAD_DELETE,
+        TOOL_SCRATCHPAD_PIN,
         TOOL_SKILL_SEARCH,
         TOOL_SKILL_GET,
     ];
@@ -851,6 +855,11 @@ impl BuiltinToolService {
             .map(|(_, blurb)| *blurb)
     }
 
+    /// Dispatch a builtin by name. Callers gate on [`Self::supports_tool`]
+    /// first, so the catch-all arm is only reached when a name in
+    /// [`Self::ALL_TOOL_NAMES`] has no dispatch arm - the
+    /// `every_advertised_builtin_is_routable` guard reads its wording, so
+    /// reword it there in the same change.
     pub async fn execute_tool(
         &self,
         name: &str,
@@ -2088,17 +2097,10 @@ mod tests {
                 "builtin '{name}' maps to '{group}', which is not an authored PROVIDER_GROUP"
             );
         }
-        // ALL_TOOL_NAMES must also cover everything supports_tool accepts and
-        // everything the default service actually emits (notify aside) — a
-        // classified name that is not a real builtin, or a real builtin missing
-        // from the list, is a drift bug.
-        for name in BuiltinToolService::ALL_TOOL_NAMES {
-            assert!(
-                BuiltinToolService::supports_tool(name),
-                "ALL_TOOL_NAMES lists '{name}', which supports_tool rejects"
-            );
-        }
-        for def in BuiltinToolService::new().tool_definitions() {
+        // The same must hold for what a runtime actually advertises, including
+        // the capability-gated tools: an unclassified builtin registers under
+        // the generic fallback group instead of its own.
+        for def in fully_wired_service().tool_definitions() {
             assert!(
                 BuiltinToolService::provider_group(&def.name).is_some(),
                 "runtime builtin '{}' is unclassified",
@@ -3574,21 +3576,157 @@ mod tests {
         assert_eq!(miss_json["ok"], false);
     }
 
+    /// A service with *every* capability closure wired, so `tool_definitions()`
+    /// emits the maximal builtin set.
+    ///
+    /// Why: the capability-gated tools (`builtin_notify`, the skill tools,
+    /// `builtin_scratchpad_pin`) are invisible to a bare `new()` service, and a
+    /// drift guard that walks a bare service therefore cannot see the very
+    /// tools most likely to drift. Wire a new capability here the moment you
+    /// add one, or the guards below stop covering it.
+    fn fully_wired_service() -> BuiltinToolService {
+        use desktop_assistant_core::ports::knowledge::KnowledgeListPage;
+
+        let embed_fn: EmbedFn = Arc::new(|inputs: Vec<String>| {
+            Box::pin(async move { Ok(inputs.iter().map(|_| vec![0.0f32; 3]).collect()) })
+        });
+        let kb_write: KnowledgeWriteFn = Arc::new(|entry| Box::pin(async move { Ok(entry) }));
+        let kb_search: KnowledgeSearchFn =
+            Arc::new(|_query, _emb, _model, _tags, _exclude_tags, _limit| {
+                Box::pin(async { Ok(Vec::new()) })
+            });
+        let kb_delete: KnowledgeDeleteFn = Arc::new(|_ids| Box::pin(async { Ok(0) }));
+        let kb_list: KnowledgeListFn = Arc::new(|_query| {
+            Box::pin(async {
+                Ok(KnowledgeListPage {
+                    entries: Vec::new(),
+                    next_cursor: None,
+                })
+            })
+        });
+        let kb_get: KnowledgeGetFn = Arc::new(|_id| Box::pin(async { Ok(None) }));
+        let tool_search: ToolSearchFn =
+            Arc::new(|_query, _emb, _limit| Box::pin(async { Ok(Vec::new()) }));
+        let tool_def: ToolDefinitionFn = Arc::new(|_name| Box::pin(async { Ok(None) }));
+        let db_query: DbQueryFn =
+            Arc::new(|_sql, _limit| Box::pin(async { Ok(serde_json::json!({"rows": []})) }));
+        let conv_search: ConversationSearchFn =
+            Arc::new(|_query, _limit, _role| Box::pin(async { Ok(Vec::new()) }));
+        let notify: NotifyFn =
+            Arc::new(|_summary, _body, _urgency| Box::pin(async { Ok(Some(1u32)) }));
+        let skill_search: SkillSearchFn =
+            Arc::new(|_query, _emb, _model, _limit| Box::pin(async { Ok(Vec::new()) }));
+        let skill_get: SkillGetFn = Arc::new(|_name, _owner| Box::pin(async { Ok(None) }));
+
+        // The scratchpad closures (including the pin write) come from the
+        // shared in-memory pad so the pin tool is wired the same way the daemon
+        // wires it.
+        let mut service = scratchpad_service()
+            .0
+            .with_embedding(embed_fn, "test-embed-model".to_string())
+            .with_knowledge_base(kb_write, kb_search, kb_delete, kb_list, kb_get)
+            .with_tool_registry(tool_search, tool_def)
+            .with_database(db_query)
+            .with_conversation_search(conv_search)
+            .with_notify(notify)
+            .with_skills(skill_search, skill_get);
+        service.set_mcp_control(crate::executor::McpToolExecutor::new(Vec::new()).control_handle());
+        service
+    }
+
     #[test]
-    fn every_advertised_builtin_is_routable() {
+    fn scratchpad_pin_is_routable_not_an_unknown_tool() {
+        // #725: the pin tool is advertised whenever the pin write is wired, and
+        // the always-present system prompt tells the model to call it, so the
+        // gate the executor consults before falling through to MCP routing
+        // (`supports_tool`) has to claim it, or every call answers
+        // "unknown tool" and pinning is dead.
+        let service = fully_wired_service();
+        assert!(
+            service
+                .tool_definitions()
+                .iter()
+                .any(|def| def.name == TOOL_SCRATCHPAD_PIN),
+            "premise: wiring the pin write advertises {TOOL_SCRATCHPAD_PIN}"
+        );
+        assert!(
+            BuiltinToolService::supports_tool(TOOL_SCRATCHPAD_PIN),
+            "{TOOL_SCRATCHPAD_PIN} is advertised to the model but supports_tool() rejects it - \
+             the executor would route it to MCP and answer \"unknown tool\""
+        );
+    }
+
+    #[tokio::test]
+    async fn every_advertised_builtin_is_routable() {
         // Regression guard: a tool that `tool_definitions()` advertises but
         // `supports_tool()` doesn't recognize gets routed to MCP at execution
-        // and fails with "unknown tool" (this bit builtin_knowledge_base_list
-        // and builtin_notify). Wiring notify makes the full builtin set appear.
-        use std::sync::Arc;
-        let notify_fn: NotifyFn = Arc::new(|_, _, _| Box::pin(async { Ok(Some(1u32)) }));
-        let service = BuiltinToolService::new().with_notify(notify_fn);
+        // and fails with "unknown tool" (this bit builtin_knowledge_base_list,
+        // builtin_notify, and builtin_scratchpad_pin). Every capability is
+        // wired so the guard sees the capability-gated tools too.
+        let service = fully_wired_service();
         for def in service.tool_definitions() {
             assert!(
                 BuiltinToolService::supports_tool(&def.name),
                 "tool '{}' is advertised by tool_definitions() but supports_tool() rejects it — \
                  it would fail to route at execution time",
                 def.name
+            );
+
+            // Routing is only half of it: dispatch must also have an arm for
+            // the name. Arguments are deliberately empty: what is asserted is
+            // that the call lands on the tool's own implementation (which then
+            // validates them) and not on `execute_tool`'s catch-all.
+            let outcome = service.execute_tool(&def.name, serde_json::json!({})).await;
+            if let Err(CoreError::ToolExecution(message)) = &outcome {
+                assert!(
+                    !message.contains("unknown built-in tool"),
+                    "tool '{}' is advertised but execute_tool() has no arm for it: {message}",
+                    def.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn all_tool_names_matches_the_advertised_builtin_set() {
+        // ALL_TOOL_NAMES is the one list routing is derived from, so it must be
+        // exactly what a fully-wired service advertises. A name only in the
+        // list routes a tool that does not exist; a name only in
+        // `tool_definitions()` is advertised without being routable.
+        use std::collections::BTreeSet;
+
+        let advertised: BTreeSet<String> = fully_wired_service()
+            .tool_definitions()
+            .into_iter()
+            .map(|def| def.name)
+            .collect();
+        let listed: BTreeSet<String> = BuiltinToolService::ALL_TOOL_NAMES
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        assert_eq!(
+            advertised, listed,
+            "ALL_TOOL_NAMES and the advertised builtin set have drifted"
+        );
+    }
+
+    #[test]
+    fn supports_tool_rejects_names_that_are_not_builtins() {
+        // The gate is exact-match: a name it wrongly claims is swallowed by the
+        // builtin service instead of reaching the MCP server that owns it.
+        for name in [
+            "",
+            "   ",
+            "builtin_",
+            "builtin_scratchpad",
+            "builtin_scratchpad_pinned",
+            "BUILTIN_SCRATCHPAD_PIN",
+            "scratchpad_pin",
+            "fileio__read_file",
+        ] {
+            assert!(
+                !BuiltinToolService::supports_tool(name),
+                "'{name}' is not a builtin, but supports_tool() claimed it"
             );
         }
     }

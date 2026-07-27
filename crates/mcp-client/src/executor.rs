@@ -1952,6 +1952,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn executor_routes_builtin_scratchpad_pin_to_the_builtin_service() {
+        // #725: the executor decides builtin-vs-MCP purely on
+        // `BuiltinToolService::supports_tool`. A capability-gated builtin that
+        // is advertised but unclaimed by that gate falls through to the MCP
+        // routing table and answers "unknown tool" for every call.
+        use desktop_assistant_core::ports::scratchpad::ScratchpadSetPinnedFn;
+
+        let set_pinned_fn: ScratchpadSetPinnedFn =
+            Arc::new(|_conv, _keys, _pinned| Box::pin(async { Ok(0u64) }));
+        let executor = McpToolExecutor::with_builtin_tools(
+            vec![],
+            BuiltinToolService::new().with_scratchpad_pin(set_pinned_fn),
+        );
+
+        assert!(
+            executor
+                .core_tools()
+                .await
+                .iter()
+                .any(|tool| tool.name == "builtin_scratchpad_pin"),
+            "premise: wiring the pin write advertises builtin_scratchpad_pin to the model"
+        );
+
+        let def = executor
+            .tool_definition("builtin_scratchpad_pin")
+            .await
+            .expect("looking up a builtin definition must not fail");
+        assert!(
+            def.is_some(),
+            "builtin_scratchpad_pin is advertised but the executor does not resolve it as a \
+             builtin - it would be looked up in the MCP routing table"
+        );
+
+        // Dispatch reaches the pin implementation: with no conversation scope
+        // installed it answers the scratchpad's own precondition error, which
+        // only the builtin path can produce.
+        let err = executor
+            .execute_tool("builtin_scratchpad_pin", serde_json::json!({"keys": ["k"]}))
+            .await
+            .expect_err("pinning without an active conversation is a precondition failure");
+        assert!(
+            matches!(&err, CoreError::ToolExecution(m) if m.contains("active conversation")),
+            "builtin_scratchpad_pin must be executed by the builtin service, got: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn control_handle_status_empty() {
         let executor = McpToolExecutor::new(vec![]);
         let handle = executor.control_handle();
