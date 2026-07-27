@@ -10,8 +10,10 @@
 //!   estimated cost exceeds the threshold.
 //! - **Recovery** ([`recover_from_overflow`]): When the provider rejects a
 //!   turn with [`crate::CoreError::ContextOverflow`], runs a structured
-//!   recovery ladder (truncate the largest tool result → trim oldest tool
-//!   pairs → summarise-and-shrink) before the dispatch loop retries.
+//!   recovery ladder (truncate the largest tool result → compact the oldest
+//!   tool results → summarise-and-shrink) before the dispatch loop retries.
+//!   Every rung rewrites message content; none removes a message, because the
+//!   list it works on is the one the turn persists.
 //! - **Summarisation** ([`generate_context_summary`]): Asks the LLM for a
 //!   bullet-point summary of dropped messages and merges it with any
 //!   existing rolling summary, so windowed-out history is not lost.
@@ -1049,33 +1051,50 @@ fn find_largest_tool_result_above(
         .map(|(i, _)| i)
 }
 
-/// Outcome of [`trim_tool_pairs`].
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct TrimResult {
-    /// Total messages removed from the list.
-    total_removed: usize,
-    /// How many of the removed messages lay at indices `< compacted_through`,
-    /// i.e. inside the already-summarized prefix. The caller decrements
-    /// `compacted_through` by exactly this — never by `total_removed` — so the
-    /// marker keeps pointing at the same logical boundary (DA-11 / #298).
-    removed_before_marker: usize,
+/// Text left in place of a tool result that overflow recovery dropped.
+///
+/// The prefix is deliberately distinct from
+/// [`planning::COMPACTION_POINTER_PREFIX`]: that one promises the content was
+/// distilled into a scratchpad note and can be looked up. This one promises
+/// nothing of the sort — the output is gone and the tool has to be re-run.
+fn overflow_compaction_notice(original_bytes: usize) -> String {
+    format!(
+        "<earlier tool output omitted: {original_bytes} bytes were dropped to fit the \
+         model's context window. The call above and its arguments are unchanged; \
+         re-run the tool if you need this output again.>"
+    )
 }
 
-/// Remove the oldest assistant(tool_calls)+tool_result groups from a message
-/// list to reduce context size. Keeps the first user message and the most
-/// recent tool interaction intact.
+/// Outcome of [`compact_oldest_tool_groups`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct CompactionResult {
+    /// Tool results replaced by a notice.
+    compacted: usize,
+    /// Message-content bytes the replacement freed.
+    freed_bytes: usize,
+}
+
+/// Shrink the oldest assistant(tool_calls)+tool_result groups by replacing
+/// their RESULTS with [`overflow_compaction_notice`], keeping every message.
 ///
-/// `compacted_through` is the caller's summary boundary: messages at indices
-/// `< compacted_through` have already been folded into the rolling context
-/// summary. Removing them shifts the boundary, but removing messages *after* it
-/// does not — so the returned [`TrimResult::removed_before_marker`] counts only
-/// the removals inside the summarized prefix. The previous code decremented
-/// `compacted_through` by the *total* removed, which re-summarized
-/// already-summarized messages whenever a removed group lay past the marker
-/// (DA-11 / #298).
-fn trim_tool_pairs(messages: &mut Vec<Message>, compacted_through: usize) -> TrimResult {
-    // Find ranges of (assistant-with-tool-calls, tool_result, ..., tool_result)
-    // groups and remove roughly the oldest half.
+/// Why replace rather than remove: this list is the live `conv`, and the turn
+/// writes it back at the end — a positional diff that UPDATEs each ordinal and
+/// deletes the tail. Draining groups here therefore deleted them from the
+/// user's stored transcript, with no summary, no marker and no way back
+/// (#733). Replacing content frees the same prompt tokens while the record of
+/// what ran, with what arguments, stays where the user left it. The message
+/// count is unchanged, so the caller's `compacted_through` boundary still
+/// points at the same message and needs no adjustment.
+///
+/// Only results at or above [`planning::COMPACTION_MIN_EVICT_BYTES`] are worth
+/// replacing; below that the notice can be larger than what it replaces. The
+/// most recent group is never touched, and a group whose results are all
+/// already compacted contributes nothing — so repeated recoveries walk
+/// backwards through history and then hand off to the next rung instead of
+/// spinning on the same messages.
+fn compact_oldest_tool_groups(messages: &mut [Message]) -> CompactionResult {
+    // Ranges of (assistant-with-tool-calls, tool_result, ..., tool_result)
+    // that still hold something worth compacting, oldest first.
     let mut groups: Vec<std::ops::Range<usize>> = Vec::new();
     let mut i = 0;
     while i < messages.len() {
@@ -1085,33 +1104,51 @@ fn trim_tool_pairs(messages: &mut Vec<Message>, compacted_through: usize) -> Tri
             while i < messages.len() && messages[i].role == Role::Tool {
                 i += 1;
             }
-            groups.push(start..i);
+            if messages[start..i].iter().any(is_worth_compacting) {
+                groups.push(start..i);
+            }
         } else {
             i += 1;
         }
     }
 
     if groups.len() <= 1 {
-        // Nothing safe to remove — keep the most recent group
-        return TrimResult::default();
+        // The most recent tool interaction stays intact: it is the one the
+        // model is still working from.
+        return CompactionResult::default();
     }
 
-    // Remove the oldest half of groups
-    let remove_count = groups.len() / 2;
-    let groups_to_remove: Vec<_> = groups[..remove_count].to_vec();
-
-    // Remove in reverse order to keep indices stable. Count, separately, how
-    // many removed messages sat inside the already-summarized prefix
-    // (`index < compacted_through`) — that, not the total, is the marker shift.
-    let mut result = TrimResult::default();
-    for range in groups_to_remove.into_iter().rev() {
-        result.total_removed += range.len();
-        result.removed_before_marker +=
-            range.clone().filter(|idx| *idx < compacted_through).count();
-        messages.drain(range);
+    // The oldest half, so each recovery leaves the newer material alone.
+    let compact_count = groups.len() / 2;
+    let mut result = CompactionResult::default();
+    for range in groups.into_iter().take(compact_count) {
+        for msg in &mut messages[range] {
+            if !is_worth_compacting(msg) {
+                continue;
+            }
+            let notice = overflow_compaction_notice(msg.content.len());
+            // Never trade a result for something bigger, whatever the floor
+            // above happens to be set to.
+            let Some(freed) = msg
+                .content
+                .len()
+                .checked_sub(notice.len())
+                .filter(|f| *f > 0)
+            else {
+                continue;
+            };
+            result.freed_bytes += freed;
+            result.compacted += 1;
+            msg.content = notice;
+        }
     }
 
     result
+}
+
+/// A tool result big enough that replacing it with a notice frees space.
+fn is_worth_compacting(msg: &Message) -> bool {
+    msg.role == Role::Tool && msg.content.len() >= planning::COMPACTION_MIN_EVICT_BYTES
 }
 
 /// Compute the window-start index, snapped forward to a `Role::User` boundary.
@@ -1258,15 +1295,17 @@ pub(crate) async fn generate_context_summary<L: LlmClient>(
 /// The ladder runs steps in order until one frees space:
 ///   1. Truncate the largest tool result with a chunking notice (preserves
 ///      the tool_call/result pair so the model sees what it tried).
-///   2. If no tool result is large enough to be worth truncating, trim the
-///      oldest tool-pair groups via [`trim_tool_pairs`].
-///   3. If nothing to trim, summarise-and-shrink the active window
+///   2. If no tool result is large enough to be worth truncating, shrink the
+///      oldest tool-pair groups in place via [`compact_oldest_tool_groups`].
+///   3. If nothing is worth compacting, summarise-and-shrink the active window
 ///      (delegates to the same logic that path A uses on the success branch).
 ///
 /// Why this order: step 1 is the cleanest because it preserves history;
-/// step 3 is the last resort. The retry counter in `send_prompt` bounds
-/// total attempts across all steps so a persistently-oversized request
-/// can't loop indefinitely.
+/// step 3 is the last resort. No step deletes a message — the caller writes
+/// this same `conv` back at the end of the turn, so a removal here would be a
+/// removal from the user's stored transcript. The retry counter in
+/// `send_prompt` bounds total attempts across all steps so a
+/// persistently-oversized request can't loop indefinitely.
 pub(crate) async fn recover_from_overflow<L: LlmClient>(
     conv: &mut Conversation,
     prompt_tokens: Option<u64>,
@@ -1292,19 +1331,16 @@ pub(crate) async fn recover_from_overflow<L: LlmClient>(
         return;
     }
 
-    // Step 2: trim oldest tool-pair groups. Decrement `compacted_through` only
-    // by the removals inside the already-summarized prefix — not the total —
-    // so trimming groups that lie *after* the marker doesn't drag it backwards
-    // and re-summarize messages already folded into the summary (DA-11 / #298).
-    let trimmed = trim_tool_pairs(&mut conv.messages, conv.compacted_through);
-    if trimmed.total_removed > 0 {
-        conv.compacted_through = conv
-            .compacted_through
-            .saturating_sub(trimmed.removed_before_marker);
+    // Step 2: shrink the oldest tool results in place. No message is removed,
+    // so `compacted_through` still points at the same message and the stored
+    // transcript keeps every row (#733). If nothing was worth compacting the
+    // step frees nothing and recovery falls through to step 3.
+    let compacted = compact_oldest_tool_groups(&mut conv.messages);
+    if compacted.freed_bytes > 0 {
         tracing::warn!(
-            removed = trimmed.total_removed,
-            removed_before_marker = trimmed.removed_before_marker,
-            "context overflow — trimmed oldest tool pairs (step 2)"
+            compacted = compacted.compacted,
+            freed_bytes = compacted.freed_bytes,
+            "context overflow — compacted oldest tool results (step 2)"
         );
         return;
     }
@@ -1641,165 +1677,257 @@ mod tests {
         }
     }
 
-    // --- trim_tool_pairs tests ---
+    // --- Overflow recovery rung 2: compact in place, never delete (#733) ---
 
-    #[test]
-    fn trim_tool_pairs_removes_oldest_half() {
-        let mut messages = vec![
-            Message::new(Role::User, "hello"),
-            // Group 1
-            Message::assistant_with_tool_calls(vec![ToolCall::new("c1", "tool_a", "{}")]),
-            Message::tool_result("c1", "result_1"),
-            // Group 2
-            Message::assistant_with_tool_calls(vec![ToolCall::new("c2", "tool_a", "{}")]),
-            Message::tool_result("c2", "result_2"),
-            // Group 3
-            Message::assistant_with_tool_calls(vec![ToolCall::new("c3", "tool_a", "{}")]),
-            Message::tool_result("c3", "result_3"),
-            // Group 4
-            Message::assistant_with_tool_calls(vec![ToolCall::new("c4", "tool_a", "{}")]),
-            Message::tool_result("c4", "result_4"),
-        ];
-
-        // compacted_through = 0 → nothing was summarized, so the marker
-        // adjustment is 0 even though 4 messages are removed.
-        let trimmed = trim_tool_pairs(&mut messages, 0);
-        // 4 groups, remove oldest half (2 groups = 4 messages)
-        assert_eq!(trimmed.total_removed, 4);
-        assert_eq!(trimmed.removed_before_marker, 0);
-        // Should keep: user + group3 + group4
-        assert_eq!(messages.len(), 5);
-        assert_eq!(messages[0].role, Role::User);
-        assert_eq!(messages[1].tool_calls[0].id, "c3");
+    /// A tool result big enough to be worth replacing with a notice, but below
+    /// the rung-1 truncation floor (`MIN_TRUNCATION_TOKENS`) so rung 1 declines
+    /// and recovery reaches rung 2.
+    fn mid_sized_result(marker: char) -> String {
+        marker.to_string().repeat(2048)
     }
 
-    #[test]
-    fn trim_tool_pairs_keeps_single_group() {
-        let mut messages = vec![
-            Message::new(Role::User, "hello"),
-            Message::assistant_with_tool_calls(vec![ToolCall::new("c1", "tool_a", "{}")]),
-            Message::tool_result("c1", "result"),
-        ];
-
-        let trimmed = trim_tool_pairs(&mut messages, 0);
-        assert_eq!(trimmed.total_removed, 0);
-        assert_eq!(trimmed.removed_before_marker, 0);
-        assert_eq!(messages.len(), 3);
-    }
-
-    // --- DA-11: marker-aware trim so recovery doesn't corrupt compacted_through ---
-
-    #[test]
-    fn trim_counts_only_removals_before_the_marker() {
-        // Marker at index 4: messages 0..4 (the user msg + group 1 + group 2's
-        // first message) are summarized. The two removed groups (1 and 2) span
-        // indices 1..5; of those, indices 1,2,3 lie at < 4, so the marker must
-        // drop by exactly 3 — NOT by the full 4 removed.
-        let mut messages = vec![
-            Message::new(Role::User, "hello"), // 0
-            // Group 1 (indices 1,2) — fully before marker(4)
-            Message::assistant_with_tool_calls(vec![ToolCall::new("c1", "t", "{}")]), // 1
-            Message::tool_result("c1", "r1"),                                         // 2
-            // Group 2 (indices 3,4) — straddles the marker(4): index 3 < 4, 4 not
-            Message::assistant_with_tool_calls(vec![ToolCall::new("c2", "t", "{}")]), // 3
-            Message::tool_result("c2", "r2"),                                         // 4
-            // Group 3 (indices 5,6) — kept (most-recent half)
-            Message::assistant_with_tool_calls(vec![ToolCall::new("c3", "t", "{}")]), // 5
-            Message::tool_result("c3", "r3"),                                         // 6
-            // Group 4 (indices 7,8) — kept
-            Message::assistant_with_tool_calls(vec![ToolCall::new("c4", "t", "{}")]), // 7
-            Message::tool_result("c4", "r4"),                                         // 8
-        ];
-        let compacted_through = 4;
-        let trimmed = trim_tool_pairs(&mut messages, compacted_through);
-        assert_eq!(trimmed.total_removed, 4, "two oldest groups removed");
-        assert_eq!(
-            trimmed.removed_before_marker, 3,
-            "indices 1,2 (group1) + index 3 (group2's first msg) lie at < compacted_through(4)"
-        );
-    }
-
-    #[test]
-    fn trim_marker_adjustment_zero_when_all_removals_after_marker() {
-        // Marker at 1: only the leading user message is summarized. Every
-        // removed tool group lies at indices >= 1, so the marker must NOT move,
-        // or already-summarized messages would be re-summarized (the DA-11 bug).
-        let mut messages = vec![
-            Message::new(Role::User, "hello"), // 0
-            Message::assistant_with_tool_calls(vec![ToolCall::new("c1", "t", "{}")]), // 1
-            Message::tool_result("c1", "r1"),  // 2
-            Message::assistant_with_tool_calls(vec![ToolCall::new("c2", "t", "{}")]), // 3
-            Message::tool_result("c2", "r2"),  // 4
-            Message::assistant_with_tool_calls(vec![ToolCall::new("c3", "t", "{}")]), // 5
-            Message::tool_result("c3", "r3"),  // 6
-            Message::assistant_with_tool_calls(vec![ToolCall::new("c4", "t", "{}")]), // 7
-            Message::tool_result("c4", "r4"),  // 8
-        ];
-        let trimmed = trim_tool_pairs(&mut messages, 1);
-        assert_eq!(trimmed.total_removed, 4);
-        assert_eq!(
-            trimmed.removed_before_marker, 0,
-            "removals at indices >= compacted_through must not move the marker"
-        );
-    }
-
-    #[tokio::test]
-    async fn recover_step2_does_not_drag_marker_back_for_post_marker_trims() {
-        // End-to-end (DA-11 / #298): a conversation whose tool results are all
-        // small (so step 1 doesn't fire) and whose summary marker sits before
-        // the trimmed groups. Step 2 must trim but leave `compacted_through`
-        // pointing at the same logical boundary, not re-summarize already-
-        // summarized messages.
+    /// Conversation with `groups` (assistant-with-tool_calls, tool_result)
+    /// groups, each result mid-sized. Group `n` uses call id `cN`.
+    fn conv_with_tool_groups(groups: usize) -> Conversation {
         let mut conv = Conversation::new("c1", "t");
-        conv.messages = vec![
-            Message::new(Role::User, "hello"), // 0 — summarized
-            // Group 1 (1,2)
-            Message::assistant_with_tool_calls(vec![ToolCall::new("c1", "t", "{}")]),
-            Message::tool_result("c1", "small"),
-            // Group 2 (3,4)
-            Message::assistant_with_tool_calls(vec![ToolCall::new("c2", "t", "{}")]),
-            Message::tool_result("c2", "small"),
-            // Group 3 (5,6) — kept
-            Message::assistant_with_tool_calls(vec![ToolCall::new("c3", "t", "{}")]),
-            Message::tool_result("c3", "small"),
-            // Group 4 (7,8) — kept
-            Message::assistant_with_tool_calls(vec![ToolCall::new("c4", "t", "{}")]),
-            Message::tool_result("c4", "small"),
-        ];
-        // Only the leading user message is summarized; every removed group lies
-        // after the marker. Pre-fix this dropped to 0 (4 - 4, saturating);
-        // post-fix it must stay at 1.
-        conv.compacted_through = 1;
+        conv.messages.push(Message::new(Role::User, "hello"));
+        for n in 1..=groups {
+            conv.messages
+                .push(Message::assistant_with_tool_calls(vec![ToolCall::new(
+                    format!("c{n}"),
+                    "read_file",
+                    format!(r#"{{"path":"/tmp/{n}"}}"#),
+                )]));
+            conv.messages
+                .push(Message::tool_result(format!("c{n}"), mid_sized_result('r')));
+        }
+        conv
+    }
 
-        let mut target_window = MAX_CONTEXT_MESSAGES;
+    async fn run_recovery(conv: &mut Conversation, target_window: &mut usize) {
         recover_from_overflow(
-            &mut conv,
+            conv,
             Some(100_000),
             Some(8_000),
-            &mut target_window,
+            target_window,
             &FailingLlm,
             &default_estimate,
         )
         .await;
+    }
 
-        assert_eq!(conv.messages.len(), 5, "two oldest groups trimmed");
+    #[tokio::test]
+    async fn overflow_recovery_rung2_keeps_every_message_row() {
+        let mut conv = conv_with_tool_groups(4);
+        let before = conv.messages.len();
+        let mut target_window = MAX_CONTEXT_MESSAGES;
+        run_recovery(&mut conv, &mut target_window).await;
+
         assert_eq!(
-            conv.compacted_through, 1,
-            "marker must not move when trimmed groups lie after it"
+            conv.messages.len(),
+            before,
+            "rung 2 must not delete rows from the stored transcript"
+        );
+        for n in 1..=4 {
+            let id = format!("c{n}");
+            assert!(
+                conv.messages
+                    .iter()
+                    .any(|m| m.tool_call_id.as_deref() == Some(id.as_str())),
+                "the result row for {id} must still exist"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn overflow_recovery_rung2_leaves_a_notice_in_place_of_the_dropped_output() {
+        let mut conv = conv_with_tool_groups(4);
+        let original_bytes = mid_sized_result('r').len();
+        let mut target_window = MAX_CONTEXT_MESSAGES;
+        run_recovery(&mut conv, &mut target_window).await;
+
+        let oldest = conv
+            .messages
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("c1"))
+            .expect("oldest result row");
+        assert!(
+            oldest.content.contains(&format!("{original_bytes} bytes")),
+            "the notice must say how much was dropped, got {:?}",
+            oldest.content
+        );
+        assert!(
+            !oldest.content.contains(&mid_sized_result('r')),
+            "the bulk must actually be gone"
+        );
+        assert_eq!(oldest.role, Role::Tool, "the role must be preserved");
+        assert!(
+            oldest.content.len() < original_bytes,
+            "the notice must be smaller than what it replaced"
         );
     }
 
-    #[test]
-    fn trim_tool_pairs_no_groups() {
-        let mut messages = vec![
+    #[tokio::test]
+    async fn overflow_recovery_rung2_preserves_the_tool_call_audit_trail() {
+        let mut conv = conv_with_tool_groups(4);
+        let mut target_window = MAX_CONTEXT_MESSAGES;
+        run_recovery(&mut conv, &mut target_window).await;
+
+        let call = conv
+            .messages
+            .iter()
+            .find(|m| m.tool_calls.iter().any(|c| c.id == "c1"))
+            .expect("the oldest assistant tool-call message must survive");
+        let tc = &call.tool_calls[0];
+        assert_eq!(tc.name, "read_file", "the tool name must survive");
+        assert_eq!(
+            tc.arguments, r#"{"path":"/tmp/1"}"#,
+            "the arguments must survive so the user can see what ran"
+        );
+    }
+
+    #[tokio::test]
+    async fn overflow_recovery_rung2_keeps_the_most_recent_tool_result_intact() {
+        let mut conv = conv_with_tool_groups(4);
+        let mut target_window = MAX_CONTEXT_MESSAGES;
+        run_recovery(&mut conv, &mut target_window).await;
+
+        let newest = conv
+            .messages
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("c4"))
+            .expect("newest result row");
+        assert_eq!(
+            newest.content,
+            mid_sized_result('r'),
+            "the most recent tool interaction must stay intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn overflow_recovery_rung2_does_not_move_the_compaction_marker() {
+        // Nothing is removed, so the summary boundary still points at the same
+        // logical message — the DA-11 / #298 hazard cannot arise.
+        let mut conv = conv_with_tool_groups(4);
+        conv.compacted_through = 4;
+        let mut target_window = MAX_CONTEXT_MESSAGES;
+        run_recovery(&mut conv, &mut target_window).await;
+
+        assert_eq!(
+            conv.compacted_through, 4,
+            "an in-place compaction must leave the summary marker alone"
+        );
+    }
+
+    #[tokio::test]
+    async fn overflow_recovery_rung2_does_not_recompact_an_already_compacted_result() {
+        let mut conv = conv_with_tool_groups(4);
+        let mut target_window = MAX_CONTEXT_MESSAGES;
+        run_recovery(&mut conv, &mut target_window).await;
+        let after_first = conv
+            .messages
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("c1"))
+            .expect("oldest result row")
+            .content
+            .clone();
+
+        run_recovery(&mut conv, &mut target_window).await;
+        let after_second = conv
+            .messages
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("c1"))
+            .expect("oldest result row")
+            .content
+            .clone();
+        assert_eq!(
+            after_first, after_second,
+            "a notice must never be compacted a second time"
+        );
+        assert!(
+            after_second.contains(&format!("{} bytes", mid_sized_result('r').len())),
+            "the notice must keep naming the ORIGINAL size, not its own, got {after_second:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn overflow_recovery_rung2_skips_results_too_small_to_be_worth_a_notice() {
+        // Every result is tiny: replacing one would GROW the prompt, so rung 2
+        // must decline and recovery must escalate to rung 3.
+        let mut conv = Conversation::new("c1", "t");
+        conv.messages.push(Message::new(Role::User, "hello"));
+        for n in 1..=4 {
+            conv.messages
+                .push(Message::assistant_with_tool_calls(vec![ToolCall::new(
+                    format!("c{n}"),
+                    "t",
+                    "{}",
+                )]));
+            conv.messages
+                .push(Message::tool_result(format!("c{n}"), "ok"));
+        }
+        let before = conv.messages.clone();
+        let mut target_window = MAX_CONTEXT_MESSAGES;
+        run_recovery(&mut conv, &mut target_window).await;
+
+        assert_eq!(conv.messages, before, "tiny results must be left alone");
+        assert!(
+            target_window < MAX_CONTEXT_MESSAGES,
+            "recovery must escalate to rung 3 when rung 2 declines"
+        );
+    }
+
+    #[tokio::test]
+    async fn overflow_recovery_rung2_keeps_a_lone_tool_group() {
+        // One group is the most recent interaction; there is nothing older to
+        // compact, so rung 2 declines and rung 3 takes over.
+        let mut conv = conv_with_tool_groups(1);
+        let before = conv.messages.clone();
+        let mut target_window = MAX_CONTEXT_MESSAGES;
+        run_recovery(&mut conv, &mut target_window).await;
+
+        assert_eq!(
+            conv.messages, before,
+            "the only tool group must survive untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn overflow_recovery_rung2_handles_a_group_whose_call_has_no_result() {
+        // Malformed shape: an assistant tool-call message with no result after
+        // it (a turn abandoned mid-dispatch). Recovery must not panic and must
+        // not fabricate a result.
+        let mut conv = conv_with_tool_groups(2);
+        conv.messages
+            .push(Message::assistant_with_tool_calls(vec![ToolCall::new(
+                "c3", "t", "{}",
+            )]));
+        let before = conv.messages.len();
+        let mut target_window = MAX_CONTEXT_MESSAGES;
+        run_recovery(&mut conv, &mut target_window).await;
+
+        assert_eq!(conv.messages.len(), before);
+        assert!(
+            !conv
+                .messages
+                .iter()
+                .any(|m| m.tool_call_id.as_deref() == Some("c3")),
+            "recovery must not invent a result for an unanswered call"
+        );
+    }
+
+    #[tokio::test]
+    async fn overflow_recovery_rung2_is_skipped_when_there_are_no_tool_groups() {
+        let mut conv = Conversation::new("c1", "t");
+        conv.messages = vec![
             Message::new(Role::User, "hello"),
             Message::new(Role::Assistant, "hi there"),
         ];
+        let before = conv.messages.clone();
+        let mut target_window = MAX_CONTEXT_MESSAGES;
+        run_recovery(&mut conv, &mut target_window).await;
 
-        let trimmed = trim_tool_pairs(&mut messages, 0);
-        assert_eq!(trimmed.total_removed, 0);
-        assert_eq!(trimmed.removed_before_marker, 0);
-        assert_eq!(messages.len(), 2);
+        assert_eq!(conv.messages, before);
     }
 
     // --- Window/compaction tests ---
