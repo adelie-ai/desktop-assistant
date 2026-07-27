@@ -1982,7 +1982,7 @@ mod tests {
         assert!(
             def.is_some(),
             "builtin_scratchpad_pin is advertised but the executor does not resolve it as a \
-             builtin — it would be looked up in the MCP routing table"
+             builtin - it would be looked up in the MCP routing table"
         );
 
         // Dispatch reaches the pin implementation: with no conversation scope

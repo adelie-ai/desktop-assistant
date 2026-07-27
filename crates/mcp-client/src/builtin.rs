@@ -730,25 +730,20 @@ impl BuiltinToolService {
         defs
     }
 
+    /// Whether `name` is a built-in tool, i.e. whether the caller must dispatch
+    /// it to [`Self::execute_tool`] instead of looking for an MCP server that
+    /// owns it. This is the gate `McpToolExecutor` consults first.
+    ///
+    /// Derived from [`Self::ALL_TOOL_NAMES`] rather than restating the set, so
+    /// the two cannot drift: a builtin that is advertised but not claimed here
+    /// is routed to MCP and fails every call with "unknown tool".
+    ///
+    /// Capability-gated tools are claimed whether or not their closure is
+    /// wired. Absence is expressed by not advertising the tool, and a call that
+    /// arrives anyway gets the tool's own "not configured" error rather than
+    /// being routed somewhere it does not belong.
     pub fn supports_tool(name: &str) -> bool {
-        matches!(
-            name,
-            TOOL_KB_WRITE
-                | TOOL_KB_SEARCH
-                | TOOL_KB_DELETE
-                | TOOL_KB_LIST
-                | TOOL_SEARCH
-                | TOOL_NOTIFY
-                | TOOL_SYS_PROPS
-                | TOOL_DB_QUERY
-                | TOOL_MCP_CONTROL
-                | TOOL_CONV_SEARCH
-                | TOOL_SCRATCHPAD_WRITE
-                | TOOL_SCRATCHPAD_SEARCH
-                | TOOL_SCRATCHPAD_DELETE
-                | TOOL_SKILL_SEARCH
-                | TOOL_SKILL_GET
-        )
+        Self::ALL_TOOL_NAMES.contains(&name)
     }
 
     /// The builtin provider groups (Phase 1): a stable group id plus the authored
@@ -796,9 +791,17 @@ impl BuiltinToolService {
         ),
     ];
 
-    /// Every builtin tool name, including the capability-gated `builtin_notify`
-    /// (absent at runtime when no notifier is wired). The exhaustiveness guard
-    /// walks this so a NEW builtin without a provider mapping fails the build.
+    /// Every builtin tool name - the one list the routing surfaces are held to.
+    ///
+    /// [`Self::supports_tool`] answers straight out of it, and the tests hold
+    /// [`Self::tool_definitions`], [`Self::execute_tool`] and
+    /// [`Self::provider_group`] to it, so a new builtin cannot be advertised
+    /// without being routable, classified, and dispatchable.
+    ///
+    /// The capability-gated tools (`builtin_notify`, `builtin_scratchpad_pin`,
+    /// the skill tools) are listed here even though a given runtime may not
+    /// advertise them: routing is by name, and an unwired tool answers with its
+    /// own "not configured" error.
     pub const ALL_TOOL_NAMES: &'static [&'static str] = &[
         TOOL_KB_WRITE,
         TOOL_KB_SEARCH,
@@ -813,6 +816,7 @@ impl BuiltinToolService {
         TOOL_SCRATCHPAD_WRITE,
         TOOL_SCRATCHPAD_SEARCH,
         TOOL_SCRATCHPAD_DELETE,
+        TOOL_SCRATCHPAD_PIN,
         TOOL_SKILL_SEARCH,
         TOOL_SKILL_GET,
     ];
@@ -846,6 +850,11 @@ impl BuiltinToolService {
             .map(|(_, blurb)| *blurb)
     }
 
+    /// Dispatch a builtin by name. Callers gate on [`Self::supports_tool`]
+    /// first, so the catch-all arm is only reached when a name in
+    /// [`Self::ALL_TOOL_NAMES`] has no dispatch arm - the
+    /// `every_advertised_builtin_is_routable` guard reads its wording, so
+    /// reword it there in the same change.
     pub async fn execute_tool(
         &self,
         name: &str,
@@ -3623,7 +3632,7 @@ mod tests {
     #[test]
     fn scratchpad_pin_is_routable_not_an_unknown_tool() {
         // #725: the pin tool is advertised whenever the pin write is wired, and
-        // the always-present system prompt tells the model to call it — so the
+        // the always-present system prompt tells the model to call it, so the
         // gate the executor consults before falling through to MCP routing
         // (`supports_tool`) has to claim it, or every call answers
         // "unknown tool" and pinning is dead.
@@ -3637,7 +3646,7 @@ mod tests {
         );
         assert!(
             BuiltinToolService::supports_tool(TOOL_SCRATCHPAD_PIN),
-            "{TOOL_SCRATCHPAD_PIN} is advertised to the model but supports_tool() rejects it — \
+            "{TOOL_SCRATCHPAD_PIN} is advertised to the model but supports_tool() rejects it - \
              the executor would route it to MCP and answer \"unknown tool\""
         );
     }
@@ -3659,7 +3668,7 @@ mod tests {
             );
 
             // Routing is only half of it: dispatch must also have an arm for
-            // the name. Arguments are deliberately empty — what is asserted is
+            // the name. Arguments are deliberately empty: what is asserted is
             // that the call lands on the tool's own implementation (which then
             // validates them) and not on `execute_tool`'s catch-all.
             let outcome = service.execute_tool(&def.name, serde_json::json!({})).await;
