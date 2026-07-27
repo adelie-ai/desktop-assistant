@@ -1020,16 +1020,15 @@ pub fn store_connection_secret(
 
 /// Where the configuration the daemon is running actually came from.
 ///
-/// The daemon starts even when `daemon.toml` cannot be loaded — refusing to
-/// start would be worse than running on defaults — so "the process has a
+/// The daemon starts even when `daemon.toml` cannot be loaded - refusing to
+/// start would be worse than running on defaults - so "the process has a
 /// config" and "the process has *the user's* config" are two different facts.
 /// This type carries the difference to everything that would otherwise treat
 /// the in-memory snapshot as authoritative.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigOrigin {
-    /// The running config is what the file held when the daemon read it — or
+    /// The running config is what the file held when the daemon read it - or
     /// there was no file (or an empty one), which is a legitimate first run.
-    #[default]
     File,
     /// [`load_daemon_config`] failed, so the process is running
     /// [`DaemonConfig::default`] and the file's real contents were never in
@@ -1038,17 +1037,18 @@ pub enum ConfigOrigin {
     DefaultsAfterFailedLoad,
 }
 
+/// Read the config file into a [`DaemonConfig`], migrating legacy shapes on
+/// the way - which **rewrites the file** (see
+/// [`migration::maybe_migrate_legacy_connections`]).
+///
+/// `Ok(None)` means there is nothing to load: no file, or an empty one. Use
+/// [`parse_daemon_config`] where the question is only whether the file is
+/// valid; this one is for the paths that actually take the config on.
 pub fn load_daemon_config(path: &Path) -> anyhow::Result<Option<DaemonConfig>> {
-    if !path.exists() {
+    let Some((content, parsed)) = read_daemon_config_file(path)? else {
         return Ok(None);
-    }
+    };
 
-    let content = std::fs::read_to_string(path)?;
-    if content.trim().is_empty() {
-        return Ok(None);
-    }
-
-    let parsed: DaemonConfig = toml::from_str(&content)?;
     let explicit_connections_table = migration::file_has_top_level_table(&content, "connections");
     let explicit_purposes_table = migration::file_has_top_level_table(&content, "purposes");
     // Purpose migration runs only when the file is in a legacy shape:
@@ -1061,17 +1061,8 @@ pub fn load_daemon_config(path: &Path) -> anyhow::Result<Option<DaemonConfig>> {
     let parsed = migration::maybe_migrate_legacy_connections(path, parsed, &content)?;
 
     // Validate `[connections]` *after* migration so legacy-only configs still
-    // succeed on first load. Two cases trigger validation:
-    //
-    // 1. The parsed map is non-empty (normal case).
-    // 2. The user wrote an explicit `[connections]` header but left it empty.
-    //    Catching this here surfaces the misconfiguration at startup rather
-    //    than at the first request.
-    if parsed.has_connections() || explicit_connections_table {
-        parsed
-            .validated_connections()
-            .with_context(|| format!("invalid [connections] in {}", path.display()))?;
-    }
+    // succeed on first load.
+    validate_connections_table(path, &parsed, explicit_connections_table)?;
 
     // Purpose migration runs after connection migration so it can reference
     // the synthesized `[connections.default]`. It also rewrites the config
@@ -1084,15 +1075,79 @@ pub fn load_daemon_config(path: &Path) -> anyhow::Result<Option<DaemonConfig>> {
         legacy_shape_present,
     )?;
 
-    // Validate purposes: structural checks (interactive required when set,
-    // no `Primary` in interactive) happen here so misconfigurations surface
-    // at startup rather than at the first dispatch.
+    validate_purposes_table(path, &parsed)?;
+
+    Ok(Some(parsed))
+}
+
+/// Read and validate the config file **without touching it**: the same parse
+/// and the same `[connections]` / `[purposes]` validation as
+/// [`load_daemon_config`], minus the legacy migrations that rewrite the file
+/// and take a `.bak`.
+///
+/// `Ok(None)` means there is nothing to read (no file, or an empty one).
+///
+/// Why: paths that only need to *ask* whether the file is sound must not have
+/// a rewrite as a side effect - most of all the guard that decides whether a
+/// config write would destroy the file (#723). Deliberately no stricter than
+/// `load_daemon_config`: a legacy-shaped file that only validates once
+/// migrated is accepted here, because loading it would succeed.
+pub fn parse_daemon_config(path: &Path) -> anyhow::Result<Option<DaemonConfig>> {
+    let Some((content, parsed)) = read_daemon_config_file(path)? else {
+        return Ok(None);
+    };
+
+    let explicit_connections_table = migration::file_has_top_level_table(&content, "connections");
+    validate_connections_table(path, &parsed, explicit_connections_table)?;
+    validate_purposes_table(path, &parsed)?;
+
+    Ok(Some(parsed))
+}
+
+/// Read `path` and deserialize it, returning the raw text alongside the parsed
+/// config. `Ok(None)` for an absent or blank file - both mean "no config
+/// authored", not "bad config".
+fn read_daemon_config_file(path: &Path) -> anyhow::Result<Option<(String, DaemonConfig)>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let content = std::fs::read_to_string(path)?;
+    if content.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let parsed: DaemonConfig = toml::from_str(&content)?;
+    Ok(Some((content, parsed)))
+}
+
+/// Reject an unusable `[connections]` table. Two cases trigger validation:
+///
+/// 1. The parsed map is non-empty (normal case).
+/// 2. The user wrote an explicit `[connections]` header but left it empty
+///    (`explicit_connections_table`). Catching that here surfaces the
+///    misconfiguration at startup rather than at the first request.
+fn validate_connections_table(
+    path: &Path,
+    parsed: &DaemonConfig,
+    explicit_connections_table: bool,
+) -> anyhow::Result<()> {
+    if parsed.has_connections() || explicit_connections_table {
+        parsed
+            .validated_connections()
+            .with_context(|| format!("invalid [connections] in {}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Reject an unusable `[purposes]` table: structural checks (interactive
+/// required when set, no `Primary` in interactive) so misconfigurations
+/// surface at startup rather than at the first dispatch.
+fn validate_purposes_table(path: &Path, parsed: &DaemonConfig) -> anyhow::Result<()> {
     parsed
         .purposes
         .validate()
-        .with_context(|| format!("invalid [purposes] in {}", path.display()))?;
-
-    Ok(Some(parsed))
+        .with_context(|| format!("invalid [purposes] in {}", path.display()))
 }
 
 /// If the config has a legacy `[llm]` block and no `[connections]`, synthesize
@@ -1122,6 +1177,19 @@ pub fn ensure_daemon_config_exists(path: &Path) -> anyhow::Result<bool> {
     Ok(true)
 }
 
+/// Serialize `config` over the file at `path`, creating the parent directory
+/// if needed.
+///
+/// This is a whole-file replacement: it truncates in place, so the caller is
+/// responsible for the config being the file's content plus its edit.
+/// `RegistryHandle::mutate_config` - the path that writes an in-memory
+/// snapshot - refuses to call this when the running config is not the file's
+/// content (#723). It is also not atomic: an interrupted write leaves a
+/// truncated file, which the daemon then refuses to overwrite on the next
+/// start rather than compounding the loss (#914).
+///
+/// Comments and key order in a hand-authored file do not survive a rewrite;
+/// only the values do.
 pub fn save_daemon_config(path: &Path, config: &DaemonConfig) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -1265,6 +1333,85 @@ mod tests {
 
     fn ws_jwt_env_lock() -> std::sync::MutexGuard<'static, ()> {
         super::xdg_data_home_test_lock()
+    }
+
+    // --- parse_daemon_config: validate without touching the file (#723) ----
+
+    fn tmp_config_file(content: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!("da-parse-{}.toml", uuid::Uuid::new_v4().simple()));
+        std::fs::write(&path, content).expect("write the config fixture");
+        path
+    }
+
+    /// The legacy shape `load_daemon_config` migrates: `[llm]` and no
+    /// `[connections]`.
+    const LEGACY_CONFIG: &str = r#"
+# hand-authored
+[llm]
+connector = "ollama"
+model = "llama3"
+"#;
+
+    #[test]
+    fn parse_daemon_config_accepts_a_legacy_file_without_rewriting_it() {
+        let path = tmp_config_file(LEGACY_CONFIG);
+
+        let parsed = parse_daemon_config(&path)
+            .expect("a legacy config is loadable, so it must not be rejected")
+            .expect("the file is neither absent nor empty");
+        assert_eq!(parsed.llm.connector, "ollama");
+
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read the config back"),
+            LEGACY_CONFIG,
+            "asking whether the file is valid must not rewrite it"
+        );
+        assert!(
+            !path.with_extension("toml.bak").exists(),
+            "asking whether the file is valid must not leave a backup behind"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn parse_daemon_config_rejects_the_same_files_load_daemon_config_rejects() {
+        // Malformed TOML, an invalid connection id, and an explicit but empty
+        // `[connections]` table - the three shapes the loader refuses.
+        for broken in [
+            "this is not = valid toml [[[",
+            "[connections.\"Bad Id\"]\ntype = \"ollama\"\n",
+            "[connections]\n",
+        ] {
+            let path = tmp_config_file(broken);
+            assert!(
+                parse_daemon_config(&path).is_err(),
+                "must refuse the config the loader refuses: {broken}"
+            );
+            std::fs::remove_file(&path).ok();
+        }
+    }
+
+    #[test]
+    fn parse_daemon_config_reports_nothing_to_read_for_an_absent_or_empty_file() {
+        let mut absent = std::env::temp_dir();
+        absent.push(format!(
+            "da-parse-absent-{}.toml",
+            uuid::Uuid::new_v4().simple()
+        ));
+        assert!(
+            parse_daemon_config(&absent)
+                .expect("an absent file is not an error")
+                .is_none()
+        );
+
+        let empty = tmp_config_file("  \n\n");
+        assert!(
+            parse_daemon_config(&empty)
+                .expect("an empty file is not an error")
+                .is_none()
+        );
+        std::fs::remove_file(&empty).ok();
     }
 
     #[test]

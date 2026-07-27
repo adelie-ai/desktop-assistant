@@ -37,11 +37,16 @@ Settings are expected to be small in number (~10). Prefer a **typed config struc
 - `GetConfig -> Config`
 - `SetConfig(ConfigChanges) -> Config`
 
-`Config` also reports `restart_required`: the config areas whose configured value
-is on disk but cannot take effect until the daemon restarts. Some subsystems
-(TLS, WS auth, the embedding client) are wired once at startup; a reload applies
-every hot knob in the same edit and reports the rest here rather than accepting
-the change silently. Area names only, never configured values.
+`Config` also reports `restart_required`: what is on disk that the running
+process is not acting on. Some subsystems (TLS, WS auth, the embedding client)
+are wired once at startup; a reload applies every hot knob in the same edit and
+reports the rest here rather than accepting the change silently. Area names
+only, never configured values.
+
+The key `config_load_failed` is the whole-file case: `daemon.toml` would not
+load, so the daemon is running built-in defaults and refuses config-changing
+commands until the file loads again - it will not overwrite a file it could not
+read.
 
 If settings later grow significantly, introduce `ListConfigSchema` and move to a registry-based key/value system.
 
