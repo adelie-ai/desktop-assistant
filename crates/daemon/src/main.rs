@@ -1057,10 +1057,15 @@ async fn main() -> Result<()> {
         embedding_client::build_embedding_client(&resolved_emb);
 
     // Resolve model identifier once at startup (includes digest for Ollama).
+    // `embedding_model_resolved` records whether it came from the backend or
+    // from the configured name as a fallback — the destructive stale-embedding
+    // sweep below may only act on the former.
+    let mut embedding_model_resolved = false;
     let embedding_model_id: String = if let Some(client) = &embedding_client {
         match client.model_identifier().await {
             Ok(id) => {
                 tracing::info!("resolved embedding model identifier: {id}");
+                embedding_model_resolved = true;
                 id
             }
             Err(e) => {
@@ -1079,9 +1084,11 @@ async fn main() -> Result<()> {
     // prove the configured model can actually embed. A generation model
     // configured as the embedder answers every embed with HTTP 501 and would
     // otherwise silently disable all vector search behind a green status. Probe
-    // once here with a tiny embed so a broken backend is caught at startup,
-    // surfaced as degraded health via `GetConfig`, and search takes the honest
-    // "vector search disabled -> FTS" path instead of FTS-degrading per call.
+    // here with a tiny embed so a broken backend is caught at startup and
+    // surfaced as degraded health via `GetConfig`, letting search take the
+    // honest "vector search unavailable -> FTS" path instead of FTS-degrading
+    // per call. The verdict seeds the live capability below; it is a starting
+    // point, not a decision that outlives the moment it sampled.
     let embed_configured = embedding_client.is_some();
     let embed_probe: Option<EmbeddingHealth> = if let Some(client) = embedding_client.as_ref() {
         if let Err(reason) = config::reject_generation_model_embedder(&resolved_emb.model) {
@@ -1096,8 +1103,9 @@ async fn main() -> Result<()> {
                 EmbeddingHealth::Ok => {
                     tracing::info!("embedding backend probe succeeded; vector search live")
                 }
-                EmbeddingHealth::Unavailable { reason } => tracing::error!(
-                    "embedding backend probe failed; vector search degraded to full-text search: {reason}"
+                EmbeddingHealth::Unavailable { reason } => tracing::warn!(
+                    "embedding backend probe failed; vector search degraded to full-text search until it re-probes healthy (every {:?}): {reason}",
+                    embedding_probe::RECHECK_INTERVAL
                 ),
                 // The probe only ever returns Ok/Unavailable; Disabled/Unknown are
                 // set by the caller when there is no backend to probe.
@@ -1111,16 +1119,47 @@ async fn main() -> Result<()> {
     };
     let embed_health = embedding_probe::embedding_view_health(embed_configured, embed_probe);
 
-    // On anything but a healthy probe, drop the embedding client so every
-    // downstream vector path (query embedding, stale-embedding invalidation,
-    // background backfill) takes the disabled path uniformly rather than
-    // churning against a backend that cannot embed. The health handle below
-    // still reports *why* (Disabled vs Unavailable vs Unknown) via `GetConfig`.
-    // The keep-or-drop decision is unit-pinned in `embedding_probe`.
+    // The probe's verdict seeds a *live* capability rather than deciding
+    // anything for the process lifetime: it samples the one moment a co-hosted
+    // backend is most likely to be restarting or cold-loading, and latching a
+    // failure there took vector search, the backfill loop, dreaming,
+    // consolidation and the knowledge-maintenance handler down until the next
+    // restart. The client stays wired whenever a backend is *configured*; the
+    // gate below declines calls while the capability reads unavailable, the
+    // re-check loop lifts it when the backend returns, and `GetConfig` reports
+    // the current state and its reason. The keep-or-drop decision is unit-pinned
+    // in `embedding_probe`.
     if !embedding_probe::keep_embedding_client(&embed_health) {
         embedding_client = None;
     }
-    let embed_health_handle = Arc::new(embed_health);
+    let embed_capability = Arc::new(embedding_probe::EmbeddingCapability::new(embed_health));
+
+    // Re-probe on an interval while degraded, driven by the *undecorated*
+    // client so the gate cannot block its own recovery.
+    let (embed_recheck_shutdown_tx, embed_recheck_shutdown_rx) =
+        tokio::sync::oneshot::channel::<()>();
+    let embed_recheck_task = if let Some(client) = embedding_client.as_ref() {
+        Some(tokio::spawn(embedding_probe::recheck_degraded_backend(
+            Arc::clone(client),
+            Arc::clone(&embed_capability),
+            embedding_probe::RECHECK_INTERVAL,
+            embed_recheck_shutdown_rx,
+        )))
+    } else {
+        // Nothing configured: there is no backend to re-check.
+        drop(embed_recheck_shutdown_rx);
+        None
+    };
+
+    // Every downstream consumer sees the gated client, so one decision point
+    // governs query embedding, stale-embedding invalidation, the background
+    // backfill and knowledge maintenance alike.
+    let embedding_client: Option<Arc<dyn EmbeddingClient>> = embedding_client.map(|client| {
+        Arc::new(embedding_probe::HealthGatedEmbeddingClient::new(
+            client,
+            Arc::clone(&embed_capability),
+        )) as Arc<dyn EmbeddingClient>
+    });
 
     let embedding_fn: Option<EmbedFn> = embedding_client.as_ref().map(|client| {
         let client = Arc::clone(client);
@@ -1196,8 +1235,18 @@ async fn main() -> Result<()> {
 
     // Invalidate embeddings from a different model so that vector-dimension
     // mismatches cannot cause search errors while the backfill is running.
+    //
+    // The sweep is destructive — it NULLs every vector whose model stamp
+    // differs — so it runs only on proof of the two facts it rests on, which
+    // `sweep_stale_embeddings` states and unit-pins. Rows whose stamp is merely
+    // out of date are re-embedded by the backfill loop regardless; what the
+    // sweep uniquely prevents is a dimension mismatch, and that needs a known
+    // model to be worth acting on.
     if let Some(pool) = &pg_pool
-        && embedding_client.is_some()
+        && embedding_probe::sweep_stale_embeddings(
+            embedding_model_resolved,
+            &embed_capability.health(),
+        )
     {
         match desktop_assistant_storage::embedding_backfill::invalidate_stale_embeddings(
             pool,
@@ -1350,7 +1399,7 @@ async fn main() -> Result<()> {
         );
         builtin_tools = builtin_tools.with_embedding(embed_fn, embedding_model_id.clone());
     } else {
-        tracing::info!("built-in vector search disabled (no embedding backend available)");
+        tracing::info!("built-in vector search disabled (no embedding backend configured)");
     }
 
     if let Some(kb) = &kb_store {
@@ -2132,7 +2181,9 @@ async fn main() -> Result<()> {
             if pg_pool.is_none() {
                 tracing::warn!("dreaming enabled but no database configured; dreaming disabled");
             } else {
-                tracing::warn!("dreaming enabled but embeddings unavailable; dreaming disabled");
+                tracing::warn!(
+                    "dreaming enabled but no embedding backend configured; dreaming disabled"
+                );
             }
             drop(dreaming_shutdown_rx);
             None
@@ -2517,9 +2568,9 @@ async fn main() -> Result<()> {
             // Personality (#226) reads/writes through the shared registry handle
             // so settings changes hit the in-memory config the dispatch reads.
             .with_registry(Arc::clone(&registry_handle))
-            // Startup embedding-probe result (#499) so `GetConfig` reports the
-            // backend's real degraded/disabled/ok health.
-            .with_embedding_health(Arc::clone(&embed_health_handle)),
+            // Live embedding capability (#499) so `GetConfig` reports the
+            // backend's real degraded/disabled/ok health as of now.
+            .with_embedding_capability(Arc::clone(&embed_capability)),
     );
 
     // Knowledge management service (#73). Client-authored entries are
@@ -2889,6 +2940,13 @@ async fn main() -> Result<()> {
         && let Err(e) = task.await
     {
         tracing::warn!("backfill task join error during shutdown: {e}");
+    }
+
+    let _ = embed_recheck_shutdown_tx.send(());
+    if let Some(task) = embed_recheck_task
+        && let Err(e) = task.await
+    {
+        tracing::warn!("embedding health re-check join error during shutdown: {e}");
     }
 
     let _ = trash_sweep_shutdown_tx.send(());

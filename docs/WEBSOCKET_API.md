@@ -134,14 +134,20 @@ Current command variants:
 - `set_api_key { api_key }`
 - `get_embeddings_settings`
   - The embeddings view (also carried in `get_config`) includes a `health`
-    field with a capability-detected runtime state from the daemon's startup
-    probe: `{ "status": "disabled" }` (no embedding backend configured, vector
-    search off by design), `{ "status": "ok" }` (probe produced a real
-    embedding), `{ "status": "unavailable", "reason": "..." }` (a backend is
-    configured but the probe failed, so vector search has degraded to full-text
-    search), or `{ "status": "unknown" }` (health was not determined — configured
-    but not probed). The legacy `available` boolean remains a shallow connector
-    check; `health` is the honest signal. Additive and backward-compatible:
+    field with the backend's capability-detected state *as of the moment you
+    ask*: `{ "status": "disabled" }` (no embedding backend configured, vector
+    search off by design), `{ "status": "ok" }` (the backend is producing real
+    embeddings), `{ "status": "unavailable", "reason": "..." }` (a backend is
+    configured but cannot embed right now, so vector search has degraded to
+    full-text search), or `{ "status": "unknown" }` (health was not determined —
+    configured but not probed). A startup probe seeds the value; from then on it
+    tracks live embed outcomes and a background re-probe that runs while the
+    backend is `unavailable`, so a backend that recovers flips back to `ok`
+    without a daemon restart and a backend that breaks flips to `unavailable`
+    without one either. Changing the `[embeddings]` configuration itself still
+    requires a restart. The legacy `available` boolean remains a shallow
+    connector check; `health` is the honest signal. Additive and
+    backward-compatible:
     `health` defaults to `unknown`, so an older daemon that omits the field
     deserializes as `unknown` (not `disabled` — a working-but-unreported backend
     must not read as off), and a future `status` an older client does not

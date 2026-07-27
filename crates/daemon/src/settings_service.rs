@@ -22,12 +22,16 @@ pub struct DaemonSettingsService {
     /// all share the registry's in-memory config — making personality changes
     /// take effect on the next turn without a separate reload.
     registry: Option<Arc<RegistryHandle>>,
-    /// Result of the daemon's startup embedding probe (#499). Set once at
-    /// start-up; `get_embeddings_settings` reports it so `GetConfig` surfaces a
-    /// real degraded/disabled state instead of a bare `available = true`. A
-    /// config change after start-up does not re-probe, so this reflects the
-    /// backend as it was at boot (re-probe on reload is a follow-up).
-    embedding_health: Option<Arc<EmbeddingHealth>>,
+    /// The daemon's live embedding-backend capability (#499). Seeded by the
+    /// startup probe and kept current by the embed path and the background
+    /// re-check loop, so `get_embeddings_settings` surfaces a real
+    /// degraded/disabled state instead of a bare `available = true`, and
+    /// reports it as of *now* rather than as of boot.
+    ///
+    /// A `[embeddings]` config change still needs a restart to take effect
+    /// (`config::reload`), so a rebuilt backend is not reflected here until
+    /// then; a backend that recovered on its own is.
+    embedding_capability: Option<Arc<EmbeddingCapability>>,
 }
 
 impl DaemonSettingsService {
@@ -36,7 +40,7 @@ impl DaemonSettingsService {
             config_path,
             mcp_handle: None,
             registry: None,
-            embedding_health: None,
+            embedding_capability: None,
         }
     }
 
@@ -50,18 +54,11 @@ impl DaemonSettingsService {
         self
     }
 
-    /// Inject the startup embedding-probe result (#499) so `GetConfig` reports
-    /// the backend's real health.
-    pub fn with_embedding_health(mut self, health: Arc<EmbeddingHealth>) -> Self {
-        self.embedding_health = Some(health);
+    /// Inject the daemon's live embedding capability (#499) so `GetConfig`
+    /// reports the backend's real health as of the moment it is asked.
+    pub fn with_embedding_capability(mut self, capability: Arc<EmbeddingCapability>) -> Self {
+        self.embedding_capability = Some(capability);
         self
-    }
-
-    /// Inject the daemon's live embedding capability so `GetConfig` reports the
-    /// backend's health.
-    pub fn with_embedding_capability(self, capability: Arc<EmbeddingCapability>) -> Self {
-        let snapshot = capability.health();
-        self.with_embedding_health(Arc::new(snapshot))
     }
 
     fn registry(&self) -> Result<&Arc<RegistryHandle>, CoreError> {
@@ -182,16 +179,16 @@ impl SettingsService for DaemonSettingsService {
         let view = config::get_embeddings_settings_view(&self.config_path)
             .map_err(|error| CoreError::SystemService(error.to_string()))?;
 
-        // Prefer the startup probe result (#499) when it was injected; it knows
-        // whether the configured backend can actually embed. Without a probe
-        // handle (only in tests / degraded wiring) the honest answer is
-        // `Unknown` — health was never determined. Deriving `Ok` from the shallow
-        // `available` connector check would be exactly the false-green #499
-        // exists to kill.
+        // Prefer the live capability (#499) when it was injected; it knows
+        // whether the configured backend can actually embed *right now*. Without
+        // a capability handle (only in tests / degraded wiring) the honest
+        // answer is `Unknown` — health was never determined. Deriving `Ok` from
+        // the shallow `available` connector check would be exactly the
+        // false-green #499 exists to kill.
         let health = self
-            .embedding_health
+            .embedding_capability
             .as_ref()
-            .map(|health| (**health).clone())
+            .map(|capability| capability.health())
             .unwrap_or(EmbeddingHealth::Unknown);
 
         Ok(EmbeddingsSettingsView {
@@ -693,11 +690,12 @@ mod tests {
         // #499: `available` is a shallow connector check and is `true` here, but
         // the startup probe found the backend broken. The reported health MUST be
         // the probe's `Unavailable`, never a false-green derived from `available`.
-        let service = DaemonSettingsService::new(available_config_path()).with_embedding_health(
-            Arc::new(EmbeddingHealth::Unavailable {
-                reason: "HTTP 501 Not Implemented".to_string(),
-            }),
-        );
+        let service = DaemonSettingsService::new(available_config_path())
+            .with_embedding_capability(Arc::new(EmbeddingCapability::new(
+                EmbeddingHealth::Unavailable {
+                    reason: "HTTP 501 Not Implemented".to_string(),
+                },
+            )));
         let view = service
             .get_embeddings_settings()
             .await
@@ -716,10 +714,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_embeddings_without_probe_handle_reports_unknown_not_false_green() {
-        // Without a probe handle (only in tests / degraded wiring), the honest
-        // answer is `Unknown` — health was never determined — NOT the shallow
-        // `available -> Ok` false-green that #499 exists to kill.
+    async fn get_embeddings_without_capability_handle_reports_unknown_not_false_green() {
+        // Without a capability handle (only in tests / degraded wiring), the
+        // honest answer is `Unknown` — health was never determined — NOT the
+        // shallow `available -> Ok` false-green that #499 exists to kill.
         let service = DaemonSettingsService::new(available_config_path());
         let view = service
             .get_embeddings_settings()
