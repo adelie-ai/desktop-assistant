@@ -166,8 +166,21 @@ impl SettingsService for DaemonSettingsService {
             .map_err(|error| CoreError::SystemService(error.to_string()))
     }
 
-    async fn generate_ws_jwt(&self, _subject: Option<String>) -> Result<String, CoreError> {
-        config::generate_ws_jwt(Some(config::current_username()))
+    /// Mint an HS256 WebSocket bearer token for `subject`.
+    ///
+    /// The `sub` claim is the caller's `subject` verbatim; `None` (or blank)
+    /// falls back to the daemon's own OS user. Why it matters: the WS door maps
+    /// `sub` to the `UserId` that scopes every subsequent storage query
+    /// (`WsSettingsAuth::extract_user_id`), so the subject *is* the tenant the
+    /// connection writes as. Substituting the daemon's OS account would file a
+    /// remote client's data under the wrong partition while `/login` reported
+    /// the name it asked for.
+    ///
+    /// Authenticating the subject is the caller's job — the door that mints for
+    /// a remote client is `WsBasicLogin`, which only ever passes an identity its
+    /// own basic-auth check accepted.
+    async fn generate_ws_jwt(&self, subject: Option<String>) -> Result<String, CoreError> {
+        config::generate_ws_jwt(subject)
             .map_err(|error| CoreError::SystemService(error.to_string()))
     }
 
@@ -895,5 +908,63 @@ base_url = "http://localhost:11434"
             service.restart_required().await.is_err(),
             "an unwired service must not claim the running config is current"
         );
+    }
+
+    // --- WS JWT subject (#726) ----------------------------------------------
+    //
+    // The `sub` of a minted token becomes the storage `user_id` for every
+    // conversation, knowledge entry and scratchpad note that connection writes
+    // (`WsSettingsAuth::extract_user_id`). These pin whose partition it is.
+
+    /// Drive `future` to completion on a fresh current-thread runtime. Kept
+    /// sync (vs `#[tokio::test]`) so the `XDG_DATA_HOME` guard held by
+    /// `with_isolated_xdg_data_home` is never held across an `.await`.
+    fn run_async<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build current-thread runtime")
+            .block_on(future)
+    }
+
+    /// Mint a token for `subject` against an isolated signing-key store and
+    /// return the `sub` the WS door would read back out of it.
+    fn minted_subject(subject: Option<&str>) -> String {
+        config::with_isolated_xdg_data_home("ws-jwt-subject", || {
+            let service = DaemonSettingsService::new(available_config_path());
+            let token = run_async(service.generate_ws_jwt(subject.map(str::to_string)))
+                .expect("minting a WS JWT should succeed");
+            config::ws_jwt_sub(&token)
+                .expect("a freshly minted token must validate and carry a sub")
+        })
+    }
+
+    #[test]
+    fn generate_ws_jwt_issues_a_token_whose_sub_is_the_requested_subject() {
+        assert_eq!(minted_subject(Some("api-user")), "api-user");
+    }
+
+    /// The identity a `/login` client is issued must be the one the operator
+    /// configured, not whichever OS account the daemon process happens to run
+    /// as — in a container that is the `desktop-user` fallback, and every write
+    /// would land in that partition instead.
+    #[test]
+    fn generate_ws_jwt_does_not_substitute_the_daemon_os_user_for_the_requested_subject() {
+        let requested = format!("tenant-not-{}", config::current_username());
+        assert_eq!(minted_subject(Some(&requested)), requested);
+    }
+
+    /// No subject requested (the port's `None`) still has to produce a usable
+    /// identity: the daemon's own OS user, as before.
+    #[test]
+    fn generate_ws_jwt_falls_back_to_the_daemon_os_user_when_no_subject_is_requested() {
+        assert_eq!(minted_subject(None), config::current_username());
+    }
+
+    /// Malformed input: a blank / whitespace-only subject is not an identity.
+    /// It must fall back rather than mint a token with an empty `sub`.
+    #[test]
+    fn generate_ws_jwt_treats_a_blank_subject_as_no_subject() {
+        assert_eq!(minted_subject(Some("   ")), config::current_username());
     }
 }

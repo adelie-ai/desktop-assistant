@@ -72,9 +72,22 @@ pub trait WsAuthValidator: Send + Sync {
     }
 }
 
+/// Backs `POST /login`: validates HTTP Basic credentials and exchanges them for
+/// a bearer token the client then presents on `/ws`.
 #[async_trait::async_trait]
 pub trait WsLoginService: Send + Sync {
+    /// Accept or reject a username/password pair. Implementations compare the
+    /// password in constant time.
     async fn authenticate_basic(&self, username: &str, password: &str) -> bool;
+
+    /// Mint a bearer token whose identity claim is `subject`.
+    ///
+    /// The identity in the token is what
+    /// [`WsAuthValidator::extract_user_id`] later reads back to scope that
+    /// connection's storage, so `subject` must be an identity the caller has
+    /// authenticated — the login handler only ever passes the username that
+    /// [`Self::authenticate_basic`] just accepted, and an implementation is
+    /// entitled to fail on anything else.
     async fn issue_token_for_subject(&self, subject: &str) -> Result<String, String>;
 }
 

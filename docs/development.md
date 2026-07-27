@@ -126,18 +126,22 @@ Secret backend default is `auto`:
 - Reads check that file first, then systemd credentials, then desktop keyrings, then environment variables.
 
 WebSocket auth uses bearer JWTs:
-- Generate a token over D-Bus with `GenerateWsJwt(subject)` (subject resolves to current OS username).
+- Get a token from `POST /login` (HTTP Basic); local UDS and D-Bus clients need no
+  token, authenticating by kernel peer credentials instead.
 - Connect to `/ws` with `Authorization: Bearer <token>`.
 - Tokens are locally signed by the daemon and multiple tokens can coexist until expiry.
+- The token's `sub` is the account `/login` authenticated, and that is the user
+  identity the daemon scopes the connection's stored data by.
 
-For remote clients without D-Bus access, enable HTTP login:
+To enable HTTP login:
 
 ```bash
 export DESKTOP_ASSISTANT_WS_LOGIN_USERNAME=alice
 export DESKTOP_ASSISTANT_WS_LOGIN_PASSWORD='change-me'
 ```
 
-Then call `POST /login` with Basic auth (`alice:change-me`) to mint a bearer token.
+Then call `POST /login` with Basic auth (`alice:change-me`) to mint a bearer token
+for `alice`.
 
 Default login behavior:
 - Local Linux host (non-container): `/login` authenticates against the current OS user password
