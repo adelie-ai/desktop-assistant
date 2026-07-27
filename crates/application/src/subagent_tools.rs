@@ -37,6 +37,12 @@
 //!    If `wait=false`, returns a JSON object with the child's task id
 //!    immediately.
 //!
+//! The dispatch mode outlives the call: `TaskKind::Subagent` records it as
+//! `notify_parent = !wait`, because the terminal transition that raises the
+//! parent-wake signal happens in the registry long after this stack is gone.
+//! Only a detached child's parent needs re-engaging — a blocking spawn hands
+//! its answer back at step 6, to a parent turn that is still running.
+//!
 //! ## Out of scope (follow-ups)
 //!
 //! - **Dispatch-side allowlist enforcement**: the `tools` input is
@@ -379,6 +385,10 @@ impl<C: ?Sized + ConversationService + Send + Sync + 'static> SubagentTools<C> {
                 conversation_id: conv_id,
                 name: name_for_kind,
                 session_conversation_id: session_conv_for_kind,
+                // Only a detached child needs the parent re-engaged when it
+                // finishes. A blocking spawn hands its answer back below, to a
+                // parent turn that is still running.
+                notify_parent: !wait,
             },
         );
 

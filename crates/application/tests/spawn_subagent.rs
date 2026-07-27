@@ -1315,6 +1315,7 @@ where
                 conversation_id: format!("sub-conv-{remaining}"),
                 name: format!("level-{remaining}"),
                 session_conversation_id: format!("sub-conv-{remaining}"),
+                notify_parent: false,
             },
             format!("level-{remaining}"),
             move |ctx| {
@@ -2105,6 +2106,7 @@ fn completed_subagent_row(id: &str, user: &UserId, owner_todo: &str) -> Backgrou
         conversation_id: "child-conv".to_string(),
         name: "researcher".to_string(),
         session_conversation_id: "sess-1".to_string(),
+        notify_parent: false,
     };
     BackgroundTaskRow {
         id: id.to_string(),

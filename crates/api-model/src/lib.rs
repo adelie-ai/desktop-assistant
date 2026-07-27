@@ -1772,6 +1772,21 @@ pub enum TaskKind {
         /// persisted before this field deserialize as the root sentinel "".
         #[serde(default)]
         session_conversation_id: String,
+        /// Whether this child's completion should re-engage the parent with an
+        /// autonomous wake turn. `true` only for a detached
+        /// `spawn_subagent { wait: false }`, whose parent's turn ends without
+        /// ever seeing the answer. A blocking spawn (`wait: true`, the default)
+        /// hands its answer straight back to the still-running parent, so
+        /// waking it would run a second, unrequested turn over a result the
+        /// parent already delivered.
+        ///
+        /// Why the field and not just the tool argument: the terminal
+        /// transition that raises the wake signal happens in the registry, long
+        /// after the tool call's stack is gone, so the dispatch mode has to
+        /// travel on the task itself. `#[serde(default)]` (false) so kind_json
+        /// rows persisted before this field never resurrect as a wake.
+        #[serde(default)]
+        notify_parent: bool,
     },
     /// A user-initiated standalone background agent (no waiting parent).
     Standalone {
@@ -2578,6 +2593,7 @@ mod tests {
                 conversation_id: "conv-9".into(),
                 name: "researcher".into(),
                 session_conversation_id: "session-9".into(),
+                notify_parent: false,
             },
             status: TaskStatus::Running,
             started_at: 1_700_000_000,
@@ -2689,6 +2705,7 @@ mod tests {
                 conversation_id: "c2".into(),
                 name: "child".into(),
                 session_conversation_id: "s2".into(),
+                notify_parent: true,
             },
             TaskKind::Standalone {
                 name: "agent".into(),
@@ -3711,6 +3728,7 @@ mod tests {
             conversation_id: "child".into(),
             name: "researcher".into(),
             session_conversation_id: "sess".into(),
+            notify_parent: true,
         };
         // Round-trips with the field set (#287).
         let json = serde_json::to_string(&k).unwrap();
@@ -3728,6 +3746,35 @@ mod tests {
                 session_conversation_id,
                 ..
             } => assert_eq!(session_conversation_id, ""),
+            other => panic!("expected Subagent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subagent_kind_notify_parent_round_trips_and_defaults_false() {
+        let detached = TaskKind::Subagent {
+            parent_task_id: TaskId("p".into()),
+            conversation_id: "child".into(),
+            name: "researcher".into(),
+            session_conversation_id: "sess".into(),
+            notify_parent: true,
+        };
+        // Round-trips with the field set (#724).
+        let json = serde_json::to_string(&detached).unwrap();
+        assert!(json.contains("notify_parent"), "json: {json}");
+        let back: TaskKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, detached);
+
+        // Backcompat: a kind_json persisted before this field deserializes as
+        // `false`, so an old row can never resurrect as an autonomous wake.
+        let mut v = serde_json::to_value(&detached).unwrap();
+        remove_key_recursive(&mut v, "notify_parent");
+        let legacy: TaskKind = serde_json::from_value(v).unwrap();
+        match legacy {
+            TaskKind::Subagent { notify_parent, .. } => assert!(
+                !notify_parent,
+                "a row with no recorded dispatch mode must not wake a parent"
+            ),
             other => panic!("expected Subagent, got {other:?}"),
         }
     }

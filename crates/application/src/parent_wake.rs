@@ -19,9 +19,15 @@
 //!   two children finishing together never launch two overlapping turns on the
 //!   same conversation (which would corrupt its transcript order).
 //!
-//! Bounding autonomy: the coordinator only ever wakes the *session*
-//! conversation — the top-level one the user sees — never a hidden subagent
-//! conversation (see the `session == child` skip in [`ParentWakeCoordinator::on_completion`]).
+//! Bounding autonomy, two skips in [`ParentWakeCoordinator::on_completion`]:
+//!
+//! - **Detached children only.** A completion whose `notify_parent` is `false`
+//!   came from a blocking `spawn_subagent { wait: true }` — the default — whose
+//!   result the parent consumed inline during its own turn. Waking there would
+//!   run a whole extra turn over an answer the parent already delivered.
+//! - **User-visible conversations only.** The coordinator wakes the *session*
+//!   conversation — the top-level one the user sees — never a hidden subagent
+//!   conversation (the `session == child` skip).
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -117,6 +123,16 @@ impl ParentWakeCoordinator {
     /// the turn inline.
     fn on_completion(self: &Arc<Self>, completion: SubagentCompletion) {
         if !self.enabled {
+            return;
+        }
+        // The parent already has this child's answer: a blocking
+        // `spawn_subagent { wait: true }` (the default) returns the child's
+        // final text straight into the still-running parent turn. Waking would
+        // queue a second turn behind that turn's per-conversation lock and then
+        // ask the parent to consolidate a result it has already delivered.
+        // Parent-wake exists for the detached (`wait: false`) case, where the
+        // parent's turn ends without ever seeing the answer.
+        if !completion.notify_parent {
             return;
         }
         // No distinct parent to wake: a subagent whose session conversation is
@@ -280,6 +296,27 @@ mod tests {
             owner_todo: owner_todo.into(),
             status,
             siblings_remaining,
+            // These fixtures describe detached (`wait: false`) children — the
+            // case parent-wake exists for. `waited` builds the other one.
+            notify_parent: true,
+        }
+    }
+
+    /// A completion for a child the parent blocked on (`spawn_subagent
+    /// { wait: true }`, the default): its result went back inline, so nothing
+    /// is owed to the parent.
+    fn waited(session: &str, child_conv: &str, name: &str) -> SubagentCompletion {
+        SubagentCompletion {
+            notify_parent: false,
+            ..completion(
+                session,
+                child_conv,
+                name,
+                "todo-x",
+                "task-x",
+                api::TaskStatus::Completed,
+                0,
+            )
         }
     }
 
@@ -534,6 +571,95 @@ mod tests {
         assert!(
             waker.prompts.lock().expect("poisoned").is_empty(),
             "a subagent with no distinct parent conversation must not wake"
+        );
+    }
+
+    /// A child the parent blocked on is dropped: the parent already returned
+    /// its result inline, so waking would run an extra unrequested turn on the
+    /// user's own conversation.
+    #[tokio::test]
+    async fn waited_child_consumed_inline_is_skipped() {
+        let waker = Arc::new(MockWaker::default());
+        let _dynamic: Arc<dyn ParentWaker> = waker.clone();
+        let coord = coordinator(&waker, true);
+
+        coord.on_completion(waited("sess-T", "child-1", "researcher"));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            waker.prompts.lock().expect("poisoned").is_empty(),
+            "a child the parent blocked on must not wake it again"
+        );
+    }
+
+    /// A mixed burst: only the detached children reach the wake prompt, and the
+    /// count and holistic ask are computed over those alone — a waited child
+    /// never inflates "N subagents you dispatched just finished".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mixed_burst_wakes_only_for_detached_children() {
+        let (release, released) = oneshot::channel::<()>();
+        let waker = Arc::new(MockWaker {
+            hold: Mutex::new(Some(released)),
+            ..MockWaker::default()
+        });
+        let _dynamic: Arc<dyn ParentWaker> = waker.clone();
+        let coord = coordinator(&waker, true);
+
+        // A detached child starts a wake that blocks on the hold.
+        coord.on_completion(completion(
+            "sess-T",
+            "child-1",
+            "alpha",
+            "todo-a",
+            "task-a",
+            api::TaskStatus::Completed,
+            1,
+        ));
+        wait_until(
+            || waker.in_flight.load(Ordering::SeqCst) == 1,
+            "first wake is in progress",
+        )
+        .await;
+
+        // One waited and one detached child finish during that turn.
+        coord.on_completion(waited("sess-T", "child-2", "beta"));
+        coord.on_completion(completion(
+            "sess-T",
+            "child-3",
+            "gamma",
+            "todo-c",
+            "task-c",
+            api::TaskStatus::Completed,
+            0,
+        ));
+
+        let _ = release.send(());
+        wait_until(
+            || waker.prompts.lock().expect("poisoned").len() == 2,
+            "the follow-up wake ran",
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let prompts = waker.prompts.lock().expect("poisoned").clone();
+        assert_eq!(
+            prompts.len(),
+            2,
+            "the waited child added no turn: {prompts:?}"
+        );
+        assert!(
+            prompts[1].contains("gamma"),
+            "the follow-up carries the detached child: {}",
+            prompts[1]
+        );
+        assert!(
+            !prompts[1].contains("beta"),
+            "a waited child never appears in a wake prompt: {}",
+            prompts[1]
+        );
+        assert!(
+            prompts[1].starts_with("[automatic] 1 subagent "),
+            "the count covers only the children being reported: {}",
+            prompts[1]
         );
     }
 
