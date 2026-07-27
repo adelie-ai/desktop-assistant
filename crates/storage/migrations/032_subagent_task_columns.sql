@@ -3,8 +3,9 @@
 -- daemon restart (single source of truth on the row; the registry is a
 -- passthrough). Set once at spawn (slice 5); update_task never touches them.
 --
--- Additive + idempotent (the runner re-executes every migration on every
--- startup with no version table). owner_todo backfills legacy rows as root '';
+-- Additive + idempotent (the runner applies each migration at most once, but a
+-- database migrated before the `schema_migrations` ledger existed replays the
+-- whole set once on its first boot under it). owner_todo backfills legacy rows as root '';
 -- spawn_marker is nullable (legacy / non-subagent tasks never read a pad
 -- snapshot). The RLS 029 background_tasks_user_isolation policy is row-level and
 -- covers the new columns unchanged.

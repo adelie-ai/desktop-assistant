@@ -11,7 +11,7 @@
 -- personal-data table to the caller's own rows — the hard backstop underneath
 -- the grafter.
 --
--- IMPORTANT — this migration is run automatically at every daemon startup,
+-- IMPORTANT — this migration is run automatically at daemon startup,
 -- AS THE DAEMON'S OWN (deliberately un-privileged) DATABASE ROLE. It must
 -- therefore only do things a plain table OWNER can do: ENABLE ROW LEVEL
 -- SECURITY and CREATE POLICY on its own tables. It must NOT create roles or
@@ -31,9 +31,15 @@
 -- clauses — see all rows as before. Only the `SET LOCAL ROLE adele_query`
 -- read path is filtered.
 --
--- Idempotent (re-run every startup): DROP POLICY IF EXISTS before each
--- CREATE POLICY (Postgres has no CREATE POLICY IF NOT EXISTS), and
--- ENABLE ROW LEVEL SECURITY is a no-op when already enabled.
+-- Idempotent (a database migrated before the `schema_migrations` ledger
+-- existed replays it once): DROP POLICY IF EXISTS before each CREATE POLICY
+-- (Postgres has no CREATE POLICY IF NOT EXISTS), and ENABLE ROW LEVEL
+-- SECURITY is a no-op when already enabled.
+--
+-- The policy list is static, so a user-scoped table added by a LATER migration
+-- needs its own ENABLE + CREATE POLICY in that migration; this file will not
+-- pick it up. `rls_enabled_on_every_user_scoped_table` in
+-- `tests/rls_backstop.rs` is the drift guard.
 --
 -- `current_setting('app.user_id', true)` returns NULL when the GUC is unset
 -- (the `true` = missing_ok), and `user_id = NULL` is NULL, so a read path

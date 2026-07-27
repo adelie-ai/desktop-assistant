@@ -1,5 +1,7 @@
-use sqlx::PgPool;
+use std::collections::HashSet;
+
 use sqlx::postgres::PgPoolOptions;
+use sqlx::{Acquire, Connection, PgConnection, PgPool};
 
 /// Create a connection pool to PostgreSQL.
 pub async fn create_pool(url: &str, max_connections: u32) -> Result<PgPool, sqlx::Error> {
@@ -9,332 +11,395 @@ pub async fn create_pool(url: &str, max_connections: u32) -> Result<PgPool, sqlx
         .await
 }
 
-/// Run embedded migrations against the database.
+/// One registered migration.
+struct Migration {
+    /// The file's name, recorded verbatim in `schema_migrations`. Renaming a
+    /// file therefore re-applies it, which is why migrations are append-only.
+    name: &'static str,
+    /// The SQL applied when it runs.
+    sql: &'static str,
+}
+
+/// Register a migration by file name, so the name that identifies it in the
+/// ledger and the file it loads cannot drift apart.
+macro_rules! migration {
+    ($file:literal) => {
+        Migration {
+            name: $file,
+            sql: include_str!(concat!("../migrations/", $file)),
+        }
+    };
+}
+
+/// The ledger of applied migrations. Created before anything else runs, so it
+/// cannot itself be a numbered migration.
 ///
-/// The `pgvector` extension is required and must be available in the
-/// database — migrations will fail if it cannot be created.
+/// Absent on databases created before the ledger existed; see
+/// [`run_migrations`] for how those are brought forward.
+const LEDGER_DDL: &str = "CREATE TABLE IF NOT EXISTS schema_migrations (\
+     name       TEXT PRIMARY KEY, \
+     applied_at TIMESTAMPTZ NOT NULL DEFAULT now())";
+
+/// First half of the advisory-lock key — an arbitrary constant ("ADEL")
+/// identifying this runner, so the lock cannot collide with an unrelated
+/// application's advisory lock on the same database.
+const MIGRATION_LOCK_NAMESPACE: i32 = 0x4144_454C;
+
+/// Every migration, in the order it must be applied.
 ///
-/// HNSW indexes on the `embedding` column are NOT created here because the
-/// vector dimension depends on which embedding model the user configures.
-/// GIN/btree indexes for full-text search and tags are created.
-pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
+/// Append-only and ordinally numbered: an entry that has shipped is never
+/// renamed, reordered, or edited in a way that changes the schema it produces,
+/// because databases that already recorded it will not run it again.
+const MIGRATIONS: &[Migration] = &[
     // Core tables — always required.
-    sqlx::raw_sql(include_str!("../migrations/001_initial_schema.sql"))
-        .execute(pool)
-        .await?;
-
-    // pgvector is required — fail fast if it cannot be enabled.
-    sqlx::raw_sql("CREATE EXTENSION IF NOT EXISTS vector")
-        .execute(pool)
-        .await?;
-
+    migration!("001_initial_schema.sql"),
     // Vector tables.
-    sqlx::raw_sql(include_str!("../migrations/002_vector_tables.sql"))
-        .execute(pool)
-        .await?;
-    sqlx::raw_sql(include_str!("../migrations/002b_tool_definitions.sql"))
-        .execute(pool)
-        .await?;
-
+    migration!("002_vector_tables.sql"),
+    migration!("002b_tool_definitions.sql"),
     // Indexes (GIN for full-text, btree for flags).
-    sqlx::raw_sql(include_str!("../migrations/003_vector_indexes.sql"))
-        .execute(pool)
-        .await?;
-
+    migration!("003_vector_indexes.sql"),
     // Track which embedding model produced each vector.
-    sqlx::raw_sql(include_str!(
-        "../migrations/004_embedding_model_tracking.sql"
-    ))
-    .execute(pool)
-    .await?;
-
+    migration!("004_embedding_model_tracking.sql"),
     // Convert messages.id from BIGSERIAL to TEXT (UUIDv7).
-    sqlx::raw_sql(include_str!("../migrations/005_uuidv7_ids.sql"))
-        .execute(pool)
-        .await?;
-
+    migration!("005_uuidv7_ids.sql"),
     // Dreaming watermarks — tracks per-conversation extraction progress.
-    sqlx::raw_sql(include_str!("../migrations/006_dreaming_watermarks.sql"))
-        .execute(pool)
-        .await?;
-
+    migration!("006_dreaming_watermarks.sql"),
     // Chunked embeddings — knowledge_base.embedding becomes vector[].
-    sqlx::raw_sql(include_str!("../migrations/007_chunked_embeddings.sql"))
-        .execute(pool)
-        .await?;
-
+    migration!("007_chunked_embeddings.sql"),
     // Collapsible message summaries — reversible range summaries.
-    sqlx::raw_sql(include_str!("../migrations/008_message_summaries.sql"))
-        .execute(pool)
-        .await?;
-
+    migration!("008_message_summaries.sql"),
     // Conversation archival — nullable archived_at timestamp.
-    sqlx::raw_sql(include_str!(
-        "../migrations/009_conversation_archived_at.sql"
-    ))
-    .execute(pool)
-    .await?;
-
+    migration!("009_conversation_archived_at.sql"),
     // Repair damage from pre-idempotent runs of migration 007 on existing
     // databases. No-op on fresh installs.
-    sqlx::raw_sql(include_str!("../migrations/010_fix_damaged_embeddings.sql"))
-        .execute(pool)
-        .await?;
-
+    migration!("010_fix_damaged_embeddings.sql"),
     // Per-conversation model selection (issue #11) — nullable JSONB column
     // on `conversations`.
-    sqlx::raw_sql(include_str!(
-        "../migrations/011_conversation_last_model.sql"
-    ))
-    .execute(pool)
-    .await?;
-
+    migration!("011_conversation_last_model.sql"),
     // Active-task anchor (issue #57) — nullable text column capturing the
     // user's current goal so it can be re-injected after windowing/summary.
-    sqlx::raw_sql(include_str!(
-        "../migrations/012_conversation_active_task.sql"
-    ))
-    .execute(pool)
-    .await?;
-
+    migration!("012_conversation_active_task.sql"),
     // Conversation full-text search (issue #71) — generated tsvector
     // columns + GIN indexes on `messages` and `conversations`. Generated-
     // stored columns auto-backfill on `ALTER TABLE`; the rewrite takes a
-    // write lock proportional to message count, so first-run on large
-    // histories may take a moment.
-    sqlx::raw_sql(include_str!(
-        "../migrations/013_conversation_message_fts.sql"
-    ))
-    .execute(pool)
-    .await?;
-
+    // write lock proportional to message count, so on a large history the
+    // boot that applies this one takes a while.
+    migration!("013_conversation_message_fts.sql"),
     // Tag registry (issue #108) — formal vocabulary for KB tags. Categorical
     // tags emitted by the extractor are constrained to the registry; new
     // tags are created via a tool call with description and examples.
-    sqlx::raw_sql(include_str!("../migrations/014_tag_registry.sql"))
-        .execute(pool)
-        .await?;
-
+    migration!("014_tag_registry.sql"),
     // Knowledge-base review columns (issue #108) — `reviewed_at` watermark
     // gates per-memory consolidation; `review_generation` caps mutation
     // re-review loops; `deleted_at` enables soft-delete with TTL.
-    sqlx::raw_sql(include_str!(
-        "../migrations/015_knowledge_base_review_columns.sql"
-    ))
-    .execute(pool)
-    .await?;
-
+    migration!("015_knowledge_base_review_columns.sql"),
     // Multi-tenant schema (issue #102) — every personal-data table gains
     // `user_id NOT NULL` plus a `(user_id, …)` composite index for the
     // hot query paths #105's scoping will use. Pre-existing rows are
     // backfilled to the sentinel `'default'` user so single-tenant
     // installs keep working without auth changes.
-    sqlx::raw_sql(include_str!("../migrations/016_multi_tenant_user_id.sql"))
-        .execute(pool)
-        .await?;
-
+    migration!("016_multi_tenant_user_id.sql"),
     // Turn state machine (issue #107) — DB-persisted turn state for
     // client-side execution of client-local MCP tools. A `pending_client_tool`
     // row is the daemon's record of "the LLM asked for a client-local
     // tool; we're waiting for the client to post the result back".
-    sqlx::raw_sql(include_str!("../migrations/017_turn_state.sql"))
-        .execute(pool)
-        .await?;
-
+    migration!("017_turn_state.sql"),
     // Background tasks (issue #115) — persistent mirror of the in-memory
     // `BackgroundTaskRegistry`. On daemon restart the cold-restart sweep
     // reads this table to surface tasks that were running when the
     // previous daemon died.
-    sqlx::raw_sql(include_str!("../migrations/018_background_tasks.sql"))
-        .execute(pool)
-        .await?;
-
+    migration!("018_background_tasks.sql"),
     // Conversation scratchpad (issue #184) — ephemeral per-conversation
     // keyed notes, cascade-deleted with the conversation, with an FTS column.
-    sqlx::raw_sql(include_str!("../migrations/019_scratchpads.sql"))
-        .execute(pool)
-        .await?;
-
+    migration!("019_scratchpads.sql"),
     // Scratchpad note kind/order/done (issue #188) — note_type / seq / done
     // columns so a scratchpad can hold an ordered, checkable plan of TODOs.
-    sqlx::raw_sql(include_str!(
-        "../migrations/020_scratchpad_type_sequence_done.sql"
-    ))
-    .execute(pool)
-    .await?;
-
+    migration!("020_scratchpad_type_sequence_done.sql"),
     // Message FTS INSERT guard (issue #177) — the migration-013 generated
     // `tsv` column ran `to_tsvector` over full message content, which on a
     // large/high-entropy message exceeds Postgres's 1 MB tsvector limit and
     // aborts the INSERT. Redefine it to skip `tool`-role rows and bound the
     // indexed input so a large message can always be stored.
-    sqlx::raw_sql(include_str!("../migrations/021_message_fts_guard.sql"))
-        .execute(pool)
-        .await?;
-
+    migration!("021_message_fts_guard.sql"),
     // Learned error-classification cache (issue #178, tier 2) — global
     // (no user_id) connector knowledge mapping opaque error signatures to a
     // normalized cause, populated by the cheap-LLM tier so repeats are
     // recognized locally.
-    sqlx::raw_sql(include_str!("../migrations/022_error_classifications.sql"))
-        .execute(pool)
-        .await?;
-
+    migration!("022_error_classifications.sql"),
     // SendMessage idempotency keys (#204): records a completed turn's reply
     // keyed by (user_id, conversation_id, idempotency_key) so a dropped-then-
     // retried turn replays instead of re-running.
-    sqlx::raw_sql(include_str!("../migrations/023_idempotency_keys.sql"))
-        .execute(pool)
-        .await?;
-
+    migration!("023_idempotency_keys.sql"),
     // #227: per-conversation personality override (JSONB column on
     // conversations), mirroring 011's last_model_selection.
-    sqlx::raw_sql(include_str!(
-        "../migrations/024_conversation_personality.sql"
-    ))
-    .execute(pool)
-    .await?;
-
+    migration!("024_conversation_personality.sql"),
     // #343: learned effective context-window observations — the reactive
     // safety net that `min()`s an observed-overflow ceiling into budget
     // resolution (down-only), complementing #342's proactive provisioning.
-    sqlx::raw_sql(include_str!(
-        "../migrations/025_context_window_observations.sql"
-    ))
-    .execute(pool)
-    .await?;
-
+    migration!("025_context_window_observations.sql"),
     // Dream-cycle overhaul foundation — `embeddings_updated_at` (embedding
     // generation decoupled from content writes; a background task regenerates
     // NULL/stale vectors) and a first-class `source` provenance column
     // ('extraction' | 'consolidation' | 'explicit') replacing the
     // `source:dreaming` tag convention.
-    sqlx::raw_sql(include_str!(
-        "../migrations/026_knowledge_base_source_and_embedding_freshness.sql"
-    ))
-    .execute(pool)
-    .await?;
-
+    migration!("026_knowledge_base_source_and_embedding_freshness.sql"),
     // Per-conversation tags (`TEXT[]`) so callers can label conversations at
     // creation time (e.g. "voice") and the UI can filter on them.
-    sqlx::raw_sql(include_str!("../migrations/027_conversation_tags.sql"))
-        .execute(pool)
-        .await?;
-
+    migration!("027_conversation_tags.sql"),
     // Success high-water mark for learned context windows (#425): the other
     // half of the #343 bracket, so a mis-parsed overflow can't pin the budget
     // below a proven-good size and the budget can recover.
-    sqlx::raw_sql(include_str!(
-        "../migrations/028_context_window_success_watermark.sql"
-    ))
-    .execute(pool)
-    .await?;
-
+    migration!("028_context_window_success_watermark.sql"),
     // #434: Row-Level Security backstop for the LLM-facing db_query read
     // path — enables RLS + a per-user isolation policy on every user-scoped
     // table, so Postgres itself enforces tenant scoping even if the AST
-    // grafter (#141) ever misses a table. Owner-only + idempotent (re-run
-    // every startup) so it is safe as the daemon's un-privileged role; the
-    // privileged role/grant half is a one-time superuser bootstrap
-    // (`bootstrap/rls_role.sql`). The daemon's owner role is exempt
-    // (non-FORCE RLS), so trusted paths are unaffected.
-    sqlx::raw_sql(include_str!("../migrations/029_rls_backstop.sql"))
-        .execute(pool)
-        .await?;
-
+    // grafter (#141) ever misses a table. Owner-only, so it is safe as the
+    // daemon's un-privileged role; the privileged role/grant half is a
+    // one-time superuser bootstrap (`bootstrap/rls_role.sql`). The daemon's
+    // owner role is exempt (non-FORCE RLS), so trusted paths are unaffected.
+    migration!("029_rls_backstop.sql"),
     // Provider identity + index for provider-level tool surfacing (Phase 1):
     // real tools carry their MCP server / builtin-group provider, and the
     // daemon registers one synthetic `provider:<provider>` row per provider that
     // boosts its members' search scores when it matches a query.
-    sqlx::raw_sql(include_str!(
-        "../migrations/030_tool_definitions_provider.sql"
-    ))
-    .execute(pool)
-    .await?;
-
+    migration!("030_tool_definitions_provider.sql"),
     // #287: namespace the scratchpad by owner_todo (subagent-tree path) so
     // subagent writes are confined and reads snapshot by spawn marker.
-    sqlx::raw_sql(include_str!("../migrations/031_scratchpad_owner_todo.sql"))
-        .execute(pool)
-        .await?;
-
+    migration!("031_scratchpad_owner_todo.sql"),
     // #287: persist owner_todo + spawn_marker on background tasks so a
     // wait=false subagent's namespace/snapshot survive a daemon restart.
-    sqlx::raw_sql(include_str!("../migrations/032_subagent_task_columns.sql"))
-        .execute(pool)
-        .await?;
-
+    migration!("032_subagent_task_columns.sql"),
     // Host-global skill index (#573): the disk-sourced skill/workflow catalog,
     // searchable by hybrid vector + full-text, mirroring `tool_definitions`.
-    sqlx::raw_sql(include_str!("../migrations/033_skill_index.sql"))
-        .execute(pool)
-        .await?;
-
+    migration!("033_skill_index.sql"),
     // #570 Phase 1b: nullable `idempotency_key` on messages, carried on USER
     // rows only, so a transcript reload/reconnect surfaces the client's key and
     // clients dedup an echoed UserMessageAdded by exact match.
-    sqlx::raw_sql(include_str!(
-        "../migrations/034_message_idempotency_key.sql"
-    ))
-    .execute(pool)
-    .await?;
-
+    migration!("034_message_idempotency_key.sql"),
     // #639: the skill catalog is cumulative -- a skill a scan no longer sees is
     // marked absent rather than deleted, so presence needs somewhere to live.
-    sqlx::raw_sql(include_str!("../migrations/035_skill_presence.sql"))
-        .execute(pool)
-        .await?;
-
+    migration!("035_skill_presence.sql"),
     // #597: a note can be pinned so its content is re-surfaced every turn,
     // rather than only its key appearing in the `[Scratchpad]` index.
-    sqlx::raw_sql(include_str!("../migrations/036_scratchpad_pinned.sql"))
-        .execute(pool)
-        .await?;
-
+    migration!("036_scratchpad_pinned.sql"),
     // #599: recover a message's creation time from its UUIDv7 id, so "when did
     // this happen" needs no timestamp column and works on existing rows.
-    sqlx::raw_sql(include_str!("../migrations/037_uuidv7_timestamp_fn.sql"))
-        .execute(pool)
-        .await?;
-
+    migration!("037_uuidv7_timestamp_fn.sql"),
     // Tombstones record why they were retired: merge (with the superseding id)
     // or prune (with the model's stated reason).
-    sqlx::raw_sql(include_str!("../migrations/038_kb_delete_provenance.sql"))
-        .execute(pool)
+    migration!("038_kb_delete_provenance.sql"),
+];
+
+/// Second half of the advisory-lock key: the schema the migrations write to.
+///
+/// Why: the ledger and the tables live in the first schema on the connection's
+/// `search_path`, so two runs against *different* schemas share nothing and
+/// must not block each other (the storage suites migrate dozens of private
+/// schemas in parallel). Two runs against the same schema must serialize.
+///
+/// FNV-1a over the schema name, computed here rather than in SQL so it depends
+/// on no Postgres internals. The value is a bit pattern, not a number: it is
+/// reinterpreted as `i32` because that is what `pg_advisory_lock` takes.
+fn schema_lock_key(schema: &str) -> i32 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in schema.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    i32::from_ne_bytes(hash.to_ne_bytes())
+}
+
+/// Run embedded migrations against the database.
+///
+/// Each migration runs **at most once**: applying it and recording its name in
+/// the `schema_migrations` ledger happen in one transaction, so a boot that
+/// finds the name already there skips the file. This is what keeps startup
+/// cost flat — several migrations (013 and 021 in particular) rewrite the
+/// whole `messages` heap and rebuild its GIN index, work that must not repeat
+/// on every restart.
+///
+/// The run is serialized by a `pg_advisory_lock` scoped to the target schema,
+/// so two daemons booting against one database queue rather than race. The
+/// lock is taken on a connection detached from the pool, so it is released
+/// when this function returns — including on error, when the connection is
+/// dropped and the server releases the session's locks.
+///
+/// # Databases created before the ledger existed
+///
+/// They have no ledger, so the first boot under this runner replays every
+/// migration once — exactly the work the previous runner did on *every* boot —
+/// and records the result; later boots do nothing. The alternative, marking
+/// everything applied without running it, would silently skip migrations on an
+/// install whose last daemon predated them. Every migration is idempotent, and
+/// has to be: this transition re-applies all of them.
+///
+/// The `pgvector` extension is required and must be available in the
+/// database — migrations will fail if it cannot be created. It is asserted on
+/// every run rather than ledger-tracked, because an extension is database-wide
+/// state that can be dropped independently of the tables that need it.
+///
+/// HNSW indexes on the `embedding` column are NOT created here because the
+/// vector dimension depends on which embedding model the user configures.
+/// GIN/btree indexes for full-text search and tags are created.
+pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
+    // Detached from the pool on purpose: a session-level advisory lock outlives
+    // the statement that took it, so a pooled connection handed back mid-run
+    // (a panic, a dropped future) would strand the lock for the pool's
+    // lifetime. A detached connection is closed instead, and the server
+    // releases the lock with the session. The cost is that the pool may open a
+    // replacement while this one is alive, so a migrating process can sit one
+    // connection over `max_connections` until this returns.
+    let mut conn = pool.acquire().await?.detach();
+
+    // NULL when `search_path` names no existing schema; the migrations then
+    // fail on their own terms, and the empty key still serializes everyone in
+    // that state against each other.
+    let schema: String = sqlx::query_scalar::<_, Option<String>>("SELECT current_schema()::text")
+        .fetch_one(&mut conn)
+        .await?
+        .unwrap_or_default();
+    let key = schema_lock_key(&schema);
+
+    sqlx::query("SELECT pg_advisory_lock($1, $2)")
+        .bind(MIGRATION_LOCK_NAMESPACE)
+        .bind(key)
+        .execute(&mut conn)
         .await?;
 
+    let outcome = apply_pending(&mut conn, &schema).await;
+
+    // Best-effort: closing the connection below releases the lock anyway, and
+    // a failure here means the session is already gone. Reported, never
+    // allowed to mask the migration's own outcome.
+    if let Err(e) = sqlx::query("SELECT pg_advisory_unlock($1, $2)")
+        .bind(MIGRATION_LOCK_NAMESPACE)
+        .bind(key)
+        .execute(&mut conn)
+        .await
+    {
+        tracing::warn!(error = %e, "releasing the migration advisory lock failed");
+    }
+    if let Err(e) = conn.close().await {
+        tracing::warn!(error = %e, "closing the migration connection failed");
+    }
+
+    outcome
+}
+
+/// Apply every migration the ledger does not already record, on a connection
+/// that already holds the migration lock.
+async fn apply_pending(conn: &mut PgConnection, schema: &str) -> Result<(), sqlx::Error> {
+    sqlx::raw_sql(LEDGER_DDL).execute(&mut *conn).await?;
+
+    // Deliberately not ledger-tracked: the extension is database-wide state
+    // that can be dropped independently of the tables that need it, and
+    // migration 002 onwards references the `vector` type. Re-asserting it is a
+    // catalog lookup once it exists.
+    sqlx::raw_sql("CREATE EXTENSION IF NOT EXISTS vector")
+        .execute(&mut *conn)
+        .await?;
+
+    // Names this build does not carry (a downgrade, a hand-edited row) are
+    // simply not in `MIGRATIONS` and are left alone.
+    let recorded: HashSet<String> = sqlx::query_scalar("SELECT name FROM schema_migrations")
+        .fetch_all(&mut *conn)
+        .await?
+        .into_iter()
+        .collect();
+
+    let mut applied = 0usize;
+    for migration in MIGRATIONS {
+        if recorded.contains(migration.name) {
+            continue;
+        }
+        // One transaction per migration: the schema change and the ledger row
+        // commit together, so a run interrupted here resumes at exactly the
+        // migration that did not finish.
+        let mut tx = Acquire::begin(&mut *conn).await?;
+        if let Err(e) = sqlx::raw_sql(migration.sql).execute(&mut *tx).await {
+            tracing::error!(migration = migration.name, error = %e, "migration failed");
+            return Err(e);
+        }
+        sqlx::query("INSERT INTO schema_migrations (name) VALUES ($1)")
+            .bind(migration.name)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        applied += 1;
+    }
+
+    tracing::info!(
+        schema,
+        applied,
+        registered = MIGRATIONS.len(),
+        "migrations up to date"
+    );
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    /// Every `.sql` file in `migrations/` must be wired into `run_migrations`
-    /// above. Migrations are a hand-maintained `include_str!` list, NOT
-    /// auto-discovered from the directory — so a new migration file that nobody
-    /// registers compiles fine and silently never runs, surfacing only as a
-    /// runtime "column does not exist" error against the live DB. This guard
-    /// turns that into a build-time failure instead.
+    use super::{MIGRATIONS, schema_lock_key};
+
+    /// Every `.sql` file in `migrations/` must be registered in [`MIGRATIONS`],
+    /// and every registered name must be a file. Migrations are a
+    /// hand-maintained list, NOT auto-discovered from the directory — so a new
+    /// migration file that nobody registers compiles fine and silently never
+    /// runs, surfacing only as a runtime "column does not exist" error against
+    /// the live DB. This guard turns that into a build-time failure instead.
     ///
-    /// (The reverse direction — a registered file that doesn't exist — is
-    /// already caught at compile time, since `include_str!` fails to build.)
+    /// (A registered file that doesn't exist is already caught at compile time,
+    /// since `include_str!` fails to build — but a registered *name* that
+    /// disagrees with the file it loads would not be, and is caught here: a
+    /// wrong name would let the ledger record a migration that never ran.)
     #[test]
     fn every_migration_is_registered() {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/migrations");
-        let source = include_str!("pool.rs");
 
-        let mut unregistered: Vec<String> = std::fs::read_dir(dir)
+        let mut on_disk: Vec<String> = std::fs::read_dir(dir)
             .expect("read migrations/ dir")
             .map(|e| e.expect("dir entry").file_name().into_string().unwrap())
             .filter(|name| name.ends_with(".sql"))
-            .filter(|name| !source.contains(name.as_str()))
             .collect();
-        unregistered.sort();
+        on_disk.sort();
 
-        assert!(
-            unregistered.is_empty(),
-            "migration file(s) exist in migrations/ but are not referenced in \
-             run_migrations() in pool.rs — add an \
-             `sqlx::raw_sql(include_str!(\"../migrations/<name>\"))` call: {unregistered:?}"
+        let mut registered: Vec<String> = MIGRATIONS.iter().map(|m| m.name.to_string()).collect();
+        registered.sort();
+
+        assert_eq!(
+            registered, on_disk,
+            "the MIGRATIONS list in pool.rs and the migrations/ directory disagree — \
+             add a `migration!(\"<name>.sql\")` entry for a new file (an unregistered \
+             file never runs), or drop a stale entry"
         );
+    }
+
+    /// Application order is the ordinal order of the file names, and no
+    /// migration is registered twice — a duplicate would apply once and then be
+    /// skipped, quietly changing what a fresh database gets.
+    #[test]
+    fn registered_migrations_are_unique_and_in_ordinal_order() {
+        let names: Vec<&str> = MIGRATIONS.iter().map(|m| m.name).collect();
+
+        let unique: std::collections::HashSet<&str> = names.iter().copied().collect();
+        assert_eq!(unique.len(), names.len(), "a migration is registered twice");
+
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            names, sorted,
+            "MIGRATIONS must be listed in ordinal order — it is the order they \
+             are applied in on a fresh database"
+        );
+    }
+
+    /// The boot lock is keyed on the schema being migrated: same schema, same
+    /// key (two daemons serialize); different schema, different key (parallel
+    /// migrations of private schemas do not block each other).
+    #[test]
+    fn schema_lock_key_is_stable_and_schema_specific() {
+        assert_eq!(schema_lock_key("public"), schema_lock_key("public"));
+        assert_ne!(schema_lock_key("public"), schema_lock_key("adele"));
+        assert_ne!(schema_lock_key(""), schema_lock_key("public"));
     }
 }

@@ -4,8 +4,10 @@
 -- their owner_todo; reads snapshot by the spawn marker. Top-level notes stay
 -- owner_todo='' so behavior is unchanged for the non-subagent case.
 --
--- The migration runner (pool.rs) re-executes every migration on every startup
--- with no version table, so every statement here MUST be idempotent.
+-- The migration runner (pool.rs) applies each migration at most once, tracked
+-- in the `schema_migrations` ledger, but every statement here MUST still be
+-- idempotent: a database migrated before that ledger existed replays the whole
+-- set once on its first boot under it.
 
 ALTER TABLE scratchpads ADD COLUMN IF NOT EXISTS owner_todo TEXT NOT NULL DEFAULT '';
 

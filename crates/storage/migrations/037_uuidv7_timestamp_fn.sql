@@ -12,8 +12,10 @@
 -- Returns NULL for anything that is not a UUIDv7 (a pre-id daemon's row, or a
 -- v4 id), so callers degrade to "unknown time" instead of erroring.
 --
--- The migration runner (pool.rs) re-executes every migration on every startup
--- with no version table, so every statement here MUST be idempotent.
+-- The migration runner (pool.rs) applies each migration at most once, tracked
+-- in the `schema_migrations` ledger, but every statement here MUST still be
+-- idempotent: a database migrated before that ledger existed replays the whole
+-- set once on its first boot under it.
 
 CREATE OR REPLACE FUNCTION uuidv7_ts(id TEXT)
 RETURNS TIMESTAMPTZ

@@ -25,8 +25,10 @@
 -- are read as such -- the same contract `metadata.source_conversation_id`
 -- already carries against archival hard-deletes.
 --
--- Every statement here is idempotent: the runner re-executes every migration on
--- every startup and has no version table.
+-- Every statement here is idempotent: the runner applies each migration at most
+-- once, tracked in the `schema_migrations` ledger, but a database migrated
+-- before that ledger existed replays the whole set once on its first boot
+-- under it.
 
 ALTER TABLE knowledge_base
     ADD COLUMN IF NOT EXISTS deleted_kind   TEXT,

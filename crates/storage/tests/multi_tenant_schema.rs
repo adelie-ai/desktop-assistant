@@ -435,10 +435,10 @@ async fn composite_user_id_index_exists_on_message_summaries() {
 // ---------------------------------------------------------------------------
 
 /// Running `run_migrations` a second time against an already-migrated
-/// schema must be a no-op — both the daemon and the dreaming worker
-/// invoke it at startup, and existing installs already see migrations
-/// 001-015 re-run cleanly on every boot. The multi-tenant migration
-/// has to preserve that contract.
+/// schema must be a no-op and must leave the multi-tenant columns in place.
+/// Since #730 the ledger is what makes the second call cheap; that the SQL
+/// itself survives re-application (which the pre-ledger transition still
+/// does once) is pinned by `migration_versioning.rs`.
 #[tokio::test]
 async fn migrations_are_idempotent() {
     with_fixture("migrations_are_idempotent", |fx| async move {
