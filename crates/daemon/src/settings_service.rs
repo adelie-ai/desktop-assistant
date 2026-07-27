@@ -11,6 +11,7 @@ use desktop_assistant_mcp_client::executor::McpControlHandle;
 
 use crate::api_surface::RegistryHandle;
 use crate::config;
+use crate::embedding_probe::EmbeddingCapability;
 
 pub struct DaemonSettingsService {
     config_path: PathBuf,
@@ -54,6 +55,13 @@ impl DaemonSettingsService {
     pub fn with_embedding_health(mut self, health: Arc<EmbeddingHealth>) -> Self {
         self.embedding_health = Some(health);
         self
+    }
+
+    /// Inject the daemon's live embedding capability so `GetConfig` reports the
+    /// backend's health.
+    pub fn with_embedding_capability(self, capability: Arc<EmbeddingCapability>) -> Self {
+        let snapshot = capability.health();
+        self.with_embedding_health(Arc::new(snapshot))
     }
 
     fn registry(&self) -> Result<&Arc<RegistryHandle>, CoreError> {
@@ -726,6 +734,53 @@ mod tests {
             EmbeddingHealth::Unknown,
             "no probe handle must report Unknown, never a false-green Ok"
         );
+    }
+
+    #[tokio::test]
+    async fn get_embeddings_reports_live_health_not_the_boot_snapshot() {
+        // The boot probe found the backend down; it has since recovered. A
+        // client asking for settings must see the *current* health, otherwise
+        // the UI keeps claiming vector search is broken until a restart.
+        let capability = Arc::new(EmbeddingCapability::new(EmbeddingHealth::Unavailable {
+            reason: "connection refused".to_string(),
+        }));
+        let service = DaemonSettingsService::new(available_config_path())
+            .with_embedding_capability(Arc::clone(&capability));
+
+        capability.record_ok();
+
+        let view = service
+            .get_embeddings_settings()
+            .await
+            .expect("resolving default embeddings settings should succeed");
+        assert_eq!(
+            view.health,
+            EmbeddingHealth::Ok,
+            "GetConfig must report the live health, not the boot-probe snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_embeddings_reports_live_degradation_after_boot() {
+        // The mirror case: the boot probe was healthy and the backend has since
+        // failed. The reported health must degrade without a restart.
+        let capability = Arc::new(EmbeddingCapability::new(EmbeddingHealth::Ok));
+        let service = DaemonSettingsService::new(available_config_path())
+            .with_embedding_capability(Arc::clone(&capability));
+
+        capability.record_failure("HTTP 501 Not Implemented");
+
+        let view = service
+            .get_embeddings_settings()
+            .await
+            .expect("resolving default embeddings settings should succeed");
+        match view.health {
+            EmbeddingHealth::Unavailable { reason } => assert!(
+                reason.contains("501"),
+                "the live degraded reason must be surfaced, got: {reason}"
+            ),
+            other => panic!("expected live Unavailable, got {other:?}"),
+        }
     }
 
     // --- Restart-required reporting (#686) --------------------------------
