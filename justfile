@@ -51,7 +51,9 @@ build:
 # tests for the gate's own shell steps (on the pinned toolchain).
 # `audit` comes first on purpose: build scripts execute at first compile - under
 # `clippy` as much as under `build` - so the advisory scan has to precede both.
-check: audit fmt-check lint build test test-scripts
+# The `-sqlite` steps are separate because that adapter is compiled out of the
+# workspace steps entirely; see `lint-sqlite`.
+check: audit fmt-check lint lint-sqlite build test test-sqlite test-scripts
 
 # RustSec advisory scan of Cargo.lock. Fails loudly when cargo-audit is missing
 # or the advisory database cannot be fetched, rather than passing on silence
@@ -71,6 +73,15 @@ fmt:
 lint:
     cargo clippy --workspace --all-targets -- -D warnings
 
+# Clippy the SQLite adapter with its own feature enabled (#742). Every module
+# and test file in crates/storage-sqlite is `#[cfg(feature = "sqlite")]`, and
+# the feature is off by default so the daemon never links the sqlite C library
+# - which means the workspace lint above type-checks an empty crate. Without
+# this step a change to a `core::ports` trait can break the adapter with no
+# signal at all.
+lint-sqlite:
+    cargo clippy -p desktop-assistant-storage-sqlite --features sqlite --all-targets -- -D warnings
+
 # Run the workspace test suite (excludes #[ignore] integration tests)
 test:
     #!/usr/bin/env bash
@@ -80,6 +91,13 @@ test:
       echo "   A green run here does NOT verify cross-tenant safety. Run 'just test-db' for that." >&2
     fi
     cargo test --workspace
+
+# Run the SQLite adapter's own suite with its feature enabled (#742). Its test
+# files are `#![cfg(feature = "sqlite")]`, so `cargo test --workspace` builds
+# them as empty binaries and runs none of them - including the guard that every
+# migration file is registered with the runner.
+test-sqlite:
+    cargo test -p desktop-assistant-storage-sqlite --features sqlite
 
 # Real-Secret-Service integration tests (needs a live session bus; mutates + cleans keyring)
 test-integration:

@@ -71,8 +71,15 @@ The port now exposes primitives — `upsert`, `list_scope`, `set_presence`,
 decision once. A trait pins signatures, not semantics, so the guarantee is
 enforced by an executable contract: `core::ports::skill_index::conformance` runs
 against the Postgres adapter, the SQLite adapter, and an in-memory reference
-implementation. The last needs no database, so parity is checked on every test
-run rather than only when someone has Postgres handy.
+implementation.
+
+Each arm is reached by a different command, so it is worth being precise about
+what a green run proves. The reference needs no database and runs on every
+`cargo test --workspace`. The SQLite arm needs that crate's off-by-default
+`sqlite` feature and runs in the gate's `just test-sqlite` step (#742). The
+Postgres arm needs `TEST_DATABASE_URL` and pass-skips without it, so it runs
+under `just test-db`. A bare `cargo test` therefore checks the reference alone,
+`just check` adds SQLite, and three-way parity wants `just test-db` as well.
 
 Dropping deletion also removed the need for a transaction. The reconcile used to
 need one because a half-finished pass could delete; now the worst it leaves is a

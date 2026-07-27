@@ -73,11 +73,22 @@ The workspace is held to:
 - `cargo fmt`
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `cargo test --workspace`
+- the same `clippy` and `test` runs for `crates/storage-sqlite` with its
+  `--features sqlite` on (`just lint-sqlite`, `just test-sqlite`)
 
-`just check` runs exactly those, in that order, with `build` before the tests,
-and finishes with `just test-scripts` (the named tests for the gate's own shell
-steps, under `scripts/tests/`). The advisory scan is first because build scripts
-execute at first compile - under `clippy` as much as under `build`.
+The last pair is not redundant. That crate is entirely behind an off-by-default
+`sqlite` feature - the feature exists so the daemon build never links the
+sqlite C library - so the `--workspace` steps compile an empty shell and run
+none of its tests. Only a step that names the crate *and* the feature covers
+it, and the shell suite `scripts/tests/sqlite-gate.test.sh` holds the gate to
+having one (#742).
+
+`just check` runs all of those, each workspace step followed by its
+`storage-sqlite` counterpart (`lint` then `lint-sqlite`, `test` then
+`test-sqlite`), with `build` in between and `just test-scripts` last (the named
+tests for the gate's own shell steps, under `scripts/tests/`). The advisory scan
+is first because build scripts execute at first compile - under `clippy` as much
+as under `build`, and enabling `sqlite` adds `libsqlite3-sys`, which compiles C.
 
 What `just check` does **not** cover:
 

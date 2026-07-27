@@ -80,8 +80,10 @@ the_gates_sqlite_test_step_executes_the_adapters_own_tests() {
     local step
     step="$(gate_step_for test)"
     [ -n "$step" ] || fail "no 'cargo test' step in 'just check' names $SQLITE_CRATE"
-    # `eval` on a line printed by our own justfile, not on external input.
-    run_cmd bash -c "cd '$SCRIPT_TESTS_ROOT' && eval \"\$1 -- --list\"" _ "$step"
+    # The repo path and the planned command are passed as arguments rather than
+    # spliced into the script, so neither has to survive a round of quoting. The
+    # `eval` is on a line printed by our own justfile, not on external input.
+    run_cmd bash -c 'cd "$1" && eval "$2 -- --list"' _ "$SCRIPT_TESTS_ROOT" "$step"
     assert_eq 0 "$RUN_STATUS" "the gate's sqlite test step must build: $step"
     local listed
     listed="$(printf '%s\n' "$RUN_OUT" | grep -c ': test$' || true)"
@@ -93,7 +95,7 @@ the_workspace_test_run_alone_executes_none_of_the_adapters_tests() {
     # The premise of the dedicated step. If this ever fails because the feature
     # became default-on, the extra step is redundant - remove it deliberately
     # rather than leaving two ways to run the same suite.
-    run_cmd bash -c "cd '$SCRIPT_TESTS_ROOT' && cargo test -p '$SQLITE_CRATE' -- --list"
+    run_cmd bash -c 'cd "$1" && cargo test -p "$2" -- --list' _ "$SCRIPT_TESTS_ROOT" "$SQLITE_CRATE"
     assert_eq 0 "$RUN_STATUS" 'the crate builds with default features'
     local listed
     listed="$(printf '%s\n' "$RUN_OUT" | grep -c ': test$' || true)"
