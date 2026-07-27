@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 pub mod client;
+pub mod secret_url;
 pub mod signal;
 pub use signal::{SignalEvent, map_event_to_signal};
 
