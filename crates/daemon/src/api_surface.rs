@@ -86,13 +86,23 @@ pub struct RegistryHandle {
 struct RegistryState {
     config: DaemonConfig,
     registry: ConnectionRegistry,
+    /// Whether `config` is the config file's content or the built-in defaults
+    /// the daemon fell back to when the file would not load. Lives beside the
+    /// config it describes so the two are always read under one lock.
+    // Read by the write guard and the restart report once the behaviour lands.
+    #[allow(dead_code)]
+    config_origin: crate::config::ConfigOrigin,
 }
 
 impl RegistryHandle {
     pub fn new(config: DaemonConfig, registry: ConnectionRegistry) -> Self {
         Self {
             booted_config: config.clone(),
-            state: RwLock::new(RegistryState { config, registry }),
+            state: RwLock::new(RegistryState {
+                config,
+                registry,
+                config_origin: crate::config::ConfigOrigin::File,
+            }),
             write_serializer: Mutex::new(()),
             config_path: default_daemon_config_path(),
         }
@@ -100,6 +110,15 @@ impl RegistryHandle {
 
     pub fn with_config_path(mut self, path: std::path::PathBuf) -> Self {
         self.config_path = path;
+        self
+    }
+
+    /// Record that the daemon is running built-in defaults because
+    /// `daemon.toml` failed to load, rather than the file's own contents.
+    ///
+    /// Set once by `main` at startup from the boot-time load result.
+    pub fn with_config_origin(mut self, origin: crate::config::ConfigOrigin) -> Self {
+        self.state.get_mut().config_origin = origin;
         self
     }
 
@@ -3685,16 +3704,292 @@ model = "nomic-embed-text"
         }
 
         #[test]
-        fn unparseable_config_falls_back_to_the_last_good_report() {
+        fn unparseable_config_reports_the_load_failure_and_invents_no_areas() {
             // A broken file must not panic the report or invent areas out of a
-            // config nobody can read. The daemon keeps running the last-good
-            // config, so that is what the report describes.
+            // config nobody can read. What the client needs to see is the one
+            // fact the daemon does know: the file on disk did not load.
             let (handle, path) = handle_for_toml(OLLAMA_WITH_PURPOSES);
             std::fs::write(&path, "this is not = valid toml [[[").expect("write garbage");
+            let keys: Vec<String> = handle
+                .restart_required()
+                .iter()
+                .map(|area| area.as_key().to_string())
+                .collect();
+            assert_eq!(
+                keys,
+                vec!["config_load_failed".to_string()],
+                "an unreadable config is reported as exactly that, with no areas invented \
+                 out of a config nobody can read"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    // ----- A config that failed to load must not be overwritten (#723) ---
+    //
+    // The daemon still starts on a broken `daemon.toml` — going down entirely
+    // is worse. What it must not do is serialize its built-in defaults over
+    // the file, which is what every connection/purpose/personality write does
+    // with the in-memory snapshot.
+    mod config_load_failure {
+        use super::*;
+        use crate::config::ConfigOrigin;
+
+        /// A hand-authored config the daemon cannot load: `api_key_envv` is a
+        /// typo and connection tables `deny_unknown_fields`, so the whole file
+        /// is refused. Everything else in it is what a write-from-defaults
+        /// destroys.
+        const TYPO_IN_CONNECTION: &str = r#"
+# Hand-authored, comments and all.
+[connections.work]
+type = "anthropic"
+api_key_envv = "WORK_ANTHROPIC_KEY"
+
+[connections.local]
+type = "ollama"
+base_url = "http://localhost:11434"
+
+[purposes.interactive]
+connection = "local"
+model = "llama3"
+
+[ws_auth]
+methods = ["oidc"]
+"#;
+
+        /// The same file with the typo fixed — the user's repair.
+        const REPAIRED: &str = r#"
+[connections.work]
+type = "anthropic"
+api_key_env = "WORK_ANTHROPIC_KEY"
+
+[connections.local]
+type = "ollama"
+base_url = "http://localhost:11434"
+
+[purposes.interactive]
+connection = "local"
+model = "llama3"
+"#;
+
+        /// A load failure whose *parse error* quotes a credential: the URL is
+        /// unquoted, so the TOML error names that line verbatim.
+        const UNQUOTED_URL_WITH_PASSWORD: &str = r#"
+[connections.local]
+type = "ollama"
+base_url = "http://localhost:11434"
+
+[database]
+url = postgres://adele:hunter2@db.example/adele
+"#;
+
+        /// The synthetic password inside `UNQUOTED_URL_WITH_PASSWORD`.
+        const PASSWORD_IN_BROKEN_LINE: &str = "hunter2";
+
+        /// Boot a handle the way `main` does when `load_daemon_config`
+        /// returned `Err`: built-in defaults in memory, the user's real file
+        /// still on disk.
+        fn booted_from_a_failed_load(toml: &str) -> (Arc<RegistryHandle>, std::path::PathBuf) {
+            let path = tmp_config_path();
+            std::fs::write(&path, toml).expect("write the user's config");
             assert!(
-                handle.restart_required().is_empty(),
-                "an unreadable config reports against the running config, not the garbage: {:?}",
+                crate::config::load_daemon_config(&path).is_err(),
+                "fixture must be a config the daemon cannot load"
+            );
+            let cfg = DaemonConfig::default();
+            let registry = build_registry(&cfg);
+            let handle = Arc::new(
+                RegistryHandle::new(cfg, registry)
+                    .with_config_path(path.clone())
+                    .with_config_origin(ConfigOrigin::DefaultsAfterFailedLoad),
+            );
+            (handle, path)
+        }
+
+        fn ollama_payload() -> ConnectionConfigPayload {
+            ConnectionConfigPayload::Ollama {
+                base_url: Some("http://localhost:11434".into()),
+                connect_timeout_secs: None,
+                stream_timeout_secs: None,
+                keep_warm: None,
+                max_context_tokens: None,
+            }
+        }
+
+        #[tokio::test]
+        async fn adding_a_connection_after_a_failed_load_leaves_the_file_intact() {
+            let (handle, path) = booted_from_a_failed_load(TYPO_IN_CONNECTION);
+            let before = std::fs::read_to_string(&path).expect("read the config back");
+            let svc = DaemonConnectionsService::new(Arc::clone(&handle));
+
+            let err = svc
+                .create_connection("new".to_string(), ollama_payload())
+                .await
+                .expect_err("a write from defaults must be refused, not persisted");
+            assert!(
+                format!("{err}").contains(&path.display().to_string()),
+                "the refusal must name the file the user has to fix: {err}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("read the config back"),
+                before,
+                "the user's connections, purposes and [ws_auth] must survive byte-for-byte"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[test]
+        fn the_refusal_never_repeats_the_parse_error_or_its_credentials() {
+            let (handle, path) = booted_from_a_failed_load(UNQUOTED_URL_WITH_PASSWORD);
+            // The premise: the parse error itself quotes the offending line.
+            let parse_error = format!(
+                "{:#}",
+                crate::config::load_daemon_config(&path).expect_err("fixture must not load")
+            );
+            assert!(
+                parse_error.contains(PASSWORD_IN_BROKEN_LINE),
+                "fixture must produce a parse error that quotes the credential: {parse_error}"
+            );
+
+            let err = handle
+                .set_personality(Personality::default())
+                .expect_err("a write from defaults must be refused");
+            assert!(
+                !format!("{err}").contains(PASSWORD_IN_BROKEN_LINE),
+                "the client-visible refusal must not echo the offending line: {err}"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[test]
+        fn a_config_that_stops_parsing_after_boot_is_not_overwritten_by_the_running_config() {
+            // The daemon booted fine; the user then hand-edits the file and
+            // mistypes a key. The running snapshot must not be written over
+            // the edit the daemon could not read.
+            let path = tmp_config_path();
+            std::fs::write(&path, REPAIRED).expect("write the boot config");
+            let cfg = crate::config::load_daemon_config(&path)
+                .expect("boot config parses")
+                .expect("boot config present");
+            let registry = build_registry(&cfg);
+            let handle = Arc::new(RegistryHandle::new(cfg, registry).with_config_path(path.clone()));
+
+            std::fs::write(&path, TYPO_IN_CONNECTION).expect("hand edit introduces a typo");
+            let before = std::fs::read_to_string(&path).expect("read the config back");
+
+            handle
+                .set_personality(Personality::default())
+                .expect_err("the daemon must not overwrite an edit it could not read");
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("read the config back"),
+                before,
+                "the hand edit must survive so the user can fix the typo"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[test]
+        fn a_successful_reload_clears_the_degraded_state_and_restores_config_writes() {
+            let (handle, path) = booted_from_a_failed_load(TYPO_IN_CONNECTION);
+            std::fs::write(&path, REPAIRED).expect("the user fixes the file");
+            handle
+                .apply_reload()
+                .expect("the repaired config loads and applies");
+
+            handle
+                .set_personality(Personality::default())
+                .expect("writes resume once the daemon is running the file's own contents");
+
+            let reloaded = crate::config::load_daemon_config(&path)
+                .expect("the written config still parses")
+                .expect("the written config is present");
+            assert!(
+                reloaded.connections.contains_key("work")
+                    && reloaded.connections.contains_key("local"),
+                "the repaired config's connections must survive the write: {:?}",
+                reloaded.connections.keys().collect::<Vec<_>>()
+            );
+            assert!(
+                reloaded.purposes.get(PurposeKind::Interactive).is_some(),
+                "the repaired config's purposes must survive the write"
+            );
+            assert!(
+                handle
+                    .restart_required()
+                    .iter()
+                    .all(|area| area.as_key() != "config_load_failed"),
+                "a recovered daemon must stop reporting a failed load: {:?}",
                 handle.restart_required()
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[test]
+        fn a_failed_config_load_is_reported_through_restart_required() {
+            // The degraded state has to be visible *before* the user tries to
+            // write, or an empty connections panel reads as "nothing is
+            // configured" rather than "the daemon could not read your config".
+            let (handle, path) = booted_from_a_failed_load(TYPO_IN_CONNECTION);
+            let keys: Vec<String> = handle
+                .restart_required()
+                .iter()
+                .map(|area| area.as_key().to_string())
+                .collect();
+            assert!(
+                keys.contains(&"config_load_failed".to_string()),
+                "the settings view must show a degraded daemon, not an empty one: {keys:?}"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[test]
+        fn an_absent_config_file_is_not_a_failed_load_and_still_accepts_writes() {
+            // First run: there is nothing to destroy, so the guard must not
+            // turn a fresh install into a daemon that cannot save anything.
+            let path = tmp_config_path();
+            let handle = make_handle_at(DaemonConfig::default(), path.clone());
+            handle
+                .set_personality(Personality::default())
+                .expect("a first run must still be able to save its config");
+            assert!(path.exists(), "the write created the config file");
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[test]
+        fn an_empty_config_file_is_not_a_failed_load_and_still_accepts_writes() {
+            let path = tmp_config_path();
+            std::fs::write(&path, "  \n\n").expect("write an empty config");
+            let handle = make_handle_at(DaemonConfig::default(), path.clone());
+            handle
+                .set_personality(Personality::default())
+                .expect("an empty config file is not a failed load");
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[test]
+        fn concurrent_writes_during_a_failed_load_are_all_refused() {
+            let (handle, path) = booted_from_a_failed_load(TYPO_IN_CONNECTION);
+            let before = std::fs::read_to_string(&path).expect("read the config back");
+
+            let workers: Vec<_> = (0..4)
+                .map(|_| {
+                    let handle = Arc::clone(&handle);
+                    std::thread::spawn(move || {
+                        handle.set_personality(Personality::default()).is_err()
+                    })
+                })
+                .collect();
+            for worker in workers {
+                assert!(
+                    worker.join().expect("worker thread finished"),
+                    "every concurrent write must be refused, not just the first"
+                );
+            }
+
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("read the config back"),
+                before,
+                "no interleaving of refused writes may touch the file"
             );
             let _ = std::fs::remove_file(&path);
         }

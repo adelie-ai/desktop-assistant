@@ -768,6 +768,24 @@ base_url = "http://localhost:11434"
     }
 
     #[tokio::test]
+    async fn restart_required_reports_a_config_file_that_failed_to_load() {
+        // The client-visible half of #723: a daemon that could not read
+        // daemon.toml has to say so through the settings view it already
+        // answers, so a panel shows a degraded daemon instead of an empty one.
+        let (service, path) = service_booted_from(BOOT_CONFIG);
+        std::fs::write(&path, "type = \"ollama\"\n[connections.local\n").expect("break the file");
+        assert_eq!(
+            service
+                .restart_required()
+                .await
+                .expect("reporting restart areas succeeds"),
+            vec!["config_load_failed".to_string()],
+            "a config the daemon cannot load is reported as a stable area key"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
     async fn restart_required_reports_ws_auth_as_a_stable_area_key() {
         let (service, path) = service_booted_from(BOOT_CONFIG);
         std::fs::write(

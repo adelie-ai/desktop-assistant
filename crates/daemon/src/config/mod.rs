@@ -1018,6 +1018,26 @@ pub fn store_connection_secret(
     Ok(Some(secret))
 }
 
+/// Where the configuration the daemon is running actually came from.
+///
+/// The daemon starts even when `daemon.toml` cannot be loaded — refusing to
+/// start would be worse than running on defaults — so "the process has a
+/// config" and "the process has *the user's* config" are two different facts.
+/// This type carries the difference to everything that would otherwise treat
+/// the in-memory snapshot as authoritative.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConfigOrigin {
+    /// The running config is what the file held when the daemon read it — or
+    /// there was no file (or an empty one), which is a legitimate first run.
+    #[default]
+    File,
+    /// [`load_daemon_config`] failed, so the process is running
+    /// [`DaemonConfig::default`] and the file's real contents were never in
+    /// memory. Serializing that snapshot back over the file would replace the
+    /// user's configuration with defaults.
+    DefaultsAfterFailedLoad,
+}
+
 pub fn load_daemon_config(path: &Path) -> anyhow::Result<Option<DaemonConfig>> {
     if !path.exists() {
         return Ok(None);
