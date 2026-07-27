@@ -2668,6 +2668,404 @@ mod tests {
         );
     }
 
+    // --- api_key_env may not name an arbitrary process env var (#736) -------
+
+    /// Connector tags whose wire payload carries an `api_key_env` field.
+    const API_KEY_ENV_CONNECTORS: [&str; 5] =
+        ["anthropic", "openai", "openrouter", "azure", "google"];
+
+    /// A payload for `connector` carrying `api_key_env` and connector defaults
+    /// for everything else. Panics for connectors with no such field.
+    fn payload_with_api_key_env(
+        connector: &str,
+        api_key_env: Option<&str>,
+    ) -> ConnectionConfigPayload {
+        let api_key_env = api_key_env.map(str::to_string);
+        match connector {
+            "anthropic" => ConnectionConfigPayload::Anthropic {
+                base_url: None,
+                api_key_env,
+                connect_timeout_secs: None,
+                stream_timeout_secs: None,
+                max_context_tokens: None,
+            },
+            "openai" => ConnectionConfigPayload::OpenAi {
+                base_url: None,
+                api_key_env,
+                connect_timeout_secs: None,
+                stream_timeout_secs: None,
+                max_context_tokens: None,
+            },
+            "openrouter" => ConnectionConfigPayload::OpenRouter {
+                base_url: None,
+                api_key_env,
+                connect_timeout_secs: None,
+                stream_timeout_secs: None,
+                max_context_tokens: None,
+            },
+            "azure" => ConnectionConfigPayload::Azure {
+                base_url: None,
+                api_key_env,
+                api_surface: None,
+                auth_mode: None,
+                api_version: None,
+                connect_timeout_secs: None,
+                stream_timeout_secs: None,
+                max_context_tokens: None,
+            },
+            "google" => ConnectionConfigPayload::Google {
+                base_url: None,
+                api_key_env,
+                project: Some("proj".into()),
+                location: None,
+                auth_mode: None,
+                credentials_path: None,
+                connect_timeout_secs: None,
+                stream_timeout_secs: None,
+                max_context_tokens: None,
+            },
+            other => panic!("connector {other:?} carries no api_key_env field"),
+        }
+    }
+
+    /// The `api_key_env` stored on a connection, whatever its connector.
+    fn stored_api_key_env(conn: &ConnectionConfig) -> Option<String> {
+        match conn {
+            ConnectionConfig::Anthropic(c) => c.api_key_env.clone(),
+            ConnectionConfig::OpenAi(c) => c.api_key_env.clone(),
+            ConnectionConfig::OpenRouter(c) => c.api_key_env.clone(),
+            ConnectionConfig::Azure(c) => c.api_key_env.clone(),
+            ConnectionConfig::Google(c) => c.api_key_env.clone(),
+            ConnectionConfig::Bedrock(_) | ConnectionConfig::Ollama(_) => None,
+        }
+    }
+
+    /// A stored OpenAI connection reading its key from `name`, as an operator
+    /// would write it in `daemon.toml`.
+    fn openai_reading_env(name: Option<&str>) -> ConnectionConfig {
+        use crate::connections::OpenAiConnection;
+        ConnectionConfig::OpenAi(OpenAiConnection {
+            base_url: Some("https://api.openai.com/v1".into()),
+            api_key_env: name.map(str::to_string),
+            ..Default::default()
+        })
+    }
+
+    /// The `api_key_env` a stored connection reads, by connection id.
+    fn api_key_env_of(handle: &RegistryHandle, id: &str) -> Option<String> {
+        stored_api_key_env(
+            handle
+                .snapshot_config()
+                .connections
+                .get(id)
+                .expect("connection should exist"),
+        )
+    }
+
+    #[tokio::test]
+    async fn create_connection_rejects_api_key_env_outside_the_connector_allowlist() {
+        let handle = make_handle_with(DaemonConfig::default());
+        let svc = DaemonConnectionsService::new(handle.clone());
+
+        // The daemon's own process environment carries the deployment's
+        // secrets; naming one here would POST it to `base_url` as a bearer
+        // token.
+        for name in [
+            "POSTGRES_PASSWORD",
+            "DESKTOP_ASSISTANT_DATABASE_URL",
+            "DESKTOP_ASSISTANT_WS_LOGIN_PASSWORD",
+            "PATH",
+        ] {
+            let err = svc
+                .create_connection(
+                    "exfil".to_string(),
+                    payload_with_api_key_env("openai", Some(name)),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                format!("{err}").contains("api_key_env"),
+                "rejecting {name} should name the offending field; got: {err}"
+            );
+        }
+
+        assert!(
+            handle.snapshot_config().connections.is_empty(),
+            "a rejected create must not store a connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_connection_rejects_lowercase_api_key_env_bypass() {
+        let handle = make_handle_with(DaemonConfig::default());
+        let svc = DaemonConnectionsService::new(handle.clone());
+
+        // Environment variable names are case-sensitive on Unix, so a
+        // case-folded match would admit a different variable entirely.
+        for name in ["openai_api_key", "OpenAi_Api_Key", "OPENAI_API_key"] {
+            svc.create_connection(
+                "exfil".to_string(),
+                payload_with_api_key_env("openai", Some(name)),
+            )
+            .await
+            .unwrap_err();
+        }
+
+        assert!(
+            handle.snapshot_config().connections.is_empty(),
+            "a case-folded bypass must not store a connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_connection_rejects_api_key_env_that_merely_contains_an_allowed_name() {
+        let handle = make_handle_with(DaemonConfig::default());
+        let svc = DaemonConnectionsService::new(handle.clone());
+
+        for name in [
+            "MY_OPENAI_API_KEY",
+            "OPENAI_API_KEY_BACKUP",
+            "XOPENAI_API_KEYX",
+            "OPENAI_API_KE",
+        ] {
+            svc.create_connection(
+                "exfil".to_string(),
+                payload_with_api_key_env("openai", Some(name)),
+            )
+            .await
+            .unwrap_err();
+        }
+
+        assert!(
+            handle.snapshot_config().connections.is_empty(),
+            "a substring match must not store a connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_connection_rejects_another_connectors_api_key_env() {
+        let handle = make_handle_with(DaemonConfig::default());
+        let svc = DaemonConnectionsService::new(handle.clone());
+
+        // Pointing one connector at another's key sends that key to a host
+        // the payload also chooses.
+        for (connector, name) in [
+            ("anthropic", "OPENAI_API_KEY"),
+            ("openai", "ANTHROPIC_API_KEY"),
+            ("google", "AZURE_OPENAI_API_KEY"),
+            ("openrouter", "GOOGLE_API_KEY"),
+        ] {
+            let err = svc
+                .create_connection(
+                    "exfil".to_string(),
+                    payload_with_api_key_env(connector, Some(name)),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                format!("{err}").contains("api_key_env"),
+                "{connector} must not read {name}; got: {err}"
+            );
+        }
+
+        assert!(
+            handle.snapshot_config().connections.is_empty(),
+            "a cross-connector key name must not store a connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_connection_accepts_the_documented_api_key_env_for_each_connector() {
+        for (connector, name) in [
+            ("anthropic", "ANTHROPIC_API_KEY"),
+            ("openai", "OPENAI_API_KEY"),
+            ("openrouter", "OPENROUTER_API_KEY"),
+            ("azure", "AZURE_OPENAI_API_KEY"),
+            ("azure", "AZURE_API_KEY"),
+            ("google", "GOOGLE_API_KEY"),
+        ] {
+            let handle = make_handle_with(DaemonConfig::default());
+            let svc = DaemonConnectionsService::new(handle.clone());
+
+            svc.create_connection(
+                "conn".to_string(),
+                payload_with_api_key_env(connector, Some(name)),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{connector} should accept {name}: {e}"));
+
+            assert_eq!(
+                api_key_env_of(&handle, "conn").as_deref(),
+                Some(name),
+                "{connector} should store {name} verbatim"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn create_connection_accepts_each_connectors_derived_default_api_key_env() {
+        // Pins the allowlist to the `<CONNECTOR>_API_KEY` derivation so the
+        // two cannot drift apart.
+        for connector in API_KEY_ENV_CONNECTORS {
+            let derived = crate::config::default_api_key_env(connector);
+            let handle = make_handle_with(DaemonConfig::default());
+            let svc = DaemonConnectionsService::new(handle.clone());
+
+            svc.create_connection(
+                "conn".to_string(),
+                payload_with_api_key_env(connector, Some(&derived)),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{connector} should accept its derived {derived}: {e}"));
+
+            assert_eq!(
+                api_key_env_of(&handle, "conn").as_deref(),
+                Some(derived.as_str()),
+                "{connector} should store its derived default verbatim"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn create_connection_normalizes_a_blank_api_key_env_to_unset() {
+        for blank in ["", "   ", "\t"] {
+            let handle = make_handle_with(DaemonConfig::default());
+            let svc = DaemonConnectionsService::new(handle.clone());
+
+            svc.create_connection(
+                "conn".to_string(),
+                payload_with_api_key_env("openai", Some(blank)),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("a blank api_key_env should mean unset: {e}"));
+
+            assert_eq!(
+                api_key_env_of(&handle, "conn"),
+                None,
+                "a blank api_key_env must not be stored as a variable name"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn create_connection_trims_whitespace_around_an_allowed_api_key_env() {
+        let handle = make_handle_with(DaemonConfig::default());
+        let svc = DaemonConnectionsService::new(handle.clone());
+
+        svc.create_connection(
+            "conn".to_string(),
+            payload_with_api_key_env("openai", Some("  OPENAI_API_KEY\n")),
+        )
+        .await
+        .expect("surrounding whitespace should not defeat the allowlist");
+
+        assert_eq!(
+            api_key_env_of(&handle, "conn").as_deref(),
+            Some("OPENAI_API_KEY"),
+            "the stored name must be the trimmed one, not the padded one"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_connection_rejects_api_key_env_outside_the_connector_allowlist() {
+        let handle = make_handle_with(config_with_connections(&[(
+            "work",
+            openai_reading_env(Some("OPENAI_API_KEY")),
+        )]));
+        let svc = DaemonConnectionsService::new(handle.clone());
+
+        let err = svc
+            .update_connection(
+                "work".to_string(),
+                ConnectionConfigPayload::OpenAi {
+                    base_url: Some("https://attacker.example.invalid/v1".into()),
+                    api_key_env: Some("POSTGRES_PASSWORD".into()),
+                    connect_timeout_secs: None,
+                    stream_timeout_secs: None,
+                    max_context_tokens: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("api_key_env"),
+            "rejection should name the offending field; got: {err}"
+        );
+
+        let cfg = handle.snapshot_config();
+        let conn = cfg
+            .connections
+            .get("work")
+            .expect("connection should exist");
+        assert_eq!(
+            stored_api_key_env(conn).as_deref(),
+            Some("OPENAI_API_KEY"),
+            "a rejected update must leave the stored key variable alone"
+        );
+        match conn {
+            ConnectionConfig::OpenAi(c) => assert_eq!(
+                c.base_url.as_deref(),
+                Some("https://api.openai.com/v1"),
+                "a rejected update must not apply its base_url either"
+            ),
+            other => panic!("expected an openai connection, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn update_connection_keeps_an_operator_configured_api_key_env() {
+        // `daemon.toml` is operator-owned and may name a custom variable; the
+        // echoed view carries it back, so a client edit that leaves the field
+        // untouched must still save.
+        let handle = make_handle_with(config_with_connections(&[(
+            "work",
+            openai_reading_env(Some("OPENAI_WORK_KEY")),
+        )]));
+        let svc = DaemonConnectionsService::new(handle.clone());
+
+        svc.update_connection(
+            "work".to_string(),
+            payload_with_api_key_env("openai", Some("OPENAI_WORK_KEY")),
+        )
+        .await
+        .expect("re-sending the stored api_key_env must not be rejected");
+
+        assert_eq!(
+            api_key_env_of(&handle, "work").as_deref(),
+            Some("OPENAI_WORK_KEY"),
+            "the operator's custom variable should survive a client round-trip"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_connection_rejects_another_connections_api_key_env() {
+        // Carrying an unchanged value forward is per-connection: connection B
+        // must not inherit connection A's custom variable.
+        let handle = make_handle_with(config_with_connections(&[
+            ("work", openai_reading_env(Some("OPENAI_WORK_KEY"))),
+            ("personal", openai_reading_env(Some("OPENAI_API_KEY"))),
+        ]));
+        let svc = DaemonConnectionsService::new(handle.clone());
+
+        let err = svc
+            .update_connection(
+                "personal".to_string(),
+                payload_with_api_key_env("openai", Some("OPENAI_WORK_KEY")),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("api_key_env"),
+            "rejection should name the offending field; got: {err}"
+        );
+
+        assert_eq!(
+            api_key_env_of(&handle, "personal").as_deref(),
+            Some("OPENAI_API_KEY"),
+            "the rejected update must not have applied"
+        );
+    }
+
     #[test]
     fn set_connection_secret_overwrites_a_carried_forward_coordinate() {
         with_isolated_secret_store(|_| {
