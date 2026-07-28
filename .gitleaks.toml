@@ -8,11 +8,10 @@ title = "desktop-assistant secret scan"
 useDefault = true
 
 [allowlist]
-description = "Generated/vendored trees: never hand-authored, so never a place a secret gets typed, and large enough to make the scan slow for no security benefit (#811). .flatpak-builder/ is deliberately NOT here - that is exactly where the .env copies in this issue were found, so the scanner must still be able to see it."
+description = "Generated/vendored trees: never hand-authored, so never a place a secret gets typed, and large enough to make the scan slow for no security benefit (#811). .flatpak-builder/ and .claude/worktrees/ are deliberately NOT here - the #811 incident's own .env copies were found under BOTH: a live .env plus eight stale .claude/worktrees checkouts. Excluding either would reopen half the blind spot this gate exists to close."
 paths = [
   '''(^|/)\.git/''',
   '''(^|/)target/''',
   '''(^|/)build/''',
   '''(^|/)\.venv/''',
-  '''(^|/)\.claude/worktrees/''',
 ]

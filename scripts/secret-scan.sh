@@ -45,28 +45,88 @@ die_loud() {
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 target="${1:-$repo_root}"
 
+# The pinned release tarball is the PRIMARY install path, not `pacman -S
+# gitleaks`: the CachyOS/Arch package (confirmed 8.30.1-1.1 - the pinned
+# version itself - on both plain Arch and CachyOS) never sets the
+# build-time version ldflag, so `gitleaks version` prints a sentence instead
+# of a version number, and the exact pinned release then fails the version
+# check below. The tarball install is user-local (no sudo) and reversible.
+tarball_install_instructions() {
+    printf '%s\n' \
+        "    curl -sL -o gitleaks.tar.gz https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+        '    tar -xzf gitleaks.tar.gz gitleaks && install -m 755 gitleaks ~/.local/bin/gitleaks' \
+        '' \
+        "    Other platforms/checksums: https://github.com/gitleaks/gitleaks/releases/tag/v${GITLEAKS_VERSION}"
+}
+
 if ! command -v gitleaks >/dev/null 2>&1; then
     die_loud 'SECRET SCAN DID NOT RUN: gitleaks is not installed' \
         'The gate promises a working-tree secret scan, so a missing scanner' \
         'fails it instead of quietly passing it.' \
         '' \
-        "Install gitleaks ${GITLEAKS_VERSION}:" \
-        '    pacman -S gitleaks        # Arch/CachyOS' \
-        '    brew install gitleaks     # macOS/Linuxbrew' \
-        "    https://github.com/gitleaks/gitleaks/releases/tag/v${GITLEAKS_VERSION}"
+        "Install gitleaks ${GITLEAKS_VERSION} from the pinned release tarball" \
+        '(user-local, no sudo, and reports a real version - see below for why' \
+        'that matters here):' \
+        "$(tarball_install_instructions)" \
+        '' \
+        "\`pacman -S gitleaks\` (Arch/CachyOS) also installs ${GITLEAKS_VERSION}, but that" \
+        'package does not set the build-time version ldflag, so `gitleaks version`' \
+        'prints "version is set by build process" instead of a real version - the' \
+        'pin check below cannot verify that install, so prefer the tarball.'
 fi
 
+# Diagnosed as two distinct failures, not one: "gitleaks cannot say what
+# version it is" (a packaging defect - confirmed on the CachyOS/Arch package
+# above) and "gitleaks says a version, and it is the wrong one" (real drift)
+# have different fixes, and conflating them sends the reader at the wrong
+# one. A real gitleaks version is a plain X.Y.Z; anything else - including
+# empty output, or "version is set by build process" - is unparseable.
 installed_version="$(gitleaks version 2>/dev/null | tr -d '[:space:]' || true)"
-if [ "$installed_version" != "$GITLEAKS_VERSION" ]; then
+version_is_parseable=0
+case "$installed_version" in
+    [0-9]*.[0-9]*.[0-9]*) version_is_parseable=1 ;;
+esac
+
+if [ "$version_is_parseable" -eq 1 ] && [ "$installed_version" = "$GITLEAKS_VERSION" ]; then
+    : # pinned version, verified - proceed
+elif [ -n "${ADELE_SECRET_SCAN_ALLOW_UNPINNED:-}" ]; then
+    if [ "$version_is_parseable" -eq 1 ]; then
+        loud 'SECRET SCAN: gitleaks version does not match the pin (opt-in)' \
+            "found ${installed_version}, pinned ${GITLEAKS_VERSION}. ADELE_SECRET_SCAN_ALLOW_UNPINNED" \
+            'is set, so this run scans anyway with whatever rule set that version' \
+            'bundles - the scan is not skipped, only the pin check is.'
+    else
+        loud 'SECRET SCAN: gitleaks reports no parseable version (opt-in)' \
+            "\`gitleaks version\` printed \"${installed_version:-<empty>}\", not a version" \
+            'number. ADELE_SECRET_SCAN_ALLOW_UNPINNED is set, so this run scans anyway' \
+            'without verifying which rule set it is running.'
+    fi
+elif [ "$version_is_parseable" -eq 1 ]; then
     die_loud 'SECRET SCAN DID NOT RUN: gitleaks version does not match the pin' \
         "This gate pins gitleaks ${GITLEAKS_VERSION} so the bundled rule set is" \
         'identical on every machine that runs it (AGENTS.base.md, rule 6.2).' \
         '' \
-        "    found:  ${installed_version:-none}" \
+        "    found:  ${installed_version}" \
         "    pinned: ${GITLEAKS_VERSION}" \
         '' \
         'Install the pinned version, or bump GITLEAKS_VERSION in this script' \
-        'deliberately after checking the new release notes (AGENTS.base.md, rule 6.1).'
+        'deliberately after checking the new release notes (AGENTS.base.md, rule 6.1).' \
+        '' \
+        'To unblock unrelated work right now instead of fixing the install:' \
+        '    ADELE_SECRET_SCAN_ALLOW_UNPINNED=1 just secret-scan'
+else
+    die_loud 'SECRET SCAN DID NOT RUN: gitleaks reports no parseable version' \
+        "\`gitleaks version\` printed \"${installed_version:-<empty>}\", not a version" \
+        'number. This is a known packaging defect, not version drift: the' \
+        'CachyOS/Arch pacman gitleaks package (confirmed 8.30.1-1.1, the pinned' \
+        'version, on both plain Arch and CachyOS) does not set the build-time' \
+        'version ldflag, so even the exact pinned release reports this.' \
+        '' \
+        'Install the pinned release tarball instead (reports a real version):' \
+        "$(tarball_install_instructions)" \
+        '' \
+        'To unblock unrelated work right now instead of fixing the install:' \
+        '    ADELE_SECRET_SCAN_ALLOW_UNPINNED=1 just secret-scan'
 fi
 
 config="$repo_root/.gitleaks.toml"

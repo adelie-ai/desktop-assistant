@@ -149,24 +149,39 @@ the entire time the key was exposed. The script calls `gitleaks dir`, the
 filesystem-walk subcommand, which reads whatever is on disk - tracked or not,
 gitignored or not.
 
-`gitleaks` is therefore a prerequisite of the gate, the same as `cargo-audit`:
-install the pinned version (`pacman -S gitleaks` on Arch/CachyOS, or
-`brew install gitleaks`). The gitleaks rule set is bundled in the binary
-itself, not fetched per run, so the version is pinned in
-`scripts/secret-scan.sh` (`GITLEAKS_VERSION`) rather than left to whatever a
-machine happens to have - two developers running two different rule sets is
-the same reproducibility failure as two different Rust toolchains. Bump the
-pin deliberately, after checking the new release's notes (base rule 6.1), not
-by installing whatever a package manager offers this week.
+`gitleaks` is therefore a prerequisite of the gate, the same as `cargo-audit`.
+**Install the pinned release tarball, user-local, no sudo:**
+
+```sh
+curl -sL -o gitleaks.tar.gz https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+tar -xzf gitleaks.tar.gz gitleaks && install -m 755 gitleaks ~/.local/bin/gitleaks
+```
+
+That is the primary path, not a fallback: `pacman -S gitleaks` also installs
+the pinned `8.30.1`, but the CachyOS/Arch package (confirmed on both plain
+Arch and CachyOS) does not set the build-time version ldflag, so
+`gitleaks version` prints `version is set by build process` instead of a
+version number - the exact pinned release then fails the pin check below.
+This is a packaging defect in that distro build, not something this repo can
+fix from here; the tarball release does set the ldflag correctly.
+
+The gitleaks rule set is bundled in the binary itself, not fetched per run,
+so the version is pinned in `scripts/secret-scan.sh` (`GITLEAKS_VERSION`)
+rather than left to whatever a machine happens to have - two developers
+running two different rule sets is the same reproducibility failure as two
+different Rust toolchains. Bump the pin deliberately, after checking the new
+release's notes (base rule 6.1), not by installing whatever a package
+manager offers this week.
 
 Two files at the repo root configure the scan:
 
 - **`.gitleaks.toml`** extends (not replaces) gitleaks' default rule set and
   allowlists a short list of generated/vendored directories - `target/`,
-  `build/`, `.git/`, `.venv/`, `.claude/worktrees/` - that are never
-  hand-authored and only slow the scan down. `.flatpak-builder/` is
-  deliberately **not** on that list: it is exactly where the `.env` copies in
-  #811 were found, so the scanner must still be able to see it.
+  `build/`, `.git/`, `.venv/` - that are never hand-authored and only slow the
+  scan down. `.flatpak-builder/` and `.claude/worktrees/` are deliberately
+  **not** on that list: the #811 incident's own leak involved a live `.env`
+  *and* eight stale `.claude/worktrees` checkouts, so excluding either
+  directory would reopen half the blind spot this gate exists to close.
 - **`.gitleaksignore`** lists reviewed false positives by gitleaks fingerprint
   (`file:rule-id:start-line`), one entry per finding, each with a comment
   explaining why it is not a real secret (this repo's own test-only PEM
@@ -180,7 +195,11 @@ Like the advisory scan, the step is deliberately unable to pass by accident:
 
 - **gitleaks not installed** - hard failure, with the install command.
 - **Installed version does not match the pin** - hard failure, naming both
-  versions.
+  versions. Diagnosed separately from the next case, because they have
+  different fixes.
+- **Installed gitleaks reports no parseable version** (e.g. the CachyOS/Arch
+  packaging defect above) - hard failure, with its own message: this is not
+  version drift, so it is not worded as one.
 - **A scan that produced no report** - hard failure. An exit status alone is
   not proof a scan ran (the same #706 failure mode `scripts/audit.sh` guards
   against): a fatal gitleaks error (bad config, bad path) exits non-zero and
@@ -190,6 +209,14 @@ Like the advisory scan, the step is deliberately unable to pass by accident:
   path for a real finding the way there is for an informational RustSec
   advisory; add a reviewed `.gitleaksignore` entry for a genuine false
   positive, or rotate and remove a real one.
+
+Either of the two version failures above can be overridden with
+`ADELE_SECRET_SCAN_ALLOW_UNPINNED=1` (mirrors `ADELE_AUDIT_ALLOW_STALE`'s
+shape and purpose in `scripts/audit.sh`): the scan still runs, against
+whatever gitleaks is actually on `PATH`, and says loudly that the pin was not
+verified. The exact pin stays the default - determinism in a security
+scanner's rule set is worth keeping - but nobody should have to edit the gate
+or reach for `--no-verify` to unblock work unrelated to the scanner itself.
 
 ## Overrides and additions to the shared base
 
