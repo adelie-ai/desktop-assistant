@@ -118,6 +118,13 @@ outcome, so a caller can act on it programmatically instead of reading prose:
 
 - `code` is the stable identifier to branch on: `not_authorized`,
   `unsupported`, `not_found`, `already_terminal`. Never match the message text.
+  A handful of rules-based refusals carry a feature-specific code instead, via
+  the same field: `CreateConnection`, `UpdateConnection`, and
+  `UpsertMcpServer` refuse a `base_url` or MCP server `url` that fails the
+  shared remote-URL policy (#804, #895) with one of `url_malformed`,
+  `url_scheme_not_allowed`, `url_insecure_scheme`, or `url_target_blocked` —
+  see `docs/mcp-services.md`. An older client that does not recognize a code
+  still round-trips it unchanged (below), so this never breaks parsing.
 - `description` is for logs; `message` is fit to show a person; `retryable`
   says whether repeating the identical request could plausibly succeed.
 - `detail` is **absent** when the daemon cannot classify the failure honestly.

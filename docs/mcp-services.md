@@ -324,9 +324,33 @@ Fields under `[servers.http]`:
 
 | Field                | Required | Description                                                                                |
 |----------------------|----------|--------------------------------------------------------------------------------------------|
-| `url`                | yes      | Remote MCP endpoint (`http://` or `https://`). Its presence selects the HTTP transport      |
+| `url`                | yes      | Remote MCP endpoint. Its presence selects the HTTP transport. See "Which URLs are accepted" below |
 | `auth_bearer_secret` | no       | Secret **ID** (looked up in `secrets.toml`) whose value is sent as a **static** `Authorization: Bearer` token — never refreshed |
 | `[servers.http.oauth]` | no     | Authenticate with OAuth 2.0 instead: the daemon refreshes short-lived access tokens on its own — see [OAuth 2.0](#oauth-20-google) |
+
+### Which URLs are accepted
+
+Every request to `url` carries the bearer token or OAuth access token above,
+so `url` is checked against the same rule as a connection's `base_url`
+(#804, #895):
+
+- `https://` is required for a host reachable over the open network.
+- Plain `http://` is accepted only to loopback (`localhost`, `127.0.0.1`,
+  `::1`), a private network address (RFC1918, e.g. `192.168.x.x`), or a bare
+  hostname with no dot — the shape of a Kubernetes short Service name, such
+  as `http://homeassistant-mcp:8080` reached over an in-cluster network.
+  A dotted hostname (`mcp.example.com`) always needs `https://`, even on a
+  LAN.
+- A link-local address, an unspecified address (`0.0.0.0` / `::`), the cloud
+  metadata address `169.254.169.254`, and the GCP metadata hostname
+  `metadata.google.internal` are refused regardless of scheme.
+
+The daemon checks this both when the config is saved (`UpsertMcpServer`, so a
+bad URL is refused immediately with a clear reason) and when it connects, so
+a `mcp_servers.toml` edited by hand gets the same protection. A refusal
+names the rule it hit; see `docs/WEBSOCKET_API.md` for the wire shape
+(`detail.code`: `url_malformed`, `url_scheme_not_allowed`,
+`url_insecure_scheme`, or `url_target_blocked`).
 
 The bearer token itself is never written in `mcp_servers.toml` — only the secret **ID** is. Put the real token in `secrets.toml` (also enforced `0600`):
 
