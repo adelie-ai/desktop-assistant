@@ -56,7 +56,7 @@ if ! command -v gitleaks >/dev/null 2>&1; then
         "    https://github.com/gitleaks/gitleaks/releases/tag/v${GITLEAKS_VERSION}"
 fi
 
-installed_version="$(gitleaks version 2>/dev/null | tr -d '[:space:]')"
+installed_version="$(gitleaks version 2>/dev/null | tr -d '[:space:]' || true)"
 if [ "$installed_version" != "$GITLEAKS_VERSION" ]; then
     die_loud 'SECRET SCAN DID NOT RUN: gitleaks version does not match the pin' \
         "This gate pins gitleaks ${GITLEAKS_VERSION} so the bundled rule set is" \
@@ -118,8 +118,8 @@ fi
 # the thing this whole step exists to insist on.
 findings_summary() {
     local files rules
-    files="$(grep -oE '"File": *"[^"]*"' "$report" | sed -E 's/.*: *"(.*)"$/\1/')"
-    rules="$(grep -oE '"RuleID": *"[^"]*"' "$report" | sed -E 's/.*: *"(.*)"$/\1/')"
+    files="$(grep -oE '"File": *"[^"]*"' "$report" | sed -E 's/.*: *"(.*)"$/\1/' || true)"
+    rules="$(grep -oE '"RuleID": *"[^"]*"' "$report" | sed -E 's/.*: *"(.*)"$/\1/' || true)"
     paste -d'\t' <(printf '%s\n' "$rules") <(printf '%s\n' "$files") \
         | awk -F'\t' '{printf "    %s  (rule: %s)\n", $2, $1}'
 }
