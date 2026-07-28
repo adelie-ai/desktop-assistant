@@ -1,0 +1,18 @@
+title = "desktop-assistant secret scan"
+
+# Extends (does not replace) gitleaks' built-in rule set. The rule set is
+# bundled in the gitleaks binary itself, not fetched per run, so pinning the
+# binary version in scripts/secret-scan.sh is what keeps this reproducible -
+# see AGENTS.md, "Secret scanning".
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Generated/vendored trees: never hand-authored, so never a place a secret gets typed, and large enough to make the scan slow for no security benefit (#811). .flatpak-builder/ is deliberately NOT here - that is exactly where the .env copies in this issue were found, so the scanner must still be able to see it."
+paths = [
+  '''(^|/)\.git/''',
+  '''(^|/)target/''',
+  '''(^|/)build/''',
+  '''(^|/)\.venv/''',
+  '''(^|/)\.claude/worktrees/''',
+]

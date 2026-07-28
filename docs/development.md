@@ -5,7 +5,7 @@ The assistant persona is named **Adele**, in reference to the **Adélie penguin*
 ## Day-to-day Commands
 
 ```bash
-# the whole gate: dependency scan, format, lints, build, tests
+# the whole gate: dependency scan, secret scan, format, lints, build, tests
 just check
 
 # individual steps
@@ -13,6 +13,7 @@ cargo fmt
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 just audit                  # RustSec advisory scan of Cargo.lock
+just secret-scan            # gitleaks over the working tree, not git history
 just lint-sqlite            # clippy the SQLite adapter with --features sqlite
 just test-sqlite            # its own suite, which --workspace runs none of
 ```
@@ -23,11 +24,13 @@ it as an empty crate and run zero of its tests.
 
 `just check` needs `cargo-audit` (`cargo install cargo-audit --locked`) and
 network access for the advisory database; it fails loudly without either rather
-than skipping the scan. Its last step also boots two throwaway databases, to
-check that the harness below really is parallel-safe; with no container runtime
-reachable that one criterion skips and says so. The pre-push hook runs all of
-this, so a push with the runtime up costs about half a minute more than one
-without.
+than skipping the scan. It also needs the pinned `gitleaks` version (see
+AGENTS.md, "Secret scanning") for the working-tree secret scan, but that step
+needs no network - its rule set is bundled in the binary. Its last step also
+boots two throwaway databases, to check that the harness below really is
+parallel-safe; with no container runtime reachable that one criterion skips and
+says so. The pre-push hook runs all of this, so a push with the runtime up
+costs about half a minute more than one without.
 
 It does **not** run the DB-gated `crates/storage` isolation suites, which
 pass-skip without `TEST_DATABASE_URL`:

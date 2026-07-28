@@ -47,19 +47,28 @@ build:
 # We run these locally instead of GitHub Actions. `install-hooks` wires `check`
 # into a git pre-push hook so it runs automatically before every push.
 
-# Full local gate: dependency scan, formatting, lints, build, tests, and the
-# tests for the gate's own shell steps (on the pinned toolchain).
-# `audit` comes first on purpose: build scripts execute at first compile - under
-# `clippy` as much as under `build` - so the advisory scan has to precede both.
-# The `-sqlite` steps are separate because that adapter is compiled out of the
-# workspace steps entirely; see `lint-sqlite`.
-check: audit fmt-check lint lint-sqlite build test test-sqlite test-scripts
+# Full local gate: dependency scan, secret scan, formatting, lints, build,
+# tests, and the tests for the gate's own shell steps (on the pinned
+# toolchain).
+# `audit` and `secret-scan` come first on purpose: build scripts execute at
+# first compile - under `clippy` as much as under `build` - so both scans have
+# to precede either. The `-sqlite` steps are separate because that adapter is
+# compiled out of the workspace steps entirely; see `lint-sqlite`.
+check: audit secret-scan fmt-check lint lint-sqlite build test test-sqlite test-scripts
 
 # RustSec advisory scan of Cargo.lock. Fails loudly when cargo-audit is missing
 # or the advisory database cannot be fetched, rather than passing on silence
 # (#706); see scripts/audit.sh for the offline opt-in.
 audit:
     ./scripts/audit.sh
+
+# Working-tree secret scan (#811): gitleaks over the checked-out files, not
+# git history - the key that prompted this issue was never committed, so a
+# history-only scan would have reported clean the whole time it was exposed.
+# Fails loudly when gitleaks is missing, is the wrong (unpinned) version, or
+# produces no report, rather than passing on silence; see scripts/secret-scan.sh.
+secret-scan:
+    ./scripts/secret-scan.sh
 
 # Verify formatting without modifying files
 fmt-check:

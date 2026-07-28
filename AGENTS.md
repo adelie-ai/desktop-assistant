@@ -78,6 +78,7 @@ The daemon is built and run as `cargo run -p desktop-assistant-daemon`. Operatio
 The workspace is held to:
 
 - a RustSec advisory scan of `Cargo.lock` (`scripts/audit.sh`)
+- a working-tree secret scan (`scripts/secret-scan.sh`) - see "Secret scanning" below
 - `cargo fmt`
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `cargo test --workspace`
@@ -95,8 +96,9 @@ having one.
 `storage-sqlite` counterpart (`lint` then `lint-sqlite`, `test` then
 `test-sqlite`), with `build` in between and `just test-scripts` last (the named
 tests for the gate's own shell steps, under `scripts/tests/`). The advisory scan
-is first because build scripts execute at first compile - under `clippy` as much
-as under `build`, and enabling `sqlite` adds `libsqlite3-sys`, which compiles C.
+and the secret scan both come first, before either `lint` or `build` - build
+scripts execute at first compile, under `clippy` as much as under `build`, and
+enabling `sqlite` adds `libsqlite3-sys`, which compiles C.
 
 What `just check` does **not** cover:
 
@@ -111,8 +113,9 @@ What `just check` does **not** cover:
 
 So the gate wants a reachable podman/docker and the network - the advisory scan
 fetches, and runs offline only under the `ADELE_AUDIT_ALLOW_STALE=1` opt-in
-described below. That goes for `git push` too: the pre-push hook runs the same
-`just check`.
+described below. The secret scan adds no network requirement: gitleaks' rule
+set is bundled in the binary, not fetched per run. That goes for `git push`
+too: the pre-push hook runs the same `just check`.
 
 New code keeps it there. Warnings-as-errors is enforced **mechanically**, not by reviewer vigilance: the root `Cargo.toml` sets `[workspace.lints] rust.warnings = "deny"` and `clippy.all = "deny"`, and every member inherits via `[lints] workspace = true`, so a plain `cargo build`/`test`/`clippy` hard-fails on any warning. Base rule 2.1 states the posture.
 
@@ -135,6 +138,58 @@ Common, well-maintained cargo plugins are fine — `cargo-edit` (`cargo upgrade`
 - **Advisory suppressed by an audit.toml `ignore` list** - named in the output
   and in the summary line, and does not fail the gate: suppressing one is a
   reviewed decision, but the gate never presents it as a clean scan.
+
+## Secret scanning
+
+`just secret-scan` (`scripts/secret-scan.sh`) runs [gitleaks](https://github.com/gitleaks/gitleaks)
+over the **checked-out files**, not git history. This is deliberate, not an
+oversight: #811's key was never committed, so a history-based scan
+(`gitleaks git`, or the older `gitleaks detect`) would have reported clean for
+the entire time the key was exposed. The script calls `gitleaks dir`, the
+filesystem-walk subcommand, which reads whatever is on disk - tracked or not,
+gitignored or not.
+
+`gitleaks` is therefore a prerequisite of the gate, the same as `cargo-audit`:
+install the pinned version (`pacman -S gitleaks` on Arch/CachyOS, or
+`brew install gitleaks`). The gitleaks rule set is bundled in the binary
+itself, not fetched per run, so the version is pinned in
+`scripts/secret-scan.sh` (`GITLEAKS_VERSION`) rather than left to whatever a
+machine happens to have - two developers running two different rule sets is
+the same reproducibility failure as two different Rust toolchains. Bump the
+pin deliberately, after checking the new release's notes (base rule 6.1), not
+by installing whatever a package manager offers this week.
+
+Two files at the repo root configure the scan:
+
+- **`.gitleaks.toml`** extends (not replaces) gitleaks' default rule set and
+  allowlists a short list of generated/vendored directories - `target/`,
+  `build/`, `.git/`, `.venv/`, `.claude/worktrees/` - that are never
+  hand-authored and only slow the scan down. `.flatpak-builder/` is
+  deliberately **not** on that list: it is exactly where the `.env` copies in
+  #811 were found, so the scanner must still be able to see it.
+- **`.gitleaksignore`** lists reviewed false positives by gitleaks fingerprint
+  (`file:rule-id:start-line`), one entry per finding, each with a comment
+  explaining why it is not a real secret (this repo's own test-only PEM
+  fixtures and a couple of truncated example tokens in docs, at the time of
+  writing). Because the fingerprint pins the line number too, an unrelated
+  edit that shifts the match makes the finding reappear rather than silently
+  keeping a stale exemption - re-add it once you have re-confirmed it is still
+  a fixture, not a regression.
+
+Like the advisory scan, the step is deliberately unable to pass by accident:
+
+- **gitleaks not installed** - hard failure, with the install command.
+- **Installed version does not match the pin** - hard failure, naming both
+  versions.
+- **A scan that produced no report** - hard failure. An exit status alone is
+  not proof a scan ran (the same #706 failure mode `scripts/audit.sh` guards
+  against): a fatal gitleaks error (bad config, bad path) exits non-zero and
+  writes no report at all, so report-existence, not exit code alone, is what
+  the script trusts.
+- **A secret found** - hard failure, always. There is no suppress-and-warn
+  path for a real finding the way there is for an informational RustSec
+  advisory; add a reviewed `.gitleaksignore` entry for a genuine false
+  positive, or rotate and remove a real one.
 
 ## Overrides and additions to the shared base
 
