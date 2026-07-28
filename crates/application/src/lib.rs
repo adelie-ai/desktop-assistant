@@ -94,9 +94,86 @@ pub enum ApiError {
     /// client instead of pretending the operation succeeded.
     #[error("task is already terminal")]
     AlreadyTerminal,
+
+    /// A rules-based refusal of caller-supplied input (base rule 8.3):
+    /// carries the stable code, the developer-facing description, and the
+    /// user-facing message straight through from
+    /// [`desktop_assistant_core::CoreError::InvalidInput`], so the
+    /// transport layer can build a classified `api::ErrorDetail` without
+    /// parsing prose.
+    #[error("{description}")]
+    InvalidInput {
+        code: String,
+        description: String,
+        message: String,
+    },
 }
 
 pub type ApiResult<T> = Result<T, ApiError>;
+
+/// Classify a [`desktop_assistant_core::CoreError`] that may carry a
+/// rules-based input refusal into the matching [`ApiError`], preserving the
+/// stable code the transport layer needs to build a classified
+/// `api::ErrorDetail` (#804, #895). Used only by the handlers whose service
+/// methods can raise [`desktop_assistant_core::CoreError::InvalidInput`]
+/// today (`CreateConnection`, `UpdateConnection`, `UpsertMcpServer`); every
+/// other `CoreError` variant renders through `Display`, same as the
+/// general, unclassified mapping in
+/// [`DefaultAssistantApiHandler::map_core_err`] — classifying those
+/// generally is tracked separately (#972).
+///
+/// A free function rather than an associated one: `map_core_err` lives on
+/// `DefaultAssistantApiHandler<A, C, S, N, K>`, whose five type parameters
+/// would otherwise have to be pinned to call it from a unit test.
+fn map_validated_core_err(e: desktop_assistant_core::CoreError) -> ApiError {
+    match e {
+        desktop_assistant_core::CoreError::InvalidInput {
+            code,
+            description,
+            message,
+        } => ApiError::InvalidInput {
+            code: code.to_string(),
+            description,
+            message,
+        },
+        other => ApiError::Core(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod map_validated_core_err_tests {
+    use super::*;
+
+    #[test]
+    fn preserves_the_code_description_and_message_of_an_invalid_input_refusal() {
+        let core_err = desktop_assistant_core::CoreError::InvalidInput {
+            code: "url_insecure_scheme",
+            description: "connection base_url refused: ...".to_string(),
+            message: "Use https:// instead.".to_string(),
+        };
+        match map_validated_core_err(core_err) {
+            ApiError::InvalidInput {
+                code,
+                description,
+                message,
+            } => {
+                assert_eq!(code, "url_insecure_scheme");
+                assert_eq!(description, "connection base_url refused: ...");
+                assert_eq!(message, "Use https:// instead.");
+            }
+            other => panic!("expected ApiError::InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn falls_back_to_the_general_unclassified_mapping_for_every_other_core_error() {
+        let core_err = desktop_assistant_core::CoreError::Llm("boom".to_string());
+        match map_validated_core_err(core_err) {
+            ApiError::Core(message) => assert_eq!(message, "LLM error: boom"),
+            other => panic!("expected the general ApiError::Core fallback, got {other:?}"),
+        }
+    }
+}
 
 /// Per-request context threaded from the transport layer through the
 /// handler into core services (#105).
@@ -2173,7 +2250,7 @@ where
                 self.settings
                     .upsert_mcp_server(config_json)
                     .await
-                    .map_err(Self::map_core_err)?;
+                    .map_err(map_validated_core_err)?;
                 Ok(api::CommandResult::Ack)
             }
 
@@ -2244,7 +2321,7 @@ where
                 self.connections
                     .create_connection(id, api_connection_config_to_core(config))
                     .await
-                    .map_err(Self::map_core_err)?;
+                    .map_err(map_validated_core_err)?;
                 Ok(api::CommandResult::Ack)
             }
 
@@ -2252,7 +2329,7 @@ where
                 self.connections
                     .update_connection(id, api_connection_config_to_core(config))
                     .await
-                    .map_err(Self::map_core_err)?;
+                    .map_err(map_validated_core_err)?;
                 Ok(api::CommandResult::Ack)
             }
 

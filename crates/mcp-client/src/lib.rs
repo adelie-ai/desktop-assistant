@@ -6,6 +6,8 @@ pub mod executor;
 mod jsonrpc;
 #[cfg(feature = "http")]
 pub mod oauth;
+#[cfg(feature = "http")]
+pub mod url_policy;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -1056,11 +1058,22 @@ struct HttpTransport {
 #[cfg(feature = "http")]
 impl HttpTransport {
     fn new(url: &str, credential: Credential) -> Result<Self, McpError> {
-        if !(url.starts_with("https://") || url.starts_with("http://")) {
-            return Err(McpError::Http(format!(
-                "remote MCP url must be http(s): {url}"
-            )));
-        }
+        // #804: every request below attaches `credential` as `Authorization:
+        // Bearer` (or, for a static credential, may carry a live OAuth
+        // access token) — refuse a URL that would send it in the clear
+        // before ever attempting a connection. `credential` is already
+        // resolved here, so whether it carries anything at all is a direct
+        // fact rather than a guess (see url_policy's module docs on why
+        // that distinction narrows the bare-hostname exemption).
+        let request_credential = match credential {
+            Credential::None => crate::url_policy::RequestCredential::None,
+            Credential::Static(_) | Credential::OAuth(_) => {
+                crate::url_policy::RequestCredential::Attached
+            }
+        };
+        crate::url_policy::validate_remote_url(url, request_credential).map_err(|e| {
+            McpError::Http(format!("refusing remote MCP url (rule: {}): {e}", e.code()))
+        })?;
         let client = reqwest::Client::builder()
             .build()
             .map_err(|e| McpError::Http(format!("failed to build HTTP client: {e}")))?;
@@ -1408,6 +1421,52 @@ struct RawToolDef {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ----- HttpTransport::new applies the shared remote-URL policy (#804) -----
+    //
+    // `HttpTransport::new` used to accept any URL that merely started with
+    // "http://" or "https://" — including a plain-http URL to any host,
+    // which sends the bearer/OAuth token attached to every request in the
+    // clear. These exercise the fix directly, without a mock server: the
+    // refusal happens before any request is sent.
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn http_transport_new_rejects_plain_http_to_a_public_host() {
+        // `HttpTransport` is not `Debug`, so match instead of `expect_err`.
+        match HttpTransport::new("http://evil.example.com/mcp", Credential::None) {
+            Ok(_) => panic!("plain http to a non-loopback host must be refused"),
+            Err(McpError::Http(_)) => {}
+            Err(other) => panic!("expected a transport error, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn http_transport_new_accepts_plain_http_to_loopback() {
+        // Loopback stays permitted: this is also what keeps the httpmock
+        // integration tests in tests/http_transport.rs working, since
+        // httpmock binds to 127.0.0.1.
+        HttpTransport::new("http://127.0.0.1:8080/mcp", Credential::None)
+            .expect("plain http to loopback must still connect");
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn http_transport_new_accepts_https() {
+        HttpTransport::new("https://mcp.example.com/mcp", Credential::None)
+            .expect("https to a public host must be accepted");
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn http_transport_new_rejects_a_disallowed_scheme() {
+        match HttpTransport::new("ftp://mcp.example.com/mcp", Credential::None) {
+            Ok(_) => panic!("a non-http(s) scheme must be refused"),
+            Err(McpError::Http(_)) => {}
+            Err(other) => panic!("expected a transport error, got {other:?}"),
+        }
+    }
 
     #[test]
     fn validate_command_rejects_empty() {

@@ -105,6 +105,85 @@ impl DaemonSettingsService {
     }
 }
 
+/// Validate a remote MCP server's `url` against the shared remote-URL policy
+/// (#804, #895) before the config is accepted.
+///
+/// A free function rather than a method on [`DaemonSettingsService`], pulled
+/// out for direct, granular unit tests of the pure rule (a documented
+/// contract on an otherwise-private fn, per this repo's testing conventions)
+/// alongside the coarser end-to-end coverage through
+/// [`DaemonSettingsService::upsert_mcp_server`] itself
+/// (`upsert_mcp_server_rejects_a_plain_http_url_to_a_public_host` below,
+/// built on the crate's pure in-memory `McpToolExecutor::new` — no live
+/// fleet or filesystem needed, since a refused URL never reaches
+/// `upsert_mcp_server`'s own filesystem read).
+fn validate_mcp_http_config(
+    http: &desktop_assistant_mcp_client::executor::HttpTransportConfig,
+) -> Result<(), CoreError> {
+    // A server carries a credential if it names any of the three ways to
+    // authenticate one: a static bearer secret, an inline OAuth block, or a
+    // reference to a shared service account. Narrows the bare-hostname
+    // exemption for exactly the servers that have something to lose to a
+    // hijacked resolution (see url_policy's module docs).
+    let credential = if http.auth_bearer_secret.is_some()
+        || http.oauth.is_some()
+        || http.oauth_account.is_some()
+    {
+        desktop_assistant_mcp_client::url_policy::RequestCredential::Attached
+    } else {
+        desktop_assistant_mcp_client::url_policy::RequestCredential::None
+    };
+    desktop_assistant_mcp_client::url_policy::validate_remote_url(&http.url, credential).map_err(
+        |e| CoreError::InvalidInput {
+            code: e.code(),
+            description: format!("MCP server http url {:?} refused: {e}", http.url),
+            message: e.user_message(),
+        },
+    )
+}
+
+/// Validate an MCP server's inline `[servers.http.oauth]` endpoints (#804
+/// review, F7) against the same rule this crate's own `OAuthClient` already
+/// enforces at use time (`oauth::validate_endpoint_url`: HTTPS required
+/// except for loopback). Without this, a bad `token_url` or `authorize_url`
+/// saved today only fails the first time the daemon tries to sign in or
+/// refresh a token for this server — a late, fail-closed surprise rather
+/// than a legible refusal when the config was saved.
+///
+/// A server that references a shared service account instead of an inline
+/// block (`http.oauth_account`) already gets this at the account level:
+/// `desktop-assistant-mcp-client::config::validate_service_account` requires
+/// `https://` for both endpoints before `upsert_service_account` will save
+/// one.
+fn validate_mcp_inline_oauth_endpoints(
+    http: &desktop_assistant_mcp_client::executor::HttpTransportConfig,
+) -> Result<(), CoreError> {
+    let Some(oauth) = &http.oauth else {
+        return Ok(());
+    };
+    desktop_assistant_mcp_client::oauth::validate_endpoint_url(&oauth.token_url).map_err(|e| {
+        CoreError::InvalidInput {
+            code: "url_oauth_endpoint_insecure",
+            description: format!("MCP server oauth token_url refused: {e}"),
+            message: "This OAuth token endpoint can't be used. It must use 'https://', or point \
+                      at localhost."
+                .to_string(),
+        }
+    })?;
+    if let Some(authorize_url) = &oauth.authorize_url {
+        desktop_assistant_mcp_client::oauth::validate_endpoint_url(authorize_url).map_err(|e| {
+            CoreError::InvalidInput {
+                code: "url_oauth_endpoint_insecure",
+                description: format!("MCP server oauth authorize_url refused: {e}"),
+                message: "This OAuth authorization endpoint can't be used. It must use \
+                          'https://', or point at localhost."
+                    .to_string(),
+            }
+        })?;
+    }
+    Ok(())
+}
+
 impl SettingsService for DaemonSettingsService {
     /// Report the config areas the running process is behind on (#686).
     ///
@@ -517,6 +596,8 @@ impl SettingsService for DaemonSettingsService {
         // inline oauth block. resolve_server_oauth returns those exact errors, so
         // reuse it to reject a cross-wired / dangling config before persisting.
         if let Some(http) = &config.http {
+            validate_mcp_http_config(http)?;
+            validate_mcp_inline_oauth_endpoints(http)?;
             let path = desktop_assistant_mcp_client::config::default_config_path();
             let accounts = desktop_assistant_mcp_client::config::load_service_accounts(&path)
                 .map_err(|e| CoreError::SystemService(e.to_string()))?;
@@ -695,6 +776,227 @@ mod tests {
     fn settings_service_constructs() {
         let service = DaemonSettingsService::new(PathBuf::from("/tmp/desktop-assistant-test.toml"));
         assert!(service.config_path.ends_with("desktop-assistant-test.toml"));
+    }
+
+    // --- upsert_mcp_server's http url is checked against the shared ---------
+    // remote-URL policy (#804, #895), before the config is ever handed to a
+    // live fleet handle.
+
+    fn http_config(url: &str) -> desktop_assistant_mcp_client::executor::HttpTransportConfig {
+        desktop_assistant_mcp_client::executor::HttpTransportConfig {
+            url: url.to_string(),
+            auth_bearer_secret: None,
+            oauth: None,
+            oauth_account: None,
+            scopes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn validate_mcp_http_config_rejects_a_plain_http_url_to_a_public_host() {
+        let err = validate_mcp_http_config(&http_config("http://evil.example.com/mcp"))
+            .expect_err("plain http to a public host must be refused");
+        match err {
+            CoreError::InvalidInput { code, message, .. } => {
+                assert_eq!(code, "url_insecure_scheme");
+                assert!(
+                    !message.is_empty(),
+                    "the refusal must carry a user-facing message"
+                );
+            }
+            other => panic!("expected CoreError::InvalidInput, got {other}"),
+        }
+    }
+
+    #[test]
+    fn validate_mcp_http_config_rejects_a_cloud_metadata_address() {
+        let err = validate_mcp_http_config(&http_config("http://169.254.169.254/"))
+            .expect_err("the cloud metadata address must be refused");
+        match err {
+            CoreError::InvalidInput { code, .. } => assert_eq!(code, "url_target_blocked"),
+            other => panic!("expected CoreError::InvalidInput, got {other}"),
+        }
+    }
+
+    #[test]
+    fn validate_mcp_http_config_accepts_a_loopback_http_url() {
+        validate_mcp_http_config(&http_config("http://127.0.0.1:8765/mcp"))
+            .expect("loopback http must keep working (also what httpmock tests rely on)");
+    }
+
+    #[test]
+    fn validate_mcp_http_config_accepts_a_legitimate_https_url() {
+        validate_mcp_http_config(&http_config("https://gmailmcp.googleapis.com/mcp/v1"))
+            .expect("a documented hosted https MCP endpoint must be accepted");
+    }
+
+    #[test]
+    fn validate_mcp_http_config_accepts_a_bare_hostname_with_no_credential_configured() {
+        validate_mcp_http_config(&http_config("http://internal-tool:8080/mcp"))
+            .expect("a bare hostname with no bearer/oauth configured has nothing to steal");
+    }
+
+    #[test]
+    fn validate_mcp_http_config_rejects_a_bare_hostname_when_a_bearer_secret_is_configured() {
+        let mut http = http_config("http://internal-tool:8080/mcp");
+        http.auth_bearer_secret = Some("mcp_token".to_string());
+        let err = validate_mcp_http_config(&http)
+            .expect_err("a bare hostname must be refused once a credential travels with it");
+        match err {
+            CoreError::InvalidInput { code, .. } => assert_eq!(code, "url_insecure_scheme"),
+            other => panic!("expected CoreError::InvalidInput, got {other}"),
+        }
+    }
+
+    // --- F7 (#804 review): an MCP server's inline oauth endpoints are ------
+    // checked at write time, not only the first time OAuthClient uses them.
+
+    fn oauth_config(token_url: &str) -> desktop_assistant_mcp_client::executor::OAuthServerConfig {
+        desktop_assistant_mcp_client::executor::OAuthServerConfig {
+            client_id: "client-id".to_string(),
+            token_url: token_url.to_string(),
+            refresh_token_ref: "refresh_token".to_string(),
+            client_secret_ref: None,
+            authorize_url: None,
+            scopes: Vec::new(),
+            account: None,
+            refresh_skew_seconds: None,
+        }
+    }
+
+    #[test]
+    fn validate_mcp_inline_oauth_endpoints_rejects_a_plain_http_token_url() {
+        let mut http = http_config("https://mcp.example.com/mcp");
+        http.oauth = Some(oauth_config("http://evil.example.com/token"));
+        let err = validate_mcp_inline_oauth_endpoints(&http)
+            .expect_err("a plain http token endpoint must be refused");
+        match err {
+            CoreError::InvalidInput { code, .. } => assert_eq!(code, "url_oauth_endpoint_insecure"),
+            other => panic!("expected CoreError::InvalidInput, got {other}"),
+        }
+    }
+
+    #[test]
+    fn validate_mcp_inline_oauth_endpoints_rejects_a_plain_http_authorize_url() {
+        let mut http = http_config("https://mcp.example.com/mcp");
+        let mut oauth = oauth_config("https://oauth2.example.com/token");
+        oauth.authorize_url = Some("http://evil.example.com/authorize".to_string());
+        http.oauth = Some(oauth);
+        let err = validate_mcp_inline_oauth_endpoints(&http)
+            .expect_err("a plain http authorize endpoint must be refused");
+        match err {
+            CoreError::InvalidInput { code, .. } => assert_eq!(code, "url_oauth_endpoint_insecure"),
+            other => panic!("expected CoreError::InvalidInput, got {other}"),
+        }
+    }
+
+    #[test]
+    fn validate_mcp_inline_oauth_endpoints_accepts_https_endpoints() {
+        let mut http = http_config("https://mcp.example.com/mcp");
+        let mut oauth = oauth_config("https://oauth2.example.com/token");
+        oauth.authorize_url = Some("https://oauth2.example.com/authorize".to_string());
+        http.oauth = Some(oauth);
+        validate_mcp_inline_oauth_endpoints(&http).expect("https oauth endpoints must be accepted");
+    }
+
+    #[test]
+    fn validate_mcp_inline_oauth_endpoints_accepts_a_server_with_no_oauth_block() {
+        validate_mcp_inline_oauth_endpoints(&http_config("https://mcp.example.com/mcp"))
+            .expect("a server with no oauth block has nothing to check");
+    }
+
+    /// #804 review: the four call sites through the shared policy were all
+    /// verified except this one — `validate_mcp_http_config`'s caller inside
+    /// `upsert_mcp_server` was never itself exercised, so a dropped `?` on
+    /// that call would have gone unnoticed. Drive the public command, not
+    /// the private helper, to close that gap.
+    ///
+    /// `McpToolExecutor::new` is a pure in-memory constructor (no spawn, no
+    /// file I/O — `executor::tests::upsert_server_adds_then_replaces_by_name`
+    /// relies on the same fact), so this needs no filesystem or process
+    /// fixture. The bad URL is refused before `upsert_mcp_server` ever
+    /// reaches its `default_config_path()` service-account read, so this
+    /// test touches no real path either.
+    #[tokio::test]
+    async fn upsert_mcp_server_rejects_a_plain_http_url_to_a_public_host() {
+        let handle = desktop_assistant_mcp_client::executor::McpToolExecutor::new(Vec::new())
+            .control_handle();
+        let service = DaemonSettingsService::new(PathBuf::from(
+            "/nonexistent/desktop-assistant-upsert-mcp-test.toml",
+        ))
+        .with_mcp_control(handle);
+
+        let config = desktop_assistant_mcp_client::executor::McpServerConfig {
+            name: "evil".to_string(),
+            command: String::new(),
+            args: Vec::new(),
+            namespace: None,
+            enabled: true,
+            env: std::collections::HashMap::new(),
+            env_secrets: std::collections::HashMap::new(),
+            inherit_env: Vec::new(),
+            http: Some(http_config("http://evil.example.com/mcp")),
+            description: None,
+        };
+        let config_json = serde_json::to_string(&config).expect("config serializes");
+
+        let err = service
+            .upsert_mcp_server(config_json)
+            .await
+            .expect_err("a plain http url to a public host must be refused");
+        match err {
+            CoreError::InvalidInput { code, .. } => assert_eq!(code, "url_insecure_scheme"),
+            other => panic!("expected CoreError::InvalidInput, got {other}"),
+        }
+    }
+
+    /// Second-pass review: `157a6da` closed the discarded-`Result` gap for
+    /// `validate_mcp_http_config` and, in the same edit, added
+    /// `validate_mcp_inline_oauth_endpoints(http)?;` directly beneath it with
+    /// the identical shape — but every test for that function called it
+    /// directly, so nothing drove it through `upsert_mcp_server` the way the
+    /// sibling test above does for the URL check. Mutating that call site to
+    /// `let _ = validate_mcp_inline_oauth_endpoints(http);` left the whole
+    /// daemon suite green before this test existed; confirmed, then reverted.
+    ///
+    /// The server's own `url` here is a valid `https://` endpoint, so
+    /// `validate_mcp_http_config` passes and execution actually reaches the
+    /// oauth-endpoint check this test targets.
+    #[tokio::test]
+    async fn upsert_mcp_server_rejects_a_plain_http_inline_oauth_token_url() {
+        let handle = desktop_assistant_mcp_client::executor::McpToolExecutor::new(Vec::new())
+            .control_handle();
+        let service = DaemonSettingsService::new(PathBuf::from(
+            "/nonexistent/desktop-assistant-upsert-mcp-oauth-test.toml",
+        ))
+        .with_mcp_control(handle);
+
+        let mut http = http_config("https://mcp.example.com/mcp");
+        http.oauth = Some(oauth_config("http://evil.example.com/token"));
+        let config = desktop_assistant_mcp_client::executor::McpServerConfig {
+            name: "evil-oauth".to_string(),
+            command: String::new(),
+            args: Vec::new(),
+            namespace: None,
+            enabled: true,
+            env: std::collections::HashMap::new(),
+            env_secrets: std::collections::HashMap::new(),
+            inherit_env: Vec::new(),
+            http: Some(http),
+            description: None,
+        };
+        let config_json = serde_json::to_string(&config).expect("config serializes");
+
+        let err = service
+            .upsert_mcp_server(config_json)
+            .await
+            .expect_err("a plain http oauth token_url must be refused");
+        match err {
+            CoreError::InvalidInput { code, .. } => {
+                assert_eq!(code, "url_oauth_endpoint_insecure")
+            }
+            other => panic!("expected CoreError::InvalidInput, got {other}"),
+        }
     }
 
     /// A path that does not exist resolves to the daemon's default config, whose

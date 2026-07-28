@@ -209,6 +209,36 @@ impl ConnectionConfig {
         }
     }
 
+    /// This connection's endpoint override, if it set one. Every connector
+    /// carries the field; `None` means "use the connector's own hosted
+    /// default", which is never client-controlled and so needs no
+    /// validation.
+    pub fn base_url(&self) -> Option<&str> {
+        match self {
+            Self::Anthropic(c) => c.base_url.as_deref(),
+            Self::OpenAi(c) => c.base_url.as_deref(),
+            Self::OpenRouter(c) => c.base_url.as_deref(),
+            Self::Azure(c) => c.base_url.as_deref(),
+            Self::Google(c) => c.base_url.as_deref(),
+            Self::Bedrock(c) => c.base_url.as_deref(),
+            Self::Ollama(c) => c.base_url.as_deref(),
+        }
+    }
+
+    /// Whether requests through this connection carry a per-request
+    /// credential (an API key header, a bearer token, or Bedrock's
+    /// SigV4-signed request) that a hijacked `base_url` resolution could
+    /// expose. Connector-typed, not based on whether a key happens to be
+    /// configured *yet*: a connector that is meant to carry one gets the
+    /// stricter URL-policy rule (`url_policy::RequestCredential`) even
+    /// before its first `SetConnectionSecret` — waiting for the first
+    /// credential write would let an operator's very first save of a
+    /// malicious `base_url` through. Ollama is the only connector with no
+    /// credential concept at all.
+    pub fn carries_credential(&self) -> bool {
+        !matches!(self, Self::Ollama(_))
+    }
+
     /// Set (or clear, with `None`) this connection's secret-store coordinate.
     ///
     /// Only credential-bearing connectors carry a `secret` field. Ollama talks

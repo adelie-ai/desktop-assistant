@@ -85,6 +85,9 @@ pub fn set_llm_settings(
     config.llm.top_p = top_p;
     config.llm.max_tokens = max_tokens;
     config.llm.hosted_tool_search = hosted_tool_search;
+    if let Some(base_url) = config.llm.base_url.as_deref() {
+        constrain_settings_base_url(base_url, Some(config.llm.connector.as_str()))?;
+    }
 
     save_daemon_config(path, &config)
 }
@@ -145,6 +148,32 @@ pub fn get_embeddings_settings_view(path: &Path) -> anyhow::Result<EmbeddingsSet
     Ok(resolved)
 }
 
+/// Validate a legacy-settings `base_url` against the shared remote-URL
+/// policy (#804, #895 review): the same URL a hosted connector's API key,
+/// or a self-hosted one's bearer token, is sent to.
+///
+/// Skipped for Bedrock. `docs/development.md` documents `base_url` there as
+/// dual-use for this legacy single-block settings shape: an AWS region
+/// string (`us-east-1`) or a real endpoint URL. Parsing a bare region as a
+/// URL would reject a working config, and there is no way to tell which one
+/// the caller meant from the string alone. The named-connections model
+/// (`constrain_base_url` in `api_surface.rs`) does not have this ambiguity —
+/// `BedrockConnection` carries `region` and `base_url` as separate fields —
+/// so it validates unconditionally.
+fn constrain_settings_base_url(base_url: &str, connector: Option<&str>) -> anyhow::Result<()> {
+    let typed = connector.map(parse_connector_or_openai);
+    if typed == Some(Connector::Bedrock) {
+        return Ok(());
+    }
+    let credential = if typed == Some(Connector::Ollama) {
+        desktop_assistant_mcp_client::url_policy::RequestCredential::None
+    } else {
+        desktop_assistant_mcp_client::url_policy::RequestCredential::Attached
+    };
+    desktop_assistant_mcp_client::url_policy::validate_remote_url(base_url, credential)
+        .map_err(|e| anyhow!("{}: {}", e.user_message(), e))
+}
+
 pub fn set_embeddings_settings(
     path: &Path,
     connector: Option<&str>,
@@ -159,6 +188,9 @@ pub fn set_embeddings_settings(
         .map(|v| v.to_lowercase());
     config.embeddings.model = normalize_optional_value(model);
     config.embeddings.base_url = normalize_optional_value(base_url);
+    if let Some(base_url) = config.embeddings.base_url.as_deref() {
+        constrain_settings_base_url(base_url, config.embeddings.connector.as_deref())?;
+    }
 
     save_daemon_config(path, &config)
 }
@@ -178,6 +210,14 @@ pub fn set_persistence_settings(
     let mut config = load_daemon_config(path)?.unwrap_or_default();
 
     config.persistence.git.enabled = enabled;
+    // #804/#895 review (deliberately not validated here, recorded rather than
+    // silent): `remote_url` is a git remote, which also accepts `ssh://`,
+    // `git://`, the SCP-like `user@host:path` shorthand, and local paths -
+    // `url_policy`'s http(s)-only scheme allowlist would reject all of those
+    // and break a working install. A plain-http remote with a credential in
+    // its userinfo (`http://user:token@host/repo.git`) still leaks that
+    // credential in the clear; tracked as a git-remote-shaped follow-up in #991
+    // rather than forced into this shape.
     config.persistence.git.remote_url = normalize_optional_value(remote_url);
     config.persistence.git.remote_name = remote_name
         .map(str::trim)
@@ -269,6 +309,9 @@ pub fn set_backend_tasks_settings(
         llm.connector = connector.to_lowercase();
         llm.model = normalize_optional_value(llm_model);
         llm.base_url = normalize_optional_value(llm_base_url);
+        if let Some(base_url) = llm.base_url.as_deref() {
+            constrain_settings_base_url(base_url, Some(connector))?;
+        }
         config.backend_tasks.llm = Some(llm);
     } else {
         config.backend_tasks.llm = None;

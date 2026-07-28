@@ -87,6 +87,23 @@ pub enum CoreError {
     /// is the user's explicit signal to stop.
     #[error("operation cancelled")]
     Cancelled,
+
+    /// A rules-based refusal of a value the caller supplied: the request was
+    /// understood, but a fixed rule refuses it, so retrying the identical
+    /// input cannot succeed (base rule 8.2 — a decline, not a failure).
+    ///
+    /// `code` is a stable, machine-readable identifier a transport adapter
+    /// mirrors onto the wire's own classification (`api::ErrorCode::Other`)
+    /// rather than inventing a second shape; `message` is fit to show the
+    /// person who supplied the input. Today only the shared remote-URL
+    /// policy (#804, #895) raises this; a general reclassification of the
+    /// string-carrying variants above is tracked separately (#972).
+    #[error("{description}")]
+    InvalidInput {
+        code: &'static str,
+        description: String,
+        message: String,
+    },
 }
 
 #[cfg(test)]
