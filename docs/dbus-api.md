@@ -73,7 +73,7 @@ writes, and the MCP writes. Reads, conversations, and personality are unaffected
 A refusal reaches D-Bus as an `org.freedesktop.DBus.Error.Failed` whose message
 begins `not authorized:` and names the command. The structured classification
 the socket transports carry (`detail.code = "not_authorized"`) does not survive
-the D-Bus error type, which carries only a name and a message. See
+the D-Bus error type, which carries only a name and a message (#974). See
 [API_TRANSPORT.md](API_TRANSPORT.md) for the full contract.
 
 ## Signals

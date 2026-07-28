@@ -119,9 +119,8 @@ pub fn capability_for_local_peer(peer_uid: u32, daemon_uid: u32) -> Capability {
 ///   (design decisions 8 and 9). Writing them is administration.
 /// - Reading operator settings stays tenant because the credentials they used
 ///   to carry are now redacted on the way out (#727) and the same values reach
-///   every client through `GetConfig`. Tightening the reads is tracked
-///   separately; it needs `Config` itself partitioned, which is decision 1's
-///   per-user override layer.
+///   every client through `GetConfig`. Tightening the reads needs `Config`
+///   itself partitioned, which is decision 1's per-user override layer (#973).
 /// - Conversation, knowledge, scratchpad and background-task commands are all
 ///   scoped to the calling user by `with_user_id`, so they are tenant work even
 ///   when they delete data. `ClearAllHistory` clears the caller's own

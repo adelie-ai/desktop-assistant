@@ -146,7 +146,7 @@ still open, for two reasons: the credentials they used to carry are redacted on 
 out (#727), and the same values reach every client through `GetConfig`, which every
 settings panel and the personality surface already read. Gating the reads coherently
 means partitioning `Config` itself, which is decision 1's per-user override layer.
-Tracked separately rather than half-done here.
+Tracked as #973 rather than half-done here.
 
 ## Consequences
 

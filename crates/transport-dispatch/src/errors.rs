@@ -24,8 +24,8 @@
 //! `Display` output is exactly what this project forbids. Classifying those
 //! declines - the config-load refusal and the in-use connection refusal among
 //! them - needs `CoreError`'s variants carried across the `ApiError` boundary
-//! first. Tracked separately; until then an unclassified frame is honest about
-//! being unclassified rather than mislabelled.
+//! first (#972). Until then an unclassified frame is honest about being
+//! unclassified rather than mislabelled.
 
 use desktop_assistant_api_model as api;
 use desktop_assistant_application::ApiError;
