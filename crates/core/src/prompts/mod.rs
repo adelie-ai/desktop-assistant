@@ -599,6 +599,117 @@ mod tests {
         );
     }
 
+    // --- Narration (#944) --------------------------------------------------
+
+    /// Header of the narration section. Used to locate the section inside the
+    /// assembled prompt so an assertion cannot be satisfied by wording that
+    /// lives in another section.
+    const NARRATION_HEADER: &str = "== Telling the user what is happening ==";
+
+    /// The narration section as assembled, or an empty string when the section
+    /// is absent. An empty return fails every `contains` below, so a dropped
+    /// section fails the test rather than passing it vacuously.
+    fn narration_section(assembled: &str) -> String {
+        let Some((_, after)) = assembled.split_once(NARRATION_HEADER) else {
+            return String::new();
+        };
+        match after.split_once("\n== ") {
+            Some((section, _)) => section.to_string(),
+            None => after.to_string(),
+        }
+    }
+
+    #[test]
+    fn the_prompt_asks_the_model_to_report_findings() {
+        // The prompt sold begin_step as a planning and context-compaction
+        // device and never said that reporting what the work turned up is
+        // worth doing (#944). The always-present prompt must carry that
+        // guidance, and a section reshuffle must not drop it silently.
+        let assembled = assemble(&static_sections());
+        assert!(
+            assembled.contains(NARRATION_HEADER),
+            "the assembled prompt must carry the narration section"
+        );
+        let section = narration_section(&assembled);
+        assert!(
+            section.contains("What you found, and what it changed"),
+            "the section must ask for findings, not only for plans: {section}"
+        );
+        assert!(
+            section.contains("complete_step"),
+            "and point at the outcome that already records them: {section}"
+        );
+        assert!(
+            section.contains("whether or not a person is watching"),
+            "findings are worth saying in both modes: {section}"
+        );
+        assert!(
+            section.contains("the whole record"),
+            "and are the record itself when nobody is watching: {section}"
+        );
+    }
+
+    #[test]
+    fn the_prompt_scopes_about_to_do_narration_to_a_watching_user() {
+        // The other half of the split (#940): "what I am about to do" is
+        // reassurance. It earns its tokens while somebody waits and earns
+        // nothing in a headless run, so the prompt must scope it rather than
+        // asking for blanket narration.
+        let section = narration_section(&assemble(&static_sections()));
+        assert!(
+            section.contains("What you are about to do"),
+            "the section must name the about-to-do half: {section}"
+        );
+        assert!(
+            section.contains("when a person is waiting"),
+            "and scope it to a turn somebody is watching: {section}"
+        );
+        assert!(
+            section.contains("reassurance"),
+            "and say what it is for: {section}"
+        );
+        assert!(
+            section.contains("subagent"),
+            "and name a case with nobody waiting: {section}"
+        );
+    }
+
+    #[test]
+    fn the_prompt_leaves_per_tool_reporting_out_of_narration() {
+        // #266 rejected a line per tool call, and #941 now covers per-tool
+        // visibility daemon-side. The section must say so, so a later edit
+        // cannot quietly turn narration into a running commentary.
+        let section = narration_section(&assemble(&static_sections()));
+        assert!(
+            section.contains("Don't report every tool call"),
+            "the section must rule out a line per tool call: {section}"
+        );
+        assert!(
+            section.contains("already told which tools ran"),
+            "and say why it is unnecessary: {section}"
+        );
+        assert!(
+            section.contains("not one per call"),
+            "and set the grain at the logical step: {section}"
+        );
+    }
+
+    #[test]
+    fn the_prompt_keeps_narration_a_courtesy_not_a_requirement() {
+        // Narration is a courtesy; the daemon-side floor (#943) is what makes
+        // liveness reliable. The prompt must not turn it into a rule the model
+        // has to obey to be correct.
+        let section = narration_section(&assemble(&static_sections()));
+        assert!(
+            section.contains("a courtesy, not a rule"),
+            "the section must frame narration as a courtesy: {section}"
+        );
+        assert!(
+            section.contains("say what is going on as you work"),
+            "while still asking for it: {section}"
+        );
+    }
+
     // --- Personality (#226) ------------------------------------------------
 
     /// The fixed adaptation clause is appended to every personality blurb,
