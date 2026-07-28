@@ -231,7 +231,7 @@ impl UdsClient {
                             let _ = tx.send(Ok(result));
                         }
                     }
-                    WsFrame::Error { id, error } => {
+                    WsFrame::Error { id, error, .. } => {
                         let mut state = pending_for_reader.lock().await;
                         if let Some(tx) = state.map.remove(&id) {
                             // Per-request error: fail just that call.

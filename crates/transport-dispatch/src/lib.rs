@@ -18,6 +18,21 @@
 //! Behaviorally identical to the old `handle_socket` in `ws-interface`.
 //! Transports differ only in how they produce the stream/sink and how
 //! they validate the JWT.
+//!
+//! ## Authorization
+//!
+//! Authentication says who the connection is; the [`authz`] module says what it
+//! may do. `dispatch_loop` holds the **only** gate: every inbound request is
+//! measured against [`authz::required_capability`] before anything else happens
+//! to it, so a refused command never reaches the handler. A refusal is a
+//! rendered `WsFrame::Error`, not a disconnect - the connection keeps serving.
+//!
+//! The gate also answers the question *before* it is asked: every reply that
+//! carries the aggregate config is stamped with the caller's own capability
+//! ([`api::Config::caller_capability`]), so a settings client can render what it
+//! may not change as unavailable rather than failing on submit. The dispatcher
+//! stamps it because it is the one layer that knows the connection's capability
+//! - the settings service stays unaware of authorization entirely.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,9 +47,15 @@ use desktop_assistant_core::ports::transport::{
 use futures::sink::{Sink, SinkExt};
 use futures::stream::{Stream, StreamExt};
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
+
+pub mod authz;
+pub mod errors;
 
 pub use api::{WsFrame, WsRequest};
+pub use authz::{
+    AdminSubjects, Capability, REFUSAL_PREFIX, capability_for_local_peer, required_capability,
+};
 // Re-exported so transport adapters can name their kind without each taking a
 // direct dependency on `desktop-assistant-core` (#243).
 pub use desktop_assistant_core::domain::TransportKind;
@@ -110,6 +131,15 @@ pub struct AuthContext {
     /// per-connection state (client-local tool registration) keys on it
     /// instead of the user — two windows of the same user stay independent.
     pub session_id: String,
+    /// What this connection is allowed to do (#728). Resolved once by the
+    /// transport adapter from the kernel-attested peer uid (local) or the
+    /// operator's `[authz] admin_subjects` allowlist (remote), and enforced by
+    /// the single gate in [`dispatch_loop`].
+    ///
+    /// Defaults to [`Capability::Tenant`] on every constructor: a connection
+    /// with no resolved grant is the least-privileged one, so an adapter that
+    /// forgets to resolve a capability fails closed rather than open.
+    pub capability: Capability,
 }
 
 impl AuthContext {
@@ -125,6 +155,7 @@ impl AuthContext {
             client_label: None,
             client_context: None,
             session_id: mint_session_id(),
+            capability: Capability::Tenant,
         }
     }
 
@@ -149,8 +180,16 @@ impl AuthContext {
         self
     }
 
+    /// Attach the [`Capability`] this connection holds (#728). The transport
+    /// adapter resolves it once, at authentication time.
+    pub fn with_capability(mut self, capability: Capability) -> Self {
+        self.capability = capability;
+        self
+    }
+
     /// Convenience for tests that don't need a real subject. Defaults to the
-    /// co-located UDS transport with no system-id result.
+    /// co-located UDS transport with no system-id result, and to the
+    /// least-privileged capability.
     pub fn anonymous() -> Self {
         Self {
             user_id: "anonymous".to_string(),
@@ -159,6 +198,7 @@ impl AuthContext {
             client_label: None,
             client_context: None,
             session_id: mint_session_id(),
+            capability: Capability::Tenant,
         }
     }
 }
@@ -315,10 +355,10 @@ pub async fn dispatch_loop<R, W>(
                 // an unparseable frame; the loop keeps serving.
                 warn!("inbound frame decode error: {e}");
                 if out_tx
-                    .send(WsFrame::Error {
-                        id: String::new(),
-                        error: format!("invalid request json: {e}"),
-                    })
+                    .send(WsFrame::error(
+                        String::new(),
+                        format!("invalid request json: {e}"),
+                    ))
                     .await
                     .is_err()
                 {
@@ -329,6 +369,29 @@ pub async fn dispatch_loop<R, W>(
         };
 
         debug!(id = %req.id, "request received");
+
+        // The authorization gate (#728). This is the ONE place a capability is
+        // checked, and it runs before the command reaches the handler, so a
+        // refused command has no effect at all. A refusal is a normal-path
+        // outcome, not a failure: it is logged at info and rendered as an error
+        // frame the client can display, and the loop keeps serving.
+        let required = authz::required_capability(&req.command);
+        if !auth.capability.permits(required) {
+            let frame =
+                errors::refusal_frame(req.id.clone(), &req.command, required, auth.capability);
+            if let WsFrame::Error { error, .. } = &frame {
+                info!(
+                    id = %req.id,
+                    user = %auth.user_id,
+                    transport = ?auth.transport,
+                    "{error}"
+                );
+            }
+            if out_tx.send(frame).await.is_err() {
+                break;
+            }
+            continue;
+        }
 
         match req.command {
             api::Command::SendMessage {
@@ -489,24 +552,9 @@ pub async fn dispatch_loop<R, W>(
                             .await;
                         });
                     }
-                    Err(ApiError::Core(e)) => {
-                        if out_tx
-                            .send(WsFrame::Error {
-                                id: req.id,
-                                error: e,
-                            })
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
                     Err(e) => {
                         if out_tx
-                            .send(WsFrame::Error {
-                                id: req.id,
-                                error: e.to_string(),
-                            })
+                            .send(errors::api_error_frame(req.id, e))
                             .await
                             .is_err()
                         {
@@ -547,11 +595,7 @@ pub async fn dispatch_loop<R, W>(
                     // clean error frame so the client knows
                     // subscription is unsupported here.
                     if out_tx
-                        .send(WsFrame::Error {
-                            id: req.id,
-                            error: "background-task subscription not supported by this handler"
-                                .to_string(),
-                        })
+                        .send(errors::api_error_frame(req.id, ApiError::Unsupported))
                         .await
                         .is_err()
                     {
@@ -586,13 +630,13 @@ pub async fn dispatch_loop<R, W>(
                                      by {n} events; oldest dropped"
                                 );
                                 if out_tx_for_forwarder
-                                    .send(WsFrame::Error {
-                                        id: String::new(),
-                                        error: format!(
+                                    .send(WsFrame::error(
+                                        String::new(),
+                                        format!(
                                             "{n} events dropped (subscriber lagged); \
                                              refetch state to resync"
                                         ),
-                                    })
+                                    ))
                                     .await
                                     .is_err()
                                 {
@@ -664,6 +708,7 @@ pub async fn dispatch_loop<R, W>(
                 .await;
                 match res {
                     Ok(api::CommandResult::Config(config)) => {
+                        let config = authz::with_caller_capability(config, auth.capability);
                         if out_tx
                             .send(WsFrame::Result {
                                 id: req.id.clone(),
@@ -684,7 +729,8 @@ pub async fn dispatch_loop<R, W>(
                             break;
                         }
                     }
-                    Ok(result) => {
+                    Ok(mut result) => {
+                        authz::stamp_caller_capability(&mut result, auth.capability);
                         if out_tx
                             .send(WsFrame::Result { id: req.id, result })
                             .await
@@ -693,24 +739,9 @@ pub async fn dispatch_loop<R, W>(
                             break;
                         }
                     }
-                    Err(ApiError::Core(e)) => {
-                        if out_tx
-                            .send(WsFrame::Error {
-                                id: req.id,
-                                error: e,
-                            })
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
                     Err(e) => {
                         if out_tx
-                            .send(WsFrame::Error {
-                                id: req.id,
-                                error: e.to_string(),
-                            })
+                            .send(errors::api_error_frame(req.id, e))
                             .await
                             .is_err()
                         {
@@ -736,7 +767,10 @@ pub async fn dispatch_loop<R, W>(
                 .await;
                 let applied = res.is_ok();
                 match res {
-                    Ok(result) => {
+                    Ok(mut result) => {
+                        // `GetConfig` comes through here, so this is where an
+                        // ordinary settings read learns what it may change.
+                        authz::stamp_caller_capability(&mut result, auth.capability);
                         if out_tx
                             .send(WsFrame::Result {
                                 id: req.id.clone(),
@@ -748,24 +782,9 @@ pub async fn dispatch_loop<R, W>(
                             break;
                         }
                     }
-                    Err(ApiError::Core(e)) => {
-                        if out_tx
-                            .send(WsFrame::Error {
-                                id: req.id,
-                                error: e,
-                            })
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
                     Err(e) => {
                         if out_tx
-                            .send(WsFrame::Error {
-                                id: req.id,
-                                error: e.to_string(),
-                            })
+                            .send(errors::api_error_frame(req.id, e))
                             .await
                             .is_err()
                         {
@@ -788,7 +807,9 @@ pub async fn dispatch_loop<R, W>(
                     if let Ok(api::CommandResult::Config(config)) = config
                         && out_tx
                             .send(WsFrame::Event {
-                                event: api::Event::ConfigChanged { config },
+                                event: api::Event::ConfigChanged {
+                                    config: authz::with_caller_capability(config, auth.capability),
+                                },
                             })
                             .await
                             .is_err()

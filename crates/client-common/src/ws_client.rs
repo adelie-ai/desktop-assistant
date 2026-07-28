@@ -224,7 +224,7 @@ impl WsClient {
                             let _ = tx.send(Ok(result));
                         }
                     }
-                    WsFrame::Error { id, error } => {
+                    WsFrame::Error { id, error, .. } => {
                         if let Some(tx) = pending_for_reader.lock().await.map.remove(&id) {
                             let _ = tx.send(Err(error));
                         }
@@ -786,6 +786,7 @@ mod tests {
                 },
                 personality: api::PersonalitySettingsView::default(),
                 restart_required: Vec::new(),
+                caller_capability: None,
             },
         });
         assert!(event.is_none());

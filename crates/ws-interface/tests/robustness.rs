@@ -97,7 +97,7 @@ async fn invalid_ws_json_yields_error_frame_with_empty_id() {
         .unwrap();
     let frame: WsFrame = serde_json::from_str(msg.to_text().unwrap()).unwrap();
     match frame {
-        WsFrame::Error { id, error } => {
+        WsFrame::Error { id, error, .. } => {
             assert_eq!(id, "", "no request id is known for a malformed frame");
             assert!(
                 error.to_lowercase().contains("json") || error.to_lowercase().contains("invalid"),

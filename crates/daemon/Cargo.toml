@@ -9,6 +9,7 @@ desktop-assistant-application = { path = "../application" }
 desktop-assistant-peer-cred = { path = "../peer-cred" }
 desktop-assistant-ws = { path = "../ws-interface", features = ["tls"] }
 desktop-assistant-uds = { path = "../uds-interface" }
+desktop-assistant-transport-dispatch = { path = "../transport-dispatch" }
 desktop-assistant-core.workspace = true
 desktop-assistant-llm-anthropic.workspace = true
 desktop-assistant-llm-openai.workspace = true

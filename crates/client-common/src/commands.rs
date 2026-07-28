@@ -646,7 +646,7 @@ pub trait AssistantCommands: Send + Sync {
     async fn set_database_settings(&self, url: &str, max_connections: u32) -> Result<()> {
         let result = self
             .send_command(api::Command::SetDatabaseSettings {
-                url: url.to_string(),
+                url: url.into(),
                 max_connections,
             })
             .await?;
@@ -1255,7 +1255,7 @@ mod tests {
                 url,
                 max_connections,
             } => {
-                assert_eq!(url, "postgres://u:p@host/db");
+                assert_eq!(url.as_str(), "postgres://u:p@host/db");
                 assert_eq!(max_connections, 8);
             }
             other => panic!("expected SetDatabaseSettings, got {other:?}"),

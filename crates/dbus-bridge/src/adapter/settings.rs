@@ -302,7 +302,7 @@ impl<T: BridgeTransport + 'static> DbusSettingsAdapter<T> {
         let result = self
             .dispatch(api::Command::SetPersistenceSettings {
                 enabled,
-                remote_url: normalize(remote_url),
+                remote_url: normalize(remote_url).map(api::Secret::from),
                 remote_name: normalize(remote_name),
                 push_on_update,
             })
@@ -486,7 +486,7 @@ impl<T: BridgeTransport + 'static> DbusSettingsAdapter<T> {
     async fn set_database_settings(&self, url: &str, max_connections: u32) -> fdo::Result<()> {
         let result = self
             .dispatch(api::Command::SetDatabaseSettings {
-                url: url.to_string(),
+                url: url.into(),
                 max_connections,
             })
             .await?;
@@ -900,7 +900,7 @@ mod tests {
                 url,
                 max_connections,
             } => {
-                assert_eq!(url, "   ");
+                assert_eq!(url.as_str(), "   ");
                 assert_eq!(max_connections, 3);
             }
             other => panic!("unexpected command: {other:?}"),
@@ -1066,6 +1066,7 @@ mod tests {
             },
             personality: api::PersonalitySettingsView::default(),
             restart_required: Vec::new(),
+            caller_capability: None,
         };
         let data = config_from_wire(&wire);
         assert_eq!(data.embeddings_connector, "openai");
@@ -1200,6 +1201,7 @@ mod tests {
             },
             personality: api::PersonalitySettingsView::default(),
             restart_required: Vec::new(),
+            caller_capability: None,
         }));
         let data = settings(Arc::clone(&t)).get_config().await.unwrap();
         assert_eq!(data.embeddings_connector, "openai");

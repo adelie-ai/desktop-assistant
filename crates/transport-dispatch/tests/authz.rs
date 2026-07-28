@@ -4,9 +4,9 @@
 //! run names the unmet requirement rather than a line number.
 //!
 //! The tier has two levels. A tenant runs their own conversations, knowledge
-//! and preferences. An administrator additionally changes how the service runs
-//! - credentials, connectors, purposes, the database, the WebSocket auth
-//! posture, and which child processes the daemon spawns for MCP.
+//! and preferences. An administrator additionally changes how the service runs:
+//! credentials, connectors, purposes, the database, the WebSocket auth posture,
+//! and which child processes the daemon spawns for MCP.
 //!
 //! Adding a `Command` variant makes `required_capability` fail to compile,
 //! because that match has no wildcard arm. Add the new variant to
@@ -39,6 +39,32 @@ impl RecordingHandler {
     }
 }
 
+/// The aggregate config a settings client reads. `caller_capability` is left
+/// unset here on purpose: the settings service has no notion of a connection,
+/// so the dispatcher is what must fill it in.
+fn unstamped_config() -> api::Config {
+    api::Config {
+        embeddings: api::EmbeddingsSettingsView {
+            connector: "ollama".to_string(),
+            model: "nomic-embed-text".to_string(),
+            base_url: "http://localhost:11434".to_string(),
+            has_api_key: false,
+            available: true,
+            is_default: false,
+            health: api::EmbeddingHealth::Ok,
+        },
+        persistence: api::PersistenceSettingsView {
+            enabled: false,
+            remote_url: String::new(),
+            remote_name: "origin".to_string(),
+            push_on_update: false,
+        },
+        personality: api::PersonalitySettingsView::default(),
+        restart_required: Vec::new(),
+        caller_capability: None,
+    }
+}
+
 #[async_trait::async_trait]
 impl AssistantApiHandler for RecordingHandler {
     async fn handle_command(&self, cmd: api::Command) -> ApiResult<api::CommandResult> {
@@ -46,7 +72,12 @@ impl AssistantApiHandler for RecordingHandler {
             .lock()
             .expect("recording handler lock")
             .push(command_key(&cmd));
-        Ok(api::CommandResult::Ack)
+        match cmd {
+            api::Command::GetConfig | api::Command::SetConfig { .. } => {
+                Ok(api::CommandResult::Config(unstamped_config()))
+            }
+            _ => Ok(api::CommandResult::Ack),
+        }
     }
 
     async fn handle_send_message(
@@ -120,8 +151,12 @@ async fn assert_refused_for_tenant(command: api::Command) {
     let key = command_key(&command);
     let (frames, seen) = dispatch_as(Capability::Tenant, vec![command]).await;
     assert_eq!(frames.len(), 1, "{key}: expected exactly one frame");
-    let text = refusal(&frames[0])
-        .unwrap_or_else(|| panic!("{key}: expected an authorization refusal, got {:?}", frames[0]));
+    let text = refusal(&frames[0]).unwrap_or_else(|| {
+        panic!(
+            "{key}: expected an authorization refusal, got {:?}",
+            frames[0]
+        )
+    });
     assert!(
         text.contains(&key),
         "{key}: the refusal must name the command, got {text}"
@@ -130,6 +165,25 @@ async fn assert_refused_for_tenant(command: api::Command) {
         seen.is_empty(),
         "{key}: a refused command must not reach the handler, saw {seen:?}"
     );
+}
+
+/// How many handler calls `commands` should produce when none is refused.
+///
+/// Two dispatcher behaviours make this differ from `commands.len()`: the
+/// subscription commands are answered by the dispatcher itself and never reach
+/// the handler, and `SetWsAuthSettings` is followed by a `GetConfig` read so the
+/// reply can report what is still pending a restart (#686).
+fn expected_handler_calls(commands: &[api::Command]) -> usize {
+    commands
+        .iter()
+        .map(|command| match command {
+            api::Command::SubscribeBackgroundTasks
+            | api::Command::UnsubscribeBackgroundTasks
+            | api::Command::SubscribeConversations { .. } => 0,
+            api::Command::SetWsAuthSettings { .. } => 2,
+            _ => 1,
+        })
+        .sum()
 }
 
 /// Assert `command` is NOT refused for a tenant.
@@ -569,10 +623,7 @@ fn command_samples() -> Vec<(api::Command, Capability)> {
             },
             Tenant,
         ),
-        (
-            api::Command::RegisterClientTools { tools: vec![] },
-            Tenant,
-        ),
+        (api::Command::RegisterClientTools { tools: vec![] }, Tenant),
         (
             api::Command::ClientToolResult {
                 task_id: api::TaskId("t".to_string()),
@@ -634,7 +685,7 @@ async fn ws_subject_in_admin_subjects_is_admitted() {
     assert_eq!(allowlist.capability_for("alice"), Capability::Admin);
 
     let commands = admin_commands();
-    let expected = commands.len();
+    let expected = expected_handler_calls(&commands);
     let (frames, seen) = dispatch_as(allowlist.capability_for("alice"), commands).await;
     for frame in &frames {
         assert!(refusal(frame).is_none(), "admitted subject: {frame:?}");
@@ -883,18 +934,7 @@ async fn single_user_desktop_needs_no_authz_config() {
     assert_eq!(capability, Capability::Admin);
 
     let commands: Vec<api::Command> = command_samples().into_iter().map(|(c, _)| c).collect();
-    let expected_handler_calls = commands
-        .iter()
-        .filter(|c| {
-            // The dispatcher answers these itself; they never reach the handler.
-            !matches!(
-                c,
-                api::Command::SubscribeBackgroundTasks
-                    | api::Command::UnsubscribeBackgroundTasks
-                    | api::Command::SubscribeConversations { .. }
-            )
-        })
-        .count();
+    let expected = expected_handler_calls(&commands);
 
     let (frames, seen) = dispatch_as(capability, commands).await;
     for frame in &frames {
@@ -905,7 +945,7 @@ async fn single_user_desktop_needs_no_authz_config() {
     }
     assert_eq!(
         seen.len(),
-        expected_handler_calls,
+        expected,
         "every command must still reach the handler, saw {seen:?}"
     );
 }
@@ -927,10 +967,14 @@ async fn refused_command_returns_a_rendered_refusal_not_a_disconnect() {
     )
     .await;
 
-    assert_eq!(frames.len(), 2, "the loop must keep serving after a refusal");
+    assert_eq!(
+        frames.len(),
+        2,
+        "the loop must keep serving after a refusal"
+    );
 
     match &frames[0] {
-        api::WsFrame::Error { id, error } => {
+        api::WsFrame::Error { id, error, .. } => {
             assert_eq!(id, "req-0", "the refusal must correlate to the request");
             assert!(error.starts_with(REFUSAL_PREFIX), "got {error}");
         }
@@ -974,6 +1018,128 @@ async fn every_declared_capability_matches_the_dispatcher_gate() {
             "{} has the wrong required capability",
             command_key(&command)
         );
+    }
+}
+
+// --- discovering the capability before using it -----------------------------
+
+/// The capability the daemon reported on a `GetConfig` reply.
+async fn reported_capability(held: Capability) -> Option<api::Capability> {
+    let (frames, _) = dispatch_as(held, vec![api::Command::GetConfig]).await;
+    match frames.first() {
+        Some(api::WsFrame::Result {
+            result: api::CommandResult::Config(config),
+            ..
+        }) => config.caller_capability,
+        other => panic!("expected a config result, got {other:?}"),
+    }
+}
+
+/// An administrator is told so on the settings read it already makes, so a
+/// client can render the operator sections as editable.
+#[tokio::test]
+async fn admin_caller_is_told_it_holds_the_admin_capability() {
+    assert_eq!(
+        reported_capability(Capability::Admin).await,
+        Some(api::Capability::Admin)
+    );
+}
+
+/// A tenant is told so too, and up front - so a settings panel marks the
+/// operator sections unavailable with a reason rather than failing on submit.
+#[tokio::test]
+async fn tenant_caller_is_told_it_holds_only_the_tenant_capability() {
+    assert_eq!(
+        reported_capability(Capability::Tenant).await,
+        Some(api::Capability::Tenant)
+    );
+}
+
+/// The `ConfigChanged` event carries the same answer as the reply that caused
+/// it, so a client re-rendering from the event does not lose the verdict.
+#[tokio::test]
+async fn config_changed_event_carries_the_callers_capability() {
+    let (frames, _) = dispatch_as(
+        Capability::Admin,
+        vec![api::Command::SetConfig {
+            changes: personality_changes(),
+        }],
+    )
+    .await;
+    let event = frames
+        .iter()
+        .find_map(|frame| match frame {
+            api::WsFrame::Event {
+                event: api::Event::ConfigChanged { config },
+            } => Some(config.clone()),
+            _ => None,
+        })
+        .expect("a ConfigChanged event");
+    assert_eq!(event.caller_capability, Some(api::Capability::Admin));
+}
+
+// --- the refusal is an API response, not an error string --------------------
+
+/// A caller keys on a stable code, never on English text, and knows not to
+/// retry.
+#[tokio::test]
+async fn a_refusal_carries_the_stable_code_and_is_not_retryable() {
+    let (frames, _) = dispatch_as(
+        Capability::Tenant,
+        vec![api::Command::SetApiKey {
+            api_key: "k".to_string(),
+        }],
+    )
+    .await;
+    match frames.first() {
+        Some(api::WsFrame::Error {
+            detail: Some(detail),
+            ..
+        }) => {
+            assert_eq!(detail.code, api::ErrorCode::NotAuthorized);
+            assert_eq!(detail.code.as_str(), "not_authorized");
+            assert!(!detail.retryable, "repeating cannot change the answer");
+            assert!(!detail.message.is_empty(), "a person must be told why");
+        }
+        other => panic!("expected a classified refusal, got {other:?}"),
+    }
+}
+
+/// An older client, which knows only `{id, error}`, still parses the frame -
+/// the classification is an optional added field, not a new variant.
+#[tokio::test]
+async fn an_older_client_still_parses_a_refusal_frame() {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum LegacyWsFrame {
+        Result {
+            #[allow(dead_code)]
+            id: String,
+        },
+        Error {
+            id: String,
+            error: String,
+        },
+        Event {},
+    }
+
+    let (frames, _) = dispatch_as(
+        Capability::Tenant,
+        vec![api::Command::SetApiKey {
+            api_key: "k".to_string(),
+        }],
+    )
+    .await;
+    let json = serde_json::to_string(&frames[0]).expect("serialize");
+    match serde_json::from_str::<LegacyWsFrame>(&json).expect("an older client must still parse") {
+        LegacyWsFrame::Error { id, error } => {
+            assert_eq!(id, "req-0");
+            assert!(
+                error.starts_with(REFUSAL_PREFIX),
+                "the human string stays present and unchanged in shape: {error}"
+            );
+        }
+        _ => panic!("expected the error variant"),
     }
 }
 

@@ -562,7 +562,7 @@ async fn invalid_request_json_gets_error_frame_with_empty_id() {
         .expect("io error reading the error frame");
     let frame: api::WsFrame = serde_json::from_slice(&raw).unwrap();
     match frame {
-        api::WsFrame::Error { id, error } => {
+        api::WsFrame::Error { id, error, .. } => {
             assert_eq!(id, "", "no request id is known for a malformed frame");
             assert!(
                 error.to_lowercase().contains("json") || error.to_lowercase().contains("invalid"),
@@ -701,7 +701,7 @@ impl UdsAuthValidator for PeerCredAuth {
         peer: Option<&desktop_assistant_uds::PeerIdentity>,
     ) -> desktop_assistant_uds::UdsAuth {
         match peer {
-            Some(p) => desktop_assistant_uds::UdsAuth::Allow(
+            Some(p) => desktop_assistant_uds::UdsAuth::allow_tenant(
                 desktop_assistant_application::UserId::from(p.username.clone()),
             ),
             None => desktop_assistant_uds::UdsAuth::Reject("auth: no peer credentials".to_string()),

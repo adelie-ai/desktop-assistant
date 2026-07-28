@@ -29,11 +29,76 @@ impl Secret {
     pub fn into_inner(self) -> String {
         self.0
     }
+
+    /// Borrow the raw value. Call only at the point the value is actually used
+    /// - a `&str` no longer redacts itself.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for Secret {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for Secret {
+    fn from(value: &str) -> Self {
+        Self(value.to_string())
+    }
 }
 
 impl std::fmt::Debug for Secret {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("Secret(***)")
+    }
+}
+
+/// What a connection is allowed to do (#728).
+///
+/// Authentication says which subject a connection is; this says what that
+/// subject may do, and there are exactly two answers. A **tenant** owns their
+/// own conversations, knowledge, scratchpads, background tasks and preferences.
+/// An **administrator** additionally owns the service: provider credentials,
+/// connectors and purposes, the database, the WebSocket auth posture, and which
+/// child processes the daemon spawns for MCP.
+///
+/// The daemon resolves it per connection and reports it back on
+/// [`Config::caller_capability`], so a settings client can render the parts it
+/// may not change as unavailable instead of failing on submit. The policy that
+/// maps each [`Command`] to the capability it needs lives with the dispatcher's
+/// single gate, not here - this crate only carries the vocabulary.
+///
+/// Ordered `Tenant < Admin`, so [`Ord::max`] merges two independent grants.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Capability {
+    /// The default and the floor. Fail closed: a connection with no resolved
+    /// grant lands here.
+    #[default]
+    Tenant,
+    /// Owns the service configuration.
+    Admin,
+}
+
+impl Capability {
+    /// Whether a connection holding `self` may run a command that requires
+    /// `required`.
+    pub fn permits(self, required: Capability) -> bool {
+        match (self, required) {
+            (Capability::Admin, _) => true,
+            (Capability::Tenant, Capability::Tenant) => true,
+            (Capability::Tenant, Capability::Admin) => false,
+        }
+    }
+
+    /// Human-readable name, for a refusal message or a UI label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Capability::Tenant => "tenant",
+            Capability::Admin => "administrator",
+        }
     }
 }
 
@@ -192,7 +257,13 @@ pub enum Command {
         /// accepted only when it is exactly the redaction of the stored
         /// remote, and then keeps the stored credential; otherwise the write
         /// is refused. See [`secret_url::resolve_submitted`].
-        remote_url: Option<String>,
+        ///
+        /// A [`Secret`]: an HTTPS remote carries a token in its userinfo, and
+        /// this command is on the *write* path, where the plaintext value is
+        /// present. `Secret` is `#[serde(transparent)]`, so the wire form is a
+        /// plain string exactly as before, but a `{:?}` of the command prints
+        /// `Secret(***)` and cannot leak the token into a log line.
+        remote_url: Option<Secret>,
         remote_name: Option<String>,
         push_on_update: bool,
     },
@@ -209,15 +280,19 @@ pub enum Command {
     ///
     /// SECURITY: the returned `url` is redacted by [`secret_url`] — its
     /// password reads [`secret_url::REDACTED_PASSWORD`] and everything else
-    /// (scheme, user, host, port, database, options) is intact. This command
-    /// is reachable by any authenticated client on any transport, including a
-    /// remote WebSocket one, and the credential it would otherwise carry
-    /// belongs to the role that owns every table — a role the row-level
-    /// security backstop deliberately does not `FORCE` — so returning it would
-    /// hand any caller a way around the per-user scoping.
+    /// (scheme, user, host, port, database, options) is intact. This is a
+    /// *read*, so it stays open to a tenant on any transport, including a
+    /// remote WebSocket one; the credential it would otherwise carry belongs to
+    /// the role that owns every table — a role the row-level security backstop
+    /// deliberately does not `FORCE` — so returning it would hand any caller a
+    /// way around the per-user scoping. Writing the setting is a different
+    /// matter and needs [`Capability::Admin`] (#728).
     GetDatabaseSettings,
     /// Update database settings. An empty `url` clears it (no database
     /// configured). Mirrors the D-Bus `SetDatabaseSettings` method.
+    ///
+    /// Requires [`Capability::Admin`]: the database is service configuration,
+    /// not a tenant preference.
     SetDatabaseSettings {
         /// Empty string clears the configured URL. A url still carrying
         /// [`secret_url::REDACTED_PASSWORD`] is accepted only when it is
@@ -225,7 +300,14 @@ pub enum Command {
         /// credential rather than overwriting it with the placeholder;
         /// otherwise the write is refused. See
         /// [`secret_url::resolve_submitted`].
-        url: String,
+        ///
+        /// A [`Secret`]: a password-auth DSN carries the credential of the role
+        /// that owns every table, and this command is on the *write* path,
+        /// where the plaintext value is present. `Secret` is
+        /// `#[serde(transparent)]`, so the wire form is a plain string exactly
+        /// as before, but a `{:?}` of the command prints `Secret(***)` and
+        /// cannot leak the password into a log line.
+        url: Secret,
         max_connections: u32,
     },
 
@@ -1026,6 +1108,28 @@ pub struct Config {
     /// payload it saw before.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub restart_required: Vec<String>,
+    /// What the connection that asked for this config is allowed to do (#728).
+    ///
+    /// Stamped per connection by the dispatcher, which is the one layer that
+    /// knows the caller's capability. A settings client reads it to render the
+    /// operator-owned sections as visibly unavailable, with the reason, instead
+    /// of letting a write fail on submit - the same honest-state discipline
+    /// [`Self::restart_required`] serves.
+    ///
+    /// Three states, matching the project's capability-degradation rule:
+    ///
+    /// - `None` - the daemon did not report a capability, so it predates the
+    ///   authorization tier. A client keeps its prior behaviour and shows
+    ///   everything; the daemon would accept the writes.
+    /// - `Some(Capability::Admin)` - the caller may change service config. This
+    ///   is what a single-user desktop always sees, so nothing changes there.
+    /// - `Some(Capability::Tenant)` - the caller may not, and the client should
+    ///   say so up front.
+    ///
+    /// Additive and backward-compatible: absent on the wire when unset, so an
+    /// older client sees exactly the payload it saw before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_capability: Option<Capability>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -1978,13 +2082,157 @@ pub struct WsRequest {
     pub command: Command,
 }
 
+/// Machine-readable classification of a [`WsFrame::Error`] (#728).
+///
+/// The wire contract is the product: a caller must be able to tell "you lack
+/// permission" from "the database is down" without matching English text,
+/// because the two demand different responses (hide a panel and re-authenticate
+/// versus retry). The code is that discriminator.
+///
+/// Serializes as a plain snake-case string. [`Self::Other`] carries any code
+/// this build does not recognize, verbatim, so a daemon may add codes without
+/// breaking an older client: an unknown code deserializes into `Other` and
+/// re-serializes unchanged, instead of failing the whole frame.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(from = "String", into = "String")]
+pub enum ErrorCode {
+    /// The caller is authenticated, but does not hold the [`Capability`] this
+    /// command requires. Never retryable: repeating the request cannot change
+    /// the answer. The caller must connect as a subject that holds the
+    /// capability, or ask the operator to grant it.
+    NotAuthorized,
+    /// This daemon does not implement the command, or the handler it was routed
+    /// to has the feature switched off.
+    Unsupported,
+    /// The named entity does not exist, or does not belong to the caller. The
+    /// two are deliberately indistinguishable, so an id cannot be probed for
+    /// existence across the tenant boundary.
+    NotFound,
+    /// The targeted background task already reached a terminal state, so the
+    /// requested transition no longer applies.
+    AlreadyTerminal,
+    /// A code this build does not recognize. Only produced on deserialize.
+    Other(String),
+}
+
+impl ErrorCode {
+    /// The stable wire string. Callers key on this, never on the message.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::NotAuthorized => "not_authorized",
+            Self::Unsupported => "unsupported",
+            Self::NotFound => "not_found",
+            Self::AlreadyTerminal => "already_terminal",
+            Self::Other(code) => code,
+        }
+    }
+}
+
+impl From<String> for ErrorCode {
+    fn from(value: String) -> Self {
+        match value.as_str() {
+            "not_authorized" => Self::NotAuthorized,
+            "unsupported" => Self::Unsupported,
+            "not_found" => Self::NotFound,
+            "already_terminal" => Self::AlreadyTerminal,
+            _ => Self::Other(value),
+        }
+    }
+}
+
+impl From<ErrorCode> for String {
+    fn from(value: ErrorCode) -> Self {
+        match value {
+            ErrorCode::Other(code) => code,
+            known => known.as_str().to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for ErrorCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Structured detail attached to a [`WsFrame::Error`], so a caller can act on a
+/// failure programmatically rather than by reading prose.
+///
+/// The transport frame already says whether the request succeeded
+/// ([`WsFrame::Result`]) or not ([`WsFrame::Error`]), so this carries only what
+/// that split cannot: the stable [`ErrorCode`], a developer-facing
+/// `description`, a `message` fit to show a person, and whether repeating the
+/// request could plausibly succeed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ErrorDetail {
+    /// Stable, machine-readable classification. The field a caller branches on.
+    pub code: ErrorCode,
+    /// Developer-facing explanation, for logs and bug reports. May name the
+    /// command and the missing capability; never carries the request payload,
+    /// so a refused credential write cannot echo the credential.
+    pub description: String,
+    /// Text fit to show the person using the client.
+    pub message: String,
+    /// Whether repeating the identical request could plausibly succeed. A
+    /// business decline (an authorization refusal, a missing entity) is
+    /// `false`; a transient technical failure is `true`.
+    pub retryable: bool,
+}
+
 /// WebSocket frames sent from server to client.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum WsFrame {
-    Result { id: String, result: CommandResult },
-    Error { id: String, error: String },
-    Event { event: Event },
+    Result {
+        id: String,
+        result: CommandResult,
+    },
+    Error {
+        id: String,
+        /// Human-readable failure text. Frozen: every client renders it, so it
+        /// stays present and stays the same shape whether or not `detail` is.
+        error: String,
+        /// Structured classification of this failure (#728).
+        ///
+        /// An **optional addition**, exactly like `UdsHandshake::system_id`:
+        /// `#[serde(default, skip_serializing_if = "Option::is_none")]` keeps
+        /// the wire bytes byte-identical to the old `{"error": {...}}` shape
+        /// when it is absent, and an older client ignores the extra field. A
+        /// new *variant* would have broken every existing client, because serde
+        /// refuses an unknown enum variant; an extra field it simply ignores.
+        ///
+        /// `None` means this daemon did not classify the failure - either it
+        /// predates the field, or the error crossed a boundary that lost its
+        /// structure. A caller must treat an absent detail as "unclassified",
+        /// never as "not an authorization problem".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<ErrorDetail>,
+    },
+    Event {
+        event: Event,
+    },
+}
+
+impl WsFrame {
+    /// An unclassified failure: the historical shape, message only.
+    pub fn error(id: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::Error {
+            id: id.into(),
+            error: message.into(),
+            detail: None,
+        }
+    }
+
+    /// A classified failure or decline. The frame's `error` text is the
+    /// detail's `description`, so a client that reads only the string sees the
+    /// same explanation it always did.
+    pub fn declined(id: impl Into<String>, detail: ErrorDetail) -> Self {
+        Self::Error {
+            id: id.into(),
+            error: detail.description.clone(),
+            detail: Some(detail),
+        }
+    }
 }
 
 /// The first frame on a UDS connection: the JWT plus, optionally, the client's
@@ -2081,6 +2329,129 @@ pub fn decode_client_context(value: &str) -> Option<ClientContext> {
 mod tests {
     use super::*;
 
+    // --- structured error frames (#728) ------------------------------------
+
+    /// The classification is an optional *field*, not a new `WsFrame` variant:
+    /// serde refuses an unknown variant but ignores an unknown field, so this
+    /// is the only shape an older client survives.
+    #[test]
+    fn an_unclassified_error_frame_is_byte_identical_to_the_old_shape() {
+        let frame = WsFrame::error("req-1", "boom");
+        assert_eq!(
+            serde_json::to_string(&frame).unwrap(),
+            r#"{"error":{"id":"req-1","error":"boom"}}"#,
+            "an absent detail must not appear on the wire"
+        );
+
+        // And an old payload still deserializes.
+        let legacy: WsFrame =
+            serde_json::from_str(r#"{"error":{"id":"req-1","error":"boom"}}"#).unwrap();
+        assert_eq!(legacy, frame);
+    }
+
+    /// A client that knows only `{id, error}` parses a classified frame, and
+    /// still gets a readable message.
+    #[test]
+    fn an_older_client_parses_a_classified_error_frame() {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum LegacyWsFrame {
+            Result {
+                #[allow(dead_code)]
+                id: String,
+            },
+            Error {
+                id: String,
+                error: String,
+            },
+            Event {},
+        }
+
+        let frame = WsFrame::declined(
+            "req-1",
+            ErrorDetail {
+                code: ErrorCode::NotAuthorized,
+                description: "not authorized: 'set_api_key' requires the administrator capability"
+                    .to_string(),
+                message: "Only a daemon administrator can do that.".to_string(),
+                retryable: false,
+            },
+        );
+        let json = serde_json::to_string(&frame).unwrap();
+        match serde_json::from_str::<LegacyWsFrame>(&json).expect("older client parses") {
+            LegacyWsFrame::Error { id, error } => {
+                assert_eq!(id, "req-1");
+                assert!(error.contains("set_api_key"), "{error}");
+            }
+            _ => panic!("expected the error variant"),
+        }
+    }
+
+    /// A code this build does not know deserializes into `Other` and
+    /// re-serializes unchanged, so a newer daemon may add codes without
+    /// breaking an older client's parse of the whole frame.
+    #[test]
+    fn an_unknown_error_code_round_trips_instead_of_failing_the_frame() {
+        let json = r#"{"error":{"id":"1","error":"x","detail":{"code":"quota_exhausted","description":"d","message":"m","retryable":true}}}"#;
+        let frame: WsFrame = serde_json::from_str(json).expect("unknown codes must not fail");
+        match &frame {
+            WsFrame::Error {
+                detail: Some(detail),
+                ..
+            } => {
+                assert_eq!(detail.code, ErrorCode::Other("quota_exhausted".to_string()));
+                assert_eq!(detail.code.as_str(), "quota_exhausted");
+            }
+            other => panic!("expected a classified error, got {other:?}"),
+        }
+        assert_eq!(serde_json::to_string(&frame).unwrap(), json);
+    }
+
+    /// The known codes are the stable strings a caller branches on.
+    #[test]
+    fn error_codes_have_stable_wire_strings() {
+        for (code, wire) in [
+            (ErrorCode::NotAuthorized, "not_authorized"),
+            (ErrorCode::Unsupported, "unsupported"),
+            (ErrorCode::NotFound, "not_found"),
+            (ErrorCode::AlreadyTerminal, "already_terminal"),
+        ] {
+            assert_eq!(code.as_str(), wire);
+            assert_eq!(serde_json::to_string(&code).unwrap(), format!("\"{wire}\""));
+            assert_eq!(
+                serde_json::from_str::<ErrorCode>(&format!("\"{wire}\"")).unwrap(),
+                code
+            );
+        }
+    }
+
+    /// The caller's capability is an optional addition too: absent on the wire
+    /// when unset, so an older client sees the payload it always saw.
+    #[test]
+    fn caller_capability_is_an_optional_addition_to_config() {
+        let mut cfg = config_fixture(Vec::new());
+        assert!(
+            !serde_json::to_string(&cfg)
+                .unwrap()
+                .contains("caller_capability"),
+            "an unset capability must not appear on the wire"
+        );
+
+        cfg.caller_capability = Some(Capability::Admin);
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains(r#""caller_capability":"admin""#), "{json}");
+        let back: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.caller_capability, Some(Capability::Admin));
+    }
+
+    #[test]
+    fn a_capability_ordering_lets_the_higher_grant_win() {
+        assert!(Capability::Admin.permits(Capability::Tenant));
+        assert!(!Capability::Tenant.permits(Capability::Admin));
+        assert_eq!(Capability::Tenant.max(Capability::Admin), Capability::Admin);
+        assert_eq!(Capability::default(), Capability::Tenant);
+    }
+
     // --- credential-carrying write commands (#899) -------------------------
 
     /// A plaintext DSN on the write path must not print through `Debug`. The
@@ -2123,7 +2494,8 @@ mod tests {
     /// source-only change: the wire form older clients send is unchanged.
     #[test]
     fn secret_dsn_fields_keep_their_wire_form() {
-        let db_json = r#"{"set_database_settings":{"url":"postgres://u:p@h/d","max_connections":5}}"#;
+        let db_json =
+            r#"{"set_database_settings":{"url":"postgres://u:p@h/d","max_connections":5}}"#;
         let db: Command = serde_json::from_str(db_json).expect("legacy database payload parses");
         assert_eq!(
             db,
@@ -3669,6 +4041,7 @@ mod tests {
             },
             personality: PersonalitySettingsView::default(),
             restart_required: Vec::new(),
+            caller_capability: None,
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let back: Config = serde_json::from_str(&json).unwrap();
@@ -3698,6 +4071,7 @@ mod tests {
             },
             personality: PersonalitySettingsView::default(),
             restart_required,
+            caller_capability: None,
         }
     }
 

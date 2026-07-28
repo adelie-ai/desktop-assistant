@@ -160,6 +160,48 @@ pub struct DaemonConfig {
     /// defaults (parent-wake on).
     #[serde(default, skip_serializing_if = "SubagentsConfig::is_default")]
     pub subagents: SubagentsConfig,
+    /// `[authz]` — who may administer this daemon from a remote transport
+    /// (#728). Absent section => nobody, which is what a single-user desktop
+    /// always wants: the local peer is an administrator by construction, so the
+    /// desktop never learns this section exists.
+    #[serde(default, skip_serializing_if = "AuthzConfig::is_default")]
+    pub authz: AuthzConfig,
+}
+
+/// `[authz]` configuration: the operator's remote-administrator allowlist.
+///
+/// The daemon grants administration two ways. A Unix-socket peer whose
+/// kernel-attested uid equals the daemon's own is an administrator by
+/// construction - unforgeable, and needing no configuration. Everyone else,
+/// including every WebSocket client, is a tenant unless named here.
+///
+/// This section is **file-only by design**. No command writes it, because a
+/// tenant must never be able to grant themselves the capability they are being
+/// denied. Change it by editing `daemon.toml` and restarting the daemon; the
+/// value is read once, into the transport validators, at startup.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AuthzConfig {
+    /// Authenticated subjects granted the administrator capability. A subject
+    /// is the JWT `sub` on a WebSocket connection, and the peer's login name on
+    /// a Unix socket. Empty by default: fail closed.
+    #[serde(default)]
+    pub admin_subjects: Vec<String>,
+}
+
+impl AuthzConfig {
+    /// Whether this equals the default section, so an unconfigured daemon never
+    /// writes an `[authz]` table into `daemon.toml`.
+    fn is_default(&self) -> bool {
+        self.admin_subjects.is_empty()
+    }
+}
+
+impl From<&AuthzConfig> for desktop_assistant_transport_dispatch::AdminSubjects {
+    /// Build the runtime allowlist the transports consult. Blank entries are
+    /// dropped there, so a stray line in the file admits nobody.
+    fn from(config: &AuthzConfig) -> Self {
+        Self::new(&config.admin_subjects)
+    }
 }
 
 /// `[subagents]` configuration: multi-agent behaviour knobs.
@@ -4430,9 +4472,11 @@ admin_subjects = ["operator", "ops-oncall"]
             std::fs::create_dir_all(&dir).expect("create temp dir");
             let path = dir.join("daemon.toml");
 
-            let mut cfg = DaemonConfig::default();
-            cfg.authz = AuthzConfig {
-                admin_subjects: vec!["operator".to_string()],
+            let cfg = DaemonConfig {
+                authz: AuthzConfig {
+                    admin_subjects: vec!["operator".to_string()],
+                },
+                ..DaemonConfig::default()
             };
             save_daemon_config(&path, &cfg).expect("write config");
 
