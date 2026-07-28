@@ -103,6 +103,11 @@ enabled = false
 # client's settings UI. The subject is the JWT `sub`: the login username for the
 # built-in /login door, or the subject your OIDC provider issues.
 #
+# Name the real subject. `"default"` is the storage schema's own sentinel rather
+# than a person, and the daemon drops it from this list with a warning: a token
+# that named nobody used to resolve to it, so admitting it here would have
+# promoted every such connection.
+#
 # [authz]
 # admin_subjects = ["operator"]
 

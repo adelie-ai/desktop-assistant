@@ -144,7 +144,9 @@ WebSocket auth uses bearer JWTs:
 - Connect to `/ws` with `Authorization: Bearer <token>`.
 - Tokens are locally signed by the daemon and multiple tokens can coexist until expiry.
 - The token's `sub` is the account `/login` authenticated, and that is the user
-  identity the daemon scopes the connection's stored data by.
+  identity the daemon scopes the connection's stored data by. A token with no
+  `sub` names nobody, so `/ws` refuses it with `401` rather than filing the
+  connection under the shared `"default"` identity.
 
 To enable HTTP login:
 
@@ -157,10 +159,17 @@ Then call `POST /login` with Basic auth (`alice:change-me`) to mint a bearer tok
 for `alice`.
 
 Default login behavior:
-- Local Linux host (non-container): `/login` authenticates against the current OS user password
-  and current OS username.
-- Container/remote: set `DESKTOP_ASSISTANT_WS_LOGIN_PASSWORD` (and optional username) for env-based auth.
-- Override local-mode detection with `DESKTOP_ASSISTANT_WS_LOGIN_LOCAL_SYSTEM_AUTH=true|false`.
+- Loopback bind, no container, no static password: `/login` authenticates against
+  the current OS user password and current OS username (through PAM).
+- Any other bind address, or a container: that mode is **off**. Set
+  `DESKTOP_ASSISTANT_WS_LOGIN_PASSWORD` (and optional username) for env-based
+  auth, which is the right mode for anything reachable over a network.
+- `DESKTOP_ASSISTANT_WS_LOGIN_LOCAL_SYSTEM_AUTH=true` turns the OS-password mode
+  on deliberately, including past loopback; `=false` turns it off everywhere.
+  Leaving it unset lets the bind address decide.
+- `/login` throttles failed attempts per source address and per username, and
+  answers `429` with `Retry-After` once the budget is spent. See
+  `docs/WEBSOCKET_API.md`.
 
 TUI transport defaults to WebSocket and can be configured:
 

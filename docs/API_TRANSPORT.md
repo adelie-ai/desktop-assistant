@@ -64,6 +64,14 @@ If settings later grow significantly, introduce `ListConfigSchema` and move to a
 Authentication says which subject a connection is. Authorization says what that
 subject may do, and there are two levels.
 
+Because the subject now decides an authorization outcome, a connection that
+cannot be given one is refused rather than given a fallback. A bearer token that
+validates but carries no `sub` claim (or a blank one) is rejected on both the
+WebSocket door and the UDS token fallback, instead of resolving to the storage
+sentinel `"default"`. That sentinel is also not admissible to
+`[authz] admin_subjects`: it names a schema default, not a person, and putting
+it on the list would have promoted every subject-less connection.
+
 - **Tenant** - the caller's own conversations, knowledge, scratchpads,
   background tasks and preferences.
 - **Administrator** - additionally the service itself: provider credentials,
@@ -183,9 +191,15 @@ What an integrator must do:
 - If your integration only sends messages and reads its own data, nothing
   changes.
 - If it configures the daemon, add its authenticated subject (the JWT `sub`) to
-  `[authz] admin_subjects` in `daemon.toml` and restart the daemon.
+  `[authz] admin_subjects` in `daemon.toml` and restart the daemon. `"default"`
+  is not a valid entry - it is the storage sentinel, and the daemon drops it with
+  a warning.
+- Make sure the token carries a `sub`. An issuer that mints a token without one
+  now fails the handshake with `401` instead of connecting as `"default"`.
 - Read `Config.caller_capability` at connect time and adapt, instead of
   discovering the boundary from a refusal.
+- Handle `429` from `POST /login`: the endpoint throttles failed attempts per
+  source address and per username, and names the wait in `Retry-After`.
 
 Local clients on the same account are unaffected: the peer-uid grant makes them
 administrators with no configuration.

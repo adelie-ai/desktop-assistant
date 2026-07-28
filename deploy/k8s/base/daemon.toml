@@ -70,6 +70,11 @@ enabled = false
 # an operator administers the instance through a settings UI. File-only - no
 # command writes it - so a restart is required after a change.
 #
+# Name the real subject. `"default"` is the storage schema's own sentinel rather
+# than a person, and the daemon drops it from this list with a warning: a token
+# that named nobody used to resolve to it, so admitting it here would have
+# promoted every such connection.
+#
 # admin_subjects = ["operator"]
 
 [personality]

@@ -15,6 +15,20 @@ The WebSocket handshake requires a bearer token:
 
 - Header: `Authorization: Bearer <jwt>`
 - Missing or invalid token: HTTP `401 Unauthorized` during handshake
+- A valid token that names no subject: HTTP `401 Unauthorized` during handshake
+
+The last case is worth stating on its own, because a token can be signed
+correctly and still fail here. The daemon resolves the caller's identity from
+the token as part of accepting the connection, and the identity is the `sub`
+claim. A token with no `sub` (or a blank one) names nobody, so the upgrade is
+refused and the daemon logs why.
+
+This matters most with an external identity provider. An RS256 access token is
+validated against the issuer's keys, and that validation only requires `exp`, so
+a machine or client-credentials token with no `sub` claim passes it. The daemon
+used to file such a connection under the shared `"default"` identity - the same
+partition a single-tenant install keeps all its data in. Configure the issuer to
+put the caller's identity in `sub`.
 
 Local clients need no token: the UDS door (which the D-Bus bridge also goes
 through) authenticates by kernel peer credentials, and the identity is the
@@ -40,10 +54,34 @@ Successful response:
 ```
 
 `/login` credential validation modes:
-- Local Linux host (non-container): validates against current OS user password
-  and uses the current OS username (ignores `DESKTOP_ASSISTANT_WS_LOGIN_USERNAME`).
-- Container/remote mode: validates against daemon env credentials
+- **Static password.** Validates against the daemon's own env credentials
   (`DESKTOP_ASSISTANT_WS_LOGIN_USERNAME`, `DESKTOP_ASSISTANT_WS_LOGIN_PASSWORD`).
+  This is the mode for any deployment that is reachable over a network. Setting
+  the password selects it, whatever else is configured.
+- **OS password (PAM).** Validates against the host's own account password and
+  uses the current OS username (ignores `DESKTOP_ASSISTANT_WS_LOGIN_USERNAME`).
+  It is a local convenience - the point is that a person on their own machine
+  logs in with the password they already have - so the daemon enables it only
+  when it is listening on loopback, and never in a container. A daemon bound
+  past loopback (`DESKTOP_ASSISTANT_WS_BIND=0.0.0.0:11339`) leaves it off unless
+  `DESKTOP_ASSISTANT_WS_LOGIN_LOCAL_SYSTEM_AUTH=true` says otherwise, because
+  the same mode on a reachable port is a password oracle for a real system
+  account. Setting that variable to `false` turns it off everywhere.
+- **Off.** With no static password and no local door, `/login` answers `404`.
+  The startup log says which of the three conditions applies.
+
+### Failed-attempt throttling
+
+`/login` counts failed attempts, per source address and per username. The first
+few failures are answered normally, so a mistyped password costs nothing. After
+that the endpoint answers `429 Too Many Requests` with a `Retry-After` header in
+whole seconds, and the wait doubles with each further failure up to fifteen
+minutes. One successful login clears both counters.
+
+A `429` is not a credential verdict - it says the door is shut for now, not that
+the password was wrong. A client should wait for `Retry-After` and try again
+rather than re-prompting immediately. Failed attempts are logged at warn level
+with the source address and the username tried.
 
 `/login` authenticates exactly one account, and the `subject` in the response is
 the account it authenticated — the same value carried in the token's `sub` claim.
@@ -300,6 +338,8 @@ refused.
 2. Acquire JWT (remote clients, no D-Bus)
 - `POST /login` with Basic auth.
 - Receive `token`.
+- On `429`, wait for the seconds named in `Retry-After` and repeat. Do not
+  re-prompt for the password: the door is shut, and the credential may be right.
 
 3. Open WebSocket
 - Connect to `ws://127.0.0.1:11339/ws`.
