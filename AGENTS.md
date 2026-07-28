@@ -324,6 +324,26 @@ instead. `WsHandshake` in `crates/api-model/src/lib.rs` documents this pattern w
 `system_id` and `host_label` were added without changing the wire bytes for older clients.
 Prove it with a test that parses the old shape.
 
+**Serde compatibility is not source compatibility. Sweep the sibling repos.** An optional
+field keeps old *payloads* parsing, and does nothing for old *code*: a downstream repo that
+constructs the struct with an explicit field list fails to compile the moment the field
+exists, and one that matches a struct variant without a `..` rest pattern fails the same way.
+The clients in this group consume these crates by path or by a git dependency on `main`, so
+there is no version to gate on - their build breaks as soon as this repo's `main` moves.
+
+So a change to any shared type carries a sweep of `adele-gtk`, `adele-tui`, `adele-kde`,
+`adele-web-ui`, `client-ui-common` and `voice` before it lands, and lands together with any
+fix it needs. This is not confined to `api-model`: any type a client can name counts,
+including configuration structs in the MCP and client crates.
+
+Two traps make a hand search unreliable. Bare `grep` in the agent shell wraps `ugrep` with
+`--ignore-files` and does not follow symlinked directories, and this group path-deps its
+siblings through symlinks - use `command grep` or `rg`. And a construction site can hide
+behind a type alias or a re-export, so search the field names as well as the type name.
+Compilation is the only authoritative axis: build each consumer with `--all-targets`, which
+includes test code, where most of these sites live. Enumerate consumers from the dependency
+graph rather than from memory.
+
 **Document the contract in the same change**, in `docs/API_TRANSPORT.md`,
 `docs/WEBSOCKET_API.md` and `docs/dbus-api.md`. Where a change alters what an existing
 caller sees - a command that starts refusing, a tool that starts declining, an environment a
