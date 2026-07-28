@@ -2874,26 +2874,39 @@ async fn main() -> Result<()> {
             .map(|v| !matches!(v.trim().to_lowercase().as_str(), "false" | "0" | "no"));
         let tls_enabled = tls_env_override.unwrap_or(tls_config.enabled);
 
-        let tls_acceptor = if tls_enabled {
-            match tls::setup(
-                tls_config.cert_file.as_deref(),
-                tls_config.key_file.as_deref(),
-            ) {
-                Ok(server_config) => {
-                    tracing::info!(
-                        "TLS enabled; CA cert at {}",
-                        tls::default_ca_cert_path().display()
-                    );
-                    Some(tokio_rustls::TlsAcceptor::from(server_config))
-                }
-                Err(e) => {
-                    tracing::error!("TLS setup failed: {e:#}; falling back to plain ws://");
-                    None
-                }
+        // #805: TLS setup failure must not silently downgrade this door to
+        // plaintext. `resolve_ws_tls` returns `Err` when TLS is enabled but
+        // cannot be delivered; `?` aborts daemon startup on that path rather
+        // than falling back, because the remote WebSocket door now carries
+        // the bearer token for an administrator (#728) and a config that
+        // asked for TLS is asking for that token to stay encrypted in
+        // transit. Deliberate plaintext (`[tls] enabled = false`) is
+        // unaffected — that is an operator choice, not a downgrade.
+        let tls_acceptor = match tls::resolve_ws_tls(
+            tls_enabled,
+            tls_config.cert_file.as_deref(),
+            tls_config.key_file.as_deref(),
+        ) {
+            Ok(tls::WsTlsPosture::Tls(server_config)) => {
+                tracing::info!(
+                    "TLS enabled; CA cert at {}",
+                    tls::default_ca_cert_path().display()
+                );
+                Some(tokio_rustls::TlsAcceptor::from(server_config))
             }
-        } else {
-            tracing::info!("TLS disabled; serving plain ws://");
-            None
+            Ok(tls::WsTlsPosture::PlaintextByConfig) => {
+                tracing::info!("TLS disabled; serving plain ws:// deliberately");
+                None
+            }
+            Err(e) => {
+                tracing::error!(
+                    "TLS setup failed: {e:#}; refusing to start the remote WebSocket door in \
+                     plaintext. Fix the TLS configuration, or set \
+                     DESKTOP_ASSISTANT_WS_TLS=false ([tls] enabled = false) to serve plaintext \
+                     deliberately"
+                );
+                return Err(e);
+            }
         };
 
         let (ws_shutdown_tx, ws_shutdown_rx) = tokio::sync::oneshot::channel::<()>();

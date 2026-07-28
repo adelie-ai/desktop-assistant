@@ -63,6 +63,53 @@ pub fn setup(
     }
 }
 
+/// Outcome of resolving the WebSocket door's TLS posture at startup (#805).
+///
+/// There is no "TLS enabled but serving plaintext" state. Either TLS is off
+/// by deliberate configuration ([`PlaintextByConfig`](Self::PlaintextByConfig)),
+/// or it is on and ready ([`Tls`](Self::Tls)) — "on but not deliverable" is
+/// not a variant here because [`resolve_ws_tls`] returns `Err` for it
+/// instead, so the caller cannot construct a silent downgrade by accident.
+pub enum WsTlsPosture {
+    /// `[tls] enabled = false` (or `DESKTOP_ASSISTANT_WS_TLS=false`): the
+    /// operator deliberately turned TLS off. Serving plaintext here is a
+    /// choice the operator made, not a downgrade from one they didn't.
+    PlaintextByConfig,
+    /// TLS is on and ready to serve.
+    Tls(Arc<rustls::ServerConfig>),
+}
+
+/// Decide the WebSocket door's TLS posture (#805): plaintext because TLS is
+/// deliberately off, or TLS because it is on and ready — and fail closed
+/// when it is on but cannot be delivered.
+///
+/// Why: the remote WebSocket door now carries the bearer token for an
+/// administrator (#728: `[authz] admin_subjects`), so a daemon told to use
+/// TLS and unable to must not silently serve that door in plaintext. When
+/// `enabled` is `true` and [`setup`] cannot deliver it — missing files,
+/// unreadable permissions (e.g. an ACME renewal that rewrote the key file
+/// 0600 root:root), malformed PEM, or a write failure on the auto-generate
+/// path — this returns `Err` instead of falling back to
+/// [`WsTlsPosture::PlaintextByConfig`]. The configuration asked for a
+/// security property the process cannot provide, which is a startup
+/// failure, not a degradation: the caller is expected to abort rather than
+/// bind.
+pub fn resolve_ws_tls(
+    enabled: bool,
+    cert_file: Option<&Path>,
+    key_file: Option<&Path>,
+) -> anyhow::Result<WsTlsPosture> {
+    if !enabled {
+        return Ok(WsTlsPosture::PlaintextByConfig);
+    }
+    let server_config = setup(cert_file, key_file).context(
+        "TLS is enabled ([tls] enabled defaults to true) but setup failed; refusing to serve \
+         the remote WebSocket door in plaintext. Fix the TLS configuration, or set \
+         DESKTOP_ASSISTANT_WS_TLS=false ([tls] enabled = false) to serve plaintext deliberately",
+    )?;
+    Ok(WsTlsPosture::Tls(server_config))
+}
+
 /// Load or generate the local CA.
 fn ensure_ca(tls_dir: &Path) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
     let cert_path = tls_dir.join(CA_CERT_FILENAME);
