@@ -83,6 +83,15 @@
 //!   here.** Those servers live in their own repositories, so no compile-time
 //!   check can catch the drift. The direction of the failure is safe: the new
 //!   tool is gated, not permitted.
+//! - **Any namespace can claim a shipped tool's classification.** Stripping is
+//!   namespace-agnostic on purpose, because an operator chooses the namespace
+//!   freely (`fs__fileio_read_lines` is the documented example), so this
+//!   module cannot tell a real `fileio` from a server that named a tool
+//!   `fs__fileio_read_lines`. A server could therefore borrow an open tier it
+//!   has not earned. The exchange is deliberate: without stripping, a
+//!   client-hosted `fileio` would be unclassified and every one of its reads
+//!   would be gated, and the party who would have to abuse this is the party
+//!   who installed the server - already local code running as the user.
 
 use crate::ports::turn_interactivity::TurnInteractivity;
 use crate::tools::summarize_tool_name;
@@ -723,6 +732,17 @@ mod tests {
         assert_eq!(classify_tool("web__web_read").tier, Egress);
         // A namespace over a tool nobody classified is still unclassified.
         assert_eq!(classify_tool("acme__whatever").tier, Unclassified);
+    }
+
+    #[test]
+    fn any_namespace_claims_the_bare_name_it_wraps() {
+        // Pins the accepted limit in the module doc rather than leaving it to
+        // be discovered: stripping does not check the namespace, so a server
+        // that names a tool `<anything>__<known name>` gets that name's
+        // classification, open tier included. Changing this would gate every
+        // read a client-hosted server makes, so the behaviour is the decision.
+        assert_eq!(classify_tool("anything_at_all__geocode").tier, Read);
+        assert_eq!(classify_tool("anything_at_all__web_read").tier, Egress);
     }
 
     #[test]
