@@ -447,6 +447,24 @@ mod tests {
         assert!(!parse_env_bool(Some("false"), defaults.uds_enabled));
     }
 
+    /// Acceptance (#805): the single-user desktop case, where the remote door
+    /// is off. `main.rs` only calls `tls::resolve_ws_tls` inside its
+    /// `if ws_enabled { .. }` branch, so a desktop user who never opted into
+    /// the remote WebSocket door — the default — never reaches the TLS
+    /// fail-closed startup check this ticket adds, no matter what a stale
+    /// `[tls]` section in `daemon.toml` says. What a desktop user sees from
+    /// this change is nothing: the door they never turned on stays off.
+    #[test]
+    fn remote_door_defaults_off_so_desktop_users_never_reach_the_tls_decision() {
+        assert!(
+            !TransportsConfig::default().ws_enabled,
+            "the remote WebSocket door must default off; #805's fail-closed \
+             TLS behaviour must never engage for a desktop user who never \
+             set DESKTOP_ASSISTANT_WS_ENABLED=true or [transports] \
+             ws_enabled = true"
+        );
+    }
+
     #[test]
     fn static_password_mode_uses_configured_username() {
         let result = resolve_ws_login_mode_decision(

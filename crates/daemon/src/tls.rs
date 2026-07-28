@@ -486,4 +486,85 @@ mod tests {
 
         assert!(is_pem_cert_expired(&pem), "should detect expired cert");
     }
+
+    // --- resolve_ws_tls (#805): fail closed instead of silently downgrading
+    // the remote WebSocket door to plaintext when TLS is enabled but cannot
+    // be delivered. -------------------------------------------------------
+
+    /// Writes a fresh self-signed cert + key PEM pair to `dir` and returns
+    /// their paths, so a test can point `resolve_ws_tls` at real files
+    /// without touching the process-wide `XDG_DATA_HOME` auto-generate path.
+    fn write_self_signed_cert(dir: &Path) -> (PathBuf, PathBuf) {
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("generate self-signed cert for test fixture");
+        let cert_path = dir.join("cert.pem");
+        let key_path = dir.join("key.pem");
+        std::fs::write(&cert_path, certified.cert.pem()).expect("write test cert");
+        std::fs::write(&key_path, certified.signing_key.serialize_pem()).expect("write test key");
+        (cert_path, key_path)
+    }
+
+    /// Acceptance: TLS configured and working. A daemon with `[tls] enabled
+    /// = true` and a readable, valid cert/key pair serves TLS, not
+    /// plaintext.
+    #[test]
+    fn resolve_ws_tls_configured_and_working_yields_a_ready_tls_posture() {
+        install_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let (cert_path, key_path) = write_self_signed_cert(dir.path());
+
+        let posture = resolve_ws_tls(true, Some(&cert_path), Some(&key_path))
+            .expect("valid cert/key must resolve to a TLS posture, not an error");
+
+        assert!(
+            matches!(posture, WsTlsPosture::Tls(_)),
+            "TLS configured and working must yield WsTlsPosture::Tls, not plaintext"
+        );
+    }
+
+    /// Acceptance: TLS configured and failing. A daemon with `[tls] enabled
+    /// = true` (the default) but an unreadable cert/key pair — an expired
+    /// ACME renewal, a permissions error, a corrupt file — must refuse to
+    /// serve the remote WebSocket door at all. It must NOT return a
+    /// plaintext posture: this is the silent-downgrade bug (#805), and the
+    /// regression is specifically that `resolve_ws_tls` must return `Err`,
+    /// not `Ok(WsTlsPosture::PlaintextByConfig)`.
+    #[test]
+    fn resolve_ws_tls_configured_and_failing_refuses_rather_than_downgrading() {
+        install_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let missing_cert = dir.path().join("does-not-exist-cert.pem");
+        let missing_key = dir.path().join("does-not-exist-key.pem");
+
+        let result = resolve_ws_tls(true, Some(&missing_cert), Some(&missing_key));
+
+        assert!(
+            result.is_err(),
+            "TLS enabled with an unreadable cert/key must fail closed (Err), \
+             never silently fall back to plaintext"
+        );
+    }
+
+    /// Acceptance: TLS not configured at all. `[tls] enabled = false` (or
+    /// `DESKTOP_ASSISTANT_WS_TLS=false`) is a deliberate operator choice, so
+    /// plaintext here is correct — and it must stay correct even when a
+    /// stale cert/key path also happens to be present in config, since a
+    /// disabled TLS section makes those paths irrelevant.
+    #[test]
+    fn resolve_ws_tls_not_configured_at_all_is_deliberate_plaintext() {
+        let result = resolve_ws_tls(false, None, None)
+            .expect("TLS disabled must resolve, not error");
+        assert!(matches!(result, WsTlsPosture::PlaintextByConfig));
+
+        let dir = tempfile::tempdir().unwrap();
+        let missing_cert = dir.path().join("does-not-exist-cert.pem");
+        let missing_key = dir.path().join("does-not-exist-key.pem");
+        let result_with_stale_paths =
+            resolve_ws_tls(false, Some(&missing_cert), Some(&missing_key))
+                .expect("TLS disabled must resolve even if cert/key paths are stale");
+        assert!(matches!(
+            result_with_stale_paths,
+            WsTlsPosture::PlaintextByConfig
+        ));
+    }
 }
