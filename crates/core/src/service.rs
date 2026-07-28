@@ -3918,6 +3918,411 @@ mod tests {
         );
     }
 
+    // --- Tool-provenance gating (issue #741) ---------------------------
+    //
+    // A turn that has taken in bytes an outside party can influence must
+    // not then run a tool that can send data out, change the user's state,
+    // or run code. The refusal is a recoverable tool_result, so the turn
+    // continues and the model can pick another path.
+
+    /// Tool definition helper for the provenance tests.
+    fn tool_def(name: &str) -> ToolDefinition {
+        ToolDefinition::new(name, name, serde_json::json!({"type": "object"}))
+    }
+
+    /// One round that calls `name`, keyed by call id `id`.
+    fn calls(id: &str, name: &str) -> LlmResponse {
+        LlmResponse::with_tool_calls("", vec![ToolCall::new(id, name, "{}")])
+    }
+
+    /// Every `Role::Tool` message in the conversation, in order.
+    async fn tool_results(
+        handler: &ConversationHandler<MockStore, ToolCallingLlm, MockToolExecutor>,
+        id: &ConversationId,
+    ) -> Vec<String> {
+        handler
+            .get_conversation(id)
+            .await
+            .expect("conversation exists")
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .map(|m| m.content.clone())
+            .collect()
+    }
+
+    /// A handler whose LLM calls `first` then `second` then answers "done",
+    /// with every named tool wired to a marker result.
+    fn two_call_handler(
+        first: &str,
+        second: &str,
+    ) -> ConversationHandler<MockStore, ToolCallingLlm, MockToolExecutor> {
+        let responses = vec![
+            calls("c1", first),
+            calls("c2", second),
+            LlmResponse::text("done"),
+        ];
+        let mut results = HashMap::new();
+        results.insert(first.to_string(), format!("RAN {first}"));
+        results.insert(second.to_string(), format!("RAN {second}"));
+        make_tool_handler(responses, vec![tool_def(first), tool_def(second)], results)
+    }
+
+    #[tokio::test]
+    async fn clean_turn_permits_egress_tool() {
+        // A turn that has taken in nothing external runs an egress tool
+        // normally. The gate must not fire on a clean turn.
+        let responses = vec![calls("c1", "web_read"), LlmResponse::text("summarised")];
+        let mut results = HashMap::new();
+        results.insert("web_read".to_string(), "PAGE BODY".to_string());
+        let handler = make_tool_handler(responses, vec![tool_def("web_read")], results);
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
+
+        let answer = handler
+            .send_prompt(&conv.id, "read it".into(), noop_callback(), noop_status())
+            .await
+            .expect("a clean turn must complete");
+
+        assert_eq!(answer, "summarised");
+        assert_eq!(
+            tool_results(&handler, &conv.id).await,
+            vec!["PAGE BODY".to_string()],
+            "an egress tool must run normally in a turn that ingested nothing external"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_that_ingested_external_bytes_refuses_egress_tool() {
+        // `weather_get_current` returns bytes from a third-party service, so
+        // it taints the turn. `web_read` can then send those bytes to a
+        // destination the model chose, so it is refused.
+        let handler = two_call_handler("weather_get_current", "web_read");
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
+
+        handler
+            .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
+            .await
+            .expect("the turn continues after the refusal");
+
+        let results = tool_results(&handler, &conv.id).await;
+        assert_eq!(results.len(), 2, "both calls must record a tool_result");
+        assert_eq!(results[0], "RAN weather_get_current");
+        assert!(
+            !results[1].contains("RAN web_read"),
+            "the egress tool must NOT have executed, got: {}",
+            results[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_that_ingested_external_bytes_refuses_destructive_tool() {
+        let handler = two_call_handler("weather_get_current", "fileio_remove");
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
+
+        handler
+            .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
+            .await
+            .expect("the turn continues after the refusal");
+
+        let results = tool_results(&handler, &conv.id).await;
+        assert!(
+            !results[1].contains("RAN fileio_remove"),
+            "a destructive tool must NOT have executed, got: {}",
+            results[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_that_ingested_external_bytes_refuses_execution_tool() {
+        let handler = two_call_handler("weather_get_current", "terminal_execute");
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
+
+        handler
+            .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
+            .await
+            .expect("the turn continues after the refusal");
+
+        let results = tool_results(&handler, &conv.id).await;
+        assert!(
+            !results[1].contains("RAN terminal_execute"),
+            "an execution tool must NOT have executed, got: {}",
+            results[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn refusal_is_a_recoverable_tool_result_not_a_turn_failure() {
+        // After the refusal the turn keeps running: the model picks a
+        // read-only tool, that one executes, and the turn answers normally.
+        let responses = vec![
+            calls("c1", "weather_get_current"),
+            calls("c2", "web_read"),
+            calls("c3", "builtin_conversation_search"),
+            LlmResponse::text("answered anyway"),
+        ];
+        let mut results = HashMap::new();
+        results.insert("weather_get_current".to_string(), "sunny".to_string());
+        results.insert("web_read".to_string(), "RAN web_read".to_string());
+        results.insert(
+            "builtin_conversation_search".to_string(),
+            "recalled".to_string(),
+        );
+        let handler = make_tool_handler(
+            responses,
+            vec![
+                tool_def("weather_get_current"),
+                tool_def("web_read"),
+                tool_def("builtin_conversation_search"),
+            ],
+            results,
+        );
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
+
+        let answer = handler
+            .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
+            .await
+            .expect("a refusal must not fail the turn");
+
+        assert_eq!(answer, "answered anyway");
+        let results = tool_results(&handler, &conv.id).await;
+        assert_eq!(results.len(), 3, "every call records a tool_result");
+        assert!(
+            !results[1].contains("RAN web_read"),
+            "the gated call must not have executed, got: {}",
+            results[1]
+        );
+        assert_eq!(
+            results[2], "recalled",
+            "a read-only tool must still run after a refusal"
+        );
+    }
+
+    #[tokio::test]
+    async fn refusal_names_the_reason() {
+        // Decision 5 of docs/design/multi-tenancy-boundary.md: a capability
+        // that disappears at call time produces confabulation unless the
+        // refusal says why. The text must name the tool, the ingest, and the
+        // tier that is now closed.
+        let handler = two_call_handler("weather_get_current", "web_read");
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
+
+        handler
+            .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
+            .await
+            .expect("the turn continues after the refusal");
+
+        let refusal = tool_results(&handler, &conv.id).await.remove(1);
+        let lower = refusal.to_lowercase();
+        assert!(
+            refusal.contains("web_read"),
+            "the refusal must name the tool, got: {refusal}"
+        );
+        assert!(
+            lower.contains("outside") || lower.contains("external"),
+            "the refusal must say the turn took in outside content, got: {refusal}"
+        );
+        assert!(
+            lower.contains("egress"),
+            "the refusal must name the tier that is closed, got: {refusal}"
+        );
+        assert!(
+            lower.contains("turn"),
+            "the refusal must scope itself to this turn, got: {refusal}"
+        );
+    }
+
+    #[tokio::test]
+    async fn provenance_taint_does_not_leak_across_turns() {
+        // Turn one taints and gets refused. Turn two starts clean, so the
+        // same egress tool runs.
+        let responses = vec![
+            calls("c1", "weather_get_current"),
+            calls("c2", "web_read"),
+            LlmResponse::text("first done"),
+            calls("c3", "web_read"),
+            LlmResponse::text("second done"),
+        ];
+        let mut results = HashMap::new();
+        results.insert("weather_get_current".to_string(), "sunny".to_string());
+        results.insert("web_read".to_string(), "PAGE BODY".to_string());
+        let handler = make_tool_handler(
+            responses,
+            vec![tool_def("weather_get_current"), tool_def("web_read")],
+            results,
+        );
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
+
+        handler
+            .send_prompt(&conv.id, "one".into(), noop_callback(), noop_status())
+            .await
+            .expect("first turn completes");
+        handler
+            .send_prompt(&conv.id, "two".into(), noop_callback(), noop_status())
+            .await
+            .expect("second turn completes");
+
+        let results = tool_results(&handler, &conv.id).await;
+        assert!(
+            !results[1].contains("PAGE BODY"),
+            "the first turn was tainted, so its egress call is refused"
+        );
+        assert_eq!(
+            results[2], "PAGE BODY",
+            "a fresh turn starts clean, so the egress tool runs again"
+        );
+    }
+
+    #[tokio::test]
+    async fn headless_turn_refuses_rather_than_parking() {
+        // Nobody is watching, so there is no approval to wait for. The turn
+        // must refuse and finish; the timeout proves it does not park.
+        use crate::ports::turn_interactivity::{TurnInteractivity, with_turn_interactivity};
+
+        let handler = two_call_handler("weather_get_current", "web_read");
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
+
+        let answer = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            with_turn_interactivity(
+                TurnInteractivity::Headless,
+                handler.send_prompt(&conv.id, "go".into(), noop_callback(), noop_status()),
+            ),
+        )
+        .await
+        .expect("a headless turn must not park waiting for approval")
+        .expect("a headless turn completes");
+
+        assert_eq!(answer, "done");
+        let refusal = tool_results(&handler, &conv.id).await.remove(1);
+        assert!(
+            !refusal.contains("RAN web_read"),
+            "the gated call must not have executed, got: {refusal}"
+        );
+        assert!(
+            refusal.to_lowercase().contains("nobody is watching"),
+            "a headless refusal must say no one can lift it, got: {refusal}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_tool_is_not_refused_after_external_ingest() {
+        // Reading is not exfiltration. Gating reads would break recall and
+        // buy nothing, so only the acting tiers close.
+        let handler = two_call_handler("weather_get_current", "builtin_conversation_search");
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
+
+        handler
+            .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
+            .await
+            .expect("the turn completes");
+
+        let results = tool_results(&handler, &conv.id).await;
+        assert_eq!(
+            results[1], "RAN builtin_conversation_search",
+            "a read-only tool must still run after external ingest"
+        );
+    }
+
+    #[tokio::test]
+    async fn unclassified_tool_is_refused_after_external_ingest() {
+        // An operator-added or remote MCP server this build does not know is
+        // gated, because an unknown capability is exactly what the gate is
+        // for. There is no permissive default.
+        let handler = two_call_handler("weather_get_current", "acme_do_something");
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
+
+        handler
+            .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
+            .await
+            .expect("the turn completes");
+
+        let results = tool_results(&handler, &conv.id).await;
+        assert!(
+            !results[1].contains("RAN acme_do_something"),
+            "an unclassified tool must NOT run after external ingest, got: {}",
+            results[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn unclassified_tool_does_not_taint_the_turn() {
+        // The other half of the unclassified default: a tool this build does
+        // not know does not itself close the gate. Two calls to the same
+        // operator-added server must both run, or every user-added MCP
+        // server would break after its first call.
+        let handler = two_call_handler("acme_read", "acme_write");
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
+
+        handler
+            .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
+            .await
+            .expect("the turn completes");
+
+        let results = tool_results(&handler, &conv.id).await;
+        assert_eq!(
+            results,
+            vec!["RAN acme_read".to_string(), "RAN acme_write".to_string()],
+            "an unclassified tool must not taint the turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn namespaced_fleet_tool_is_gated_like_its_bare_name() {
+        // An operator that sets `namespace` on a server, and every
+        // client-hosted MCP server, expose tools as `{namespace}__{tool}`.
+        // The gate must see through the prefix.
+        let handler = two_call_handler("weather_get_current", "fs__fileio_remove");
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
+
+        handler
+            .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
+            .await
+            .expect("the turn completes");
+
+        let results = tool_results(&handler, &conv.id).await;
+        assert!(
+            !results[1].contains("RAN fs__fileio_remove"),
+            "a namespaced fleet tool must be gated like its bare name, got: {}",
+            results[1]
+        );
+    }
+
     #[tokio::test]
     async fn final_answer_streams_after_a_tool_round() {
         // DA-9: the user-facing chunk callback must keep streaming after the
