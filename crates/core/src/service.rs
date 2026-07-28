@@ -147,6 +147,50 @@ const MAX_TOOL_ROUNDS: usize = 200;
 /// for several resets.
 const SERVER_TOOL_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// The consecutive run of one tool name used to coalesce completion statuses:
+/// the tool that last completed and how many times in a row it has done so.
+/// `None` before the first completion, and after a failure.
+type ToolCompletionRun = Option<(String, u32)>;
+
+/// Advance `run` for a just-completed server-side tool and return the status
+/// line to emit for it.
+///
+/// Why: the keepalive covers one slow tool, not many fast ones, so a
+/// tool-heavy round shows nothing for tens of seconds (#941). Emitting on
+/// completion gives that round a cadence.
+///
+/// The line carries the tool's name and a count and nothing else. It reaches
+/// every subscribed client and the journal, so arguments and output must stay
+/// out of it (#776); `summarize_tool_value` feeds the activity feed, which is
+/// the surface for those.
+///
+/// Repeats of the same tool coalesce into one running count rather than one
+/// line each, because a client renders a status by replacing the previous one:
+/// twenty calls then read as "Ran fileio_read 20 times", not twenty lines. A
+/// failure is reported alone and resets the run - it is more interesting to a
+/// watching human than the successes around it, and folding it into a success
+/// count would hide it.
+fn advance_tool_completion_status(run: &mut ToolCompletionRun, name: &str, ok: bool) -> String {
+    if !ok {
+        *run = None;
+        return format!("{name} failed");
+    }
+    let count = match run {
+        Some((running, count)) if running == name => {
+            *count += 1;
+            *count
+        }
+        _ => {
+            *run = Some((name.to_string(), 1));
+            1
+        }
+    };
+    match count {
+        1 => format!("Ran {name}"),
+        n => format!("Ran {name} {n} times"),
+    }
+}
+
 /// Transient instruction shown to the model for the #453 wind-down completion
 /// only (never persisted): the tool budget is spent, so it must close out in
 /// prose rather than request more tools.
@@ -1206,6 +1250,11 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         // via the scratchpad's upsert-by-key write (DA-7 / #292).
         let mut step_stack = self.build_step_stack(conversation_id).await;
 
+        // Coalescing run for the per-completion status (#941). Spans the whole
+        // turn, not one round, so a tool the model keeps calling across rounds
+        // stays one running line.
+        let mut tool_completion_run: ToolCompletionRun = None;
+
         for round in 0..MAX_TOOL_ROUNDS {
             // Between-rounds cancellation checkpoint (issue #109): if the
             // caller cancelled while the previous tool round was
@@ -1673,10 +1722,12 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                         || tool_call.name == planning::COMPLETE_STEP_TOOL)
                 {
                     // Step-level narration: announce the logical step the model
-                    // just declared, once, as its goal. This is the only progress
-                    // narration now (turn-start filler and per-tool chatter were
-                    // removed); a step spans multiple tool calls. complete_step
-                    // stays silent.
+                    // just declared, once, as its goal. A step spans multiple
+                    // tool calls, so this says what the work is *for*, where the
+                    // completion status below says what ran. complete_step stays
+                    // silent, and neither control tool gets a completion status
+                    // of its own - the `continue` at the end of this branch
+                    // keeps them out of the dispatch path that emits one.
                     if tool_call.name == planning::BEGIN_STEP_TOOL
                         && let Some(goal) = arguments.get("goal").and_then(|v| v.as_str())
                     {
@@ -1865,13 +1916,27 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                             }
                         }
                     };
+                    // Completion status (#941): the keepalive above covers one
+                    // slow tool; this covers many fast ones, which is what a
+                    // tool-heavy round is. Name and count only - see
+                    // `advance_tool_completion_status`.
                     match outcome {
                         Ok(output) => {
                             tracing::debug!(tool = %tool_call.name, output = %output, "tool result");
+                            on_status(advance_tool_completion_status(
+                                &mut tool_completion_run,
+                                &tool_call.name,
+                                true,
+                            ));
                             (output, true)
                         }
                         Err(e) => {
                             tracing::warn!(tool = %tool_call.name, error = %e, "tool execution failed");
+                            on_status(advance_tool_completion_status(
+                                &mut tool_completion_run,
+                                &tool_call.name,
+                                false,
+                            ));
                             (format!("Error: {e}"), false)
                         }
                     }
@@ -2776,6 +2841,293 @@ mod tests {
                 format!("conv-{n}")
             }),
         )
+    }
+
+    // --- #941: a completed server-side tool emits a status ---
+
+    #[test]
+    fn tool_completion_status_coalesces_repeats_and_resets_on_failure() {
+        // Branch coverage for the coalescing rule the turn-level tests exercise
+        // one path of each: a run grows, a different tool restarts it, and a
+        // failure both interrupts the run and starts the next one over.
+        let mut run: ToolCompletionRun = None;
+        assert_eq!(
+            advance_tool_completion_status(&mut run, "fileio_read", true),
+            "Ran fileio_read"
+        );
+        assert_eq!(
+            advance_tool_completion_status(&mut run, "fileio_read", true),
+            "Ran fileio_read 2 times"
+        );
+        assert_eq!(
+            advance_tool_completion_status(&mut run, "web_search", true),
+            "Ran web_search"
+        );
+        assert_eq!(
+            advance_tool_completion_status(&mut run, "web_search", false),
+            "web_search failed"
+        );
+        assert_eq!(
+            advance_tool_completion_status(&mut run, "web_search", true),
+            "Ran web_search",
+            "a failure resets the run, so the next success counts from one"
+        );
+    }
+
+    /// Statuses a completed tool produced, i.e. everything that is neither a
+    /// tool keepalive ("Still working on X") nor an LLM keepalive
+    /// ("Thinking..."). Keeps the #941 assertions independent of the #584 and
+    /// #611 keepalives, which stay unchanged.
+    fn completion_statuses(log: &Arc<std::sync::Mutex<Vec<String>>>) -> Vec<String> {
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|s| !s.starts_with("Still working on") && s.as_str() != "Thinking...")
+            .cloned()
+            .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_completed_server_tool_emits_a_status() {
+        // #941: the status must be driven by the tool resolving, not by the 30s
+        // keepalive timer. The clock is paused and the tool is instant, so a
+        // status here can only have come from the completion.
+        let tools = vec![ToolDefinition::new(
+            "calendar_list",
+            "List calendar",
+            serde_json::json!({}),
+        )];
+        let responses = vec![
+            LlmResponse::with_tool_calls("", vec![ToolCall::new("c1", "calendar_list", "{}")]),
+            LlmResponse::text("All set"),
+        ];
+        let mut tool_results = HashMap::new();
+        tool_results.insert("calendar_list".to_string(), "ok".to_string());
+
+        let handler = make_tool_handler(responses, tools, tool_results);
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        let (status_cb, status_log) = recording_status();
+        handler
+            .send_prompt(&conv.id, "Do it".into(), noop_callback(), status_cb)
+            .await
+            .expect("turn completes");
+
+        let all = status_log.lock().unwrap().clone();
+        assert!(
+            all.iter().all(|s| !s.starts_with("Still working on")),
+            "the keepalive must not have fired for an instant tool; got {all:?}"
+        );
+        assert_eq!(
+            completion_statuses(&status_log),
+            vec!["Ran calendar_list".to_string()],
+            "a resolved server-side tool must emit exactly one status; got {all:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn many_fast_tools_emit_status_without_the_keepalive_firing() {
+        // The reported case: ten fast tools inside one keepalive window. Every
+        // completion emits, so the client sees movement, and repeats of the same
+        // tool coalesce into one running line rather than ten separate ones.
+        let tools = vec![ToolDefinition::new(
+            "notes_search",
+            "Search notes",
+            serde_json::json!({}),
+        )];
+        let calls: Vec<ToolCall> = (0..10)
+            .map(|i| ToolCall::new(format!("c{i}"), "notes_search", "{}"))
+            .collect();
+        let responses = vec![
+            LlmResponse::with_tool_calls("", calls),
+            LlmResponse::text("All set"),
+        ];
+        let mut tool_results = HashMap::new();
+        tool_results.insert("notes_search".to_string(), "ok".to_string());
+
+        let handler = make_tool_handler(responses, tools, tool_results);
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        let (status_cb, status_log) = recording_status();
+        handler
+            .send_prompt(&conv.id, "Do it".into(), noop_callback(), status_cb)
+            .await
+            .expect("turn completes");
+
+        let all = status_log.lock().unwrap().clone();
+        assert_eq!(
+            all.iter()
+                .filter(|s| s.starts_with("Still working on"))
+                .count(),
+            0,
+            "ten fast tools must not need the keepalive; got {all:?}"
+        );
+        let completions = completion_statuses(&status_log);
+        assert_eq!(
+            completions.len(),
+            10,
+            "each of the ten completions must emit; got {completions:?}"
+        );
+        assert_eq!(
+            completions.first().map(String::as_str),
+            Some("Ran notes_search"),
+            "the first completion names the tool; got {completions:?}"
+        );
+        assert_eq!(
+            completions.last().map(String::as_str),
+            Some("Ran notes_search 10 times"),
+            "repeats of one tool coalesce into a running count; got {completions:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_tool_still_emits_a_status() {
+        // A tool that errors is more interesting to a watching human, not less.
+        // `MockToolExecutor` has no result for `flaky_probe`, so it errors.
+        let tools = vec![ToolDefinition::new(
+            "flaky_probe",
+            "Probe something",
+            serde_json::json!({}),
+        )];
+        let responses = vec![
+            LlmResponse::with_tool_calls("", vec![ToolCall::new("c1", "flaky_probe", "{}")]),
+            LlmResponse::text("That did not work"),
+        ];
+
+        let handler = make_tool_handler(responses, tools, HashMap::new());
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        let (status_cb, status_log) = recording_status();
+        handler
+            .send_prompt(&conv.id, "Do it".into(), noop_callback(), status_cb)
+            .await
+            .expect("turn completes");
+
+        let completions = completion_statuses(&status_log);
+        assert_eq!(
+            completions,
+            vec!["flaky_probe failed".to_string()],
+            "a failed tool must emit its own status; got {completions:?}"
+        );
+        assert!(
+            !completions.iter().any(|s| s.contains("unknown tool")),
+            "the status must not carry the executor's error detail; got {completions:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tool_status_never_contains_arguments_or_output() {
+        // The status reaches every subscribed client and the journal, so it
+        // carries the tool name and a count only - never the payload (#776).
+        const SECRET: &str = "sk-live-941-DO-NOT-LEAK";
+        let tools = vec![ToolDefinition::new(
+            "vault_fetch",
+            "Fetch a value",
+            serde_json::json!({}),
+        )];
+        let responses = vec![
+            LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new(
+                    "c1",
+                    "vault_fetch",
+                    format!(r#"{{"api_key":"{SECRET}"}}"#),
+                )],
+            ),
+            LlmResponse::text("Done"),
+        ];
+        let mut tool_results = HashMap::new();
+        tool_results.insert("vault_fetch".to_string(), format!("value={SECRET}"));
+
+        let handler = make_tool_handler(responses, tools, tool_results);
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        let (status_cb, status_log) = recording_status();
+        handler
+            .send_prompt(&conv.id, "Fetch it".into(), noop_callback(), status_cb)
+            .await
+            .expect("turn completes");
+
+        let all = status_log.lock().unwrap().clone();
+        assert!(
+            all.iter().all(|s| !s.contains(SECRET)),
+            "no status may carry tool arguments or output; got {all:?}"
+        );
+        // Prove the absence is not simply an absent status.
+        assert!(
+            all.iter().any(|s| s.contains("vault_fetch")),
+            "the completion status must still name the tool; got {all:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn step_control_tools_emit_no_completion_status() {
+        // `begin_step` narrates its goal and nothing else; `complete_step` stays
+        // silent. They are control tools, so a completion line is noise on top
+        // of the narration they already produce. The real tool between them
+        // proves the exclusion is selective, not a silent turn.
+        let tools = vec![ToolDefinition::new(
+            "notes_search",
+            "Search notes",
+            serde_json::json!({}),
+        )];
+        let responses = vec![
+            LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new(
+                    "b1",
+                    "begin_step",
+                    r#"{"goal":"map the plan"}"#,
+                )],
+            ),
+            LlmResponse::with_tool_calls("", vec![ToolCall::new("t1", "notes_search", "{}")]),
+            LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new(
+                    "c1",
+                    "complete_step",
+                    r#"{"outcome":"mapped"}"#,
+                )],
+            ),
+            LlmResponse::text("done"),
+        ];
+        let mut tool_results = HashMap::new();
+        tool_results.insert("notes_search".to_string(), "ok".to_string());
+
+        let (write, list, _sp) = in_memory_scratchpad();
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            ToolCallingLlm::new(responses),
+            MockToolExecutor::new(tools, tool_results),
+            id_gen(),
+        )
+        .with_scratchpad_write(write)
+        .with_scratchpad_list(list);
+
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        let (status_cb, status_log) = recording_status();
+        handler
+            .send_prompt(&conv.id, "plan it".into(), noop_callback(), status_cb)
+            .await
+            .expect("turn completes");
+
+        let all = status_log.lock().unwrap().clone();
+        assert_eq!(
+            all,
+            vec!["map the plan".to_string(), "Ran notes_search".to_string()],
+            "only the begin_step goal and the real tool's completion may appear; got {all:?}"
+        );
     }
 
     #[tokio::test]
@@ -3707,10 +4059,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_calls_without_steps_emit_no_status() {
-        // New narration model: no turn-start filler and no per-tool chatter. A
-        // turn that calls tools but declares no plan steps narrates nothing —
-        // progress is reserved for logical steps (`begin_step`).
+    async fn tool_calls_without_steps_emit_only_completion_status() {
+        // Narration model: still no turn-start filler, and a declared plan step
+        // is still the only thing that narrates a *goal*. What a turn without
+        // steps now emits is one compact completion line per resolved tool
+        // (#941), so a tool-heavy round is never silent.
         let tools = vec![
             ToolDefinition::new("calendar_list", "List calendar", serde_json::json!({})),
             ToolDefinition::new("notes_search", "Search notes", serde_json::json!({})),
@@ -3743,9 +4096,13 @@ mod tests {
         assert_eq!(result, "All set");
 
         let statuses = status_log.lock().unwrap().clone();
-        assert!(
-            statuses.is_empty(),
-            "tool calls without declared steps must emit no status; got {statuses:?}"
+        assert_eq!(
+            statuses,
+            vec![
+                "Ran calendar_list".to_string(),
+                "Ran notes_search".to_string()
+            ],
+            "tool calls without declared steps emit one completion line each; got {statuses:?}"
         );
     }
 
