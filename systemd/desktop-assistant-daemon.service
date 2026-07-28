@@ -13,7 +13,14 @@ Type=simple
 ExecStart=%h/.cargo/bin/desktop-assistant-daemon
 Restart=on-failure
 RestartSec=2
-Environment=RUST_LOG=info,desktop_assistant_core::service=debug,desktop_assistant_mcp_client=debug,desktop_assistant_llm_openai=debug
+# Those three targets log conversation content verbatim at debug: whole tool
+# results before the ingestion cap (core::service), every MCP JSON-RPC request
+# and response in full (mcp_client), and the head of each assembled prompt
+# (llm_openai). The journal is not a private sink - it is world-readable to
+# anything that can run journalctl, and it ships to a collector in k8s. Raise a
+# single target by hand when you are actually debugging it, e.g.
+#   Environment=RUST_LOG=info,desktop_assistant_mcp_client=debug
+Environment=RUST_LOG=info
 
 [Install]
 WantedBy=default.target
