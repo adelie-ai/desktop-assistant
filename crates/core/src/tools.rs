@@ -31,6 +31,15 @@ const FULL_LISTING_FIT_RATIO: f64 = 0.10;
 /// the per-task log ring cheap and each entry single-line.
 const TOOL_EVENT_SUMMARY_MAX: usize = 200;
 
+/// Max characters of a tool's name surfaced in a status line or an
+/// activity-feed row. A name is an identifier, not a payload, so the cap is
+/// far tighter than [`TOOL_EVENT_SUMMARY_MAX`].
+///
+/// Why 64: the model APIs accept at most 64 characters for a tool name, so a
+/// name a model may legitimately call always fits, and a longer one is already
+/// outside the contract (issue #945).
+pub(crate) const TOOL_NAME_MAX: usize = 64;
+
 /// Placeholder substituted for a sensitive argument value before it reaches
 /// the activity feed (which is broadcast over WebSocket and D-Bus, issue #253).
 const REDACTED: &str = "‹redacted›";
@@ -80,6 +89,19 @@ pub(crate) fn summarize_tool_value(args: &serde_json::Value) -> String {
 /// activity feed. Truncated to [`TOOL_EVENT_SUMMARY_MAX`] characters.
 pub(crate) fn summarize_tool_text(text: &str) -> String {
     truncate_single_line(text, TOOL_EVENT_SUMMARY_MAX)
+}
+
+/// Compact, single-line rendering of a tool's name for a status line or an
+/// activity-feed row. Truncated to [`TOOL_NAME_MAX`] characters.
+///
+/// The name is model-supplied and reaches every subscribed client and the
+/// journal, so a hallucinated or injected name must not arrive unbounded or
+/// span several lines - a one-line status widget cannot show either
+/// (issue #945). A normal name is shorter than the cap and holds no
+/// whitespace, so it passes through unchanged and a status still correlates
+/// with the activity feed.
+pub(crate) fn summarize_tool_name(name: &str) -> String {
+    truncate_single_line(name, TOOL_NAME_MAX)
 }
 
 /// Render a single JSON value compactly: strings unquoted (so `path=/tmp/x`
@@ -536,6 +558,29 @@ mod tests {
         // Multibyte content flowed through intact (valid UTF-8, char-boundary
         // safe — a byte-slice at 200 would have split 'é'/'ï' and panicked).
         assert!(out.contains('é') || out.contains('ï'));
+    }
+
+    /// `summarize_tool_name` caps a name at exactly `TOOL_NAME_MAX` characters
+    /// plus a one-char ellipsis, and leaves a name at the cap alone. The
+    /// boundary matters: 64 characters is what the model APIs accept, so a name
+    /// of exactly that length is legitimate and must reach a status untouched.
+    #[test]
+    fn summarize_tool_name_caps_at_the_boundary() {
+        let at_cap = "n".repeat(TOOL_NAME_MAX);
+        assert_eq!(
+            summarize_tool_name(&at_cap),
+            at_cap,
+            "a name of exactly the cap must pass through unchanged"
+        );
+
+        let over_cap = "n".repeat(TOOL_NAME_MAX + 1);
+        let out = summarize_tool_name(&over_cap);
+        assert_eq!(
+            out.chars().count(),
+            TOOL_NAME_MAX + 1,
+            "one char over the cap must truncate to 64 kept chars + '…', got {out:?}"
+        );
+        assert!(out.ends_with('…'), "truncated output must end with '…'");
     }
 
     /// The categorization cache key must be order-independent (tools are sorted

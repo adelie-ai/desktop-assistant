@@ -31,8 +31,8 @@ use crate::ports::tools::ToolExecutor;
 use crate::ports::transport::{current_client_label, current_co_location, current_transport_kind};
 use crate::sanitize::sanitize_assistant_text;
 use crate::tools::{
-    NoopToolExecutor, categorize_tool_namespaces, summarize_tool_text, summarize_tool_value,
-    tool_set_hash,
+    NoopToolExecutor, categorize_tool_namespaces, summarize_tool_name, summarize_tool_text,
+    summarize_tool_value, tool_set_hash,
 };
 use chrono::{Duration, Local};
 use std::collections::HashMap;
@@ -162,7 +162,10 @@ type ToolCompletionRun = Option<(String, u32)>;
 /// The line carries the tool's name and a count and nothing else. It reaches
 /// every subscribed client and the journal, so arguments and output must stay
 /// out of it (#776); `summarize_tool_value` feeds the activity feed, which is
-/// the surface for those.
+/// the surface for those. The name itself is model-supplied, so
+/// `summarize_tool_name` bounds it here - one line, capped length (#945) -
+/// while the run stays keyed on the raw name, so two long names that share a
+/// prefix are still two runs.
 ///
 /// Repeats of the same tool coalesce into one running count rather than one
 /// line each, because a client renders a status by replacing the previous one:
@@ -171,9 +174,10 @@ type ToolCompletionRun = Option<(String, u32)>;
 /// watching human than the successes around it, and folding it into a success
 /// count would hide it.
 fn advance_tool_completion_status(run: &mut ToolCompletionRun, name: &str, ok: bool) -> String {
+    let shown = summarize_tool_name(name);
     if !ok {
         *run = None;
-        return format!("{name} failed");
+        return format!("{shown} failed");
     }
     let count = match run {
         Some((running, count)) if running == name => {
@@ -186,8 +190,8 @@ fn advance_tool_completion_status(run: &mut ToolCompletionRun, name: &str, ok: b
         }
     };
     match count {
-        1 => format!("Ran {name}"),
-        n => format!("Ran {name} {n} times"),
+        1 => format!("Ran {shown}"),
+        n => format!("Ran {shown} {n} times"),
     }
 }
 
@@ -1813,11 +1817,11 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                         tool_call.name
                     );
                     notify_tool_event(ToolEvent::Started {
-                        name: tool_call.name.clone(),
+                        name: summarize_tool_name(&tool_call.name),
                         args: summarize_tool_value(&arguments),
                     });
                     notify_tool_event(ToolEvent::Finished {
-                        name: tool_call.name.clone(),
+                        name: summarize_tool_name(&tool_call.name),
                         ok: false,
                         output: "rejected: not on allowlist".to_string(),
                     });
@@ -1830,8 +1834,11 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 // panel's activity feed). Emitted here — after the step-control
                 // fast path, before either execution branch — so it covers real
                 // tool work (server-side and client-local alike) exactly once.
+                // The name is model-supplied, so it is bounded to one line of
+                // capped length before it leaves the process (#945), the same
+                // way the arguments beside it are.
                 notify_tool_event(ToolEvent::Started {
-                    name: tool_call.name.clone(),
+                    name: summarize_tool_name(&tool_call.name),
                     args: summarize_tool_value(&arguments),
                 });
 
@@ -1869,7 +1876,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                         // -finished row on the cancel path (issue #252).
                         Err(CoreError::Cancelled) => {
                             notify_tool_event(ToolEvent::Finished {
-                                name: tool_call.name.clone(),
+                                name: summarize_tool_name(&tool_call.name),
                                 ok: false,
                                 output: "cancelled".to_string(),
                             });
@@ -1912,7 +1919,13 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                         tokio::select! {
                             r = &mut exec => break r,
                             _ = tokio::time::sleep(SERVER_TOOL_KEEPALIVE_INTERVAL) => {
-                                on_status(format!("Still working on {}", tool_call.name));
+                                // Bounded like the completion status below: the
+                                // name comes from the model and the line reaches
+                                // every subscribed client and the journal (#945).
+                                on_status(format!(
+                                    "Still working on {}",
+                                    summarize_tool_name(&tool_call.name)
+                                ));
                             }
                         }
                     };
@@ -1965,7 +1978,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 };
 
                 notify_tool_event(ToolEvent::Finished {
-                    name: tool_call.name.clone(),
+                    name: summarize_tool_name(&tool_call.name),
                     ok: tool_ok,
                     output: summarize_tool_text(&stored),
                 });
@@ -3301,6 +3314,227 @@ mod tests {
             all,
             vec!["map the plan".to_string(), "Ran notes_search".to_string()],
             "only the begin_step goal and the real tool's completion may appear; got {all:?}"
+        );
+    }
+
+    // --- #945: the model-supplied tool name is bounded before it reaches a
+    // status ---
+
+    /// The longest tool name a status line may carry. Stated here as the spec
+    /// the tests below hold the code to: 64 characters is the longest name the
+    /// model APIs accept for a tool, so a real name never reaches this cap and
+    /// a name that does is already outside what a model may call.
+    const STATUS_TOOL_NAME_CAP: usize = 64;
+
+    /// The keepalive prefix, so a test can state the bound as "the prefix plus
+    /// a capped name plus the one-character ellipsis".
+    const KEEPALIVE_PREFIX: &str = "Still working on ";
+
+    /// The completion prefix, for the same reason.
+    const COMPLETION_PREFIX: &str = "Ran ";
+
+    /// Build a handler whose only tool sleeps for `delay`, so one turn produces
+    /// both status surfaces: the keepalive while the tool runs, and the
+    /// completion when it resolves.
+    fn slow_named_tool_handler(
+        name: &str,
+        delay: std::time::Duration,
+    ) -> ConversationHandler<MockStore, ToolCallingLlm, SlowToolExecutor> {
+        let tools = vec![ToolDefinition::new(
+            name,
+            "slow tool",
+            serde_json::json!({}),
+        )];
+        let responses = vec![
+            LlmResponse::with_tool_calls("", vec![ToolCall::new("c1", name, "{}")]),
+            LlmResponse::text("done"),
+        ];
+        ConversationHandler::with_tools(
+            MockStore::new(),
+            ToolCallingLlm::new(responses),
+            SlowToolExecutor {
+                tools,
+                result: "ok".to_string(),
+                delay,
+            },
+            id_gen(),
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_long_tool_name_is_bounded_in_the_keepalive_status() {
+        // A status reaches every subscribed client and the journal, and the
+        // name in it comes from the model. An unbounded name broadcasts
+        // whatever the model emitted to a one-line widget.
+        let long_name = "a".repeat(STATUS_TOOL_NAME_CAP * 3);
+        let handler = slow_named_tool_handler(&long_name, std::time::Duration::from_secs(120));
+        let conv = handler
+            .create_conversation("c".into(), vec![])
+            .await
+            .unwrap();
+        let (status_cb, status_log) = recording_status();
+        handler
+            .send_prompt(&conv.id, "go".into(), noop_callback(), status_cb)
+            .await
+            .expect("turn completes");
+
+        let keepalives: Vec<String> = status_log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| s.starts_with(KEEPALIVE_PREFIX))
+            .cloned()
+            .collect();
+        assert!(
+            !keepalives.is_empty(),
+            "the keepalive must still fire for a slow tool, or the bound is untested"
+        );
+        let limit = KEEPALIVE_PREFIX.chars().count() + STATUS_TOOL_NAME_CAP + 1;
+        for line in &keepalives {
+            assert!(
+                line.chars().count() <= limit,
+                "the keepalive must bound the tool name; got {} chars: {line:?}",
+                line.chars().count()
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_long_tool_name_is_bounded_in_the_completion_status() {
+        // #941 made the name reach a status on every completion, including the
+        // failure path that an unknown name takes, so the completion line needs
+        // the same bound as the keepalive.
+        let long_name = "b".repeat(STATUS_TOOL_NAME_CAP * 3);
+        let tools = vec![ToolDefinition::new(
+            long_name.as_str(),
+            "does something",
+            serde_json::json!({}),
+        )];
+        let responses = vec![
+            LlmResponse::with_tool_calls("", vec![ToolCall::new("c1", long_name.as_str(), "{}")]),
+            LlmResponse::text("All set"),
+        ];
+        let mut tool_results = HashMap::new();
+        tool_results.insert(long_name.clone(), "ok".to_string());
+
+        let handler = make_tool_handler(responses, tools, tool_results);
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        let (status_cb, status_log) = recording_status();
+        handler
+            .send_prompt(&conv.id, "Do it".into(), noop_callback(), status_cb)
+            .await
+            .expect("turn completes");
+
+        let completions = completion_statuses(&status_log);
+        assert_eq!(
+            completions.len(),
+            1,
+            "the completion must still emit, or the bound is untested; got {completions:?}"
+        );
+        let line = &completions[0];
+        assert!(
+            line.starts_with(COMPLETION_PREFIX),
+            "the completion status must still name the tool; got {line:?}"
+        );
+        assert!(
+            line.chars().count() <= COMPLETION_PREFIX.chars().count() + STATUS_TOOL_NAME_CAP + 1,
+            "the completion must bound the tool name; got {} chars: {line:?}",
+            line.chars().count()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_multiline_tool_name_never_produces_a_multiline_status() {
+        // A one-line status widget cannot show a name that spans lines, and the
+        // journal records one entry per line. The slow tool makes one turn
+        // produce both surfaces, so both are held to the rule.
+        let name = "notes_search\nsecond line\rthird line";
+        let handler = slow_named_tool_handler(name, std::time::Duration::from_secs(120));
+        let conv = handler
+            .create_conversation("c".into(), vec![])
+            .await
+            .unwrap();
+        let (status_cb, status_log) = recording_status();
+        handler
+            .send_prompt(&conv.id, "go".into(), noop_callback(), status_cb)
+            .await
+            .expect("turn completes");
+
+        let all = status_log.lock().unwrap().clone();
+        let named: Vec<&String> = all
+            .iter()
+            .filter(|s| s.starts_with(KEEPALIVE_PREFIX) || s.starts_with(COMPLETION_PREFIX))
+            .collect();
+        assert!(
+            all.iter().any(|s| s.starts_with(KEEPALIVE_PREFIX)),
+            "the keepalive must still fire, or the rule is untested; got {all:?}"
+        );
+        assert!(
+            all.iter().any(|s| s.starts_with(COMPLETION_PREFIX)),
+            "the completion must still fire, or the rule is untested; got {all:?}"
+        );
+        for line in named {
+            assert!(
+                !line.contains('\n') && !line.contains('\r'),
+                "a status must stay on one line; got {line:?}"
+            );
+            assert!(
+                line.contains("notes_search"),
+                "the status must still name the tool; got {line:?}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_bounded_tool_name_still_identifies_the_tool() {
+        // The bound must leave a normal name alone. The status and the activity
+        // feed then carry the same identifier, so a reader correlates the two.
+        let tools = vec![ToolDefinition::new(
+            "calendar_list",
+            "List calendar",
+            serde_json::json!({}),
+        )];
+        let responses = vec![
+            LlmResponse::with_tool_calls("", vec![ToolCall::new("c1", "calendar_list", "{}")]),
+            LlmResponse::text("All set"),
+        ];
+        let mut tool_results = HashMap::new();
+        tool_results.insert("calendar_list".to_string(), "ok".to_string());
+
+        let handler = make_tool_handler(responses, tools, tool_results);
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        let (status_cb, status_log) = recording_status();
+        let (result, events) = capture_tool_events(handler.send_prompt(
+            &conv.id,
+            "Do it".into(),
+            noop_callback(),
+            status_cb,
+        ))
+        .await;
+        result.expect("turn completes");
+
+        assert_eq!(
+            completion_statuses(&status_log),
+            vec!["Ran calendar_list".to_string()],
+            "a normal name reaches the status unchanged"
+        );
+        let feed_names: Vec<String> = events
+            .iter()
+            .map(|e| match e {
+                ToolEvent::Started { name, .. } => name.clone(),
+                ToolEvent::Finished { name, .. } => name.clone(),
+            })
+            .collect();
+        assert_eq!(
+            feed_names,
+            vec!["calendar_list".to_string(), "calendar_list".to_string()],
+            "the activity feed must carry the same identifier as the status; got {feed_names:?}"
         );
     }
 
