@@ -10,7 +10,7 @@
 //! so the stdio transport and the real `initialize` path are exercised.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use desktop_assistant_mcp_client::{McpClient, McpError};
 
@@ -28,7 +28,7 @@ fn temp_path(label: &str) -> PathBuf {
 
 /// Write a fake MCP server that answers `initialize` with `result_body` and
 /// echoes the request line it received to `echo_file`. Returns the script path.
-fn write_server(label: &str, result_body: &str, echo_file: &PathBuf) -> PathBuf {
+fn write_server(label: &str, result_body: &str, echo_file: &Path) -> PathBuf {
     let script = format!(
         r#"#!/bin/sh
 while IFS= read -r line; do

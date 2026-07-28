@@ -378,7 +378,11 @@ impl McpClient {
         });
 
         let response = self.send_request("initialize", Some(params)).await?;
-        self.protocol_version = Some(negotiated_protocol_version(&response)?);
+        let negotiated = negotiated_protocol_version(&response)?;
+        // Before the `initialized` notification, which is itself the first
+        // post-initialize request and so must already carry the header.
+        self.transport.set_protocol_version(&negotiated);
+        self.protocol_version = Some(negotiated);
         self.server_instructions = parse_server_instructions(&response);
 
         // Send initialized notification (no id, no response expected).
@@ -544,6 +548,21 @@ impl Transport {
             Transport::Stdio(t) => t.round_trip(request, timeout, flags).await,
             #[cfg(feature = "http")]
             Transport::Http(t) => t.round_trip(request, timeout, flags).await,
+        }
+    }
+
+    /// Record the revision `initialize` negotiated, so transports that carry it
+    /// on the wire can start doing so.
+    ///
+    /// Only Streamable HTTP has somewhere to put it (`MCP-Protocol-Version`,
+    /// required on every post-initialize request since 2025-06-18). stdio
+    /// negotiates once per process and has no per-message envelope, so this is
+    /// a no-op there.
+    fn set_protocol_version(&mut self, version: &str) {
+        match self {
+            Transport::Stdio(_) => {}
+            #[cfg(feature = "http")]
+            Transport::Http(t) => t.protocol_version = Some(version.to_string()),
         }
     }
 
@@ -782,6 +801,12 @@ struct HttpTransport {
     /// `Mcp-Session-Id` assigned by the server on initialize; echoed on
     /// subsequent requests when present.
     session_id: Option<String>,
+    /// The negotiated revision, sent as `MCP-Protocol-Version` on every request
+    /// after initialize (required since spec revision 2025-06-18).
+    ///
+    /// `None` until the handshake resolves, which is exactly the window in
+    /// which the header must *not* be sent: nothing has been negotiated yet.
+    protocol_version: Option<String>,
 }
 
 #[cfg(feature = "http")]
@@ -800,6 +825,7 @@ impl HttpTransport {
             url: url.to_string(),
             credential,
             session_id: None,
+            protocol_version: None,
         })
     }
 
@@ -823,6 +849,9 @@ impl HttpTransport {
         }
         if let Some(session) = &self.session_id {
             builder = builder.header("Mcp-Session-Id", session);
+        }
+        if let Some(version) = &self.protocol_version {
+            builder = builder.header("MCP-Protocol-Version", version);
         }
 
         let response = tokio::time::timeout(timeout, builder.send())
@@ -949,6 +978,9 @@ impl HttpTransport {
         }
         if let Some(session) = &self.session_id {
             builder = builder.header("Mcp-Session-Id", session);
+        }
+        if let Some(version) = &self.protocol_version {
+            builder = builder.header("MCP-Protocol-Version", version);
         }
         let response = builder
             .send()
