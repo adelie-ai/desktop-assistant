@@ -6,6 +6,8 @@ pub mod executor;
 mod jsonrpc;
 #[cfg(feature = "http")]
 pub mod oauth;
+#[cfg(feature = "http")]
+pub mod url_policy;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -1408,6 +1410,52 @@ struct RawToolDef {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ----- HttpTransport::new applies the shared remote-URL policy (#804) -----
+    //
+    // `HttpTransport::new` used to accept any URL that merely started with
+    // "http://" or "https://" — including a plain-http URL to any host,
+    // which sends the bearer/OAuth token attached to every request in the
+    // clear. These exercise the fix directly, without a mock server: the
+    // refusal happens before any request is sent.
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn http_transport_new_rejects_plain_http_to_a_public_host() {
+        // `HttpTransport` is not `Debug`, so match instead of `expect_err`.
+        match HttpTransport::new("http://evil.example.com/mcp", Credential::None) {
+            Ok(_) => panic!("plain http to a non-loopback host must be refused"),
+            Err(McpError::Http(_)) => {}
+            Err(other) => panic!("expected a transport error, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn http_transport_new_accepts_plain_http_to_loopback() {
+        // Loopback stays permitted: this is also what keeps the httpmock
+        // integration tests in tests/http_transport.rs working, since
+        // httpmock binds to 127.0.0.1.
+        HttpTransport::new("http://127.0.0.1:8080/mcp", Credential::None)
+            .expect("plain http to loopback must still connect");
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn http_transport_new_accepts_https() {
+        HttpTransport::new("https://mcp.example.com/mcp", Credential::None)
+            .expect("https to a public host must be accepted");
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn http_transport_new_rejects_a_disallowed_scheme() {
+        match HttpTransport::new("ftp://mcp.example.com/mcp", Credential::None) {
+            Ok(_) => panic!("a non-http(s) scheme must be refused"),
+            Err(McpError::Http(_)) => {}
+            Err(other) => panic!("expected a transport error, got {other:?}"),
+        }
+    }
 
     #[test]
     fn validate_command_rejects_empty() {

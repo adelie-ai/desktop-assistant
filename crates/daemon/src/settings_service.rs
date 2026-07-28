@@ -105,6 +105,29 @@ impl DaemonSettingsService {
     }
 }
 
+/// Validate a remote MCP server's `url` against the shared remote-URL policy
+/// (#804, #895) before the config is accepted.
+///
+/// A free function rather than a method on [`DaemonSettingsService`]:
+/// [`DaemonSettingsService::upsert_mcp_server`] calls `self.mcp_handle()?`
+/// before it ever reaches this check, and unit-constructed test doubles have
+/// no live [`McpControlHandle`] — so testing this rule through the public
+/// service method is not possible without standing up the fleet. Pulling the
+/// pure check out makes it directly testable (base rule: test public
+/// behavior, and where a private fn needs testing on its own, surface it
+/// with a documented contract, which this doc comment is).
+fn validate_mcp_http_config(
+    http: &desktop_assistant_mcp_client::executor::HttpTransportConfig,
+) -> Result<(), CoreError> {
+    desktop_assistant_mcp_client::url_policy::validate_remote_url(&http.url).map_err(|e| {
+        CoreError::InvalidInput {
+            code: e.code(),
+            description: format!("MCP server http url {:?} refused: {e}", http.url),
+            message: e.user_message(),
+        }
+    })
+}
+
 impl SettingsService for DaemonSettingsService {
     /// Report the config areas the running process is behind on (#686).
     ///
@@ -517,6 +540,7 @@ impl SettingsService for DaemonSettingsService {
         // inline oauth block. resolve_server_oauth returns those exact errors, so
         // reuse it to reject a cross-wired / dangling config before persisting.
         if let Some(http) = &config.http {
+            validate_mcp_http_config(http)?;
             let path = desktop_assistant_mcp_client::config::default_config_path();
             let accounts = desktop_assistant_mcp_client::config::load_service_accounts(&path)
                 .map_err(|e| CoreError::SystemService(e.to_string()))?;
@@ -695,6 +719,58 @@ mod tests {
     fn settings_service_constructs() {
         let service = DaemonSettingsService::new(PathBuf::from("/tmp/desktop-assistant-test.toml"));
         assert!(service.config_path.ends_with("desktop-assistant-test.toml"));
+    }
+
+    // --- upsert_mcp_server's http url is checked against the shared ---------
+    // remote-URL policy (#804, #895), before the config is ever handed to a
+    // live fleet handle.
+
+    fn http_config(url: &str) -> desktop_assistant_mcp_client::executor::HttpTransportConfig {
+        desktop_assistant_mcp_client::executor::HttpTransportConfig {
+            url: url.to_string(),
+            auth_bearer_secret: None,
+            oauth: None,
+            oauth_account: None,
+            scopes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn validate_mcp_http_config_rejects_a_plain_http_url_to_a_public_host() {
+        let err = validate_mcp_http_config(&http_config("http://evil.example.com/mcp"))
+            .expect_err("plain http to a public host must be refused");
+        match err {
+            CoreError::InvalidInput { code, message, .. } => {
+                assert_eq!(code, "url_insecure_scheme");
+                assert!(
+                    !message.is_empty(),
+                    "the refusal must carry a user-facing message"
+                );
+            }
+            other => panic!("expected CoreError::InvalidInput, got {other}"),
+        }
+    }
+
+    #[test]
+    fn validate_mcp_http_config_rejects_a_cloud_metadata_address() {
+        let err = validate_mcp_http_config(&http_config("http://169.254.169.254/"))
+            .expect_err("the cloud metadata address must be refused");
+        match err {
+            CoreError::InvalidInput { code, .. } => assert_eq!(code, "url_target_blocked"),
+            other => panic!("expected CoreError::InvalidInput, got {other}"),
+        }
+    }
+
+    #[test]
+    fn validate_mcp_http_config_accepts_a_loopback_http_url() {
+        validate_mcp_http_config(&http_config("http://127.0.0.1:8765/mcp"))
+            .expect("loopback http must keep working (also what httpmock tests rely on)");
+    }
+
+    #[test]
+    fn validate_mcp_http_config_accepts_a_legitimate_https_url() {
+        validate_mcp_http_config(&http_config("https://gmailmcp.googleapis.com/mcp/v1"))
+            .expect("a documented hosted https MCP endpoint must be accepted");
     }
 
     /// A path that does not exist resolves to the daemon's default config, whose

@@ -26,6 +26,14 @@
 //! them - needs `CoreError`'s variants carried across the `ApiError` boundary
 //! first (#972). Until then an unclassified frame is honest about being
 //! unclassified rather than mislabelled.
+//!
+//! [`ApiError::InvalidInput`] is the one narrow exception (#804, #895): a
+//! rules-based refusal of a URL a client supplied (a connection `base_url`,
+//! a remote MCP endpoint) needed a legible, classified refusal immediately,
+//! rather than waiting on #972's broader reclassification of the
+//! pre-existing message-only variants above. It carries its own stable code
+//! and user-facing message end to end from `CoreError::InvalidInput`, so
+//! this module does not have to guess one from a string.
 
 use desktop_assistant_api_model as api;
 use desktop_assistant_application::ApiError;
@@ -113,6 +121,19 @@ pub(crate) fn api_error_frame(id: String, error: ApiError) -> api::WsFrame {
                 retryable: false,
             },
         ),
+        ApiError::InvalidInput {
+            code,
+            description,
+            message,
+        } => api::WsFrame::declined(
+            id,
+            api::ErrorDetail {
+                code: api::ErrorCode::Other(code),
+                description,
+                message,
+                retryable: false,
+            },
+        ),
     }
 }
 
@@ -182,6 +203,28 @@ mod tests {
             detail(&api_error_frame("i".to_string(), ApiError::AlreadyTerminal)).code,
             api::ErrorCode::AlreadyTerminal
         );
+    }
+
+    /// #804 / #895: a rules-based URL refusal reaches the wire as a
+    /// classified, not-retryable decline, carrying its own stable code
+    /// and user-facing message rather than the generic unclassified string.
+    #[test]
+    fn an_invalid_input_refusal_is_classified_with_its_own_stable_code() {
+        let frame = api_error_frame(
+            "i".to_string(),
+            ApiError::InvalidInput {
+                code: "url_insecure_scheme".to_string(),
+                description: "connection base_url refused: ...".to_string(),
+                message: "Use https:// instead.".to_string(),
+            },
+        );
+        let detail = detail(&frame);
+        assert_eq!(
+            detail.code,
+            api::ErrorCode::Other("url_insecure_scheme".to_string())
+        );
+        assert_eq!(detail.message, "Use https:// instead.");
+        assert!(!detail.retryable, "the same URL will always be refused");
     }
 
     #[test]

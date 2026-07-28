@@ -209,6 +209,22 @@ impl ConnectionConfig {
         }
     }
 
+    /// This connection's endpoint override, if it set one. Every connector
+    /// carries the field; `None` means "use the connector's own hosted
+    /// default", which is never client-controlled and so needs no
+    /// validation.
+    pub fn base_url(&self) -> Option<&str> {
+        match self {
+            Self::Anthropic(c) => c.base_url.as_deref(),
+            Self::OpenAi(c) => c.base_url.as_deref(),
+            Self::OpenRouter(c) => c.base_url.as_deref(),
+            Self::Azure(c) => c.base_url.as_deref(),
+            Self::Google(c) => c.base_url.as_deref(),
+            Self::Bedrock(c) => c.base_url.as_deref(),
+            Self::Ollama(c) => c.base_url.as_deref(),
+        }
+    }
+
     /// Set (or clear, with `None`) this connection's secret-store coordinate.
     ///
     /// Only credential-bearing connectors carry a `secret` field. Ollama talks

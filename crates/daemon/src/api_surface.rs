@@ -625,6 +625,7 @@ impl ConnectionsService for DaemonConnectionsService {
         // Nothing to carry forward on a create, so the connector's own key
         // variables are the only names accepted.
         constrain_api_key_env(&mut new_conn, None).map_err(CoreError::Llm)?;
+        constrain_base_url(&new_conn)?;
         self.registry.mutate_config(|cfg| {
             if cfg.connections.contains_key(id_valid.as_str()) {
                 return Err(format!("connection id {:?} already exists", id_valid));
@@ -643,6 +644,7 @@ impl ConnectionsService for DaemonConnectionsService {
         let id_valid = ConnectionId::new(id.clone())
             .map_err(|e| CoreError::Llm(format!("invalid connection id: {e}")))?;
         let mut new_conn = payload_to_connection(config);
+        constrain_base_url(&new_conn)?;
         self.registry.mutate_config(|cfg| {
             let Some(existing) = cfg.connections.get(id_valid.as_str()) else {
                 return Err(format!("connection id {:?} does not exist", id_valid));
@@ -1845,6 +1847,27 @@ fn constrain_api_key_env(
         .map_err(|e| format!("api_key_env: {e}"))
 }
 
+/// Validate a connection's `base_url` against the shared remote-URL policy
+/// (#804, #895) before it is stored.
+///
+/// `None` (use the connector's own hosted default) is always fine — that
+/// endpoint is never client-controlled. When the client sets one, it is
+/// exactly the value the connector attaches the connection's API key or
+/// bearer token to on every request, so it gets the same scrutiny as a
+/// remote MCP endpoint's `url`.
+fn constrain_base_url(conn: &ConnectionConfig) -> Result<(), CoreError> {
+    let Some(base_url) = conn.base_url() else {
+        return Ok(());
+    };
+    desktop_assistant_mcp_client::url_policy::validate_remote_url(base_url).map_err(|e| {
+        CoreError::InvalidInput {
+            code: e.code(),
+            description: format!("connection base_url {base_url:?} refused: {e}"),
+            message: e.user_message(),
+        }
+    })
+}
+
 /// Project a client-supplied [`ConnectionConfigPayload`] onto the stored
 /// [`ConnectionConfig`] shape.
 ///
@@ -2592,6 +2615,115 @@ mod tests {
             .await
             .unwrap_err();
         assert!(format!("{err}").contains("already exists"));
+    }
+
+    // --- base_url is validated against the shared remote-URL policy --------
+    // (#804, #895): a connection's base_url is a client-controlled value the
+    // connector attaches a credential to on every request, so it is checked
+    // the same way as a remote MCP endpoint's url.
+
+    fn openai_payload_with_base_url(base_url: &str) -> ConnectionConfigPayload {
+        ConnectionConfigPayload::OpenAi {
+            base_url: Some(base_url.to_string()),
+            api_key_env: None,
+            connect_timeout_secs: None,
+            stream_timeout_secs: None,
+            max_context_tokens: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn create_connection_rejects_a_plain_http_base_url_to_a_public_host() {
+        let svc = DaemonConnectionsService::new(make_handle_with(DaemonConfig::default()));
+        let err = svc
+            .create_connection(
+                "work".to_string(),
+                openai_payload_with_base_url("http://evil.example.com/v1"),
+            )
+            .await
+            .unwrap_err();
+        match err {
+            CoreError::InvalidInput { code, .. } => assert_eq!(code, "url_insecure_scheme"),
+            other => panic!("expected CoreError::InvalidInput, got {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_connection_rejects_a_link_local_base_url() {
+        let svc = DaemonConnectionsService::new(make_handle_with(DaemonConfig::default()));
+        let err = svc
+            .create_connection(
+                "work".to_string(),
+                openai_payload_with_base_url("http://169.254.169.254/v1"),
+            )
+            .await
+            .unwrap_err();
+        match err {
+            CoreError::InvalidInput { code, .. } => assert_eq!(code, "url_target_blocked"),
+            other => panic!("expected CoreError::InvalidInput, got {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_connection_accepts_an_https_base_url() {
+        let svc = DaemonConnectionsService::new(make_handle_with(DaemonConfig::default()));
+        svc.create_connection(
+            "work".to_string(),
+            openai_payload_with_base_url("https://api.openai.com/v1"),
+        )
+        .await
+        .expect("a legitimate https base_url must keep working");
+    }
+
+    #[tokio::test]
+    async fn create_connection_accepts_a_loopback_http_base_url() {
+        let svc = DaemonConnectionsService::new(make_handle_with(DaemonConfig::default()));
+        svc.create_connection(
+            "local".to_string(),
+            ConnectionConfigPayload::Ollama {
+                base_url: Some("http://localhost:11434".into()),
+                connect_timeout_secs: None,
+                stream_timeout_secs: None,
+                keep_warm: None,
+                max_context_tokens: None,
+            },
+        )
+        .await
+        .expect("a loopback http base_url must be accepted");
+    }
+
+    #[tokio::test]
+    async fn update_connection_rejects_a_plain_http_base_url_to_a_public_host() {
+        let handle = make_handle_with(config_with_connections(&[(
+            "work",
+            openai_reading_env(Some("OPENAI_API_KEY")),
+        )]));
+        let svc = DaemonConnectionsService::new(handle.clone());
+        let err = svc
+            .update_connection(
+                "work".to_string(),
+                openai_payload_with_base_url("http://attacker.example.invalid/v1"),
+            )
+            .await
+            .unwrap_err();
+        match err {
+            CoreError::InvalidInput { code, .. } => assert_eq!(code, "url_insecure_scheme"),
+            other => panic!("expected CoreError::InvalidInput, got {other}"),
+        }
+
+        let cfg = handle.snapshot_config();
+        let conn = cfg
+            .connections
+            .get("work")
+            .expect("connection should exist");
+        match conn {
+            ConnectionConfig::OpenAi(c) => assert_eq!(
+                c.base_url.as_deref(),
+                Some("https://api.openai.com/v1"),
+                "a rejected update must not apply its base_url either"
+            ),
+            other => panic!("expected an openai connection, got {other:?}"),
+        }
     }
 
     // --- UpdateConnection must not clobber the secret coordinate -----------
