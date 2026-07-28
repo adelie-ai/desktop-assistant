@@ -145,8 +145,15 @@ The split landed as *writes* admin, *reads* tenant. Reading the operator section
 still open, for two reasons: the credentials they used to carry are redacted on the way
 out (#727), and the same values reach every client through `GetConfig`, which every
 settings panel and the personality surface already read. Gating the reads coherently
-means partitioning `Config` itself, which is decision 1's per-user override layer.
-Tracked as #973 rather than half-done here.
+means partitioning `Config` itself - the read half of this decision, tracked as
+#973 rather than half-done here.
+
+The global `[personality]` block is admin-gated for the same staging reason, not
+because it is an operator concern: decision 9 names personality and speech mode
+as the right candidates for decision 1's per-user override layer, and that layer
+does not exist yet. It is tracked as #986; when it lands a tenant edits their own
+personality and only the instance default stays admin. `SetConversationPersonality`
+is the tenant's lever in the meantime.
 
 ## Consequences
 

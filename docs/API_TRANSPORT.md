@@ -101,8 +101,9 @@ capability. That includes the seven personality traits: they are one global
 override resolves against it, so one caller writing a trait changes every other
 tenant's assistant. A tenant sets their own disposition with
 `SetConversationPersonality`, which is genuinely per-conversation and stays
-tenant work. When the per-user override layer lands the traits move to the
-tenant side.
+tenant work. This is staging, not a judgement that personality is an operator
+concern: the per-user override layer (#986) is where the traits belong, and when
+it lands a tenant edits their own while the instance default stays admin.
 
 `McpServerAction` is split the same way, by its verb. `"status"` is a read
 returning exactly what `ListMcpServers` returns and stays tenant; `"start"`,

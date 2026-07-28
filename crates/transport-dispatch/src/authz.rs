@@ -118,7 +118,7 @@ pub fn capability_for_local_peer(peer_uid: u32, daemon_uid: u32) -> Capability {
 /// - Reading operator settings stays tenant because the credentials they used
 ///   to carry are now redacted on the way out (#727) and the same values reach
 ///   every client through `GetConfig`. Tightening the reads needs `Config`
-///   itself partitioned, which is decision 1's per-user override layer (#973).
+///   itself partitioned, which is the read half of design decision 6 (#973).
 /// - Conversation, knowledge, scratchpad and background-task commands are
 ///   tenant work **only where the storage path actually carries a `user_id`
 ///   predicate**. Verify that against the SQL before classifying a command
@@ -278,8 +278,14 @@ fn classify(cmd: &api::Command) -> (&'static str, Capability) {
 /// genuinely per-user (stored on the conversation, resolved against the global
 /// on each send) and stays [`Capability::Tenant`]. The global value is the
 /// instance default, which is operator configuration under design decision 6.
-/// A per-user personality layer is decision 1's override layer, tracked as #973;
-/// when it lands, the traits move to the tenant side here.
+///
+/// **This is staging, not a judgement that personality is an operator concern.**
+/// Design decision 9 names personality and speech mode as good candidates for
+/// the per-user override layer in decision 1, precisely because they are cheap
+/// and personal. That layer does not exist yet, which is the only reason the
+/// traits are gated here. It is tracked as #986; when it lands, a tenant's write
+/// targets their own row and this arm moves to the tenant side, while writing
+/// the instance default stays admin.
 ///
 /// An empty change set writes nothing, so it costs nothing.
 ///
