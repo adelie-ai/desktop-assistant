@@ -24,7 +24,7 @@ async fn mock_handshake(server: &MockServer) {
                 .body_includes(r#""method":"initialize""#);
             then.status(200)
                 .header("content-type", "application/json")
-                .body(r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"mock","version":"0"}}}"#);
+                .body(r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"mock","version":"0"}}}"#);
         })
         .await;
     server
@@ -82,6 +82,192 @@ async fn http_transport_initialize_list_and_call() {
     assert_eq!(result, "event created");
 }
 
+// ----- MCP-Protocol-Version header (issue #932) -----
+//
+// Required on every HTTP request after initialization since spec revision
+// 2025-06-18. A compliant server that receives no header is told to assume
+// 2025-03-26 and to answer 400 for a version it does not support — so against a
+// server that has retired 2025-03-26 (which is exactly what mcp-core just did)
+// every request we make is entitled to fail.
+
+/// Register a handshake whose `initialize` reply negotiates `version`, and
+/// return a mock matching any request that carries `MCP-Protocol-Version`.
+async fn mock_handshake_negotiating(server: &MockServer, version: &str) {
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":"{version}","capabilities":{{}},"serverInfo":{{"name":"mock","version":"0"}}}}}}"#
+    );
+    server
+        .mock_async(move |when, then| {
+            when.method(POST)
+                .path("/mcp")
+                .body_includes(r#""method":"initialize""#);
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(body);
+        })
+        .await;
+    server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/mcp")
+                .body_includes(r#""method":"notifications/initialized""#);
+            then.status(202);
+        })
+        .await;
+}
+
+/// Nothing is negotiated until the server replies, so the initialize request
+/// itself must not carry the header.
+#[tokio::test]
+async fn http_initialize_omits_protocol_version_header() {
+    let server = MockServer::start_async().await;
+    let without_header = server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/mcp")
+                .body_includes(r#""method":"initialize""#)
+                .header_missing("MCP-Protocol-Version");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"mock","version":"0"}}}"#);
+        })
+        .await;
+    server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/mcp")
+                .body_includes(r#""method":"notifications/initialized""#);
+            then.status(202);
+        })
+        .await;
+
+    McpClient::connect_http(&server.url("/mcp"), None)
+        .await
+        .expect("handshake must succeed");
+    without_header.assert_calls_async(1).await;
+}
+
+/// The `notifications/initialized` POST is the first post-initialize message,
+/// so it is already subject to the rule.
+#[tokio::test]
+async fn http_initialized_notification_carries_protocol_version_header() {
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/mcp")
+                .body_includes(r#""method":"initialize""#);
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"mock","version":"0"}}}"#);
+        })
+        .await;
+    let notified = server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/mcp")
+                .body_includes(r#""method":"notifications/initialized""#)
+                .header("MCP-Protocol-Version", "2025-11-25");
+            then.status(202);
+        })
+        .await;
+
+    McpClient::connect_http(&server.url("/mcp"), None)
+        .await
+        .expect("handshake must succeed");
+    notified.assert_calls_async(1).await;
+}
+
+#[tokio::test]
+async fn http_requests_carry_negotiated_protocol_version_header() {
+    let server = MockServer::start_async().await;
+    mock_handshake_negotiating(&server, "2025-11-25").await;
+    let listed = server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/mcp")
+                .body_includes(r#""method":"tools/list""#)
+                .header("MCP-Protocol-Version", "2025-11-25");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}"#);
+        })
+        .await;
+
+    let mut client = McpClient::connect_http(&server.url("/mcp"), None)
+        .await
+        .expect("handshake must succeed");
+    client.list_tools().await.expect("tools/list");
+    listed.assert_calls_async(1).await;
+}
+
+/// The header must carry what the server agreed to, not what we asked for.
+#[tokio::test]
+async fn http_header_reflects_downgraded_version() {
+    let server = MockServer::start_async().await;
+    mock_handshake_negotiating(&server, "2025-06-18").await;
+    let listed = server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/mcp")
+                .body_includes(r#""method":"tools/list""#)
+                .header("MCP-Protocol-Version", "2025-06-18");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}"#);
+        })
+        .await;
+
+    let mut client = McpClient::connect_http(&server.url("/mcp"), None)
+        .await
+        .expect("a 2025-06-18 server must still connect");
+    client.list_tools().await.expect("tools/list");
+    listed.assert_calls_async(1).await;
+}
+
+/// Adding the protocol header must not displace the session header.
+#[tokio::test]
+async fn http_session_and_protocol_headers_coexist() {
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/mcp")
+                .body_includes(r#""method":"initialize""#);
+            then.status(200)
+                .header("content-type", "application/json")
+                .header("Mcp-Session-Id", "sess-42")
+                .body(r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"mock","version":"0"}}}"#);
+        })
+        .await;
+    server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/mcp")
+                .body_includes(r#""method":"notifications/initialized""#);
+            then.status(202);
+        })
+        .await;
+    let listed = server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/mcp")
+                .body_includes(r#""method":"tools/list""#)
+                .header("Mcp-Session-Id", "sess-42")
+                .header("MCP-Protocol-Version", "2025-11-25");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}"#);
+        })
+        .await;
+
+    let mut client = McpClient::connect_http(&server.url("/mcp"), None)
+        .await
+        .expect("handshake must succeed");
+    client.list_tools().await.expect("tools/list");
+    listed.assert_calls_async(1).await;
+}
+
 #[tokio::test]
 async fn http_transport_sends_bearer_token() {
     let server = MockServer::start_async().await;
@@ -97,7 +283,7 @@ async fn http_transport_sends_bearer_token() {
                 .body_includes(r#""method":"initialize""#);
             then.status(200)
                 .header("content-type", "application/json")
-                .body(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#);
+                .body(r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"mock","version":"0"}}}"#);
         })
         .await;
     server
@@ -135,7 +321,7 @@ async fn mock_handshake_with_bearer(server: &MockServer, bearer: &str) {
                 .body_includes(r#""method":"initialize""#);
             then.status(200)
                 .header("content-type", "application/json")
-                .body(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#);
+                .body(r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"mock","version":"0"}}}"#);
         })
         .await;
     server

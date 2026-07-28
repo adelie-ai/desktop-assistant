@@ -45,6 +45,7 @@ for line in sys.stdin:
             "jsonrpc": "2.0",
             "id": req_id,
             "result": {
+                "protocolVersion": "2025-11-25",
                 "capabilities": {
                     "tools": {"listChanged": True},
                     "resources": {"listChanged": True},

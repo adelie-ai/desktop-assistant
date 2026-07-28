@@ -24,7 +24,7 @@ async fn mock_handshake_with_bearer(server: &MockServer, bearer: &str) {
                 .body_includes(r#""method":"initialize""#);
             then.status(200)
                 .header("content-type", "application/json")
-                .body(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#);
+                .body(r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"mock","version":"0"}}}"#);
         })
         .await;
     server

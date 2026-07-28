@@ -46,6 +46,21 @@ const MAX_LINE_BYTES: u64 = 8 * 1024 * 1024;
 #[cfg(feature = "http")]
 const MAX_HTTP_BODY_BYTES: usize = 16 * 1024 * 1024;
 
+/// The MCP spec revision this client requests at `initialize`. The spec says a
+/// client SHOULD request the latest version it supports; bumping this is the
+/// one-line edit that adopts a new revision.
+const REQUESTED_PROTOCOL_VERSION: &str = "2025-11-25";
+
+/// Revisions this client can reason about, oldest first.
+///
+/// Deliberately wider than what our own servers advertise: `mcp-core` retired
+/// `2024-11-05` and `2025-03-26`, but this client also talks to third-party
+/// servers that have not. Every revision listed carries `initialize`,
+/// `tools/list`, `tools/call` and `resources/list` identically, which is why a
+/// downgrade to any of them is safe to proceed on.
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
+    &["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"];
+
 /// Error type for MCP client operations.
 #[derive(Debug, thiserror::Error)]
 pub enum McpError {
@@ -78,6 +93,12 @@ pub enum McpError {
 
     #[error("MCP client is not connected")]
     NotConnected,
+
+    #[error(
+        "MCP server negotiated protocol version '{got}', which this client does not \
+         support (requested '{requested}')"
+    )]
+    UnsupportedProtocolVersion { got: String, requested: String },
 
     #[error("MCP request '{method}' timed out after {after:?} of silence")]
     Timeout { method: String, after: Duration },
@@ -156,6 +177,10 @@ pub struct McpClient {
     /// (trimmed, non-empty). Captured once at connect and used as the primary
     /// seed for the server's provider description in tool-search surfacing.
     server_instructions: Option<String>,
+    /// The protocol revision this session actually negotiated, captured from
+    /// the `initialize` result. `None` only before the handshake runs — a
+    /// completed `initialize` always sets it or fails.
+    protocol_version: Option<String>,
 }
 
 /// Extract the trimmed, non-empty `instructions` string from an MCP
@@ -169,6 +194,53 @@ pub fn parse_server_instructions(result: &serde_json::Value) -> Option<String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(String::from)
+}
+
+/// Validate the `protocolVersion` an MCP server answered `initialize` with, and
+/// return the revision this session is on.
+///
+/// Why warn-and-proceed rather than disconnect: the spec says a client that
+/// does not support the returned version SHOULD disconnect. We deliberately do
+/// not, for a version we recognise. Every revision in
+/// [`SUPPORTED_PROTOCOL_VERSIONS`] carries the entire surface this client uses
+/// identically, so hard-failing would break working third-party servers — and
+/// every fleet server whose `mcp-core` pin has not moved yet — in exchange for
+/// nothing. We fail only where we genuinely cannot reason about the session:
+/// a version we do not know, a non-string value, or no value at all.
+fn negotiated_protocol_version(result: &serde_json::Value) -> Result<String, McpError> {
+    let Some(version) = result.get("protocolVersion") else {
+        return Err(McpError::UnexpectedResponse(
+            "initialize result is missing 'protocolVersion'".into(),
+        ));
+    };
+    let Some(version) = version.as_str() else {
+        return Err(McpError::UnexpectedResponse(format!(
+            "initialize result has a non-string 'protocolVersion': {version}"
+        )));
+    };
+
+    if !SUPPORTED_PROTOCOL_VERSIONS.contains(&version) {
+        return Err(McpError::UnsupportedProtocolVersion {
+            got: version.to_string(),
+            requested: REQUESTED_PROTOCOL_VERSION.to_string(),
+        });
+    }
+
+    if version != REQUESTED_PROTOCOL_VERSION {
+        let server = result
+            .get("serverInfo")
+            .and_then(|i| i.get("name"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("<unnamed>");
+        tracing::warn!(
+            server,
+            negotiated = version,
+            requested = REQUESTED_PROTOCOL_VERSION,
+            "MCP server negotiated an older protocol revision; proceeding"
+        );
+    }
+
+    Ok(version.to_string())
 }
 
 impl McpClient {
@@ -262,6 +334,7 @@ impl McpClient {
             flags: Arc::new(ListChangeFlags::default()),
             request_timeout,
             server_instructions: None,
+            protocol_version: None,
         };
 
         let init_timeout = INIT_TIMEOUT.min(request_timeout);
@@ -286,9 +359,17 @@ impl McpClient {
         self.server_instructions.as_deref()
     }
 
+    /// The MCP protocol revision this session negotiated, as reported by the
+    /// server's `initialize` result — which may be older than
+    /// [`REQUESTED_PROTOCOL_VERSION`]. `None` only before the handshake has
+    /// run; a connected client always has one.
+    pub fn protocol_version(&self) -> Option<&str> {
+        self.protocol_version.as_deref()
+    }
+
     async fn initialize(&mut self) -> Result<(), McpError> {
         let params = serde_json::json!({
-            "protocolVersion": "2024-11-05",
+            "protocolVersion": REQUESTED_PROTOCOL_VERSION,
             "capabilities": {},
             "clientInfo": {
                 "name": "desktop-assistant",
@@ -297,6 +378,11 @@ impl McpClient {
         });
 
         let response = self.send_request("initialize", Some(params)).await?;
+        let negotiated = negotiated_protocol_version(&response)?;
+        // Before the `initialized` notification, which is itself the first
+        // post-initialize request and so must already carry the header.
+        self.transport.set_protocol_version(&negotiated);
+        self.protocol_version = Some(negotiated);
         self.server_instructions = parse_server_instructions(&response);
 
         // Send initialized notification (no id, no response expected).
@@ -462,6 +548,21 @@ impl Transport {
             Transport::Stdio(t) => t.round_trip(request, timeout, flags).await,
             #[cfg(feature = "http")]
             Transport::Http(t) => t.round_trip(request, timeout, flags).await,
+        }
+    }
+
+    /// Record the revision `initialize` negotiated, so transports that carry it
+    /// on the wire can start doing so.
+    ///
+    /// Only Streamable HTTP has somewhere to put it (`MCP-Protocol-Version`,
+    /// required on every post-initialize request since 2025-06-18). stdio
+    /// negotiates once per process and has no per-message envelope, so this is
+    /// a no-op there.
+    fn set_protocol_version(&mut self, version: &str) {
+        match self {
+            Transport::Stdio(_) => {}
+            #[cfg(feature = "http")]
+            Transport::Http(t) => t.protocol_version = Some(version.to_string()),
         }
     }
 
@@ -700,6 +801,12 @@ struct HttpTransport {
     /// `Mcp-Session-Id` assigned by the server on initialize; echoed on
     /// subsequent requests when present.
     session_id: Option<String>,
+    /// The negotiated revision, sent as `MCP-Protocol-Version` on every request
+    /// after initialize (required since spec revision 2025-06-18).
+    ///
+    /// `None` until the handshake resolves, which is exactly the window in
+    /// which the header must *not* be sent: nothing has been negotiated yet.
+    protocol_version: Option<String>,
 }
 
 #[cfg(feature = "http")]
@@ -718,6 +825,7 @@ impl HttpTransport {
             url: url.to_string(),
             credential,
             session_id: None,
+            protocol_version: None,
         })
     }
 
@@ -741,6 +849,9 @@ impl HttpTransport {
         }
         if let Some(session) = &self.session_id {
             builder = builder.header("Mcp-Session-Id", session);
+        }
+        if let Some(version) = &self.protocol_version {
+            builder = builder.header("MCP-Protocol-Version", version);
         }
 
         let response = tokio::time::timeout(timeout, builder.send())
@@ -867,6 +978,9 @@ impl HttpTransport {
         }
         if let Some(session) = &self.session_id {
             builder = builder.header("Mcp-Session-Id", session);
+        }
+        if let Some(version) = &self.protocol_version {
+            builder = builder.header("MCP-Protocol-Version", version);
         }
         let response = builder
             .send()

@@ -507,7 +507,7 @@ mod tests {
   id=$(printf %s "$line" | sed 's/.*"id":\([0-9]*\).*/\1/')
   case "$line" in
     *'"method":"initialize"'*)
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"fake","version":"0.0"}}}\n' "$id" ;;
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"fake","version":"0.0"}}}\n' "$id" ;;
     *'"method":"notifications/initialized"'*) : ;;
     *'"method":"tools/list"'*)
       printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"@TOOL@","description":"d","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
