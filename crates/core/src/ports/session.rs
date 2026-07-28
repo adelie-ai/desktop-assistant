@@ -38,6 +38,9 @@
 pub struct SessionId(String);
 
 impl SessionId {
+    /// The sentinel value for a context with no connection installed.
+    const UNSCOPED: &'static str = "unscoped";
+
     /// Wrap a transport-minted session identifier.
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
@@ -47,12 +50,21 @@ impl SessionId {
     /// Distinct from any real connection id so the unscoped bucket can
     /// never collide with a live session.
     pub fn unscoped() -> Self {
-        Self("unscoped".to_string())
+        Self(Self::UNSCOPED.to_string())
     }
 
     /// Borrow the underlying identifier.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Whether this is the unscoped sentinel rather than a real connection.
+    ///
+    /// Why: readers that branch on "is a client connection attached?" - turn
+    /// interactivity (#942) is the first - should ask that question by name
+    /// instead of comparing against [`SessionId::unscoped`] at each site.
+    pub fn is_unscoped(&self) -> bool {
+        self.0 == Self::UNSCOPED
     }
 }
 
@@ -96,6 +108,17 @@ mod tests {
     async fn current_session_id_outside_scope_is_unscoped() {
         assert_eq!(current_session_id(), SessionId::unscoped());
         assert_eq!(current_session_id().as_str(), "unscoped");
+    }
+
+    #[test]
+    fn is_unscoped_tells_the_sentinel_from_a_real_connection() {
+        assert!(SessionId::unscoped().is_unscoped());
+        assert!(SessionId::default().is_unscoped());
+        assert!(!SessionId::new("sess-1").is_unscoped());
+        // A transport mints ids as `sess-N`, so nothing on the wire can dress
+        // itself up as the sentinel; the check stays exact all the same.
+        assert!(!SessionId::new("Unscoped").is_unscoped());
+        assert!(!SessionId::new("unscoped ").is_unscoped());
     }
 
     #[tokio::test]

@@ -8,7 +8,9 @@
 //! the connection's transport kind plus its system-id co-location result and
 //! client host label (#243/#248), and the self-reported client context (#549).
 //! The transport dispatcher installs all of
-//! them around each request. But `task_local`s do **not** cross a
+//! them around each request. One more, the turn's interactivity (#942), is
+//! stated by whoever starts the turn, or derived from the session when nobody
+//! stated it. But `task_local`s do **not** cross a
 //! `tokio::spawn`, and the streaming send-message path spawns the turn body on
 //! a fresh task. So every spawn site has to *capture each value before the
 //! spawn and re-install it inside the spawned body*.
@@ -51,13 +53,18 @@ use crate::ports::transport::{
     current_transport_kind, with_client_context, with_client_label, with_co_location,
     with_transport_kind,
 };
+use crate::ports::turn_interactivity::{
+    TurnInteractivity, current_turn_interactivity, with_turn_interactivity,
+};
 
 /// The set of request-scoped task-locals that must be re-installed inside a
 /// spawned turn body. Capture it before the spawn, re-install it inside.
 ///
-/// Every field corresponds to one `tokio::task_local!` that the transport
-/// dispatcher installs around a request but that would otherwise be lost across
-/// the `tokio::spawn` that runs the streaming turn body.
+/// Every field corresponds to one `tokio::task_local!` that is set around a
+/// request but that would otherwise be lost across the `tokio::spawn` that runs
+/// the streaming turn body. The transport dispatcher installs all of them
+/// except `interactivity`, which the turn's caller states or the session
+/// derives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestScope {
     /// Per-request user identity (#105). Defaults to [`UserId::default`] (the
@@ -81,6 +88,13 @@ pub struct RequestScope {
     /// bundle because it is installed at the transport layer but read when the
     /// prompt is assembled, deep inside the spawned turn body.
     pub client_context: Option<ClientContext>,
+    /// Whether a person is watching this turn (#942). Unlike the other fields
+    /// this one is *resolved*, not just read: [`RequestScope::capture`] takes
+    /// the value a caller stated, or the session-derived default when none did,
+    /// and [`RequestScope::scope`] re-installs that answer. So a turn body that
+    /// runs on a spawned task inherits the decision its caller made rather than
+    /// re-deriving it from the session it also carries.
+    pub interactivity: TurnInteractivity,
 }
 
 impl RequestScope {
@@ -99,6 +113,7 @@ impl RequestScope {
             co_located: current_co_location(),
             client_label: current_client_label(),
             client_context: current_client_context(),
+            interactivity: current_turn_interactivity(),
         }
     }
 
@@ -106,11 +121,20 @@ impl RequestScope {
     ///
     /// Call this *inside* a spawned turn body so the turn sees the same
     /// request scope its dispatcher installed. The nesting order matches the
-    /// dispatcher's (and is immaterial — the locals are independent slots).
+    /// dispatcher's and is immaterial: every slot is installed explicitly here,
+    /// so none of them falls back to another's value.
     ///
     /// `current_user_id()`, `current_session_id()`, `current_transport_kind()`,
-    /// `current_co_location()`, `current_client_label()`, and
-    /// `current_client_context()` inside `fut` all observe the captured values.
+    /// `current_co_location()`, `current_client_label()`,
+    /// `current_client_context()` and `current_turn_interactivity()` inside
+    /// `fut` all observe the captured values.
+    ///
+    /// Why the box: each `with_*` wraps `fut` in a `TaskLocalFuture` *by
+    /// value*, so an unboxed turn future is re-embedded once per slot and the
+    /// nest grows with every field added here. A turn future is large, and an
+    /// unoptimised build does not fold those frames away - the seventh slot put
+    /// the streaming send path over a worker thread's stack. Boxing once keeps
+    /// the wrappers pointer-sized whatever the field count.
     pub async fn scope<F, T>(self, fut: F) -> T
     where
         F: Future<Output = T>,
@@ -122,16 +146,21 @@ impl RequestScope {
             co_located,
             client_label,
             client_context,
+            interactivity,
         } = self;
-        with_client_context(
-            client_context,
-            with_co_location(
-                co_located,
-                with_client_label(
-                    client_label,
-                    with_transport_kind(
-                        transport,
-                        with_user_id(user_id, with_session_id(session_id, fut)),
+        let fut = Box::pin(fut);
+        with_turn_interactivity(
+            interactivity,
+            with_client_context(
+                client_context,
+                with_co_location(
+                    co_located,
+                    with_client_label(
+                        client_label,
+                        with_transport_kind(
+                            transport,
+                            with_user_id(user_id, with_session_id(session_id, fut)),
+                        ),
                     ),
                 ),
             ),
@@ -143,6 +172,7 @@ impl RequestScope {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ports::turn_interactivity::{TurnInteractivity, current_turn_interactivity};
 
     #[tokio::test]
     async fn capture_outside_any_scope_is_all_defaults() {
@@ -153,6 +183,7 @@ mod tests {
         assert_eq!(scope.co_located, None);
         assert_eq!(scope.client_label, None);
         assert_eq!(scope.client_context, None);
+        assert_eq!(scope.interactivity, TurnInteractivity::Headless);
     }
 
     #[tokio::test]
@@ -192,6 +223,7 @@ mod tests {
         assert_eq!(captured.co_located, Some(true));
         assert_eq!(captured.client_label, Some("laptop".to_string()));
         assert_eq!(captured.client_context, Some(client_context.clone()));
+        assert_eq!(captured.interactivity, TurnInteractivity::Interactive);
 
         // Re-install from the captured bundle in a context where none of the
         // locals are set (simulating the post-spawn task) and read them back.
@@ -205,6 +237,7 @@ mod tests {
                     current_co_location(),
                     current_client_label(),
                     current_client_context(),
+                    current_turn_interactivity(),
                 )
             })
             .await;
@@ -215,6 +248,7 @@ mod tests {
         assert_eq!(observed.3, Some(true));
         assert_eq!(observed.4, Some("laptop".to_string()));
         assert_eq!(observed.5, Some(client_context));
+        assert_eq!(observed.6, TurnInteractivity::Interactive);
     }
 
     #[tokio::test]
@@ -261,6 +295,7 @@ mod tests {
                 username: Some("bob".to_string()),
                 ..ClientContext::default()
             }),
+            interactivity: TurnInteractivity::Interactive,
         };
         scope.scope(async {}).await;
 
@@ -271,5 +306,6 @@ mod tests {
         assert_eq!(current_co_location(), None);
         assert_eq!(current_client_label(), None);
         assert_eq!(current_client_context(), None);
+        assert_eq!(current_turn_interactivity(), TurnInteractivity::Headless);
     }
 }
