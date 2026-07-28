@@ -142,17 +142,21 @@ fn only_tasks_and_internet_radio_inherit_a_session_variable() {
     ensure_mcp_config_exists(&dest, Some(&src)).expect("seed");
     let servers = load_mcp_configs(&dest).expect("load");
 
-    let with_inherit_env: Vec<(&str, &[String])> = servers
+    // Sorted by name: `[[servers]]` block order in the TOML is not part of
+    // the contract this test pins, so reordering the shipped config must not
+    // fail it spuriously.
+    let mut with_inherit_env: Vec<(&str, &[String])> = servers
         .iter()
         .filter(|s| !s.inherit_env.is_empty())
         .map(|s| (s.name.as_str(), s.inherit_env.as_slice()))
         .collect();
+    with_inherit_env.sort_by_key(|(name, _)| *name);
 
     assert_eq!(
         with_inherit_env,
         [
-            ("tasks", ["DBUS_SESSION_BUS_ADDRESS".to_string()].as_slice()),
             ("internet-radio", ["XDG_RUNTIME_DIR".to_string()].as_slice()),
+            ("tasks", ["DBUS_SESSION_BUS_ADDRESS".to_string()].as_slice()),
         ],
         "only tasks (session-bus signal service) and internet-radio (mpv's \
          audio session) should inherit a session-scoped variable"

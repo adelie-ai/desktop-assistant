@@ -491,6 +491,11 @@ mod tests {
         Ok,
         Error,
         Oversize,
+        /// Reply with the *current value* of this env var name (`<UNSET>` if
+        /// absent), so a test can observe what the spawned child actually
+        /// received (#910: `McpHost::start_with_disabled` calls
+        /// `cfg.base_env()`, not just `cfg.env`).
+        EchoEnv(&'static str),
     }
 
     /// Render a minimal `/bin/sh` fake MCP server (mirrors the pattern in
@@ -512,6 +517,20 @@ mod tests {
                 r#"printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"' "$id"
       head -c 2000000 /dev/zero | tr '\0' 'x'
       printf '"}]}}\n'"#.to_string()
+            }
+            CallMode::EchoEnv(var) => {
+                // `val=` is assigned in a double-quoted context (expansion
+                // happens), then passed as a printf ARGUMENT rather than
+                // interpolated inside the single-quoted format string (which
+                // would never expand at all).
+                let mut s = String::new();
+                s.push_str("val=\"${");
+                s.push_str(var);
+                s.push_str(":-<UNSET>}\"\n      ");
+                s.push_str(
+                    r#"printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"%s"}]}}\n' "$id" "$val""#,
+                );
+                s
             }
         };
         const TEMPLATE: &str = r#"#!/bin/sh
@@ -565,6 +584,185 @@ done
             http: None,
             description: None,
         }
+    }
+
+    /// Like [`sh_config`], but with `env`/`inherit_env` set explicitly, for
+    /// the environment tests below.
+    fn env_probe_config(
+        name: &str,
+        script: &Path,
+        env: HashMap<String, String>,
+        inherit_env: Vec<String>,
+    ) -> McpServerConfig {
+        McpServerConfig {
+            name: name.into(),
+            command: "/bin/sh".into(),
+            args: vec![script.display().to_string()],
+            namespace: Some("probe".into()),
+            enabled: true,
+            env,
+            env_secrets: HashMap::new(),
+            inherit_env,
+            http: None,
+            description: None,
+        }
+    }
+
+    /// RAII guard: sets an environment variable on the current (test)
+    /// process and restores its previous value (or removes it) on drop,
+    /// including on panic. Each test below gives its variable a name that no
+    /// other test in this binary touches, so parallel test threads never
+    /// race on the same key (mirrors `crates/mcp-client/tests/env_isolation.rs`'s
+    /// `EnvVarGuard` and `crates/llm-anthropic/src/lib.rs::from_env_missing_key`).
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            // SAFETY: `key` is exclusively owned by the calling test within
+            // this binary (see struct doc); no other test thread reads or
+            // writes it while this guard is alive.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: see `set`.
+            match &self.previous {
+                Some(v) => unsafe { std::env::set_var(self.key, v) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    // --- Environment isolation via the client-side host (#910) -------------
+    //
+    // `McpHost::start_with_disabled` calls `cfg.base_env()`, not `cfg.env`
+    // directly - these tests exercise THAT call site specifically, since it
+    // is a separate spawn path from the daemon's `McpExecutorState::resolve_env`
+    // (already covered by `crates/mcp-client/tests/env_isolation.rs` and
+    // `crates/mcp-client/src/executor.rs`'s own unit tests) and had no
+    // coverage of its own.
+
+    /// A variable named in `inherit_env` reaches the child spawned by the
+    /// client-side host - the path that matters most for
+    /// `XDG_RUNTIME_DIR`/`DBUS_SESSION_BUS_ADDRESS`, since this is the one
+    /// that runs on a real desktop session.
+    #[tokio::test]
+    async fn client_host_delivers_an_inherit_env_variable_to_the_spawned_child() {
+        let _guard = EnvVarGuard::set("ADELE_TEST_CLIENT_HOST_INHERIT", "session-bus-address");
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("probe.sh");
+        std::fs::write(
+            &script,
+            fake_script(
+                "echo",
+                CallMode::EchoEnv("ADELE_TEST_CLIENT_HOST_INHERIT"),
+                None,
+            ),
+        )
+        .unwrap();
+
+        let host = McpHost::start(&[env_probe_config(
+            "probe",
+            &script,
+            HashMap::new(),
+            vec!["ADELE_TEST_CLIENT_HOST_INHERIT".into()],
+        )])
+        .await;
+
+        let result = host.call("probe__echo", serde_json::json!({})).await;
+        host.shutdown().await;
+
+        assert_eq!(
+            result.as_deref(),
+            Ok("session-bus-address"),
+            "an inherit_env-named variable must reach a client-host-spawned child"
+        );
+    }
+
+    /// A server's own configured `env` wins over an `inherit_env`-sourced
+    /// ambient value of the same name, through the client-side host.
+    #[tokio::test]
+    async fn client_host_configured_env_overrides_inherit_env() {
+        let _guard = EnvVarGuard::set("ADELE_TEST_CLIENT_HOST_OVERRIDE", "ambient-value");
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("probe.sh");
+        std::fs::write(
+            &script,
+            fake_script(
+                "echo",
+                CallMode::EchoEnv("ADELE_TEST_CLIENT_HOST_OVERRIDE"),
+                None,
+            ),
+        )
+        .unwrap();
+
+        let mut env = HashMap::new();
+        env.insert(
+            "ADELE_TEST_CLIENT_HOST_OVERRIDE".to_string(),
+            "configured-value".to_string(),
+        );
+        let host = McpHost::start(&[env_probe_config(
+            "probe",
+            &script,
+            env,
+            vec!["ADELE_TEST_CLIENT_HOST_OVERRIDE".into()],
+        )])
+        .await;
+
+        let result = host.call("probe__echo", serde_json::json!({})).await;
+        host.shutdown().await;
+
+        assert_eq!(
+            result.as_deref(),
+            Ok("configured-value"),
+            "the server's own configured env must win over inherit_env"
+        );
+    }
+
+    /// A variable present in the client process's own environment, but named
+    /// in neither `env` nor `inherit_env`, must NOT reach a spawned child -
+    /// the client-side host does not fall back to inheriting everything.
+    #[tokio::test]
+    async fn client_host_does_not_leak_a_variable_outside_env_and_inherit_env() {
+        let _guard = EnvVarGuard::set("ADELE_TEST_CLIENT_HOST_UNGRANTED", "should-not-arrive");
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("probe.sh");
+        std::fs::write(
+            &script,
+            fake_script(
+                "echo",
+                CallMode::EchoEnv("ADELE_TEST_CLIENT_HOST_UNGRANTED"),
+                None,
+            ),
+        )
+        .unwrap();
+
+        let host = McpHost::start(&[env_probe_config(
+            "probe",
+            &script,
+            HashMap::new(),
+            Vec::new(),
+        )])
+        .await;
+
+        let result = host.call("probe__echo", serde_json::json!({})).await;
+        host.shutdown().await;
+
+        assert_eq!(
+            result.as_deref(),
+            Ok("<UNSET>"),
+            "a variable outside both env and inherit_env must not reach the child"
+        );
     }
 
     /// True when the process exists and is not a zombie.

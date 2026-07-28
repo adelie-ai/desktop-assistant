@@ -185,6 +185,43 @@ session-bus signal service that refreshes QML widgets) and `internet-radio`
 session socket). Every other server — including any third-party one you
 add — does not receive either variable unless you opt it in explicitly here.
 
+### Upgrading an existing install
+
+The daemon seeds the shipped default config on **first boot only** — it never
+overwrites an `mcp_servers.toml` that already exists (`ensure_mcp_config_exists`
+in `crates/mcp-client/src/config.rs`). The `inherit_env` grants above therefore
+reach a fresh container install automatically, but **not** an existing one:
+your own `mcp_servers.toml` (daemon) or `client-mcp.toml` (client-side host,
+see [Client-side MCP host](client-mcp-host.md)) is untouched. This matters
+most on a real desktop session — exactly where `DBUS_SESSION_BUS_ADDRESS` and
+`XDG_RUNTIME_DIR` mean something and where the credential store they front
+actually lives — since a headless fleet container is the case that seeds
+fresh most often.
+
+If you already have a `tasks` or `internet-radio` entry (or an
+equivalent third-party server that needs its own session-bus/runtime-dir
+variable) from before this change, add the relevant `inherit_env` line to it
+by hand:
+
+```toml
+[[servers]]
+name        = "tasks"
+command     = "tasks-mcp"
+args        = ["serve"]
+inherit_env = ["DBUS_SESSION_BUS_ADDRESS"]
+
+[[servers]]
+name        = "internet-radio"
+command     = "internet-radio-mcp"
+args        = ["serve"]
+inherit_env = ["XDG_RUNTIME_DIR"]
+```
+
+Without it, `tasks`' QML-widget-refresh signal service silently stops working
+(it treats a bus failure as non-fatal) and `internet-radio`'s spawned `mpv`
+cannot find the audio session — no error, just a feature that quietly does
+less than it used to.
+
 ## Tool Namespacing
 
 By default, tool names are passed through exactly as the MCP server reports them. Set the optional `namespace` field to prefix all tools from that server:

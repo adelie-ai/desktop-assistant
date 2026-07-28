@@ -61,6 +61,17 @@ name = "browser"
 command = "web-mcp"
 namespace = "web"
 
+# XDG_RUNTIME_DIR is not in the default allowlist (it's also how a stock
+# D-Bus client library auto-discovers the session bus, which fronts the
+# freedesktop Secret Service - see mcp-services.md#per-server-opt-in-inherit_env).
+# internet-radio-mcp's mpv genuinely needs it to find the PipeWire/PulseAudio
+# session, so this server opts it in explicitly.
+[[servers]]
+name        = "internet-radio"
+command     = "internet-radio-mcp"
+namespace   = "radio"
+inherit_env = ["XDG_RUNTIME_DIR"]
+
 # Applies to any surface without its own entry (e.g. tui).
 [surfaces.default]
 enabled = ["filesystem", "git"]

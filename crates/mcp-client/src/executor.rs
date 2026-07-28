@@ -276,6 +276,17 @@ impl McpServerConfig {
     /// `McpExecutorState::resolve_env` layers `env_secrets` on top of this,
     /// and the client-side MCP host (`crates/client-common/src/mcp_host/host.rs`,
     /// which does not resolve `env_secrets`) uses this directly.
+    ///
+    /// Accepted asymmetry: this uses `std::env::var` (`Ok`/`Err`), not the
+    /// `var_os` the `ENV_PASSTHROUGH_ALLOWLIST` loop in `crate::lib` uses.
+    /// `var` conflates "absent" with "not valid UTF-8", so an `inherit_env`
+    /// value that happens not to be valid UTF-8 is silently dropped here
+    /// where the allowlist path would preserve it byte-for-byte. `inherit_env`
+    /// carries `HashMap<String, String>` throughout `McpServerConfig`/`env`,
+    /// so fixing this means threading `OsString` through the whole type and
+    /// `resolve_env`, not a one-line swap — a design decision, not a bug fix,
+    /// deferred because every named `inherit_env` value in practice (a D-Bus
+    /// address, a filesystem path) is realistically ASCII.
     pub fn base_env(&self) -> HashMap<String, String> {
         let mut env = HashMap::new();
         for name in &self.inherit_env {
