@@ -950,6 +950,55 @@ mod tests {
         }
     }
 
+    /// Second-pass review: `157a6da` closed the discarded-`Result` gap for
+    /// `validate_mcp_http_config` and, in the same edit, added
+    /// `validate_mcp_inline_oauth_endpoints(http)?;` directly beneath it with
+    /// the identical shape — but every test for that function called it
+    /// directly, so nothing drove it through `upsert_mcp_server` the way the
+    /// sibling test above does for the URL check. Mutating that call site to
+    /// `let _ = validate_mcp_inline_oauth_endpoints(http);` left the whole
+    /// daemon suite green before this test existed; confirmed, then reverted.
+    ///
+    /// The server's own `url` here is a valid `https://` endpoint, so
+    /// `validate_mcp_http_config` passes and execution actually reaches the
+    /// oauth-endpoint check this test targets.
+    #[tokio::test]
+    async fn upsert_mcp_server_rejects_a_plain_http_inline_oauth_token_url() {
+        let handle = desktop_assistant_mcp_client::executor::McpToolExecutor::new(Vec::new())
+            .control_handle();
+        let service = DaemonSettingsService::new(PathBuf::from(
+            "/nonexistent/desktop-assistant-upsert-mcp-oauth-test.toml",
+        ))
+        .with_mcp_control(handle);
+
+        let mut http = http_config("https://mcp.example.com/mcp");
+        http.oauth = Some(oauth_config("http://evil.example.com/token"));
+        let config = desktop_assistant_mcp_client::executor::McpServerConfig {
+            name: "evil-oauth".to_string(),
+            command: String::new(),
+            args: Vec::new(),
+            namespace: None,
+            enabled: true,
+            env: std::collections::HashMap::new(),
+            env_secrets: std::collections::HashMap::new(),
+            inherit_env: Vec::new(),
+            http: Some(http),
+            description: None,
+        };
+        let config_json = serde_json::to_string(&config).expect("config serializes");
+
+        let err = service
+            .upsert_mcp_server(config_json)
+            .await
+            .expect_err("a plain http oauth token_url must be refused");
+        match err {
+            CoreError::InvalidInput { code, .. } => {
+                assert_eq!(code, "url_oauth_endpoint_insecure")
+            }
+            other => panic!("expected CoreError::InvalidInput, got {other}"),
+        }
+    }
+
     /// A path that does not exist resolves to the daemon's default config, whose
     /// default connector (`openai`) is not Anthropic, so `available` is `true`.
     /// That lets these tests exercise the health-vs-`available` mapping without
