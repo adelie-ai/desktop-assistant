@@ -1,3 +1,4 @@
+@AGENTS.base.md
 # Adele — project instructions
 
 @AGENTS.md
@@ -36,11 +37,9 @@ continue, and never dump raw errors or dead-end the user. A turn should never en
 mess or vanish silently. (Example: exhausting the tool-round budget winds down with a
 fluent closing and persists the turn, rather than erroring and dropping it — #453.)
 
-**Degrade, never hard-depend.** Every optional OS/desktop integration (logind, screen
-lock, KDE, PipeWire, any D-Bus service, audio devices) must be capability-detected and
-degrade cleanly when absent — Adele may run headless. Distinguish "is this capability
-present?" from "did this call succeed?", and surface *why* something is off rather than
-failing opaquely.
+**Degrade, never hard-depend.** Every optional OS/desktop integration must be
+capability-detected and degrade cleanly when absent — Adele may run headless. The rule and
+its three states are in `AGENTS.md`, under **Capability-based degradation**.
 
 **Multi-tenant, fail-closed.** User data is isolated by `user_id`. Prefer defense in
 depth (e.g. the `db_query` tool is both AST-scoped *and* Postgres-RLS-enforced), and
@@ -53,16 +52,9 @@ Chromium.
 
 ## How we build it
 
-- **Spec-driven / TDD.** Write the failing test first; make each acceptance criterion
-  a named test; enumerate the unhappy paths (empty, max, concurrent, cross-tenant,
-  partial, malformed). Pin a bug with a test before fixing it.
-- **Warnings are failures.** No compiler or clippy warnings, no ignored tests, no
-  `--no-verify`. Fix the root cause, or suppress narrowly with a written reason.
-- **Security review before every PR.** Adversarially read the diff and scan new
-  dependencies for CVEs; high/critical findings are hard blockers, not advisories.
-- **Small, low-cognitive-load changes.** Phase big work into small issues; avoid
-  speculative abstractions; reuse existing traits; justify every new type.
-- **Don't break `main`.** Merge each green, independently-shippable PR; land
-  co-dependent PRs together and note the interlock.
+How we build it is in `AGENTS.base.md` (the shared engineering standards) and `AGENTS.md`
+(this repo's conventions, plus its overrides and additions to the base). Both load with this
+file. One point is specific to this codebase and not stated there:
+
 - **Keep `crates/core` adapter-independent**, behind trait boundaries — see
   `docs/development.md` for the full conventions.
