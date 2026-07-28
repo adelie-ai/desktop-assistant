@@ -1,14 +1,19 @@
 //! WebSocket frontend for the assistant API (axum-based, with optional TLS).
 
-use std::net::SocketAddr;
+mod login_throttle;
+
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use std::{future::Future, future::pending};
 
 use axum::{
     Json, Router,
-    extract::{State, ws::Message, ws::WebSocket, ws::WebSocketUpgrade},
-    http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    extract::{
+        ConnectInfo, FromRequestParts, State, ws::Message, ws::WebSocket, ws::WebSocketUpgrade,
+    },
+    http::{HeaderMap, StatusCode, request::Parts},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use base64::Engine;
@@ -19,6 +24,8 @@ use futures::SinkExt;
 #[cfg(feature = "tls")]
 use tracing::debug;
 use tracing::warn;
+
+use login_throttle::LoginThrottle;
 
 pub use api::{WsFrame, WsRequest};
 // Re-exported so a validator implementation can name the capability it grants
@@ -50,6 +57,10 @@ pub struct WsServerState {
     /// WebSocket. `None` ⇒ co-location falls back to the transport heuristic
     /// (WS ⇒ remote), preserving Phase-1 behaviour.
     daemon_system_id: Arc<Option<String>>,
+    /// Failed-login counters for `POST /login` (#808). Shared by every clone of
+    /// the state, so one router keeps one set of counters however many requests
+    /// it serves.
+    login_throttle: Arc<LoginThrottle>,
 }
 
 #[async_trait::async_trait]
@@ -59,16 +70,21 @@ pub trait WsAuthValidator: Send + Sync {
     /// Extract the user id ([JWT `sub`]) from a bearer token that
     /// [`Self::validate_bearer_token`] already accepted (#105).
     ///
-    /// The default returns `None` — meaning "validator opted out of
-    /// identity extraction"; the WS handler then falls back to
-    /// [`UserId::default`] (the schema sentinel `"default"`). That
-    /// covers single-tenant deploys that don't need multi-tenancy
-    /// without forcing every existing validator implementation to
-    /// change.
+    /// Returning `None`, or a blank subject, means "this token names
+    /// nobody", and it **refuses the upgrade with `401`** (#807).
+    /// Identity resolution is part of accepting a connection, not a
+    /// best-effort afterthought: the handler used to fall through to
+    /// [`UserId::default`] (the schema sentinel `"default"`), which on
+    /// any desktop-originated database is the operator's own
+    /// conversations and knowledge base, and which an operator can name
+    /// on the administrator allowlist.
     ///
-    /// Multi-tenant correctness REQUIRES returning `Some(user_id)`.
-    /// The current mapping rule is `sub` → `user_id` verbatim;
-    /// future revisions may consult a different claim.
+    /// The default therefore names nobody, which is the fail-closed
+    /// answer. Every validator that accepts a token must override this
+    /// and return the subject that same token carries, so acceptance and
+    /// identity cannot disagree. The current mapping rule is `sub` →
+    /// `user_id` verbatim; future revisions may consult a different
+    /// claim.
     async fn extract_user_id(&self, token: &str) -> Option<UserId> {
         let _ = token;
         None
@@ -190,6 +206,7 @@ impl WsServeConfig {
             auth_discovery: self.auth_discovery,
             allowed_origins: Arc::new(self.allowed_origins),
             daemon_system_id: Arc::new(self.daemon_system_id),
+            login_throttle: Arc::new(LoginThrottle::default()),
         };
 
         Router::new()
@@ -200,15 +217,21 @@ impl WsServeConfig {
     }
 
     /// Bind `bind` and serve until `shutdown` resolves (plaintext).
+    ///
+    /// Serves with connection info attached, so `POST /login` can count failed
+    /// attempts per source address (#808) rather than per username alone.
     pub async fn serve<F>(self, bind: SocketAddr, shutdown: F) -> anyhow::Result<()>
     where
         F: Future<Output = ()> + Send + 'static,
     {
         let app = self.into_router();
         let listener = tokio::net::TcpListener::bind(bind).await?;
-        axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown)
-            .await?;
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown)
+        .await?;
         Ok(())
     }
 
@@ -354,17 +377,28 @@ async fn ws_handler(
         return (StatusCode::UNAUTHORIZED, "invalid bearer token").into_response();
     }
 
-    // Resolve the per-connection user identity once at upgrade time
-    // (#105). The validator returns `Some(sub)` for multi-tenant
-    // tokens; in the single-tenant fallback path it returns `None`
-    // and we collapse to the schema sentinel `"default"`. Identity
-    // is per-connection: one WS upgrade carries one bearer token,
-    // so every command on this socket runs as the same user.
-    let user_id = state
+    // Resolve the per-connection user identity once at upgrade time (#105).
+    // Identity is per-connection: one WS upgrade carries one bearer token, so
+    // every command on this socket runs as the same user.
+    //
+    // A token that authenticates but names no subject is refused (#807). It
+    // used to collapse to the schema sentinel `"default"` — the primary data
+    // partition — with no log line, and the authorization tier then read that
+    // same sentinel as a name an operator could allowlist. An issuer that
+    // accepts a token with no `sub` claim (an RS256 `Validation` only requires
+    // `exp`) reached exactly this path.
+    let Some(user_id) = state
         .auth_validator
         .extract_user_id(&token)
         .await
-        .unwrap_or_default();
+        .filter(UserId::names_a_subject)
+    else {
+        warn!(
+            "ws upgrade refused: the bearer token validated but names no subject. \
+             The issuer must put the caller's identity in the `sub` claim"
+        );
+        return (StatusCode::UNAUTHORIZED, "token names no subject").into_response();
+    };
 
     // System-id co-location (#248): the client reports its per-machine id (and
     // optionally a host label) in custom upgrade headers. Compare it to the
@@ -405,25 +439,106 @@ struct LoginResponse {
     subject: String,
 }
 
+/// The connecting peer's address, when the server was wired to report it.
+///
+/// [`ConnectInfo`] itself is a hard requirement: it rejects the request when the
+/// server was started without it. `POST /login` must still work in that case —
+/// a caller that builds the router itself and serves it its own way is a
+/// supported shape — so this wraps it in an `Option`. The failed-login counters
+/// then fall back to the username alone, which still bounds guessing; only the
+/// per-source counter is lost.
+///
+/// [`WsServeConfig::serve`] and the TLS accept loop both supply it.
+struct SourceAddress(Option<IpAddr>);
+
+impl<S: Send + Sync> FromRequestParts<S> for SourceAddress {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        Ok(Self(
+            ConnectInfo::<SocketAddr>::from_request_parts(parts, state)
+                .await
+                .ok()
+                .map(|ConnectInfo(address)| address.ip()),
+        ))
+    }
+}
+
+/// Render a source address for a log line.
+fn source_label(source: Option<IpAddr>) -> String {
+    source.map_or_else(|| "unknown".to_string(), |address| address.to_string())
+}
+
+/// The reply to a caller whose failure budget is spent. `Retry-After` is whole
+/// seconds, rounded up, so a client that honours it never comes back early.
+fn locked_out_response(retry_after: Duration) -> Response {
+    let seconds = (retry_after.as_secs_f64().ceil() as u64).max(1);
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(axum::http::header::RETRY_AFTER, seconds.to_string())],
+        "too many failed login attempts",
+    )
+        .into_response()
+}
+
 async fn login_handler(
     State(state): State<WsServerState>,
+    SourceAddress(source): SourceAddress,
     headers: HeaderMap,
-) -> impl IntoResponse {
+) -> Response {
     if let Err(status) = validate_origin(&headers, &state.allowed_origins) {
         return (status, "origin not allowed").into_response();
     }
 
-    let Some(login_service) = state.login_service else {
+    let Some(login_service) = state.login_service.clone() else {
         return (StatusCode::NOT_FOUND, "login is not enabled").into_response();
     };
 
+    // A header the door cannot parse carries no credential to guess with, so it
+    // is refused without spending the failure budget. Counting it would let a
+    // stray misconfigured client lock out the person sharing its address.
     let Some((username, password)) = extract_basic_credentials(&headers) else {
         return (StatusCode::UNAUTHORIZED, "missing basic auth").into_response();
     };
 
+    // Refusals are not counted (see `login_throttle`): a client polling a
+    // locked door would otherwise extend its own lockout for ever.
+    if let Some(retry_after) = state
+        .login_throttle
+        .locked_for(source, &username, Instant::now())
+    {
+        warn!(
+            "login refused for {:?} from {}: too many recent failures, {} s remaining",
+            username,
+            source_label(source),
+            retry_after.as_secs()
+        );
+        return locked_out_response(retry_after);
+    }
+
     if !login_service.authenticate_basic(&username, &password).await {
+        // Every failed attempt is recorded. Before this, a wrong password
+        // produced no log line at all, so guessing left no trace.
+        let lockout = state
+            .login_throttle
+            .record_failure(source, &username, Instant::now());
+        match lockout {
+            Some(retry_after) => warn!(
+                "login failed for {:?} from {}; the door is now shut for {} s",
+                username,
+                source_label(source),
+                retry_after.as_secs()
+            ),
+            None => warn!(
+                "login failed for {:?} from {}",
+                username,
+                source_label(source)
+            ),
+        }
         return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
     }
+
+    state.login_throttle.record_success(source, &username);
 
     match login_service.issue_token_for_subject(&username).await {
         Ok(token) => (
@@ -783,7 +898,20 @@ where
                     }
                 };
                 let acceptor = tls_acceptor.clone();
-                let app = app.clone();
+                // Attach the peer address the same way `axum::serve` does on the
+                // plaintext path, so `POST /login` counts failed attempts per
+                // source address (#808). An address the OS will not report
+                // leaves the per-source counter off for that connection; the
+                // per-username counter still applies.
+                let app = match tcp_stream.peer_addr() {
+                    Ok(peer) => app
+                        .clone()
+                        .layer(axum::Extension(axum::extract::ConnectInfo(peer))),
+                    Err(e) => {
+                        debug!("peer address unavailable; login throttling is per-username: {e}");
+                        app.clone()
+                    }
+                };
 
                 tokio::spawn(async move {
                     let tls_stream = match acceptor.accept(tcp_stream).await {

@@ -2825,15 +2825,18 @@ async fn main() -> Result<()> {
                 }
             };
 
-        let ws_login_service: Option<Arc<dyn ws::WsLoginService>> =
-            resolve_ws_login_mode().map(|(username, mode)| {
+        // The bind address decides whether the OS-password door is a local
+        // convenience or a network-reachable PAM oracle (#806), so it is an
+        // input to the decision rather than something the door ignores.
+        let ws_login_service: Option<Arc<dyn ws::WsLoginService>> = resolve_ws_login_mode(ws_addr)
+            .map(|(username, mode)| {
                 match &mode {
                     WsLoginMode::StaticPassword(_) => {
                         tracing::info!(
                             "Web login enabled (env-password mode) for username={username}"
                         );
                     }
-                    WsLoginMode::SystemPassword => {
+                    WsLoginMode::SystemPassword(_) => {
                         tracing::info!(
                             "Web login enabled (local system-password mode) for username={username}"
                         );
@@ -2848,7 +2851,11 @@ async fn main() -> Result<()> {
             });
         if ws_login_service.is_none() {
             tracing::warn!(
-                "Web login disabled: set DESKTOP_ASSISTANT_WS_LOGIN_PASSWORD or enable local auth via DESKTOP_ASSISTANT_WS_LOGIN_LOCAL_SYSTEM_AUTH=true"
+                "Web login disabled: set DESKTOP_ASSISTANT_WS_LOGIN_PASSWORD. The \
+                 local system-password mode is off here because this daemon is bound to \
+                 {ws_addr}, which is not loopback, or because it runs in a container, or \
+                 because DESKTOP_ASSISTANT_WS_LOGIN_LOCAL_SYSTEM_AUTH is false. Setting \
+                 that variable to true turns it on deliberately"
             );
         }
 

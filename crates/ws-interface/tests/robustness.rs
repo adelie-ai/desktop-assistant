@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use desktop_assistant_api_model as api;
-use desktop_assistant_application::{ApiError, ApiResult, AssistantApiHandler, EventSink};
+use desktop_assistant_application::{ApiError, ApiResult, AssistantApiHandler, EventSink, UserId};
 use desktop_assistant_ws::{WsAuthValidator, WsFrame, WsRequest, router};
 use futures_util::{SinkExt, StreamExt};
 use tokio::time::timeout;
@@ -51,6 +51,12 @@ struct AcceptAllAuth;
 impl WsAuthValidator for AcceptAllAuth {
     async fn validate_bearer_token(&self, _token: &str) -> bool {
         true
+    }
+
+    /// Identity is part of acceptance (#807): a validator that accepts a
+    /// token must name the subject it belongs to, or the upgrade is refused.
+    async fn extract_user_id(&self, _token: &str) -> Option<UserId> {
+        Some(UserId::from("test-user"))
     }
 }
 

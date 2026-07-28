@@ -106,11 +106,16 @@ pub trait UdsAuthValidator: Send + Sync {
     /// Extract the user id ([JWT `sub`]) from a bearer token that
     /// [`Self::validate_bearer_token`] already accepted (#105).
     ///
-    /// Default returns `None`, which collapses the connection to the
-    /// schema sentinel `UserId::default()`. Single-tenant desktop
-    /// installs that don't care about identity can keep the default;
-    /// multi-tenant or multi-user-host deploys override this method
-    /// to return the JWT subject so storage queries scope per-user.
+    /// Returning `None` means "this token names no subject", and it **rejects
+    /// the connection** (#807). Identity resolution is part of accepting a
+    /// caller, not a best-effort afterthought: a `None` that fell through to
+    /// the schema sentinel `UserId::default()` admitted the caller to the
+    /// primary data partition, and - since the authorization tier landed - to
+    /// whatever capability the allowlist grants that name.
+    ///
+    /// The default therefore names nobody, which is the fail-closed answer. A
+    /// validator that accepts tokens overrides this to return the subject the
+    /// same token carries, so acceptance and identity cannot disagree.
     async fn extract_user_id(&self, token: &str) -> Option<UserId> {
         let _ = token;
         None
@@ -120,13 +125,27 @@ pub trait UdsAuthValidator: Send + Sync {
     /// kernel-attested `peer` credentials (if the OS provided them).
     ///
     /// The default implementation is the historical token-only policy: require
-    /// a valid bearer token and ignore peer credentials. Local-trust daemons
-    /// override this to authenticate by `peer` instead (#407).
+    /// a valid bearer token **that names a subject**, and ignore peer
+    /// credentials. Local-trust daemons override this to authenticate by `peer`
+    /// instead (#407).
     async fn authenticate(&self, token: Option<&str>, peer: Option<&PeerIdentity>) -> UdsAuth {
         let _ = peer;
         match token {
             Some(t) if self.validate_bearer_token(t).await => {
-                UdsAuth::allow_tenant(self.extract_user_id(t).await.unwrap_or_default())
+                match self
+                    .extract_user_id(t)
+                    .await
+                    .filter(UserId::names_a_subject)
+                {
+                    Some(user) => UdsAuth::allow_tenant(user),
+                    None => {
+                        tracing::warn!(
+                            "auth: a bearer token validated but names no subject; refusing the \
+                             connection rather than filing it under the shared default identity"
+                        );
+                        UdsAuth::Reject("auth: token names no subject".to_string())
+                    }
+                }
             }
             Some(_) => UdsAuth::Reject("auth: invalid jwt".to_string()),
             None => UdsAuth::Reject("auth: missing jwt in handshake".to_string()),

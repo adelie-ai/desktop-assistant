@@ -70,6 +70,26 @@ impl UserId {
         &self.0
     }
 
+    /// Whether this identity actually names somebody.
+    ///
+    /// A blank or whitespace-only subject names nobody: it would reach storage
+    /// as an empty `user_id` predicate and the authorization allowlist as an
+    /// empty string. Transports use this to decide whether a validator's answer
+    /// is an identity they may act on, because identity resolution is part of
+    /// accepting a connection, not a best-effort afterthought (#807).
+    ///
+    /// Pair it with `Option::filter`:
+    ///
+    /// ```
+    /// use desktop_assistant_auth_jwt::UserId;
+    ///
+    /// let resolved = Some(UserId::from("   ")).filter(UserId::names_a_subject);
+    /// assert_eq!(resolved, None);
+    /// ```
+    pub fn names_a_subject(&self) -> bool {
+        !self.0.trim().is_empty()
+    }
+
     /// Consume the wrapper, returning the underlying string. Used when a
     /// caller needs to hand ownership to a string-typed API (e.g. SQL
     /// bind that wants `String`).
@@ -463,6 +483,21 @@ mod tests {
         // resolve to this sentinel — matches the schema default in #102.
         assert_eq!(UserId::default().as_str(), "default");
         assert_eq!(UserId::default().as_str(), DEFAULT_USER_ID);
+    }
+
+    /// #807: a transport asks this before it acts on a validator's answer.
+    /// Whitespace is not an identity - it would reach storage as an empty
+    /// `user_id` predicate and the allowlist as an empty string.
+    #[test]
+    fn a_blank_user_id_names_no_subject() {
+        assert!(UserId::from("alice").names_a_subject());
+        assert!(!UserId::from("").names_a_subject());
+        assert!(!UserId::from("   ").names_a_subject());
+        assert!(!UserId::from("\t\n").names_a_subject());
+        // The sentinel is a real storage scope, so it does name a subject. It
+        // is refused where it matters instead: `AdminSubjects` will not admit
+        // it to the administrator allowlist.
+        assert!(UserId::default().names_a_subject());
     }
 
     #[test]

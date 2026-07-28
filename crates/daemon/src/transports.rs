@@ -43,11 +43,12 @@ impl<S: SettingsService + 'static> ws::WsAuthValidator for WsSettingsAuth<S> {
     }
 
     async fn extract_user_id(&self, token: &str) -> Option<desktop_assistant_application::UserId> {
-        // #105 mapping rule: JWT `sub` → `UserId`. Returns `None` for
-        // tokens this validator would reject; the ws-interface
-        // handler then falls back to `UserId::default` (the schema
-        // sentinel) so a single-tenant deploy without identity
-        // information still resolves correctly.
+        // #105 mapping rule: JWT `sub` → `UserId`. Returns `None` for tokens
+        // this validator would reject, and for a token that carries no usable
+        // subject; the transport then refuses the connection rather than
+        // filing it under the schema sentinel (#807). The locally minted
+        // HS256 token always carries a `sub`, so the desktop path is
+        // unaffected.
         config::ws_jwt_sub(token).map(desktop_assistant_application::UserId::from)
     }
 
@@ -190,11 +191,22 @@ impl uds::UdsAuthValidator for PeerCredUdsAuth {
         // tolerance; see the struct docs).
         match token {
             Some(t) if self.jwt_fallback.validate_bearer_token(t).await => {
-                let user = self
+                // Identity is part of acceptance (#807). A token that
+                // authenticates but names no subject used to collapse to the
+                // schema sentinel `"default"` — the primary data partition —
+                // and the allowlist then read that sentinel as a name.
+                let Some(user) = self
                     .jwt_fallback
                     .extract_user_id(t)
                     .await
-                    .unwrap_or_default();
+                    .filter(desktop_assistant_application::UserId::names_a_subject)
+                else {
+                    tracing::warn!(
+                        "auth: a bearer token validated but names no subject; refusing the \
+                         connection rather than filing it under the shared default identity"
+                    );
+                    return uds::UdsAuth::Reject("auth: token names no subject".to_string());
+                };
                 // No peer credentials means no unforgeable uid to compare, so
                 // the local grant does not apply: only the allowlist can
                 // promote this connection.
@@ -245,9 +257,20 @@ pub(crate) struct WsBasicLogin<S: SettingsService + 'static> {
     mode: WsLoginMode,
 }
 
+/// The blocking OS-password check behind [`WsLoginMode::SystemPassword`].
+///
+/// A function pointer rather than a direct call, for two reasons. It names the
+/// call as blocking work at the type level, and it lets the tests drive the
+/// mode without a PAM stack on the machine running them - libpam's fail delay
+/// is exactly the behaviour the `spawn_blocking` fix is about, and a unit test
+/// must not depend on the host's real accounts.
+pub(crate) type SystemPasswordCheck = fn(&str, &str) -> anyhow::Result<bool>;
+
 pub(crate) enum WsLoginMode {
     StaticPassword(String),
-    SystemPassword,
+    /// Validate against the host's own OS account password. Local-only: see
+    /// [`resolve_ws_login_mode_decision`] for what "local" means here.
+    SystemPassword(SystemPasswordCheck),
 }
 
 impl<S: SettingsService + 'static> WsBasicLogin<S> {
@@ -277,11 +300,24 @@ impl<S: SettingsService + 'static> ws::WsLoginService for WsBasicLogin<S> {
                 use subtle::ConstantTimeEq;
                 password.as_bytes().ct_eq(expected.as_bytes()).into()
             }
-            WsLoginMode::SystemPassword => {
-                match config::authenticate_os_user_password(username, password) {
-                    Ok(valid) => valid,
-                    Err(error) => {
+            // libpam blocks, and on a wrong password it blocks for its whole
+            // fail delay. Run it on the blocking pool: inline it parked a
+            // tokio worker per attempt, so a guessing loop throttled the
+            // daemon's own runtime as a side effect (#806).
+            WsLoginMode::SystemPassword(check) => {
+                let check = *check;
+                let username = username.to_string();
+                let password = password.to_string();
+                let outcome =
+                    tokio::task::spawn_blocking(move || check(&username, &password)).await;
+                match outcome {
+                    Ok(Ok(valid)) => valid,
+                    Ok(Err(error)) => {
                         tracing::warn!("system-password auth check failed: {error}");
+                        false
+                    }
+                    Err(error) => {
+                        tracing::warn!("system-password auth check did not run: {error}");
                         false
                     }
                 }
@@ -317,6 +353,17 @@ pub(crate) fn env_bool(name: &str, default: bool) -> bool {
     parse_env_bool(std::env::var(name).ok().as_deref(), default)
 }
 
+/// Read a flag whose *unset* state is a third answer, not a default.
+///
+/// `DESKTOP_ASSISTANT_WS_LOGIN_LOCAL_SYSTEM_AUTH` is one: an operator who never
+/// set it has said nothing, and the daemon decides from the bind address; an
+/// operator who set it to `true` has said something, and it is honoured.
+/// Collapsing the two into a `bool` is what made the OS-password door
+/// default-on beyond loopback (#806).
+pub(crate) fn env_opt_bool(name: &str) -> Option<bool> {
+    parse_env_opt_bool(std::env::var(name).ok().as_deref())
+}
+
 /// The daemon's self-identity **display label** for server-side tool localities
 /// (#243) — the human-readable `host` shown in the tool note (e.g.
 /// `terminal — server 'daemon-host'`). Co-location is decided separately by the
@@ -347,13 +394,16 @@ pub(crate) fn daemon_host_label() -> String {
 /// unit-testable without touching the process environment. `None` (unset) and
 /// unrecognized values fall back to `default`.
 pub(crate) fn parse_env_bool(value: Option<&str>, default: bool) -> bool {
-    match value {
-        Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => true,
-            "0" | "false" | "no" | "off" => false,
-            _ => default,
-        },
-        None => default,
+    parse_env_opt_bool(value).unwrap_or(default)
+}
+
+/// Pure parser behind [`env_opt_bool`]. `None` (unset, blank, or a value this
+/// parser does not recognize) means the operator stated nothing.
+pub(crate) fn parse_env_opt_bool(value: Option<&str>) -> Option<bool> {
+    match value?.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
     }
 }
 
@@ -367,26 +417,67 @@ pub(crate) fn is_container_environment() -> bool {
         || std::path::Path::new("/run/.containerenv").exists()
 }
 
+/// Decide what `POST /login` validates against, if anything.
+///
+/// A configured static password wins outright: it is the deployed shape, it is
+/// unrelated to the host's OS accounts, and where the daemon listens does not
+/// change what it means.
+///
+/// The OS-password (PAM) mode is different. It exists so a person on their own
+/// machine can log in to their own daemon with the password they already have,
+/// which makes it a **local** convenience, and the bind address is what says
+/// whether the door is local. Beyond loopback the same mode turns `/login` into
+/// a network-reachable password oracle for a real system account, so the
+/// operator has to ask for it by name (#806):
+///
+/// | operator said | container | loopback bind | OS-password mode |
+/// |---|---|---|---|
+/// | nothing | no | yes | on - the desktop case, no configuration needed |
+/// | nothing | no | no | **off** - say so explicitly to get it |
+/// | `true` | no | either | on |
+/// | `false` | either | either | off |
+/// | anything | yes | either | off - a container has no local user to check |
 pub(crate) fn resolve_ws_login_mode_decision(
     current_username: String,
     configured_username: Option<String>,
     configured_password: Option<String>,
-    local_system_auth_enabled: bool,
+    local_system_auth: Option<bool>,
     is_container: bool,
+    bind_is_loopback: bool,
 ) -> Option<(String, WsLoginMode)> {
     if let Some(password) = configured_password {
         let username = configured_username.unwrap_or(current_username);
         return Some((username, WsLoginMode::StaticPassword(password)));
     }
 
-    if local_system_auth_enabled && !is_container {
-        return Some((current_username, WsLoginMode::SystemPassword));
+    if is_container || local_system_auth == Some(false) {
+        return None;
+    }
+
+    let asked_for_it = local_system_auth == Some(true);
+    if bind_is_loopback || asked_for_it {
+        if asked_for_it && !bind_is_loopback {
+            tracing::warn!(
+                "web login: DESKTOP_ASSISTANT_WS_LOGIN_LOCAL_SYSTEM_AUTH=true on a \
+                 non-loopback bind, so POST /login checks the host account password \
+                 through PAM for anyone who can reach the port. Prefer \
+                 DESKTOP_ASSISTANT_WS_LOGIN_PASSWORD unless this is what you meant"
+            );
+        }
+        return Some((
+            current_username,
+            WsLoginMode::SystemPassword(config::authenticate_os_user_password),
+        ));
     }
 
     None
 }
 
-pub(crate) fn resolve_ws_login_mode() -> Option<(String, WsLoginMode)> {
+/// Resolve the login mode from the environment for a daemon listening on
+/// `ws_bind`.
+pub(crate) fn resolve_ws_login_mode(
+    ws_bind: std::net::SocketAddr,
+) -> Option<(String, WsLoginMode)> {
     let current_username = config::current_username();
     let configured_username = std::env::var("DESKTOP_ASSISTANT_WS_LOGIN_USERNAME")
         .ok()
@@ -398,13 +489,14 @@ pub(crate) fn resolve_ws_login_mode() -> Option<(String, WsLoginMode)> {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
 
-    let local_system_auth_enabled = env_bool("DESKTOP_ASSISTANT_WS_LOGIN_LOCAL_SYSTEM_AUTH", true);
+    let local_system_auth = env_opt_bool("DESKTOP_ASSISTANT_WS_LOGIN_LOCAL_SYSTEM_AUTH");
     resolve_ws_login_mode_decision(
         current_username,
         configured_username,
         configured_password,
-        local_system_auth_enabled,
+        local_system_auth,
         is_container_environment(),
+        ws_bind.ip().is_loopback(),
     )
 }
 
@@ -560,7 +652,10 @@ mod tests {
         #[test]
         fn system_password_login_on_a_non_loopback_bind_needs_an_explicit_opt_in() {
             assert!(
-                matches!(decide(Some(true), false, false), Some((_, WsLoginMode::SystemPassword(_)))),
+                matches!(
+                    decide(Some(true), false, false),
+                    Some((_, WsLoginMode::SystemPassword(_)))
+                ),
                 "an operator who sets the flag deliberately still gets the mode"
             );
         }
@@ -571,7 +666,10 @@ mod tests {
         #[test]
         fn system_password_login_stays_on_for_a_loopback_bind() {
             assert!(
-                matches!(decide(None, false, true), Some((_, WsLoginMode::SystemPassword(_)))),
+                matches!(
+                    decide(None, false, true),
+                    Some((_, WsLoginMode::SystemPassword(_)))
+                ),
                 "the loopback door is the case this mode was designed for"
             );
         }
@@ -654,7 +752,8 @@ mod tests {
         #[tokio::test]
         async fn the_os_password_check_does_not_block_the_async_runtime() {
             let door = login(WsLoginMode::SystemPassword(slow_check));
-            let check = tokio::spawn(async move { door.authenticate_basic("local-user", "guess").await });
+            let check =
+                tokio::spawn(async move { door.authenticate_basic("local-user", "guess").await });
 
             // This test runtime is single-threaded, so an inline blocking call
             // would hold its only worker for the whole 300 ms and this short

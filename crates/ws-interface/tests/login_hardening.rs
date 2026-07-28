@@ -17,9 +17,7 @@ use std::sync::Arc;
 
 use axum::extract::connect_info::MockConnectInfo;
 use desktop_assistant_api_model as api;
-use desktop_assistant_application::{
-    ApiError, ApiResult, AssistantApiHandler, EventSink, UserId,
-};
+use desktop_assistant_application::{ApiError, ApiResult, AssistantApiHandler, EventSink, UserId};
 use desktop_assistant_ws::{WsAuthValidator, WsFrame, WsLoginService, WsRequest, router_full};
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -112,7 +110,11 @@ fn login_app() -> axum::Router {
     .layer(MockConnectInfo(SocketAddr::from(([192, 0, 2, 10], 4242))))
 }
 
-async fn post_login(app: &axum::Router, username: &str, password: &str) -> axum::http::Response<axum::body::Body> {
+async fn post_login(
+    app: &axum::Router,
+    username: &str,
+    password: &str,
+) -> axum::http::Response<axum::body::Body> {
     app.clone()
         .oneshot(
             axum::http::Request::builder()
@@ -136,7 +138,9 @@ fn ws_request(url: &str, bearer: &str) -> tokio_tungstenite::tungstenite::http::
 }
 
 /// Serve `validator` on an ephemeral loopback port.
-async fn spawn_ws(validator: Arc<dyn WsAuthValidator>) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+async fn spawn_ws(
+    validator: Arc<dyn WsAuthValidator>,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let handler: Arc<dyn AssistantApiHandler> = Arc::new(PingHandler);
     let app = router_full(handler, validator, None, None, Vec::new());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -154,7 +158,10 @@ async fn spawn_ws(validator: Arc<dyn WsAuthValidator>) -> (SocketAddr, tokio::ta
 }
 
 /// The upgrade's HTTP status, for a handshake that is expected to fail.
-async fn upgrade_status(addr: SocketAddr, token: &str) -> tokio_tungstenite::tungstenite::http::StatusCode {
+async fn upgrade_status(
+    addr: SocketAddr,
+    token: &str,
+) -> tokio_tungstenite::tungstenite::http::StatusCode {
     let url = format!("ws://{addr}/ws");
     match tokio_tungstenite::connect_async(ws_request(&url, token)).await {
         Err(tokio_tungstenite::tungstenite::Error::Http(response)) => response.status(),

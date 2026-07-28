@@ -415,6 +415,14 @@ impl UdsAuthValidator for StaticJwtAuth {
     async fn validate_bearer_token(&self, token: &str) -> bool {
         jwt::decode(token, &self.signing_key, ISS, AUD).is_ok()
     }
+
+    /// Identity is part of acceptance (#807): a validator that accepts a token
+    /// must name the subject it belongs to, or the connection is refused.
+    async fn extract_user_id(&self, token: &str) -> Option<jwt::UserId> {
+        jwt::decode(token, &self.signing_key, ISS, AUD)
+            .ok()
+            .map(|claims| jwt::UserId::new(claims.sub))
+    }
 }
 
 async fn wait_for_socket(path: &std::path::Path) {
