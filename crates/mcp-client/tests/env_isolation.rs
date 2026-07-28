@@ -21,14 +21,31 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use desktop_assistant_mcp_client::{McpClient, McpError};
+
+/// This suite's own scratch directory, resolved once and cached.
+///
+/// `TMPDIR` is one of the variables under test (`allowlisted_env_tmpdir_reaches_terminal_mcp`),
+/// and `std::env::temp_dir()` reads it live on every call. Calling
+/// `temp_dir()` fresh from [`temp_path`] would make every *other*
+/// concurrently-running test's scratch files resolve against whatever value
+/// the TMPDIR test happens to have set at that moment (including a
+/// deliberately non-UTF-8 one) — a process-global side effect from a single
+/// test, not a race in name only. Resolving once, before any test can have
+/// mutated `TMPDIR`, decouples this harness's own file I/O from the value
+/// under test.
+fn scratch_dir() -> &'static std::path::Path {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(std::env::temp_dir)
+}
 
 /// Unique temp file path for this test process (mirrors `robustness.rs`).
 fn temp_path(label: &str) -> PathBuf {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
+    scratch_dir().join(format!(
         "mcp-env-isolation-{}-{}-{}.sh",
         std::process::id(),
         n,
@@ -370,6 +387,128 @@ async fn allowlisted_env_skills_mcp_roots_reaches_skills_mcp() {
     .await;
 }
 
+/// skills-mcp (enabled by default): documented override for where NEW skills
+/// are written when the default root isn't writable.
+#[tokio::test]
+async fn allowlisted_env_skills_mcp_write_root_reaches_skills_mcp() {
+    assert_passes_through(
+        "SKILLS_MCP_WRITE_ROOT",
+        "/home/assistant/.local/share/skills",
+        "skills-write-root",
+    )
+    .await;
+}
+
+/// internet-radio-mcp spawns `mpv`, which inherits this variable to locate
+/// the PipeWire/PulseAudio session socket. This one matters on the
+/// client-side MCP host (a real desktop session), not the headless fleet
+/// container, since audio playback has nowhere to go there.
+#[tokio::test]
+async fn allowlisted_env_xdg_runtime_dir_reaches_internet_radio_mcp() {
+    assert_passes_through("XDG_RUNTIME_DIR", "/run/user/1000", "xdg-runtime-dir").await;
+}
+
+/// tasks-mcp (enabled by default) runs a session-bus signal service so QML
+/// widgets refresh when a task changes; it treats a bus failure as
+/// non-fatal, so without this pass-through the feature would silently stop
+/// working instead of erroring.
+#[tokio::test]
+async fn allowlisted_env_dbus_session_bus_address_reaches_tasks_mcp() {
+    assert_passes_through(
+        "DBUS_SESSION_BUS_ADDRESS",
+        "unix:path=/run/user/1000/bus",
+        "dbus-session-bus",
+    )
+    .await;
+}
+
+/// terminal-mcp's own defence-in-depth env scrub reads exactly PATH, HOME,
+/// USER, TMPDIR, TERM, LANG from its process environment before running a
+/// command. PATH/HOME/LANG are covered elsewhere; these three cover the
+/// rest, so every command it runs sees the full set terminal-mcp expects
+/// rather than an arbitrary subset.
+#[tokio::test]
+async fn allowlisted_env_user_reaches_terminal_mcp() {
+    assert_passes_through("USER", "assistant", "user").await;
+}
+
+#[tokio::test]
+async fn allowlisted_env_term_reaches_terminal_mcp() {
+    assert_passes_through("TERM", "xterm-256color", "term").await;
+}
+
+/// Also covers the `var_os` fix: `std::env::var` returns `Err` both when a
+/// variable is absent and when its value is not valid UTF-8, which would
+/// silently drop a well-formed-but-non-UTF-8 value instead of passing it
+/// through. Checked here (not a dedicated test) so it exercises a real
+/// allowlist entry without a second test contending for the same env var
+/// name (see `EnvVarGuard`'s doc on exclusive ownership).
+#[tokio::test]
+async fn allowlisted_env_tmpdir_reaches_terminal_mcp() {
+    assert_passes_through("TMPDIR", "/tmp/terminal-mcp-scratch", "tmpdir").await;
+    assert_non_utf8_value_passes_through("TMPDIR").await;
+}
+
+/// Spawns the real `StdioTransport` (via `McpClient::connect`) with `var` set
+/// to a value that is not valid UTF-8, and confirms the child receives it
+/// byte-for-byte. Bypasses the JSON/stdout probe pipeline the other tests
+/// use — JSON text cannot carry arbitrary non-UTF-8 bytes — by having the
+/// child write the raw bytes straight to a file instead.
+async fn assert_non_utf8_value_passes_through(var: &'static str) {
+    use std::os::unix::ffi::OsStringExt;
+
+    let raw_bytes: Vec<u8> = vec![b'X', 0xFF, 0xFE, b'Y'];
+    let raw_value = std::ffi::OsString::from_vec(raw_bytes.clone());
+    let previous = std::env::var_os(var);
+    // SAFETY: the caller (a per-variable allowlist test) owns `var`
+    // exclusively within this binary; see `EnvVarGuard`'s doc. This runs
+    // strictly after that test's own `EnvVarGuard` for the same key has
+    // already been set and dropped (sequential, single-threaded within one
+    // `#[tokio::test]` function), so there is no overlap.
+    unsafe { std::env::set_var(var, &raw_value) };
+
+    let out_path = temp_path("non-utf8-out");
+    let script_path = temp_path("non-utf8-script");
+
+    let mut script = String::new();
+    script.push_str("#!/bin/sh\nprintf '%s' \"$");
+    script.push_str(var);
+    script.push_str("\" > '");
+    script.push_str(&out_path.display().to_string());
+    script.push_str(
+        "'\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"method\":\"initialize\"'*)\n      rest=${line#*\\\"id\\\":}\n      id=${rest%%,*}\n",
+    );
+    script.push_str(
+        "      printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"serverInfo\":{\"name\":\"non-utf8-probe\",\"version\":\"0.0\"}}}\\n' \"$id\"\n      ;;\n    *) : ;;\n  esac\ndone\n",
+    );
+    std::fs::write(&script_path, script).expect("write non-utf8 probe script");
+
+    let result = McpClient::connect(
+        "/bin/sh",
+        &[script_path.display().to_string()],
+        &HashMap::new(),
+    )
+    .await;
+
+    // SAFETY: see above.
+    match &previous {
+        Some(v) => unsafe { std::env::set_var(var, v) },
+        None => unsafe { std::env::remove_var(var) },
+    }
+
+    let mut client = result.expect("handshake should succeed");
+    client.shutdown().await;
+    let _ = std::fs::remove_file(&script_path);
+
+    let seen = std::fs::read(&out_path).expect("read raw output file");
+    let _ = std::fs::remove_file(&out_path);
+
+    assert_eq!(
+        seen, raw_bytes,
+        "{var}: a non-UTF-8 allowlisted env value must reach the child byte-for-byte"
+    );
+}
+
 // --- Diagnosability: a too-tight allowlist must fail loud, not silent ------
 //
 // If a server genuinely needs a variable this allowlist doesn't carry, it
@@ -416,4 +555,63 @@ exit 7
             panic!("expected McpError::UnexpectedResponse naming the exit status, got: {other}")
         }
     }
+}
+
+/// `enrich_with_exit_status`'s wait for the child's exit status must itself
+/// be bounded. `round_trip` (which this runs inside) backs every
+/// post-handshake `tools/call` too, and that path has no outer timeout the
+/// way the initial handshake does — a *server* that closes stdout but keeps
+/// running and ignores `SIGTERM` would hang a live tool call indefinitely
+/// against an unbounded wait. Only `EXIT_STATUS_WAIT` stands between "closed
+/// stdout" and a hung daemon here.
+///
+/// Asserts both that the call returns within a bounded window (comfortably
+/// above `EXIT_STATUS_WAIT` so this does not flake under load, but well
+/// under the outer handshake timeout so it is *this* bound doing the work)
+/// and that the result is the original generic message, not a fabricated
+/// exit status — proving the fallback path, not just "it eventually
+/// returns".
+#[tokio::test]
+async fn server_closing_stdout_without_exiting_falls_back_within_a_bounded_window() {
+    let script = temp_path("closes-stdout-stays-alive");
+    std::fs::write(
+        &script,
+        r#"#!/bin/sh
+# Consume the initialize request, close stdout (triggers the "closed
+# stdout" error on the client side), then keep running and ignore SIGTERM -
+# only SIGKILL (sent unconditionally on client teardown, DS-2) can end this.
+read -r line
+exec 1>&-
+trap '' TERM
+while true; do sleep 1; done
+"#,
+    )
+    .expect("write stdout-closing-but-alive probe script");
+
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(25),
+        McpClient::connect("/bin/sh", &[script.display().to_string()], &HashMap::new()),
+    )
+    .await
+    .expect("connect must return within the outer test bound, not hang forever");
+    let elapsed = started.elapsed();
+
+    let _ = std::fs::remove_file(&script);
+
+    match result {
+        Ok(_) => panic!("expected the handshake to fail, but connect succeeded"),
+        Err(McpError::UnexpectedResponse(msg)) => {
+            assert_eq!(
+                msg, "MCP server closed stdout",
+                "a child that never exits must fall back to the original generic \
+                 message, not a fabricated exit status"
+            );
+        }
+        Err(other) => panic!("expected McpError::UnexpectedResponse, got: {other}"),
+    }
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "the bounded wait for the child's exit status must not run away; took {elapsed:?}"
+    );
 }

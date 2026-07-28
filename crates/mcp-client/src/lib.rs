@@ -145,16 +145,31 @@ fn validate_command(command: &str, _args: &[String]) -> Result<(), McpError> {
 /// `DESKTOP_ASSISTANT_DATABASE_URL` — the application role's Postgres DSN —
 /// and reach straight past the #721/#722 `scratch`-schema sandbox.
 ///
-/// Every entry is named for the server(s) in the shipped fleet
-/// (`deploy/mcp/mcp_servers.default.toml`, `Dockerfile.fleet`) that need it.
-/// Add a new entry only with that same kind of evidence, not "it might be
-/// useful" — see `crates/mcp-client/tests/env_isolation.rs` for the test
-/// that must accompany it (one per variable, named for the server it
-/// protects, so a later tightening fails the test that names what it broke).
+/// This same code path spawns servers for **two** deployment shapes: the
+/// daemon's own fleet (headless, containers) via `crates/mcp-client/src/executor.rs`,
+/// and the **client-side** MCP host (`crates/client-common/src/mcp_host/host.rs`),
+/// which runs on a real desktop session where D-Bus and audio genuinely
+/// exist. Weigh both when adding or refusing an entry, not just the fleet
+/// container.
+///
+/// Every entry is named for the server(s) — in the shipped fleet
+/// (`deploy/mcp/mcp_servers.default.toml`, `Dockerfile.fleet`) or documented
+/// by the server itself — that need it. Add a new entry only with that same
+/// kind of evidence, not "it might be useful" — see
+/// `crates/mcp-client/tests/env_isolation.rs` for the test that must
+/// accompany it (one per variable, named for the server it protects, so a
+/// later tightening fails the test that names what it broke).
 const ENV_PASSTHROUGH_ALLOWLIST: &[&str] = &[
     // Every spawned server needs these to run at all.
     "PATH", // resolve its own subprocess dependencies (chromium, shell tools, mpv, ...)
     "HOME", // XDG fallback dir + any library that resolves `~` for its own config/cache
+    // terminal-mcp's own defence-in-depth env scrub reads exactly this set -
+    // PATH, HOME, USER, TMPDIR, TERM, LANG - from its process environment
+    // before running a command. Supplying only some of those six would
+    // silently drop the rest regardless of terminal-mcp's own settings.
+    "USER",
+    "TMPDIR",
+    "TERM",
     // Locale/time, named directly in #910's fix-shape.
     "LANG",
     "TZ",
@@ -180,10 +195,28 @@ const ENV_PASSTHROUGH_ALLOWLIST: &[&str] = &[
     "XDG_DATA_HOME",
     "XDG_CACHE_HOME",
     "XDG_STATE_HOME",
+    // XDG_RUNTIME_DIR: internet-radio-mcp spawns `mpv`, which inherits this
+    // process's environment; PipeWire/PulseAudio locate the session audio
+    // socket through it. It's also the D-Bus specification's documented
+    // fallback for locating the session bus, so it covers part of the next
+    // entry too. Its whole purpose is a real desktop session, so this is one
+    // that matters on the client-side MCP host, not the headless fleet.
+    "XDG_RUNTIME_DIR",
+    // DBUS_SESSION_BUS_ADDRESS: tasks-mcp (enabled by default) runs a
+    // session-bus signal service so QML widgets refresh when a task changes.
+    // It treats a bus failure as non-fatal, so without this the feature
+    // silently stops working instead of erroring - the worst kind of gap.
+    "DBUS_SESSION_BUS_ADDRESS",
     // Named single-server dependencies from the shipped fleet image
-    // (Dockerfile.fleet, deploy/mcp/mcp_servers.default.toml).
+    // (Dockerfile.fleet, deploy/mcp/mcp_servers.default.toml) or documented
+    // by the server itself.
     "WEB_CHROME_PATH",  // web-mcp: bundled headless-Chrome binary
     "SKILLS_MCP_ROOTS", // skills-mcp: skill root search path
+    // skills-mcp (enabled by default): documented override for where NEW
+    // skills are written when the default root isn't writable (e.g. a
+    // read-only container filesystem) - the sibling of SKILLS_MCP_ROOTS
+    // above, for writes rather than reads.
+    "SKILLS_MCP_WRITE_ROOT",
 ];
 
 /// "List changed" notification flags, shared between an `McpClient` and the
@@ -748,7 +781,11 @@ impl StdioTransport {
             .kill_on_drop(true)
             .env_clear();
         for key in ENV_PASSTHROUGH_ALLOWLIST {
-            if let Ok(value) = std::env::var(key) {
+            // `var_os`, not `var`: `var` returns `Err` both when a variable
+            // is absent and when its value is not valid UTF-8, which would
+            // silently drop a well-formed-but-non-UTF-8 value (e.g. a path
+            // with non-UTF-8 bytes) instead of passing it through.
+            if let Some(value) = std::env::var_os(key) {
                 cmd.env(key, value);
             }
         }

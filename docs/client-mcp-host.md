@@ -37,6 +37,11 @@ depending on which edge is connected.
 
 Definitions say what exists; surfaces say who gets what.
 
+A server spawned from here does not inherit the client process's whole
+environment — only a small named allowlist, plus this server's own `env`/
+`env_secrets`. See [Environment Variables](mcp-services.md#environment-variables)
+for the full list and what to do if a server needs something else.
+
 ## Example
 
 ```toml

@@ -102,9 +102,12 @@ The daemon communicates with each server over stdio using the MCP JSON-RPC proto
 
 ## Environment Variables
 
-A spawned stdio server does not inherit the daemon's environment. This is
-deliberate: the daemon's environment can hold values a server has no reason
-to see, such as the database connection string.
+A spawned stdio server does not inherit its parent's environment. This is
+deliberate: the parent's environment can hold values a server has no reason
+to see, such as the database connection string. The rule is the same for
+both places that spawn a stdio server: the daemon's own fleet (this page) and
+the [client-side MCP host](client-mcp-host.md), which runs on a real desktop
+session where D-Bus and audio genuinely exist.
 
 The daemon passes through only a small, named set of variables from its own
 environment:
@@ -113,12 +116,16 @@ environment:
 |----------|-----|
 | `PATH` | Resolve the server's own subprocess dependencies (a bundled browser, shell tools, and so on) |
 | `HOME` | Config/cache directory fallback |
+| `USER`, `TMPDIR`, `TERM` | `terminal-mcp` reads exactly `PATH, HOME, USER, TMPDIR, TERM, LANG` from its own process environment as part of its defence-in-depth env scrub before running a command |
 | `LANG` | Locale-dependent output formatting |
 | `TZ` | Local-time timestamps |
 | `HTTP_PROXY`, `http_proxy`, `HTTPS_PROXY`, `https_proxy`, `NO_PROXY`, `no_proxy` | Outbound HTTP through a proxy |
 | `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME`, `XDG_STATE_HOME` | Standard config/data/cache/state directories |
+| `XDG_RUNTIME_DIR` | `internet-radio-mcp` spawns `mpv`, which needs this to locate the PipeWire/PulseAudio session socket; also the D-Bus specification's documented fallback for locating the session bus |
+| `DBUS_SESSION_BUS_ADDRESS` | `tasks-mcp` (enabled by default) runs a session-bus signal service so QML widgets refresh when a task changes; it treats a bus failure as non-fatal, so without this the feature silently stops working instead of erroring |
 | `WEB_CHROME_PATH` | Path to a bundled Chromium binary (`web-mcp`) |
-| `SKILLS_MCP_ROOTS` | Skill-root search path (`skills-mcp`) |
+| `SKILLS_MCP_ROOTS` | Skill-root search path (`skills-mcp`, enabled by default) |
+| `SKILLS_MCP_WRITE_ROOT` | Where `skills-mcp` (enabled by default) writes a new skill when the default root is not writable |
 
 Every other variable is stripped, even one the daemon itself received. A
 server that needs something else must receive it through its own `env` (or
