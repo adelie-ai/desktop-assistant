@@ -43,16 +43,13 @@ const TOOL_SKILL_SEARCH: &str = "builtin_skill_search";
 const TOOL_SKILL_GET: &str = "builtin_skill_get";
 
 /// Marker passed as `SkillGetFn`'s `owner` argument to mean "the caller's
-/// own scope". Per the port contract (#911), a conforming store resolves
-/// "the caller's own" from `current_user_id()`, never from this string, so
-/// its literal content is irrelevant to `PgSkillIndexStore::get` -- only its
-/// `Some`-ness is. It exists purely so [`BuiltinToolService::skill_get`]'s
-/// call site reads as intent, not a magic string.
-///
-/// `SqliteSkillIndexStore::get` does not implement this contract yet (a
-/// separately tracked gap, #850): there, `Some("self")` addresses a row
-/// literally owned by a user named "self", which no real deployment has, so
-/// the lookup harmlessly misses and falls through to the global one below.
+/// own scope". Per the port contract (#911), every implementation --
+/// `PgSkillIndexStore::get`, `SqliteSkillIndexStore::get`, and the in-memory
+/// reference implementation -- resolves "the caller's own" from
+/// `current_user_id()`, never from this string, so its literal content is
+/// irrelevant; only its `Some`-ness is. It exists purely so
+/// [`BuiltinToolService::skill_get`]'s call site reads as intent, not a
+/// magic string.
 const SKILL_GET_OWN_SCOPE: &str = "self";
 
 /// Hard cap on how long an embedding call may block a real-time request. A
