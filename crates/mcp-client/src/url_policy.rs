@@ -10,39 +10,54 @@
 //! ## The rule
 //!
 //! TLS is required. Plain `http://` is accepted only when the host stays on
-//! a network the operator already controls: loopback, an RFC1918/ULA/CGNAT
-//! private range, or — when the request carries no credential — a bare
-//! (dot-free) hostname. `docs/remote-brain-setup.md` documents the load-
-//! bearing case: the shipped k8s manifests reach Ollama, which carries no
-//! credential, at `http://ollama:11434` over the in-cluster network, and a
-//! blanket TLS-only rule would refuse a working install.
+//! a network the operator already controls: loopback, an RFC1918 IPv4 or
+//! IPv6 ULA (`fc00::/7`) private range unconditionally, and CGNAT
+//! (`100.64.0.0/10`) or a bare (dot-free) hostname only when the request
+//! carries no credential. `docs/remote-brain-setup.md` documents the
+//! load-bearing case: the shipped k8s manifests reach Ollama, which carries
+//! no credential, at `http://ollama:11434` over the in-cluster network, and
+//! a blanket TLS-only rule would refuse a working install.
 //!
 //! Regardless of scheme, a destination in the link-local range (which
 //! includes the cloud metadata address `169.254.169.254` shared by AWS,
 //! Azure, and GCP's legacy metadata path), the unspecified address
-//! (`0.0.0.0` / `::`), or a known cloud-metadata hostname alias is always
+//! (`0.0.0.0` / `::`), a known cloud-metadata hostname alias, or a known
+//! cloud-metadata IPv4 literal outside the link-local range (Alibaba Cloud's
+//! ECS metadata service lives inside the CGNAT range instead) is always
 //! refused. That check runs first and is not exempted by anything below it,
 //! so an operator who types `https://` to one of these, or reaches it
-//! through the bare-hostname exemption, is not saved by either.
+//! through the bare-hostname or CGNAT exemption, is not saved by either.
 //!
-//! ## Why the bare-hostname exemption is gated on whether a credential is
-//! attached
+//! ## Why the bare-hostname and CGNAT exemptions are credential-gated, and
+//! RFC1918/ULA are not
 //!
-//! A dot-free name is not "a network the operator controls" the way a
-//! literal private IP address is — it is whatever the resolver decides,
-//! and the resolver is not always trustworthy: search-domain append (DHCP
-//! option 15/119, attacker-settable on a hostile LAN), LLMNR (an
-//! unauthenticated multicast query any LAN peer can answer), and, for a
-//! single-label name that happens to also be a public TLD with an apex
-//! record, public DNS. A request that carries no credential has nothing an
-//! adversarial answer can steal, so `http://ollama:11434` (Ollama has no
-//! credential concept at all) stays permitted regardless of how `ollama`
-//! resolves. A request that does carry one — a remote MCP server's bearer
-//! token, a connection's API key — needs the same scrutiny a private IP
-//! literal gets: a bare name is refused, and the operator points it at a
-//! literal address, a private range, or `https://` instead. `RequestCredential`
-//! is the caller's declaration of which case this is; get it right, because
-//! this module cannot infer it from the URL string alone.
+//! A bare hostname and a CGNAT address are both reached through a mechanism
+//! the operator does not fully control, which an RFC1918 or ULA literal is
+//! not:
+//!
+//! - A dot-free name is whatever the resolver decides: search-domain append
+//!   (DHCP option 15/119, attacker-settable on a hostile LAN), LLMNR (an
+//!   unauthenticated multicast query any LAN peer can answer), and, for a
+//!   single-label name that happens to also be a public TLD with an apex
+//!   record, public DNS.
+//! - CGNAT (`100.64.0.0/10`, RFC 6598) is explicitly *shared* address space
+//!   - carriers assign it to many unrelated subscribers on the same tethered
+//!     or LTE network, unlike RFC1918 or ULA, which are never routed on a
+//!     shared public-facing network. A credentialed plain-HTTP request to a
+//!     CGNAT literal can land on another subscriber's equipment, not just
+//!     the operator's own.
+//!
+//! A request that carries no credential has nothing an adversarial answer or
+//! neighbour can steal, so `http://ollama:11434` (Ollama has no credential
+//! concept at all) stays permitted regardless of how `ollama` resolves, and
+//! a credential-free request to a Tailscale/CGNAT address keeps working. A
+//! request that does carry one — a remote MCP server's bearer token, a
+//! connection's API key — needs the same scrutiny a private IP literal
+//! gets: a bare name or a CGNAT literal is refused, and the operator points
+//! it at an RFC1918/ULA/loopback address or `https://` instead.
+//! `RequestCredential` is the caller's declaration of which case this is;
+//! get it right, because this module cannot infer it from the URL string
+//! alone.
 //!
 //! ## What this does not do
 //!
@@ -129,6 +144,19 @@ const BLOCKED_METADATA_HOSTNAMES: &[&str] = &[
     "metadata.google.internal", // GCP: canonical
     "metadata",                 // GCP: the short alias GCE Linux images preload into /etc/hosts
     "instance-data",            // AWS: a documented alias for the IMDS on some AMIs
+];
+
+/// Cloud-metadata IPv4 literals outside the link-local range this policy
+/// already blocks unconditionally: Alibaba Cloud ECS's metadata service,
+/// which lives inside `100.64.0.0/10` (CGNAT / RFC 6598) rather than
+/// `169.254.0.0/16`. CGNAT is otherwise a credential-gated private-range
+/// exemption ([`is_private_target`]) - these two addresses are refused
+/// unconditionally instead, the same as link-local, because nothing inside
+/// that range should ever answer as a metadata service, credentialed or
+/// not.
+const BLOCKED_METADATA_IPV4: [Ipv4Addr; 2] = [
+    Ipv4Addr::new(100, 100, 100, 200), // Alibaba Cloud ECS: primary
+    Ipv4Addr::new(100, 100, 100, 100), // Alibaba Cloud ECS: secondary
 ];
 
 /// Why a candidate remote URL was refused. Each variant is an independently
@@ -236,13 +264,19 @@ pub fn validate_remote_url(raw: &str, credential: RequestCredential) -> Result<(
 /// A destination this policy always refuses, regardless of scheme or
 /// [`RequestCredential`]: the link-local range (host to the cloud-metadata
 /// address `169.254.169.254` shared by AWS, Azure, and GCP's legacy
-/// metadata path lives here), the unspecified address, and a known
-/// cloud-metadata hostname alias ([`BLOCKED_METADATA_HOSTNAMES`]).
+/// metadata path lives here), the unspecified address, a known
+/// cloud-metadata hostname alias ([`BLOCKED_METADATA_HOSTNAMES`]), or a
+/// known cloud-metadata IPv4 literal outside the link-local range
+/// ([`BLOCKED_METADATA_IPV4`]).
 fn is_blocked_target(url: &Url) -> bool {
     match url.host() {
-        Some(Host::Ipv4(ip)) => ip.is_link_local() || ip.is_unspecified(),
+        Some(Host::Ipv4(ip)) => {
+            ip.is_link_local() || ip.is_unspecified() || BLOCKED_METADATA_IPV4.contains(&ip)
+        }
         Some(Host::Ipv6(ip)) => match embedded_ipv4(&ip) {
-            Some(v4) => v4.is_link_local() || v4.is_unspecified(),
+            Some(v4) => {
+                v4.is_link_local() || v4.is_unspecified() || BLOCKED_METADATA_IPV4.contains(&v4)
+            }
             None => is_ipv6_link_local(&ip) || ip.is_unspecified(),
         },
         Some(Host::Domain(name)) => {
@@ -256,20 +290,37 @@ fn is_blocked_target(url: &Url) -> bool {
 }
 
 /// A destination plain `http://` may reach without sending an attached
-/// credential onto the open network: loopback, a private range (RFC1918
-/// IPv4, IPv6 ULA `fc00::/7`, or CGNAT `100.64.0.0/10` — the range
-/// Tailscale addresses live in, so treating it differently from RFC1918
-/// would push operators toward the wider bare-hostname exemption instead),
-/// or — only when [`RequestCredential::None`] — a bare (dot-free) hostname.
-/// See the module docs for why the bare-hostname arm is credential-gated
-/// and the other two are not: an IP literal is not resolved by anything an
-/// attacker can influence, so it carries none of the DNS-hijack risk a bare
-/// name does.
+/// credential onto the open network: loopback, an RFC1918 IPv4 range, an
+/// IPv6 ULA (`fc00::/7`) range, or a bare (dot-free) hostname / CGNAT
+/// address (`100.64.0.0/10`) — but only the first three are unconditional.
+///
+/// CGNAT and the bare-hostname arm are both gated on
+/// [`RequestCredential::None`], for the same underlying reason stated in the
+/// module docs, not two different ones: both are shared or resolved by a
+/// mechanism outside the operator's control. A bare hostname resolves by
+/// search-domain append, LLMNR, or public DNS; CGNAT space is explicitly
+/// *shared* across a carrier's subscribers (RFC 6598's whole purpose,
+/// unlike RFC1918 or ULA, which are not routed on any shared public-facing
+/// network) - on a tethered or LTE link, the daemon's own address and an
+/// unrelated subscriber's are both inside `100.64.0.0/10`, so a credentialed
+/// plain-HTTP request there can land on someone else's equipment. Loopback,
+/// RFC1918, and ULA carry no such risk: none of them is a shared or
+/// resolved destination, so they stay exempt regardless of credential. A
+/// credential-free request to a CGNAT/Tailscale address (`http://ollama`'s
+/// shape, just by IP instead of by name) keeps working either way.
 fn is_private_target(url: &Url, credential: RequestCredential) -> bool {
     match url.host() {
-        Some(Host::Ipv4(ip)) => ip.is_loopback() || ip.is_private() || is_cgnat(ip),
+        Some(Host::Ipv4(ip)) => {
+            ip.is_loopback()
+                || ip.is_private()
+                || (credential == RequestCredential::None && is_cgnat(ip))
+        }
         Some(Host::Ipv6(ip)) => match embedded_ipv4(&ip) {
-            Some(v4) => v4.is_loopback() || v4.is_private() || is_cgnat(v4),
+            Some(v4) => {
+                v4.is_loopback()
+                    || v4.is_private()
+                    || (credential == RequestCredential::None && is_cgnat(v4))
+            }
             None => ip.is_loopback() || is_ipv6_ula(&ip),
         },
         Some(Host::Domain(name)) => {
@@ -376,11 +427,21 @@ mod tests {
             .expect("http to a LAN address, even with a credential attached");
     }
 
+    /// F3 (review): CGNAT space is shared across a carrier's subscribers
+    /// (unlike RFC1918/ULA), so - mirroring the bare-hostname arm exactly -
+    /// it is only exempt when the request carries nothing an unrelated
+    /// subscriber's equipment could steal.
     #[test]
-    fn accepts_http_to_a_cgnat_address_with_a_credential_attached() {
+    fn accepts_http_to_a_cgnat_address_with_no_credential() {
         // 100.64.0.0/10 is the range Tailscale addresses live in.
-        validate_remote_url("http://100.100.100.5:8080/v1", ATTACHED)
-            .expect("http to a CGNAT/Tailscale address, even with a credential attached");
+        validate_remote_url("http://100.100.100.5:8080/v1", NONE)
+            .expect("http to a CGNAT/Tailscale address is fine when nothing is attached to steal");
+    }
+
+    #[test]
+    fn rejects_http_to_a_cgnat_address_with_a_credential_attached() {
+        let err = validate_remote_url("http://100.100.100.5:8080/v1", ATTACHED).unwrap_err();
+        assert_eq!(err.code(), "url_insecure_scheme");
     }
 
     #[test]
@@ -461,6 +522,39 @@ mod tests {
     #[test]
     fn rejects_the_aws_instance_data_bare_alias_even_with_no_credential_attached() {
         let err = validate_remote_url("http://instance-data/latest/meta-data/", NONE).unwrap_err();
+        assert_eq!(err.code(), "url_target_blocked");
+    }
+
+    /// F3 (review, the demonstrated case): Alibaba Cloud ECS's metadata
+    /// service lives inside the CGNAT range (`100.64.0.0/10`), not the
+    /// link-local range the other cloud metadata IPs share, so it needs its
+    /// own entry on the floor. Demonstrated accepted before this fix, with a
+    /// credential attached, over plain http.
+    #[test]
+    fn rejects_alibaba_metadata_primary_address_even_with_no_credential_attached() {
+        let err = validate_remote_url(
+            "http://100.100.100.200/latest/meta-data/ram/security-credentials/",
+            NONE,
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), "url_target_blocked");
+    }
+
+    #[test]
+    fn rejects_alibaba_metadata_secondary_address_even_over_https() {
+        // The scheme check alone would accept this; the blocked-target check
+        // must run first regardless of scheme (see the module docs).
+        let err = validate_remote_url("https://100.100.100.100/", ATTACHED).unwrap_err();
+        assert_eq!(err.code(), "url_target_blocked");
+    }
+
+    /// The CGNAT exemption is credential-gated, but the Alibaba metadata
+    /// addresses must stay refused even in the permitted (no-credential)
+    /// case - they are on the unconditional floor, not the gated exemption.
+    #[test]
+    fn rejects_alibaba_metadata_address_regardless_of_the_cgnat_exemption() {
+        let err =
+            validate_remote_url("http://100.100.100.200/latest/meta-data/", NONE).unwrap_err();
         assert_eq!(err.code(), "url_target_blocked");
     }
 
