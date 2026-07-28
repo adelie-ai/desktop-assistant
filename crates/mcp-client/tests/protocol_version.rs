@@ -73,6 +73,56 @@ async fn connect_to(label: &str, result_body: &str) -> (Result<McpClient, McpErr
     (client, request)
 }
 
+// ----- SEP-973 serverInfo metadata (issue #938) -----
+
+/// An `initialize` result whose `serverInfo` carries `extra` alongside the
+/// required `name`/`version`.
+fn result_with_server_info(extra: &str) -> String {
+    format!(
+        r#"{{"protocolVersion":"2025-11-25","capabilities":{{}},"serverInfo":{{"name":"fake","version":"0.0"{extra}}}}}"#
+    )
+}
+
+#[tokio::test]
+async fn initialize_records_server_metadata() {
+    let body = result_with_server_info(
+        r#","title":"Fake Server","description":"Does fake things.","websiteUrl":"https://example.com/fake""#,
+    );
+    let (client, _) = connect_to("metadata", &body).await;
+    let client = client.expect("handshake must succeed");
+    let meta = client.server_metadata();
+    assert_eq!(meta.title.as_deref(), Some("Fake Server"));
+    assert_eq!(meta.description.as_deref(), Some("Does fake things."));
+    assert_eq!(
+        meta.website_url.as_deref(),
+        Some("https://example.com/fake")
+    );
+}
+
+/// The case for every server today: it declares nothing, and must keep working.
+#[tokio::test]
+async fn initialize_server_metadata_absent_when_not_sent() {
+    let (client, _) = connect_to("no-metadata", &result_with_server_info("")).await;
+    let client = client.expect("handshake must succeed");
+    assert!(
+        client.server_metadata().is_empty(),
+        "a server declaring nothing must yield empty metadata"
+    );
+}
+
+#[tokio::test]
+async fn initialize_server_metadata_ignores_blank_values() {
+    // Spaces only, no escapes: the fake server renders this through `printf`,
+    // which would interpret a `\t` and emit a raw tab inside a JSON string.
+    let body = result_with_server_info(r#","title":"   ","description":"","websiteUrl":" ""#);
+    let (client, _) = connect_to("blank-metadata", &body).await;
+    let client = client.expect("handshake must succeed");
+    assert!(
+        client.server_metadata().is_empty(),
+        "whitespace-only values carry no signal and must be treated as absent"
+    );
+}
+
 #[tokio::test]
 async fn initialize_requests_current_protocol_revision() {
     let (client, request) =

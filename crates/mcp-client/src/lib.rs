@@ -181,12 +181,70 @@ pub struct McpClient {
     /// the `initialize` result. `None` only before the handshake runs — a
     /// completed `initialize` always sets it or fails.
     protocol_version: Option<String>,
+    /// What the server declared about itself in `serverInfo` (SEP-973). Empty
+    /// for every server that has not opted in.
+    server_metadata: ServerMetadata,
+}
+
+/// What a server declared about *itself* in `initialize`'s `serverInfo`
+/// (SEP-973, spec revision 2025-11-25), beyond the required `name`/`version`.
+///
+/// Grouped rather than carried as three loose `Option<String>`s because the
+/// three are parsed together and travel together through `ClientHandle`,
+/// `McpServerStatusInfo` and on to the settings surface — three call sites, so
+/// the type is earned rather than speculative. It stays a *domain* shape: the
+/// wire type flattens it, matching its neighbouring fields.
+///
+/// Every field is untrusted input from whatever process the server config
+/// points at. They are trimmed and empty-filtered here; a consumer that renders
+/// them owes them the same scrutiny it gives any other remote string.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ServerMetadata {
+    /// Human-facing display name, where `name` is the programmatic identity.
+    pub title: Option<String>,
+    /// What the server offers. Distinct from `instructions`, which is usage
+    /// guidance aimed at the model.
+    pub description: Option<String>,
+    /// The server's home page.
+    pub website_url: Option<String>,
+}
+
+impl ServerMetadata {
+    /// True when the server declared none of the optional fields — the case for
+    /// every server that has not opted in.
+    pub fn is_empty(&self) -> bool {
+        self.title.is_none() && self.description.is_none() && self.website_url.is_none()
+    }
+}
+
+/// Extract the optional [`ServerMetadata`] from an MCP `initialize` result.
+///
+/// Applies the same rule as [`parse_server_instructions`]: trimmed, and blank
+/// treated as absent, so a whitespace-only value falls through to the next
+/// description source rather than seeding an empty one. A non-string value is
+/// dropped rather than coerced.
+pub fn parse_server_metadata(result: &serde_json::Value) -> ServerMetadata {
+    let field = |key: &str| {
+        result
+            .get("serverInfo")
+            .and_then(|info| info.get(key))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    };
+    ServerMetadata {
+        title: field("title"),
+        description: field("description"),
+        website_url: field("websiteUrl"),
+    }
 }
 
 /// Extract the trimmed, non-empty `instructions` string from an MCP
 /// `initialize` result, or `None` when absent or blank. Servers may include
 /// human-facing usage instructions here (MCP spec); Adele seeds a server's
-/// provider description from it.
+/// provider description from it when the server declares no
+/// `serverInfo.description`.
 pub fn parse_server_instructions(result: &serde_json::Value) -> Option<String> {
     result
         .get("instructions")
@@ -335,6 +393,7 @@ impl McpClient {
             request_timeout,
             server_instructions: None,
             protocol_version: None,
+            server_metadata: ServerMetadata::default(),
         };
 
         let init_timeout = INIT_TIMEOUT.min(request_timeout);
@@ -367,6 +426,13 @@ impl McpClient {
         self.protocol_version.as_deref()
     }
 
+    /// What the server declared about itself in `initialize`'s `serverInfo`
+    /// (SEP-973). Empty for any server that has not opted in, which is all of
+    /// them until they do.
+    pub fn server_metadata(&self) -> &ServerMetadata {
+        &self.server_metadata
+    }
+
     async fn initialize(&mut self) -> Result<(), McpError> {
         let params = serde_json::json!({
             "protocolVersion": REQUESTED_PROTOCOL_VERSION,
@@ -378,6 +444,7 @@ impl McpClient {
         });
 
         let response = self.send_request("initialize", Some(params)).await?;
+        self.server_metadata = parse_server_metadata(&response);
         let negotiated = negotiated_protocol_version(&response)?;
         // Before the `initialized` notification, which is itself the first
         // post-initialize request and so must already carry the header.
@@ -1391,8 +1458,14 @@ mod tests {
         });
         let meta = parse_server_metadata(&result);
         assert_eq!(meta.title.as_deref(), Some("Weather Service"));
-        assert_eq!(meta.description.as_deref(), Some("Live weather and forecasts."));
-        assert_eq!(meta.website_url.as_deref(), Some("https://example.com/weather"));
+        assert_eq!(
+            meta.description.as_deref(),
+            Some("Live weather and forecasts.")
+        );
+        assert_eq!(
+            meta.website_url.as_deref(),
+            Some("https://example.com/weather")
+        );
     }
 
     #[test]
