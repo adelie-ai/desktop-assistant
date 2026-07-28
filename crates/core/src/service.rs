@@ -147,6 +147,50 @@ const MAX_TOOL_ROUNDS: usize = 200;
 /// for several resets.
 const SERVER_TOOL_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// The consecutive run of one tool name used to coalesce completion statuses:
+/// the tool that last completed and how many times in a row it has done so.
+/// `None` before the first completion, and after a failure.
+type ToolCompletionRun = Option<(String, u32)>;
+
+/// Advance `run` for a just-completed server-side tool and return the status
+/// line to emit for it.
+///
+/// Why: the keepalive covers one slow tool, not many fast ones, so a
+/// tool-heavy round shows nothing for tens of seconds (#941). Emitting on
+/// completion gives that round a cadence.
+///
+/// The line carries the tool's name and a count and nothing else. It reaches
+/// every subscribed client and the journal, so arguments and output must stay
+/// out of it (#776); `summarize_tool_value` feeds the activity feed, which is
+/// the surface for those.
+///
+/// Repeats of the same tool coalesce into one running count rather than one
+/// line each, because a client renders a status by replacing the previous one:
+/// twenty calls then read as "Ran fileio_read 20 times", not twenty lines. A
+/// failure is reported alone and resets the run - it is more interesting to a
+/// watching human than the successes around it, and folding it into a success
+/// count would hide it.
+fn advance_tool_completion_status(run: &mut ToolCompletionRun, name: &str, ok: bool) -> String {
+    if !ok {
+        *run = None;
+        return format!("{name} failed");
+    }
+    let count = match run {
+        Some((running, count)) if running == name => {
+            *count += 1;
+            *count
+        }
+        _ => {
+            *run = Some((name.to_string(), 1));
+            1
+        }
+    };
+    match count {
+        1 => format!("Ran {name}"),
+        n => format!("Ran {name} {n} times"),
+    }
+}
+
 /// Transient instruction shown to the model for the #453 wind-down completion
 /// only (never persisted): the tool budget is spent, so it must close out in
 /// prose rather than request more tools.
@@ -1206,6 +1250,11 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         // via the scratchpad's upsert-by-key write (DA-7 / #292).
         let mut step_stack = self.build_step_stack(conversation_id).await;
 
+        // Coalescing run for the per-completion status (#941). Spans the whole
+        // turn, not one round, so a tool the model keeps calling across rounds
+        // stays one running line.
+        let mut tool_completion_run: ToolCompletionRun = None;
+
         for round in 0..MAX_TOOL_ROUNDS {
             // Between-rounds cancellation checkpoint (issue #109): if the
             // caller cancelled while the previous tool round was
@@ -1673,10 +1722,12 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                         || tool_call.name == planning::COMPLETE_STEP_TOOL)
                 {
                     // Step-level narration: announce the logical step the model
-                    // just declared, once, as its goal. This is the only progress
-                    // narration now (turn-start filler and per-tool chatter were
-                    // removed); a step spans multiple tool calls. complete_step
-                    // stays silent.
+                    // just declared, once, as its goal. A step spans multiple
+                    // tool calls, so this says what the work is *for*, where the
+                    // completion status below says what ran. complete_step stays
+                    // silent, and neither control tool gets a completion status
+                    // of its own - the `continue` at the end of this branch
+                    // keeps them out of the dispatch path that emits one.
                     if tool_call.name == planning::BEGIN_STEP_TOOL
                         && let Some(goal) = arguments.get("goal").and_then(|v| v.as_str())
                     {
@@ -1865,13 +1916,27 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                             }
                         }
                     };
+                    // Completion status (#941): the keepalive above covers one
+                    // slow tool; this covers many fast ones, which is what a
+                    // tool-heavy round is. Name and count only - see
+                    // `advance_tool_completion_status`.
                     match outcome {
                         Ok(output) => {
                             tracing::debug!(tool = %tool_call.name, output = %output, "tool result");
+                            on_status(advance_tool_completion_status(
+                                &mut tool_completion_run,
+                                &tool_call.name,
+                                true,
+                            ));
                             (output, true)
                         }
                         Err(e) => {
                             tracing::warn!(tool = %tool_call.name, error = %e, "tool execution failed");
+                            on_status(advance_tool_completion_status(
+                                &mut tool_completion_run,
+                                &tool_call.name,
+                                false,
+                            ));
                             (format!("Error: {e}"), false)
                         }
                     }
@@ -2779,6 +2844,35 @@ mod tests {
     }
 
     // --- #941: a completed server-side tool emits a status ---
+
+    #[test]
+    fn tool_completion_status_coalesces_repeats_and_resets_on_failure() {
+        // Branch coverage for the coalescing rule the turn-level tests exercise
+        // one path of each: a run grows, a different tool restarts it, and a
+        // failure both interrupts the run and starts the next one over.
+        let mut run: ToolCompletionRun = None;
+        assert_eq!(
+            advance_tool_completion_status(&mut run, "fileio_read", true),
+            "Ran fileio_read"
+        );
+        assert_eq!(
+            advance_tool_completion_status(&mut run, "fileio_read", true),
+            "Ran fileio_read 2 times"
+        );
+        assert_eq!(
+            advance_tool_completion_status(&mut run, "web_search", true),
+            "Ran web_search"
+        );
+        assert_eq!(
+            advance_tool_completion_status(&mut run, "web_search", false),
+            "web_search failed"
+        );
+        assert_eq!(
+            advance_tool_completion_status(&mut run, "web_search", true),
+            "Ran web_search",
+            "a failure resets the run, so the next success counts from one"
+        );
+    }
 
     /// Statuses a completed tool produced, i.e. everything that is neither a
     /// tool keepalive ("Still working on X") nor an LLM keepalive
