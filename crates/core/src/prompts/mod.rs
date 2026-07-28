@@ -283,16 +283,16 @@ const SECTION_NARRATION: &str = include_str!("sections/narration.txt");
 /// Return the static (file-based) prompt sections in order.
 ///
 /// Every section here is the same for every turn. [`PromptSectionKind::Narration`]
-/// is the one that could plausibly vary: a turn nobody watches needs no
-/// reassurance. It does not vary, for two reasons. A prompt that varies with
-/// the turn is a dynamic section, so it leaves the golden snapshot that
-/// `assembled_static_sections_match_original` holds, and two prompts to keep
-/// golden drift apart one edit at a time. And it would split the cached system
-/// block, which a conversation that mixes an interactive turn with a
-/// parent-wake turn pays for on every turn. The static wording states the
-/// condition instead and lets the model resolve it, the same way the subagent
-/// section says "If you are yourself a subagent". Cadence, which the model
-/// cannot judge, stays with the daemon (#943).
+/// is the one that could plausibly vary, because a turn nobody watches needs no
+/// reassurance. It does not vary, for two reasons. A prompt that varies with the
+/// turn is a dynamic section, so it leaves the golden snapshot that
+/// `assembled_static_sections_match_original` holds; two prompts to keep golden
+/// then drift apart one edit at a time. It also splits the cached system block,
+/// which a conversation that mixes an interactive turn with a parent-wake turn
+/// pays for on every turn. The static wording states the condition and lets the
+/// model resolve it, the same way the subagent section says "If you are yourself
+/// a subagent". Cadence, which the model cannot judge, stays with the daemon
+/// (#943).
 pub fn static_sections() -> Vec<PromptSection> {
     vec![
         PromptSection::new(PromptSectionKind::Identity, SECTION_IDENTITY),
