@@ -356,6 +356,152 @@ async fn cross_user_isolation() {
     .await;
 }
 
+// --- #809: cross-tenant write guard ----------------------------------------
+//
+// `write`'s `ON CONFLICT (conversation_id, owner_todo, note_key) DO UPDATE`
+// has no `user_id` component in its conflict target (migration 031), so
+// without a `WHERE` guard on the update, a second tenant writing a colliding
+// key against another user's conversation id silently overwrites that row in
+// place. `cross_user_isolation` above proves reads/deletes already fail
+// closed; these prove the write path does too.
+
+#[tokio::test]
+async fn write_against_another_users_conversation_changes_nothing() {
+    with_fixture(
+        "write_against_another_users_conversation_changes_nothing",
+        |fx| async move {
+            let convs = PgConversationStore::new(fx.pool.clone());
+            let pad = PgScratchpadStore::new(fx.pool.clone());
+
+            // Alice owns "c1" and writes her real note under key "goal".
+            with_user_id(UserId::new("alice"), async {
+                convs
+                    .create(make_conversation("c1"))
+                    .await
+                    .expect("alice conv");
+                pad.write("c1", &[note("goal", "alice's real plan")])
+                    .await
+                    .expect("alice write");
+            })
+            .await;
+
+            // Bob writes against Alice's conversation id with a colliding note
+            // key. The FK to conversations(id) is satisfied (it isn't scoped by
+            // user), so the only thing standing between Bob and Alice's row is
+            // the upsert's own guard. The call must not error, but must also
+            // not report Alice's row as written/updated — it fails closed.
+            let bob_result = with_user_id(UserId::new("bob"), async {
+                pad.write("c1", &[note("goal", "bob's injected content")])
+                    .await
+                    .expect("bob's write must not error")
+            })
+            .await;
+            assert!(
+                bob_result.is_empty(),
+                "a cross-tenant conflict must not report a written/updated row, got {bob_result:?}"
+            );
+
+            // Alice's content is unchanged, and no second row was created.
+            with_user_id(UserId::new("alice"), async {
+                let after = pad.list("c1", None, 50).await.expect("list");
+                assert_eq!(
+                    after.len(),
+                    1,
+                    "bob's write must not create a second row alongside alice's"
+                );
+                assert_eq!(
+                    after[0].content, "alice's real plan",
+                    "bob must not be able to overwrite alice's note content"
+                );
+            })
+            .await;
+            fx
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn write_to_own_conversation_still_upserts() {
+    with_fixture("write_to_own_conversation_still_upserts", |fx| async move {
+        let convs = PgConversationStore::new(fx.pool.clone());
+        let pad = PgScratchpadStore::new(fx.pool.clone());
+
+        with_user_id(UserId::new("alice"), async {
+            convs
+                .create(make_conversation("c1"))
+                .await
+                .expect("create conv");
+            pad.write("c1", &[note("goal", "first draft")])
+                .await
+                .expect("initial write");
+
+            // Re-writing the same key as the SAME user must still upsert in
+            // place: the new user_id guard must not turn a normal same-tenant
+            // upsert into a silent no-op.
+            let updated = pad
+                .write("c1", &[note("goal", "revised plan")])
+                .await
+                .expect("own-tenant upsert");
+            assert_eq!(
+                updated.len(),
+                1,
+                "own-tenant upsert must report the changed row"
+            );
+            assert_eq!(updated[0].content, "revised plan");
+
+            let after = pad.list("c1", None, 50).await.expect("list");
+            assert_eq!(after.len(), 1, "upsert must not create a duplicate row");
+            assert_eq!(after[0].content, "revised plan");
+        })
+        .await;
+        fx
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn single_tenant_write_is_unaffected() {
+    with_fixture("single_tenant_write_is_unaffected", |fx| async move {
+        let convs = PgConversationStore::new(fx.pool.clone());
+        let pad = PgScratchpadStore::new(fx.pool.clone());
+
+        // No `with_user_id` scope at all: `current_user_id()` falls through to
+        // the "default" sentinel for every call here, matching a single-tenant
+        // desktop install with no JWT auth installed (design record
+        // constraint: this path must not change behaviour).
+        convs
+            .create(make_conversation("c1"))
+            .await
+            .expect("create conv");
+        let saved = pad
+            .write("c1", &[note("goal", "ship it")])
+            .await
+            .expect("write");
+        assert_eq!(saved.len(), 1);
+
+        // Re-writing under the same (absent) scope still upserts in place: the
+        // fail-closed guard compares the sentinel to itself and must still
+        // match.
+        let updated = pad
+            .write("c1", &[note("goal", "ship it well")])
+            .await
+            .expect("upsert");
+        assert_eq!(
+            updated.len(),
+            1,
+            "single-tenant upsert must still report the changed row"
+        );
+        assert_eq!(updated[0].content, "ship it well");
+
+        let after = pad.list("c1", None, 50).await.expect("list");
+        assert_eq!(after.len(), 1, "upsert must not create a duplicate row");
+        assert_eq!(after[0].content, "ship it well");
+        fx
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn list_orders_by_type_then_sequence_nulls_last() {
     with_fixture(

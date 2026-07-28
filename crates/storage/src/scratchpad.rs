@@ -5,6 +5,12 @@
 //! - `(user_id, conversation_id)`-scoped queries throughout, with
 //!   `current_user_id()` read from the task-local — nothing here takes a
 //!   `UserId` parameter (see `desktop-assistant-core::ports::auth`).
+//! - Cross-user reads/deletes/upserts all fail closed: reads and deletes via
+//!   a plain `WHERE user_id = $1`, and `write`'s upsert via a
+//!   `WHERE scratchpads.user_id = EXCLUDED.user_id` guard on its
+//!   `ON CONFLICT ... DO UPDATE` (the conflict target itself is not
+//!   user-scoped, so the guard is the only thing standing between a
+//!   colliding key and another tenant's row — see `write`, #809).
 //! - Cross-user reads return empty, not an error.
 //! - The full-text `search` reuses the `plainto_tsquery` / `ts_rank_cd`
 //!   shape from the conversation search adapter.
@@ -120,6 +126,17 @@ impl ScratchpadStore for PgScratchpadStore {
         let seqs: Vec<Option<i32>> = notes.iter().map(|n| n.sequence).collect();
         let dones: Vec<bool> = notes.iter().map(|n| n.done).collect();
 
+        // The conflict target `(conversation_id, owner_todo, note_key)`
+        // (migration 031) has no `user_id` component, so without a `WHERE`
+        // guard on the update, a colliding key from a DIFFERENT tenant would
+        // silently overwrite another user's row in place — the FK to
+        // `conversations(id)` isn't user-scoped, so any conversation id is
+        // syntactically writable. `scratchpads.user_id = EXCLUDED.user_id`
+        // fails closed exactly like `PgKnowledgeBaseStore::write`
+        // (knowledge.rs): when the guard is false, Postgres treats the
+        // conflict as a no-op for that row (no update, no error) and
+        // `RETURNING` omits it, so a cross-tenant write neither changes the
+        // victim's row nor leaks its content back to the writer (#809).
         let rows: Vec<SpRow> = sqlx::query_as(
             "INSERT INTO scratchpads \
                  (id, user_id, conversation_id, owner_todo, note_key, content, note_type, seq, done) \
@@ -128,6 +145,7 @@ impl ScratchpadStore for PgScratchpadStore {
              ON CONFLICT (conversation_id, owner_todo, note_key) \
              DO UPDATE SET content = EXCLUDED.content, note_type = EXCLUDED.note_type, \
                            seq = EXCLUDED.seq, done = EXCLUDED.done, updated_at = NOW() \
+             WHERE scratchpads.user_id = EXCLUDED.user_id \
              RETURNING id, conversation_id, owner_todo, note_key, content, note_type, seq, done, pinned, \
                        created_at, updated_at",
         )
