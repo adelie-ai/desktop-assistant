@@ -75,7 +75,8 @@ async fn connect_to(label: &str, result_body: &str) -> (Result<McpClient, McpErr
 
 #[tokio::test]
 async fn initialize_requests_current_protocol_revision() {
-    let (client, request) = connect_to("requests-current", &result_with_version("2025-11-25")).await;
+    let (client, request) =
+        connect_to("requests-current", &result_with_version("2025-11-25")).await;
     client.expect("handshake must succeed");
     assert!(
         request.contains(r#""protocolVersion":"2025-11-25""#),
@@ -117,7 +118,9 @@ async fn initialize_accepts_legacy_revision_with_warning() {
 #[tokio::test]
 async fn initialize_rejects_unknown_negotiated_version() {
     let (client, _) = connect_to("unknown", &result_with_version("1999-01-01")).await;
-    let err = client.err().expect("an unknown revision must fail the handshake");
+    let err = client
+        .err()
+        .expect("an unknown revision must fail the handshake");
     assert!(
         err.to_string().contains("1999-01-01"),
         "the error must name what the server sent, got: {err}"

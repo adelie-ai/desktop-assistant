@@ -69,6 +69,10 @@ impl FakeServer {
             Some(p) => format!("echo $$ > '{}'\n", p.display()),
             None => String::new(),
         };
+        // Deliberately still on 2024-11-05 while the other fixtures moved to
+        // 2025-11-25 (#931): this suite then doubles as end-to-end proof that a
+        // legacy third-party server keeps working through the whole client,
+        // not just through the negotiation path in `protocol_version.rs`.
         let init_action = if self.reply_initialize {
             r#"printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"fake","version":"0.0"}}}\n' "$id""#
         } else {
