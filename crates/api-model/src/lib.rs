@@ -2343,7 +2343,13 @@ pub enum ErrorCode {
     /// The targeted background task already reached a terminal state, so the
     /// requested transition no longer applies.
     AlreadyTerminal,
-    /// A code this build does not recognize. Only produced on deserialize.
+    /// A code with no dedicated variant. Produced on deserialize for a code
+    /// this build does not recognize (the extensibility case described
+    /// above), and constructed directly by a server that wants a stable,
+    /// feature-specific code without adding a wire variant for it — the
+    /// `url_malformed` / `url_scheme_not_allowed` / `url_insecure_scheme` /
+    /// `url_target_blocked` family from the remote-URL policy
+    /// (`desktop-assistant-mcp-client::url_policy`) is the first of these.
     Other(String),
 }
 
