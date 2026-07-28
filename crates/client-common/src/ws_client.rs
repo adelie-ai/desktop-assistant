@@ -11,7 +11,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-use crate::commands::{AssistantCommands, PendingResult};
+use crate::commands::{AssistantCommands, CommandFailure, PendingResult};
 use crate::signal::SignalEvent;
 use crate::timeouts::{DISPATCH_TIMEOUT, WS_PING_INTERVAL};
 
@@ -29,7 +29,7 @@ impl PendingState {
             self.closed = Some(reason.to_string());
         }
         for (_id, tx) in self.map.drain() {
-            let _ = tx.send(Err(reason.to_string()));
+            let _ = tx.send(Err(CommandFailure::unclassified(reason)));
         }
     }
 
@@ -224,9 +224,12 @@ impl WsClient {
                             let _ = tx.send(Ok(result));
                         }
                     }
-                    WsFrame::Error { id, error, .. } => {
+                    WsFrame::Error { id, error, detail } => {
                         if let Some(tx) = pending_for_reader.lock().await.map.remove(&id) {
-                            let _ = tx.send(Err(error));
+                            let _ = tx.send(Err(CommandFailure {
+                                message: error,
+                                detail,
+                            }));
                         }
                     }
                     WsFrame::Event { event } => {
@@ -361,7 +364,7 @@ impl AssistantCommands for WsClient {
         // expiry so it can't leak, and return a clear transport error.
         match tokio::time::timeout(self.dispatch_timeout, rx).await {
             Ok(Ok(Ok(result))) => Ok(result),
-            Ok(Ok(Err(error))) => Err(anyhow!(error)),
+            Ok(Ok(Err(failure))) => Err(anyhow::Error::new(failure)),
             Ok(Err(_closed)) => Err(anyhow!("websocket response channel closed")),
             Err(_elapsed) => {
                 self.pending.lock().await.map.remove(&id);

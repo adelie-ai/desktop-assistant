@@ -68,7 +68,9 @@ unless `[authz] admin_subjects` in `daemon.toml` names that account's login
 name. A tenant is refused the service-configuration writes - `SetApiKey`,
 `SetLlmSettings`, `SetEmbeddingsSettings`, `SetDatabaseSettings`,
 `SetBackendTasksSettings`, `SetWsAuthSettings`, the connection and purpose
-writes, and the MCP writes. Reads, conversations, and personality are unaffected.
+writes, the MCP lifecycle writes, and `SetConfig` (whose personality traits are
+one global block, not a per-user preference). Reads and conversations are
+unaffected, and a tenant still sets their own disposition per conversation.
 
 A refusal reaches D-Bus as an `org.freedesktop.DBus.Error.Failed` whose message
 begins `not authorized:` and names the command. The structured classification

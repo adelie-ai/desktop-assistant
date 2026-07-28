@@ -18,10 +18,75 @@ use desktop_assistant_api_model as api;
 
 use crate::types::{ConversationDetail, ConversationSummary};
 
+/// Why a command did not succeed, as the daemon reported it.
+///
+/// `Display` is the daemon's message verbatim, so every existing caller that
+/// renders the error string sees exactly what it saw before. `detail` carries
+/// the daemon's machine-readable classification when there is one (#728), so a
+/// client can tell an authorization refusal from a technical failure without
+/// matching English text - the whole point of the structured shape.
+///
+/// `detail` is `None` when the daemon did not classify the failure, or when the
+/// failure never reached the daemon at all (a transport error, a timeout, a
+/// closed connection). Absent means "unclassified", never "not an
+/// authorization problem".
+///
+/// [`AssistantCommands::send_command`] returns `anyhow::Result`, which keeps
+/// this as the error's source, so a caller recovers the classification with
+/// `err.downcast_ref::<CommandFailure>()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandFailure {
+    /// The daemon's human-readable message.
+    pub message: String,
+    /// The daemon's classification, when it supplied one.
+    pub detail: Option<api::ErrorDetail>,
+}
+
+impl CommandFailure {
+    /// A failure the daemon did not classify - a transport error, a timeout, or
+    /// a message from a daemon that predates the classification.
+    pub fn unclassified(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            detail: None,
+        }
+    }
+
+    /// The stable code, when the daemon supplied one. Branch on this, never on
+    /// [`Self::message`].
+    pub fn code(&self) -> Option<&api::ErrorCode> {
+        self.detail.as_ref().map(|d| &d.code)
+    }
+
+    /// Whether the daemon refused this command for lack of capability (#728).
+    /// A client uses it to prompt for a different account, or to mark the
+    /// surface read-only, rather than showing a bare failure.
+    pub fn is_not_authorized(&self) -> bool {
+        self.code() == Some(&api::ErrorCode::NotAuthorized)
+    }
+
+    /// Text fit to show a person: the daemon's user-facing message when it
+    /// classified the failure, otherwise the raw message.
+    pub fn user_message(&self) -> &str {
+        self.detail
+            .as_ref()
+            .map(|d| d.message.as_str())
+            .unwrap_or(&self.message)
+    }
+}
+
+impl std::fmt::Display for CommandFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CommandFailure {}
+
 /// Outcome of a single in-flight request, stored by request id in each
-/// client's pending map: `Ok` on a `WsFrame::Result`, `Err(message)` on a
+/// client's pending map: `Ok` on a `WsFrame::Result`, `Err` on a
 /// `WsFrame::Error` or a connection-level failure.
-pub type PendingResult = Result<api::CommandResult, String>;
+pub type PendingResult = Result<api::CommandResult, CommandFailure>;
 
 /// Both correlation ids the daemon returns for an accepted `SendMessage`
 /// (issue #138).
@@ -1365,5 +1430,68 @@ mod tests {
         assert!(client.get_database_settings().await.is_err());
         assert!(client.get_backend_tasks_settings().await.is_err());
         assert!(client.get_ws_auth_settings().await.is_err());
+    }
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::*;
+
+    fn refusal() -> CommandFailure {
+        CommandFailure {
+            message: "not authorized: 'set_api_key' requires the administrator capability"
+                .to_string(),
+            detail: Some(api::ErrorDetail {
+                code: api::ErrorCode::NotAuthorized,
+                description: "not authorized: 'set_api_key' requires the administrator capability"
+                    .to_string(),
+                message: "Only a daemon administrator can do that.".to_string(),
+                retryable: false,
+            }),
+        }
+    }
+
+    /// A client can tell an authorization refusal from a technical failure
+    /// without matching the message text (#728).
+    #[test]
+    fn a_refusal_is_recognisable_without_reading_the_message() {
+        let failure = refusal();
+        assert!(failure.is_not_authorized());
+        assert_eq!(failure.code(), Some(&api::ErrorCode::NotAuthorized));
+        assert_eq!(
+            failure.user_message(),
+            "Only a daemon administrator can do that."
+        );
+    }
+
+    /// An unclassified failure is not mistaken for an authorized outcome, and
+    /// still renders something useful.
+    #[test]
+    fn an_unclassified_failure_is_not_read_as_authorized() {
+        let failure = CommandFailure::unclassified("uds response channel closed");
+        assert!(!failure.is_not_authorized());
+        assert_eq!(failure.code(), None);
+        assert_eq!(failure.user_message(), "uds response channel closed");
+    }
+
+    /// `Display` is unchanged, so every existing caller that renders the error
+    /// string sees exactly what it saw before.
+    #[test]
+    fn display_is_the_daemons_message_verbatim() {
+        assert_eq!(
+            refusal().to_string(),
+            "not authorized: 'set_api_key' requires the administrator capability"
+        );
+    }
+
+    /// `send_command` returns `anyhow::Result`, so the classification must
+    /// survive the conversion for a caller to recover it.
+    #[test]
+    fn the_classification_survives_the_anyhow_boundary() {
+        let err = anyhow::Error::new(refusal());
+        let recovered = err
+            .downcast_ref::<CommandFailure>()
+            .expect("the failure must remain downcastable");
+        assert!(recovered.is_not_authorized());
     }
 }

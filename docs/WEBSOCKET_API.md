@@ -291,8 +291,11 @@ Current event variants:
 Authenticating a token says who you are. It does not say that you own the
 service. A WebSocket connection is a **tenant** unless `[authz] admin_subjects`
 in `daemon.toml` names its subject (the JWT `sub`), in which case it is an
-**administrator**. The allowlist is empty by default and is file-only - no
-command writes it - so a tenant cannot grant themselves the capability.
+**administrator**. The allowlist is empty by default, and **no command writes
+it**: it is set by editing `daemon.toml`, so the API surface offers a tenant no
+way to grant themselves the capability. (Daemon-side file and shell MCP servers
+run as the daemon's own uid and could reach the file; they ship disabled, and
+constraining them belongs to the tool-execution design, not this tier.)
 
 A tenant may do everything with its own data: conversations, messages,
 knowledge, scratchpads, background tasks, personality, and every read on this
@@ -305,12 +308,24 @@ An administrator is additionally required for the service-configuration writes:
 `set_database_settings`, `set_backend_tasks_settings`, `set_ws_auth_settings`,
 `create_connection`, `update_connection`, `delete_connection`,
 `set_connection_secret`, `set_purpose`, `add_mcp_server`, `remove_mcp_server`,
-`set_mcp_server_enabled`, `mcp_server_action`, `upsert_mcp_server`,
-`set_mcp_secret`, `upsert_service_account`, `remove_service_account`.
+`set_mcp_server_enabled`, `upsert_mcp_server`, `set_mcp_secret`,
+`upsert_service_account`, `remove_service_account`,
+`start_knowledge_maintenance`, and `mcp_server_action` for every verb except
+`"status"`.
 
-`set_config` is decided by its payload: a personality-only change is tenant
-work, and a change touching an `embeddings_*` or `persistence_*` field needs the
+`set_config` is decided by its payload, and every field it carries writes
+daemon-global state, so any non-empty change set needs the administrator
+capability - the personality traits included, because they are one global block
+that every conversation without an override resolves against. A tenant sets
+their own disposition with `set_conversation_personality`.
+
+`mcp_server_action` is split by its verb: `"status"` is a read and stays tenant;
+`"start"`, `"stop"`, `"restart"` and anything added later need the
 administrator capability.
+
+`start_knowledge_maintenance` needs the administrator capability: every
+operation reaches past the caller's own rows, up to nulling and re-deriving
+every tenant's embeddings through the operator's provider.
 
 Discover your own level from `caller_capability` on the `get_config` reply (and
 on every `config_changed` event) rather than probing with a write.

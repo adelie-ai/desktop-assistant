@@ -240,11 +240,16 @@ configuration over the network. That is the right setting for an instance whose
 config is fully declared in the overlay and re-seeded on change. Set it when you
 administer the instance through a client's settings UI.
 
-The section is deliberately file-only. No command writes it, so a tenant cannot
-grant themselves the capability, and a leaked WS login password no longer hands
-over the whole admin surface. It is read once at startup: edit it and restart
-the pod. A config reload reports `authz` in `restart_required` rather than
-pretending the edit is live.
+The section is deliberately file-only. No command writes it, so a leaked WS
+login password no longer hands over the whole admin surface. It is read once at
+startup: edit it and restart the pod. A config reload reports `authz` in
+`restart_required` rather than pretending the edit is live.
+
+One caveat worth knowing before you enable extra MCP servers on a shared
+instance: the daemon-side `fileio`, `terminal` and `command` servers run inside
+the daemon process as its own uid, so a tool call could write `daemon.toml`
+directly. They ship disabled. Constraining daemon-side tool execution is the
+other half of `docs/design/multi-tenancy-boundary.md` (decisions 3 to 5).
 
 Remember the seed rule below: editing `daemon.toml` in the overlay does not
 reconfigure a running instance. Re-seed, or set the value before first boot.

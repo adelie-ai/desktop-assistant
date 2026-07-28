@@ -40,10 +40,10 @@ use crate::authz::Capability;
 pub(crate) fn refusal_frame(
     id: String,
     command: &api::Command,
-    required: Capability,
-    held: Capability,
+    required: &Capability,
+    held: &Capability,
 ) -> api::WsFrame {
-    let name = command_name(command);
+    let name = crate::authz::command_name(command);
     api::WsFrame::declined(
         id,
         api::ErrorDetail {
@@ -99,23 +99,6 @@ pub(crate) fn api_error_frame(id: String, error: ApiError) -> api::WsFrame {
     }
 }
 
-/// The command's serde tag (`"set_api_key"`, `"ping"`, ...).
-///
-/// Read back off the serialized form rather than from a second hand-written
-/// match, so the name in a refusal can never drift from the name on the wire.
-/// Only the tag is kept; the payload is dropped immediately.
-fn command_name(cmd: &api::Command) -> String {
-    match serde_json::to_value(cmd) {
-        Ok(serde_json::Value::String(name)) => name,
-        Ok(serde_json::Value::Object(map)) => map
-            .keys()
-            .next()
-            .cloned()
-            .unwrap_or_else(|| "command".to_string()),
-        _ => "command".to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,8 +120,8 @@ mod tests {
             &api::Command::SetApiKey {
                 api_key: "sk-secret-value".to_string(),
             },
-            Capability::Admin,
-            Capability::Tenant,
+            &Capability::Admin,
+            &Capability::Tenant,
         );
         let detail = detail(&frame);
         assert_eq!(detail.code, api::ErrorCode::NotAuthorized);
@@ -157,8 +140,8 @@ mod tests {
         let frame = refusal_frame(
             "r1".to_string(),
             &api::Command::Ping,
-            Capability::Admin,
-            Capability::Tenant,
+            &Capability::Admin,
+            &Capability::Tenant,
         );
         match &frame {
             api::WsFrame::Error { error, detail, .. } => {
@@ -194,14 +177,5 @@ mod tests {
             }
             other => panic!("expected an error frame, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn unit_variants_name_themselves() {
-        assert_eq!(command_name(&api::Command::Ping), "ping");
-        assert_eq!(
-            command_name(&api::Command::ListConnections),
-            "list_connections"
-        );
     }
 }

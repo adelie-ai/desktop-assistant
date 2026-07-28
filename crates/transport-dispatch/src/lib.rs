@@ -54,7 +54,8 @@ pub mod errors;
 
 pub use api::{WsFrame, WsRequest};
 pub use authz::{
-    AdminSubjects, Capability, REFUSAL_PREFIX, capability_for_local_peer, required_capability,
+    AdminSubjects, Capability, REFUSAL_PREFIX, capability_for_local_peer, command_name,
+    required_capability,
 };
 // Re-exported so transport adapters can name their kind without each taking a
 // direct dependency on `desktop-assistant-core` (#243).
@@ -376,9 +377,9 @@ pub async fn dispatch_loop<R, W>(
         // outcome, not a failure: it is logged at info and rendered as an error
         // frame the client can display, and the loop keeps serving.
         let required = authz::required_capability(&req.command);
-        if !auth.capability.permits(required) {
+        if !auth.capability.permits(&required) {
             let frame =
-                errors::refusal_frame(req.id.clone(), &req.command, required, auth.capability);
+                errors::refusal_frame(req.id.clone(), &req.command, &required, &auth.capability);
             if let WsFrame::Error { error, .. } = &frame {
                 info!(
                     id = %req.id,
@@ -708,7 +709,7 @@ pub async fn dispatch_loop<R, W>(
                 .await;
                 match res {
                     Ok(api::CommandResult::Config(config)) => {
-                        let config = authz::with_caller_capability(config, auth.capability);
+                        let config = authz::with_caller_capability(config, auth.capability.clone());
                         if out_tx
                             .send(WsFrame::Result {
                                 id: req.id.clone(),
@@ -730,7 +731,7 @@ pub async fn dispatch_loop<R, W>(
                         }
                     }
                     Ok(mut result) => {
-                        authz::stamp_caller_capability(&mut result, auth.capability);
+                        authz::stamp_caller_capability(&mut result, auth.capability.clone());
                         if out_tx
                             .send(WsFrame::Result { id: req.id, result })
                             .await
@@ -770,7 +771,7 @@ pub async fn dispatch_loop<R, W>(
                     Ok(mut result) => {
                         // `GetConfig` comes through here, so this is where an
                         // ordinary settings read learns what it may change.
-                        authz::stamp_caller_capability(&mut result, auth.capability);
+                        authz::stamp_caller_capability(&mut result, auth.capability.clone());
                         if out_tx
                             .send(WsFrame::Result {
                                 id: req.id.clone(),
@@ -808,7 +809,10 @@ pub async fn dispatch_loop<R, W>(
                         && out_tx
                             .send(WsFrame::Event {
                                 event: api::Event::ConfigChanged {
-                                    config: authz::with_caller_capability(config, auth.capability),
+                                    config: authz::with_caller_capability(
+                                        config,
+                                        auth.capability.clone(),
+                                    ),
                                 },
                             })
                             .await

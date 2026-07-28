@@ -68,9 +68,18 @@ The daemon grants the administrator capability two ways:
    administers it. A single-user desktop therefore needs no configuration.
 2. **A subject named in `[authz] admin_subjects` in `daemon.toml`.** Empty by
    default. This is the only way a remote (WebSocket) caller becomes an
-   administrator. The section is file-only: no command writes it, so a tenant
-   cannot grant themselves the capability they are being denied. Editing it
-   needs a daemon restart, and a reload reports `authz` in `restart_required`.
+   administrator. **No command writes the section** - it is set by editing the
+   file. Editing it needs a daemon restart, and a reload reports `authz` in
+   `restart_required`.
+
+   The API surface is therefore closed, but that is not the same as the file
+   being unreachable. The daemon-side `fileio`, `terminal` and `command` MCP
+   servers run in the daemon process as the daemon's own uid, so a tool call in
+   an ordinary turn could write `daemon.toml` and wait for a restart. Those
+   three ship disabled, and constraining daemon-side tool execution is the
+   tool-execution half of `docs/design/multi-tenancy-boundary.md` (decisions 3
+   to 5), not part of this tier. Enable them on a shared instance only with
+   that in mind.
 
 ### Which commands need the administrator capability
 
@@ -81,12 +90,31 @@ the ordinary model picker uses. Writes to service configuration do not:
 `SetDatabaseSettings`, `SetBackendTasksSettings`, `SetWsAuthSettings`,
 `CreateConnection`, `UpdateConnection`, `DeleteConnection`,
 `SetConnectionSecret`, `SetPurpose`, `AddMcpServer`, `RemoveMcpServer`,
-`SetMcpServerEnabled`, `McpServerAction`, `UpsertMcpServer`, `SetMcpSecret`,
-`UpsertServiceAccount`, `RemoveServiceAccount`.
+`SetMcpServerEnabled`, `UpsertMcpServer`, `SetMcpSecret`,
+`UpsertServiceAccount`, `RemoveServiceAccount`, `StartKnowledgeMaintenance`,
+and `McpServerAction` for every verb except `"status"`.
 
-`SetConfig` is mixed and is decided by its payload. A change that touches only
-the seven personality traits is tenant work. A change that touches an
-`embeddings_*` or `persistence_*` field needs the administrator capability.
+`SetConfig` is decided by its payload, and every field it carries today writes
+daemon-global state, so any non-empty change set needs the administrator
+capability. That includes the seven personality traits: they are one global
+`[personality]` block in `daemon.toml`, and every conversation without an
+override resolves against it, so one caller writing a trait changes every other
+tenant's assistant. A tenant sets their own disposition with
+`SetConversationPersonality`, which is genuinely per-conversation and stays
+tenant work. When the per-user override layer lands the traits move to the
+tenant side.
+
+`McpServerAction` is split the same way, by its verb. `"status"` is a read
+returning exactly what `ListMcpServers` returns and stays tenant; `"start"`,
+`"stop"`, `"restart"` and any verb added later spawn or kill a child process and
+need the administrator capability.
+
+`StartKnowledgeMaintenance` needs the administrator capability. It looks like
+knowledge work, which is otherwise per-user, but every operation reaches past
+the caller: the embedding recompute nulls and re-derives vectors for **all**
+tenants through the operator's provider, consolidation rewrites every user's
+knowledge base, and extraction's archival phase widens to all users under the
+default-subject sentinel.
 
 Every other command is tenant work, including `ClearAllHistory`, which clears
 only the calling user's conversations.

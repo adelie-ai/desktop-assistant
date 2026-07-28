@@ -180,7 +180,7 @@ impl uds::UdsAuthValidator for PeerCredUdsAuth {
             // uid says whether this is the daemon's own account, and the
             // allowlist can name another local account as an administrator.
             let capability = capability_for_local_peer(peer.uid, self.daemon_uid)
-                .max(self.admin_subjects.capability_for(&peer.username));
+                .strongest(self.admin_subjects.capability_for(&peer.username));
             return uds::UdsAuth::Allow {
                 user: desktop_assistant_application::UserId::from(peer.username.clone()),
                 capability,

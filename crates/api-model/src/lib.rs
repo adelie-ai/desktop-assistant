@@ -70,9 +70,13 @@ impl std::fmt::Debug for Secret {
 /// maps each [`Command`] to the capability it needs lives with the dispatcher's
 /// single gate, not here - this crate only carries the vocabulary.
 ///
-/// Ordered `Tenant < Admin`, so [`Ord::max`] merges two independent grants.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Default)]
-#[serde(rename_all = "snake_case")]
+/// Serializes as a plain snake-case string. [`Self::Other`] carries any level
+/// this build does not recognize, verbatim, so a daemon may add a level without
+/// breaking an older client: the value deserializes into `Other` and
+/// re-serializes unchanged, instead of failing the parse of the **whole**
+/// result frame and leaving a pending `GetConfig` unresolved.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[serde(from = "String", into = "String")]
 pub enum Capability {
     /// The default and the floor. Fail closed: a connection with no resolved
     /// grant lands here.
@@ -80,24 +84,94 @@ pub enum Capability {
     Tenant,
     /// Owns the service configuration.
     Admin,
+    /// A level this build does not recognize. Only ever produced by
+    /// deserializing a payload from a newer daemon - this daemon never grants
+    /// it, and it satisfies nothing (see [`Self::permits`]).
+    Other(String),
 }
 
 impl Capability {
     /// Whether a connection holding `self` may run a command that requires
     /// `required`.
-    pub fn permits(self, required: Capability) -> bool {
+    ///
+    /// Every pair is written out. There is deliberately **no wildcard arm**,
+    /// not even on the permitted side: a `(Admin, _) => true` would silently
+    /// let an administrator run the commands of a level added *above* admin,
+    /// with no build error to catch it. Adding a variant must break this match.
+    pub fn permits(&self, required: &Capability) -> bool {
         match (self, required) {
-            (Capability::Admin, _) => true,
+            (Capability::Admin, Capability::Admin) => true,
+            (Capability::Admin, Capability::Tenant) => true,
             (Capability::Tenant, Capability::Tenant) => true,
             (Capability::Tenant, Capability::Admin) => false,
+            // An unrecognized level grants nothing and is satisfied by nothing.
+            (Capability::Other(_), Capability::Tenant) => false,
+            (Capability::Other(_), Capability::Admin) => false,
+            (Capability::Other(_), Capability::Other(_)) => false,
+            (Capability::Tenant, Capability::Other(_)) => false,
+            (Capability::Admin, Capability::Other(_)) => false,
+        }
+    }
+
+    /// Privilege rank, for merging two independent grants. An unrecognized
+    /// level ranks with the floor, so it can never beat a real grant.
+    fn rank(&self) -> u8 {
+        match self {
+            Capability::Tenant => 0,
+            Capability::Other(_) => 0,
+            Capability::Admin => 1,
+        }
+    }
+
+    /// The stronger of two independent grants - the peer-uid verdict and the
+    /// allowlist verdict, for example.
+    ///
+    /// Deliberately not `Ord`: an ordering that ranks `Other` with `Tenant`
+    /// while `PartialEq` says they differ would break the `Ord` contract, and a
+    /// derived ordering would rank an unrecognized level *above* `Admin`, which
+    /// is the opposite of fail-closed.
+    pub fn strongest(self, other: Capability) -> Capability {
+        if other.rank() > self.rank() {
+            other
+        } else {
+            self
+        }
+    }
+
+    /// The stable wire string.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Capability::Tenant => "tenant",
+            Capability::Admin => "admin",
+            Capability::Other(level) => level,
         }
     }
 
     /// Human-readable name, for a refusal message or a UI label.
-    pub fn label(self) -> &'static str {
+    pub fn label(&self) -> &str {
         match self {
             Capability::Tenant => "tenant",
             Capability::Admin => "administrator",
+            Capability::Other(level) => level,
+        }
+    }
+}
+
+impl From<String> for Capability {
+    fn from(value: String) -> Self {
+        match value.as_str() {
+            "tenant" => Self::Tenant,
+            "admin" => Self::Admin,
+            _ => Self::Other(value),
+        }
+    }
+}
+
+impl From<Capability> for String {
+    fn from(value: Capability) -> Self {
+        match value {
+            Capability::Other(level) => level,
+            known => known.as_str().to_string(),
         }
     }
 }
@@ -2444,11 +2518,71 @@ mod tests {
         assert_eq!(back.caller_capability, Some(Capability::Admin));
     }
 
+    /// The old `Config` shape - from a daemon that predates the authorization
+    /// tier - still parses, and reports "not stated" rather than "tenant".
+    ///
+    /// Proved by parsing a literal of the OLD payload, not by round-tripping
+    /// the new type through itself, which would pass even if the field were
+    /// mandatory.
+    #[test]
+    fn an_older_daemons_config_still_parses_and_reports_no_capability() {
+        let legacy = r#"{
+            "embeddings": {
+                "connector": "ollama",
+                "model": "nomic-embed-text",
+                "base_url": "http://localhost:11434",
+                "has_api_key": false,
+                "available": true,
+                "is_default": false
+            },
+            "persistence": {
+                "enabled": false,
+                "remote_url": "",
+                "remote_name": "origin",
+                "push_on_update": false
+            }
+        }"#;
+        let parsed: Config =
+            serde_json::from_str(legacy).expect("a pre-#728 Config payload must still parse");
+        assert_eq!(
+            parsed.caller_capability, None,
+            "an absent capability must read as 'not reported', never as tenant"
+        );
+        assert!(parsed.restart_required.is_empty());
+    }
+
+    /// A capability level this build does not know does not fail the parse of
+    /// the whole payload - which would leave a pending `GetConfig` unresolved.
+    #[test]
+    fn an_unknown_capability_level_does_not_fail_the_config_parse() {
+        let mut cfg = config_fixture(Vec::new());
+        cfg.caller_capability = Some(Capability::Other("owner".to_string()));
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains(r#""caller_capability":"owner""#), "{json}");
+
+        let back: Config = serde_json::from_str(&json).expect("unknown levels must not fail");
+        assert_eq!(
+            back.caller_capability,
+            Some(Capability::Other("owner".to_string()))
+        );
+        // And it grants nothing.
+        assert!(
+            !back
+                .caller_capability
+                .as_ref()
+                .unwrap()
+                .permits(&Capability::Tenant)
+        );
+    }
+
     #[test]
     fn a_capability_ordering_lets_the_higher_grant_win() {
-        assert!(Capability::Admin.permits(Capability::Tenant));
-        assert!(!Capability::Tenant.permits(Capability::Admin));
-        assert_eq!(Capability::Tenant.max(Capability::Admin), Capability::Admin);
+        assert!(Capability::Admin.permits(&Capability::Tenant));
+        assert!(!Capability::Tenant.permits(&Capability::Admin));
+        assert_eq!(
+            Capability::Tenant.strongest(Capability::Admin),
+            Capability::Admin
+        );
         assert_eq!(Capability::default(), Capability::Tenant);
     }
 

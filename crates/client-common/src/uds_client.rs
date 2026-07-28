@@ -37,7 +37,7 @@ use desktop_assistant_frame_codec::{read_frame, write_frame};
 use tokio::net::UnixStream;
 use tokio::sync::{Mutex, mpsc, oneshot};
 
-use crate::commands::{AssistantCommands, PendingResult};
+use crate::commands::{AssistantCommands, CommandFailure, PendingResult};
 use crate::signal::SignalEvent;
 use crate::timeouts::DISPATCH_TIMEOUT;
 use crate::ws_client::map_event_to_signal;
@@ -64,7 +64,7 @@ impl PendingState {
             self.closed = Some(reason.to_string());
         }
         for (_id, tx) in self.map.drain() {
-            let _ = tx.send(Err(reason.to_string()));
+            let _ = tx.send(Err(CommandFailure::unclassified(reason)));
         }
     }
 
@@ -231,11 +231,14 @@ impl UdsClient {
                             let _ = tx.send(Ok(result));
                         }
                     }
-                    WsFrame::Error { id, error, .. } => {
+                    WsFrame::Error { id, error, detail } => {
                         let mut state = pending_for_reader.lock().await;
                         if let Some(tx) = state.map.remove(&id) {
                             // Per-request error: fail just that call.
-                            let _ = tx.send(Err(error));
+                            let _ = tx.send(Err(CommandFailure {
+                                message: error,
+                                detail,
+                            }));
                         } else {
                             // Unmatched id: the server's pre-dispatch errors
                             // (auth/handshake) carry an empty id and are
@@ -336,7 +339,7 @@ impl AssistantCommands for UdsClient {
         // transport error.
         match tokio::time::timeout(self.dispatch_timeout, rx).await {
             Ok(Ok(Ok(result))) => Ok(result),
-            Ok(Ok(Err(error))) => Err(anyhow!(error)),
+            Ok(Ok(Err(failure))) => Err(anyhow::Error::new(failure)),
             Ok(Err(_closed)) => Err(anyhow!("uds response channel closed")),
             Err(_elapsed) => {
                 self.pending.lock().await.map.remove(&id);

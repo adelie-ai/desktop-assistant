@@ -108,9 +108,7 @@ pub fn capability_for_local_peer(peer_uid: u32, daemon_uid: u32) -> Capability {
 
 /// The capability a command requires.
 ///
-/// The match below has no wildcard arm on purpose (see the module docs): a new
-/// `Command` variant must be classified here explicitly, and the compiler makes
-/// that mandatory rather than optional.
+/// Delegates to [`classify`], the single exhaustive match.
 ///
 /// The split is *write* versus *read*, not command-name prefix:
 ///
@@ -121,120 +119,173 @@ pub fn capability_for_local_peer(peer_uid: u32, daemon_uid: u32) -> Capability {
 ///   to carry are now redacted on the way out (#727) and the same values reach
 ///   every client through `GetConfig`. Tightening the reads needs `Config`
 ///   itself partitioned, which is decision 1's per-user override layer (#973).
-/// - Conversation, knowledge, scratchpad and background-task commands are all
-///   scoped to the calling user by `with_user_id`, so they are tenant work even
-///   when they delete data. `ClearAllHistory` clears the caller's own
-///   conversations, not the instance's.
+/// - Conversation, knowledge, scratchpad and background-task commands are
+///   tenant work **only where the storage path actually carries a `user_id`
+///   predicate**. Verify that against the SQL before classifying a command
+///   `Tenant`; do not infer it from the family it belongs to, or from a comment
+///   saying the family is user-scoped. `StartKnowledgeMaintenance` sat in the
+///   knowledge family and reached every tenant's rows, which is exactly how
+///   this rule was learned.
 pub fn required_capability(cmd: &api::Command) -> Capability {
+    classify(cmd).1
+}
+
+/// The command's stable wire name (`"set_api_key"`, `"ping"`, ...), for a
+/// refusal message.
+///
+/// Comes out of the same match as the capability, so the two cannot disagree
+/// and a new variant must supply both. Reading the name off
+/// `serde_json::to_value(cmd)` would be self-maintaining, but it materialises a
+/// full copy of the command on the heap - including a plaintext `SetApiKey`
+/// key - purely to read a tag. `commands_report_their_wire_name` pins each name
+/// to the serde tag, so the hand-written strings cannot drift.
+pub fn command_name(cmd: &api::Command) -> &'static str {
+    classify(cmd).0
+}
+
+/// The wire name and the required capability for every command.
+///
+/// The match has **no wildcard arm** on purpose (see the module docs): a new
+/// `Command` variant must be classified here explicitly, and the compiler makes
+/// that mandatory rather than optional.
+fn classify(cmd: &api::Command) -> (&'static str, Capability) {
     use Capability::{Admin, Tenant};
     match cmd {
         // Liveness and read-only aggregates.
-        api::Command::Ping => Tenant,
-        api::Command::GetStatus => Tenant,
-        api::Command::GetConfig => Tenant,
+        api::Command::Ping => ("ping", Tenant),
+        api::Command::GetStatus => ("get_status", Tenant),
+        api::Command::GetConfig => ("get_config", Tenant),
 
         // The mixed command; see `config_changes_capability`.
-        api::Command::SetConfig { changes } => config_changes_capability(changes),
+        api::Command::SetConfig { changes } => ("set_config", config_changes_capability(changes)),
 
         // Conversations: the caller's own, scoped by `with_user_id`.
-        api::Command::CreateConversation { .. } => Tenant,
-        api::Command::ListConversations { .. } => Tenant,
-        api::Command::GetConversation { .. } => Tenant,
-        api::Command::GetMessages { .. } => Tenant,
-        api::Command::DeleteConversation { .. } => Tenant,
-        api::Command::RenameConversation { .. } => Tenant,
-        api::Command::ArchiveConversation { .. } => Tenant,
-        api::Command::UnarchiveConversation { .. } => Tenant,
-        api::Command::ClearAllHistory => Tenant,
-        api::Command::SendMessage { .. } => Tenant,
-        api::Command::SetConversationPersonality { .. } => Tenant,
+        api::Command::CreateConversation { .. } => ("create_conversation", Tenant),
+        api::Command::ListConversations { .. } => ("list_conversations", Tenant),
+        api::Command::GetConversation { .. } => ("get_conversation", Tenant),
+        api::Command::GetMessages { .. } => ("get_messages", Tenant),
+        api::Command::DeleteConversation { .. } => ("delete_conversation", Tenant),
+        api::Command::RenameConversation { .. } => ("rename_conversation", Tenant),
+        api::Command::ArchiveConversation { .. } => ("archive_conversation", Tenant),
+        api::Command::UnarchiveConversation { .. } => ("unarchive_conversation", Tenant),
+        api::Command::ClearAllHistory => ("clear_all_history", Tenant),
+        api::Command::SendMessage { .. } => ("send_message", Tenant),
+        api::Command::SetConversationPersonality { .. } => ("set_conversation_personality", Tenant),
 
         // Provider credentials and the embedding backend: operator config.
-        api::Command::SetApiKey { .. } => Admin,
-        api::Command::GetEmbeddingsSettings => Tenant,
-        api::Command::SetEmbeddingsSettings { .. } => Admin,
-        api::Command::GetConnectorDefaults { .. } => Tenant,
+        api::Command::SetApiKey { .. } => ("set_api_key", Admin),
+        api::Command::GetEmbeddingsSettings => ("get_embeddings_settings", Tenant),
+        api::Command::SetEmbeddingsSettings { .. } => ("set_embeddings_settings", Admin),
+        api::Command::GetConnectorDefaults { .. } => ("get_connector_defaults", Tenant),
 
         // Git persistence, the database, background work, and the auth posture.
-        api::Command::GetPersistenceSettings => Tenant,
-        api::Command::SetPersistenceSettings { .. } => Admin,
-        api::Command::GetDatabaseSettings => Tenant,
-        api::Command::SetDatabaseSettings { .. } => Admin,
-        api::Command::GetBackendTasksSettings => Tenant,
-        api::Command::SetBackendTasksSettings { .. } => Admin,
-        api::Command::GetWsAuthSettings => Tenant,
-        api::Command::SetWsAuthSettings { .. } => Admin,
+        api::Command::GetPersistenceSettings => ("get_persistence_settings", Tenant),
+        api::Command::SetPersistenceSettings { .. } => ("set_persistence_settings", Admin),
+        api::Command::GetDatabaseSettings => ("get_database_settings", Tenant),
+        api::Command::SetDatabaseSettings { .. } => ("set_database_settings", Admin),
+        api::Command::GetBackendTasksSettings => ("get_backend_tasks_settings", Tenant),
+        api::Command::SetBackendTasksSettings { .. } => ("set_backend_tasks_settings", Admin),
+        api::Command::GetWsAuthSettings => ("get_ws_auth_settings", Tenant),
+        api::Command::SetWsAuthSettings { .. } => ("set_ws_auth_settings", Admin),
 
         // Connections and purposes: read for the model picker, write for the
         // operator (design decisions 8 and 9).
-        api::Command::ListConnections => Tenant,
-        api::Command::CreateConnection { .. } => Admin,
-        api::Command::UpdateConnection { .. } => Admin,
-        api::Command::DeleteConnection { .. } => Admin,
-        api::Command::SetConnectionSecret { .. } => Admin,
-        api::Command::ListAvailableModels { .. } => Tenant,
-        api::Command::GetPurposes => Tenant,
-        api::Command::SetPurpose { .. } => Admin,
+        api::Command::ListConnections => ("list_connections", Tenant),
+        api::Command::CreateConnection { .. } => ("create_connection", Admin),
+        api::Command::UpdateConnection { .. } => ("update_connection", Admin),
+        api::Command::DeleteConnection { .. } => ("delete_connection", Admin),
+        api::Command::SetConnectionSecret { .. } => ("set_connection_secret", Admin),
+        api::Command::ListAvailableModels { .. } => ("list_available_models", Tenant),
+        api::Command::GetPurposes => ("get_purposes", Tenant),
+        api::Command::SetPurpose { .. } => ("set_purpose", Admin),
 
         // Knowledge base and cost reporting: the caller's own rows.
-        api::Command::GetToolUsage { .. } => Tenant,
-        api::Command::ListKnowledgeEntries { .. } => Tenant,
-        api::Command::GetKnowledgeEntry { .. } => Tenant,
-        api::Command::SearchKnowledgeEntries { .. } => Tenant,
-        api::Command::CreateKnowledgeEntry { .. } => Tenant,
-        api::Command::UpdateKnowledgeEntry { .. } => Tenant,
-        api::Command::DeleteKnowledgeEntry { .. } => Tenant,
-        api::Command::GetKnowledgeTrashCount => Tenant,
-        api::Command::EmptyKnowledgeTrash => Tenant,
-        api::Command::StartKnowledgeMaintenance { .. } => Tenant,
+        api::Command::GetToolUsage { .. } => ("get_tool_usage", Tenant),
+        api::Command::ListKnowledgeEntries { .. } => ("list_knowledge_entries", Tenant),
+        api::Command::GetKnowledgeEntry { .. } => ("get_knowledge_entry", Tenant),
+        api::Command::SearchKnowledgeEntries { .. } => ("search_knowledge_entries", Tenant),
+        api::Command::CreateKnowledgeEntry { .. } => ("create_knowledge_entry", Tenant),
+        api::Command::UpdateKnowledgeEntry { .. } => ("update_knowledge_entry", Tenant),
+        api::Command::DeleteKnowledgeEntry { .. } => ("delete_knowledge_entry", Tenant),
+        api::Command::GetKnowledgeTrashCount => ("get_knowledge_trash_count", Tenant),
+        api::Command::EmptyKnowledgeTrash => ("empty_knowledge_trash", Tenant),
+        // NOT tenant work, despite sitting in the knowledge family. Every arm
+        // reaches past the caller's own rows:
+        // `RecalculateEmbeddings` runs an UPDATE over `knowledge_base` with no
+        // `user_id` predicate (`crates/storage/src/embedding_backfill.rs`,
+        // `invalidate_all_knowledge_embeddings`), nulling every tenant's
+        // vectors and re-embedding the instance through the operator's
+        // provider; `Consolidation` loops over every user with active entries;
+        // and `Extraction`'s archival phase widens to all users when the
+        // caller's scope is the `"default"` sentinel. It backs an
+        // operator-facing maintenance button, and no ordinary client calls it.
+        api::Command::StartKnowledgeMaintenance { .. } => ("start_knowledge_maintenance", Admin),
 
         // MCP: every write makes the daemon spawn or reconfigure a child
         // process, with arguments and an environment the caller supplies.
-        api::Command::ListMcpServers => Tenant,
-        api::Command::AddMcpServer { .. } => Admin,
-        api::Command::RemoveMcpServer { .. } => Admin,
-        api::Command::SetMcpServerEnabled { .. } => Admin,
-        api::Command::McpServerAction { .. } => Admin,
-        api::Command::UpsertMcpServer { .. } => Admin,
-        api::Command::SetMcpSecret { .. } => Admin,
+        api::Command::ListMcpServers => ("list_mcp_servers", Tenant),
+        api::Command::AddMcpServer { .. } => ("add_mcp_server", Admin),
+        api::Command::RemoveMcpServer { .. } => ("remove_mcp_server", Admin),
+        api::Command::SetMcpServerEnabled { .. } => ("set_mcp_server_enabled", Admin),
+        api::Command::McpServerAction { action, .. } => {
+            ("mcp_server_action", mcp_action_capability(action))
+        }
+        api::Command::UpsertMcpServer { .. } => ("upsert_mcp_server", Admin),
+        api::Command::SetMcpSecret { .. } => ("set_mcp_secret", Admin),
 
         // Outbound OAuth service accounts are instance-wide, like connections.
-        api::Command::ListServiceAccounts => Tenant,
-        api::Command::UpsertServiceAccount { .. } => Admin,
-        api::Command::RemoveServiceAccount { .. } => Admin,
+        api::Command::ListServiceAccounts => ("list_service_accounts", Tenant),
+        api::Command::UpsertServiceAccount { .. } => ("upsert_service_account", Admin),
+        api::Command::RemoveServiceAccount { .. } => ("remove_service_account", Admin),
 
         // Background tasks and subscriptions: per-user, per-connection.
-        api::Command::ListBackgroundTasks { .. } => Tenant,
-        api::Command::GetBackgroundTask { .. } => Tenant,
-        api::Command::CancelBackgroundTask { .. } => Tenant,
-        api::Command::GetBackgroundTaskLogs { .. } => Tenant,
-        api::Command::SubscribeBackgroundTasks => Tenant,
-        api::Command::UnsubscribeBackgroundTasks => Tenant,
-        api::Command::SubscribeConversations { .. } => Tenant,
-        api::Command::SpawnStandaloneAgent { .. } => Tenant,
+        api::Command::ListBackgroundTasks { .. } => ("list_background_tasks", Tenant),
+        api::Command::GetBackgroundTask { .. } => ("get_background_task", Tenant),
+        api::Command::CancelBackgroundTask { .. } => ("cancel_background_task", Tenant),
+        api::Command::GetBackgroundTaskLogs { .. } => ("get_background_task_logs", Tenant),
+        api::Command::SubscribeBackgroundTasks => ("subscribe_background_tasks", Tenant),
+        api::Command::UnsubscribeBackgroundTasks => ("unsubscribe_background_tasks", Tenant),
+        api::Command::SubscribeConversations { .. } => ("subscribe_conversations", Tenant),
+        api::Command::SpawnStandaloneAgent { .. } => ("spawn_standalone_agent", Tenant),
 
         // Conversation scratchpad: the caller's own notes.
-        api::Command::GetConversationScratchpad { .. } => Tenant,
-        api::Command::SetScratchpadNote { .. } => Tenant,
-        api::Command::DeleteScratchpadNotes { .. } => Tenant,
+        api::Command::GetConversationScratchpad { .. } => ("get_conversation_scratchpad", Tenant),
+        api::Command::SetScratchpadNote { .. } => ("set_scratchpad_note", Tenant),
+        api::Command::DeleteScratchpadNotes { .. } => ("delete_scratchpad_notes", Tenant),
 
         // Client-side tool execution runs on the caller's own machine.
-        api::Command::RegisterClientTools { .. } => Tenant,
-        api::Command::ClientToolResult { .. } => Tenant,
+        api::Command::RegisterClientTools { .. } => ("register_client_tools", Tenant),
+        api::Command::ClientToolResult { .. } => ("client_tool_result", Tenant),
     }
 }
 
 /// The capability a `SetConfig` requires, decided by *what it changes*.
 ///
-/// `SetConfig` is the one mixed command: it carries daemon-global knobs
-/// (embeddings backend, git persistence) alongside the seven personality traits
-/// that every ordinary client writes. Splitting on the command name alone would
-/// either lock a tenant out of their own personality settings or leave the
-/// global knobs open, so the payload decides.
+/// Every field this command carries today writes **daemon-global** state, so
+/// any non-empty change set needs the administrator capability.
+///
+/// The personality traits look like a personal preference and are not one, yet.
+/// `SetConfig` routes them to `SettingsService::set_personality_settings`, which
+/// reaches `RegistryHandle::set_personality` -> `mutate_config`: that serializes
+/// the whole config over the operator's `daemon.toml` and rebuilds the
+/// connection registry. `resolve_personality` then returns that one global value
+/// for every conversation with no per-conversation override, so one tenant
+/// writing a trait changes every other tenant's assistant, destroys the
+/// operator's hand-edits and comments in `daemon.toml`, and can force a registry
+/// rebuild at will.
+///
+/// A tenant is not left without a lever: `SetConversationPersonality` is
+/// genuinely per-user (stored on the conversation, resolved against the global
+/// on each send) and stays [`Capability::Tenant`]. The global value is the
+/// instance default, which is operator configuration under design decision 6.
+/// A per-user personality layer is decision 1's override layer, tracked as #973;
+/// when it lands, the traits move to the tenant side here.
+///
+/// An empty change set writes nothing, so it costs nothing.
 ///
 /// The destructuring below names every field and uses no `..` rest pattern, so a
-/// new `ConfigChanges` field fails to compile here rather than defaulting to
-/// tenant-writable.
+/// new `ConfigChanges` field fails to compile here rather than silently
+/// inheriting a classification that was never considered for it.
 fn config_changes_capability(changes: &api::ConfigChanges) -> Capability {
     let api::ConfigChanges {
         embeddings_connector,
@@ -244,14 +295,13 @@ fn config_changes_capability(changes: &api::ConfigChanges) -> Capability {
         persistence_remote_url,
         persistence_remote_name,
         persistence_push_on_update,
-        // Personality is per-person preference, not service configuration.
-        personality_professionalism: _,
-        personality_warmth: _,
-        personality_directness: _,
-        personality_enthusiasm: _,
-        personality_humor: _,
-        personality_sarcasm: _,
-        personality_pretentiousness: _,
+        personality_professionalism,
+        personality_warmth,
+        personality_directness,
+        personality_enthusiasm,
+        personality_humor,
+        personality_sarcasm,
+        personality_pretentiousness,
     } = changes;
 
     let touches_service_config = embeddings_connector.is_some()
@@ -260,12 +310,38 @@ fn config_changes_capability(changes: &api::ConfigChanges) -> Capability {
         || persistence_enabled.is_some()
         || persistence_remote_url.is_some()
         || persistence_remote_name.is_some()
-        || persistence_push_on_update.is_some();
+        || persistence_push_on_update.is_some()
+        || personality_professionalism.is_some()
+        || personality_warmth.is_some()
+        || personality_directness.is_some()
+        || personality_enthusiasm.is_some()
+        || personality_humor.is_some()
+        || personality_sarcasm.is_some()
+        || personality_pretentiousness.is_some();
 
     if touches_service_config {
         Capability::Admin
     } else {
         Capability::Tenant
+    }
+}
+
+/// The capability an `McpServerAction` requires, decided by *what it does*.
+///
+/// The same write-versus-read split `SetConfig` gets. `"status"` is a pure read
+/// returning exactly what `ListMcpServers` returns, so gating it would be
+/// inconsistent with leaving that command open to a tenant. `"start"`,
+/// `"stop"` and `"restart"` spawn or kill a child process, which is
+/// administration.
+///
+/// An unrecognized action is Admin, not Tenant. The daemon rejects it anyway,
+/// but the gate must not be the place that decides an unknown verb is
+/// harmless - a verb added later is administration until someone says
+/// otherwise.
+fn mcp_action_capability(action: &str) -> Capability {
+    match action {
+        "status" => Capability::Tenant,
+        _ => Capability::Admin,
     }
 }
 
@@ -302,13 +378,19 @@ mod tests {
     #[test]
     fn merging_two_grants_takes_the_higher_one() {
         assert_eq!(
-            Capability::Tenant.max(Capability::Admin),
+            Capability::Tenant.strongest(Capability::Admin),
             Capability::Admin,
             "an allowlist grant must survive a tenant peer-uid verdict"
         );
         assert_eq!(
-            Capability::Tenant.max(Capability::Tenant),
+            Capability::Tenant.strongest(Capability::Tenant),
             Capability::Tenant
+        );
+        // Fail closed: a level this build does not know never beats a real one.
+        assert_eq!(
+            Capability::Admin.strongest(Capability::Other("owner".to_string())),
+            Capability::Admin,
+            "an unrecognized level must not outrank a real grant"
         );
     }
 

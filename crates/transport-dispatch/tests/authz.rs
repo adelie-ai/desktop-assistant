@@ -19,7 +19,7 @@ use desktop_assistant_api_model as api;
 use desktop_assistant_application::{ApiResult, AssistantApiHandler, EventSink};
 use desktop_assistant_transport_dispatch::{
     AdminSubjects, AuthContext, Capability, REFUSAL_PREFIX, TransportKind,
-    capability_for_local_peer, dispatch_loop, required_capability,
+    capability_for_local_peer, command_name, dispatch_loop, required_capability,
 };
 use futures::StreamExt;
 use futures::channel::mpsc;
@@ -189,13 +189,24 @@ fn expected_handler_calls(commands: &[api::Command]) -> usize {
 /// Assert `command` is NOT refused for a tenant.
 async fn assert_allowed_for_tenant(command: api::Command) {
     let key = command_key(&command);
-    let (frames, _seen) = dispatch_as(Capability::Tenant, vec![command]).await;
+    let (frames, seen) = dispatch_as(Capability::Tenant, vec![command]).await;
     for frame in &frames {
         assert!(
             refusal(frame).is_none(),
             "{key}: must stay readable by a tenant, got {frame:?}"
         );
     }
+    // "No refusal" alone is satisfied by nothing happening at all, which would
+    // pass even if the dispatcher silently dropped the command. Prove it was
+    // actually served.
+    assert!(
+        seen.contains(&key),
+        "{key}: must reach the handler, not merely avoid a refusal; saw {seen:?}"
+    );
+    assert!(
+        !frames.is_empty(),
+        "{key}: must produce a reply the client can correlate"
+    );
 }
 
 // --- the capability table ---------------------------------------------------
@@ -235,6 +246,95 @@ fn operator_changes() -> api::ConfigChanges {
     }
 }
 
+/// The number of distinct `Command` variants [`command_samples`] must cover.
+///
+/// Kept honest by `every_command_variant_has_a_sample` together with the
+/// compile-time probe below: adding a variant breaks the probe, and the count
+/// assertion then names the number to raise this to.
+const COMMAND_VARIANT_COUNT: usize = 68;
+
+/// Compile-time guard for [`command_samples`]. Never called, and deliberately
+/// has **no wildcard arm**.
+///
+/// Adding a `Command` variant is otherwise invisible to this file: the
+/// production `required_capability` match forces the author to classify it, but
+/// nothing forced them to add a sample here - so four behaviour tests would
+/// quietly stop covering it. This match makes the omission a build error that
+/// points at this file.
+#[allow(dead_code)]
+fn every_variant_needs_a_sample(cmd: &api::Command) {
+    match cmd {
+        api::Command::Ping
+        | api::Command::GetStatus
+        | api::Command::GetConfig
+        | api::Command::SetConfig { .. }
+        | api::Command::CreateConversation { .. }
+        | api::Command::ListConversations { .. }
+        | api::Command::GetConversation { .. }
+        | api::Command::GetMessages { .. }
+        | api::Command::DeleteConversation { .. }
+        | api::Command::RenameConversation { .. }
+        | api::Command::ArchiveConversation { .. }
+        | api::Command::UnarchiveConversation { .. }
+        | api::Command::ClearAllHistory
+        | api::Command::SendMessage { .. }
+        | api::Command::SetConversationPersonality { .. }
+        | api::Command::SetApiKey { .. }
+        | api::Command::GetEmbeddingsSettings
+        | api::Command::SetEmbeddingsSettings { .. }
+        | api::Command::GetConnectorDefaults { .. }
+        | api::Command::GetPersistenceSettings
+        | api::Command::SetPersistenceSettings { .. }
+        | api::Command::GetDatabaseSettings
+        | api::Command::SetDatabaseSettings { .. }
+        | api::Command::GetBackendTasksSettings
+        | api::Command::SetBackendTasksSettings { .. }
+        | api::Command::GetWsAuthSettings
+        | api::Command::SetWsAuthSettings { .. }
+        | api::Command::ListConnections
+        | api::Command::CreateConnection { .. }
+        | api::Command::UpdateConnection { .. }
+        | api::Command::DeleteConnection { .. }
+        | api::Command::SetConnectionSecret { .. }
+        | api::Command::ListAvailableModels { .. }
+        | api::Command::GetPurposes
+        | api::Command::SetPurpose { .. }
+        | api::Command::GetToolUsage { .. }
+        | api::Command::ListKnowledgeEntries { .. }
+        | api::Command::GetKnowledgeEntry { .. }
+        | api::Command::SearchKnowledgeEntries { .. }
+        | api::Command::CreateKnowledgeEntry { .. }
+        | api::Command::UpdateKnowledgeEntry { .. }
+        | api::Command::DeleteKnowledgeEntry { .. }
+        | api::Command::GetKnowledgeTrashCount
+        | api::Command::EmptyKnowledgeTrash
+        | api::Command::StartKnowledgeMaintenance { .. }
+        | api::Command::ListMcpServers
+        | api::Command::AddMcpServer { .. }
+        | api::Command::RemoveMcpServer { .. }
+        | api::Command::SetMcpServerEnabled { .. }
+        | api::Command::McpServerAction { .. }
+        | api::Command::UpsertMcpServer { .. }
+        | api::Command::SetMcpSecret { .. }
+        | api::Command::ListServiceAccounts
+        | api::Command::UpsertServiceAccount { .. }
+        | api::Command::RemoveServiceAccount { .. }
+        | api::Command::ListBackgroundTasks { .. }
+        | api::Command::GetBackgroundTask { .. }
+        | api::Command::CancelBackgroundTask { .. }
+        | api::Command::GetBackgroundTaskLogs { .. }
+        | api::Command::SubscribeBackgroundTasks
+        | api::Command::UnsubscribeBackgroundTasks
+        | api::Command::SubscribeConversations { .. }
+        | api::Command::SpawnStandaloneAgent { .. }
+        | api::Command::GetConversationScratchpad { .. }
+        | api::Command::SetScratchpadNote { .. }
+        | api::Command::DeleteScratchpadNotes { .. }
+        | api::Command::RegisterClientTools { .. }
+        | api::Command::ClientToolResult { .. } => {}
+    }
+}
+
 /// One sample of every `Command` variant with the capability it requires.
 ///
 /// `SetConfig` appears twice on purpose: it is the mixed command, carrying both
@@ -249,7 +349,7 @@ fn command_samples() -> Vec<(api::Command, Capability)> {
             api::Command::SetConfig {
                 changes: personality_changes(),
             },
-            Tenant,
+            Admin,
         ),
         (
             api::Command::SetConfig {
@@ -490,11 +590,13 @@ fn command_samples() -> Vec<(api::Command, Capability)> {
         ),
         (api::Command::GetKnowledgeTrashCount, Tenant),
         (api::Command::EmptyKnowledgeTrash, Tenant),
+        // Admin, not tenant: every arm reaches past the caller's own rows. See
+        // `knowledge_maintenance_is_admin_because_it_touches_every_tenant`.
         (
             api::Command::StartKnowledgeMaintenance {
                 op: api::MaintenanceOp::Extraction,
             },
-            Tenant,
+            Admin,
         ),
         (api::Command::ListMcpServers, Tenant),
         (
@@ -520,6 +622,8 @@ fn command_samples() -> Vec<(api::Command, Capability)> {
             },
             Admin,
         ),
+        // The sample is the process-spawning action; `"status"` is a read and
+        // is covered by `mcp_status_is_a_read_and_stays_tenant`.
         (
             api::Command::McpServerAction {
                 action: "restart".to_string(),
@@ -766,6 +870,68 @@ async fn create_connection_refused_for_non_admin() {
     .await;
 }
 
+/// `StartKnowledgeMaintenance` sits in the knowledge family, whose other
+/// commands are user-scoped, but it is not tenant work.
+///
+/// `RecalculateEmbeddings` reaches `invalidate_all_knowledge_embeddings`, which
+/// runs `UPDATE knowledge_base SET embedding = NULL ... WHERE deleted_at IS
+/// NULL` with no `user_id` predicate: one tenant nulls every tenant's vectors
+/// and re-embeds the whole instance through the operator's provider. The other
+/// arms are instance-wide too - consolidation loops over every user, and
+/// extraction's archival phase widens to all users under the `"default"`
+/// sentinel. The registry also files the task under the *caller's* user id, and
+/// cancellation is owner-scoped, so an operator cannot stop it.
+#[tokio::test]
+async fn knowledge_maintenance_is_admin_because_it_touches_every_tenant() {
+    for op in [
+        api::MaintenanceOp::Extraction,
+        api::MaintenanceOp::Consolidation,
+        api::MaintenanceOp::RecalculateEmbeddings,
+    ] {
+        assert_eq!(
+            required_capability(&api::Command::StartKnowledgeMaintenance { op }),
+            Capability::Admin,
+            "{op:?} is instance-wide work"
+        );
+        assert_refused_for_tenant(api::Command::StartKnowledgeMaintenance { op }).await;
+    }
+}
+
+/// `McpServerAction` is split by its verb, the same way `SetConfig` is split by
+/// its payload. `"status"` returns exactly what `ListMcpServers` returns, which
+/// is tenant-readable, so gating it would contradict that.
+#[tokio::test]
+async fn mcp_status_is_a_read_and_stays_tenant() {
+    assert_eq!(
+        required_capability(&api::Command::McpServerAction {
+            action: "status".to_string(),
+            server: None,
+        }),
+        Capability::Tenant
+    );
+    assert_allowed_for_tenant(api::Command::McpServerAction {
+        action: "status".to_string(),
+        server: Some("fileio".to_string()),
+    })
+    .await;
+}
+
+/// Every other verb spawns or kills a child process. An unrecognized verb fails
+/// closed to admin rather than being assumed harmless.
+#[tokio::test]
+async fn mcp_lifecycle_actions_require_admin() {
+    for action in ["start", "stop", "restart", "a-verb-added-later"] {
+        assert_eq!(
+            required_capability(&api::Command::McpServerAction {
+                action: action.to_string(),
+                server: None,
+            }),
+            Capability::Admin,
+            "{action} must require admin"
+        );
+    }
+}
+
 #[tokio::test]
 async fn set_purpose_refused_for_non_admin() {
     assert_refused_for_tenant(api::Command::SetPurpose {
@@ -809,10 +975,53 @@ async fn get_purposes_allowed_for_tenant() {
     assert_allowed_for_tenant(api::Command::GetPurposes).await;
 }
 
-/// Trap 1: `SetConfig` is mixed. The seven personality traits stay writable by
-/// a tenant while the daemon-global knobs in the same command need admin.
+/// Trap 1 as the issue framed it, corrected by what the code actually does.
+///
+/// The acceptance criterion asked that the seven personality traits stay
+/// writable by a tenant, on the premise that they are a personal preference.
+/// They are not, yet: `SetConfig` writes ONE global `[personality]` into the
+/// operator's `daemon.toml` and every conversation without an override resolves
+/// against it, so a tenant writing a trait would change every other tenant's
+/// assistant. The tenant lever is the per-conversation override, which is
+/// genuinely user-scoped - so this test asserts the criterion's intent (a
+/// tenant can still set their assistant's personality) against the command that
+/// honours it.
 #[tokio::test]
 async fn personality_traits_writable_by_tenant() {
+    // The per-conversation override is the tenant's own, and stays open.
+    assert_eq!(
+        required_capability(&api::Command::SetConversationPersonality {
+            conversation_id: "c".to_string(),
+            personality: api::ConversationPersonalityView {
+                warmth: Some(api::PersonalityLevel::Often),
+                ..api::ConversationPersonalityView::default()
+            },
+        }),
+        Capability::Tenant
+    );
+    assert_allowed_for_tenant(api::Command::SetConversationPersonality {
+        conversation_id: "c".to_string(),
+        personality: api::ConversationPersonalityView {
+            sarcasm: Some(api::PersonalityLevel::Rarely),
+            ..api::ConversationPersonalityView::default()
+        },
+    })
+    .await;
+
+    // An empty change set writes nothing, so it costs nothing.
+    assert_eq!(
+        required_capability(&api::Command::SetConfig {
+            changes: api::ConfigChanges::default()
+        }),
+        Capability::Tenant
+    );
+}
+
+/// The global `[personality]` block is the instance default, and writing it is
+/// administration - it rewrites `daemon.toml`, rebuilds the connection
+/// registry, and changes the disposition every other tenant gets.
+#[tokio::test]
+async fn global_personality_is_instance_configuration_and_needs_admin() {
     let traits = [
         api::ConfigChanges {
             personality_professionalism: Some(api::PersonalityLevel::Always),
@@ -848,19 +1057,11 @@ async fn personality_traits_writable_by_tenant() {
             required_capability(&api::Command::SetConfig {
                 changes: changes.clone()
             }),
-            Capability::Tenant,
-            "a personality-only SetConfig must stay tenant-writable: {changes:?}"
+            Capability::Admin,
+            "a global personality write is instance configuration: {changes:?}"
         );
-        assert_allowed_for_tenant(api::Command::SetConfig { changes }).await;
+        assert_refused_for_tenant(api::Command::SetConfig { changes }).await;
     }
-
-    // An empty change set writes nothing, so it needs nothing.
-    assert_eq!(
-        required_capability(&api::Command::SetConfig {
-            changes: api::ConfigChanges::default()
-        }),
-        Capability::Tenant
-    );
 }
 
 /// The other half of trap 1: a `SetConfig` that touches a daemon-global knob is
@@ -929,8 +1130,8 @@ async fn single_user_desktop_needs_no_authz_config() {
     // What a desktop daemon resolves with no configuration at all.
     let allowlist = AdminSubjects::default();
     let daemon_uid = 1000;
-    let capability =
-        capability_for_local_peer(daemon_uid, daemon_uid).max(allowlist.capability_for("dave"));
+    let capability = capability_for_local_peer(daemon_uid, daemon_uid)
+        .strongest(allowlist.capability_for("dave"));
     assert_eq!(capability, Capability::Admin);
 
     let commands: Vec<api::Command> = command_samples().into_iter().map(|(c, _)| c).collect();
@@ -1030,7 +1231,7 @@ async fn reported_capability(held: Capability) -> Option<api::Capability> {
         Some(api::WsFrame::Result {
             result: api::CommandResult::Config(config),
             ..
-        }) => config.caller_capability,
+        }) => config.caller_capability.clone(),
         other => panic!("expected a config result, got {other:?}"),
     }
 }
@@ -1143,11 +1344,59 @@ async fn an_older_client_still_parses_a_refusal_frame() {
     }
 }
 
+/// The sample table covers every `Command` variant exactly once, so the
+/// behaviour tests driven from it cannot silently narrow.
+#[test]
+fn every_command_variant_has_a_sample() {
+    let samples = command_samples();
+    let mut names: Vec<String> = samples.iter().map(|(c, _)| command_key(c)).collect();
+    names.sort();
+    names.dedup();
+    assert_eq!(
+        names.len(),
+        COMMAND_VARIANT_COUNT,
+        "command_samples() covers {} of {COMMAND_VARIANT_COUNT} variants. \
+         Add the missing sample, or raise COMMAND_VARIANT_COUNT if a variant \
+         was added. Covered: {names:?}",
+        names.len()
+    );
+}
+
+/// The hand-written wire names in `classify` match the serde tag the command
+/// actually serializes as, for every variant. This is what lets the refusal
+/// path read a name without materialising a copy of the command.
+#[test]
+fn commands_report_their_wire_name() {
+    for (command, _) in command_samples() {
+        assert_eq!(
+            command_name(&command),
+            command_key(&command),
+            "the refusal name must match the wire tag"
+        );
+    }
+}
+
 /// Admin satisfies tenant; tenant does not satisfy admin.
 #[test]
 fn admin_permits_everything_a_tenant_may_do() {
-    assert!(Capability::Admin.permits(Capability::Tenant));
-    assert!(Capability::Admin.permits(Capability::Admin));
-    assert!(Capability::Tenant.permits(Capability::Tenant));
-    assert!(!Capability::Tenant.permits(Capability::Admin));
+    assert!(Capability::Admin.permits(&Capability::Tenant));
+    assert!(Capability::Admin.permits(&Capability::Admin));
+    assert!(Capability::Tenant.permits(&Capability::Tenant));
+    assert!(!Capability::Tenant.permits(&Capability::Admin));
+}
+
+/// A level from a newer daemon grants nothing and satisfies nothing, in both
+/// directions. Fail closed on the unknown.
+#[test]
+fn an_unrecognized_capability_grants_nothing() {
+    let unknown = Capability::Other("owner".to_string());
+    assert!(!unknown.permits(&Capability::Tenant));
+    assert!(!unknown.permits(&Capability::Admin));
+    assert!(!Capability::Admin.permits(&unknown));
+    assert!(!Capability::Tenant.permits(&unknown));
+    assert_eq!(
+        Capability::Tenant.strongest(unknown.clone()),
+        Capability::Tenant,
+        "an unrecognized level must never outrank a real grant"
+    );
 }
