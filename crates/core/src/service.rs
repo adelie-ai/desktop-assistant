@@ -29,6 +29,7 @@ use crate::ports::store::ConversationStore;
 use crate::ports::tool_observer::{ToolEvent, notify_tool_event};
 use crate::ports::tools::ToolExecutor;
 use crate::ports::transport::{current_client_label, current_co_location, current_transport_kind};
+use crate::ports::turn_interactivity::{TurnInteractivity, current_turn_interactivity};
 use crate::sanitize::sanitize_assistant_text;
 use crate::tools::{
     NoopToolExecutor, categorize_tool_namespaces, summarize_tool_name, summarize_tool_text,
@@ -139,6 +140,114 @@ fn cancellation_token_or_default() -> CancellationToken {
 
 /// Maximum number of tool-calling rounds before giving up.
 const MAX_TOOL_ROUNDS: usize = 200;
+
+/// The longest an interactive turn may run with no narration before the
+/// dispatch loop synthesises a line (#943).
+///
+/// Why 40 seconds: this is a human number, not a machine one. A person watching
+/// an unchanged progress line is still patient at half a minute and starts to
+/// suspect the work has died some way past it. It is deliberately neither the
+/// client's 90s stall watchdog (`EVENT_STALL_TIMEOUT`) nor the 30s
+/// [`SERVER_TOOL_KEEPALIVE_INTERVAL`], because both were sized against a
+/// watchdog rather than against patience.
+const NARRATION_FLOOR_INTERVAL: std::time::Duration = std::time::Duration::from_secs(40);
+
+/// The narration floor: a backstop beneath `begin_step` narration that holds
+/// whatever the model does (#943).
+///
+/// Narration is the model's choice (#266 narrates a declared step and nothing
+/// else), so a model that opens no step leaves a turn with no account of itself
+/// at all. This tracks how long the turn has gone with no narration and
+/// synthesises one line when it passes [`NARRATION_FLOOR_INTERVAL`].
+///
+/// # What resets the clock, and what does not
+///
+/// Only narration resets it: a `begin_step` goal, or a line the floor itself
+/// synthesised. The per-tool completion statuses (#941) and the two keepalives
+/// (#584, #611) do not, because they report machine activity rather than what
+/// the work is for - a turn can emit a completion line every second and still
+/// have said nothing about its purpose.
+///
+/// # Why the two never double-narrate
+///
+/// The floor is checked once per round, at the top, before the round's LLM
+/// call. A completion status is emitted inside a round, as each tool resolves,
+/// and a keepalive only fires inside the `select!` of a pending LLM or tool
+/// call. So the floor speaks exactly where the other two cannot, and the line
+/// it leaves on screen survives the whole of the round that follows.
+///
+/// # Mode
+///
+/// [`TurnInteractivity::Headless`] disables the floor outright. Nobody is
+/// waiting on that turn, so a synthesised "still working" line costs tokens and
+/// log volume for a reader who will only ever see the finished record. Step
+/// narration still flows in both modes; reassurance does not.
+struct NarrationFloor {
+    /// Whether a person is watching this turn (#942), read once at turn start.
+    interactivity: TurnInteractivity,
+    /// When the turn last narrated. Uses [`tokio::time::Instant`] so a paused
+    /// test clock advances it.
+    last_narration: tokio::time::Instant,
+    /// Tool calls this turn has made, counted where the dispatch loop leaves
+    /// its own step-control tools behind - so `begin_step` and `complete_step`
+    /// are excluded, exactly as they are from the completion status (#941).
+    /// Reported in the synthesised line, and the only thing in it beyond a
+    /// fixed phrase.
+    tool_calls: u32,
+}
+
+impl NarrationFloor {
+    /// Start the floor's clock for a turn whose audience is `interactivity`.
+    fn new(interactivity: TurnInteractivity) -> Self {
+        Self {
+            interactivity,
+            last_narration: tokio::time::Instant::now(),
+            tool_calls: 0,
+        }
+    }
+
+    /// Record that the turn narrated, which resets the clock.
+    fn narrated(&mut self) {
+        self.last_narration = tokio::time::Instant::now();
+    }
+
+    /// Record a dispatched tool call. This does not reset the clock.
+    fn tool_dispatched(&mut self) {
+        self.tool_calls = self.tool_calls.saturating_add(1);
+    }
+
+    /// Take the line to narrate now, or `None` when the turn has narrated
+    /// recently enough or has nobody watching. Returning a line resets the
+    /// clock, so two calls in a row never narrate twice.
+    fn take_due_line(&mut self) -> Option<String> {
+        match self.interactivity {
+            TurnInteractivity::Headless => None,
+            TurnInteractivity::Interactive => {
+                let now = tokio::time::Instant::now();
+                if now.duration_since(self.last_narration) < NARRATION_FLOOR_INTERVAL {
+                    return None;
+                }
+                self.last_narration = now;
+                Some(self.line())
+            }
+        }
+    }
+
+    /// The synthesised line.
+    ///
+    /// It reaches every subscribed client and the journal, so it carries a fixed
+    /// phrase and a count of tool calls and reads nothing else - no goal, no
+    /// tool name, no arguments, no output (#776). It must also be honest: it
+    /// states that the turn is still working, which the loop knows, and never a
+    /// purpose the model has not stated.
+    fn line(&self) -> String {
+        match self.tool_calls {
+            0 => "Still working".to_string(),
+            1 => "Still working (1 tool call)".to_string(),
+            n => format!("Still working ({n} tool calls)"),
+        }
+    }
+}
 
 /// How often to emit a keepalive status while a server-side tool (or a subagent,
 /// which runs as a tool) executes silently, so the client's stall watchdog
@@ -1191,11 +1300,13 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         let mut hosted_search_demoted = false;
 
         // No turn-start filler. A quick/direct answer narrates nothing and just
-        // streams its reply. Progress is narrated only when the model declares a
+        // streams its reply. Progress is narrated when the model declares a
         // logical step (`begin_step`, in the dispatch loop below) — a step spans
         // multiple tool calls, so we narrate the step, not the turn start or each
-        // tool. A slow turn that declares no step is covered by the voice
-        // client's delayed-liveness safety net, not an unconditional status here.
+        // tool. Under that sits the narration floor (#943): an interactive turn
+        // that has narrated nothing for `NARRATION_FLOOR_INTERVAL` gets one
+        // synthesised line, so a model that opens no step still leaves the human
+        // something. A headless turn gets no floor at all.
 
         // Client-side tool execution (#107 / #234). When the connection
         // registered client-local tools, the application installs a per-turn
@@ -1259,6 +1370,10 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         // stays one running line.
         let mut tool_completion_run: ToolCompletionRun = None;
 
+        // The narration floor (#943). The turn's audience is resolved once here
+        // and travels with the floor, because it cannot change mid-turn.
+        let mut narration_floor = NarrationFloor::new(current_turn_interactivity());
+
         for round in 0..MAX_TOOL_ROUNDS {
             // Between-rounds cancellation checkpoint (issue #109): if the
             // caller cancelled while the previous tool round was
@@ -1270,6 +1385,17 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
             if is_cancelled() {
                 self.persist_abandoned_turn(&conv, turn_start).await;
                 return Err(CoreError::Cancelled);
+            }
+
+            // The narration floor is checked here, once per round, and nowhere
+            // else. This is the one point in the loop where neither keepalive is
+            // running and no tool is about to resolve, so the floor never speaks
+            // over the per-tool completion status (#941) and the line it leaves
+            // survives the whole of the round that follows. Round 0 cannot fire
+            // it: the clock starts with the turn, so there is still no
+            // turn-start filler.
+            if let Some(line) = narration_floor.take_due_line() {
+                on_status(line);
             }
 
             // Build the tool set: core + dynamically activated.
@@ -1738,6 +1864,9 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                         let goal = goal.trim();
                         if !goal.is_empty() {
                             on_status(goal.to_string());
+                            // The model narrated, so the floor below it stands
+                            // down for another interval (#943).
+                            narration_floor.narrated();
                         }
                     }
                     let ack = self
@@ -1753,6 +1882,12 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                         .push(Message::tool_result(&tool_call.id, &ack));
                     continue;
                 }
+
+                // Real tool work, for the narration floor's count (#943). The
+                // step-control tools above `continue` before this point, so the
+                // count matches what the completion status counts: the loop's
+                // own control surface is not tool work.
+                narration_floor.tool_dispatched();
 
                 // Subagent spawn (#287): mint the child's session-pad scope HERE,
                 // in the loop that owns `step_stack`, because `spawn_subagent`
@@ -2690,9 +2825,10 @@ mod tests {
         );
     }
 
-    /// #942 lands the property and nothing else: no code branches on it yet, so
-    /// a turn must emit byte-identical chunks, statuses and text whichever
-    /// interactivity is installed.
+    /// Interactivity changes the narration floor's cadence (#943) and nothing
+    /// else. A turn this short cannot reach the floor's interval, so it must
+    /// emit byte-identical chunks, statuses and text whichever interactivity is
+    /// installed.
     #[tokio::test]
     async fn turn_interactivity_does_not_change_what_a_turn_emits() {
         use crate::ports::turn_interactivity::{TurnInteractivity, with_turn_interactivity};
@@ -4563,6 +4699,450 @@ mod tests {
             statuses,
             vec!["map the plan".to_string()],
             "the begin_step goal must be narrated once; got {statuses:?}"
+        );
+    }
+
+    // --- #943: a mode-aware narration floor ---
+
+    #[tokio::test(start_paused = true)]
+    async fn the_floor_comes_due_at_the_interval_and_not_before() {
+        // Branch coverage for the clock the turn-level tests exercise one path
+        // of: the boundary itself, and both things that reset it.
+        let mut floor = NarrationFloor::new(TurnInteractivity::Interactive);
+        tokio::time::advance(NARRATION_FLOOR_INTERVAL - std::time::Duration::from_millis(1)).await;
+        assert_eq!(
+            floor.take_due_line(),
+            None,
+            "one millisecond under the interval is still quiet"
+        );
+
+        tokio::time::advance(std::time::Duration::from_millis(1)).await;
+        assert_eq!(
+            floor.take_due_line().as_deref(),
+            Some("Still working"),
+            "the interval itself comes due"
+        );
+        assert_eq!(floor.take_due_line(), None, "firing resets the clock");
+
+        tokio::time::advance(NARRATION_FLOOR_INTERVAL).await;
+        floor.narrated();
+        assert_eq!(
+            floor.take_due_line(),
+            None,
+            "the model narrating resets it too"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_floor_never_comes_due_for_a_headless_turn() {
+        let mut floor = NarrationFloor::new(TurnInteractivity::Headless);
+        tokio::time::advance(NARRATION_FLOOR_INTERVAL * 10).await;
+        assert_eq!(
+            floor.take_due_line(),
+            None,
+            "a headless turn has nobody to reassure, however long it runs"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_synthesised_line_carries_a_fixed_phrase_and_a_count() {
+        let mut floor = NarrationFloor::new(TurnInteractivity::Interactive);
+        assert_eq!(floor.line(), "Still working");
+        floor.tool_dispatched();
+        assert_eq!(floor.line(), "Still working (1 tool call)");
+        floor.tool_dispatched();
+        assert_eq!(floor.line(), "Still working (2 tool calls)");
+    }
+
+    /// Every tool call in the floor tests takes this long, so a turn's timeline
+    /// is exact under `start_paused` and the floor fires (or stays quiet) for a
+    /// stated reason rather than by a race.
+    const FLOOR_TEST_TOOL_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// A scripted LLM that counts every request the turn makes, and panics when
+    /// the turn asks for a response the script does not hold. A test can then
+    /// prove a turn made exactly the calls its script describes and no others.
+    struct CountedLlm {
+        responses: Mutex<Vec<LlmResponse>>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for CountedLlm {
+        async fn stream_completion(
+            &self,
+            _messages: Vec<Message>,
+            _tools: &[ToolDefinition],
+            _reasoning: ReasoningConfig,
+            mut on_chunk: ChunkCallback,
+        ) -> Result<LlmResponse, CoreError> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let response = {
+                let mut responses = self.responses.lock().unwrap();
+                assert!(
+                    !responses.is_empty(),
+                    "the turn asked for an LLM response the script does not hold"
+                );
+                responses.remove(0)
+            };
+            if !response.text.is_empty() {
+                on_chunk(response.text.clone());
+            }
+            Ok(response)
+        }
+    }
+
+    /// The statuses that can only have come from the narration floor.
+    /// "Still working on `<tool>`" is the #584 tool keepalive, so it is excluded.
+    fn floor_statuses(statuses: &[String]) -> Vec<String> {
+        statuses
+            .iter()
+            .filter(|s| s.starts_with("Still working") && !s.starts_with("Still working on"))
+            .cloned()
+            .collect()
+    }
+
+    /// Drive `tool_rounds` rounds under `mode`, each running one tool that takes
+    /// [`FLOOR_TEST_TOOL_DELAY`], with no plan step at any point. Returns every
+    /// status the turn emitted.
+    async fn run_tool_only_turn(
+        mode: crate::ports::turn_interactivity::TurnInteractivity,
+        tool_rounds: usize,
+    ) -> Vec<String> {
+        use crate::ports::turn_interactivity::with_turn_interactivity;
+
+        let tools = vec![ToolDefinition::new(
+            "notes_search",
+            "Search notes",
+            serde_json::json!({}),
+        )];
+        let mut responses: Vec<LlmResponse> = (0..tool_rounds)
+            .map(|i| {
+                LlmResponse::with_tool_calls(
+                    "",
+                    vec![ToolCall::new(format!("t{i}"), "notes_search", "{}")],
+                )
+            })
+            .collect();
+        responses.push(LlmResponse::text("All set"));
+
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            ToolCallingLlm::new(responses),
+            SlowToolExecutor {
+                tools,
+                result: "ok".to_string(),
+                delay: FLOOR_TEST_TOOL_DELAY,
+            },
+            id_gen(),
+        );
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .expect("conversation created");
+        let (status_cb, status_log) = recording_status();
+        with_turn_interactivity(
+            mode,
+            handler.send_prompt(&conv.id, "go".into(), noop_callback(), status_cb),
+        )
+        .await
+        .expect("turn completes");
+        status_log.lock().unwrap().clone()
+    }
+
+    /// The same timeline as [`run_tool_only_turn`], except the model opens a
+    /// plan step before every tool round, so the turn narrates all the way
+    /// through.
+    async fn run_narrated_turn(
+        mode: crate::ports::turn_interactivity::TurnInteractivity,
+        tool_rounds: usize,
+    ) -> Vec<String> {
+        use crate::ports::turn_interactivity::with_turn_interactivity;
+
+        let tools = vec![ToolDefinition::new(
+            "notes_search",
+            "Search notes",
+            serde_json::json!({}),
+        )];
+        let mut responses: Vec<LlmResponse> = Vec::new();
+        for i in 0..tool_rounds {
+            responses.push(LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new(
+                    format!("b{i}"),
+                    "begin_step",
+                    format!(r#"{{"goal":"step {i}"}}"#),
+                )],
+            ));
+            responses.push(LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new(format!("t{i}"), "notes_search", "{}")],
+            ));
+        }
+        responses.push(LlmResponse::text("All set"));
+
+        let (write, list, _sp) = in_memory_scratchpad();
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            ToolCallingLlm::new(responses),
+            SlowToolExecutor {
+                tools,
+                result: "ok".to_string(),
+                delay: FLOOR_TEST_TOOL_DELAY,
+            },
+            id_gen(),
+        )
+        .with_scratchpad_write(write)
+        .with_scratchpad_list(list);
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .expect("conversation created");
+        let (status_cb, status_log) = recording_status();
+        with_turn_interactivity(
+            mode,
+            handler.send_prompt(&conv.id, "go".into(), noop_callback(), status_cb),
+        )
+        .await
+        .expect("turn completes");
+        status_log.lock().unwrap().clone()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_interactive_turn_narrates_even_when_the_model_opens_no_step() {
+        // The reported failure: narration is the model's choice, so a model that
+        // opens no step says nothing for the whole turn. The floor holds under
+        // it. Six tool rounds of ten seconds each pass forty seconds of
+        // narration silence at the top of the fifth round, and the loop
+        // synthesises one line there.
+        use crate::ports::turn_interactivity::TurnInteractivity;
+
+        let statuses = run_tool_only_turn(TurnInteractivity::Interactive, 6).await;
+        assert_eq!(
+            floor_statuses(&statuses),
+            vec!["Still working (4 tool calls)".to_string()],
+            "an interactive turn that opens no step must still narrate; got {statuses:?}"
+        );
+        // The whole sequence, because where the line sits is the proof that the
+        // floor and the per-tool completion status (#941) do not double-narrate:
+        // the floor speaks once, between two rounds, and every other line is a
+        // completion.
+        assert_eq!(
+            statuses,
+            vec![
+                "Ran notes_search".to_string(),
+                "Ran notes_search 2 times".to_string(),
+                "Ran notes_search 3 times".to_string(),
+                "Ran notes_search 4 times".to_string(),
+                "Still working (4 tool calls)".to_string(),
+                "Ran notes_search 5 times".to_string(),
+                "Ran notes_search 6 times".to_string(),
+            ],
+            "the floor must add exactly one line to the turn"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_headless_turn_emits_no_filler_narration() {
+        // Nobody is waiting on a headless turn, so reassurance costs tokens and
+        // log volume for a reader who only ever sees the finished record. The
+        // interactive run of the same script is the control: it proves the
+        // silence comes from the mode and not from a floor that never fires.
+        use crate::ports::turn_interactivity::TurnInteractivity;
+
+        let headless = run_tool_only_turn(TurnInteractivity::Headless, 6).await;
+        assert!(
+            floor_statuses(&headless).is_empty(),
+            "a headless turn must synthesise no line; got {headless:?}"
+        );
+        assert!(
+            headless.iter().any(|s| s == "Ran notes_search 4 times"),
+            "the turn still ran and still emitted its tool statuses; got {headless:?}"
+        );
+
+        let interactive = run_tool_only_turn(TurnInteractivity::Interactive, 6).await;
+        assert_eq!(
+            floor_statuses(&interactive),
+            vec!["Still working (4 tool calls)".to_string()],
+            "the same turn interactively must synthesise a line; got {interactive:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_floor_does_not_fire_while_the_model_is_narrating() {
+        // The floor is a backstop beneath `begin_step` narration, not a second
+        // voice on top of it. The tool-only run of the same timeline is the
+        // control: it fires, so the quiet floor above is caused by the model's
+        // own narration and not by a turn that was too short.
+        use crate::ports::turn_interactivity::TurnInteractivity;
+
+        let narrated = run_narrated_turn(TurnInteractivity::Interactive, 6).await;
+        assert!(
+            floor_statuses(&narrated).is_empty(),
+            "a narrating turn must get no synthesised line on top; got {narrated:?}"
+        );
+        assert!(
+            narrated.iter().any(|s| s == "step 0") && narrated.iter().any(|s| s == "step 5"),
+            "the model's own step goals must still be narrated; got {narrated:?}"
+        );
+
+        let unnarrated = run_tool_only_turn(TurnInteractivity::Interactive, 6).await;
+        assert_eq!(
+            floor_statuses(&unnarrated),
+            vec!["Still working (4 tool calls)".to_string()],
+            "the same timeline without narration must fire the floor; got {unnarrated:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_synthesised_line_never_invents_a_goal() {
+        // The line reaches every subscribed client and the journal. It says the
+        // turn is still working and how many tool calls it has made, and it
+        // reads nothing else: not the request, not a tool name, not an argument
+        // and not a result (#776).
+        use crate::ports::turn_interactivity::{TurnInteractivity, with_turn_interactivity};
+
+        const SECRET: &str = "sk-live-943-DO-NOT-LEAK";
+        let tools = vec![ToolDefinition::new(
+            "vault_fetch",
+            "Fetch a value",
+            serde_json::json!({}),
+        )];
+        let mut responses: Vec<LlmResponse> = (0..6)
+            .map(|i| {
+                LlmResponse::with_tool_calls(
+                    "",
+                    vec![ToolCall::new(
+                        format!("t{i}"),
+                        "vault_fetch",
+                        format!(r#"{{"api_key":"{SECRET}"}}"#),
+                    )],
+                )
+            })
+            .collect();
+        responses.push(LlmResponse::text("All set"));
+
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            ToolCallingLlm::new(responses),
+            SlowToolExecutor {
+                tools,
+                result: format!("value={SECRET}"),
+                delay: FLOOR_TEST_TOOL_DELAY,
+            },
+            id_gen(),
+        );
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .expect("conversation created");
+        let (status_cb, status_log) = recording_status();
+        with_turn_interactivity(
+            TurnInteractivity::Interactive,
+            handler.send_prompt(
+                &conv.id,
+                "reorganise the photo library by year".into(),
+                noop_callback(),
+                status_cb,
+            ),
+        )
+        .await
+        .expect("turn completes");
+
+        let statuses = status_log.lock().unwrap().clone();
+        let floor = floor_statuses(&statuses);
+        assert_eq!(
+            floor,
+            vec!["Still working (4 tool calls)".to_string()],
+            "the floor must fire once, or this test proves nothing; got {statuses:?}"
+        );
+        for line in &floor {
+            assert!(
+                !line.contains("photo") && !line.contains("library"),
+                "the line must not restate the request; got {line}"
+            );
+            assert!(
+                !line.contains("vault_fetch"),
+                "the line must not name a tool; got {line}"
+            );
+            assert!(
+                !line.contains(SECRET) && !line.contains("value="),
+                "the line must not carry arguments or output; got {line}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_floor_makes_no_llm_call() {
+        // A reassurance line that costs a round trip is neither cheap nor
+        // timely, and it would fire exactly when the model is already busy. The
+        // scripted LLM panics if the turn asks for one response more than the
+        // script holds, and the counter pins the total.
+        use crate::ports::turn_interactivity::{TurnInteractivity, with_turn_interactivity};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let tools = vec![ToolDefinition::new(
+            "notes_search",
+            "Search notes",
+            serde_json::json!({}),
+        )];
+        // Turn one: one answer plus the first-message title call. Turn two: six
+        // tool rounds plus the final answer.
+        let mut responses = vec![LlmResponse::text("hello"), LlmResponse::text("A Chat")];
+        for i in 0..6 {
+            responses.push(LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new(format!("t{i}"), "notes_search", "{}")],
+            ));
+        }
+        responses.push(LlmResponse::text("All set"));
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            CountedLlm {
+                responses: Mutex::new(responses),
+                calls: Arc::clone(&calls),
+            },
+            SlowToolExecutor {
+                tools,
+                result: "ok".to_string(),
+                delay: FLOOR_TEST_TOOL_DELAY,
+            },
+            id_gen(),
+        );
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .expect("conversation created");
+
+        // Turn one leaves the conversation non-empty, so the floor turn below
+        // generates no title and its call count is the loop's alone.
+        handler
+            .send_prompt(&conv.id, "hi".into(), noop_callback(), noop_status())
+            .await
+            .expect("first turn completes");
+        calls.store(0, Ordering::Relaxed);
+
+        let (status_cb, status_log) = recording_status();
+        with_turn_interactivity(
+            TurnInteractivity::Interactive,
+            handler.send_prompt(&conv.id, "go".into(), noop_callback(), status_cb),
+        )
+        .await
+        .expect("turn completes");
+
+        let statuses = status_log.lock().unwrap().clone();
+        assert_eq!(
+            floor_statuses(&statuses),
+            vec!["Still working (4 tool calls)".to_string()],
+            "the floor must fire, or this test proves nothing; got {statuses:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            7,
+            "six tool rounds and one final round are the turn's only LLM calls; the floor adds none"
         );
     }
 
