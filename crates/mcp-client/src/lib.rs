@@ -1379,6 +1379,63 @@ mod tests {
     }
 
     #[test]
+    fn parse_server_metadata_captures_all_three() {
+        let result = serde_json::json!({
+            "serverInfo": {
+                "name": "weather",
+                "version": "1.0",
+                "title": "  Weather Service  ",
+                "description": "  Live weather and forecasts.  ",
+                "websiteUrl": "  https://example.com/weather  "
+            }
+        });
+        let meta = parse_server_metadata(&result);
+        assert_eq!(meta.title.as_deref(), Some("Weather Service"));
+        assert_eq!(meta.description.as_deref(), Some("Live weather and forecasts."));
+        assert_eq!(meta.website_url.as_deref(), Some("https://example.com/weather"));
+    }
+
+    #[test]
+    fn parse_server_metadata_absent_is_none() {
+        let result = serde_json::json!({"serverInfo": {"name": "weather", "version": "1.0"}});
+        let meta = parse_server_metadata(&result);
+        assert_eq!(meta.title, None);
+        assert_eq!(meta.description, None);
+        assert_eq!(meta.website_url, None);
+    }
+
+    #[test]
+    fn parse_server_metadata_blank_is_none() {
+        // Same rule as instructions: whitespace-only carries no signal, so
+        // description resolution must fall through rather than seed a blank.
+        let result = serde_json::json!({
+            "serverInfo": {"title": "  ", "description": "\n\t", "websiteUrl": ""}
+        });
+        let meta = parse_server_metadata(&result);
+        assert_eq!(meta.title, None);
+        assert_eq!(meta.description, None);
+        assert_eq!(meta.website_url, None);
+    }
+
+    #[test]
+    fn parse_server_metadata_ignores_non_string_values() {
+        // Malformed input from an untrusted peer must be dropped, not coerced.
+        let result = serde_json::json!({
+            "serverInfo": {"title": 42, "description": ["a"], "websiteUrl": {"a": 1}}
+        });
+        let meta = parse_server_metadata(&result);
+        assert_eq!(meta.title, None);
+        assert_eq!(meta.description, None);
+        assert_eq!(meta.website_url, None);
+    }
+
+    #[test]
+    fn parse_server_metadata_without_server_info_is_none() {
+        let meta = parse_server_metadata(&serde_json::json!({"protocolVersion": "2025-11-25"}));
+        assert!(meta.is_empty());
+    }
+
+    #[test]
     fn extract_list_field_requires_existing_array_field() {
         let missing = serde_json::json!({"other": []});
         let err = extract_list_field(&missing, "prompts").unwrap_err();

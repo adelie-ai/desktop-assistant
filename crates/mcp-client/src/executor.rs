@@ -1813,27 +1813,47 @@ mod tests {
         );
     }
 
+    /// SEP-973: a server's own `serverInfo.description` says what the server
+    /// *is*, which is what a tool-search query matches against. `instructions`
+    /// is usage guidance aimed at the model, so it loses.
     #[test]
-    fn resolved_description_prefers_instructions() {
-        // instructions ?? config.description ?? boilerplate.
+    fn provider_description_prefers_server_info_description() {
         assert_eq!(
-            resolve_provider_description(Some("live instructions"), Some("cfg desc"), "weather"),
+            resolve_provider_description(
+                Some("declared description"),
+                Some("live instructions"),
+                Some("cfg desc"),
+                "weather"
+            ),
+            "declared description"
+        );
+    }
+
+    #[test]
+    fn provider_description_falls_back_to_instructions() {
+        assert_eq!(
+            resolve_provider_description(
+                None,
+                Some("live instructions"),
+                Some("cfg desc"),
+                "weather"
+            ),
             "live instructions"
         );
     }
 
     #[test]
-    fn resolved_description_falls_back_to_config() {
+    fn provider_description_falls_back_to_config_description() {
         assert_eq!(
-            resolve_provider_description(None, Some("cfg desc"), "weather"),
+            resolve_provider_description(None, None, Some("cfg desc"), "weather"),
             "cfg desc"
         );
     }
 
     #[test]
-    fn resolved_description_falls_back_to_boilerplate() {
+    fn provider_description_falls_back_to_boilerplate() {
         assert_eq!(
-            resolve_provider_description(None, None, "weather"),
+            resolve_provider_description(None, None, None, "weather"),
             "Tools from the weather MCP server"
         );
     }
