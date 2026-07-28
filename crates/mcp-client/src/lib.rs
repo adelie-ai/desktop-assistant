@@ -560,7 +560,12 @@ impl Transport {
     /// a no-op there.
     fn set_protocol_version(&mut self, version: &str) {
         match self {
-            Transport::Stdio(_) => {}
+            Transport::Stdio(_) => {
+                // Explicitly discarded rather than ignored: with the `http`
+                // feature off this is the only arm, and an unused parameter is
+                // a hard error under the workspace lint table.
+                let _ = version;
+            }
             #[cfg(feature = "http")]
             Transport::Http(t) => t.protocol_version = Some(version.to_string()),
         }

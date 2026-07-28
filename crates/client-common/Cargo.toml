@@ -30,7 +30,7 @@ desktop-assistant-mcp-client = { path = "../mcp-client", optional = true, defaul
 desktop-assistant-frame-codec = { workspace = true }
 # First-party (adelie-ai) MCP core: only the `McpService` trait + value types
 # for in-process built-in servers. No default features -> no transport crates.
-mcp-core = { git = "https://github.com/adelie-ai/mcp-core", rev = "448b0e4a3e4dbfb04d56423d41077f0b114e6143", default-features = false, optional = true }
+mcp-core = { git = "https://github.com/adelie-ai/mcp-core", rev = "be1bbcf45b4f67498051d9571aefec7119f1e2a0", default-features = false, optional = true }
 futures = "0.3"
 # GECOS full-name lookup via `getpwuid_r` for the client's real name (#549),
 # mirroring the daemon's `peer-cred` approach. Already in the workspace tree.

@@ -386,11 +386,13 @@ impl McpHost {
     /// Results are capped to the daemon's client-tool limit.
     ///
     /// In-process built-ins are mapped to be byte-for-byte indistinguishable
-    /// from a subprocess: a [`CallError::Tool`](mcp_core::CallError::Tool)
-    /// becomes `Ok(text)` (the `isError` content path), while
-    /// [`InvalidParams`](mcp_core::CallError::InvalidParams) /
-    /// [`Internal`](mcp_core::CallError::Internal) are protocol-level faults and
-    /// become `Err` — the same split `McpClient` produces from the wire.
+    /// from a subprocess, which is the whole point of the built-in path:
+    /// [`CallError::Tool`](mcp_core::CallError::Tool) and
+    /// [`InvalidParams`](mcp_core::CallError::InvalidParams) both become
+    /// `Ok(text)` (the `isError` content path, per SEP-1303 — bad arguments are
+    /// something the model can correct, so it has to see them), while
+    /// [`Internal`](mcp_core::CallError::Internal) is a server fault and becomes
+    /// `Err` — the same split `McpClient` produces from the wire.
     pub async fn call(
         &self,
         tool_name: &str,
@@ -409,7 +411,11 @@ impl McpHost {
             }
             ServerBackend::InProcess(svc) => match svc.call_tool(original, &arguments).await {
                 Ok(reply) => Ok(cap_result(render_reply(&reply))),
-                Err(mcp_core::CallError::Tool(m)) => Ok(cap_result(m)),
+                // Both reach a subprocess caller as `isError` content, so both
+                // reach the model here as the result text (SEP-1303).
+                Err(mcp_core::CallError::Tool(m) | mcp_core::CallError::InvalidParams(m)) => {
+                    Ok(cap_result(m))
+                }
                 Err(err) => Err(format!("client MCP tool '{tool_name}' failed: {err}")),
             },
         }
@@ -763,6 +769,10 @@ done
         /// A *tool-level* failure (`CallError::Tool`) — the subprocess-parity
         /// `isError` path, which must surface as `Ok(text)`.
         ToolError(String),
+        /// Bad model-supplied arguments (`CallError::InvalidParams`). Since
+        /// SEP-1303 this is also an `isError` path, so it must surface as
+        /// `Ok(text)` exactly like [`BuiltinBehavior::ToolError`].
+        InvalidParams(String),
         /// A *protocol-level* fault (`CallError::Internal`) — must surface as `Err`.
         ProtocolError(String),
         /// A reply whose only block is Raw JSON (plus `structuredContent`).
@@ -812,6 +822,9 @@ done
             match &self.behavior {
                 BuiltinBehavior::Text(s) => Ok(mcp_core::ToolReply::text(s.clone())),
                 BuiltinBehavior::ToolError(m) => Err(mcp_core::CallError::tool(m.clone())),
+                BuiltinBehavior::InvalidParams(m) => {
+                    Err(mcp_core::CallError::invalid_params(m.clone()))
+                }
                 BuiltinBehavior::ProtocolError(m) => Err(mcp_core::CallError::internal(m.clone())),
                 BuiltinBehavior::Raw(v) => Ok(mcp_core::ToolReply {
                     content: vec![mcp_core::Content::Raw(v.clone())],
@@ -893,10 +906,55 @@ done
         host.shutdown().await;
     }
 
+    /// SEP-1303 parity: a built-in tool given bad arguments must reach the model
+    /// the same way a subprocess tool does — as readable content it can correct
+    /// against, not a hard failure.
     #[tokio::test]
-    async fn builtin_protocol_error_maps_to_err() {
-        // A protocol-level fault (`Internal`/`InvalidParams`) is a transport
-        // failure, mapped to `Err` just like a subprocess JSON-RPC error.
+    async fn builtin_invalid_params_surfaced_as_ok_text() {
+        let (b, _f) = builtin(
+            "dev-server",
+            "dev",
+            "echo",
+            BuiltinBehavior::InvalidParams("argument `path` must be a string".into()),
+        );
+        let host = McpHost::start_with(&[], vec![b]).await;
+        assert_eq!(
+            host.call("dev__echo", serde_json::json!({})).await.unwrap(),
+            "argument `path` must be a string"
+        );
+        host.shutdown().await;
+    }
+
+    /// The parity assertion itself, so a future divergence between the two
+    /// runners fails loudly rather than silently.
+    #[tokio::test]
+    async fn builtin_and_subprocess_agree_on_invalid_params() {
+        let (b, _f) = builtin(
+            "dev-server",
+            "dev",
+            "echo",
+            BuiltinBehavior::InvalidParams("bad arg".into()),
+        );
+        let (t, _g) = builtin(
+            "tool-server",
+            "tl",
+            "echo",
+            BuiltinBehavior::ToolError("bad arg".into()),
+        );
+        let host = McpHost::start_with(&[], vec![b, t]).await;
+        let invalid = host.call("dev__echo", serde_json::json!({})).await;
+        let tool = host.call("tl__echo", serde_json::json!({})).await;
+        assert_eq!(
+            invalid, tool,
+            "InvalidParams and Tool must be indistinguishable to the caller"
+        );
+        host.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn builtin_internal_error_maps_to_err() {
+        // A genuine server fault (`Internal`) is not something the model can
+        // correct, so it stays an `Err` just like a subprocess JSON-RPC error.
         let (b, _f) = builtin(
             "dev-server",
             "dev",
