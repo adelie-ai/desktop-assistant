@@ -1991,11 +1991,21 @@ uds_socket = "/tmp/adelie.sock"
     // checked against the shared remote-URL policy, the same as a remote MCP
     // endpoint's url and a named connection's base_url.
 
+    // Review (F2): a fixed path under `std::env::temp_dir()`, cleaned up only
+    // on the success path, collides between two concurrent `cargo test` runs
+    // of this crate (routine in this repo's parallel-worktree workflow) and
+    // stays broken after any one panicking run leaves its directory behind -
+    // the next, unmutated run then fails too, since the stale directory
+    // (reproduced: a mutation panic before cleanup, then every subsequent
+    // real run failed until it was removed by hand). `tempfile::TempDir` is
+    // unique per process and removes itself on drop, including on panic, so
+    // the tests below use it instead of the `std::env::temp_dir().join(...)`
+    // pattern.
+
     #[test]
     fn set_embeddings_settings_rejects_a_plain_http_base_url_to_a_public_host() {
-        let dir = std::env::temp_dir().join("da-test-emb-rejects-insecure");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("daemon.toml");
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("daemon.toml");
 
         let err = set_embeddings_settings(
             &path,
@@ -2012,8 +2022,6 @@ uds_socket = "/tmp/adelie.sock"
             load_daemon_config(&path).unwrap().is_none(),
             "a rejected write must not persist anything"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The legacy `[embeddings]` block's `base_url` is dual-use for Bedrock
@@ -2022,35 +2030,28 @@ uds_socket = "/tmp/adelie.sock"
     /// rejected as an invalid URL.
     #[test]
     fn set_embeddings_settings_accepts_a_bedrock_region_string_as_base_url() {
-        let dir = std::env::temp_dir().join("da-test-emb-bedrock-region");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("daemon.toml");
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("daemon.toml");
 
         set_embeddings_settings(&path, Some("bedrock"), None, Some("us-east-1"))
             .expect("a bedrock region string must not be parsed as an invalid URL");
         let loaded = load_daemon_config(&path).unwrap().unwrap();
         assert_eq!(loaded.embeddings.base_url.as_deref(), Some("us-east-1"));
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn set_embeddings_settings_accepts_a_bare_hostname_for_ollama() {
-        let dir = std::env::temp_dir().join("da-test-emb-ollama-bare-host");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("daemon.toml");
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("daemon.toml");
 
         set_embeddings_settings(&path, Some("ollama"), None, Some("http://ollama:11434"))
             .expect("ollama has no credential concept, so a bare hostname is fine");
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn set_backend_tasks_settings_rejects_a_plain_http_base_url_to_a_public_host() {
-        let dir = std::env::temp_dir().join("da-test-bt-rejects-insecure");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("daemon.toml");
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("daemon.toml");
 
         let err = set_backend_tasks_settings(
             &path,
@@ -2070,15 +2071,12 @@ uds_socket = "/tmp/adelie.sock"
             load_daemon_config(&path).unwrap().is_none(),
             "a rejected write must not persist anything"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn set_backend_tasks_settings_accepts_a_bedrock_region_string_as_base_url() {
-        let dir = std::env::temp_dir().join("da-test-bt-bedrock-region");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("daemon.toml");
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("daemon.toml");
 
         set_backend_tasks_settings(
             &path,
@@ -2090,8 +2088,6 @@ uds_socket = "/tmp/adelie.sock"
             30,
         )
         .expect("a bedrock region string must not be parsed as an invalid URL");
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -4279,6 +4275,39 @@ max_context_tokens = 1000000
         .unwrap();
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Review (F4): `set_llm_settings`'s `base_url` gained no check when its
+    /// two siblings (`set_embeddings_settings`, `set_backend_tasks_settings`)
+    /// did. Latent today - `Command::SetLlmSettings` was removed from the
+    /// wire and nothing dispatches to this function - but
+    /// `constrain_settings_base_url` already exists and takes the connector,
+    /// so wiring it in is nearly free and stops a restored command from
+    /// silently reintroducing the gap.
+    #[test]
+    fn set_llm_settings_rejects_a_plain_http_base_url_to_a_public_host() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("daemon.toml");
+
+        let err = set_llm_settings(
+            &path,
+            "openai",
+            None,
+            Some("http://evil.example.com/v1"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("https"),
+            "refusal should point at the fix: {err}"
+        );
+        assert!(
+            load_daemon_config(&path).unwrap().is_none(),
+            "a rejected write must not persist anything"
+        );
     }
 
     // --- set_api_key (views.rs:92-140) --

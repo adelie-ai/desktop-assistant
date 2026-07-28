@@ -85,6 +85,9 @@ pub fn set_llm_settings(
     config.llm.top_p = top_p;
     config.llm.max_tokens = max_tokens;
     config.llm.hosted_tool_search = hosted_tool_search;
+    if let Some(base_url) = config.llm.base_url.as_deref() {
+        constrain_settings_base_url(base_url, Some(config.llm.connector.as_str()))?;
+    }
 
     save_daemon_config(path, &config)
 }
