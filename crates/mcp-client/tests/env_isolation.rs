@@ -23,22 +23,29 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use desktop_assistant_core::ports::tools::ToolExecutor;
+use desktop_assistant_mcp_client::executor::{McpServerConfig, McpToolExecutor};
 use desktop_assistant_mcp_client::{McpClient, McpError};
 
-/// This suite's own scratch directory, resolved once and cached.
+/// This suite's own scratch directory: cargo's compile-time-provided
+/// per-target tmp dir, not `std::env::temp_dir()`.
 ///
-/// `TMPDIR` is one of the variables under test (`allowlisted_env_tmpdir_reaches_terminal_mcp`),
-/// and `std::env::temp_dir()` reads it live on every call. Calling
-/// `temp_dir()` fresh from [`temp_path`] would make every *other*
-/// concurrently-running test's scratch files resolve against whatever value
-/// the TMPDIR test happens to have set at that moment (including a
-/// deliberately non-UTF-8 one) — a process-global side effect from a single
-/// test, not a race in name only. Resolving once, before any test can have
-/// mutated `TMPDIR`, decouples this harness's own file I/O from the value
-/// under test.
+/// `TMPDIR` is one of the variables under test
+/// (`allowlisted_env_tmpdir_reaches_terminal_mcp`), and `std::env::temp_dir()`
+/// reads it live on every call — including from *this* harness's own
+/// `temp_path()`. A `OnceLock`-cached `temp_dir()` looked safe ("resolved
+/// once, before any test can have mutated TMPDIR") but was not: the mutating
+/// test can itself be the first caller, in which case the lock caches the
+/// corrupted value for the rest of the process, and every *other*
+/// concurrently-running test's scratch-file writes fail. That is
+/// deterministic, not a race, whenever `allowlisted_env_tmpdir_reaches_terminal_mcp`
+/// runs first — for example when it is the only test selected by name
+/// (`cargo test ... allowlisted_env_tmpdir_reaches_terminal_mcp`), an
+/// entirely ordinary workflow. `CARGO_TARGET_TMPDIR` is baked in at compile
+/// time (cargo creates it before running this binary), so no test mutating
+/// the process environment at runtime can perturb it.
 fn scratch_dir() -> &'static std::path::Path {
-    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    DIR.get_or_init(std::env::temp_dir)
+    std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
 }
 
 /// Unique temp file path for this test process (mirrors `robustness.rs`).
@@ -117,6 +124,16 @@ while IFS= read -r line; do
       ;;
     *'"method":"notifications/initialized"'*)
       :
+      ;;
+    *'"method":"tools/list"'*)
+      rest=${line#*\"id\":}
+      id=${rest%%,*}
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"env_probe","description":"env probe tool","inputSchema":{"type":"object"}}]}}\n' "$id"
+      ;;
+    *'"method":"resources/list"'*|*'"method":"prompts/list"'*)
+      rest=${line#*\"id\":}
+      id=${rest%%,*}
+      printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"method not found"}}\n' "$id"
       ;;
     *'"method":"tools/call"'*)
       rest=${line#*\"id\":}
@@ -399,27 +416,89 @@ async fn allowlisted_env_skills_mcp_write_root_reaches_skills_mcp() {
     .await;
 }
 
-/// internet-radio-mcp spawns `mpv`, which inherits this variable to locate
-/// the PipeWire/PulseAudio session socket. This one matters on the
-/// client-side MCP host (a real desktop session), not the headless fleet
-/// container, since audio playback has nowhere to go there.
-#[tokio::test]
-async fn allowlisted_env_xdg_runtime_dir_reaches_internet_radio_mcp() {
-    assert_passes_through("XDG_RUNTIME_DIR", "/run/user/1000", "xdg-runtime-dir").await;
-}
+// `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS` are NOT on the global
+// allowlist (round 3 of review): both are exactly what a stock D-Bus client
+// library uses to auto-discover the session bus, which fronts the
+// freedesktop Secret Service holding connector API keys and MCP OAuth
+// tokens. Granting them to every spawned server - including a third-party
+// one an operator adds - would hand every stdio child that route by
+// default. `internet-radio-mcp` and `tasks-mcp` get them through the
+// per-server `inherit_env` opt-in instead (see the `inherit_env` tests
+// below and `deploy/mcp/mcp_servers.default.toml`).
 
-/// tasks-mcp (enabled by default) runs a session-bus signal service so QML
-/// widgets refresh when a task changes; it treats a bus failure as
-/// non-fatal, so without this pass-through the feature would silently stop
-/// working instead of erroring.
+/// A spawned server does not see `XDG_RUNTIME_DIR` (the PipeWire/PulseAudio
+/// and D-Bus session-bus discovery variable) by default, even though it is
+/// present in the ambient environment. `internet-radio-mcp` gets it only via
+/// its own `inherit_env` config entry.
 #[tokio::test]
-async fn allowlisted_env_dbus_session_bus_address_reaches_tasks_mcp() {
-    assert_passes_through(
-        "DBUS_SESSION_BUS_ADDRESS",
-        "unix:path=/run/user/1000/bus",
-        "dbus-session-bus",
+async fn spawned_server_does_not_inherit_xdg_runtime_dir_by_default() {
+    let _guard = EnvVarGuard::set("XDG_RUNTIME_DIR", "/run/user/1000");
+    let seen = probe_env(
+        "xdg-runtime-dir-default",
+        &["XDG_RUNTIME_DIR"],
+        &HashMap::new(),
     )
     .await;
+    assert_eq!(seen["XDG_RUNTIME_DIR"], UNSET);
+}
+
+/// A spawned server does not see `DBUS_SESSION_BUS_ADDRESS` (the session-bus
+/// discovery variable that fronts the freedesktop Secret Service) by
+/// default, even though it is present in the ambient environment.
+/// `tasks-mcp` gets it only via its own `inherit_env` config entry.
+#[tokio::test]
+async fn spawned_server_does_not_inherit_dbus_session_bus_address_by_default() {
+    let _guard = EnvVarGuard::set("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus");
+    let seen = probe_env(
+        "dbus-session-bus-default",
+        &["DBUS_SESSION_BUS_ADDRESS"],
+        &HashMap::new(),
+    )
+    .await;
+    assert_eq!(seen["DBUS_SESSION_BUS_ADDRESS"], UNSET);
+}
+
+/// End-to-end proof that a server's own `inherit_env` config actually reaches
+/// a real spawned child through the full executor path (config -> `resolve_env`
+/// -> `StdioTransport::spawn`) — not just `resolve_env`'s HashMap merge,
+/// which `crates/mcp-client/src/executor.rs`'s own unit tests already cover
+/// in isolation. This is the mechanism `tasks-mcp`/`internet-radio-mcp` use
+/// in `deploy/mcp/mcp_servers.default.toml` for `DBUS_SESSION_BUS_ADDRESS`/
+/// `XDG_RUNTIME_DIR`, scoped to exactly those servers rather than granted
+/// globally.
+#[tokio::test]
+async fn inherit_env_reaches_the_child_through_the_real_executor() {
+    let _guard = EnvVarGuard::set("ADELE_TEST_INHERIT_ENV_E2E", "session-bus-address");
+    let script = write_env_probe_script("inherit-env-e2e", &["ADELE_TEST_INHERIT_ENV_E2E"]);
+
+    let config = McpServerConfig {
+        name: "probe".into(),
+        command: "/bin/sh".into(),
+        args: vec![script.display().to_string()],
+        namespace: None,
+        enabled: true,
+        env: HashMap::new(),
+        env_secrets: HashMap::new(),
+        inherit_env: vec!["ADELE_TEST_INHERIT_ENV_E2E".into()],
+        http: None,
+        description: None,
+    };
+
+    let executor = McpToolExecutor::new(vec![config]);
+    executor.start().await.expect("executor should connect");
+
+    let result = executor
+        .execute_tool("env_probe", serde_json::json!({}))
+        .await
+        .expect("env_probe tool call should succeed");
+
+    let _ = std::fs::remove_file(&script);
+
+    assert!(
+        result.contains("ADELE_TEST_INHERIT_ENV_E2E=session-bus-address"),
+        "an inherit_env-named variable should reach the child through the real \
+         executor path, got: {result}"
+    );
 }
 
 /// terminal-mcp's own defence-in-depth env scrub reads exactly PATH, HOME,

@@ -3033,6 +3033,7 @@ mod tests {
             enabled: true,
             env: Default::default(),
             env_secrets: Default::default(),
+            inherit_env: Vec::new(),
             http: Some(HttpTransportConfig {
                 url: "https://x/mcp".into(),
                 auth_bearer_secret: None,

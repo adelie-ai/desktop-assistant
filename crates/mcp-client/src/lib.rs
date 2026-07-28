@@ -135,9 +135,13 @@ fn validate_command(command: &str, _args: &[String]) -> Result<(), McpError> {
 }
 
 /// Names read from *this process's own* environment and passed through to
-/// every spawned stdio MCP child, on top of [`Command::env_clear`] and the
-/// server's own configured `env` (applied afterward, so a server's config
-/// always wins over the ambient value it happens to share a name with).
+/// **every** spawned stdio MCP child — including third-party ones this
+/// client is designed to talk to (this file talks to servers well beyond
+/// the shipped fleet, e.g. [`SUPPORTED_PROTOCOL_VERSIONS`]'s note on
+/// third-party servers, and [`ServerMetadata`] treats every server-declared
+/// field as untrusted) — on top of [`Command::env_clear`] and the server's
+/// own configured `env` (applied afterward, so a server's config always
+/// wins over the ambient value it happens to share a name with).
 ///
 /// An explicit ALLOWLIST, not a denylist (#910): a `*_SECRET` / `*_TOKEN` /
 /// `*_PASSWORD` pattern match fails open on the next variable nobody thought
@@ -151,6 +155,20 @@ fn validate_command(command: &str, _args: &[String]) -> Result<(), McpError> {
 /// which runs on a real desktop session where D-Bus and audio genuinely
 /// exist. Weigh both when adding or refusing an entry, not just the fleet
 /// container.
+///
+/// **This list is deliberately narrower than "every variable some shipped
+/// server wants".** A variable that would hand *every* spawned server —
+/// including a third-party one an operator adds — a route to something
+/// sensitive belongs on [`McpServerConfig::inherit_env`] instead, scoped to
+/// the one server that needs it. `DBUS_SESSION_BUS_ADDRESS` and
+/// `XDG_RUNTIME_DIR` are the concrete case: both are exactly what a stock
+/// D-Bus client library uses to auto-discover the session bus, which fronts
+/// the freedesktop Secret Service holding connector API keys and MCP OAuth
+/// tokens — see [`McpServerConfig::inherit_env`]'s doc for the full
+/// reasoning. They are granted to `tasks-mcp` and `internet-radio-mcp`
+/// specifically, not here.
+///
+/// [`McpServerConfig::inherit_env`]: crate::executor::McpServerConfig::inherit_env
 ///
 /// Every entry is named for the server(s) — in the shipped fleet
 /// (`deploy/mcp/mcp_servers.default.toml`, `Dockerfile.fleet`) or documented
@@ -195,18 +213,13 @@ const ENV_PASSTHROUGH_ALLOWLIST: &[&str] = &[
     "XDG_DATA_HOME",
     "XDG_CACHE_HOME",
     "XDG_STATE_HOME",
-    // XDG_RUNTIME_DIR: internet-radio-mcp spawns `mpv`, which inherits this
-    // process's environment; PipeWire/PulseAudio locate the session audio
-    // socket through it. It's also the D-Bus specification's documented
-    // fallback for locating the session bus, so it covers part of the next
-    // entry too. Its whole purpose is a real desktop session, so this is one
-    // that matters on the client-side MCP host, not the headless fleet.
-    "XDG_RUNTIME_DIR",
-    // DBUS_SESSION_BUS_ADDRESS: tasks-mcp (enabled by default) runs a
-    // session-bus signal service so QML widgets refresh when a task changes.
-    // It treats a bus failure as non-fatal, so without this the feature
-    // silently stops working instead of erroring - the worst kind of gap.
-    "DBUS_SESSION_BUS_ADDRESS",
+    // NOTE: XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS are deliberately
+    // NOT here — see this constant's doc comment above and
+    // `McpServerConfig::inherit_env`. Granting them globally would give
+    // every spawned server, including a third-party one, the standard
+    // auto-discovery route to the session D-Bus bus and, through it, the
+    // freedesktop Secret Service credential store.
+    //
     // Named single-server dependencies from the shipped fleet image
     // (Dockerfile.fleet, deploy/mcp/mcp_servers.default.toml) or documented
     // by the server itself.

@@ -179,7 +179,13 @@ impl McpHost {
                 );
             }
 
-            let mut client = match McpClient::connect(&cfg.command, &cfg.args, &cfg.env).await {
+            // `base_env()`: `env` layered over any `inherit_env`-named
+            // variable read from this client process's own environment
+            // (#910 round 3) - the per-server opt-in that keeps a session-bus
+            // or runtime-dir variable scoped to the one server that named it,
+            // rather than every spawned server getting it for free.
+            let env = cfg.base_env();
+            let mut client = match McpClient::connect(&cfg.command, &cfg.args, &env).await {
                 Ok(client) => client,
                 Err(err) => {
                     tracing::warn!(
@@ -539,6 +545,7 @@ done
             enabled: true,
             env: HashMap::new(),
             env_secrets: HashMap::new(),
+            inherit_env: Vec::new(),
             http: None,
             description: None,
         }
@@ -554,6 +561,7 @@ done
             enabled: true,
             env: HashMap::new(),
             env_secrets: HashMap::new(),
+            inherit_env: Vec::new(),
             http: None,
             description: None,
         }

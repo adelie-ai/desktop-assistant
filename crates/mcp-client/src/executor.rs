@@ -235,6 +235,22 @@ pub struct McpServerConfig {
     /// Keys are env var names, values are secret IDs.
     #[serde(default)]
     pub env_secrets: HashMap<String, String>,
+    /// Names of variables this server is explicitly opted in to receive from
+    /// the host process's own environment, in addition to `env`/`env_secrets`
+    /// (#910 round 3). Deliberately **not** part of the global
+    /// `ENV_PASSTHROUGH_ALLOWLIST` in `crate::lib`: some legitimately useful
+    /// pass-through values — `DBUS_SESSION_BUS_ADDRESS`,
+    /// `XDG_RUNTIME_DIR` — are also exactly what a stock D-Bus client library
+    /// uses to auto-discover the session bus, which fronts the freedesktop
+    /// Secret Service that holds connector API keys and MCP OAuth tokens
+    /// (`crates/daemon/src/config/secrets.rs`, `mcp_token_store.rs`). Granting
+    /// them to *every* spawned server — including third-party ones this
+    /// client is designed to talk to — would hand every stdio child a route
+    /// to the credential store by default. Naming a variable here scopes that
+    /// grant to the one server that needs it; see
+    /// `docs/mcp-services.md#environment-variables`.
+    #[serde(default)]
+    pub inherit_env: Vec<String>,
     /// When set, reach this server over HTTP (streamable-HTTP) instead of
     /// spawning `command`. See [`HttpTransportConfig`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -248,6 +264,28 @@ pub struct McpServerConfig {
     /// combined. Optional for TOML back-compat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+}
+
+impl McpServerConfig {
+    /// This server's `env`, with any `inherit_env`-named variable filled in
+    /// *underneath* it from the host process's own environment — an entry
+    /// already present in `env` always wins, so a server's own explicit
+    /// config still overrides an inherited ambient value of the same name.
+    ///
+    /// Used by both spawn paths that share this config type: the daemon's
+    /// `McpExecutorState::resolve_env` layers `env_secrets` on top of this,
+    /// and the client-side MCP host (`crates/client-common/src/mcp_host/host.rs`,
+    /// which does not resolve `env_secrets`) uses this directly.
+    pub fn base_env(&self) -> HashMap<String, String> {
+        let mut env = HashMap::new();
+        for name in &self.inherit_env {
+            if let Ok(value) = std::env::var(name) {
+                env.insert(name.clone(), value);
+            }
+        }
+        env.extend(self.env.clone());
+        env
+    }
 }
 
 /// Build a provider's description for tool-search surfacing.
@@ -505,11 +543,13 @@ pub struct McpExecutorState {
 }
 
 impl McpExecutorState {
-    /// Resolve the final environment variables for a server config by merging
-    /// `env` (plaintext) with `env_secrets` (looked up from secrets.toml).
-    /// Secret references override plaintext if both set the same var.
+    /// Resolve the final environment variables for a server config: start
+    /// from [`McpServerConfig::base_env`] (any `inherit_env`-named variable,
+    /// with `env` layered on top), then layer `env_secrets` (looked up from
+    /// secrets.toml) on top of that. Secret references override plaintext if
+    /// both set the same var.
     fn resolve_env(&self, config: &McpServerConfig) -> Result<HashMap<String, String>, McpError> {
-        let mut env = config.env.clone();
+        let mut env = config.base_env();
         let secrets = self.secrets.read().expect("secrets lock poisoned");
         for (var_name, secret_id) in &config.env_secrets {
             let value = secrets.get(secret_id).ok_or_else(|| {
@@ -1881,6 +1921,130 @@ mod tests {
         );
     }
 
+    #[test]
+    fn mcp_server_config_inherit_env_absent_defaults_empty() {
+        // TOML back-compat: an existing config with no `inherit_env` still
+        // parses, and the field defaults to empty (nothing extra inherited).
+        let toml = r#"
+            name = "weather"
+            command = "weather-mcp"
+        "#;
+        let config: McpServerConfig = toml::from_str(toml).expect("parse config");
+        assert!(
+            config.inherit_env.is_empty(),
+            "an absent inherit_env defaults to empty, got: {:?}",
+            config.inherit_env
+        );
+    }
+
+    #[test]
+    fn mcp_server_config_inherit_env_deserializes_from_toml() {
+        let toml = r#"
+            name = "tasks"
+            command = "tasks-mcp"
+            inherit_env = ["DBUS_SESSION_BUS_ADDRESS"]
+        "#;
+        let config: McpServerConfig = toml::from_str(toml).expect("parse config");
+        assert_eq!(
+            config.inherit_env,
+            vec!["DBUS_SESSION_BUS_ADDRESS".to_string()]
+        );
+    }
+
+    /// `base_env` (and therefore `resolve_env`, which starts from it) reads
+    /// `inherit_env`-named variables from *this test process's* own
+    /// environment. `ADELE_TEST_RESOLVE_ENV_INHERIT` is exclusively owned by
+    /// this test within this binary (mirrors the convention in
+    /// `crates/mcp-client/tests/env_isolation.rs`'s `EnvVarGuard`).
+    #[test]
+    fn resolve_env_layers_inherit_env_beneath_configured_env() {
+        // SAFETY: `ADELE_TEST_RESOLVE_ENV_INHERIT` is exclusively owned by
+        // this test within this binary; no other test thread reads or
+        // writes it.
+        unsafe { std::env::set_var("ADELE_TEST_RESOLVE_ENV_INHERIT", "ambient-session-bus") };
+
+        let config = McpServerConfig {
+            inherit_env: vec!["ADELE_TEST_RESOLVE_ENV_INHERIT".into()],
+            ..stdio_cfg("probe")
+        };
+
+        let executor = McpToolExecutor::new(vec![]);
+        let resolved = executor
+            .state
+            .resolve_env(&config)
+            .expect("resolve_env should not fail with no env_secrets");
+
+        // SAFETY: see above.
+        unsafe { std::env::remove_var("ADELE_TEST_RESOLVE_ENV_INHERIT") };
+
+        assert_eq!(
+            resolved.get("ADELE_TEST_RESOLVE_ENV_INHERIT"),
+            Some(&"ambient-session-bus".to_string()),
+            "an inherit_env-named variable present in the process environment \
+             must reach the resolved env map"
+        );
+    }
+
+    /// A server's own `env` always wins over an `inherit_env`-sourced value
+    /// of the same name — `inherit_env` is a floor (a narrow, named grant),
+    /// not a value a server config cannot override.
+    #[test]
+    fn resolve_env_configured_env_overrides_inherit_env() {
+        // SAFETY: see `resolve_env_layers_inherit_env_beneath_configured_env`.
+        unsafe { std::env::set_var("ADELE_TEST_RESOLVE_ENV_OVERRIDE", "ambient-value") };
+
+        let mut env = HashMap::new();
+        env.insert(
+            "ADELE_TEST_RESOLVE_ENV_OVERRIDE".to_string(),
+            "configured-value".to_string(),
+        );
+        let config = McpServerConfig {
+            env,
+            inherit_env: vec!["ADELE_TEST_RESOLVE_ENV_OVERRIDE".into()],
+            ..stdio_cfg("probe")
+        };
+
+        let executor = McpToolExecutor::new(vec![]);
+        let resolved = executor
+            .state
+            .resolve_env(&config)
+            .expect("resolve_env should not fail with no env_secrets");
+
+        // SAFETY: see above.
+        unsafe { std::env::remove_var("ADELE_TEST_RESOLVE_ENV_OVERRIDE") };
+
+        assert_eq!(
+            resolved.get("ADELE_TEST_RESOLVE_ENV_OVERRIDE"),
+            Some(&"configured-value".to_string()),
+            "a server's own configured env must win over an inherit_env-sourced \
+             ambient value of the same name"
+        );
+    }
+
+    /// A name in `inherit_env` that is absent from this process's own
+    /// environment resolves to nothing — `inherit_env` only ever narrows
+    /// what a server can receive, never invents a value.
+    #[test]
+    fn resolve_env_inherit_env_absent_from_process_is_silently_skipped() {
+        // Not set anywhere; deliberately distinct from any other test's name.
+        let config = McpServerConfig {
+            inherit_env: vec!["ADELE_TEST_RESOLVE_ENV_NEVER_SET".into()],
+            ..stdio_cfg("probe")
+        };
+
+        let executor = McpToolExecutor::new(vec![]);
+        let resolved = executor
+            .state
+            .resolve_env(&config)
+            .expect("resolve_env should not fail with no env_secrets");
+
+        assert!(
+            !resolved.contains_key("ADELE_TEST_RESOLVE_ENV_NEVER_SET"),
+            "an inherit_env name absent from the process environment must not \
+             appear in the resolved env map"
+        );
+    }
+
     /// The string is indexed, not displayed, so both server-supplied sources are
     /// kept. The declared description leads because it answers "what is this
     /// server" (SEP-973); the instructions follow and add vocabulary.
@@ -1988,6 +2152,7 @@ mod tests {
             enabled: true,
             env: HashMap::new(),
             env_secrets: HashMap::new(),
+            inherit_env: Vec::new(),
             http: None,
             description: None,
         };
@@ -2008,6 +2173,7 @@ mod tests {
             enabled: true,
             env: HashMap::new(),
             env_secrets: HashMap::new(),
+            inherit_env: Vec::new(),
             http: None,
             description: None,
         };
@@ -2024,6 +2190,7 @@ mod tests {
             enabled: true,
             env: HashMap::new(),
             env_secrets: HashMap::new(),
+            inherit_env: Vec::new(),
             http: None,
             description: None,
         };
@@ -2149,6 +2316,7 @@ mod tests {
                 enabled: true,
                 env: HashMap::new(),
                 env_secrets: HashMap::new(),
+                inherit_env: Vec::new(),
                 http: None,
                 description: None,
             },
@@ -2160,6 +2328,7 @@ mod tests {
                 enabled: false,
                 env: HashMap::new(),
                 env_secrets: HashMap::new(),
+                inherit_env: Vec::new(),
                 http: None,
                 description: None,
             },
@@ -2185,6 +2354,7 @@ mod tests {
             enabled: true,
             env: HashMap::new(),
             env_secrets: HashMap::new(),
+            inherit_env: Vec::new(),
             http: Some(HttpTransportConfig {
                 url: "https://calendarmcp.googleapis.com/mcp/v1".into(),
                 auth_bearer_secret: None,
@@ -2215,6 +2385,7 @@ mod tests {
             enabled,
             env: HashMap::new(),
             env_secrets: HashMap::new(),
+            inherit_env: Vec::new(),
             http: None,
             description: None,
         };
@@ -2320,6 +2491,7 @@ mod tests {
             enabled: true,
             env: HashMap::new(),
             env_secrets: HashMap::new(),
+            inherit_env: Vec::new(),
             http: None,
             description: None,
         }];
@@ -2345,6 +2517,7 @@ mod tests {
             enabled: true,
             env: HashMap::new(),
             env_secrets: HashMap::new(),
+            inherit_env: Vec::new(),
             http: None,
             description: None,
         }];
@@ -2380,6 +2553,7 @@ mod tests {
             enabled: false, // disabled: no connect attempt, no child spawn
             env: HashMap::new(),
             env_secrets: HashMap::new(),
+            inherit_env: Vec::new(),
             http: None,
             description: None,
         };
@@ -2632,6 +2806,7 @@ mod tests {
             enabled: true,
             env: HashMap::new(),
             env_secrets: HashMap::new(),
+            inherit_env: Vec::new(),
             http: Some(HttpTransportConfig {
                 url: format!("https://{name}/mcp"),
                 auth_bearer_secret: None,
@@ -2786,6 +2961,7 @@ mod tests {
             enabled: true,
             env: HashMap::new(),
             env_secrets: HashMap::new(),
+            inherit_env: Vec::new(),
             http: None,
             description: None,
         }
@@ -2874,6 +3050,7 @@ mod tests {
             enabled: false,
             env: HashMap::new(),
             env_secrets: HashMap::new(),
+            inherit_env: Vec::new(),
             http: None,
             description: None,
         };
@@ -2952,6 +3129,7 @@ mod tests {
             enabled: false,
             env: HashMap::new(),
             env_secrets: HashMap::new(),
+            inherit_env: Vec::new(),
             http: None,
             description: None,
         };

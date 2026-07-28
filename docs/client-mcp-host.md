@@ -23,9 +23,9 @@ depending on which edge is connected.
 ## Schema
 
 - `[[servers]]` — server *definitions*, mirroring the daemon's `mcp_servers.toml`
-  (`name`, `command`, `args`, `namespace`, `enabled`, `env`, `env_secrets`).
-  `namespace` exposes a server's tools as `{namespace}__{tool}`, which keeps
-  them from colliding with each other or with server-side tools.
+  (`name`, `command`, `args`, `namespace`, `enabled`, `env`, `env_secrets`,
+  `inherit_env`). `namespace` exposes a server's tools as `{namespace}__{tool}`,
+  which keeps them from colliding with each other or with server-side tools.
 - `[surfaces.<name>].enabled` — which defined servers that surface hosts. A
   surface with **no** entry inherits `[surfaces.default]`; an **explicit empty**
   list means "nothing".
@@ -39,7 +39,7 @@ Definitions say what exists; surfaces say who gets what.
 
 A server spawned from here does not inherit the client process's whole
 environment — only a small named allowlist, plus this server's own `env`/
-`env_secrets`. See [Environment Variables](mcp-services.md#environment-variables)
+`env_secrets`/`inherit_env`. See [Environment Variables](mcp-services.md#environment-variables)
 for the full list and what to do if a server needs something else.
 
 ## Example

@@ -132,6 +132,7 @@ done
             enabled: true,
             env: HashMap::new(),
             env_secrets: HashMap::new(),
+            inherit_env: Vec::new(),
             http: None,
             description: None,
         }

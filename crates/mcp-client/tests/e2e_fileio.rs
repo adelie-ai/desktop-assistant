@@ -110,6 +110,7 @@ async fn executor_with_real_mcp_server() {
         enabled: true,
         env: std::collections::HashMap::new(),
         env_secrets: std::collections::HashMap::new(),
+        inherit_env: Vec::new(),
         http: None,
         description: None,
     }];

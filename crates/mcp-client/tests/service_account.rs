@@ -84,6 +84,7 @@ fn account_server(name: &str, url: String, scopes: &[&str]) -> McpServerConfig {
         enabled: true,
         env: HashMap::new(),
         env_secrets: HashMap::new(),
+        inherit_env: Vec::new(),
         http: Some(HttpTransportConfig {
             url,
             auth_bearer_secret: None,
@@ -202,6 +203,7 @@ async fn inline_oauth_server_still_connects() {
         enabled: true,
         env: HashMap::new(),
         env_secrets: HashMap::new(),
+        inherit_env: Vec::new(),
         http: Some(HttpTransportConfig {
             url: server.url("/mcp"),
             auth_bearer_secret: None,

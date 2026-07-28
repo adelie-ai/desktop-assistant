@@ -475,6 +475,7 @@ OTHER_VAR = "value"
                 enabled: true,
                 env: std::collections::HashMap::new(),
                 env_secrets: std::collections::HashMap::new(),
+                inherit_env: Vec::new(),
                 http: None,
                 description: None,
             },
@@ -486,6 +487,7 @@ OTHER_VAR = "value"
                 enabled: false,
                 env: std::collections::HashMap::new(),
                 env_secrets: std::collections::HashMap::new(),
+                inherit_env: Vec::new(),
                 http: None,
                 description: None,
             },
@@ -738,6 +740,7 @@ scopes = [
             enabled: true,
             env: std::collections::HashMap::new(),
             env_secrets: std::collections::HashMap::new(),
+            inherit_env: Vec::new(),
             http: Some(HttpTransportConfig {
                 url: "https://calendarmcp.googleapis.com/mcp/v1".into(),
                 auth_bearer_secret: None,
@@ -790,6 +793,7 @@ scopes = [
                 enabled: true,
                 env: std::collections::HashMap::new(),
                 env_secrets: std::collections::HashMap::new(),
+                inherit_env: Vec::new(),
                 http: None,
                 description: None,
             },
@@ -801,6 +805,7 @@ scopes = [
                 enabled: true,
                 env: std::collections::HashMap::new(),
                 env_secrets: std::collections::HashMap::new(),
+                inherit_env: Vec::new(),
                 http: Some(crate::executor::HttpTransportConfig {
                     url: "https://calendarmcp.googleapis.com/mcp/v1".into(),
                     auth_bearer_secret: Some("google_work_token".into()),
@@ -974,6 +979,7 @@ command = "fileio-mcp"
             enabled: true,
             env: std::collections::HashMap::new(),
             env_secrets: std::collections::HashMap::new(),
+            inherit_env: Vec::new(),
             http: None,
             description: None,
         }];

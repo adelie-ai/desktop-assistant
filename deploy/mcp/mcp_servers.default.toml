@@ -48,6 +48,11 @@ description = "Create, organize, and track to-do tasks and projects."
 command = "/opt/adele/mcp/tasks-mcp"
 args = ["serve"]
 enabled = true
+# tasks-mcp runs a session-bus signal service by default so QML widgets
+# refresh when a task changes (non-fatal if the bus is unreachable, e.g. the
+# headless fleet container). DBUS_SESSION_BUS_ADDRESS is scoped to this
+# server rather than granted globally - see docs/mcp-services.md#environment-variables.
+inherit_env = ["DBUS_SESSION_BUS_ADDRESS"]
 
 [[servers]]
 name = "timeclock"
@@ -125,3 +130,8 @@ description = "Search internet radio stations and play them."
 command = "/opt/adele/mcp/internet-radio-mcp"
 args = ["serve"]
 enabled = false
+# internet-radio-mcp spawns `mpv`, which needs XDG_RUNTIME_DIR to find the
+# PipeWire/PulseAudio session socket - relevant on the client-side MCP host
+# (a real desktop session), not this headless fleet image. Scoped to this
+# server rather than granted globally - see docs/mcp-services.md#environment-variables.
+inherit_env = ["XDG_RUNTIME_DIR"]

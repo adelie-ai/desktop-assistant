@@ -394,6 +394,7 @@ impl SettingsService for DaemonSettingsService {
             enabled,
             env: std::collections::HashMap::new(),
             env_secrets: std::collections::HashMap::new(),
+            inherit_env: Vec::new(),
             http: None,
             description: None,
         };

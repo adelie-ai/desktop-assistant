@@ -128,6 +128,37 @@ fn every_shipped_server_is_a_bundled_stdio_binary() {
     );
 }
 
+/// `tasks` and `internet-radio` are the only two servers scoped to receive a
+/// session-bus/runtime-dir variable via `inherit_env` (#910 round 3) -
+/// deliberately narrow rather than a global grant, since both variables are
+/// also the standard D-Bus session-bus auto-discovery route to the
+/// freedesktop Secret Service. Pin the grant to exactly these two servers so
+/// a future edit to the shipped config cannot silently widen it.
+#[test]
+fn only_tasks_and_internet_radio_inherit_a_session_variable() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let src = staged_source(dir.path());
+    let dest = dir.path().join("mcp_servers.toml");
+    ensure_mcp_config_exists(&dest, Some(&src)).expect("seed");
+    let servers = load_mcp_configs(&dest).expect("load");
+
+    let with_inherit_env: Vec<(&str, &[String])> = servers
+        .iter()
+        .filter(|s| !s.inherit_env.is_empty())
+        .map(|s| (s.name.as_str(), s.inherit_env.as_slice()))
+        .collect();
+
+    assert_eq!(
+        with_inherit_env,
+        [
+            ("tasks", ["DBUS_SESSION_BUS_ADDRESS".to_string()].as_slice()),
+            ("internet-radio", ["XDG_RUNTIME_DIR".to_string()].as_slice()),
+        ],
+        "only tasks (session-bus signal service) and internet-radio (mpv's \
+         audio session) should inherit a session-scoped variable"
+    );
+}
+
 #[test]
 fn seeding_never_clobbers_an_existing_config() {
     let dir = tempfile::tempdir().expect("tempdir");

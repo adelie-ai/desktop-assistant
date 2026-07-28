@@ -96,6 +96,7 @@ Fields:
 | `namespace` | no       | If set, all tools from this server are exposed as `{namespace}__{tool_name}`; if absent, tool names are passed through unchanged |
 | `env`       | no       | Extra environment variables for the process, as `[servers.env]` key/value pairs |
 | `env_secrets` | no     | Environment variables whose value is looked up by ID from `secrets.toml`, as `[servers.env_secrets]` key/secret-id pairs |
+| `inherit_env` | no     | Names of variables this server is opted in to receive from the daemon's own environment, beyond the [always-passed-through allowlist](#environment-variables) — see [Per-server opt-in](#per-server-opt-in-inherit_env) |
 | `[servers.http]` | no  | Reach the server over HTTP instead of spawning `command` — see [Remote (HTTP) MCP Servers](#remote-http-mcp-servers) |
 
 The daemon communicates with each server over stdio using the MCP JSON-RPC protocol.
@@ -121,8 +122,6 @@ environment:
 | `TZ` | Local-time timestamps |
 | `HTTP_PROXY`, `http_proxy`, `HTTPS_PROXY`, `https_proxy`, `NO_PROXY`, `no_proxy` | Outbound HTTP through a proxy |
 | `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME`, `XDG_STATE_HOME` | Standard config/data/cache/state directories |
-| `XDG_RUNTIME_DIR` | `internet-radio-mcp` spawns `mpv`, which needs this to locate the PipeWire/PulseAudio session socket; also the D-Bus specification's documented fallback for locating the session bus |
-| `DBUS_SESSION_BUS_ADDRESS` | `tasks-mcp` (enabled by default) runs a session-bus signal service so QML widgets refresh when a task changes; it treats a bus failure as non-fatal, so without this the feature silently stops working instead of erroring |
 | `WEB_CHROME_PATH` | Path to a bundled Chromium binary (`web-mcp`) |
 | `SKILLS_MCP_ROOTS` | Skill-root search path (`skills-mcp`, enabled by default) |
 | `SKILLS_MCP_WRITE_ROOT` | Where `skills-mcp` (enabled by default) writes a new skill when the default root is not writable |
@@ -153,6 +152,38 @@ through globally rather than per-server, open an issue on
 `adelie-ai/desktop-assistant` naming the server and the variable; the list is
 kept deliberately short and evidence-based (see `ENV_PASSTHROUGH_ALLOWLIST`
 in `crates/mcp-client/src/lib.rs`), not grown on request.
+
+### Per-server opt-in: `inherit_env`
+
+A few variables are genuinely useful to exactly one shipped server, but would
+be a bad idea to grant every spawned server — including a third-party one an
+operator adds — by default. `DBUS_SESSION_BUS_ADDRESS` and `XDG_RUNTIME_DIR`
+are the concrete case: both are also exactly what a stock D-Bus client
+library uses to auto-discover the session bus, which fronts the freedesktop
+Secret Service holding connector API keys and MCP OAuth tokens. Granting
+either one globally would give every spawned stdio server a route to that
+credential store by default — a real lowering of the security bar, not a
+theoretical one, even though the same uid could in principle reconstruct the
+bus address by other means.
+
+`inherit_env` names the variables a *specific* server is opted in to receive
+from the daemon's own environment, on top of `env`/`env_secrets` (which still
+win on a name collision):
+
+```toml
+[[servers]]
+name        = "tasks"
+command     = "tasks-mcp"
+args        = ["serve"]
+inherit_env = ["DBUS_SESSION_BUS_ADDRESS"]
+```
+
+The shipped default config (`deploy/mcp/mcp_servers.default.toml`) sets this
+for exactly two servers: `tasks` (`DBUS_SESSION_BUS_ADDRESS`, for its
+session-bus signal service that refreshes QML widgets) and `internet-radio`
+(`XDG_RUNTIME_DIR`, so the `mpv` it spawns can find the PipeWire/PulseAudio
+session socket). Every other server — including any third-party one you
+add — does not receive either variable unless you opt it in explicitly here.
 
 ## Tool Namespacing
 
