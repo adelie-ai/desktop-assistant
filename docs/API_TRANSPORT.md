@@ -31,6 +31,15 @@ This mirrors the Ports & Adapters approach in `AGENTS.md`.
 - `AssistantDelta { request_id, chunk }`
 - `AssistantCompleted { request_id, full_response }`
 - `Error { code, message, retryable }`
+- `AssistantStatus { conversation_id, request_id, message, capability_change? }`
+
+`capability_change` carries a tool-provenance narrowing: once a turn has taken
+in content from outside the trust boundary, the daemon refuses the acting tool
+tiers for the remainder of that turn, and says so once. It is optional and
+absent on ordinary progress statuses. `docs/WEBSOCKET_API.md` documents the
+payload and what an integrator does about it; the same contract reaches D-Bus
+clients through `ResponseStatus`, minus the structured field
+(`docs/dbus-api.md`).
 
 ## Config
 Settings are expected to be small in number (~10). Prefer a **typed config struct** for v1:

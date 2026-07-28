@@ -72,6 +72,58 @@ The project follows a ports-and-adapters (hexagonal) layout:
 1. TUI (or any D-Bus client) calls `SendPrompt`
 2. D-Bus adapter forwards to core service
 3. Core requests LLM streaming completion
-4. If tool calls are requested, core executes tools through MCP executor
+4. If tool calls are requested, core checks each one against the caller's tool
+   allowlist and the turn's provenance gate, then executes the permitted ones
+   through the MCP executor
 5. D-Bus adapter emits chunk/complete/error signals
 6. Client renders updates incrementally
+
+### Tool-provenance gating
+
+A tool result is ordinary context, so instructions hidden in a web page the
+model fetched look exactly like instructions the user wrote. `core::tool_provenance`
+classifies every shipped tool on two axes - whether an outside party can
+influence what it returns, and what it can do - and the turn loop tracks
+whether the current turn has taken in externally-controlled bytes.
+
+Once it has, the acting tiers (`mutate`, `network_egress`, `code_execution`,
+and anything unclassified) refuse for the rest of that turn. Two things stay
+open: reading, and output to the user's own session. Writing does not, and that
+includes the assistant's own memory - a scratchpad note, a pinned note, or a
+knowledge-base entry is read back into a later turn, and that turn starts
+clean. The loop's own `begin_step` / `complete_step` are intercepted before
+dispatch, so planning still works in a tainted turn.
+
+A refusal is a recoverable tool result, so the turn continues and the model can
+answer another way. It hands the way forward to the user rather than telling
+the model to retry later: the content that may be driving the call is still in
+the transcript on the next turn.
+
+Two durable surfaces are written outside the turn loop and are handled at the
+write rather than at the gate. Step-planning notes (`begin_step` /
+`complete_step`) are intercepted before the gate - the step stack has to close
+or the turn's compaction breaks - so the step structure is recorded and the
+model's wording is not. A subagent's answer is mirrored onto the session
+scratchpad from the completion path; it is kept, because
+`get_subagent_status` reads a detached delegation's result from that note and
+nowhere else, and stamped, so the two tools that can read it back - that one
+and `builtin_scratchpad_search` - close the gate when they do. Pinned notes
+render into later turns with no tool in the path and so are not covered; that
+needs a durable provenance marker rather than a third special case.
+
+The gate protects the turn that read the content. It does not stop a model that
+acts on the same text one turn later - that needs a taint marker persisted on
+the ingesting message, which is a later phase.
+
+The change is reported once per turn:
+
+- as `Event::AssistantStatus.capability_change`, a typed
+  `TurnCapabilityChange` naming the reason and the closed tiers, for a client
+  or an automation
+- as the same event's `message`, one line for a person watching
+
+`ToolUsageView.tool_tier` carries the same classification per tool, so an
+integrator can tell which tools a conversation uses can be refused mid-turn.
+
+There is no confirmation round-trip. A refused call stays refused for that
+turn.

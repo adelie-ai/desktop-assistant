@@ -123,6 +123,18 @@ A denied server renders as denied-by-policy in the MCP panel rather than silentl
 vanishing, consistent with the honest-state design already used there and with the
 project's capability-degradation rule: surface *why* something is off.
 
+One control cannot obey this rule, and it is the exception rather than a
+counter-example. Tool-provenance gating (`core::tool_provenance`) closes the
+acting tool tiers for a turn that has taken in content an outside party can
+influence. Whether a turn is tainted is not known until the turn runs, so the
+decision can only be made at call time. The refusal therefore carries the
+weight this decision normally puts on advertisement: it names the tool, states
+that the turn took in outside content, names the tier that is closed and for
+how long, and gives the model a way to continue that ends with the user rather
+than with a retry. The turn also emits one
+`TurnCapabilityChange` so a client sees the capability set narrow rather than
+inferring it from a decline.
+
 ### 6. Operator config and tenant config are different things
 
 `[database]`, `[tls]`, `[ws_auth]`, `[connections]` and their credentials,

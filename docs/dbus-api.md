@@ -85,6 +85,24 @@ the D-Bus error type, which carries only a name and a message (#974). See
 - `ResponseError(conversation_id: s, request_id: s, error: s)`
 - `ConfigChanged(llm_connector: s, llm_model: s, llm_base_url: s, llm_has_api_key: b, embeddings_connector: s, embeddings_model: s, embeddings_base_url: s, embeddings_has_api_key: b, embeddings_available: b, embeddings_is_default: b, persistence_enabled: b, persistence_remote_url: s, persistence_remote_name: s, persistence_push_on_update: b)`
 
+### Tool-provenance gating (behaviour change)
+
+A turn that has read content from outside the trust boundary refuses the tools
+that could act on it - write, network egress, code execution, and anything the
+daemon cannot classify - for the remainder of that turn. A tool call that would
+previously have run may now come back refused. The refusal is an ordinary tool
+result, not an error, so the turn continues and the assistant takes another
+path; the next turn starts clean.
+
+The daemon emits one status for the turn when this happens, carrying a
+human-readable line. D-Bus clients see it on the `Status(conversation_id: s,
+request_id: s, message: s)` signal, like any other progress message. The machine-readable form of the same fact -
+`capability_change`, naming the cause and the closed tiers - rides the
+WebSocket `assistant_status` event and is **not** projected onto the D-Bus
+signal, which carries only the text. A D-Bus client that needs the structured
+value reads it over the WebSocket transport instead
+(`docs/WEBSOCKET_API.md`).
+
 ## Quick `busctl` examples
 
 ```bash
