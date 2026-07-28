@@ -4378,4 +4378,77 @@ model = "claude-haiku-4-5-20251001"
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    // --- `[authz]`: the remote administrator allowlist (#728) --------------
+
+    mod authz {
+        use super::super::{AuthzConfig, DaemonConfig, load_daemon_config, save_daemon_config};
+
+        /// A daemon with no `[authz]` section grants nobody the administrator
+        /// capability over a remote transport. Fail closed.
+        #[test]
+        fn admin_subjects_default_to_empty() {
+            let cfg = DaemonConfig::default();
+            assert!(cfg.authz.admin_subjects.is_empty());
+            let parsed: DaemonConfig = toml::from_str("").expect("an empty config parses");
+            assert!(parsed.authz.admin_subjects.is_empty());
+        }
+
+        /// The single-user desktop must not acquire new configuration, so an
+        /// all-default config never writes an `[authz]` table.
+        #[test]
+        fn single_user_desktop_writes_no_authz_section() {
+            let serialized = toml::to_string(&DaemonConfig::default()).expect("serialize");
+            assert!(
+                !serialized.contains("[authz]"),
+                "a default config must not grow an authz table: {serialized}"
+            );
+        }
+
+        /// The operator's allowlist parses from the file and round-trips.
+        #[test]
+        fn admin_subjects_parse_from_the_config_file() {
+            let src = r#"
+[authz]
+admin_subjects = ["operator", "ops-oncall"]
+"#;
+            let cfg: DaemonConfig = toml::from_str(src).expect("parse");
+            assert_eq!(cfg.authz.admin_subjects, vec!["operator", "ops-oncall"]);
+
+            let serialized = toml::to_string(&cfg).expect("serialize");
+            assert!(serialized.contains("[authz]"), "{serialized}");
+            let reparsed: DaemonConfig = toml::from_str(&serialized).expect("reparse");
+            assert_eq!(reparsed.authz.admin_subjects, cfg.authz.admin_subjects);
+        }
+
+        /// The allowlist is file-only. No command writes it, and a settings
+        /// write that rewrites `daemon.toml` must preserve it verbatim - the
+        /// other half of "a tenant cannot grant themselves admin".
+        #[test]
+        fn admin_subjects_survive_a_config_rewrite() {
+            let dir = std::env::temp_dir().join(format!("da-authz-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).expect("create temp dir");
+            let path = dir.join("daemon.toml");
+
+            let mut cfg = DaemonConfig::default();
+            cfg.authz = AuthzConfig {
+                admin_subjects: vec!["operator".to_string()],
+            };
+            save_daemon_config(&path, &cfg).expect("write config");
+
+            let loaded = load_daemon_config(&path)
+                .expect("load config")
+                .expect("config present");
+            assert_eq!(loaded.authz.admin_subjects, vec!["operator".to_string()]);
+
+            // A later rewrite (what every settings command does) keeps it.
+            save_daemon_config(&path, &loaded).expect("rewrite config");
+            let reloaded = load_daemon_config(&path)
+                .expect("reload config")
+                .expect("config present");
+            assert_eq!(reloaded.authz.admin_subjects, vec!["operator".to_string()]);
+
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
 }

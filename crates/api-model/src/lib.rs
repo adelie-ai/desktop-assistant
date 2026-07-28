@@ -2081,6 +2081,89 @@ pub fn decode_client_context(value: &str) -> Option<ClientContext> {
 mod tests {
     use super::*;
 
+    // --- credential-carrying write commands (#899) -------------------------
+
+    /// A plaintext DSN on the write path must not print through `Debug`. The
+    /// command derives `Debug`, so a single `{:?}` in a log line would leak
+    /// the database password.
+    #[test]
+    fn set_database_settings_url_is_redacted_in_debug() {
+        let cmd = Command::SetDatabaseSettings {
+            url: Secret("postgres://adele:hunter2@db.internal/adele".to_string()),
+            max_connections: 5,
+        };
+        let rendered = format!("{cmd:?}");
+        assert!(
+            !rendered.contains("hunter2"),
+            "the DSN password must not reach a log line: {rendered}"
+        );
+        assert!(rendered.contains("Secret(***)"), "{rendered}");
+    }
+
+    /// Same for the git remote, whose HTTPS form carries a token.
+    #[test]
+    fn set_persistence_settings_remote_url_is_redacted_in_debug() {
+        let cmd = Command::SetPersistenceSettings {
+            enabled: true,
+            remote_url: Some(Secret(
+                "https://user:ghp_exampletoken@git.example.com/repo.git".to_string(),
+            )),
+            remote_name: Some("origin".to_string()),
+            push_on_update: true,
+        };
+        let rendered = format!("{cmd:?}");
+        assert!(
+            !rendered.contains("ghp_exampletoken"),
+            "the remote token must not reach a log line: {rendered}"
+        );
+        assert!(rendered.contains("Secret(***)"), "{rendered}");
+    }
+
+    /// `Secret` is `#[serde(transparent)]`, so wrapping these two fields is a
+    /// source-only change: the wire form older clients send is unchanged.
+    #[test]
+    fn secret_dsn_fields_keep_their_wire_form() {
+        let db_json = r#"{"set_database_settings":{"url":"postgres://u:p@h/d","max_connections":5}}"#;
+        let db: Command = serde_json::from_str(db_json).expect("legacy database payload parses");
+        assert_eq!(
+            db,
+            Command::SetDatabaseSettings {
+                url: Secret("postgres://u:p@h/d".to_string()),
+                max_connections: 5,
+            }
+        );
+        assert_eq!(serde_json::to_string(&db).unwrap(), db_json);
+
+        let git_json = r#"{"set_persistence_settings":{"enabled":true,"remote_url":"https://h/r.git","remote_name":"origin","push_on_update":false}}"#;
+        let git: Command =
+            serde_json::from_str(git_json).expect("legacy persistence payload parses");
+        assert_eq!(
+            git,
+            Command::SetPersistenceSettings {
+                enabled: true,
+                remote_url: Some(Secret("https://h/r.git".to_string())),
+                remote_name: Some("origin".to_string()),
+                push_on_update: false,
+            }
+        );
+        assert_eq!(serde_json::to_string(&git).unwrap(), git_json);
+
+        // A cleared remote still crosses as JSON null.
+        let cleared: Command = serde_json::from_str(
+            r#"{"set_persistence_settings":{"enabled":false,"remote_url":null,"remote_name":null,"push_on_update":false}}"#,
+        )
+        .expect("cleared persistence payload parses");
+        assert_eq!(
+            cleared,
+            Command::SetPersistenceSettings {
+                enabled: false,
+                remote_url: None,
+                remote_name: None,
+                push_on_update: false,
+            }
+        );
+    }
+
     #[test]
     fn uds_handshake_without_system_id_is_wire_compatible() {
         // Older shape: a bare `{"jwt": "…"}`. The optional fields must be

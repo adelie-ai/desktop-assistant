@@ -565,10 +565,18 @@ mod tests {
 
         use async_trait::async_trait;
         use desktop_assistant_application::UserId;
+        use desktop_assistant_transport_dispatch::{AdminSubjects, Capability};
         use desktop_assistant_uds::{PeerIdentity, UdsAuth, UdsAuthValidator};
         use desktop_assistant_ws as ws;
 
         use crate::transports::PeerCredUdsAuth;
+
+        fn capability(outcome: UdsAuth) -> Capability {
+            match outcome {
+                UdsAuth::Allow { capability, .. } => capability,
+                UdsAuth::Reject(reason) => panic!("expected Allow, got Reject({reason})"),
+            }
+        }
 
         /// JWT fallback stub: accepts only the literal token `"good"`, whose
         /// `sub` is `"jwtuser"`.
@@ -584,13 +592,28 @@ mod tests {
             }
         }
 
+        /// The uid this daemon pretends to run as in these tests.
+        const DAEMON_UID: u32 = 1000;
+
         fn auth() -> PeerCredUdsAuth {
-            PeerCredUdsAuth::new(Arc::new(StubJwt))
+            PeerCredUdsAuth::new(Arc::new(StubJwt), DAEMON_UID, Arc::new(AdminSubjects::default()))
+        }
+
+        fn auth_with_admins(subjects: &[&str]) -> PeerCredUdsAuth {
+            PeerCredUdsAuth::new(
+                Arc::new(StubJwt),
+                DAEMON_UID,
+                Arc::new(AdminSubjects::new(subjects.iter().copied())),
+            )
         }
 
         fn peer(username: &str) -> PeerIdentity {
+            peer_with_uid(username, DAEMON_UID)
+        }
+
+        fn peer_with_uid(username: &str, uid: u32) -> PeerIdentity {
             PeerIdentity {
-                uid: 1000,
+                uid,
                 username: username.to_string(),
                 real_name: None,
                 home_dir: None,
@@ -599,7 +622,7 @@ mod tests {
 
         fn allowed(outcome: UdsAuth) -> UserId {
             match outcome {
-                UdsAuth::Allow(user) => user,
+                UdsAuth::Allow { user, .. } => user,
                 UdsAuth::Reject(reason) => panic!("expected Allow, got Reject({reason})"),
             }
         }
@@ -639,6 +662,112 @@ mod tests {
                 auth().authenticate(Some("bogus"), None).await,
                 UdsAuth::Reject(_)
             ));
+        }
+
+        // --- authorization tier (#728) -------------------------------------
+
+        /// Local is admin by construction: a peer whose kernel-attested uid is
+        /// the daemon's own owns the daemon. This is what lets the single-user
+        /// desktop work with no `[authz]` configuration at all.
+        #[tokio::test]
+        async fn peer_cred_grants_admin_to_the_daemons_own_uid() {
+            let outcome = auth().authenticate(None, Some(&peer("dave"))).await;
+            assert_eq!(capability(outcome), Capability::Admin);
+        }
+
+        /// Another local account on the same host is a tenant. It still
+        /// authenticates - it simply does not run the daemon.
+        #[tokio::test]
+        async fn peer_cred_grants_tenant_to_another_uid() {
+            let outcome = auth()
+                .authenticate(None, Some(&peer_with_uid("someone", 1001)))
+                .await;
+            assert_eq!(capability(outcome), Capability::Tenant);
+        }
+
+        /// The allowlist also promotes a named local account, so a multi-user
+        /// host can name a second administrator without a code change.
+        #[tokio::test]
+        async fn allowlisted_local_subject_is_admin_despite_a_different_uid() {
+            let outcome = auth_with_admins(&["someone"])
+                .authenticate(None, Some(&peer_with_uid("someone", 1001)))
+                .await;
+            assert_eq!(capability(outcome), Capability::Admin);
+        }
+
+        /// The token fallback never inherits the local-peer grant: with no
+        /// peer credentials there is no unforgeable uid to compare, so only
+        /// the allowlist can promote the subject.
+        #[tokio::test]
+        async fn token_fallback_is_tenant_unless_the_subject_is_allowlisted() {
+            let outcome = auth().authenticate(Some("good"), None).await;
+            assert_eq!(capability(outcome), Capability::Tenant);
+
+            let outcome = auth_with_admins(&["jwtuser"])
+                .authenticate(Some("good"), None)
+                .await;
+            assert_eq!(capability(outcome), Capability::Admin);
+        }
+    }
+
+    /// The remote door's end of the tier (#728): a WebSocket subject is an
+    /// administrator only when `[authz] admin_subjects` names it.
+    mod ws_admin_subjects {
+        use std::path::PathBuf;
+        use std::sync::Arc;
+
+        use desktop_assistant_transport_dispatch::{AdminSubjects, Capability};
+        use desktop_assistant_ws::WsAuthValidator;
+
+        use crate::config::DaemonConfig;
+        use crate::settings_service::DaemonSettingsService;
+        use crate::transports::WsSettingsAuth;
+
+        /// The settings service is irrelevant to the capability decision, so
+        /// point it at a path that does not exist.
+        fn validator(subjects: &[&str]) -> WsSettingsAuth<DaemonSettingsService> {
+            WsSettingsAuth::new(
+                Arc::new(DaemonSettingsService::new(PathBuf::from(
+                    "/nonexistent/desktop-assistant-authz-728.toml",
+                ))),
+                Arc::new(AdminSubjects::new(subjects.iter().copied())),
+            )
+        }
+
+        /// The default (empty) allowlist admits nobody remotely.
+        #[test]
+        fn absent_subject_is_a_tenant() {
+            assert_eq!(
+                validator(&[]).capability_for_subject("alice"),
+                Capability::Tenant
+            );
+            assert_eq!(
+                validator(&["operator"]).capability_for_subject("alice"),
+                Capability::Tenant
+            );
+        }
+
+        /// A listed subject is an administrator.
+        #[test]
+        fn listed_subject_is_an_admin() {
+            assert_eq!(
+                validator(&["operator", "alice"]).capability_for_subject("alice"),
+                Capability::Admin
+            );
+        }
+
+        /// The allowlist is built straight from `[authz] admin_subjects`, and a
+        /// config with no `[authz]` section grants nobody.
+        #[test]
+        fn allowlist_comes_from_the_authz_config_section() {
+            let empty = AdminSubjects::from(&DaemonConfig::default().authz);
+            assert_eq!(empty.capability_for("alice"), Capability::Tenant);
+
+            let cfg: DaemonConfig = toml::from_str("[authz]\nadmin_subjects = [\"alice\"]\n")
+                .expect("parse authz config");
+            let allowlist = AdminSubjects::from(&cfg.authz);
+            assert_eq!(allowlist.capability_for("alice"), Capability::Admin);
+            assert_eq!(allowlist.capability_for("bob"), Capability::Tenant);
         }
     }
 }
