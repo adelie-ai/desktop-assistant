@@ -134,6 +134,104 @@ fn validate_command(command: &str, _args: &[String]) -> Result<(), McpError> {
     Ok(())
 }
 
+/// Names read from *this process's own* environment and passed through to
+/// **every** spawned stdio MCP child — including third-party ones this
+/// client is designed to talk to (this file talks to servers well beyond
+/// the shipped fleet, e.g. [`SUPPORTED_PROTOCOL_VERSIONS`]'s note on
+/// third-party servers, and [`ServerMetadata`] treats every server-declared
+/// field as untrusted) — on top of [`Command::env_clear`] and the server's
+/// own configured `env` (applied afterward, so a server's config always
+/// wins over the ambient value it happens to share a name with).
+///
+/// An explicit ALLOWLIST, not a denylist (#910): a `*_SECRET` / `*_TOKEN` /
+/// `*_PASSWORD` pattern match fails open on the next variable nobody thought
+/// of, which is exactly the failure mode that let a spawned child inherit
+/// `DESKTOP_ASSISTANT_DATABASE_URL` — the application role's Postgres DSN —
+/// and reach straight past the #721/#722 `scratch`-schema sandbox.
+///
+/// This same code path spawns servers for **two** deployment shapes: the
+/// daemon's own fleet (headless, containers) via `crates/mcp-client/src/executor.rs`,
+/// and the **client-side** MCP host (`crates/client-common/src/mcp_host/host.rs`),
+/// which runs on a real desktop session where D-Bus and audio genuinely
+/// exist. Weigh both when adding or refusing an entry, not just the fleet
+/// container.
+///
+/// **This list is deliberately narrower than "every variable some shipped
+/// server wants".** A variable that would hand *every* spawned server —
+/// including a third-party one an operator adds — a route to something
+/// sensitive belongs on [`McpServerConfig::inherit_env`] instead, scoped to
+/// the one server that needs it. `DBUS_SESSION_BUS_ADDRESS` and
+/// `XDG_RUNTIME_DIR` are the concrete case: both are exactly what a stock
+/// D-Bus client library uses to auto-discover the session bus, which fronts
+/// the freedesktop Secret Service holding connector API keys and MCP OAuth
+/// tokens — see [`McpServerConfig::inherit_env`]'s doc for the full
+/// reasoning. They are granted to `tasks-mcp` and `internet-radio-mcp`
+/// specifically, not here.
+///
+/// [`McpServerConfig::inherit_env`]: crate::executor::McpServerConfig::inherit_env
+///
+/// Every entry is named for the server(s) — in the shipped fleet
+/// (`deploy/mcp/mcp_servers.default.toml`, `Dockerfile.fleet`) or documented
+/// by the server itself — that need it. Add a new entry only with that same
+/// kind of evidence, not "it might be useful" — see
+/// `crates/mcp-client/tests/env_isolation.rs` for the test that must
+/// accompany it (one per variable, named for the server it protects, so a
+/// later tightening fails the test that names what it broke).
+const ENV_PASSTHROUGH_ALLOWLIST: &[&str] = &[
+    // Every spawned server needs these to run at all.
+    "PATH", // resolve its own subprocess dependencies (chromium, shell tools, mpv, ...)
+    "HOME", // XDG fallback dir + any library that resolves `~` for its own config/cache
+    // terminal-mcp's own defence-in-depth env scrub reads exactly this set -
+    // PATH, HOME, USER, TMPDIR, TERM, LANG - from its process environment
+    // before running a command. Supplying only some of those six would
+    // silently drop the rest regardless of terminal-mcp's own settings.
+    "USER",
+    "TMPDIR",
+    "TERM",
+    // Locale/time, named directly in #910's fix-shape.
+    "LANG",
+    "TZ",
+    // Outbound HTTP through a proxy: weather-forecast, geocode, openstreetmap,
+    // cve, and web all call an external service. Both casings, because
+    // different HTTP client libraries check different spellings.
+    "HTTP_PROXY",
+    "http_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "NO_PROXY",
+    "no_proxy",
+    // XDG base dirs. tasks-mcp and timeclock-mcp default their persistent
+    // storage under $XDG_DATA_HOME (docs/mcp-services.md); the k8s
+    // deployment repoints XDG_DATA_HOME/XDG_CONFIG_HOME at the
+    // persistent-volume state dir specifically so daemon-side state
+    // survives a pod restart (deploy/k8s/base/daemon.yaml). Without
+    // pass-through, a spawned server would silently fall back to $HOME on
+    // the ephemeral container filesystem and lose its data on the next
+    // restart. Pass the whole XDG family together - a compliant program
+    // isn't designed to reason about a partial view of it.
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_STATE_HOME",
+    // NOTE: XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS are deliberately
+    // NOT here — see this constant's doc comment above and
+    // `McpServerConfig::inherit_env`. Granting them globally would give
+    // every spawned server, including a third-party one, the standard
+    // auto-discovery route to the session D-Bus bus and, through it, the
+    // freedesktop Secret Service credential store.
+    //
+    // Named single-server dependencies from the shipped fleet image
+    // (Dockerfile.fleet, deploy/mcp/mcp_servers.default.toml) or documented
+    // by the server itself.
+    "WEB_CHROME_PATH",  // web-mcp: bundled headless-Chrome binary
+    "SKILLS_MCP_ROOTS", // skills-mcp: skill root search path
+    // skills-mcp (enabled by default): documented override for where NEW
+    // skills are written when the default root isn't writable (e.g. a
+    // read-only container filesystem) - the sibling of SKILLS_MCP_ROOTS
+    // above, for writes rather than reads.
+    "SKILLS_MCP_WRITE_ROOT",
+];
+
 /// "List changed" notification flags, shared between an `McpClient` and the
 /// executor that owns it. Kept behind an `Arc` so the executor can poll the
 /// flags without locking the client itself — a client busy with a slow tool
@@ -671,6 +769,13 @@ impl StdioTransport {
     /// first: it must be a single program name or path with no shell
     /// metacharacters (arguments go straight to `execve`, so they are not
     /// checked).
+    ///
+    /// The child gets an explicit environment, not the daemon's whole one
+    /// (#910): [`Command::env_clear`], then [`ENV_PASSTHROUGH_ALLOWLIST`]
+    /// read from this process's own environment, then `env` (the server's
+    /// configured `env`/`env_secrets`, already resolved by the caller) on
+    /// top — so a server's own config always wins over an ambient value it
+    /// shares a name with.
     fn spawn(
         command: &str,
         args: &[String],
@@ -686,7 +791,17 @@ impl StdioTransport {
             // DS-2: make the kernel reap the server if this transport is
             // dropped without an explicit `shutdown` (panic, cancelled task,
             // error mid-connect).
-            .kill_on_drop(true);
+            .kill_on_drop(true)
+            .env_clear();
+        for key in ENV_PASSTHROUGH_ALLOWLIST {
+            // `var_os`, not `var`: `var` returns `Err` both when a variable
+            // is absent and when its value is not valid UTF-8, which would
+            // silently drop a well-formed-but-non-UTF-8 value (e.g. a path
+            // with non-UTF-8 bytes) instead of passing it through.
+            if let Some(value) = std::env::var_os(key) {
+                cmd.env(key, value);
+            }
+        }
         for (key, value) in env {
             cmd.env(key, value);
         }
@@ -786,8 +901,65 @@ impl StdioTransport {
             }
         };
 
-        let ((), result) = tokio::try_join!(write_fut, read_fut)?;
-        Ok(result)
+        match tokio::try_join!(write_fut, read_fut) {
+            Ok(((), result)) => Ok(result),
+            Err(err) => Err(Self::enrich_with_exit_status(&mut self.child, err).await),
+        }
+    }
+
+    /// Bound on waiting for the child's exit status in
+    /// [`Self::enrich_with_exit_status`]. Generous because it only runs on an
+    /// already-failed path (a few extra seconds before reporting a failure
+    /// that already happened is a fair trade for naming its cause), and it
+    /// can never hang past the *caller's* own handshake timeout ([`INIT_TIMEOUT`]
+    /// / the configured request timeout in `McpClient::from_transport`),
+    /// since this whole wait runs inside that outer bound.
+    const EXIT_STATUS_WAIT: Duration = Duration::from_secs(10);
+
+    /// If `err` is the generic "server closed stdout" error and the child has
+    /// exited (or exits promptly), replace it with one naming the exit status.
+    ///
+    /// Why: a spawned server that exits immediately (missing dependency, bad
+    /// config, or — since #910 — an environment variable it needed that
+    /// isn't on [`ENV_PASSTHROUGH_ALLOWLIST`] or its own configured `env`)
+    /// used to surface only "MCP server closed stdout", which does not say
+    /// the process is even gone. This message flows verbatim into
+    /// `McpServerStatusInfo::detail` (the settings/KCM panel's honest-state
+    /// field) and the daemon's `ERROR failed to connect to MCP server` log
+    /// line, so naming the exit status here is what makes a too-tight
+    /// allowlist diagnosable instead of a silent "server just isn't there".
+    ///
+    /// Uses `wait()` rather than the non-blocking `try_wait()`: the pipe's
+    /// read end closes (which is what produced `err`) as soon as the kernel
+    /// tears down the process's file descriptors, but tokio's own SIGCHLD
+    /// -driven reaping runs on its own background task and can lag that under
+    /// scheduler contention — `try_wait()` observed here raced `Ok(None)`
+    /// ("still running") under a fully parallel `cargo test --workspace` run,
+    /// though the process had in fact already exited. `wait()` blocks until
+    /// the reap actually completes, bounded by [`Self::EXIT_STATUS_WAIT`] so
+    /// this can never hang the caller if stdout closed for some other reason
+    /// and the process is still alive.
+    async fn enrich_with_exit_status(child: &mut Child, err: McpError) -> McpError {
+        let McpError::UnexpectedResponse(ref msg) = err else {
+            return err;
+        };
+        if msg != "MCP server closed stdout" {
+            return err;
+        }
+        let Ok(Ok(status)) = tokio::time::timeout(Self::EXIT_STATUS_WAIT, child.wait()).await
+        else {
+            return err;
+        };
+        let detail = match status.code() {
+            Some(code) => format!("exited with status {code}"),
+            None => format!("was terminated by a signal ({status})"),
+        };
+        McpError::UnexpectedResponse(format!(
+            "MCP server {detail} before completing the handshake; if it needs an \
+             environment variable, set it in this server's own `env` config (see \
+             docs/mcp-services.md#environment-variables) rather than relying on it \
+             being inherited"
+        ))
     }
 
     async fn send_notification(

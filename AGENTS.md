@@ -84,21 +84,29 @@ The workspace is held to:
 - `cargo test --workspace`
 - the same `clippy` and `test` runs for `crates/storage-sqlite` with its
   `--features sqlite` on (`just lint-sqlite`, `just test-sqlite`)
+- the same `clippy` and `test` runs for `crates/client-common` with its
+  `--features mcp-host` on (`just lint-mcp-host`, `just test-mcp-host`)
 
-The last pair is not redundant. That crate is entirely behind an off-by-default
-`sqlite` feature - the feature exists so the daemon build never links the
-sqlite C library - so the `--workspace` steps compile an empty shell and run
-none of its tests. Only a step that names the crate *and* the feature covers
-it, and the shell suite `scripts/tests/sqlite-gate.test.sh` holds the gate to
-having one.
+Neither extra pair is redundant, for the same reason. `storage-sqlite` is
+entirely behind an off-by-default `sqlite` feature - the feature exists so the
+daemon build never links the sqlite C library. `client-common`'s
+`mcp_host` module (the client-side MCP host: the spawn path a real desktop
+session uses, as opposed to the daemon's own fleet) is behind an off-by-default
+`mcp-host` feature, and - unlike `sqlite` - no other workspace crate enables it
+as a normal dependency either, so nothing pulls it in via feature unification.
+Either way the `--workspace` steps compile an empty shell and run none of that
+code's tests. Only a step that names the crate *and* the feature covers it,
+and a shell suite holds the gate to having one:
+`scripts/tests/sqlite-gate.test.sh` and `scripts/tests/mcp-host-gate.test.sh`.
 
 `just check` runs all of those, each workspace step followed by its
-`storage-sqlite` counterpart (`lint` then `lint-sqlite`, `test` then
-`test-sqlite`), with `build` in between and `just test-scripts` last (the named
-tests for the gate's own shell steps, under `scripts/tests/`). The advisory scan
-and the secret scan both come first, before either `lint` or `build` - build
-scripts execute at first compile, under `clippy` as much as under `build`, and
-enabling `sqlite` adds `libsqlite3-sys`, which compiles C.
+`storage-sqlite` and `mcp-host` counterparts (`lint` then `lint-sqlite` then
+`lint-mcp-host`, `test` then `test-sqlite` then `test-mcp-host`), with `build`
+in between and `just test-scripts` last (the named tests for the gate's own
+shell steps, under `scripts/tests/`). The advisory scan and the secret scan
+both come first, before either `lint` or `build` - build scripts execute at
+first compile, under `clippy` as much as under `build`, and enabling `sqlite`
+adds `libsqlite3-sys`, which compiles C.
 
 What `just check` does **not** cover:
 

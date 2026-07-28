@@ -52,9 +52,10 @@ build:
 # toolchain).
 # `audit` and `secret-scan` come first on purpose: build scripts execute at
 # first compile - under `clippy` as much as under `build` - so both scans have
-# to precede either. The `-sqlite` steps are separate because that adapter is
-# compiled out of the workspace steps entirely; see `lint-sqlite`.
-check: audit secret-scan fmt-check lint lint-sqlite build test test-sqlite test-scripts
+# to precede either. The `-sqlite` and `-mcp-host` steps are separate because
+# that adapter/module is compiled out of the workspace steps entirely; see
+# `lint-sqlite` and `lint-mcp-host`.
+check: audit secret-scan fmt-check lint lint-sqlite lint-mcp-host build test test-sqlite test-mcp-host test-scripts
 
 # RustSec advisory scan of Cargo.lock. Fails loudly when cargo-audit is missing
 # or the advisory database cannot be fetched, rather than passing on silence
@@ -91,6 +92,15 @@ lint:
 lint-sqlite:
     cargo clippy -p desktop-assistant-storage-sqlite --features sqlite --all-targets -- -D warnings
 
+# Clippy the client-side MCP host with its own feature enabled (#910). The
+# `mcp-host` module (crates/client-common/src/mcp_host) is
+# `#[cfg(feature = "mcp-host")]`, off by default, and no other workspace crate
+# enables it as a dependency - so the workspace lint above type-checks none of
+# it. Without this step, a change to this module (including what environment a
+# spawned client-side server receives) can break it with no signal at all.
+lint-mcp-host:
+    cargo clippy -p desktop-assistant-client-common --features mcp-host --all-targets -- -D warnings
+
 # Run the workspace test suite (excludes #[ignore] integration tests)
 test:
     #!/usr/bin/env bash
@@ -107,6 +117,14 @@ test:
 # migration file is registered with the runner.
 test-sqlite:
     cargo test -p desktop-assistant-storage-sqlite --features sqlite
+
+# Run the client-side MCP host's own suite with its feature enabled (#910).
+# Its module is `#[cfg(feature = "mcp-host")]`, so `cargo test --workspace`
+# builds it as an empty crate and runs none of its tests - including the
+# environment-isolation coverage for the spawn path a real desktop session
+# uses.
+test-mcp-host:
+    cargo test -p desktop-assistant-client-common --features mcp-host
 
 # Real-Secret-Service integration tests (needs a live session bus; mutates + cleans keyring)
 test-integration:

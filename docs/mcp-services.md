@@ -94,9 +94,133 @@ Fields:
 | `command`   | for stdio | Executable to spawn — must be on `$PATH` or an absolute path. Omit when using `[servers.http]` |
 | `args`      | no       | Command-line arguments passed to the process (default: empty list)                   |
 | `namespace` | no       | If set, all tools from this server are exposed as `{namespace}__{tool_name}`; if absent, tool names are passed through unchanged |
+| `env`       | no       | Extra environment variables for the process, as `[servers.env]` key/value pairs |
+| `env_secrets` | no     | Environment variables whose value is looked up by ID from `secrets.toml`, as `[servers.env_secrets]` key/secret-id pairs |
+| `inherit_env` | no     | Names of variables this server is opted in to receive from the daemon's own environment, beyond the [always-passed-through allowlist](#environment-variables) — see [Per-server opt-in](#per-server-opt-in-inherit_env) |
 | `[servers.http]` | no  | Reach the server over HTTP instead of spawning `command` — see [Remote (HTTP) MCP Servers](#remote-http-mcp-servers) |
 
 The daemon communicates with each server over stdio using the MCP JSON-RPC protocol.
+
+## Environment Variables
+
+A spawned stdio server does not inherit its parent's environment. This is
+deliberate: the parent's environment can hold values a server has no reason
+to see, such as the database connection string. The rule is the same for
+both places that spawn a stdio server: the daemon's own fleet (this page) and
+the [client-side MCP host](client-mcp-host.md), which runs on a real desktop
+session where D-Bus and audio genuinely exist.
+
+The daemon passes through only a small, named set of variables from its own
+environment:
+
+| Variable | Why |
+|----------|-----|
+| `PATH` | Resolve the server's own subprocess dependencies (a bundled browser, shell tools, and so on) |
+| `HOME` | Config/cache directory fallback |
+| `USER`, `TMPDIR`, `TERM` | `terminal-mcp` reads exactly `PATH, HOME, USER, TMPDIR, TERM, LANG` from its own process environment as part of its defence-in-depth env scrub before running a command |
+| `LANG` | Locale-dependent output formatting |
+| `TZ` | Local-time timestamps |
+| `HTTP_PROXY`, `http_proxy`, `HTTPS_PROXY`, `https_proxy`, `NO_PROXY`, `no_proxy` | Outbound HTTP through a proxy |
+| `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME`, `XDG_STATE_HOME` | Standard config/data/cache/state directories |
+| `WEB_CHROME_PATH` | Path to a bundled Chromium binary (`web-mcp`) |
+| `SKILLS_MCP_ROOTS` | Skill-root search path (`skills-mcp`, enabled by default) |
+| `SKILLS_MCP_WRITE_ROOT` | Where `skills-mcp` (enabled by default) writes a new skill when the default root is not writable |
+
+Every other variable is stripped, even one the daemon itself received. A
+server that needs something else must receive it through its own `env` (or
+`env_secrets`, for a value stored in `secrets.toml`) in its `[[servers]]`
+entry:
+
+```toml
+[[servers]]
+name    = "my-server"
+command = "my-server-mcp"
+args    = ["serve"]
+
+[servers.env]
+MY_SERVER_SETTING = "value"
+```
+
+A server's own `env`/`env_secrets` always wins over a passed-through value of
+the same name.
+
+**This is a behaviour change.** Before this list existed, a spawned server
+inherited the daemon's whole environment. A server that read an inherited
+variable not on this list will stop seeing it — set that variable in the
+server's own `env` instead. If a server genuinely needs a variable passed
+through globally rather than per-server, open an issue on
+`adelie-ai/desktop-assistant` naming the server and the variable; the list is
+kept deliberately short and evidence-based (see `ENV_PASSTHROUGH_ALLOWLIST`
+in `crates/mcp-client/src/lib.rs`), not grown on request.
+
+### Per-server opt-in: `inherit_env`
+
+A few variables are genuinely useful to exactly one shipped server, but would
+be a bad idea to grant every spawned server — including a third-party one an
+operator adds — by default. `DBUS_SESSION_BUS_ADDRESS` and `XDG_RUNTIME_DIR`
+are the concrete case: both are also exactly what a stock D-Bus client
+library uses to auto-discover the session bus, which fronts the freedesktop
+Secret Service holding connector API keys and MCP OAuth tokens. Granting
+either one globally would give every spawned stdio server a route to that
+credential store by default — a real lowering of the security bar, not a
+theoretical one, even though the same uid could in principle reconstruct the
+bus address by other means.
+
+`inherit_env` names the variables a *specific* server is opted in to receive
+from the daemon's own environment, on top of `env`/`env_secrets` (which still
+win on a name collision):
+
+```toml
+[[servers]]
+name        = "tasks"
+command     = "tasks-mcp"
+args        = ["serve"]
+inherit_env = ["DBUS_SESSION_BUS_ADDRESS"]
+```
+
+The shipped default config (`deploy/mcp/mcp_servers.default.toml`) sets this
+for exactly two servers: `tasks` (`DBUS_SESSION_BUS_ADDRESS`, for its
+session-bus signal service that refreshes QML widgets) and `internet-radio`
+(`XDG_RUNTIME_DIR`, so the `mpv` it spawns can find the PipeWire/PulseAudio
+session socket). Every other server — including any third-party one you
+add — does not receive either variable unless you opt it in explicitly here.
+
+### Upgrading an existing install
+
+The daemon seeds the shipped default config on **first boot only** — it never
+overwrites an `mcp_servers.toml` that already exists (`ensure_mcp_config_exists`
+in `crates/mcp-client/src/config.rs`). The `inherit_env` grants above therefore
+reach a fresh container install automatically, but **not** an existing one:
+your own `mcp_servers.toml` (daemon) or `client-mcp.toml` (client-side host,
+see [Client-side MCP host](client-mcp-host.md)) is untouched. This matters
+most on a real desktop session — exactly where `DBUS_SESSION_BUS_ADDRESS` and
+`XDG_RUNTIME_DIR` mean something and where the credential store they front
+actually lives — since a headless fleet container is the case that seeds
+fresh most often.
+
+If you already have a `tasks` or `internet-radio` entry (or an
+equivalent third-party server that needs its own session-bus/runtime-dir
+variable) from before this change, add the relevant `inherit_env` line to it
+by hand:
+
+```toml
+[[servers]]
+name        = "tasks"
+command     = "tasks-mcp"
+args        = ["serve"]
+inherit_env = ["DBUS_SESSION_BUS_ADDRESS"]
+
+[[servers]]
+name        = "internet-radio"
+command     = "internet-radio-mcp"
+args        = ["serve"]
+inherit_env = ["XDG_RUNTIME_DIR"]
+```
+
+Without it, `tasks`' QML-widget-refresh signal service silently stops working
+(it treats a bus failure as non-fatal) and `internet-radio`'s spawned `mpv`
+cannot find the audio session — no error, just a feature that quietly does
+less than it used to.
 
 ## Tool Namespacing
 
@@ -318,7 +442,7 @@ When the daemon starts:
 3. `tools/list`, `resources/list`, and `prompts/list` are fetched from each server.
 4. A routing table is built mapping tool names → server index.
 
-If a server fails to start, a warning is logged and the daemon continues without that server's tools. No server failure is fatal to the daemon.
+If a server fails to start, a warning is logged and the daemon continues without that server's tools. No server failure is fatal to the daemon. If the server process exits before completing the handshake — for example because it needed an environment variable that is not on the [pass-through allowlist](#environment-variables) — the logged error names the exit status, so a missing dependency or missing configuration is diagnosable from the log line instead of reading as a generic protocol failure.
 
 ## Verifying Loaded Tools
 

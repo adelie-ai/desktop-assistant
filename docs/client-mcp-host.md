@@ -23,9 +23,9 @@ depending on which edge is connected.
 ## Schema
 
 - `[[servers]]` — server *definitions*, mirroring the daemon's `mcp_servers.toml`
-  (`name`, `command`, `args`, `namespace`, `enabled`, `env`, `env_secrets`).
-  `namespace` exposes a server's tools as `{namespace}__{tool}`, which keeps
-  them from colliding with each other or with server-side tools.
+  (`name`, `command`, `args`, `namespace`, `enabled`, `env`, `env_secrets`,
+  `inherit_env`). `namespace` exposes a server's tools as `{namespace}__{tool}`,
+  which keeps them from colliding with each other or with server-side tools.
 - `[surfaces.<name>].enabled` — which defined servers that surface hosts. A
   surface with **no** entry inherits `[surfaces.default]`; an **explicit empty**
   list means "nothing".
@@ -36,6 +36,11 @@ depending on which edge is connected.
   built-in on.
 
 Definitions say what exists; surfaces say who gets what.
+
+A server spawned from here does not inherit the client process's whole
+environment — only a small named allowlist, plus this server's own `env`/
+`env_secrets`/`inherit_env`. See [Environment Variables](mcp-services.md#environment-variables)
+for the full list and what to do if a server needs something else.
 
 ## Example
 
@@ -55,6 +60,17 @@ namespace = "git"
 name = "browser"
 command = "web-mcp"
 namespace = "web"
+
+# XDG_RUNTIME_DIR is not in the default allowlist (it's also how a stock
+# D-Bus client library auto-discovers the session bus, which fronts the
+# freedesktop Secret Service - see mcp-services.md#per-server-opt-in-inherit_env).
+# internet-radio-mcp's mpv genuinely needs it to find the PipeWire/PulseAudio
+# session, so this server opts it in explicitly.
+[[servers]]
+name        = "internet-radio"
+command     = "internet-radio-mcp"
+namespace   = "radio"
+inherit_env = ["XDG_RUNTIME_DIR"]
 
 # Applies to any surface without its own entry (e.g. tui).
 [surfaces.default]
