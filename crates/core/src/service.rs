@@ -2778,6 +2778,264 @@ mod tests {
         )
     }
 
+    // --- #941: a completed server-side tool emits a status ---
+
+    /// Statuses a completed tool produced, i.e. everything that is neither a
+    /// tool keepalive ("Still working on X") nor an LLM keepalive
+    /// ("Thinking..."). Keeps the #941 assertions independent of the #584 and
+    /// #611 keepalives, which stay unchanged.
+    fn completion_statuses(log: &Arc<std::sync::Mutex<Vec<String>>>) -> Vec<String> {
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|s| !s.starts_with("Still working on") && s.as_str() != "Thinking...")
+            .cloned()
+            .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_completed_server_tool_emits_a_status() {
+        // #941: the status must be driven by the tool resolving, not by the 30s
+        // keepalive timer. The clock is paused and the tool is instant, so a
+        // status here can only have come from the completion.
+        let tools = vec![ToolDefinition::new(
+            "calendar_list",
+            "List calendar",
+            serde_json::json!({}),
+        )];
+        let responses = vec![
+            LlmResponse::with_tool_calls("", vec![ToolCall::new("c1", "calendar_list", "{}")]),
+            LlmResponse::text("All set"),
+        ];
+        let mut tool_results = HashMap::new();
+        tool_results.insert("calendar_list".to_string(), "ok".to_string());
+
+        let handler = make_tool_handler(responses, tools, tool_results);
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        let (status_cb, status_log) = recording_status();
+        handler
+            .send_prompt(&conv.id, "Do it".into(), noop_callback(), status_cb)
+            .await
+            .expect("turn completes");
+
+        let all = status_log.lock().unwrap().clone();
+        assert!(
+            all.iter().all(|s| !s.starts_with("Still working on")),
+            "the keepalive must not have fired for an instant tool; got {all:?}"
+        );
+        assert_eq!(
+            completion_statuses(&status_log),
+            vec!["Ran calendar_list".to_string()],
+            "a resolved server-side tool must emit exactly one status; got {all:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn many_fast_tools_emit_status_without_the_keepalive_firing() {
+        // The reported case: ten fast tools inside one keepalive window. Every
+        // completion emits, so the client sees movement, and repeats of the same
+        // tool coalesce into one running line rather than ten separate ones.
+        let tools = vec![ToolDefinition::new(
+            "notes_search",
+            "Search notes",
+            serde_json::json!({}),
+        )];
+        let calls: Vec<ToolCall> = (0..10)
+            .map(|i| ToolCall::new(format!("c{i}"), "notes_search", "{}"))
+            .collect();
+        let responses = vec![
+            LlmResponse::with_tool_calls("", calls),
+            LlmResponse::text("All set"),
+        ];
+        let mut tool_results = HashMap::new();
+        tool_results.insert("notes_search".to_string(), "ok".to_string());
+
+        let handler = make_tool_handler(responses, tools, tool_results);
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        let (status_cb, status_log) = recording_status();
+        handler
+            .send_prompt(&conv.id, "Do it".into(), noop_callback(), status_cb)
+            .await
+            .expect("turn completes");
+
+        let all = status_log.lock().unwrap().clone();
+        assert_eq!(
+            all.iter()
+                .filter(|s| s.starts_with("Still working on"))
+                .count(),
+            0,
+            "ten fast tools must not need the keepalive; got {all:?}"
+        );
+        let completions = completion_statuses(&status_log);
+        assert_eq!(
+            completions.len(),
+            10,
+            "each of the ten completions must emit; got {completions:?}"
+        );
+        assert_eq!(
+            completions.first().map(String::as_str),
+            Some("Ran notes_search"),
+            "the first completion names the tool; got {completions:?}"
+        );
+        assert_eq!(
+            completions.last().map(String::as_str),
+            Some("Ran notes_search 10 times"),
+            "repeats of one tool coalesce into a running count; got {completions:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_tool_still_emits_a_status() {
+        // A tool that errors is more interesting to a watching human, not less.
+        // `MockToolExecutor` has no result for `flaky_probe`, so it errors.
+        let tools = vec![ToolDefinition::new(
+            "flaky_probe",
+            "Probe something",
+            serde_json::json!({}),
+        )];
+        let responses = vec![
+            LlmResponse::with_tool_calls("", vec![ToolCall::new("c1", "flaky_probe", "{}")]),
+            LlmResponse::text("That did not work"),
+        ];
+
+        let handler = make_tool_handler(responses, tools, HashMap::new());
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        let (status_cb, status_log) = recording_status();
+        handler
+            .send_prompt(&conv.id, "Do it".into(), noop_callback(), status_cb)
+            .await
+            .expect("turn completes");
+
+        let completions = completion_statuses(&status_log);
+        assert_eq!(
+            completions,
+            vec!["flaky_probe failed".to_string()],
+            "a failed tool must emit its own status; got {completions:?}"
+        );
+        assert!(
+            !completions.iter().any(|s| s.contains("unknown tool")),
+            "the status must not carry the executor's error detail; got {completions:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tool_status_never_contains_arguments_or_output() {
+        // The status reaches every subscribed client and the journal, so it
+        // carries the tool name and a count only - never the payload (#776).
+        const SECRET: &str = "sk-live-941-DO-NOT-LEAK";
+        let tools = vec![ToolDefinition::new(
+            "vault_fetch",
+            "Fetch a value",
+            serde_json::json!({}),
+        )];
+        let responses = vec![
+            LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new(
+                    "c1",
+                    "vault_fetch",
+                    format!(r#"{{"api_key":"{SECRET}"}}"#),
+                )],
+            ),
+            LlmResponse::text("Done"),
+        ];
+        let mut tool_results = HashMap::new();
+        tool_results.insert("vault_fetch".to_string(), format!("value={SECRET}"));
+
+        let handler = make_tool_handler(responses, tools, tool_results);
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        let (status_cb, status_log) = recording_status();
+        handler
+            .send_prompt(&conv.id, "Fetch it".into(), noop_callback(), status_cb)
+            .await
+            .expect("turn completes");
+
+        let all = status_log.lock().unwrap().clone();
+        assert!(
+            all.iter().all(|s| !s.contains(SECRET)),
+            "no status may carry tool arguments or output; got {all:?}"
+        );
+        // Prove the absence is not simply an absent status.
+        assert!(
+            all.iter().any(|s| s.contains("vault_fetch")),
+            "the completion status must still name the tool; got {all:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn step_control_tools_emit_no_completion_status() {
+        // `begin_step` narrates its goal and nothing else; `complete_step` stays
+        // silent. They are control tools, so a completion line is noise on top
+        // of the narration they already produce. The real tool between them
+        // proves the exclusion is selective, not a silent turn.
+        let tools = vec![ToolDefinition::new(
+            "notes_search",
+            "Search notes",
+            serde_json::json!({}),
+        )];
+        let responses = vec![
+            LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new(
+                    "b1",
+                    "begin_step",
+                    r#"{"goal":"map the plan"}"#,
+                )],
+            ),
+            LlmResponse::with_tool_calls("", vec![ToolCall::new("t1", "notes_search", "{}")]),
+            LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new(
+                    "c1",
+                    "complete_step",
+                    r#"{"outcome":"mapped"}"#,
+                )],
+            ),
+            LlmResponse::text("done"),
+        ];
+        let mut tool_results = HashMap::new();
+        tool_results.insert("notes_search".to_string(), "ok".to_string());
+
+        let (write, list, _sp) = in_memory_scratchpad();
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            ToolCallingLlm::new(responses),
+            MockToolExecutor::new(tools, tool_results),
+            id_gen(),
+        )
+        .with_scratchpad_write(write)
+        .with_scratchpad_list(list);
+
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        let (status_cb, status_log) = recording_status();
+        handler
+            .send_prompt(&conv.id, "plan it".into(), noop_callback(), status_cb)
+            .await
+            .expect("turn completes");
+
+        let all = status_log.lock().unwrap().clone();
+        assert_eq!(
+            all,
+            vec!["map the plan".to_string(), "Ran notes_search".to_string()],
+            "only the begin_step goal and the real tool's completion may appear; got {all:?}"
+        );
+    }
+
     #[tokio::test]
     async fn tool_loop_executes_tool_and_returns_final_text() {
         let tool_def = ToolDefinition::new(
@@ -3707,10 +3965,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_calls_without_steps_emit_no_status() {
-        // New narration model: no turn-start filler and no per-tool chatter. A
-        // turn that calls tools but declares no plan steps narrates nothing —
-        // progress is reserved for logical steps (`begin_step`).
+    async fn tool_calls_without_steps_emit_only_completion_status() {
+        // Narration model: still no turn-start filler, and a declared plan step
+        // is still the only thing that narrates a *goal*. What a turn without
+        // steps now emits is one compact completion line per resolved tool
+        // (#941), so a tool-heavy round is never silent.
         let tools = vec![
             ToolDefinition::new("calendar_list", "List calendar", serde_json::json!({})),
             ToolDefinition::new("notes_search", "Search notes", serde_json::json!({})),
@@ -3743,9 +4002,13 @@ mod tests {
         assert_eq!(result, "All set");
 
         let statuses = status_log.lock().unwrap().clone();
-        assert!(
-            statuses.is_empty(),
-            "tool calls without declared steps must emit no status; got {statuses:?}"
+        assert_eq!(
+            statuses,
+            vec![
+                "Ran calendar_list".to_string(),
+                "Ran notes_search".to_string()
+            ],
+            "tool calls without declared steps emit one completion line each; got {statuses:?}"
         );
     }
 
