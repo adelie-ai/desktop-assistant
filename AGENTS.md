@@ -35,13 +35,13 @@ The bar is high and the soundness argument must be written down in a `// SAFETY:
 - `impl Trait` in argument position for single-bound, single-use parameters.
 - Named generics with `where` clauses for multiple bounds, recursion, or readability.
 - 3+ generic parameters usually signals a missing struct or associated type.
-- Prefer `Arc<dyn Trait>` over hand-rolled enum-dispatch when there are many implementors and no perf-critical specialization (see open issue #44 for the `AnyLlmClient` cleanup).
+- Prefer `Arc<dyn Trait>` over hand-rolled enum-dispatch when there are many implementors and no perf-critical specialization. A hand-rolled `AnyX` enum re-dispatches every trait method by hand and grows a variant per implementor, so it collapses once the set is open-ended. Storage and LLM calls already await on a socket; a vtable hop is not the cost that matters.
 - `Send + Sync + 'static` co-located on the trait def when the trait is only useful in async contexts.
 
 ### Error handling
 - Library crates: `thiserror` with structured variants (e.g. `core::CoreError`).
 - Binary crates: `anyhow` with `Context::context()` for narrative.
-- **Never pattern-match on error message strings.** Pattern-match on variants. `error.to_string().contains("429")` means the upstream type is throwing away structured info that should be preserved (open issue #46).
+- **Never pattern-match on error message strings.** Pattern-match on variants. `error.to_string().contains("429")` means the upstream type is throwing away structured info that should be preserved. Fix the upstream type to carry the distinction as a variant instead of parsing its `Display` output.
 - `Display` should carry enough context for debugging without leaking secrets — see the `redacted_secret_audit` API-key fingerprint pattern.
 
 ### Testing
@@ -67,7 +67,7 @@ The bar is high and the soundness argument must be written down in a `// SAFETY:
   - **Every migration must still be idempotent.** A database migrated before the ledger existed has no record of anything, so its first boot under this runner replays the whole set once.
   - **A migration is applied and recorded in one transaction**, so nothing that cannot run inside a transaction block (`CREATE INDEX CONCURRENTLY`, `VACUUM`) belongs in one.
   - Behaviour that used to come free from re-running every file on every boot no longer does. Migration 029's RLS policy list is the example: a later migration that adds a user-scoped table must enable RLS itself.
-- Schema changes that touch personal-data tables must respect the multi-tenant boundary (`user_id` scoping). See the multi-tenant schema work (#102) as the reference shape.
+- Schema changes that touch personal-data tables must respect the multi-tenant boundary: the table carries `user_id`, every query is scoped by it, and the migration that creates the table enables its RLS policy in the same migration.
 
 ## Daemon entry points & operations
 
@@ -89,7 +89,7 @@ The last pair is not redundant. That crate is entirely behind an off-by-default
 sqlite C library - so the `--workspace` steps compile an empty shell and run
 none of its tests. Only a step that names the crate *and* the feature covers
 it, and the shell suite `scripts/tests/sqlite-gate.test.sh` holds the gate to
-having one (#742).
+having one.
 
 `just check` runs all of those, each workspace step followed by its
 `storage-sqlite` counterpart (`lint` then `lint-sqlite`, `test` then
@@ -122,7 +122,7 @@ Common, well-maintained cargo plugins are fine — `cargo-edit` (`cargo upgrade`
 
 `cargo-audit` is therefore a prerequisite of the gate, not an optional extra:
 `cargo install cargo-audit --locked`. The scan step (`just audit`,
-`scripts/audit.sh`) is deliberately unable to pass by accident (#706):
+`scripts/audit.sh`) is deliberately unable to pass by accident:
 
 - **cargo-audit not installed** - hard failure, with the install command.
 - **Advisory database unfetchable** (offline, blocked proxy) - hard failure. It
@@ -181,7 +181,7 @@ This group runs it with its own tooling:
 
 Several sessions run at the same time. `just test-db` gives every invocation its own
 container and its own host port, and removes only what it created, so two sessions can run
-the storage suites at once (#662). Hold any new recipe that provisions something shared to
+the storage suites at once. Hold any new recipe that provisions something shared to
 the same bar. A fixed name or a fixed port turns a second session into a plausible-looking
 flake in an unrelated test.
 
@@ -195,6 +195,27 @@ one. Extend an existing crate instead of adding one, unless the seam is obvious.
 GitHub Issues on `github.com/adelie-ai/desktop-assistant`, together with the shared `adelie-ai` project
 board. Manage entries with the `gh` CLI (`gh issue create`, `gh issue list`, `gh issue edit`,
 `gh pr create`). The board states in use are In Progress, In Review, and Done.
+
+### Platform, not a single product (addition)
+
+Adele is a platform, not one product. Solve for the general case at every seam that is
+plural by domain: storage backends, LLM providers, transports, clients, MCP servers, speech
+engines. When a requirement names two of something, ask whether the real requirement is N
+of them, and build that one instead.
+
+Put the abstraction at the port. Keep the conditional compilation and the selection in one
+factory, so a new implementation costs a crate, a feature, and one arm - not an edit to
+every implementation that already exists. A hand-rolled `AnyX` enum with a variant per
+implementation is the shape that fails this test: it re-dispatches every trait method by
+hand and grows with the set.
+
+Base rule 7.3 still holds inside a component. Do not invent indirection that a single call
+site does not need. It does not licence the narrow build at a platform seam, because there
+the plurality is the product, and the seam is already past the three-call-site test.
+
+Fail loudly and by name when a configured selection is not compiled in, or is unavailable.
+Name what was asked for and what is actually present. Silent degradation to a lesser
+backend hides the problem from the one person who could fix it.
 
 ### Capability-based degradation (addition)
 
