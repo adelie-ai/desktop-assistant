@@ -3595,35 +3595,42 @@ mod tests {
         assert_eq!(miss_json["ok"], false);
     }
 
+    /// Build a same-named "deploy" `IndexedSkill` for the `skill_get`
+    /// fallback-chain tests below, so each test states only what varies: a
+    /// `description` (to prove which row won) and whether the row is live or
+    /// a tombstone (`present_on_disk`).
+    fn deploy_skill(
+        description: &str,
+        present_on_disk: bool,
+    ) -> desktop_assistant_core::domain::IndexedSkill {
+        use desktop_assistant_core::domain::{IndexedSkill, Locality, SkillKind, TrustTier};
+        IndexedSkill {
+            name: "deploy".to_string(),
+            description: description.to_string(),
+            kind: SkillKind::Skill,
+            disk_path: "/skills/deploy/SKILL.md".to_string(),
+            owner_user_id: None,
+            locality: Locality::Daemon,
+            content_hash: "h".to_string(),
+            trust_tier: TrustTier::Local,
+            source: None,
+            tags: vec![],
+            attachments: vec![],
+            body: "body".to_string(),
+            metadata: serde_json::Value::Null,
+            present_on_disk,
+            last_seen_at: None,
+        }
+    }
+
     /// #911: the `owner` argument is gone from the wire, so `skill_get` has
     /// to resolve scope itself. When a row exists in both the caller's own
     /// scope and the global one, the caller's own wins -- the override-layer
     /// precedence the schema's description now promises.
     #[tokio::test]
     async fn skill_get_prefers_the_callers_own_skill_over_the_global_one() {
-        use desktop_assistant_core::domain::{IndexedSkill, Locality, SkillKind, TrustTier};
         use desktop_assistant_core::ports::skill_index::{SkillGetFn, SkillSearchFn};
         use std::sync::Arc;
-
-        fn variant(description: &str) -> IndexedSkill {
-            IndexedSkill {
-                name: "deploy".to_string(),
-                description: description.to_string(),
-                kind: SkillKind::Skill,
-                disk_path: "/skills/deploy/SKILL.md".to_string(),
-                owner_user_id: None,
-                locality: Locality::Daemon,
-                content_hash: "h".to_string(),
-                trust_tier: TrustTier::Local,
-                source: None,
-                tags: vec![],
-                attachments: vec![],
-                body: "body".to_string(),
-                metadata: serde_json::Value::Null,
-                present_on_disk: true,
-                last_seen_at: None,
-            }
-        }
 
         // The closure stands in for the store: `owner.is_some()` is exactly
         // what `PgSkillIndexStore::get` treats as "the caller's own scope"
@@ -3634,8 +3641,8 @@ mod tests {
                     return Ok(None);
                 }
                 Ok(Some(match owner {
-                    Some(_) => variant("caller's own"),
-                    None => variant("global"),
+                    Some(_) => deploy_skill("caller's own", true),
+                    None => deploy_skill("global", true),
                 }))
             })
         });
@@ -3657,31 +3664,19 @@ mod tests {
 
     /// #911: with no own-scoped row, `skill_get` falls back to the global
     /// skill of the same name rather than reporting a miss.
+    ///
+    /// Regression guard, not a discriminator: with no `owner` key in the
+    /// payload at all, the pre-#911 handler also computed `owner = None` and
+    /// made this same single `get_fn(name, None)` call, so this scenario
+    /// passes unchanged against the old handler. It still pins down real
+    /// behavior worth keeping -- `skill_get_prefers_the_callers_own_skill_over_the_global_one`
+    /// and the tombstone-shadowing tests below are the ones that actually
+    /// exercise the new two-step (own-then-global) lookup and would fail
+    /// against the old single-call handler.
     #[tokio::test]
     async fn skill_get_falls_back_to_the_global_skill_when_the_caller_has_none() {
-        use desktop_assistant_core::domain::{IndexedSkill, Locality, SkillKind, TrustTier};
         use desktop_assistant_core::ports::skill_index::{SkillGetFn, SkillSearchFn};
         use std::sync::Arc;
-
-        fn global_skill() -> IndexedSkill {
-            IndexedSkill {
-                name: "deploy".to_string(),
-                description: "global".to_string(),
-                kind: SkillKind::Skill,
-                disk_path: "/skills/deploy/SKILL.md".to_string(),
-                owner_user_id: None,
-                locality: Locality::Daemon,
-                content_hash: "h".to_string(),
-                trust_tier: TrustTier::Local,
-                source: None,
-                tags: vec![],
-                attachments: vec![],
-                body: "body".to_string(),
-                metadata: serde_json::Value::Null,
-                present_on_disk: true,
-                last_seen_at: None,
-            }
-        }
 
         // The caller has no own-scoped row: `owner.is_some()` misses, `None`
         // (the global lookup) hits.
@@ -3690,7 +3685,7 @@ mod tests {
                 if name != "deploy" || owner.is_some() {
                     return Ok(None);
                 }
-                Ok(Some(global_skill()))
+                Ok(Some(deploy_skill("global", true)))
             })
         });
         let search_fn: SkillSearchFn =
@@ -3704,6 +3699,76 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(json["ok"], true);
         assert_eq!(json["description"], "global");
+    }
+
+    /// A personal skill removed from disk survives in the append-only
+    /// catalog as a `present_on_disk: false` tombstone. Before #911, a
+    /// caller who hit that tombstone could still reach the global skill of
+    /// the same name by omitting `owner`. That escape hatch is gone now that
+    /// `owner` is off the wire, so `skill_get` itself must not let a dead
+    /// personal row permanently shadow a live global one.
+    #[tokio::test]
+    async fn skill_get_a_removed_personal_skill_does_not_shadow_a_live_global_skill() {
+        use desktop_assistant_core::ports::skill_index::{SkillGetFn, SkillSearchFn};
+        use std::sync::Arc;
+
+        let get_fn: SkillGetFn = Arc::new(|name, owner| {
+            Box::pin(async move {
+                if name != "deploy" {
+                    return Ok(None);
+                }
+                Ok(Some(match owner {
+                    Some(_) => deploy_skill("caller's own (removed)", false),
+                    None => deploy_skill("global", true),
+                }))
+            })
+        });
+        let search_fn: SkillSearchFn =
+            Arc::new(|_q, _emb, _model, _limit| Box::pin(async { Ok(Vec::new()) }));
+        let service = BuiltinToolService::new().with_skills(search_fn, get_fn);
+
+        let out = service
+            .execute_tool(TOOL_SKILL_GET, serde_json::json!({"name": "deploy"}))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(
+            json["description"], "global",
+            "a personal tombstone must not shadow a live global skill of the same name"
+        );
+        assert_eq!(json["present_on_disk"], true);
+    }
+
+    /// The mirror case: when the caller's personal row is a tombstone and
+    /// there is no global skill of the same name at all, the tombstone is
+    /// the only record that ever existed for that name, so it is still
+    /// returned (flagged, not hidden) rather than reporting a plain miss.
+    #[tokio::test]
+    async fn skill_get_returns_the_personal_tombstone_when_no_global_skill_exists() {
+        use desktop_assistant_core::ports::skill_index::{SkillGetFn, SkillSearchFn};
+        use std::sync::Arc;
+
+        let get_fn: SkillGetFn = Arc::new(|name, owner| {
+            Box::pin(async move {
+                if name != "deploy" {
+                    return Ok(None);
+                }
+                Ok(owner.map(|_| deploy_skill("caller's own (removed)", false)))
+            })
+        });
+        let search_fn: SkillSearchFn =
+            Arc::new(|_q, _emb, _model, _limit| Box::pin(async { Ok(Vec::new()) }));
+        let service = BuiltinToolService::new().with_skills(search_fn, get_fn);
+
+        let out = service
+            .execute_tool(TOOL_SKILL_GET, serde_json::json!({"name": "deploy"}))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["description"], "caller's own (removed)");
+        assert_eq!(json["present_on_disk"], false);
     }
 
     /// #911: `owner` used to be an LLM-supplied scope selector forwarded
