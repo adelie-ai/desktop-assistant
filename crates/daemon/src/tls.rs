@@ -599,8 +599,8 @@ mod tests {
     /// disabled TLS section makes those paths irrelevant.
     #[test]
     fn resolve_ws_tls_not_configured_at_all_is_deliberate_plaintext() {
-        let result = resolve_ws_tls(false, None, None)
-            .expect("TLS disabled must resolve, not error");
+        let result =
+            resolve_ws_tls(false, None, None).expect("TLS disabled must resolve, not error");
         assert!(matches!(result, WsTlsPosture::PlaintextByConfig));
 
         let dir = tempfile::tempdir().unwrap();
