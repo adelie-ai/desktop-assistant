@@ -21,6 +21,7 @@ use chrono::{DateTime, TimeZone, Utc};
 
 use super::SkillIndexStore;
 use crate::domain::{IndexedSkill, Locality, SkillKind, SkillScope, TrustTier};
+use crate::ports::auth::{UserId, with_user_id};
 use crate::skill_catalog::reconcile_scan;
 
 /// A fixed instant for the first pass; cases that need a later one use
@@ -194,7 +195,10 @@ pub async fn rescan_restores_presence_when_skill_returns(store: &dyn SkillIndexS
 }
 
 /// Presence is per-scope: reconciling one owner must not touch global skills or
-/// another owner's, present or absent.
+/// another owner's, present or absent. The owner-scoped reads below run as
+/// that owner via [`with_user_id`] -- `get` resolves "the caller's own" from
+/// the caller's real identity (#911), not from the `owner` argument, so a
+/// read of alice's or bob's row has to happen inside their own scope.
 pub async fn reconcile_leaves_other_scopes_untouched(store: &dyn SkillIndexStore) {
     let alice = SkillScope::Owner("alice".to_string());
     let bob = SkillScope::Owner("bob".to_string());
@@ -234,24 +238,30 @@ pub async fn reconcile_leaves_other_scopes_untouched(store: &dyn SkillIndexStore
     .await
     .expect("alice rescan");
 
-    let old = fetch(store, "alice-old", Some("alice")).await;
+    let (old, new_present) = with_user_id(UserId::new("alice"), async {
+        let old = fetch(store, "alice-old", Some("alice")).await;
+        let new_present = fetch(store, "alice-new", Some("alice"))
+            .await
+            .present_on_disk;
+        (old, new_present)
+    })
+    .await;
     assert!(
         !old.present_on_disk,
         "alice's earlier skill is retained and flagged"
     );
-    assert!(
-        fetch(store, "alice-new", Some("alice"))
-            .await
-            .present_on_disk
-    );
+    assert!(new_present);
+
     assert!(
         fetch(store, "shared", None).await.present_on_disk,
         "an owner scan must not mark global skills absent"
     );
-    assert!(
-        fetch(store, "bob-only", Some("bob")).await.present_on_disk,
-        "nor another owner's"
-    );
+
+    let bob_present = with_user_id(UserId::new("bob"), async {
+        fetch(store, "bob-only", Some("bob")).await.present_on_disk
+    })
+    .await;
+    assert!(bob_present, "nor another owner's");
 }
 
 /// An absent skill stays discoverable. Hiding it would quietly recreate the
@@ -335,7 +345,24 @@ pub async fn upsert_ignores_caller_supplied_presence(store: &dyn SkillIndexStore
 }
 
 /// `get` addresses one scope: the global skill and a user's skill of the same
-/// name are different rows, and neither answers for the other.
+/// name are different rows, and neither answers for the other. Reading the
+/// owner-scoped row happens as alice, via [`with_user_id`] -- `get` resolves
+/// "the caller's own" from the caller's real identity, never from the
+/// `owner` argument's string value (#911), so exercising it as anyone else
+/// would not prove this case.
+///
+/// The `bob names alice` case below is the one that actually distinguishes a
+/// compliant implementation from a pre-#911 one. Passing `Some("alice")`
+/// while installed as alice (the case above) proves nothing on its own: an
+/// implementation that still trusts the literal argument passes it
+/// identically to one that correctly consults the caller's real identity,
+/// because here the two happen to agree. Installing a *different* identity
+/// (bob, who has no "deploy" of his own) and naming a real, seeded owner
+/// (alice) as the argument is what forces disagreement: a compliant store
+/// resolves bob's own (empty) scope and returns nothing, while a store that
+/// still binds the argument literally returns alice's row -- exactly the
+/// leak #911 fixed. Any adapter's `get` must fail this specific case before
+/// its fix, or the case is not exercising the boundary at all.
 pub async fn get_is_scope_addressed(store: &dyn SkillIndexStore) {
     reconcile_scan(
         store,
@@ -355,17 +382,30 @@ pub async fn get_is_scope_addressed(store: &dyn SkillIndexStore) {
     .expect("alice scan");
 
     assert_eq!(fetch(store, "deploy", None).await.body, "the global one");
-    assert_eq!(
-        fetch(store, "deploy", Some("alice")).await.body,
-        "alice's own"
+
+    let alice_own = with_user_id(UserId::new("alice"), fetch(store, "deploy", Some("alice"))).await;
+    assert_eq!(alice_own.body, "alice's own");
+
+    // The discriminating case (see the doc comment above): bob has no
+    // "deploy" of his own, but names alice -- who genuinely has one -- as
+    // the `owner` argument.
+    let bob_naming_alice = with_user_id(UserId::new("bob"), async {
+        store.get("deploy", Some("alice")).await.expect("get")
+    })
+    .await;
+    assert!(
+        bob_naming_alice.is_none(),
+        "an owner argument naming a different, real, seeded owner must not surface that \
+         owner's row -- the caller's real identity decides scope, not the argument"
     );
+
     assert!(
         store
             .get("deploy", Some("nobody"))
             .await
             .expect("get")
             .is_none(),
-        "an unknown owner matches nothing"
+        "a caller with no matching scope gets nothing back"
     );
 }
 

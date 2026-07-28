@@ -16,6 +16,7 @@ mod support;
 use std::sync::Arc;
 
 use desktop_assistant_core::domain::{IndexedSkill, Locality, SkillKind, SkillScope, TrustTier};
+use desktop_assistant_core::ports::auth::{UserId, with_user_id};
 use desktop_assistant_core::ports::skill_index::{SkillIndexStore, conformance};
 use desktop_assistant_core::skill_catalog::reconcile_scan;
 use desktop_assistant_storage::embedding_backfill::{BackfillEmbedFn, backfill_skill_embeddings};
@@ -127,6 +128,28 @@ fn skill(name: &str, description: &str, hash: &str, body: &str) -> IndexedSkill 
     }
 }
 
+/// A user-scoped skill, mirroring [`skill`] but owned by `owner` (a
+/// synthetic tenant id such as `"tenant-a"`, never a real identity).
+fn owned_skill(name: &str, owner: &str, description: &str, hash: &str, body: &str) -> IndexedSkill {
+    IndexedSkill {
+        name: name.to_string(),
+        description: description.to_string(),
+        kind: SkillKind::Skill,
+        disk_path: format!("/home/{owner}/.local/share/adele/skills/{name}/SKILL.md"),
+        owner_user_id: Some(owner.to_string()),
+        locality: Locality::Client,
+        content_hash: hash.to_string(),
+        trust_tier: TrustTier::Local,
+        source: Some("client".to_string()),
+        tags: vec!["ops".to_string()],
+        attachments: vec![],
+        body: body.to_string(),
+        metadata: serde_json::json!({"author": "test"}),
+        present_on_disk: true,
+        last_seen_at: None,
+    }
+}
+
 fn fake_embed_fn() -> BackfillEmbedFn {
     // Deterministic fixed-dimension vector per input text.
     Box::new(|texts: Vec<String>| {
@@ -138,14 +161,15 @@ fn fake_embed_fn() -> BackfillEmbedFn {
 /// instant, so adapter-specific tests exercise the same write path production
 /// uses.
 async fn seed(store: &PgSkillIndexStore, skills: Vec<IndexedSkill>) {
-    reconcile_scan(
-        store,
-        &SkillScope::Global,
-        skills,
-        conformance::first_scan_at(),
-    )
-    .await
-    .expect("seed scan");
+    seed_scope(store, &SkillScope::Global, skills).await;
+}
+
+/// Like [`seed`], but scoped to any [`SkillScope`] -- for tests that seed a
+/// specific owner rather than the global scope.
+async fn seed_scope(store: &PgSkillIndexStore, scope: &SkillScope, skills: Vec<IndexedSkill>) {
+    reconcile_scan(store, scope, skills, conformance::first_scan_at())
+        .await
+        .expect("seed scan");
 }
 
 /// One test per contract case, each against its own throwaway schema.
@@ -288,6 +312,276 @@ async fn backfill_embeds_null_model_rows() {
             .await
             .unwrap();
         assert_eq!(again, 0);
+        fx
+    })
+    .await;
+}
+
+// -- #911: `get` must agree with `search`/`list` about whose rows a caller
+// -- can read. Each case below is a named acceptance criterion from the
+// -- issue. `get_refuses_another_users_skill`, `get_ignores_a_spoofed_owner_argument`,
+// -- and `get_scoping_matches_search_and_list` are the ones that actually
+// -- catch the vulnerability (they fail against the pre-fix `get`, which
+// -- trusted the caller-supplied `owner` string outright); the other three
+// -- assert behavior the fix must leave alone.
+
+#[tokio::test]
+async fn get_returns_a_global_skill() {
+    with_fixture("get_returns_a_global_skill", |fx| async move {
+        let store = PgSkillIndexStore::new(fx.pool.clone());
+        seed(
+            &store,
+            vec![skill("changelog", "publish notes", "h1", "steps")],
+        )
+        .await;
+
+        // A global skill (owner_user_id IS NULL) stays readable by any
+        // caller, including one with a real, unrelated identity installed.
+        let hit = with_user_id(UserId::new("someone"), async {
+            store.get("changelog", None).await.unwrap()
+        })
+        .await;
+
+        assert_eq!(
+            hit.expect("a global skill is readable by any caller").body,
+            "steps"
+        );
+        fx
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn get_returns_own_user_scoped_skill() {
+    with_fixture("get_returns_own_user_scoped_skill", |fx| async move {
+        let store = PgSkillIndexStore::new(fx.pool.clone());
+        seed_scope(
+            &store,
+            &SkillScope::Owner("tenant-a".to_string()),
+            vec![owned_skill(
+                "deploy-notes",
+                "tenant-a",
+                "A's own procedure",
+                "ha1",
+                "A's steps",
+            )],
+        )
+        .await;
+
+        let hit = with_user_id(UserId::new("tenant-a"), async {
+            store.get("deploy-notes", Some("tenant-a")).await.unwrap()
+        })
+        .await;
+
+        assert_eq!(
+            hit.expect("the owner reading their own skill must succeed")
+                .body,
+            "A's steps",
+            "the normal path is unaffected by the fix"
+        );
+        fx
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn get_refuses_another_users_skill() {
+    with_fixture("get_refuses_another_users_skill", |fx| async move {
+        let store = PgSkillIndexStore::new(fx.pool.clone());
+        seed_scope(
+            &store,
+            &SkillScope::Owner("tenant-a".to_string()),
+            vec![owned_skill(
+                "secret-recipe",
+                "tenant-a",
+                "A's private procedure",
+                "ha2",
+                "A's private steps",
+            )],
+        )
+        .await;
+
+        // Tenant B names tenant A's id as the `owner` argument -- exactly
+        // what an LLM forwarding a caller-supplied tool argument could do.
+        let hit = with_user_id(UserId::new("tenant-b"), async {
+            store.get("secret-recipe", Some("tenant-a")).await.unwrap()
+        })
+        .await;
+
+        assert!(
+            hit.is_none(),
+            "tenant B naming tenant A's id must get nothing back"
+        );
+        fx
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn get_ignores_a_spoofed_owner_argument() {
+    with_fixture("get_ignores_a_spoofed_owner_argument", |fx| async move {
+        let store = PgSkillIndexStore::new(fx.pool.clone());
+        seed_scope(
+            &store,
+            &SkillScope::Owner("tenant-a".to_string()),
+            vec![owned_skill(
+                "deploy-notes",
+                "tenant-a",
+                "A's own procedure",
+                "ha3",
+                "A's steps",
+            )],
+        )
+        .await;
+        seed_scope(
+            &store,
+            &SkillScope::Owner("tenant-b".to_string()),
+            vec![owned_skill(
+                "deploy-notes",
+                "tenant-b",
+                "B's own procedure",
+                "hb3",
+                "B's steps",
+            )],
+        )
+        .await;
+
+        // Tenant B asks for "deploy-notes" but *names* tenant A as the
+        // owner. The LLM-supplied string must not widen scope: B gets B's
+        // own row for that name, never A's.
+        let hit = with_user_id(UserId::new("tenant-b"), async {
+            store.get("deploy-notes", Some("tenant-a")).await.unwrap()
+        })
+        .await;
+
+        assert_eq!(
+            hit.expect("B has an own-scoped row for this name").body,
+            "B's steps",
+            "a spoofed owner argument resolves to the caller's own row, never the named one"
+        );
+        fx
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn single_tenant_get_is_unaffected() {
+    with_fixture("single_tenant_get_is_unaffected", |fx| async move {
+        let store = PgSkillIndexStore::new(fx.pool.clone());
+        seed(
+            &store,
+            vec![skill("changelog", "publish notes", "h4", "steps")],
+        )
+        .await;
+
+        // No task-local identity installed at all -- the desktop,
+        // single-tenant path. `current_user_id()` falls back to the schema
+        // sentinel, and a global skill is still readable exactly as before.
+        let hit = store.get("changelog", None).await.unwrap();
+        assert_eq!(
+            hit.expect("single-tenant global read is unaffected").body,
+            "steps"
+        );
+        fx
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn get_scoping_matches_search_and_list() {
+    with_fixture("get_scoping_matches_search_and_list", |fx| async move {
+        let store = PgSkillIndexStore::new(fx.pool.clone());
+        seed(
+            &store,
+            vec![skill(
+                "global-runbook",
+                "shared procedure",
+                "hg5",
+                "shared steps",
+            )],
+        )
+        .await;
+        seed_scope(
+            &store,
+            &SkillScope::Owner("tenant-a".to_string()),
+            vec![owned_skill(
+                "a-only",
+                "tenant-a",
+                "A's procedure",
+                "ha5",
+                "A's steps",
+            )],
+        )
+        .await;
+        seed_scope(
+            &store,
+            &SkillScope::Owner("tenant-b".to_string()),
+            vec![owned_skill(
+                "b-only",
+                "tenant-b",
+                "B's procedure",
+                "hb5",
+                "B's steps",
+            )],
+        )
+        .await;
+
+        with_user_id(UserId::new("tenant-a"), async {
+            // search: global + A's own, never B's.
+            let hits = store
+                .search("procedure", vec![], "test-model", 10)
+                .await
+                .unwrap();
+            let names: std::collections::BTreeSet<_> =
+                hits.iter().map(|s| s.name.clone()).collect();
+            assert!(
+                names.contains("global-runbook"),
+                "search sees the global row"
+            );
+            assert!(names.contains("a-only"), "search sees A's own row");
+            assert!(
+                !names.contains("b-only"),
+                "search must not surface another tenant's skill"
+            );
+
+            // list: the same boundary.
+            let listed = store.list(None).await.unwrap();
+            let listed_names: std::collections::BTreeSet<_> =
+                listed.iter().map(|s| s.name.clone()).collect();
+            assert!(
+                listed_names.contains("global-runbook"),
+                "list sees the global row"
+            );
+            assert!(listed_names.contains("a-only"), "list sees A's own row");
+            assert!(
+                !listed_names.contains("b-only"),
+                "list must not surface another tenant's skill"
+            );
+
+            // get: the same boundary, addressed one row at a time.
+            assert!(
+                store.get("global-runbook", None).await.unwrap().is_some(),
+                "get sees the global row"
+            );
+            assert!(
+                store
+                    .get("a-only", Some("tenant-a"))
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "get sees A's own row"
+            );
+            assert!(
+                store
+                    .get("b-only", Some("tenant-b"))
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "get must not surface another tenant's skill either -- \
+                 the three queries agree"
+            );
+        })
+        .await;
         fx
     })
     .await;

@@ -264,6 +264,15 @@ impl SkillIndexStore for SqliteSkillIndexStore {
         name: &str,
         owner: Option<&str>,
     ) -> Result<Option<IndexedSkill>, CoreError> {
+        // `owner` only distinguishes "give me the global one" (None) from
+        // "give me mine" (Some) -- the string it carries is untrusted (an
+        // LLM-forwarded MCP tool argument, #911) and is never used to
+        // address another user's row. `Some(_)` always resolves to
+        // `current_user_id()`, the same source `search`/`list` scope to, so
+        // a caller naming a different user's id gets a silent miss rather
+        // than that user's skill.
+        let user = current_user_id();
+        let owner_key = owner.map(|_| user.as_str());
         let row: Option<SkillTuple> = sqlx::query_as(
             "SELECT name, owner_user_id, description, kind, disk_path, locality, content_hash, \
                     trust_tier, source, tags, attachments, body, metadata, present_on_disk, \
@@ -271,7 +280,7 @@ impl SkillIndexStore for SqliteSkillIndexStore {
              FROM skill_index WHERE name = ? AND owner_key = ifnull(?, '')",
         )
         .bind(name)
-        .bind(owner)
+        .bind(owner_key)
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;

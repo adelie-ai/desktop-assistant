@@ -39,7 +39,9 @@ pub type SkillSearchFn = Arc<
 >;
 
 /// Boxed-closure boundary for fetching one skill. Args: `(name, owner)`, where
-/// `owner = None` addresses the global skill.
+/// `owner = None` addresses the global skill and `owner = Some(_)` the
+/// caller's own -- see [`SkillIndexStore::get`] for why the `Some` string
+/// itself is not trusted to pick a scope.
 pub type SkillGetFn = Arc<
     dyn Fn(
             String,
@@ -129,8 +131,20 @@ pub trait SkillIndexStore: Send + Sync {
     ) -> Result<Vec<IndexedSkill>, CoreError>;
 
     /// Fetch a single skill by name within a scope: `owner = None` addresses the
-    /// global skill of that name, `owner = Some(user)` the user's own. Returns
-    /// `Ok(None)` when absent.
+    /// global skill of that name, `owner = Some(_)` the caller's own.
+    ///
+    /// The string carried by `Some` is **not** itself trusted to pick whose
+    /// scope is read -- callers include an MCP tool handler that forwards an
+    /// LLM-supplied argument straight through (#911). An implementation must
+    /// resolve "the caller's own" from the caller's real, request-scoped
+    /// identity (e.g. the same source [`Self::search`] and [`Self::list`]
+    /// read), never from this argument; the argument only distinguishes
+    /// "give me the global one" from "give me mine". A caller naming a
+    /// different user's id therefore gets `Ok(None)`, the same silent miss as
+    /// a skill that doesn't exist, matching how `search`/`list` silently omit
+    /// rows outside the caller's scope rather than erroring.
+    ///
+    /// Returns `Ok(None)` when absent.
     async fn get(&self, name: &str, owner: Option<&str>)
     -> Result<Option<IndexedSkill>, CoreError>;
 
@@ -228,10 +242,20 @@ mod tests {
             name: &str,
             owner: Option<&str>,
         ) -> Result<Option<IndexedSkill>, CoreError> {
+            // Same contract as the real adapters (#911): `owner`'s string is
+            // untrusted and only its `Some`-ness matters. `Some(_)` always
+            // resolves to `current_user_id()`, never to the argument, so the
+            // reference implementation cannot silently regress the contract
+            // it exists to pin down.
+            let user = crate::ports::auth::current_user_id();
+            let scoped_owner = owner.map(|_| user);
             let rows = self.rows.lock().expect("lock");
             Ok(rows
                 .iter()
-                .find(|r| r.name == name && r.owner_user_id.as_deref() == owner)
+                .find(|r| {
+                    r.name == name
+                        && r.owner_user_id.as_deref() == scoped_owner.as_ref().map(|u| u.as_str())
+                })
                 .cloned())
         }
 
