@@ -143,6 +143,7 @@ impl RequestScope {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ports::turn_interactivity::{TurnInteractivity, current_turn_interactivity};
 
     #[tokio::test]
     async fn capture_outside_any_scope_is_all_defaults() {
@@ -153,6 +154,7 @@ mod tests {
         assert_eq!(scope.co_located, None);
         assert_eq!(scope.client_label, None);
         assert_eq!(scope.client_context, None);
+        assert_eq!(scope.interactivity, TurnInteractivity::Headless);
     }
 
     #[tokio::test]
@@ -192,6 +194,7 @@ mod tests {
         assert_eq!(captured.co_located, Some(true));
         assert_eq!(captured.client_label, Some("laptop".to_string()));
         assert_eq!(captured.client_context, Some(client_context.clone()));
+        assert_eq!(captured.interactivity, TurnInteractivity::Interactive);
 
         // Re-install from the captured bundle in a context where none of the
         // locals are set (simulating the post-spawn task) and read them back.
@@ -205,6 +208,7 @@ mod tests {
                     current_co_location(),
                     current_client_label(),
                     current_client_context(),
+                    current_turn_interactivity(),
                 )
             })
             .await;
@@ -215,6 +219,7 @@ mod tests {
         assert_eq!(observed.3, Some(true));
         assert_eq!(observed.4, Some("laptop".to_string()));
         assert_eq!(observed.5, Some(client_context));
+        assert_eq!(observed.6, TurnInteractivity::Interactive);
     }
 
     #[tokio::test]
@@ -261,6 +266,7 @@ mod tests {
                 username: Some("bob".to_string()),
                 ..ClientContext::default()
             }),
+            interactivity: TurnInteractivity::Interactive,
         };
         scope.scope(async {}).await;
 
@@ -271,5 +277,6 @@ mod tests {
         assert_eq!(current_co_location(), None);
         assert_eq!(current_client_label(), None);
         assert_eq!(current_client_context(), None);
+        assert_eq!(current_turn_interactivity(), TurnInteractivity::Headless);
     }
 }

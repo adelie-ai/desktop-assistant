@@ -2235,6 +2235,46 @@ mod tests {
         }
     }
 
+    /// An LLM that records the ambient [`TurnInteractivity`] every time the
+    /// turn loop calls it. `stream_completion` runs inside the loop, so what
+    /// this mock sees is what the loop itself can read (#942).
+    struct InteractivityProbeLlm {
+        observed: Arc<Mutex<Vec<crate::ports::turn_interactivity::TurnInteractivity>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for InteractivityProbeLlm {
+        async fn stream_completion(
+            &self,
+            _messages: Vec<Message>,
+            _tools: &[ToolDefinition],
+            _reasoning: ReasoningConfig,
+            mut on_chunk: ChunkCallback,
+        ) -> Result<LlmResponse, CoreError> {
+            self.observed
+                .lock()
+                .unwrap()
+                .push(crate::ports::turn_interactivity::current_turn_interactivity());
+            on_chunk("ok".to_string());
+            Ok(LlmResponse::text("ok".to_string()))
+        }
+    }
+
+    fn make_probe_handler(
+        observed: Arc<Mutex<Vec<crate::ports::turn_interactivity::TurnInteractivity>>>,
+    ) -> ConversationHandler<MockStore, InteractivityProbeLlm> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let counter = Arc::new(AtomicU64::new(0));
+        ConversationHandler::new(
+            MockStore::new(),
+            InteractivityProbeLlm { observed },
+            Box::new(move || {
+                let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                format!("conv-{n}")
+            }),
+        )
+    }
+
     fn make_handler(chunks: Vec<&str>) -> ConversationHandler<MockStore, MockLlm> {
         use std::sync::atomic::{AtomicU64, Ordering};
         let counter = Arc::new(AtomicU64::new(0));
@@ -2491,6 +2531,140 @@ mod tests {
             .unwrap();
         assert_eq!(response, "abc");
         assert_eq!(*chunks.lock().unwrap(), vec!["a", "b", "c"]);
+    }
+
+    /// #942 acceptance: the turn loop can read the turn's interactivity, so a
+    /// later phase can branch narration on it. The probe LLM reads the property
+    /// from inside `stream_completion`, which the loop drives.
+    #[tokio::test]
+    async fn the_turn_loop_observes_turn_interactivity() {
+        use crate::ports::session::{SessionId, with_session_id};
+        use crate::ports::turn_interactivity::{TurnInteractivity, with_turn_interactivity};
+
+        // A turn dispatched on a real client connection.
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let handler = make_probe_handler(Arc::clone(&observed));
+        let conv = handler
+            .create_conversation("Chat".into(), vec![])
+            .await
+            .expect("conversation created");
+        with_session_id(
+            SessionId::new("conn-7"),
+            handler.send_prompt(&conv.id, "hi".into(), noop_callback(), noop_status()),
+        )
+        .await
+        .expect("turn completes");
+        let seen = observed.lock().unwrap().clone();
+        assert!(
+            !seen.is_empty(),
+            "the turn loop drove the LLM at least once"
+        );
+        assert!(
+            seen.iter().all(|m| *m == TurnInteractivity::Interactive),
+            "a turn on a client session is interactive inside the loop: {seen:?}"
+        );
+
+        // The same turn with no connection scope installed.
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let handler = make_probe_handler(Arc::clone(&observed));
+        let conv = handler
+            .create_conversation("Chat".into(), vec![])
+            .await
+            .expect("conversation created");
+        handler
+            .send_prompt(&conv.id, "hi".into(), noop_callback(), noop_status())
+            .await
+            .expect("turn completes");
+        let seen = observed.lock().unwrap().clone();
+        assert!(
+            !seen.is_empty(),
+            "the turn loop drove the LLM at least once"
+        );
+        assert!(
+            seen.iter().all(|m| *m == TurnInteractivity::Headless),
+            "a turn with no session is headless inside the loop: {seen:?}"
+        );
+
+        // A turn a caller stated is headless, dispatched on a live connection.
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let handler = make_probe_handler(Arc::clone(&observed));
+        let conv = handler
+            .create_conversation("Chat".into(), vec![])
+            .await
+            .expect("conversation created");
+        with_session_id(
+            SessionId::new("conn-7"),
+            with_turn_interactivity(
+                TurnInteractivity::Headless,
+                handler.send_prompt(&conv.id, "hi".into(), noop_callback(), noop_status()),
+            ),
+        )
+        .await
+        .expect("turn completes");
+        let seen = observed.lock().unwrap().clone();
+        assert!(
+            !seen.is_empty(),
+            "the turn loop drove the LLM at least once"
+        );
+        assert!(
+            seen.iter().all(|m| *m == TurnInteractivity::Headless),
+            "a stated headless turn stays headless inside the loop: {seen:?}"
+        );
+    }
+
+    /// #942 lands the property and nothing else: no code branches on it yet, so
+    /// a turn must emit byte-identical chunks, statuses and text whichever
+    /// interactivity is installed.
+    #[tokio::test]
+    async fn turn_interactivity_does_not_change_what_a_turn_emits() {
+        use crate::ports::turn_interactivity::{TurnInteractivity, with_turn_interactivity};
+
+        async fn run_turn(
+            mode: Option<TurnInteractivity>,
+        ) -> (String, Vec<String>, Vec<String>, usize) {
+            let handler = make_handler(vec!["a", "b", "c"]);
+            let conv = handler
+                .create_conversation("Chat".into(), vec![])
+                .await
+                .expect("conversation created");
+            let chunks = Arc::new(Mutex::new(Vec::new()));
+            let chunks_cb = Arc::clone(&chunks);
+            let (status_cb, statuses) = recording_status();
+            let send = handler.send_prompt(
+                &conv.id,
+                "test".into(),
+                Box::new(move |chunk| {
+                    chunks_cb.lock().unwrap().push(chunk);
+                    true
+                }),
+                status_cb,
+            );
+            let response = match mode {
+                Some(m) => with_turn_interactivity(m, send).await,
+                None => send.await,
+            }
+            .expect("turn completes");
+            let history = handler
+                .get_conversation(&conv.id)
+                .await
+                .expect("conversation readable");
+            let seen_chunks = chunks.lock().unwrap().clone();
+            let seen_statuses = statuses.lock().unwrap().clone();
+            (response, seen_chunks, seen_statuses, history.messages.len())
+        }
+
+        let baseline = run_turn(None).await;
+        assert_eq!(baseline.0, "abc", "baseline turn still answers");
+        assert_eq!(
+            run_turn(Some(TurnInteractivity::Interactive)).await,
+            baseline,
+            "an interactive turn emits exactly what it did before"
+        );
+        assert_eq!(
+            run_turn(Some(TurnInteractivity::Headless)).await,
+            baseline,
+            "a headless turn emits exactly what it did before"
+        );
     }
 
     #[tokio::test]

@@ -1700,6 +1700,85 @@ async fn subagent_body_runs_under_installed_child_scope() {
     );
 }
 
+/// #942 acceptance: a subagent turn runs with no one watching, and it says so
+/// rather than inheriting the answer from whatever session happens to be
+/// ambient. The child body records the interactivity twice - once as it finds
+/// it, once with a live client session installed around the read. Both must be
+/// headless, so a later change that threads a connection into the child (client
+/// tools, a re-installed request scope) cannot silently turn the child's
+/// narration back on.
+#[tokio::test]
+async fn a_spawned_subagent_turn_is_headless_even_if_a_session_is_installed() {
+    use desktop_assistant_core::ports::session::{SessionId, with_session_id};
+    use desktop_assistant_core::ports::turn_interactivity::{
+        TurnInteractivity, current_turn_interactivity,
+    };
+
+    let registry = Arc::new(BackgroundTaskRegistry::new());
+    // The first conversation the spawn creates is "conv-0".
+    let observed: Arc<Mutex<Vec<(TurnInteractivity, TurnInteractivity)>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let obs = Arc::clone(&observed);
+    let conversations = Arc::new(FakeConversations::new("hi").with_behaviour(
+        "conv-0",
+        move |_cid, _prompt| {
+            let obs = Arc::clone(&obs);
+            async move {
+                let ambient = current_turn_interactivity();
+                let under_session = with_session_id(SessionId::new("conn-child"), async {
+                    current_turn_interactivity()
+                })
+                .await;
+                obs.lock().unwrap().push((ambient, under_session));
+                Ok("hi".to_string())
+            }
+        },
+    ));
+    let tools = SubagentTools::new(Arc::clone(&registry), Arc::clone(&conversations));
+    let user = unique_user("alice");
+
+    let tools_for_body = tools.clone();
+    let user_for_body = user.clone();
+    // The parent turn is a foreground one: a real client connection is open.
+    let (_pid, result) = with_session_id(
+        SessionId::new("conn-parent"),
+        under_parent_task(&registry, user.clone(), "parent-conv", move |_pid| {
+            let tools = tools_for_body;
+            let user = user_for_body;
+            async move {
+                with_user_id(user, async move {
+                    tools
+                        .execute_tool(
+                            TOOL_SPAWN_SUBAGENT,
+                            serde_json::json!({
+                                "name": "researcher",
+                                "prompt": "go",
+                                "wait": true,
+                            }),
+                        )
+                        .await
+                })
+                .await
+            }
+        }),
+    )
+    .await;
+
+    result.expect("spawn returned Ok");
+    let seen = observed.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1, "the child body ran exactly once");
+    assert_eq!(
+        seen[0].0,
+        TurnInteractivity::Headless,
+        "a subagent turn has no one watching it"
+    );
+    assert_eq!(
+        seen[0].1,
+        TurnInteractivity::Headless,
+        "the child's stated headlessness beats any session installed around it"
+    );
+}
+
 // --- #287 slice 7: SubagentAwareToolExecutor wrapper (#134) -----------------
 
 /// Minimal inner executor whose outputs are tagged so delegation is provable.

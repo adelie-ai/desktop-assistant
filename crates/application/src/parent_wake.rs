@@ -273,6 +273,10 @@ fn status_phrase(status: api::TaskStatus) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use desktop_assistant_core::ports::session::{SessionId, with_session_id};
+    use desktop_assistant_core::ports::turn_interactivity::{
+        TurnInteractivity, current_turn_interactivity,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::sync::oneshot;
@@ -329,11 +333,24 @@ mod tests {
         in_flight: AtomicUsize,
         max_in_flight: AtomicUsize,
         hold: Mutex<Option<oneshot::Receiver<()>>>,
+        /// What each wake turn observes for its interactivity (#942): the
+        /// ambient answer, and the answer with a live client session installed
+        /// around the read.
+        interactivity: Mutex<Vec<(TurnInteractivity, TurnInteractivity)>>,
     }
 
     #[async_trait]
     impl ParentWaker for MockWaker {
         async fn wake(&self, _user_id: UserId, _conversation_id: String, prompt: String) {
+            let ambient = current_turn_interactivity();
+            let under_session = with_session_id(SessionId::new("conn-7"), async {
+                current_turn_interactivity()
+            })
+            .await;
+            self.interactivity
+                .lock()
+                .expect("interactivity poisoned")
+                .push((ambient, under_session));
             let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_in_flight.fetch_max(now, Ordering::SeqCst);
             // The first wake awaits the hold (if installed) so the test can
@@ -408,6 +425,49 @@ mod tests {
             "asks for the holistic review when none remain: {prompt}"
         );
         drop(dynamic);
+    }
+
+    /// #942: a wake turn is one nobody asked for and nobody is watching, and
+    /// the coordinator states that rather than leaving it to whatever session
+    /// is ambient when the drain runs.
+    #[tokio::test]
+    async fn a_parent_wake_turn_is_headless() {
+        let waker = Arc::new(MockWaker::default());
+        let _dynamic: Arc<dyn ParentWaker> = waker.clone();
+        let coord = coordinator(&waker, true);
+
+        coord.on_completion(completion(
+            "sess-T",
+            "child-1",
+            "prices",
+            "todo-1",
+            "task-abc",
+            api::TaskStatus::Completed,
+            0,
+        ));
+
+        wait_until(
+            || waker.prompts.lock().expect("poisoned").len() == 1,
+            "one wake fired",
+        )
+        .await;
+
+        let seen = waker
+            .interactivity
+            .lock()
+            .expect("interactivity poisoned")
+            .clone();
+        assert_eq!(seen.len(), 1, "exactly one wake turn ran");
+        assert_eq!(
+            seen[0].0,
+            TurnInteractivity::Headless,
+            "a wake turn has no one watching it"
+        );
+        assert_eq!(
+            seen[0].1,
+            TurnInteractivity::Headless,
+            "the stated headlessness beats any session installed around the wake"
+        );
     }
 
     /// A completed child with siblings still running produces the "N more still
