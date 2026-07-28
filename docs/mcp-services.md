@@ -94,9 +94,58 @@ Fields:
 | `command`   | for stdio | Executable to spawn — must be on `$PATH` or an absolute path. Omit when using `[servers.http]` |
 | `args`      | no       | Command-line arguments passed to the process (default: empty list)                   |
 | `namespace` | no       | If set, all tools from this server are exposed as `{namespace}__{tool_name}`; if absent, tool names are passed through unchanged |
+| `env`       | no       | Extra environment variables for the process, as `[servers.env]` key/value pairs |
+| `env_secrets` | no     | Environment variables whose value is looked up by ID from `secrets.toml`, as `[servers.env_secrets]` key/secret-id pairs |
 | `[servers.http]` | no  | Reach the server over HTTP instead of spawning `command` — see [Remote (HTTP) MCP Servers](#remote-http-mcp-servers) |
 
 The daemon communicates with each server over stdio using the MCP JSON-RPC protocol.
+
+## Environment Variables
+
+A spawned stdio server does not inherit the daemon's environment. This is
+deliberate: the daemon's environment can hold values a server has no reason
+to see, such as the database connection string.
+
+The daemon passes through only a small, named set of variables from its own
+environment:
+
+| Variable | Why |
+|----------|-----|
+| `PATH` | Resolve the server's own subprocess dependencies (a bundled browser, shell tools, and so on) |
+| `HOME` | Config/cache directory fallback |
+| `LANG` | Locale-dependent output formatting |
+| `TZ` | Local-time timestamps |
+| `HTTP_PROXY`, `http_proxy`, `HTTPS_PROXY`, `https_proxy`, `NO_PROXY`, `no_proxy` | Outbound HTTP through a proxy |
+| `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME`, `XDG_STATE_HOME` | Standard config/data/cache/state directories |
+| `WEB_CHROME_PATH` | Path to a bundled Chromium binary (`web-mcp`) |
+| `SKILLS_MCP_ROOTS` | Skill-root search path (`skills-mcp`) |
+
+Every other variable is stripped, even one the daemon itself received. A
+server that needs something else must receive it through its own `env` (or
+`env_secrets`, for a value stored in `secrets.toml`) in its `[[servers]]`
+entry:
+
+```toml
+[[servers]]
+name    = "my-server"
+command = "my-server-mcp"
+args    = ["serve"]
+
+[servers.env]
+MY_SERVER_SETTING = "value"
+```
+
+A server's own `env`/`env_secrets` always wins over a passed-through value of
+the same name.
+
+**This is a behaviour change.** Before this list existed, a spawned server
+inherited the daemon's whole environment. A server that read an inherited
+variable not on this list will stop seeing it — set that variable in the
+server's own `env` instead. If a server genuinely needs a variable passed
+through globally rather than per-server, open an issue on
+`adelie-ai/desktop-assistant` naming the server and the variable; the list is
+kept deliberately short and evidence-based (see `ENV_PASSTHROUGH_ALLOWLIST`
+in `crates/mcp-client/src/lib.rs`), not grown on request.
 
 ## Tool Namespacing
 
@@ -318,7 +367,7 @@ When the daemon starts:
 3. `tools/list`, `resources/list`, and `prompts/list` are fetched from each server.
 4. A routing table is built mapping tool names → server index.
 
-If a server fails to start, a warning is logged and the daemon continues without that server's tools. No server failure is fatal to the daemon.
+If a server fails to start, a warning is logged and the daemon continues without that server's tools. No server failure is fatal to the daemon. If the server process exits before completing the handshake — for example because it needed an environment variable that is not on the [pass-through allowlist](#environment-variables) — the logged error names the exit status, so a missing dependency or missing configuration is diagnosable from the log line instead of reading as a generic protocol failure.
 
 ## Verifying Loaded Tools
 

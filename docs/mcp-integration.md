@@ -59,3 +59,6 @@ Exposed by `McpToolExecutor`:
 - Unit tests for parsing and list-change detection
 - Real-server e2e (`fileio-mcp`) for tool flow
 - Dynamic mock e2e for live `list_changed` cache refresh
+- Spawned-child environment isolation (the pass-through allowlist described in
+  [mcp-services.md](mcp-services.md#environment-variables)) and exit-status
+  diagnostics for a server that fails to start (`tests/env_isolation.rs`)

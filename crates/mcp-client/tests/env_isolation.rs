@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use desktop_assistant_mcp_client::McpClient;
+use desktop_assistant_mcp_client::{McpClient, McpError};
 
 /// Unique temp file path for this test process (mirrors `robustness.rs`).
 fn temp_path(label: &str) -> PathBuf {
@@ -130,10 +130,9 @@ async fn probe_env(
 ) -> HashMap<String, String> {
     let script = write_env_probe_script(label, probe_vars);
 
-    let mut client =
-        McpClient::connect("/bin/sh", &[script.display().to_string()], configured_env)
-            .await
-            .expect("env-probe server should complete the handshake");
+    let mut client = McpClient::connect("/bin/sh", &[script.display().to_string()], configured_env)
+        .await
+        .expect("env-probe server should complete the handshake");
 
     let raw = client
         .call_tool("env_probe", serde_json::json!({}))
@@ -341,7 +340,10 @@ async fn allowlisted_env_xdg_state_home_reaches_child_and_configured_env_wins_ov
     assert_eq!(seen["XDG_STATE_HOME"], "/ambient/state");
 
     let mut configured = HashMap::new();
-    configured.insert("XDG_STATE_HOME".to_string(), "/configured/state".to_string());
+    configured.insert(
+        "XDG_STATE_HOME".to_string(),
+        "/configured/state".to_string(),
+    );
     let seen = probe_env("xdg-state-override", &["XDG_STATE_HOME"], &configured).await;
     assert_eq!(
         seen["XDG_STATE_HOME"], "/configured/state",
@@ -366,4 +368,52 @@ async fn allowlisted_env_skills_mcp_roots_reaches_skills_mcp() {
         "skills-roots",
     )
     .await;
+}
+
+// --- Diagnosability: a too-tight allowlist must fail loud, not silent ------
+//
+// If a server genuinely needs a variable this allowlist doesn't carry, it
+// may exit immediately instead of completing the handshake. The daemon must
+// report *why* (the exit status) rather than a generic protocol error, so
+// the honest-state settings/KCM panel can show something a person can act
+// on. See `StdioTransport::enrich_with_exit_status`.
+
+/// A server that reads the initialize request and then exits immediately
+/// (simulating a crash on a missing dependency/env var) must be reported by
+/// its exit status, not the generic "server closed stdout" message.
+#[tokio::test]
+async fn server_exiting_before_handshake_reports_its_exit_status() {
+    let script = temp_path("exits-before-handshake");
+    std::fs::write(
+        &script,
+        r#"#!/bin/sh
+# Consume the initialize request, then exit without replying - simulating a
+# server that crashes on startup (e.g. a missing environment variable).
+read -r line
+exit 7
+"#,
+    )
+    .expect("write fake exiting server script");
+
+    let result =
+        McpClient::connect("/bin/sh", &[script.display().to_string()], &HashMap::new()).await;
+
+    let _ = std::fs::remove_file(&script);
+
+    match result {
+        Ok(_) => panic!("expected the handshake to fail, but connect succeeded"),
+        Err(McpError::UnexpectedResponse(msg)) => {
+            assert!(
+                msg.contains("exited with status 7"),
+                "expected the exit status in the error, got: {msg}"
+            );
+            assert_ne!(
+                msg, "MCP server closed stdout",
+                "the generic message must have been replaced with the exit status"
+            );
+        }
+        Err(other) => {
+            panic!("expected McpError::UnexpectedResponse naming the exit status, got: {other}")
+        }
+    }
 }
