@@ -42,6 +42,19 @@ const TOOL_SCRATCHPAD_PIN: &str = "builtin_scratchpad_pin";
 const TOOL_SKILL_SEARCH: &str = "builtin_skill_search";
 const TOOL_SKILL_GET: &str = "builtin_skill_get";
 
+/// Marker passed as `SkillGetFn`'s `owner` argument to mean "the caller's
+/// own scope". Per the port contract (#911), a conforming store resolves
+/// "the caller's own" from `current_user_id()`, never from this string, so
+/// its literal content is irrelevant to `PgSkillIndexStore::get` -- only its
+/// `Some`-ness is. It exists purely so [`BuiltinToolService::skill_get`]'s
+/// call site reads as intent, not a magic string.
+///
+/// `SqliteSkillIndexStore::get` does not implement this contract yet (a
+/// separately tracked gap, #850): there, `Some("self")` addresses a row
+/// literally owned by a user named "self", which no real deployment has, so
+/// the lookup harmlessly misses and falls through to the global one below.
+const SKILL_GET_OWN_SCOPE: &str = "self";
+
 /// Hard cap on how long an embedding call may block a real-time request. A
 /// slow/wedged embedding backend (e.g. a stuck Ollama) must not hang the turn:
 /// on timeout we return no embedding, so semantic search falls back to FTS and
@@ -717,15 +730,13 @@ impl BuiltinToolService {
                  Use after builtin_skill_search to read a skill before following it. When \
                  present_on_disk is false the procedure is still good, but the skill's files are \
                  gone: its path and attachments no longer resolve, so don't try to run its \
-                 bundled scripts.",
+                 bundled scripts. Returns your own user-scoped copy of this skill if you have \
+                 one, otherwise the shared global one -- there is no way to address another \
+                 user's copy.",
                 serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "name": {"type": "string", "description": "The skill name."},
-                        "owner": {
-                            "type": "string",
-                            "description": "Omit for a global skill; a user id for a user-scoped one."
-                        }
+                        "name": {"type": "string", "description": "The skill name."}
                     },
                     "required": ["name"]
                 }),
@@ -1186,12 +1197,20 @@ impl BuiltinToolService {
             .ok_or_else(|| CoreError::ToolExecution("skill library not configured".to_string()))?;
 
         let name = required_string(&arguments, "name")?;
-        let owner = arguments
-            .get("owner")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string);
 
-        match get_fn(name.clone(), owner).await? {
+        // No caller-supplied scope on the wire (#911): the schema advertises
+        // only `name`, so there is nothing here to trust or reject. Prefer
+        // the caller's own user-scoped skill of this name and fall back to
+        // the global one, the same "global plus mine, mine wins" view
+        // `builtin_skill_search` presents without asking the caller to pick
+        // a scope either.
+        let mine = get_fn(name.clone(), Some(SKILL_GET_OWN_SCOPE.to_string())).await?;
+        let found = match mine {
+            Some(skill) => Some(skill),
+            None => get_fn(name.clone(), None).await?,
+        };
+
+        match found {
             Some(s) => Ok(serde_json::json!({
                 "ok": true,
                 "name": s.name,
@@ -3574,6 +3593,142 @@ mod tests {
             .unwrap();
         let miss_json: serde_json::Value = serde_json::from_str(&miss).unwrap();
         assert_eq!(miss_json["ok"], false);
+    }
+
+    /// #911: the `owner` argument is gone from the wire, so `skill_get` has
+    /// to resolve scope itself. When a row exists in both the caller's own
+    /// scope and the global one, the caller's own wins -- the override-layer
+    /// precedence the schema's description now promises.
+    #[tokio::test]
+    async fn skill_get_prefers_the_callers_own_skill_over_the_global_one() {
+        use desktop_assistant_core::domain::{IndexedSkill, Locality, SkillKind, TrustTier};
+        use desktop_assistant_core::ports::skill_index::{SkillGetFn, SkillSearchFn};
+        use std::sync::Arc;
+
+        fn variant(description: &str) -> IndexedSkill {
+            IndexedSkill {
+                name: "deploy".to_string(),
+                description: description.to_string(),
+                kind: SkillKind::Skill,
+                disk_path: "/skills/deploy/SKILL.md".to_string(),
+                owner_user_id: None,
+                locality: Locality::Daemon,
+                content_hash: "h".to_string(),
+                trust_tier: TrustTier::Local,
+                source: None,
+                tags: vec![],
+                attachments: vec![],
+                body: "body".to_string(),
+                metadata: serde_json::Value::Null,
+                present_on_disk: true,
+                last_seen_at: None,
+            }
+        }
+
+        // The closure stands in for the store: `owner.is_some()` is exactly
+        // what `PgSkillIndexStore::get` treats as "the caller's own scope"
+        // (its string content is never inspected -- see `get`'s doc).
+        let get_fn: SkillGetFn = Arc::new(|name, owner| {
+            Box::pin(async move {
+                if name != "deploy" {
+                    return Ok(None);
+                }
+                Ok(Some(match owner {
+                    Some(_) => variant("caller's own"),
+                    None => variant("global"),
+                }))
+            })
+        });
+        let search_fn: SkillSearchFn =
+            Arc::new(|_q, _emb, _model, _limit| Box::pin(async { Ok(Vec::new()) }));
+        let service = BuiltinToolService::new().with_skills(search_fn, get_fn);
+
+        let out = service
+            .execute_tool(TOOL_SKILL_GET, serde_json::json!({"name": "deploy"}))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(
+            json["description"], "caller's own",
+            "the caller's own row wins over the global one of the same name"
+        );
+    }
+
+    /// #911: with no own-scoped row, `skill_get` falls back to the global
+    /// skill of the same name rather than reporting a miss.
+    #[tokio::test]
+    async fn skill_get_falls_back_to_the_global_skill_when_the_caller_has_none() {
+        use desktop_assistant_core::domain::{IndexedSkill, Locality, SkillKind, TrustTier};
+        use desktop_assistant_core::ports::skill_index::{SkillGetFn, SkillSearchFn};
+        use std::sync::Arc;
+
+        fn global_skill() -> IndexedSkill {
+            IndexedSkill {
+                name: "deploy".to_string(),
+                description: "global".to_string(),
+                kind: SkillKind::Skill,
+                disk_path: "/skills/deploy/SKILL.md".to_string(),
+                owner_user_id: None,
+                locality: Locality::Daemon,
+                content_hash: "h".to_string(),
+                trust_tier: TrustTier::Local,
+                source: None,
+                tags: vec![],
+                attachments: vec![],
+                body: "body".to_string(),
+                metadata: serde_json::Value::Null,
+                present_on_disk: true,
+                last_seen_at: None,
+            }
+        }
+
+        // The caller has no own-scoped row: `owner.is_some()` misses, `None`
+        // (the global lookup) hits.
+        let get_fn: SkillGetFn = Arc::new(|name, owner| {
+            Box::pin(async move {
+                if name != "deploy" || owner.is_some() {
+                    return Ok(None);
+                }
+                Ok(Some(global_skill()))
+            })
+        });
+        let search_fn: SkillSearchFn =
+            Arc::new(|_q, _emb, _model, _limit| Box::pin(async { Ok(Vec::new()) }));
+        let service = BuiltinToolService::new().with_skills(search_fn, get_fn);
+
+        let out = service
+            .execute_tool(TOOL_SKILL_GET, serde_json::json!({"name": "deploy"}))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["description"], "global");
+    }
+
+    /// #911: `owner` used to be an LLM-supplied scope selector forwarded
+    /// straight to the store -- a false contract once the store started
+    /// ignoring its value. It must not still appear on the wire, or a caller
+    /// keeps passing it and silently gets different behavior than any
+    /// lingering documentation would promise. This guard and the schema stay
+    /// in the same file, so the two cannot drift apart again.
+    #[test]
+    fn skill_get_schema_does_not_advertise_an_owner_argument() {
+        let service = fully_wired_service();
+        let def = service
+            .tool_definitions()
+            .into_iter()
+            .find(|d| d.name == TOOL_SKILL_GET)
+            .expect("builtin_skill_get is advertised");
+        let properties = def.parameters["properties"]
+            .as_object()
+            .expect("object schema with a properties map");
+        assert!(
+            !properties.contains_key("owner"),
+            "builtin_skill_get's schema must not advertise an owner argument: the handler \
+             resolves scope itself and never reads one, so an advertised property here would \
+             be a contract callers cannot rely on"
+        );
     }
 
     /// A service with *every* capability closure wired, so `tool_definitions()`

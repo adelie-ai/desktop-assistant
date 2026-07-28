@@ -107,7 +107,9 @@ provider group:
   hybrid-searches the catalog (full-text only when no embedding is available),
   optionally filtering by kind. Returns name, description, kind, trust tier,
   disk path, attachment list, and `present_on_disk`.
-- `builtin_skill_get {name, owner?}` — the full body plus metadata for one skill.
+- `builtin_skill_get {name}` — the full body plus metadata for one skill. Returns the
+  caller's own user-scoped copy if one exists, otherwise the global one; there is no
+  argument to address another user's copy (#911).
 
 ## Where things live
 
