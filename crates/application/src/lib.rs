@@ -31,6 +31,9 @@ use desktop_assistant_core::ports::scratchpad::{
 };
 use desktop_assistant_core::ports::store::{IdempotencyKeyStore, TurnStateStore};
 use desktop_assistant_core::ports::tool_observer::{ToolEvent, ToolObserver, with_tool_observer};
+use desktop_assistant_core::ports::turn_interactivity::{
+    TurnInteractivity, with_turn_interactivity,
+};
 use thiserror::Error;
 use tracing::warn;
 
@@ -3225,6 +3228,12 @@ where
                     )
                     .await
             });
+            // An agent run - standalone or subagent - has nobody watching it:
+            // its text goes to the registry and its caller reads the result
+            // afterwards. State that rather than let it fall out of the session
+            // sentinel, so no future change that gives a child a connection can
+            // quietly turn its live narration back on (#942).
+            let inner = with_turn_interactivity(TurnInteractivity::Headless, inner);
             // Compose the run's task-local scopes around `inner`, awaiting in each
             // arm so their differing future types unify at the `Result`. The #287
             // subagent scope (session pad + owner_todo + snapshot marker) is

@@ -81,6 +81,12 @@ pub mod client_tools;
 pub mod tool_observer;
 pub mod tool_usage;
 
+/// Request-scoped turn interactivity: task-local
+/// [`turn_interactivity::TurnInteractivity`] saying whether a person is
+/// watching this turn while it runs, so narration can be tuned for a live
+/// audience or for the record (#942).
+pub mod turn_interactivity;
+
 #[cfg(test)]
 mod tests {
     #[test]

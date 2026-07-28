@@ -36,6 +36,9 @@ use std::sync::{Arc, Mutex, Weak};
 use async_trait::async_trait;
 use desktop_assistant_api_model as api;
 use desktop_assistant_auth_jwt::UserId;
+use desktop_assistant_core::ports::turn_interactivity::{
+    TurnInteractivity, with_turn_interactivity,
+};
 
 use crate::EventSink;
 use crate::background_tasks::{SubagentCompletion, SubagentCompletionObserver};
@@ -198,7 +201,16 @@ impl ParentWakeCoordinator {
             };
             let user_id = batch[0].user_id.clone();
             let prompt = build_wake_prompt(&batch);
-            waker.wake(user_id, session.clone(), prompt).await;
+            // A wake turn is one no client asked for and none is watching: it
+            // runs off a drain task long after the parent's connection went
+            // quiet. State that (#942) instead of leaving it to the session
+            // sentinel, which would flip the answer the moment a wake ever runs
+            // under a connection scope.
+            with_turn_interactivity(
+                TurnInteractivity::Headless,
+                waker.wake(user_id, session.clone(), prompt),
+            )
+            .await;
         }
     }
 }
