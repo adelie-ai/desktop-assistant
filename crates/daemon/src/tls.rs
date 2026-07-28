@@ -69,7 +69,13 @@ pub fn setup(
 /// by deliberate configuration ([`PlaintextByConfig`](Self::PlaintextByConfig)),
 /// or it is on and ready ([`Tls`](Self::Tls)) — "on but not deliverable" is
 /// not a variant here because [`resolve_ws_tls`] returns `Err` for it
-/// instead, so the caller cannot construct a silent downgrade by accident.
+/// instead, so the caller cannot construct a silent downgrade by accident
+/// *through this function*. The variants are plain `pub`, so that guarantee
+/// is a convention this module upholds, not one the type enforces by
+/// construction (no private field, no smart constructor) — fine today with
+/// one call site in a private binary crate, but worth revisiting with a
+/// constructor-only API if a second WS listener is ever added and starts
+/// building `WsTlsPosture` values of its own.
 pub enum WsTlsPosture {
     /// `[tls] enabled = false` (or `DESKTOP_ASSISTANT_WS_TLS=false`): the
     /// operator deliberately turned TLS off. Serving plaintext here is a
@@ -589,6 +595,79 @@ mod tests {
             result.is_err(),
             "TLS enabled with an unreadable cert/key must fail closed (Err), \
              never silently fall back to plaintext"
+        );
+    }
+
+    /// Acceptance (review follow-up): a `cert_file` set without a matching
+    /// `key_file` is a different failure shape than a missing file - it is
+    /// caught by `setup`'s own pairing check (`tls.rs:50-52`) before either
+    /// path is even read - and it must fail closed exactly like a missing
+    /// or unreadable file does, not silently succeed some other way.
+    #[test]
+    fn resolve_ws_tls_rejects_cert_without_a_matching_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert_path, _unused_key_path) = write_self_signed_cert(dir.path());
+
+        let result = resolve_ws_tls(true, Some(&cert_path), None);
+
+        assert!(
+            result.is_err(),
+            "cert_file set without key_file must fail closed, not silently \
+             fall back to auto-generate or to plaintext"
+        );
+    }
+
+    /// The mirror image of the above: `key_file` without `cert_file`.
+    #[test]
+    fn resolve_ws_tls_rejects_key_without_a_matching_cert() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_unused_cert_path, key_path) = write_self_signed_cert(dir.path());
+
+        let result = resolve_ws_tls(true, None, Some(&key_path));
+
+        assert!(
+            result.is_err(),
+            "key_file set without cert_file must fail closed, not silently \
+             fall back to auto-generate or to plaintext"
+        );
+    }
+
+    /// Acceptance (review follow-up): a present, readable cert file whose
+    /// contents are not valid PEM (truncated by a bad copy, or the wrong
+    /// file entirely) is a different failure shape than a missing file -
+    /// every prior test here only ever fed `build_server_config` freshly
+    /// generated, valid PEM, so a regression that made cert parsing
+    /// silently accept garbage would have gone undetected.
+    #[test]
+    fn resolve_ws_tls_rejects_unparseable_cert_pem() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert_path, key_path) = write_self_signed_cert(dir.path());
+        std::fs::write(&cert_path, b"this is not a certificate\n").expect("overwrite with junk");
+
+        let result = resolve_ws_tls(true, Some(&cert_path), Some(&key_path));
+
+        assert!(
+            result.is_err(),
+            "an unparseable cert PEM must fail closed, not silently succeed \
+             or fall back to plaintext"
+        );
+    }
+
+    /// The key-side mirror of the above: a present, readable key file whose
+    /// contents are not valid PEM, with a genuinely valid cert alongside it
+    /// so the failure is isolated to key parsing specifically.
+    #[test]
+    fn resolve_ws_tls_rejects_unparseable_key_pem() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert_path, key_path) = write_self_signed_cert(dir.path());
+        std::fs::write(&key_path, b"this is not a private key\n").expect("overwrite with junk");
+
+        let result = resolve_ws_tls(true, Some(&cert_path), Some(&key_path));
+
+        assert!(
+            result.is_err(),
+            "an unparseable key PEM must fail closed, not silently succeed \
+             or fall back to plaintext"
         );
     }
 
