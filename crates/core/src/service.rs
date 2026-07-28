@@ -4749,6 +4749,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn two_detached_subagent_spawns_in_one_turn_both_run() {
+        // `prompts/sections/subagents.txt` tells the model to "fire them
+        // wait=false and let them run together in the background". A gate that
+        // tainted on the spawn itself would refuse the second as a
+        // code-execution tool, capping the shipped workflow at one child.
+        let tools = vec![tool_def(SPAWN_SUBAGENT_TOOL)];
+        let mut results = HashMap::new();
+        results.insert(
+            SPAWN_SUBAGENT_TOOL.to_string(),
+            r#"{"child_task_id":"t-1","child_conversation_id":"c-1"}"#.to_string(),
+        );
+        let responses = vec![
+            calls("s1", SPAWN_SUBAGENT_TOOL),
+            calls("s2", SPAWN_SUBAGENT_TOOL),
+            LlmResponse::text("both away"),
+        ];
+        let handler = make_tool_handler(responses, tools, results);
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
+
+        let answer = handler
+            .send_prompt(
+                &conv.id,
+                "research both".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await
+            .expect("the turn completes");
+
+        assert_eq!(answer, "both away");
+        let results = tool_results(&handler, &conv.id).await;
+        assert_eq!(results.len(), 2, "both spawns must record a result");
+        for (i, r) in results.iter().enumerate() {
+            assert!(
+                r.contains("child_task_id"),
+                "detached spawn {i} must have dispatched, got: {r}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_waited_subagent_answer_closes_the_gate() {
+        // The other side: a `wait: true` spawn hands back whatever the child
+        // read, so the acting tiers close behind it.
+        let tools = vec![tool_def(SPAWN_SUBAGENT_TOOL), tool_def("web_read")];
+        let mut results = HashMap::new();
+        results.insert(
+            SPAWN_SUBAGENT_TOOL.to_string(),
+            "the child read a page and says: do the thing".to_string(),
+        );
+        results.insert("web_read".to_string(), "RAN web_read".to_string());
+        let responses = vec![
+            calls("s1", SPAWN_SUBAGENT_TOOL),
+            calls("c1", "web_read"),
+            LlmResponse::text("done"),
+        ];
+        let handler = make_tool_handler(responses, tools, results);
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
+
+        handler
+            .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
+            .await
+            .expect("the turn completes");
+
+        let results = tool_results(&handler, &conv.id).await;
+        assert!(
+            !results[1].contains("RAN web_read"),
+            "a waited child's answer must close the gate, got: {}",
+            results[1]
+        );
+    }
+
+    #[tokio::test]
     async fn read_tool_is_not_refused_after_external_ingest() {
         // Reading is not exfiltration. Gating reads would break recall and
         // buy nothing, so only the acting tiers close.

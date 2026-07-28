@@ -106,8 +106,10 @@ or the turn's compaction breaks - so the step structure is recorded and the
 model's wording is not. A subagent's answer is mirrored onto the session
 scratchpad from the completion path; it is kept, because
 `get_subagent_status` reads a detached delegation's result from that note and
-nowhere else, and stamped, so both routes that can read it back - that tool,
-and `builtin_scratchpad_search` - close the gate when they do.
+nowhere else, and stamped, so the two tools that can read it back - that one
+and `builtin_scratchpad_search` - close the gate when they do. Pinned notes
+render into later turns with no tool in the path and so are not covered; that
+needs a durable provenance marker rather than a third special case.
 
 The gate protects the turn that read the content. It does not stop a model that
 acts on the same text one turn later - that needs a taint marker persisted on

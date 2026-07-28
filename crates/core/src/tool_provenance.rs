@@ -87,11 +87,14 @@
 //!
 //! ## Known limits
 //!
-//! - **The rolling context summary is durable and is not gated, and that is
-//!   fine.** It is written mid-turn without consulting the gate, and it
-//!   survives into later turns. It is built only from user and assistant
-//!   messages and skips tool results, so ingested bytes never reach it. Left
-//!   here so the next reader does not have to re-derive that.
+//! - **The rolling context summary is durable and is not gated.** It is
+//!   written mid-turn without consulting the gate and survives into later
+//!   turns. No *tool result* reaches it directly - it is built from user and
+//!   assistant messages only - which is why it is recorded here rather than
+//!   gated. That is a narrower claim than "ingested bytes never reach it":
+//!   the assistant's own reply routinely quotes the page it just read, and
+//!   that reply is summarised like any other. The general fix is the durable
+//!   taint marker, not a special case here.
 //! - **Second-order ingest is not tracked.** `builtin_conversation_search`
 //!   and the knowledge-base tools can return text that a web page put there
 //!   in an earlier turn. They count as trusted, because marking them
@@ -146,7 +149,7 @@
 use crate::ports::turn_interactivity::TurnInteractivity;
 use crate::tools::summarize_tool_name;
 
-use DeclaredReader::{ExternalContentMarker, SkillTrustTier};
+use DeclaredReader::{ExternalContentMarker, SkillTrustTier, SubagentAnswer};
 use ResultProvenance::{Declared, ExternallyControlled, Trusted};
 use ToolTier::{Egress, Execution, Mutate, Present, Read, Unclassified};
 
@@ -192,6 +195,13 @@ pub enum DeclaredReader {
     /// content - today, a subagent's answer landing on the session pad. See
     /// [`carries_external_marker`].
     ExternalContentMarker,
+    /// The payload sometimes carries a child agent's answer and sometimes
+    /// only a handle to one. A detached spawn returns two daemon-minted ids;
+    /// a status poll returns lifecycle fields until the child has finished.
+    /// Neither holds third-party bytes, and tainting on them would cap the
+    /// fan-out workflow the shipped prompt asks for. See
+    /// [`subagent_payload_carries_an_answer`].
+    SubagentAnswer,
 }
 
 /// What a tool can do, at the granularity the gate needs.
@@ -411,8 +421,14 @@ pub const CLASSIFIED_SOURCES: &[ClassifiedSource] = &[
     source(
         "subagent",
         &[
-            tool("spawn_subagent", Execution, ExternallyControlled),
-            tool("get_subagent_status", Read, ExternallyControlled),
+            // Both hand back a child's answer only some of the time. A
+            // detached (`wait: false`) spawn returns ids, and a status poll
+            // returns lifecycle fields until the child finishes; tainting on
+            // those would let a turn dispatch exactly one subagent, which is
+            // the opposite of the fan-out `prompts/sections/subagents.txt`
+            // asks the model for.
+            tool("spawn_subagent", Execution, Declared(SubagentAnswer)),
+            tool("get_subagent_status", Read, Declared(SubagentAnswer)),
         ],
         &[],
     ),
@@ -666,25 +682,35 @@ pub fn skill_result_is_local_only(result: &str) -> bool {
     if !tiers.is_empty() {
         return tiers.iter().all(|t| t == "local");
     }
-    // No tier stated. Fail closed only if something actually came back.
-    !skill_payload_has_content(&value)
+    // No tier stated. Exempt only a payload that is *recognisably* empty;
+    // anything else is content this build cannot grade, and fails closed.
+    skill_payload_is_recognisably_empty(&value)
 }
 
-/// Whether a skill-tool payload actually returned skill content.
+/// Whether a skill-tool payload is one of the shapes that provably returned
+/// nothing.
 ///
-/// `body` is what `builtin_skill_get` returns; `results` is what
-/// `builtin_skill_search` returns. Neither present, or both empty, means the
-/// call produced nothing to be suspicious of.
-fn skill_payload_has_content(value: &serde_json::Value) -> bool {
-    let has_body = value
-        .get("body")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|b| !b.trim().is_empty());
-    let has_hits = value
-        .get("results")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|r| !r.is_empty());
-    has_body || has_hits
+/// Stated as a closed list of empties rather than as "no content found", so an
+/// unanticipated shape fails closed. Asking the opposite question - does this
+/// look like content? - lets any payload the check does not recognise
+/// (`{"skill":{"body":...}}`, `{"text":...}`, a `results` object rather than
+/// an array) slip through as harmless, which is the wrong default for a
+/// module whose whole posture is to distrust what it cannot read.
+fn skill_payload_is_recognisably_empty(value: &serde_json::Value) -> bool {
+    let Some(map) = value.as_object() else {
+        return false;
+    };
+    if map.get("ok").and_then(serde_json::Value::as_bool) == Some(false) {
+        return true;
+    }
+    if let Some(results) = map.get("results") {
+        return results.as_array().is_some_and(|r| r.is_empty());
+    }
+    if let Some(body) = map.get("body") {
+        return body.as_str().is_some_and(|b| b.trim().is_empty());
+    }
+    // A tool-level error that carried no payload at all.
+    map.contains_key("error")
 }
 
 /// Every `trust_tier` string anywhere in `value`, at any depth.
@@ -731,6 +757,50 @@ fn collect_trust_tiers(value: &serde_json::Value, out: &mut Vec<String>) {
 /// that a step ran and its wording is missing.
 pub const WITHHELD_STEP_TEXT: &str = "[step text not recorded]";
 
+/// Whether a subagent-tool payload carries a child agent's answer.
+///
+/// Fail-closed, and deliberately narrow: only the two shapes that provably
+/// hold no child output are exempt, and everything else counts as an answer.
+///
+/// - `spawn_subagent` with `wait: false` returns exactly a `child_task_id` and
+///   a `child_conversation_id`, both daemon-minted.
+/// - `get_subagent_status` returns lifecycle fields, and adds `result` only
+///   once the child has finished.
+///
+/// A waited spawn returns the child's answer as raw text, which is not JSON at
+/// all, so it falls straight through to `true`.
+///
+/// The residual, in the same family as the name-borrowing limit above: a
+/// waited spawn whose child answers with exactly the detached handle's JSON
+/// would read as answer-free. That needs the attacker to control the child's
+/// entire output verbatim, and a child they control is a child that could
+/// simply answer with nothing. Keying on the call's arguments instead of its
+/// result would remove even that, but the classification sees only the name
+/// and the result.
+#[must_use]
+pub fn subagent_payload_carries_an_answer(result: &str) -> bool {
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(result)
+    else {
+        return true;
+    };
+    let detached_handle = map.len() == 2
+        && map
+            .get("child_task_id")
+            .is_some_and(serde_json::Value::is_string)
+        && map
+            .get("child_conversation_id")
+            .is_some_and(serde_json::Value::is_string);
+    if detached_handle {
+        return false;
+    }
+    let status_shape =
+        map.contains_key("task_id") && (map.contains_key("status") || map.contains_key("error"));
+    if status_shape {
+        return map.contains_key("result");
+    }
+    true
+}
+
 /// Stamp put on durable text written by a turn that had read outside content.
 ///
 /// A subagent's final answer is mirrored onto the session scratchpad from the
@@ -739,9 +809,18 @@ pub const WITHHELD_STEP_TEXT: &str = "[step text not recorded]";
 /// place `get_subagent_status` reads the answer from, so a detached
 /// (`wait: false`) delegation would lose its result entirely and the parent
 /// would have no route to it at all. Instead the text is kept and stamped, and
-/// every route that can read it back accounts for the stamp -
-/// `get_subagent_status` taints unconditionally, and
+/// the two *tools* that can read it back account for the stamp:
+/// `get_subagent_status` taints when its payload carries the answer, and
 /// `builtin_scratchpad_search` taints when a returned note carries this.
+///
+/// One route is **not** covered, and it is a read with no tool in it at all.
+/// `builtin_scratchpad_pin` pins by arbitrary key and does not restrict note
+/// type, and pinned content is rendered into every later turn as a system
+/// block with no `observe_result` anywhere in the path. Reaching it needs a
+/// blind pin - pinning is `Mutate`, so a turn that has actually read the note
+/// cannot pin it - which is why this is recorded rather than fixed. The
+/// general answer is the durable taint marker that would let a rendered
+/// surface carry its own provenance, not a third special case here.
 ///
 /// The stamp is also a disclosure. It is prepended to the text the model
 /// reads, so the model is told where the content came from rather than left to
@@ -842,6 +921,7 @@ impl TurnProvenance {
             ExternallyControlled => true,
             Declared(SkillTrustTier) => !skill_result_is_local_only(result),
             Declared(ExternalContentMarker) => carries_external_marker(result),
+            Declared(SubagentAnswer) => subagent_payload_carries_an_answer(result),
         };
         if !external {
             return GateChange::Unchanged;
@@ -970,9 +1050,10 @@ mod tests {
         // the skill tools state their own provenance per call
         ("builtin_skill_search", Read, Declared(SkillTrustTier)),
         ("builtin_skill_get", Read, Declared(SkillTrustTier)),
-        // a child agent's report carries whatever the child read
-        ("spawn_subagent", Execution, ExternallyControlled),
-        ("get_subagent_status", Read, ExternallyControlled),
+        // A child's report carries whatever the child read, but only some of
+        // these calls return a report at all.
+        ("spawn_subagent", Execution, Declared(SubagentAnswer)),
+        ("get_subagent_status", Read, Declared(SubagentAnswer)),
         // third-party reads
         ("weather_get_current", Read, ExternallyControlled),
         ("weather_get_forecast", Read, ExternallyControlled),
@@ -1397,6 +1478,104 @@ mod tests {
             "marking must not destroy the text: {marked}"
         );
         assert!(!carries_external_marker("the three sources agree"));
+    }
+
+    #[test]
+    fn a_detached_spawn_does_not_taint_but_a_waited_one_does() {
+        // `prompts/sections/subagents.txt` tells the model to "fire them
+        // wait=false and let them run together in the background". Tainting on
+        // the spawn itself would let a turn dispatch exactly one, which is the
+        // opposite of that. A detached spawn hands back two daemon-minted ids
+        // and no child output.
+        let mut detached = TurnProvenance::new();
+        assert_eq!(
+            detached.observe_result(
+                "spawn_subagent",
+                r#"{"child_task_id":"t-1","child_conversation_id":"c-1"}"#,
+            ),
+            GateChange::Unchanged,
+            "a detached spawn returns ids, not the child's words"
+        );
+        assert_eq!(
+            detached.observe_result(
+                "spawn_subagent",
+                r#"{"child_task_id":"t-2","child_conversation_id":"c-2"}"#,
+            ),
+            GateChange::Unchanged,
+            "so a second one must dispatch too"
+        );
+
+        // A waited spawn returns the child's answer as raw text.
+        let mut waited = TurnProvenance::new();
+        assert_eq!(
+            waited.observe_result("spawn_subagent", "the three sources agree"),
+            GateChange::JustClosed
+        );
+    }
+
+    #[test]
+    fn a_status_poll_taints_only_once_it_carries_the_answer() {
+        let mut polling = TurnProvenance::new();
+        for payload in [
+            r#"{"task_id":"t-1","status":"running"}"#,
+            r#"{"task_id":"t-1","status":"pending"}"#,
+            r#"{"error":"not_found","task_id":"t-9"}"#,
+            r#"{"task_id":"t-1","status":"failed","error":"boom"}"#,
+        ] {
+            assert_eq!(
+                polling.observe_result("get_subagent_status", payload),
+                GateChange::Unchanged,
+                "lifecycle only, no child output: {payload}"
+            );
+        }
+        assert_eq!(
+            polling.observe_result(
+                "get_subagent_status",
+                r#"{"task_id":"t-1","status":"completed","result":"the sources agree"}"#,
+            ),
+            GateChange::JustClosed,
+            "the answer is what carries the child's bytes"
+        );
+    }
+
+    #[test]
+    fn a_subagent_payload_shape_it_does_not_recognise_taints() {
+        // Fail-closed, so an unanticipated shape is treated as an answer.
+        for payload in [
+            "not json",
+            r#"{"child_task_id":"t-1"}"#,
+            r#"{"child_task_id":"t-1","child_conversation_id":"c-1","result":"words"}"#,
+            r#"{"answer":"words"}"#,
+            r#"["t-1","c-1"]"#,
+        ] {
+            let mut turn = TurnProvenance::new();
+            assert_eq!(
+                turn.observe_result("spawn_subagent", payload),
+                GateChange::JustClosed,
+                "must fail closed on: {payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_skill_payload_shape_it_does_not_recognise_taints() {
+        // The emptiness test is a closed list of empties, not an open search
+        // for content, so a shape nobody anticipated is content until proven
+        // otherwise. These are reachable through the documented name-borrowing
+        // limit even though no shipped tool emits them.
+        for payload in [
+            r#"{"ok":true,"skill":{"body":"do this"}}"#,
+            r#"{"ok":true,"text":"do this"}"#,
+            r#"{"ok":true,"results":{"name":"x"}}"#,
+            r#"{"ok":true}"#,
+        ] {
+            let mut turn = TurnProvenance::new();
+            assert_eq!(
+                turn.observe_result("builtin_skill_get", payload),
+                GateChange::JustClosed,
+                "must fail closed on: {payload}"
+            );
+        }
     }
 
     #[test]
