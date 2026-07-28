@@ -118,7 +118,7 @@ New code keeps it there. Warnings-as-errors is enforced **mechanically**, not by
 
 ## Dependency safety
 
-Common, well-maintained cargo plugins are fine — `cargo-edit` (`cargo upgrade`/`add`/`rm`), `cargo-audit`, `cargo-outdated`, `cargo-deny`; prefer built-in cargo for trivial one-line edits, and avoid obscure/unmaintained single-author plugins without checking first. The `cve-mcp` MCP server's `scan_packages` tool is wired up; base rule 6.1 and the 6.1 override at the end of this file cover when and how to use it. Repo-specific note: build scripts (`build.rs`) execute on first build, so the scan happens between lockfile change and first `cargo build`, not after.
+Common, well-maintained cargo plugins are fine — `cargo-edit` (`cargo upgrade`/`add`/`rm`), `cargo-audit`, `cargo-outdated`, `cargo-deny`; prefer built-in cargo for trivial one-line edits, and avoid obscure/unmaintained single-author plugins without checking first. The `cve-mcp` MCP server's `scan_packages` tool is wired up; base rule 6.1 covers when and how to use it, and the 6.1 entry at the end of this file gives the group's scan steps. Repo-specific note: build scripts (`build.rs`) execute on first build, so the scan happens between lockfile change and first `cargo build`, not after.
 
 `cargo-audit` is therefore a prerequisite of the gate, not an optional extra:
 `cargo install cargo-audit --locked`. The scan step (`just audit`,
@@ -129,7 +129,7 @@ Common, well-maintained cargo plugins are fine — `cargo-edit` (`cargo upgrade`
   will not fall back to a cached database silently. If you accept a possibly
   stale database, opt in with `ADELE_AUDIT_ALLOW_STALE=1`; the run then prints a
   loud banner naming the database and its age, and you say so in the PR.
-- **Vulnerability reported** - hard failure (see the 6.1 override at the end of this file).
+- **Vulnerability reported** - hard failure (base rule 6.1: a high or critical advisory blocks the change).
 - **Informational advisory** (unmaintained, unsound, yanked) - reported loudly,
   does not fail the gate; treat it as a review item.
 - **Advisory suppressed by an audit.toml `ignore` list** - named in the output
@@ -167,18 +167,15 @@ that mirrors the slug. Before you run tasks in parallel worktrees, look for shar
 shared `Cargo.toml` dependency edits, and shared migration ordinals. Serialize the work where
 they overlap, and tell each parallel agent the scope it owns.
 
-### 6.1 Dependencies - a high or critical advisory is a hard blocker (override, stricter than the base)
+### 6.1 Dependencies - the group's scan workflow (addition)
 
-Scan after you add a dependency and before the first build:
+Base rule 6.1 sets the policy, including that a high or critical advisory blocks the change.
+This group runs it with its own tooling:
 
 1. Add the dependency (`cargo add <crate>`). This writes the lockfile but does not build.
 2. Scan the updated lockfile with the `cve-mcp` server's `scan_packages` tool, or with
    `cargo audit`. Pass every (name, version, ecosystem) tuple.
-3. A high or critical finding blocks the change. Patch it in the same change, or prove the
-   path unreachable and write down why, or file an issue and reference it from the change.
-4. Build only after the scan is clean, or after you have accepted the findings in writing.
-
-Never pin around an advisory without a comment or a tracked issue.
+3. Build only after the scan is clean, or after you have accepted the findings in writing.
 
 ### 6.2 Local parity - a shared resource must survive concurrent sessions (addition)
 
