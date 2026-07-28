@@ -29,8 +29,14 @@ use crate::ports::store::ConversationStore;
 use crate::ports::tool_observer::{ToolEvent, notify_tool_event};
 use crate::ports::tools::ToolExecutor;
 use crate::ports::transport::{current_client_label, current_co_location, current_transport_kind};
+use crate::ports::turn_capability::{
+    TurnCapabilityChange, TurnCapabilityReason, notify_turn_capability_change,
+};
 use crate::ports::turn_interactivity::{TurnInteractivity, current_turn_interactivity};
 use crate::sanitize::sanitize_assistant_text;
+use crate::tool_provenance::{
+    GATE_CLOSED_STATUS, GATED_TIERS, GateChange, ToolGate, TurnProvenance,
+};
 use crate::tools::{
     NoopToolExecutor, categorize_tool_namespaces, summarize_tool_name, summarize_tool_text,
     summarize_tool_value, tool_set_hash,
@@ -1298,6 +1304,12 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
             std::collections::HashMap::new();
         // Track whether hosted search has been demoted to local fallback.
         let mut hosted_search_demoted = false;
+        // Tool-provenance gating (#741). A plain local of the turn: once a
+        // tool result brings in bytes an outside party can influence, the
+        // acting tiers close for the rest of THIS turn, and a new turn builds
+        // a new value. Nothing outside this function can reach it, which is
+        // the whole of the no-leak-across-turns property.
+        let mut turn_provenance = TurnProvenance::new();
 
         // No turn-start filler. A quick/direct answer narrates nothing and just
         // streams its reply. Progress is narrated when the model declares a
@@ -1965,6 +1977,38 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                     continue;
                 }
 
+                // Tool-provenance gating (#741). Once this turn has taken in
+                // bytes an outside party can influence, a tool that can send
+                // data out, change the user's state, or run code no longer
+                // runs: instructions hidden in that content look exactly like
+                // the user's, so the call may be theirs rather than the
+                // user's. The refusal is a recoverable tool_result, like the
+                // allowlist rejection above, so the turn continues and the
+                // model picks another path. This is a separate mechanism from
+                // the caller's allowlist: that one says WHO may use a tool,
+                // this one says WHAT a tool may do given what the turn has
+                // already read.
+                if let ToolGate::Refuse(refusal) =
+                    turn_provenance.check(&tool_call.name, current_turn_interactivity())
+                {
+                    tracing::warn!(
+                        tool = %tool_call.name,
+                        "tool call refused: this turn ingested externally-controlled content"
+                    );
+                    notify_tool_event(ToolEvent::Started {
+                        name: summarize_tool_name(&tool_call.name),
+                        args: summarize_tool_value(&arguments),
+                    });
+                    notify_tool_event(ToolEvent::Finished {
+                        name: summarize_tool_name(&tool_call.name),
+                        ok: false,
+                        output: "refused: this turn ingested external content".to_string(),
+                    });
+                    conv.messages
+                        .push(Message::tool_result(&tool_call.id, &refusal));
+                    continue;
+                }
+
                 // Report the call to any installed tool observer (the task
                 // panel's activity feed). Emitted here — after the step-control
                 // fast path, before either execution branch — so it covers real
@@ -2162,6 +2206,31 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                             }
                             break;
                         }
+                    }
+                }
+
+                // Fold the result's provenance into the turn (#741) at the
+                // moment its bytes enter the context, whether the tool
+                // succeeded or failed - an error body from a remote server is
+                // outside content too. When that closes the gate, say so once,
+                // on the status channel the clients already render: a person
+                // who sees the assistant decline the next action needs to know
+                // why, and the tool result that explains it never reaches them.
+                if turn_provenance.observe_result(&tool_call.name) == GateChange::JustClosed {
+                    // Structured first: this is an API-first platform, and a
+                    // caller driving the daemon has to be able to read the
+                    // change as data rather than parse a sentence. When no
+                    // observer is installed - a test, an embedder, a
+                    // background worker - fall back to the plain status line
+                    // every caller already has, so the signal degrades rather
+                    // than disappears.
+                    let delivered = notify_turn_capability_change(TurnCapabilityChange {
+                        reason: TurnCapabilityReason::ExternalContentIngested,
+                        closed_tiers: GATED_TIERS.to_vec(),
+                        message: GATE_CLOSED_STATUS.to_string(),
+                    });
+                    if !delivered {
+                        on_status(GATE_CLOSED_STATUS.to_string());
                     }
                 }
 
@@ -4157,6 +4226,8 @@ mod tests {
             calls("c1", "weather_get_current"),
             calls("c2", "web_read"),
             LlmResponse::text("first done"),
+            // The first turn also asks the model for a conversation title.
+            LlmResponse::text("A Title"),
             calls("c3", "web_read"),
             LlmResponse::text("second done"),
         ];
@@ -4225,6 +4296,216 @@ mod tests {
         assert!(
             refusal.to_lowercase().contains("nobody is watching"),
             "a headless refusal must say no one can lift it, got: {refusal}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_closing_announces_itself_once_per_turn() {
+        // The user never reads a tool result. Without a status line they see
+        // the assistant decline something it did a minute ago and get no
+        // reason. One line when the gate closes; not one per refused call.
+        let responses = vec![
+            calls("c1", "weather_get_current"),
+            calls("c2", "osm_search"),
+            calls("c3", "web_read"),
+            calls("c4", "fileio_remove"),
+            LlmResponse::text("done"),
+            // The first turn also asks the model for a conversation title.
+            LlmResponse::text("A Title"),
+            calls("c5", "weather_get_current"),
+            calls("c6", "web_read"),
+            LlmResponse::text("done again"),
+        ];
+        let mut results = HashMap::new();
+        for name in [
+            "weather_get_current",
+            "osm_search",
+            "web_read",
+            "fileio_remove",
+        ] {
+            results.insert(name.to_string(), format!("RAN {name}"));
+        }
+        let handler = make_tool_handler(
+            responses,
+            vec![
+                tool_def("weather_get_current"),
+                tool_def("osm_search"),
+                tool_def("web_read"),
+                tool_def("fileio_remove"),
+            ],
+            results,
+        );
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
+
+        let (status_cb, first_turn) = recording_status();
+        handler
+            .send_prompt(&conv.id, "one".into(), noop_callback(), status_cb)
+            .await
+            .expect("first turn completes");
+        let announcements = first_turn
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| s.as_str() == GATE_CLOSED_STATUS)
+            .count();
+        assert_eq!(
+            announcements,
+            1,
+            "the gate closing must be announced exactly once, across two external \
+             results and two refusals; got: {:?}",
+            first_turn.lock().unwrap()
+        );
+
+        // A new turn re-arms the announcement, because it re-arms the gate.
+        let (status_cb, second_turn) = recording_status();
+        handler
+            .send_prompt(&conv.id, "two".into(), noop_callback(), status_cb)
+            .await
+            .expect("second turn completes");
+        assert_eq!(
+            second_turn
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|s| s.as_str() == GATE_CLOSED_STATUS)
+                .count(),
+            1,
+            "a fresh turn announces its own close"
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_closing_reaches_an_observer_as_data_exactly_once() {
+        // A program driving the daemon must be able to read the change as
+        // data. When it installs an observer, the typed change goes there and
+        // the prose fallback stays quiet, so the fact is reported once.
+        use crate::ports::turn_capability::{
+            TurnCapabilityChange, TurnCapabilityReason, with_turn_capability_observer,
+        };
+
+        let responses = vec![
+            calls("c1", "weather_get_current"),
+            calls("c2", "osm_search"),
+            calls("c3", "web_read"),
+            LlmResponse::text("done"),
+        ];
+        let mut results = HashMap::new();
+        for name in ["weather_get_current", "osm_search", "web_read"] {
+            results.insert(name.to_string(), format!("RAN {name}"));
+        }
+        let handler = make_tool_handler(
+            responses,
+            vec![
+                tool_def("weather_get_current"),
+                tool_def("osm_search"),
+                tool_def("web_read"),
+            ],
+            results,
+        );
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
+
+        let seen: Arc<Mutex<Vec<TurnCapabilityChange>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let (status_cb, statuses) = recording_status();
+        with_turn_capability_observer(
+            Arc::new(move |c| sink.lock().unwrap().push(c)),
+            handler.send_prompt(&conv.id, "go".into(), noop_callback(), status_cb),
+        )
+        .await
+        .expect("the turn completes");
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen.len(),
+            1,
+            "the change must reach the observer exactly once per turn"
+        );
+        assert_eq!(
+            seen[0].reason,
+            TurnCapabilityReason::ExternalContentIngested
+        );
+        assert!(
+            seen[0]
+                .closed_tiers
+                .contains(&crate::tool_provenance::ToolTier::Egress),
+            "the change must name the tiers that closed, got: {:?}",
+            seen[0].closed_tiers
+        );
+        assert_eq!(seen[0].message, GATE_CLOSED_STATUS);
+        assert!(
+            !statuses
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|s| s.as_str() == GATE_CLOSED_STATUS),
+            "with an observer installed the prose fallback must not double-report"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_clean_turn_never_announces_the_gate() {
+        // No outside content, no line. The signal must not become background
+        // noise on turns it does not apply to.
+        let responses = vec![
+            calls("c1", "builtin_conversation_search"),
+            LlmResponse::text("done"),
+        ];
+        let mut results = HashMap::new();
+        results.insert(
+            "builtin_conversation_search".to_string(),
+            "hits".to_string(),
+        );
+        let handler = make_tool_handler(
+            responses,
+            vec![tool_def("builtin_conversation_search")],
+            results,
+        );
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
+
+        let (status_cb, statuses) = recording_status();
+        handler
+            .send_prompt(&conv.id, "go".into(), noop_callback(), status_cb)
+            .await
+            .expect("the turn completes");
+
+        assert!(
+            !statuses
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|s| s.as_str() == GATE_CLOSED_STATUS),
+            "a clean turn must not announce a gate that never closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn refusal_tells_the_user_how_to_proceed() {
+        // The refusal is the user's only route to the way forward: the model
+        // reads it and relays it. It must name one.
+        let handler = two_call_handler("weather_get_current", "web_read");
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
+
+        handler
+            .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
+            .await
+            .expect("the turn continues after the refusal");
+
+        let refusal = tool_results(&handler, &conv.id).await.remove(1);
+        assert!(
+            refusal.to_lowercase().contains("a new turn can do it"),
+            "the refusal must give the user a way forward, got: {refusal}"
         );
     }
 

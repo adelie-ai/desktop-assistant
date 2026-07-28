@@ -85,6 +85,7 @@ pub mod tool_usage;
 /// [`turn_interactivity::TurnInteractivity`] saying whether a person is
 /// watching this turn while it runs, so narration can be tuned for a live
 /// audience or for the record (#942).
+pub mod turn_capability;
 pub mod turn_interactivity;
 
 #[cfg(test)]

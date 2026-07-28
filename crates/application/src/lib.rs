@@ -1356,6 +1356,36 @@ fn map_client_tool_resolution_err(e: ClientToolResolutionError) -> ApiError {
     }
 }
 
+/// Map the core provenance tier to its wire form (#741).
+///
+/// The two enums are deliberately separate types: `api-model` carries no
+/// dependency on `core`, and the wire form is a forward-compatible string
+/// while the core form is a closed enum the gate matches on. This is the
+/// mapper layer that joins them, and it is exhaustive, so a new core tier
+/// cannot reach the wire without a decision here.
+fn tool_tier_to_view(tier: desktop_assistant_core::tool_provenance::ToolTier) -> api::ToolTier {
+    use desktop_assistant_core::tool_provenance::ToolTier as Core;
+    match tier {
+        Core::Read => api::ToolTier::Read,
+        Core::AssistantMemory => api::ToolTier::AssistantMemory,
+        Core::Present => api::ToolTier::Present,
+        Core::Mutate => api::ToolTier::Mutate,
+        Core::Egress => api::ToolTier::Egress,
+        Core::Execution => api::ToolTier::Execution,
+        Core::Unclassified => api::ToolTier::Unclassified,
+    }
+}
+
+/// Map the core turn-capability reason to its wire form (#741).
+fn capability_reason_to_view(
+    reason: desktop_assistant_core::ports::turn_capability::TurnCapabilityReason,
+) -> api::TurnCapabilityReason {
+    use desktop_assistant_core::ports::turn_capability::TurnCapabilityReason as Core;
+    match reason {
+        Core::ExternalContentIngested => api::TurnCapabilityReason::ExternalContentIngested,
+    }
+}
+
 /// Map the domain aggregate to its wire view, computing the token estimate at
 /// the boundary so every client shows the same number rather than each deriving
 /// its own from bytes.
@@ -1364,6 +1394,13 @@ fn tool_usage_to_view(
 ) -> api::ToolUsageView {
     api::ToolUsageView {
         result_tokens: u.result_tokens(),
+        // Publish the provenance tier beside the cost (#741): an integrator
+        // reading this list has to be able to tell which of these tools a
+        // turn will refuse once it has read outside content, without reading
+        // the daemon's source.
+        tool_tier: Some(tool_tier_to_view(
+            desktop_assistant_core::tool_provenance::classify_tool(&u.tool_name).tier,
+        )),
         tool_name: u.tool_name,
         namespace: u.namespace,
         call_count: u.call_count,
@@ -3447,8 +3484,10 @@ where
 {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<api::Event>(STREAM_EVENT_BUFFER);
     // Cloned before `tx` is moved into the chunk callback below; used by the
-    // context-usage sink (#341) installed around the dispatch.
+    // context-usage sink (#341) and the turn-capability observer (#741)
+    // installed around the dispatch.
     let usage_tx = tx.clone();
+    let capability_tx = tx.clone();
 
     let sink_for_forwarder = Arc::clone(&sink);
     let forwarder = tokio::spawn(async move {
@@ -3517,6 +3556,9 @@ where
                 conversation_id: conv_id,
                 request_id: req_id,
                 message,
+                // Plain progress. A change in what the turn may do arrives on
+                // the capability observer instead (#741), which fills this in.
+                capability_change: None,
             })
             .await;
         });
@@ -3571,6 +3613,32 @@ where
         },
     );
 
+    // Turn-capability observer (#741): the provenance gate closes the acting
+    // tool tiers once a turn has taken in content an outside party can
+    // influence, and it stays closed for that turn. Report it as data on the
+    // same channel the usage sink uses, so a client, an automation, or another
+    // agent can react without parsing prose - and carry the human line in the
+    // same frame so a text-only renderer still explains the change. One frame
+    // per turn: the core loop reports the close once.
+    let conv_id_for_capability = conversation_id.clone();
+    let req_id_for_capability = request_id.clone();
+    let capability_observer: desktop_assistant_core::ports::turn_capability::TurnCapabilityObserver =
+        Arc::new(move |change: desktop_assistant_core::ports::turn_capability::TurnCapabilityChange| {
+            let _ = capability_tx.try_send(api::Event::AssistantStatus {
+                conversation_id: conv_id_for_capability.clone(),
+                request_id: req_id_for_capability.clone(),
+                message: change.message,
+                capability_change: Some(api::TurnCapabilityChange {
+                    reason: capability_reason_to_view(change.reason),
+                    closed_tool_tiers: change
+                        .closed_tiers
+                        .into_iter()
+                        .map(tool_tier_to_view)
+                        .collect(),
+                }),
+            });
+        });
+
     let dispatched = async move {
         match client_tool_port {
             Some(port) => with_client_tools(port, dispatch).await,
@@ -3579,6 +3647,10 @@ where
     };
     let dispatched =
         desktop_assistant_core::ports::llm::with_context_usage_sink(usage_sink, dispatched);
+    let dispatched = desktop_assistant_core::ports::turn_capability::with_turn_capability_observer(
+        capability_observer,
+        dispatched,
+    );
     // Install this turn's task-tool observer when tracked by a registry task
     // (#256 — shared with the agent path). The companion `progress_hint` clear
     // lives in the registry's panic-safe `finalize` (#254), so there is no
@@ -3676,6 +3748,78 @@ mod tests {
     use desktop_assistant_core::ports::llm::{ChunkCallback, StatusCallback};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    // --- Tool-provenance mapping to the wire (issue #741) ---------------
+
+    #[test]
+    fn every_core_tool_tier_maps_to_a_distinct_wire_tier() {
+        use desktop_assistant_core::tool_provenance::ToolTier as Core;
+        let cores = [
+            Core::Read,
+            Core::AssistantMemory,
+            Core::Present,
+            Core::Mutate,
+            Core::Egress,
+            Core::Execution,
+            Core::Unclassified,
+        ];
+        let mut wire: Vec<&str> = cores
+            .iter()
+            .map(|t| tool_tier_to_view(*t).as_wire_str())
+            .collect();
+        let count = wire.len();
+        wire.sort_unstable();
+        wire.dedup();
+        assert_eq!(
+            wire.len(),
+            count,
+            "two core tiers collapsed into one wire tier"
+        );
+    }
+
+    #[test]
+    fn the_wire_tier_agrees_with_core_about_what_is_gated() {
+        // A client decides whether to expect a refusal from the wire value.
+        // If the two answers disagree, the published contract is a lie.
+        use desktop_assistant_core::tool_provenance::ToolTier as Core;
+        for core in [
+            Core::Read,
+            Core::AssistantMemory,
+            Core::Present,
+            Core::Mutate,
+            Core::Egress,
+            Core::Execution,
+            Core::Unclassified,
+        ] {
+            assert_eq!(
+                tool_tier_to_view(core).is_gated(),
+                core.is_gated(),
+                "{core:?} is gated differently on the wire"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tool_usage_view_publishes_the_tool_tier() {
+        let usage = desktop_assistant_core::ports::tool_usage::ToolUsage {
+            tool_name: "web_read".to_string(),
+            namespace: Some("web".to_string()),
+            call_count: 1,
+            result_bytes: 100,
+            max_result_bytes: 100,
+            evicted_results: 0,
+            first_ordinal: 1,
+            last_ordinal: 1,
+            first_used_at: None,
+            last_used_at: None,
+        };
+        let view = tool_usage_to_view(usage);
+        assert_eq!(view.tool_tier, Some(api::ToolTier::Egress));
+        assert!(
+            view.tool_tier.expect("tier present").is_gated(),
+            "an integrator must be able to see that web_read can be refused"
+        );
+    }
 
     struct FakeKnowledge;
     impl desktop_assistant_core::ports::inbound::KnowledgeService for FakeKnowledge {

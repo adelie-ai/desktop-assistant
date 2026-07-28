@@ -192,10 +192,19 @@ pub fn map_event_to_signal(event: api::Event) -> Option<SignalEvent> {
         api::Event::ConversationListChanged { conversation_id } => {
             Some(SignalEvent::ConversationListChanged { conversation_id })
         }
+        // `capability_change` (#741) is deliberately not projected here.
+        // `SignalEvent` is the in-process Rust convenience view that the
+        // first-party clients destructure, so a new field on this variant
+        // would be a breaking change in every client repository. The typed
+        // change stays on the wire `Event`, which is what an API consumer
+        // reads; a client that wants it takes it there. The human-readable
+        // `message` reaches this projection either way, so nothing is lost
+        // for a client that only renders text.
         api::Event::AssistantStatus {
             conversation_id,
             request_id,
             message,
+            ..
         } => Some(SignalEvent::Status {
             conversation_id,
             request_id,

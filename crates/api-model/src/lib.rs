@@ -883,6 +883,142 @@ pub enum CommandResult {
 
 /// Wire-format view of a knowledge base entry. Mirrors
 /// `desktop_assistant_core::domain::KnowledgeEntry` but lives here so
+/// What a tool can do, as the provenance gate classifies it (#741).
+///
+/// The gate closes the acting tiers for the rest of any turn that has taken in
+/// content an outside party can influence. An integrator reads this to answer,
+/// before it calls, whether a tool can be refused mid-turn:
+/// [`ToolTier::is_gated`] gives the answer.
+///
+/// ## Wire form
+///
+/// A lower-case string (`"read"`, `"network_egress"`, ...), not a closed enum,
+/// because a value this build does not know must not fail a whole frame. An
+/// unrecognised tier reads back as [`ToolTier::Unclassified`], which is the
+/// safe reading: treat it as something that can be refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "String", into = "String")]
+pub enum ToolTier {
+    /// Reads state and changes nothing.
+    Read,
+    /// Adds to, or prunes, the assistant's own memory.
+    AssistantMemory,
+    /// Delivers output to the user's own session, or changes how that session
+    /// presents it.
+    Present,
+    /// Changes state the user owns.
+    Mutate,
+    /// Can send bytes to a destination chosen at call time.
+    Egress,
+    /// Runs a command, a script, or an agent chosen at call time.
+    Execution,
+    /// The daemon has no classification for this tool, or this build does not
+    /// know the tier the daemon named. Treated as refusable either way.
+    Unclassified,
+}
+
+impl ToolTier {
+    /// The wire string for this tier.
+    #[must_use]
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::AssistantMemory => "assistant_memory",
+            Self::Present => "present",
+            Self::Mutate => "mutate",
+            Self::Egress => "network_egress",
+            Self::Execution => "code_execution",
+            Self::Unclassified => "unclassified",
+        }
+    }
+
+    /// Whether a call to a tool in this tier is refused once the turn has
+    /// taken in externally-controlled content.
+    #[must_use]
+    pub fn is_gated(self) -> bool {
+        match self {
+            Self::Read | Self::AssistantMemory | Self::Present => false,
+            Self::Mutate | Self::Egress | Self::Execution | Self::Unclassified => true,
+        }
+    }
+}
+
+impl From<String> for ToolTier {
+    fn from(raw: String) -> Self {
+        match raw.as_str() {
+            "read" => Self::Read,
+            "assistant_memory" => Self::AssistantMemory,
+            "present" => Self::Present,
+            "mutate" => Self::Mutate,
+            "network_egress" => Self::Egress,
+            "code_execution" => Self::Execution,
+            // Includes "unclassified" and anything a newer daemon added.
+            _ => Self::Unclassified,
+        }
+    }
+}
+
+impl From<ToolTier> for String {
+    fn from(tier: ToolTier) -> Self {
+        tier.as_wire_str().to_string()
+    }
+}
+
+/// Why the turn's capabilities changed (#741).
+///
+/// A lower-case string on the wire, for the same forward-compatibility reason
+/// as [`ToolTier`]: an unknown cause reads back as
+/// [`TurnCapabilityReason::Unknown`] rather than failing the frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "String", into = "String")]
+pub enum TurnCapabilityReason {
+    /// A tool result brought in content an outside party can influence.
+    ExternalContentIngested,
+    /// A cause this build does not know. Read `closed_tool_tiers` and the
+    /// status message.
+    Unknown,
+}
+
+impl TurnCapabilityReason {
+    /// The wire string for this reason.
+    #[must_use]
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::ExternalContentIngested => "external_content_ingested",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl From<String> for TurnCapabilityReason {
+    fn from(raw: String) -> Self {
+        match raw.as_str() {
+            "external_content_ingested" => Self::ExternalContentIngested,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+impl From<TurnCapabilityReason> for String {
+    fn from(reason: TurnCapabilityReason) -> Self {
+        reason.as_wire_str().to_string()
+    }
+}
+
+/// A change in what the current turn may still do (#741).
+///
+/// Carried on [`Event::AssistantStatus`]. The change holds for the rest of the
+/// turn identified by that event's `request_id`; the next turn starts clean.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnCapabilityChange {
+    /// What caused the change.
+    pub reason: TurnCapabilityReason,
+    /// Tool tiers that are refused for the rest of this turn. A call to a tool
+    /// in one of these tiers returns a refusal in its tool result; the turn
+    /// itself keeps running.
+    pub closed_tool_tiers: Vec<ToolTier>,
+}
+
 /// Per-tool cost for one conversation — the Context Inspector's tool-usage view
 /// (#599).
 ///
@@ -895,6 +1031,12 @@ pub struct ToolUsageView {
     /// `builtin` or the MCP server hosting the tool, when resolvable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
+    /// What this tool can do, as the provenance gate classifies it (#741), so
+    /// an integrator can tell which of the tools a conversation uses will be
+    /// refused in a turn that has read outside content. Omitted on the wire
+    /// when absent, so an older client is unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_tier: Option<ToolTier>,
     /// Invocations the model requested (failures and never-executed calls
     /// included — the request is what spent the round).
     pub call_count: u32,
@@ -986,6 +1128,16 @@ pub enum Event {
         conversation_id: String,
         request_id: String,
         message: String,
+        /// Set when this status reports a change in what the turn may still
+        /// do (#741) rather than plain progress. `message` says the same
+        /// thing in words for a person; this says it as data, so a client, an
+        /// automation, or another agent can act on it without parsing prose.
+        ///
+        /// Omitted on the wire when absent, so a client that does not know
+        /// the field is unaffected - the same rule the handshake documents
+        /// for every additive field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        capability_change: Option<TurnCapabilityChange>,
     },
 
     /// Per-turn context-window fill report (issue #341). Emitted after each
@@ -4548,5 +4700,128 @@ mod tests {
             ),
             other => panic!("expected Subagent, got {other:?}"),
         }
+    }
+
+    // --- Tool-provenance gating on the wire (issue #741) ----------------
+
+    /// An older client's view of `AssistantStatus`: it knows the three fields
+    /// that always existed and nothing else. Deserializing a new frame into
+    /// this proves the added field cannot break a client that predates it.
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum LegacyEvent {
+        AssistantStatus {
+            #[allow(dead_code, reason = "the field must exist to prove it still parses")]
+            conversation_id: String,
+            #[allow(dead_code, reason = "the field must exist to prove it still parses")]
+            request_id: String,
+            message: String,
+        },
+        #[serde(other)]
+        Other,
+    }
+
+    #[test]
+    fn an_older_client_still_parses_a_status_carrying_a_capability_change() {
+        let frame = serde_json::to_string(&Event::AssistantStatus {
+            conversation_id: "c1".into(),
+            request_id: "r1".into(),
+            message: "Read outside content".into(),
+            capability_change: Some(TurnCapabilityChange {
+                reason: TurnCapabilityReason::ExternalContentIngested,
+                closed_tool_tiers: vec![ToolTier::Egress, ToolTier::Execution],
+            }),
+        })
+        .expect("serialize");
+
+        let legacy: LegacyEvent = serde_json::from_str(&frame).expect(
+            "a client that predates the capability_change field must still parse the frame",
+        );
+        match legacy {
+            LegacyEvent::AssistantStatus { message, .. } => {
+                assert_eq!(message, "Read outside content");
+            }
+            LegacyEvent::Other => panic!("the variant tag must be unchanged"),
+        }
+    }
+
+    #[test]
+    fn a_status_without_a_capability_change_omits_the_field_entirely() {
+        // Every ordinary progress status keeps its old bytes on the wire, so
+        // nothing about the common path changes for any client.
+        let frame = serde_json::to_value(&Event::AssistantStatus {
+            conversation_id: "c1".into(),
+            request_id: "r1".into(),
+            message: "Still working".into(),
+            capability_change: None,
+        })
+        .expect("serialize");
+        let body = frame
+            .get("assistant_status")
+            .expect("the variant tag must be unchanged");
+        assert!(
+            body.get("capability_change").is_none(),
+            "an absent change must not appear on the wire, got: {body}"
+        );
+    }
+
+    #[test]
+    fn a_legacy_status_frame_deserializes_with_no_capability_change() {
+        // The other direction: a frame minted before the field existed.
+        let event: Event = serde_json::from_str(
+            r#"{"assistant_status":{"conversation_id":"c1","request_id":"r1","message":"hi"}}"#,
+        )
+        .expect("a frame without the field must still parse");
+        match event {
+            Event::AssistantStatus {
+                capability_change, ..
+            } => assert!(capability_change.is_none()),
+            other => panic!("expected AssistantStatus, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_tool_tier_this_build_does_not_know_reads_as_unclassified() {
+        // A newer daemon may name a tier this client has never heard of. It
+        // must read as refusable, not fail the frame.
+        let tier: ToolTier = serde_json::from_str("\"a_tier_from_the_future\"").expect("parse");
+        assert_eq!(tier, ToolTier::Unclassified);
+        assert!(tier.is_gated(), "an unknown tier must be treated as gated");
+    }
+
+    #[test]
+    fn a_capability_reason_this_build_does_not_know_reads_as_unknown() {
+        let reason: TurnCapabilityReason =
+            serde_json::from_str("\"a_reason_from_the_future\"").expect("parse");
+        assert_eq!(reason, TurnCapabilityReason::Unknown);
+    }
+
+    #[test]
+    fn every_tool_tier_round_trips_through_its_wire_string() {
+        for tier in [
+            ToolTier::Read,
+            ToolTier::AssistantMemory,
+            ToolTier::Present,
+            ToolTier::Mutate,
+            ToolTier::Egress,
+            ToolTier::Execution,
+            ToolTier::Unclassified,
+        ] {
+            let json = serde_json::to_string(&tier).expect("serialize");
+            let back: ToolTier = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back, tier, "{} did not round-trip", tier.as_wire_str());
+        }
+    }
+
+    #[test]
+    fn tool_usage_without_a_tier_still_parses_and_omits_it() {
+        let view: ToolUsageView = serde_json::from_str(
+            r#"{"tool_name":"web_read","call_count":1,"result_bytes":10,"result_tokens":3,
+                "max_result_bytes":10,"evicted_results":0,"first_ordinal":1,"last_ordinal":1}"#,
+        )
+        .expect("a usage view minted before the tier field must still parse");
+        assert!(view.tool_tier.is_none());
+        let body = serde_json::to_value(&view).expect("serialize");
+        assert!(body.get("tool_tier").is_none());
     }
 }

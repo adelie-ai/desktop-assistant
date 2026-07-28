@@ -72,6 +72,35 @@ The project follows a ports-and-adapters (hexagonal) layout:
 1. TUI (or any D-Bus client) calls `SendPrompt`
 2. D-Bus adapter forwards to core service
 3. Core requests LLM streaming completion
-4. If tool calls are requested, core executes tools through MCP executor
+4. If tool calls are requested, core checks each one against the caller's tool
+   allowlist and the turn's provenance gate, then executes the permitted ones
+   through the MCP executor
 5. D-Bus adapter emits chunk/complete/error signals
 6. Client renders updates incrementally
+
+### Tool-provenance gating
+
+A tool result is ordinary context, so instructions hidden in a web page the
+model fetched look exactly like instructions the user wrote. `core::tool_provenance`
+classifies every shipped tool on two axes - whether an outside party can
+influence what it returns, and what it can do - and the turn loop tracks
+whether the current turn has taken in externally-controlled bytes.
+
+Once it has, the acting tiers (`mutate`, `network_egress`, `code_execution`,
+and anything unclassified) refuse for the rest of that turn. Reading, the
+assistant's own note-keeping, and output to the user's own session stay open.
+A refusal is a recoverable tool result, so the turn continues and the model can
+answer another way; the next turn starts clean.
+
+The change is reported once per turn:
+
+- as `Event::AssistantStatus.capability_change`, a typed
+  `TurnCapabilityChange` naming the reason and the closed tiers, for a client
+  or an automation
+- as the same event's `message`, one line for a person watching
+
+`ToolUsageView.tool_tier` carries the same classification per tool, so an
+integrator can tell which tools a conversation uses can be refused mid-turn.
+
+There is no confirmation round-trip. A refused call stays refused for that
+turn.
