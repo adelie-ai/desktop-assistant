@@ -6,6 +6,7 @@
 //! types are `pub(crate)` so `main.rs` can name them while wiring each
 //! transport; behavior is unchanged.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -408,6 +409,47 @@ pub(crate) fn resolve_ws_login_mode() -> Option<(String, WsLoginMode)> {
     )
 }
 
+/// What the remote WebSocket door will do at bind time (#805 review): stay
+/// off entirely (the desktop default), or bind - optionally with TLS.
+///
+/// Why a combined type: `resolve_ws_tls` alone cannot demonstrate that the
+/// fail-closed TLS check is unreachable when the door is off, because it
+/// has no `ws_enabled` input - a caller has to trust that `main.rs` gates
+/// the call correctly. `resolve_ws_door_plan` is that gate, made callable
+/// and testable in its own right, so "TLS failure is irrelevant when the
+/// door is off" is a fact this module proves by composing the real
+/// production decision, not a fact asserted about an unrelated default.
+pub(crate) enum WsDoorPlan {
+    /// `ws_enabled` is `false`: the door does not bind at all.
+    Disabled,
+    /// The door binds. `tls` is `Some` when it serves TLS, `None` when TLS
+    /// is deliberately off (`[tls] enabled = false`).
+    Enabled {
+        tls: Option<Arc<rustls::ServerConfig>>,
+    },
+}
+
+/// Decide the WebSocket door's bind plan (#805 review): composes the
+/// `ws_enabled` gate with [`crate::tls::resolve_ws_tls`]. When the door is
+/// off, TLS is never resolved at all - a broken or missing cert/key
+/// configuration cannot affect a desktop user who never turned the door on,
+/// because this function returns `Disabled` before looking at it.
+pub(crate) fn resolve_ws_door_plan(
+    ws_enabled: bool,
+    tls_enabled: bool,
+    cert_file: Option<&Path>,
+    key_file: Option<&Path>,
+) -> anyhow::Result<WsDoorPlan> {
+    if !ws_enabled {
+        return Ok(WsDoorPlan::Disabled);
+    }
+    let tls = match crate::tls::resolve_ws_tls(tls_enabled, cert_file, key_file)? {
+        crate::tls::WsTlsPosture::PlaintextByConfig => None,
+        crate::tls::WsTlsPosture::Tls(server_config) => Some(server_config),
+    };
+    Ok(WsDoorPlan::Enabled { tls })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{WsLoginMode, parse_env_bool, resolve_ws_login_mode_decision};
@@ -445,6 +487,108 @@ mod tests {
         // The env knobs (via `parse_env_bool`) still flip each policy.
         assert!(parse_env_bool(Some("true"), defaults.ws_enabled));
         assert!(!parse_env_bool(Some("false"), defaults.uds_enabled));
+    }
+
+    /// The `resolve_ws_door_plan` acceptance suite (#805 review): the
+    /// combined `ws_enabled` + TLS decision that `main.rs` wires directly,
+    /// so these tests exercise the real production glue rather than a
+    /// default value that happens to coincide with it.
+    mod ws_door_plan {
+        use std::path::PathBuf;
+
+        use crate::transports::{WsDoorPlan, resolve_ws_door_plan};
+
+        fn install_crypto_provider() {
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        }
+
+        /// Writes a fresh self-signed cert + key PEM pair to `dir` and
+        /// returns their paths. Mirrors `tls::tests::write_self_signed_cert`
+        /// (kept local rather than shared across modules - two call sites,
+        /// not three, so a shared test helper is not yet earned per 7.3).
+        fn write_self_signed_cert(dir: &std::path::Path) -> (PathBuf, PathBuf) {
+            let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+                .expect("generate self-signed cert for test fixture");
+            let cert_path = dir.join("cert.pem");
+            let key_path = dir.join("key.pem");
+            std::fs::write(&cert_path, certified.cert.pem()).expect("write test cert");
+            std::fs::write(&key_path, certified.signing_key.serialize_pem())
+                .expect("write test key");
+            (cert_path, key_path)
+        }
+
+        /// Acceptance (#805): the single-user desktop case, where the remote
+        /// door is off. It calls the real production decision function with a
+        /// deliberately broken TLS configuration, and proves that a desktop
+        /// user who never opted into the remote WebSocket door never reaches
+        /// the TLS fail-closed startup check, whatever a stale or invalid
+        /// `[tls]` section says. If a later edit hoisted TLS resolution above
+        /// the `ws_enabled` gate, this test fails with an `Err` in place of
+        /// `Disabled`.
+        #[test]
+        fn disabled_when_ws_is_off_even_with_a_broken_tls_config() {
+            let dir = tempfile::tempdir().unwrap();
+            let missing_cert = dir.path().join("does-not-exist-cert.pem");
+            let missing_key = dir.path().join("does-not-exist-key.pem");
+
+            let plan = resolve_ws_door_plan(false, true, Some(&missing_cert), Some(&missing_key))
+                .expect("the door being off must short-circuit before TLS is ever resolved");
+
+            assert!(
+                matches!(plan, WsDoorPlan::Disabled),
+                "ws_enabled = false must yield WsDoorPlan::Disabled regardless of the TLS \
+                 configuration's validity"
+            );
+        }
+
+        /// Acceptance: the door is on and TLS is configured and working.
+        #[test]
+        fn enabled_with_tls_when_configured_and_working() {
+            install_crypto_provider();
+            let dir = tempfile::tempdir().unwrap();
+            let (cert_path, key_path) = write_self_signed_cert(dir.path());
+
+            let plan = resolve_ws_door_plan(true, true, Some(&cert_path), Some(&key_path))
+                .expect("valid cert/key must resolve, not error");
+
+            assert!(
+                matches!(plan, WsDoorPlan::Enabled { tls: Some(_) }),
+                "TLS configured and working must yield an Enabled plan carrying a TLS acceptor"
+            );
+        }
+
+        /// Acceptance: the door is on and TLS is deliberately off.
+        #[test]
+        fn enabled_without_tls_when_deliberately_off() {
+            let plan = resolve_ws_door_plan(true, false, None, None)
+                .expect("TLS disabled must resolve, not error");
+
+            assert!(
+                matches!(plan, WsDoorPlan::Enabled { tls: None }),
+                "TLS disabled by configuration must yield an Enabled plan with no TLS acceptor"
+            );
+        }
+
+        /// Acceptance: the door is on and TLS is configured and failing.
+        /// This is the composed version of `tls::resolve_ws_tls`'s own
+        /// failing-config test: it proves the `?` in `resolve_ws_door_plan`
+        /// actually propagates the failure rather than swallowing it on the
+        /// way through the extra layer of composition.
+        #[test]
+        fn fails_closed_when_ws_enabled_and_tls_configured_and_failing() {
+            install_crypto_provider();
+            let dir = tempfile::tempdir().unwrap();
+            let missing_cert = dir.path().join("does-not-exist-cert.pem");
+            let missing_key = dir.path().join("does-not-exist-key.pem");
+
+            let result = resolve_ws_door_plan(true, true, Some(&missing_cert), Some(&missing_key));
+
+            assert!(
+                result.is_err(),
+                "the door being on with a broken TLS config must fail closed (Err), \
+                 never silently bind plaintext"
+            );
+        }
     }
 
     #[test]

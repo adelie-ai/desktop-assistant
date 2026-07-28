@@ -63,6 +63,59 @@ pub fn setup(
     }
 }
 
+/// Outcome of resolving the WebSocket door's TLS posture at startup (#805).
+///
+/// There is no "TLS enabled but serving plaintext" state. Either TLS is off
+/// by deliberate configuration ([`PlaintextByConfig`](Self::PlaintextByConfig)),
+/// or it is on and ready ([`Tls`](Self::Tls)) — "on but not deliverable" is
+/// not a variant here because [`resolve_ws_tls`] returns `Err` for it
+/// instead, so the caller cannot construct a silent downgrade by accident
+/// *through this function*. The variants are plain `pub`, so that guarantee
+/// is a convention this module upholds, not one the type enforces by
+/// construction (no private field, no smart constructor) — fine today with
+/// one call site in a private binary crate, but worth revisiting with a
+/// constructor-only API if a second WS listener is ever added and starts
+/// building `WsTlsPosture` values of its own.
+pub enum WsTlsPosture {
+    /// `[tls] enabled = false` (or `DESKTOP_ASSISTANT_WS_TLS=false`): the
+    /// operator deliberately turned TLS off. Serving plaintext here is a
+    /// choice the operator made, not a downgrade from one they didn't.
+    PlaintextByConfig,
+    /// TLS is on and ready to serve.
+    Tls(Arc<rustls::ServerConfig>),
+}
+
+/// Decide the WebSocket door's TLS posture (#805): plaintext because TLS is
+/// deliberately off, or TLS because it is on and ready — and fail closed
+/// when it is on but cannot be delivered.
+///
+/// Why: the remote WebSocket door now carries the bearer token for an
+/// administrator (#728: `[authz] admin_subjects`), so a daemon told to use
+/// TLS and unable to must not silently serve that door in plaintext. When
+/// `enabled` is `true` and [`setup`] cannot deliver it — missing files,
+/// unreadable permissions (e.g. an ACME renewal that rewrote the key file
+/// 0600 root:root), malformed PEM, or a write failure on the auto-generate
+/// path — this returns `Err` instead of falling back to
+/// [`WsTlsPosture::PlaintextByConfig`]. The configuration asked for a
+/// security property the process cannot provide, which is a startup
+/// failure, not a degradation: the caller is expected to abort rather than
+/// bind.
+pub fn resolve_ws_tls(
+    enabled: bool,
+    cert_file: Option<&Path>,
+    key_file: Option<&Path>,
+) -> anyhow::Result<WsTlsPosture> {
+    if !enabled {
+        return Ok(WsTlsPosture::PlaintextByConfig);
+    }
+    let server_config = setup(cert_file, key_file).context(
+        "TLS is enabled ([tls] enabled defaults to true) but setup failed; refusing to serve \
+         the remote WebSocket door in plaintext. Fix the TLS configuration, or set \
+         DESKTOP_ASSISTANT_WS_TLS=false ([tls] enabled = false) to serve plaintext deliberately",
+    )?;
+    Ok(WsTlsPosture::Tls(server_config))
+}
+
 /// Load or generate the local CA.
 fn ensure_ca(tls_dir: &Path) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
     let cert_path = tls_dir.join(CA_CERT_FILENAME);
@@ -485,5 +538,206 @@ mod tests {
         let pem = cert.pem().into_bytes();
 
         assert!(is_pem_cert_expired(&pem), "should detect expired cert");
+    }
+
+    // --- resolve_ws_tls (#805): fail closed instead of silently downgrading
+    // the remote WebSocket door to plaintext when TLS is enabled but cannot
+    // be delivered. -------------------------------------------------------
+
+    /// Writes a fresh self-signed cert + key PEM pair to `dir` and returns
+    /// their paths, so a test can point `resolve_ws_tls` at real files
+    /// without touching the process-wide `XDG_DATA_HOME` auto-generate path.
+    fn write_self_signed_cert(dir: &Path) -> (PathBuf, PathBuf) {
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("generate self-signed cert for test fixture");
+        let cert_path = dir.join("cert.pem");
+        let key_path = dir.join("key.pem");
+        std::fs::write(&cert_path, certified.cert.pem()).expect("write test cert");
+        std::fs::write(&key_path, certified.signing_key.serialize_pem()).expect("write test key");
+        (cert_path, key_path)
+    }
+
+    /// Acceptance: TLS configured and working. A daemon with `[tls] enabled
+    /// = true` and a readable, valid cert/key pair serves TLS, not
+    /// plaintext.
+    #[test]
+    fn resolve_ws_tls_configured_and_working_yields_a_ready_tls_posture() {
+        install_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let (cert_path, key_path) = write_self_signed_cert(dir.path());
+
+        let posture = resolve_ws_tls(true, Some(&cert_path), Some(&key_path))
+            .expect("valid cert/key must resolve to a TLS posture, not an error");
+
+        assert!(
+            matches!(posture, WsTlsPosture::Tls(_)),
+            "TLS configured and working must yield WsTlsPosture::Tls, not plaintext"
+        );
+    }
+
+    /// Acceptance: TLS configured and failing. A daemon with `[tls] enabled
+    /// = true` (the default) but an unreadable cert/key pair — an expired
+    /// ACME renewal, a permissions error, a corrupt file — must refuse to
+    /// serve the remote WebSocket door at all. It must NOT return a
+    /// plaintext posture: this is the silent-downgrade bug (#805), and the
+    /// regression is specifically that `resolve_ws_tls` must return `Err`,
+    /// not `Ok(WsTlsPosture::PlaintextByConfig)`.
+    #[test]
+    fn resolve_ws_tls_configured_and_failing_refuses_rather_than_downgrading() {
+        install_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let missing_cert = dir.path().join("does-not-exist-cert.pem");
+        let missing_key = dir.path().join("does-not-exist-key.pem");
+
+        let result = resolve_ws_tls(true, Some(&missing_cert), Some(&missing_key));
+
+        assert!(
+            result.is_err(),
+            "TLS enabled with an unreadable cert/key must fail closed (Err), \
+             never silently fall back to plaintext"
+        );
+    }
+
+    /// Acceptance (review follow-up): a `cert_file` set without a matching
+    /// `key_file` is a different failure shape than a missing file - it is
+    /// caught by `setup`'s own pairing check (`tls.rs:50-52`) before either
+    /// path is even read - and it must fail closed exactly like a missing
+    /// or unreadable file does, not silently succeed some other way.
+    #[test]
+    fn resolve_ws_tls_rejects_cert_without_a_matching_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert_path, _unused_key_path) = write_self_signed_cert(dir.path());
+
+        let result = resolve_ws_tls(true, Some(&cert_path), None);
+
+        assert!(
+            result.is_err(),
+            "cert_file set without key_file must fail closed, not silently \
+             fall back to auto-generate or to plaintext"
+        );
+    }
+
+    /// The mirror image of the above: `key_file` without `cert_file`.
+    #[test]
+    fn resolve_ws_tls_rejects_key_without_a_matching_cert() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_unused_cert_path, key_path) = write_self_signed_cert(dir.path());
+
+        let result = resolve_ws_tls(true, None, Some(&key_path));
+
+        assert!(
+            result.is_err(),
+            "key_file set without cert_file must fail closed, not silently \
+             fall back to auto-generate or to plaintext"
+        );
+    }
+
+    /// Acceptance (review follow-up): a present, readable cert file whose
+    /// contents are not valid PEM (truncated by a bad copy, or the wrong
+    /// file entirely) is a different failure shape than a missing file -
+    /// every prior test here only ever fed `build_server_config` freshly
+    /// generated, valid PEM, so a regression that made cert parsing
+    /// silently accept garbage would have gone undetected.
+    ///
+    /// What this test actually pins is the outcome, not the branch that
+    /// produces it. A single unreadable block degenerates to an *empty*
+    /// certificate list either way - with no `-----BEGIN-----` marker there is
+    /// nothing to decode, and a marker wrapping undecodable content leaves
+    /// nothing behind once it fails - so rustls refuses the empty chain
+    /// downstream and the `parsing certificate PEM` line is never the thing
+    /// that fails. Verified by mutation: making that line skip unreadable
+    /// entries instead of failing the whole read leaves this test green.
+    ///
+    /// That redundancy is the point here - the daemon fails closed by two
+    /// independent routes. The parse line itself is pinned by
+    /// [`resolve_ws_tls_rejects_a_chain_whose_second_block_is_corrupt`], which
+    /// is the only shape where a lenient parse would yield a usable chain.
+    #[test]
+    fn resolve_ws_tls_rejects_unparseable_cert_pem() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert_path, key_path) = write_self_signed_cert(dir.path());
+        std::fs::write(
+            &cert_path,
+            b"-----BEGIN CERTIFICATE-----\n!!! not base64 !!!\n-----END CERTIFICATE-----\n",
+        )
+        .expect("overwrite with an undecodable PEM body");
+
+        let result = resolve_ws_tls(true, Some(&cert_path), Some(&key_path));
+
+        assert!(
+            result.is_err(),
+            "an unparseable cert PEM must fail closed, not silently succeed \
+             or fall back to plaintext"
+        );
+    }
+
+    /// Acceptance (review follow-up): a chain file whose first block is a
+    /// valid leaf and whose second block is corrupt must fail as a whole.
+    ///
+    /// This is the case a lenient rewrite would quietly break: swapping the
+    /// collect for something that skips unreadable entries would leave every
+    /// other test here green while the daemon served a partial chain.
+    #[test]
+    fn resolve_ws_tls_rejects_a_chain_whose_second_block_is_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert_path, key_path) = write_self_signed_cert(dir.path());
+
+        let leaf = std::fs::read_to_string(&cert_path).expect("read the generated leaf");
+        std::fs::write(
+            &cert_path,
+            format!(
+                "{leaf}-----BEGIN CERTIFICATE-----\n!!! not base64 !!!\n-----END CERTIFICATE-----\n"
+            ),
+        )
+        .expect("append a corrupt chain entry");
+
+        let result = resolve_ws_tls(true, Some(&cert_path), Some(&key_path));
+
+        assert!(
+            result.is_err(),
+            "a chain with one unreadable entry must fail closed rather than \
+             serving the entries that happened to parse"
+        );
+    }
+
+    /// The key-side mirror of the above: a present, readable key file whose
+    /// contents are not valid PEM, with a genuinely valid cert alongside it
+    /// so the failure is isolated to key parsing specifically.
+    #[test]
+    fn resolve_ws_tls_rejects_unparseable_key_pem() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert_path, key_path) = write_self_signed_cert(dir.path());
+        std::fs::write(&key_path, b"this is not a private key\n").expect("overwrite with junk");
+
+        let result = resolve_ws_tls(true, Some(&cert_path), Some(&key_path));
+
+        assert!(
+            result.is_err(),
+            "an unparseable key PEM must fail closed, not silently succeed \
+             or fall back to plaintext"
+        );
+    }
+
+    /// Acceptance: TLS not configured at all. `[tls] enabled = false` (or
+    /// `DESKTOP_ASSISTANT_WS_TLS=false`) is a deliberate operator choice, so
+    /// plaintext here is correct — and it must stay correct even when a
+    /// stale cert/key path also happens to be present in config, since a
+    /// disabled TLS section makes those paths irrelevant.
+    #[test]
+    fn resolve_ws_tls_not_configured_at_all_is_deliberate_plaintext() {
+        let result =
+            resolve_ws_tls(false, None, None).expect("TLS disabled must resolve, not error");
+        assert!(matches!(result, WsTlsPosture::PlaintextByConfig));
+
+        let dir = tempfile::tempdir().unwrap();
+        let missing_cert = dir.path().join("does-not-exist-cert.pem");
+        let missing_key = dir.path().join("does-not-exist-key.pem");
+        let result_with_stale_paths =
+            resolve_ws_tls(false, Some(&missing_cert), Some(&missing_key))
+                .expect("TLS disabled must resolve even if cert/key paths are stale");
+        assert!(matches!(
+            result_with_stale_paths,
+            WsTlsPosture::PlaintextByConfig
+        ));
     }
 }
