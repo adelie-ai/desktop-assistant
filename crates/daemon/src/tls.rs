@@ -638,11 +638,29 @@ mod tests {
     /// every prior test here only ever fed `build_server_config` freshly
     /// generated, valid PEM, so a regression that made cert parsing
     /// silently accept garbage would have gone undetected.
+    ///
+    /// What this test actually pins is the outcome, not the branch that
+    /// produces it. A single unreadable block degenerates to an *empty*
+    /// certificate list either way - with no `-----BEGIN-----` marker there is
+    /// nothing to decode, and a marker wrapping undecodable content leaves
+    /// nothing behind once it fails - so rustls refuses the empty chain
+    /// downstream and the `parsing certificate PEM` line is never the thing
+    /// that fails. Verified by mutation: making that line skip unreadable
+    /// entries instead of failing the whole read leaves this test green.
+    ///
+    /// That redundancy is the point here - the daemon fails closed by two
+    /// independent routes. The parse line itself is pinned by
+    /// [`resolve_ws_tls_rejects_a_chain_whose_second_block_is_corrupt`], which
+    /// is the only shape where a lenient parse would yield a usable chain.
     #[test]
     fn resolve_ws_tls_rejects_unparseable_cert_pem() {
         let dir = tempfile::tempdir().unwrap();
         let (cert_path, key_path) = write_self_signed_cert(dir.path());
-        std::fs::write(&cert_path, b"this is not a certificate\n").expect("overwrite with junk");
+        std::fs::write(
+            &cert_path,
+            b"-----BEGIN CERTIFICATE-----\n!!! not base64 !!!\n-----END CERTIFICATE-----\n",
+        )
+        .expect("overwrite with an undecodable PEM body");
 
         let result = resolve_ws_tls(true, Some(&cert_path), Some(&key_path));
 
@@ -650,6 +668,35 @@ mod tests {
             result.is_err(),
             "an unparseable cert PEM must fail closed, not silently succeed \
              or fall back to plaintext"
+        );
+    }
+
+    /// Acceptance (review follow-up): a chain file whose first block is a
+    /// valid leaf and whose second block is corrupt must fail as a whole.
+    ///
+    /// This is the case a lenient rewrite would quietly break: swapping the
+    /// collect for something that skips unreadable entries would leave every
+    /// other test here green while the daemon served a partial chain.
+    #[test]
+    fn resolve_ws_tls_rejects_a_chain_whose_second_block_is_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert_path, key_path) = write_self_signed_cert(dir.path());
+
+        let leaf = std::fs::read_to_string(&cert_path).expect("read the generated leaf");
+        std::fs::write(
+            &cert_path,
+            format!(
+                "{leaf}-----BEGIN CERTIFICATE-----\n!!! not base64 !!!\n-----END CERTIFICATE-----\n"
+            ),
+        )
+        .expect("append a corrupt chain entry");
+
+        let result = resolve_ws_tls(true, Some(&cert_path), Some(&key_path));
+
+        assert!(
+            result.is_err(),
+            "a chain with one unreadable entry must fail closed rather than \
+             serving the entries that happened to parse"
         );
     }
 
