@@ -1,0 +1,17 @@
+# Reviewed false positives for the working-tree secret scan (#811), by
+# gitleaks fingerprint (`file:rule-id:start-line`).
+#
+# Currently empty: the five known false positives in this repo (self-generated
+# test-only PEM key fixtures, and two truncated example tokens) all live in
+# .gitleaks.toml's [[allowlists]] instead, matched by repo-relative path
+# suffix or by content rather than by exact path. A path-exact fingerprint
+# here only ever matches ONE checkout of a tracked file, and this repo's own
+# .claude/worktrees/<session>/ nests full duplicate checkouts of itself
+# (deliberately not excluded from the scan - see AGENTS.md, "Secret
+# scanning") - so a fingerprint here would leave every duplicate of a known
+# fixture reported as a new finding.
+#
+# Use this file for a genuinely one-off false positive that does not fit a
+# general path-suffix or content pattern (see AGENTS.md, "Secret scanning",
+# for when to reach for which mechanism). Add an entry with a comment
+# explaining why it is not a real secret, same as .gitleaks.toml's entries.

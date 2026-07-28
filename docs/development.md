@@ -5,7 +5,7 @@ The assistant persona is named **Adele**, in reference to the **Adélie penguin*
 ## Day-to-day Commands
 
 ```bash
-# the whole gate: dependency scan, format, lints, build, tests
+# the whole gate: dependency scan, secret scan, format, lints, build, tests
 just check
 
 # individual steps
@@ -13,6 +13,7 @@ cargo fmt
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 just audit                  # RustSec advisory scan of Cargo.lock
+just secret-scan            # gitleaks over the working tree, not git history
 just lint-sqlite            # clippy the SQLite adapter with --features sqlite
 just test-sqlite            # its own suite, which --workspace runs none of
 ```
@@ -23,8 +24,14 @@ it as an empty crate and run zero of its tests.
 
 `just check` needs `cargo-audit` (`cargo install cargo-audit --locked`) and
 network access for the advisory database; it fails loudly without either rather
-than skipping the scan. Its last step also boots two throwaway databases, to
-check that the harness below really is parallel-safe; with no container runtime
+than skipping the scan. It also needs the pinned `gitleaks` version for the
+working-tree secret scan, but that step needs no network - its rule set is
+bundled in the binary. Install `gitleaks` from the release tarball, not
+`pacman -S gitleaks` - the Arch/CachyOS package is the pinned version but
+does not report it, which fails the pin check; see AGENTS.md, "Secret
+scanning", for the exact command and the `ADELE_SECRET_SCAN_ALLOW_UNPINNED=1`
+escape hatch. Its last step also boots two throwaway databases, to check that
+the harness below really is parallel-safe; with no container runtime
 reachable that one criterion skips and says so. The pre-push hook runs all of
 this, so a push with the runtime up costs about half a minute more than one
 without.

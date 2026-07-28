@@ -78,6 +78,7 @@ The daemon is built and run as `cargo run -p desktop-assistant-daemon`. Operatio
 The workspace is held to:
 
 - a RustSec advisory scan of `Cargo.lock` (`scripts/audit.sh`)
+- a working-tree secret scan (`scripts/secret-scan.sh`) - see "Secret scanning" below
 - `cargo fmt`
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `cargo test --workspace`
@@ -95,8 +96,9 @@ having one.
 `storage-sqlite` counterpart (`lint` then `lint-sqlite`, `test` then
 `test-sqlite`), with `build` in between and `just test-scripts` last (the named
 tests for the gate's own shell steps, under `scripts/tests/`). The advisory scan
-is first because build scripts execute at first compile - under `clippy` as much
-as under `build`, and enabling `sqlite` adds `libsqlite3-sys`, which compiles C.
+and the secret scan both come first, before either `lint` or `build` - build
+scripts execute at first compile, under `clippy` as much as under `build`, and
+enabling `sqlite` adds `libsqlite3-sys`, which compiles C.
 
 What `just check` does **not** cover:
 
@@ -111,8 +113,9 @@ What `just check` does **not** cover:
 
 So the gate wants a reachable podman/docker and the network - the advisory scan
 fetches, and runs offline only under the `ADELE_AUDIT_ALLOW_STALE=1` opt-in
-described below. That goes for `git push` too: the pre-push hook runs the same
-`just check`.
+described below. The secret scan adds no network requirement: gitleaks' rule
+set is bundled in the binary, not fetched per run. That goes for `git push`
+too: the pre-push hook runs the same `just check`.
 
 New code keeps it there. Warnings-as-errors is enforced **mechanically**, not by reviewer vigilance: the root `Cargo.toml` sets `[workspace.lints] rust.warnings = "deny"` and `clippy.all = "deny"`, and every member inherits via `[lints] workspace = true`, so a plain `cargo build`/`test`/`clippy` hard-fails on any warning. Base rule 2.1 states the posture.
 
@@ -135,6 +138,105 @@ Common, well-maintained cargo plugins are fine — `cargo-edit` (`cargo upgrade`
 - **Advisory suppressed by an audit.toml `ignore` list** - named in the output
   and in the summary line, and does not fail the gate: suppressing one is a
   reviewed decision, but the gate never presents it as a clean scan.
+
+## Secret scanning
+
+`just secret-scan` (`scripts/secret-scan.sh`) runs [gitleaks](https://github.com/gitleaks/gitleaks)
+over the **checked-out files**, not git history. This is deliberate, not an
+oversight: #811's key was never committed, so a history-based scan
+(`gitleaks git`, or the older `gitleaks detect`) would have reported clean for
+the entire time the key was exposed. The script calls `gitleaks dir`, the
+filesystem-walk subcommand, which reads whatever is on disk - tracked or not,
+gitignored or not.
+
+`gitleaks` is therefore a prerequisite of the gate, the same as `cargo-audit`.
+**Install the pinned release tarball, user-local, no sudo:**
+
+```sh
+curl -sL -o gitleaks.tar.gz https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+tar -xzf gitleaks.tar.gz gitleaks && install -m 755 gitleaks ~/.local/bin/gitleaks
+```
+
+That is the primary path, not a fallback: `pacman -S gitleaks` also installs
+the pinned `8.30.1`, but the CachyOS/Arch package (confirmed on both plain
+Arch and CachyOS) does not set the build-time version ldflag, so
+`gitleaks version` prints `version is set by build process` instead of a
+version number - the exact pinned release then fails the pin check below.
+This is a packaging defect in that distro build, not something this repo can
+fix from here; the tarball release does set the ldflag correctly.
+
+The gitleaks rule set is bundled in the binary itself, not fetched per run,
+so the version is pinned in `scripts/secret-scan.sh` (`GITLEAKS_VERSION`)
+rather than left to whatever a machine happens to have - two developers
+running two different rule sets is the same reproducibility failure as two
+different Rust toolchains. Bump the pin deliberately, after checking the new
+release's notes (base rule 6.1), not by installing whatever a package
+manager offers this week.
+
+Two files at the repo root configure the scan:
+
+- **`.gitleaks.toml`** extends (not replaces) gitleaks' default rule set.
+  `[[allowlists]]` #1 covers generated/vendored directories - `target/`,
+  `build/`, `.git/`, `.venv/` - that are never hand-authored and only slow the
+  scan down. `.flatpak-builder/` and `.claude/worktrees/` are deliberately
+  **not** on that list: the #811 incident's own leak involved a live `.env`
+  *and* eight stale `.claude/worktrees` checkouts, so excluding either
+  directory would reopen half the blind spot this gate exists to close - and
+  because `.claude/worktrees/<session>/` nests full checkouts of this same
+  repo, its tracked files (including this repo's own known-fake test
+  fixtures) exist at N+1 different paths at once. The remaining
+  `[[allowlists]]` cover this repo's own reviewed false positives (test-only
+  PEM key fixtures, a truncated placeholder key inline in a unit test, a
+  truncated example JWT in docs), matched by **repo-relative path suffix**
+  (whole-file fixtures - the pattern names the tracked path, e.g.
+  `crates/daemon/src/config/testdata/oidc_test_key\d+\.pem$`, never a bare
+  filename and never a directory-wide exclusion) or by **content**
+  (`regexTarget = "line"` or the extracted secret itself, for a single
+  known-fake line inside an otherwise normal file, so nothing else in that
+  file is exempted). Either way the match survives duplication: the same
+  tracked fixture is exempt wherever `.claude/worktrees/` happens to have
+  checked it out, not just at its canonical path. A path-**exact**
+  `.gitleaksignore` fingerprint does not have this property - see below.
+- **`.gitleaksignore`** lists reviewed false positives by gitleaks fingerprint
+  (`file:rule-id:start-line`) - currently empty. This mechanism is
+  path-exact, which is right for a genuinely one-off finding but wrong for
+  any of this repo's own tracked fixtures: a fingerprint for
+  `crates/daemon/src/config/testdata/oidc_test_key1.pem` does not cover the
+  byte-identical tracked file at
+  `.claude/worktrees/<session>/crates/daemon/src/config/testdata/oidc_test_key1.pem`,
+  so every stale nested worktree reproduced the whole fixture set as "new"
+  findings - 27 false hard-failures scanning the primary checkout (3
+  known fixtures x 9 stale worktrees) before this was caught in review.
+  Reach for `.gitleaks.toml`'s path-suffix or content allowlists first;
+  reach for this file only when a finding truly cannot be expressed that
+  way.
+
+Like the advisory scan, the step is deliberately unable to pass by accident:
+
+- **gitleaks not installed** - hard failure, with the install command.
+- **Installed version does not match the pin** - hard failure, naming both
+  versions. Diagnosed separately from the next case, because they have
+  different fixes.
+- **Installed gitleaks reports no parseable version** (e.g. the CachyOS/Arch
+  packaging defect above) - hard failure, with its own message: this is not
+  version drift, so it is not worded as one.
+- **A scan that produced no report** - hard failure. An exit status alone is
+  not proof a scan ran (the same #706 failure mode `scripts/audit.sh` guards
+  against): a fatal gitleaks error (bad config, bad path) exits non-zero and
+  writes no report at all, so report-existence, not exit code alone, is what
+  the script trusts.
+- **A secret found** - hard failure, always. There is no suppress-and-warn
+  path for a real finding the way there is for an informational RustSec
+  advisory; add a reviewed `.gitleaksignore` entry for a genuine false
+  positive, or rotate and remove a real one.
+
+Either of the two version failures above can be overridden with
+`ADELE_SECRET_SCAN_ALLOW_UNPINNED=1` (mirrors `ADELE_AUDIT_ALLOW_STALE`'s
+shape and purpose in `scripts/audit.sh`): the scan still runs, against
+whatever gitleaks is actually on `PATH`, and says loudly that the pin was not
+verified. The exact pin stays the default - determinism in a security
+scanner's rule set is worth keeping - but nobody should have to edit the gate
+or reach for `--no-verify` to unblock work unrelated to the scanner itself.
 
 ## Overrides and additions to the shared base
 

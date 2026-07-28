@@ -28,3 +28,12 @@ modules:
     sources:
       - type: dir
         path: ../..
+        # A "dir" source copies every file at ../.. into the build sandbox
+        # regardless of .gitignore, so an untracked, gitignored secret
+        # sitting in the working tree still reaches the sandbox unless it is
+        # named here. This is how three live-key copies ended up under
+        # .flatpak-builder/build/*/.env (#811).
+        skip:
+          - .env
+          - .envrc
+          - secrets.toml
