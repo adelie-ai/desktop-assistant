@@ -190,6 +190,38 @@ flake in an unrelated test.
 Reuse the existing traits and the ports-and-adapters layout rather than inventing a parallel
 one. Extend an existing crate instead of adding one, unless the seam is obvious.
 
+### 8.3 The wire contract is the product (addition)
+
+Adele is an API-first platform. The `Command` / `CommandResult` / `Event` surface in
+`crates/api-model` is consumed directly by third-party clients, automations, and other
+agents - the shipped clients are only its first consumers. Design every change to that
+surface as a published contract, not as plumbing behind a user interface.
+
+Base rule 8.3 already requires the business outcome in the payload. Three things follow from
+it here:
+
+**A refusal is a structured result, not a string.** A caller must be able to tell "you lack
+permission" from "the database is down" without matching English text, so a rules-based
+decline carries a stable machine-readable code, a description, a user-facing message, and a
+`retryable` flag. Base rule 8.2 also applies: a decline is a normal outcome, so do not log it
+at error level.
+
+**Extend with optional fields, never with a new enum variant.** Serde fails to deserialize
+an unknown variant, so a new arm on a wire enum breaks every client that has not been
+rebuilt, including ones this repo does not ship. Add
+`#[serde(default, skip_serializing_if = "Option::is_none")]` fields to an existing shape
+instead. `WsHandshake` in `crates/api-model/src/lib.rs` documents this pattern where
+`system_id` and `host_label` were added without changing the wire bytes for older clients.
+Prove it with a test that parses the old shape.
+
+**Document the contract in the same change**, in `docs/API_TRANSPORT.md`,
+`docs/WEBSOCKET_API.md` and `docs/dbus-api.md`. Where a change alters what an existing
+caller sees - a command that starts refusing, a tool that starts declining, an environment a
+subprocess stops inheriting - say so plainly as a behaviour change and say what an integrator
+must do about it. The same applies to a tool schema advertised to the model: if an argument
+is now ignored or constrained, the advertised description says so, because a schema that
+promises what the code does not honour is a false contract.
+
 ### 9.1 Tracker for this project
 
 GitHub Issues on `github.com/adelie-ai/desktop-assistant`, together with the shared `adelie-ai` project
@@ -235,3 +267,35 @@ means the microphone never opens.
 Detect each optional dependency on its own. The absence of one never disables the others and
 never aborts startup. Surface the detected capability, so an operator can see why a feature
 is on or off.
+
+### Every change carries its user story (addition)
+
+Before a change lands, answer two questions in the pull request: how does a person meet this
+behaviour, and does any client need a user-interface change? A correct enforcement change
+with no user story is a broken product.
+
+Two shapes cause most of the damage.
+
+**Late failure.** A panel assumes its command succeeds. Add a gate, and the user types a
+value, presses save, and gets an error. The client must learn its capability up front and
+render the affected section as visibly unavailable with a reason, which usually means the
+daemon must expose that capability through the API. Decide that while you build the daemon
+side, not after a client reports it.
+
+**A silent cliff.** A capability disappears part-way through a turn and the user sees a
+refusal with no cause and no way forward. Emit one legible signal on the existing status or
+event channel, and make the refusal text say what to do next. One signal for the turn, not
+one per refused call.
+
+This is **Capability-based degradation** above, applied to authorization and policy rather
+than to optional operating-system services: surface why something is off.
+
+State what a single-user desktop user sees. For well-designed work the answer is nothing at
+all - no new setting, no new concept, no new interface. When that is not the answer, the
+design is usually wrong, not the requirement.
+
+Do not build the client interface from a daemon ticket. Client work belongs to the client
+repositories, so file an entry in each affected one naming the concrete API, the commands or
+behaviour that changed, and the expected rendering. A vague note is not a handover. Where a
+change accepts a usability cliff on purpose, record the accepted cost and what would remove
+it, so the next reader knows it was a decision and not an oversight.
