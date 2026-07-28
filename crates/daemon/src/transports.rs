@@ -12,16 +12,24 @@ use async_trait::async_trait;
 use desktop_assistant_core::ports::inbound::SettingsService;
 
 use crate::config;
+use desktop_assistant_transport_dispatch::{AdminSubjects, Capability, capability_for_local_peer};
 use desktop_assistant_uds as uds;
 use desktop_assistant_ws as ws;
 
 pub(crate) struct WsSettingsAuth<S: SettingsService + 'static> {
     settings: Arc<S>,
+    /// The operator's remote-administrator allowlist (#728), read once from
+    /// `[authz] admin_subjects`. Empty by default, so an unconfigured daemon
+    /// admits nobody to the admin surface over the network.
+    admin_subjects: Arc<AdminSubjects>,
 }
 
 impl<S: SettingsService + 'static> WsSettingsAuth<S> {
-    pub(crate) fn new(settings: Arc<S>) -> Self {
-        Self { settings }
+    pub(crate) fn new(settings: Arc<S>, admin_subjects: Arc<AdminSubjects>) -> Self {
+        Self {
+            settings,
+            admin_subjects,
+        }
     }
 }
 
@@ -41,6 +49,12 @@ impl<S: SettingsService + 'static> ws::WsAuthValidator for WsSettingsAuth<S> {
         // sentinel) so a single-tenant deploy without identity
         // information still resolves correctly.
         config::ws_jwt_sub(token).map(desktop_assistant_application::UserId::from)
+    }
+
+    fn capability_for_subject(&self, subject: &str) -> Capability {
+        // Remote is admin only by explicit allowlist (#728): a token proves who
+        // the caller is, never that they own the service.
+        self.admin_subjects.capability_for(subject)
     }
 }
 
@@ -82,6 +96,12 @@ impl<S: SettingsService + 'static> ws::WsAuthValidator for OidcAwareAuth<S> {
         }
         None
     }
+
+    fn capability_for_subject(&self, subject: &str) -> Capability {
+        // One allowlist for the door, whichever issuer authenticated the token:
+        // OIDC validates issuer and audience, never who administers this daemon.
+        self.local.capability_for_subject(subject)
+    }
 }
 
 /// Provides auth discovery info from the daemon config.
@@ -114,11 +134,27 @@ impl ws::WsAuthDiscovery for WsAuthDiscoveryProvider {
 pub(crate) struct PeerCredUdsAuth {
     /// JWT fallback for the (rare) peer-cred-unavailable case during migration.
     jwt_fallback: Arc<dyn ws::WsAuthValidator>,
+    /// The uid this daemon process runs as (#728). A peer that matches it is
+    /// the person who runs the daemon, so it administers the daemon - which is
+    /// what makes the single-user desktop need no configuration at all.
+    daemon_uid: u32,
+    /// The operator's allowlist, so a multi-user host can name a second
+    /// administrator without a code change. Also the only promotion available
+    /// on the token-fallback path, which has no unforgeable uid to compare.
+    admin_subjects: Arc<AdminSubjects>,
 }
 
 impl PeerCredUdsAuth {
-    pub(crate) fn new(jwt_fallback: Arc<dyn ws::WsAuthValidator>) -> Self {
-        Self { jwt_fallback }
+    pub(crate) fn new(
+        jwt_fallback: Arc<dyn ws::WsAuthValidator>,
+        daemon_uid: u32,
+        admin_subjects: Arc<AdminSubjects>,
+    ) -> Self {
+        Self {
+            jwt_fallback,
+            daemon_uid,
+            admin_subjects,
+        }
     }
 }
 
@@ -140,19 +176,31 @@ impl uds::UdsAuthValidator for PeerCredUdsAuth {
         // Local trust: the kernel-attested peer is the authentication. Derive
         // the per-user identity from the peer username.
         if let Some(peer) = peer {
-            return uds::UdsAuth::Allow(desktop_assistant_application::UserId::from(
-                peer.username.clone(),
-            ));
+            // Two independent grants, and the higher one wins (#728): the peer
+            // uid says whether this is the daemon's own account, and the
+            // allowlist can name another local account as an administrator.
+            let capability = capability_for_local_peer(peer.uid, self.daemon_uid)
+                .strongest(self.admin_subjects.capability_for(&peer.username));
+            return uds::UdsAuth::Allow {
+                user: desktop_assistant_application::UserId::from(peer.username.clone()),
+                capability,
+            };
         }
         // Peer-cred unavailable — fall back to a valid bearer token (migration
         // tolerance; see the struct docs).
         match token {
-            Some(t) if self.jwt_fallback.validate_bearer_token(t).await => uds::UdsAuth::Allow(
-                self.jwt_fallback
+            Some(t) if self.jwt_fallback.validate_bearer_token(t).await => {
+                let user = self
+                    .jwt_fallback
                     .extract_user_id(t)
                     .await
-                    .unwrap_or_default(),
-            ),
+                    .unwrap_or_default();
+                // No peer credentials means no unforgeable uid to compare, so
+                // the local grant does not apply: only the allowlist can
+                // promote this connection.
+                let capability = self.admin_subjects.capability_for(user.as_str());
+                uds::UdsAuth::Allow { user, capability }
+            }
             _ => uds::UdsAuth::Reject(
                 "auth: no peer credentials and no valid bearer token".to_string(),
             ),
@@ -565,10 +613,18 @@ mod tests {
 
         use async_trait::async_trait;
         use desktop_assistant_application::UserId;
+        use desktop_assistant_transport_dispatch::{AdminSubjects, Capability};
         use desktop_assistant_uds::{PeerIdentity, UdsAuth, UdsAuthValidator};
         use desktop_assistant_ws as ws;
 
         use crate::transports::PeerCredUdsAuth;
+
+        fn capability(outcome: UdsAuth) -> Capability {
+            match outcome {
+                UdsAuth::Allow { capability, .. } => capability,
+                UdsAuth::Reject(reason) => panic!("expected Allow, got Reject({reason})"),
+            }
+        }
 
         /// JWT fallback stub: accepts only the literal token `"good"`, whose
         /// `sub` is `"jwtuser"`.
@@ -584,13 +640,32 @@ mod tests {
             }
         }
 
+        /// The uid this daemon pretends to run as in these tests.
+        const DAEMON_UID: u32 = 1000;
+
         fn auth() -> PeerCredUdsAuth {
-            PeerCredUdsAuth::new(Arc::new(StubJwt))
+            PeerCredUdsAuth::new(
+                Arc::new(StubJwt),
+                DAEMON_UID,
+                Arc::new(AdminSubjects::default()),
+            )
+        }
+
+        fn auth_with_admins(subjects: &[&str]) -> PeerCredUdsAuth {
+            PeerCredUdsAuth::new(
+                Arc::new(StubJwt),
+                DAEMON_UID,
+                Arc::new(AdminSubjects::new(subjects.iter().copied())),
+            )
         }
 
         fn peer(username: &str) -> PeerIdentity {
+            peer_with_uid(username, DAEMON_UID)
+        }
+
+        fn peer_with_uid(username: &str, uid: u32) -> PeerIdentity {
             PeerIdentity {
-                uid: 1000,
+                uid,
                 username: username.to_string(),
                 real_name: None,
                 home_dir: None,
@@ -599,7 +674,7 @@ mod tests {
 
         fn allowed(outcome: UdsAuth) -> UserId {
             match outcome {
-                UdsAuth::Allow(user) => user,
+                UdsAuth::Allow { user, .. } => user,
                 UdsAuth::Reject(reason) => panic!("expected Allow, got Reject({reason})"),
             }
         }
@@ -639,6 +714,112 @@ mod tests {
                 auth().authenticate(Some("bogus"), None).await,
                 UdsAuth::Reject(_)
             ));
+        }
+
+        // --- authorization tier (#728) -------------------------------------
+
+        /// Local is admin by construction: a peer whose kernel-attested uid is
+        /// the daemon's own owns the daemon. This is what lets the single-user
+        /// desktop work with no `[authz]` configuration at all.
+        #[tokio::test]
+        async fn peer_cred_grants_admin_to_the_daemons_own_uid() {
+            let outcome = auth().authenticate(None, Some(&peer("dave"))).await;
+            assert_eq!(capability(outcome), Capability::Admin);
+        }
+
+        /// Another local account on the same host is a tenant. It still
+        /// authenticates - it simply does not run the daemon.
+        #[tokio::test]
+        async fn peer_cred_grants_tenant_to_another_uid() {
+            let outcome = auth()
+                .authenticate(None, Some(&peer_with_uid("someone", 1001)))
+                .await;
+            assert_eq!(capability(outcome), Capability::Tenant);
+        }
+
+        /// The allowlist also promotes a named local account, so a multi-user
+        /// host can name a second administrator without a code change.
+        #[tokio::test]
+        async fn allowlisted_local_subject_is_admin_despite_a_different_uid() {
+            let outcome = auth_with_admins(&["someone"])
+                .authenticate(None, Some(&peer_with_uid("someone", 1001)))
+                .await;
+            assert_eq!(capability(outcome), Capability::Admin);
+        }
+
+        /// The token fallback never inherits the local-peer grant: with no
+        /// peer credentials there is no unforgeable uid to compare, so only
+        /// the allowlist can promote the subject.
+        #[tokio::test]
+        async fn token_fallback_is_tenant_unless_the_subject_is_allowlisted() {
+            let outcome = auth().authenticate(Some("good"), None).await;
+            assert_eq!(capability(outcome), Capability::Tenant);
+
+            let outcome = auth_with_admins(&["jwtuser"])
+                .authenticate(Some("good"), None)
+                .await;
+            assert_eq!(capability(outcome), Capability::Admin);
+        }
+    }
+
+    /// The remote door's end of the tier (#728): a WebSocket subject is an
+    /// administrator only when `[authz] admin_subjects` names it.
+    mod ws_admin_subjects {
+        use std::path::PathBuf;
+        use std::sync::Arc;
+
+        use desktop_assistant_transport_dispatch::{AdminSubjects, Capability};
+        use desktop_assistant_ws::WsAuthValidator;
+
+        use crate::config::DaemonConfig;
+        use crate::settings_service::DaemonSettingsService;
+        use crate::transports::WsSettingsAuth;
+
+        /// The settings service is irrelevant to the capability decision, so
+        /// point it at a path that does not exist.
+        fn validator(subjects: &[&str]) -> WsSettingsAuth<DaemonSettingsService> {
+            WsSettingsAuth::new(
+                Arc::new(DaemonSettingsService::new(PathBuf::from(
+                    "/nonexistent/desktop-assistant-authz-728.toml",
+                ))),
+                Arc::new(AdminSubjects::new(subjects.iter().copied())),
+            )
+        }
+
+        /// The default (empty) allowlist admits nobody remotely.
+        #[test]
+        fn absent_subject_is_a_tenant() {
+            assert_eq!(
+                validator(&[]).capability_for_subject("alice"),
+                Capability::Tenant
+            );
+            assert_eq!(
+                validator(&["operator"]).capability_for_subject("alice"),
+                Capability::Tenant
+            );
+        }
+
+        /// A listed subject is an administrator.
+        #[test]
+        fn listed_subject_is_an_admin() {
+            assert_eq!(
+                validator(&["operator", "alice"]).capability_for_subject("alice"),
+                Capability::Admin
+            );
+        }
+
+        /// The allowlist is built straight from `[authz] admin_subjects`, and a
+        /// config with no `[authz]` section grants nobody.
+        #[test]
+        fn allowlist_comes_from_the_authz_config_section() {
+            let empty = AdminSubjects::from(&DaemonConfig::default().authz);
+            assert_eq!(empty.capability_for("alice"), Capability::Tenant);
+
+            let cfg: DaemonConfig = toml::from_str("[authz]\nadmin_subjects = [\"alice\"]\n")
+                .expect("parse authz config");
+            let allowlist = AdminSubjects::from(&cfg.authz);
+            assert_eq!(allowlist.capability_for("alice"), Capability::Admin);
+            assert_eq!(allowlist.capability_for("bob"), Capability::Tenant);
         }
     }
 }

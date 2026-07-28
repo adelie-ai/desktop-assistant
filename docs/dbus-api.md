@@ -55,6 +55,29 @@ any other part of the URL means re-entering the password — the daemon refuses
 to splice its stored credential into a URL a client has edited, and never
 stores the placeholder as if it were a password.
 
+## Authorization
+
+The D-Bus surface is served by `adelie-dbus-bridge`, which reaches the daemon
+over the local Unix socket. The daemon authorizes that connection by the
+bridge's kernel-attested peer uid: a bridge running as the daemon's own account
+holds the **administrator** capability, so on a single-user desktop every method
+here works exactly as it did, with no configuration to add.
+
+Where the bridge runs as a different account than the daemon, it is a **tenant**
+unless `[authz] admin_subjects` in `daemon.toml` names that account's login
+name. A tenant is refused the service-configuration writes - `SetApiKey`,
+`SetLlmSettings`, `SetEmbeddingsSettings`, `SetDatabaseSettings`,
+`SetBackendTasksSettings`, `SetWsAuthSettings`, the connection and purpose
+writes, the MCP lifecycle writes, and `SetConfig` (whose personality traits are
+one global block, not a per-user preference). Reads and conversations are
+unaffected, and a tenant still sets their own disposition per conversation.
+
+A refusal reaches D-Bus as an `org.freedesktop.DBus.Error.Failed` whose message
+begins `not authorized:` and names the command. The structured classification
+the socket transports carry (`detail.code = "not_authorized"`) does not survive
+the D-Bus error type, which carries only a name and a message (#974). See
+[API_TRANSPORT.md](API_TRANSPORT.md) for the full contract.
+
 ## Signals
 
 - `ResponseChunk(conversation_id: s, request_id: s, chunk: s)`

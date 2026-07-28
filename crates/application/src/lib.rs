@@ -855,6 +855,11 @@ where
             // the port and the api-model, so this is the identity conversion.
             personality,
             restart_required,
+            // Left unset here on purpose (#728): the caller's capability is a
+            // per-connection fact, and the settings service has no notion of
+            // one. The dispatcher stamps it on the way out, which keeps
+            // authorization in exactly one layer.
+            caller_capability: None,
         })
     }
 
@@ -925,7 +930,7 @@ where
             let enabled = persistence_enabled.unwrap_or(stored.enabled);
             let remote_url = match persistence_remote_url {
                 Some(submitted) => Self::normalize_optional_string(Some(
-                    Self::resolve_submitted_url(&submitted, &stored.remote_url)?,
+                    Self::resolve_submitted_url(submitted.as_str(), &stored.remote_url)?,
                 )),
                 None => Some(stored.remote_url.clone()),
             };
@@ -1617,7 +1622,7 @@ where
             // Settings
             api::Command::SetApiKey { api_key } => {
                 self.settings
-                    .set_api_key(api_key)
+                    .set_api_key(api_key.into_inner())
                     .await
                     .map_err(Self::map_core_err)?;
                 Ok(api::CommandResult::Ack)
@@ -1709,7 +1714,10 @@ where
                             .get_persistence_settings()
                             .await
                             .map_err(Self::map_core_err)?;
-                        Some(Self::resolve_submitted_url(&submitted, &stored.remote_url)?)
+                        Some(Self::resolve_submitted_url(
+                            submitted.as_str(),
+                            &stored.remote_url,
+                        )?)
                     }
                     None => None,
                 };
@@ -1748,7 +1756,7 @@ where
                     .get_database_settings()
                     .await
                     .map_err(Self::map_core_err)?;
-                let url = Self::resolve_submitted_url(&url, &stored.url)?;
+                let url = Self::resolve_submitted_url(url.as_str(), &stored.url)?;
                 // Mirror the D-Bus `set_database_settings`: an empty/whitespace
                 // url clears the configured URL.
                 self.settings

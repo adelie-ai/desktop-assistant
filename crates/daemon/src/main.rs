@@ -2734,12 +2734,49 @@ async fn main() -> Result<()> {
                 .unwrap_or(false)
         });
 
+    // The authorization tier's remote half (#728): `[authz] admin_subjects`,
+    // read once at startup and shared by every transport validator. Empty
+    // unless an operator configured it, so a desktop daemon carries an empty
+    // allowlist and never notices - its local peer is an administrator by
+    // construction (see `PeerCredUdsAuth`). File-only: nothing on the wire
+    // writes it, so a tenant cannot grant themselves the capability.
+    //
+    // Read from the config already loaded at startup rather than re-reading the
+    // file. A second read could fail where the first succeeded (or vice versa),
+    // and its failure would be silent: an empty allowlist is indistinguishable
+    // from a deliberately empty one, so an operator who mistyped `daemon.toml`
+    // would see no signal at all about why nobody is an administrator.
+    let admin_subjects: Arc<desktop_assistant_transport_dispatch::AdminSubjects> = Arc::new(
+        daemon_config
+            .as_ref()
+            .map(|cfg| desktop_assistant_transport_dispatch::AdminSubjects::from(&cfg.authz))
+            .unwrap_or_default(),
+    );
+    match daemon_config.as_ref() {
+        // The file did not load at all; the error above already named it. Say
+        // what that means for authorization, because the consequence is not
+        // obvious from a parse error.
+        None => tracing::warn!(
+            "[authz] daemon.toml did not load, so admin_subjects is empty: no remote client              can administer this daemon. Local peers running as this daemon's own user are              unaffected - they are administrators by construction"
+        ),
+        Some(_) if admin_subjects.is_empty() => tracing::info!(
+            "[authz] no admin_subjects configured: remote clients are tenants. This is the              default, and is correct for a desktop or for an instance configured from its              own daemon.toml"
+        ),
+        Some(_) => tracing::info!(
+            "[authz] {} admin subject(s) allowlisted for remote administration",
+            admin_subjects.len()
+        ),
+    }
+
     let ws_auth: Arc<dyn ws::WsAuthValidator> = if let Some(oidc) = &oidc_config {
         match config::OidcValidator::from_config(oidc).await {
             Ok(oidc_validator) => {
                 tracing::info!("OIDC JWT validation enabled (issuer={})", oidc.issuer_url);
                 Arc::new(OidcAwareAuth {
-                    local: WsSettingsAuth::new(Arc::clone(&settings_service)),
+                    local: WsSettingsAuth::new(
+                        Arc::clone(&settings_service),
+                        Arc::clone(&admin_subjects),
+                    ),
                     oidc_validator,
                 })
             }
@@ -2747,11 +2784,17 @@ async fn main() -> Result<()> {
                 tracing::warn!(
                     "failed to initialize OIDC validator: {e}; falling back to local JWT only"
                 );
-                Arc::new(WsSettingsAuth::new(Arc::clone(&settings_service)))
+                Arc::new(WsSettingsAuth::new(
+                    Arc::clone(&settings_service),
+                    Arc::clone(&admin_subjects),
+                ))
             }
         }
     } else {
-        Arc::new(WsSettingsAuth::new(Arc::clone(&settings_service)))
+        Arc::new(WsSettingsAuth::new(
+            Arc::clone(&settings_service),
+            Arc::clone(&admin_subjects),
+        ))
     };
 
     // WebSocket API (remote-friendly). OFF by default: the daemon is
@@ -2913,13 +2956,19 @@ async fn main() -> Result<()> {
             // local, so this mostly refines the label; included for symmetry and
             // so a mismatch — e.g. a namespaced peer — is honoured.)
             let uds_daemon_system_id = daemon_system_id.clone();
+            // The allowlist, moved into the listener task alongside the daemon's
+            // own uid: together they are the two admin grants (#728).
+            let admin_subjects_for_uds = Arc::clone(&admin_subjects);
             tracing::info!("UDS listening on {}", path.display());
             Some(tokio::spawn(async move {
                 // Local transports authenticate by kernel peer-cred (#407);
                 // the WS validator is retained only as a migration-tolerant
                 // JWT fallback for the peer-cred-unavailable case.
-                let auth: Arc<dyn uds::UdsAuthValidator> =
-                    Arc::new(PeerCredUdsAuth::new(ws_auth_for_uds));
+                let auth: Arc<dyn uds::UdsAuthValidator> = Arc::new(PeerCredUdsAuth::new(
+                    ws_auth_for_uds,
+                    desktop_assistant_peer_cred::current_uid(),
+                    admin_subjects_for_uds,
+                ));
                 let config =
                     uds::UdsServerConfig::new(path).with_daemon_system_id(uds_daemon_system_id);
                 let server = uds::UdsServer::new(api_handler, auth, config);

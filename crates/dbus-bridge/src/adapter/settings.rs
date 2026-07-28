@@ -197,7 +197,7 @@ impl<T: BridgeTransport + 'static> DbusSettingsAdapter<T> {
     async fn set_api_key(&self, api_key: &str) -> fdo::Result<()> {
         let result = self
             .dispatch(api::Command::SetApiKey {
-                api_key: api_key.to_string(),
+                api_key: api_key.into(),
             })
             .await?;
         match result {
@@ -302,7 +302,7 @@ impl<T: BridgeTransport + 'static> DbusSettingsAdapter<T> {
         let result = self
             .dispatch(api::Command::SetPersistenceSettings {
                 enabled,
-                remote_url: normalize(remote_url),
+                remote_url: normalize(remote_url).map(api::Secret::from),
                 remote_name: normalize(remote_name),
                 push_on_update,
             })
@@ -339,7 +339,7 @@ impl<T: BridgeTransport + 'static> DbusSettingsAdapter<T> {
     ) -> fdo::Result<ConfigData> {
         if changes.set_llm_api_key {
             self.dispatch(api::Command::SetApiKey {
-                api_key: changes.llm_api_key.clone(),
+                api_key: changes.llm_api_key.clone().into(),
             })
             .await?;
         }
@@ -358,7 +358,8 @@ impl<T: BridgeTransport + 'static> DbusSettingsAdapter<T> {
             wire_changes.persistence_enabled = Some(changes.persistence_enabled);
         }
         if changes.set_persistence_remote_url {
-            wire_changes.persistence_remote_url = Some(changes.persistence_remote_url.clone());
+            wire_changes.persistence_remote_url =
+                Some(changes.persistence_remote_url.clone().into());
         }
         if changes.set_persistence_remote_name {
             wire_changes.persistence_remote_name = Some(changes.persistence_remote_name.clone());
@@ -486,7 +487,7 @@ impl<T: BridgeTransport + 'static> DbusSettingsAdapter<T> {
     async fn set_database_settings(&self, url: &str, max_connections: u32) -> fdo::Result<()> {
         let result = self
             .dispatch(api::Command::SetDatabaseSettings {
-                url: url.to_string(),
+                url: url.into(),
                 max_connections,
             })
             .await?;
@@ -900,7 +901,7 @@ mod tests {
                 url,
                 max_connections,
             } => {
-                assert_eq!(url, "   ");
+                assert_eq!(url.as_str(), "   ");
                 assert_eq!(max_connections, 3);
             }
             other => panic!("unexpected command: {other:?}"),
@@ -1066,6 +1067,7 @@ mod tests {
             },
             personality: api::PersonalitySettingsView::default(),
             restart_required: Vec::new(),
+            caller_capability: None,
         };
         let data = config_from_wire(&wire);
         assert_eq!(data.embeddings_connector, "openai");
@@ -1087,7 +1089,9 @@ mod tests {
             .set_api_key("sk-123")
             .await
             .unwrap();
-        assert!(matches!(t.last(), api::Command::SetApiKey { api_key } if api_key == "sk-123"));
+        assert!(
+            matches!(t.last(), api::Command::SetApiKey { api_key } if api_key.as_str() == "sk-123")
+        );
     }
 
     #[tokio::test]
@@ -1200,6 +1204,7 @@ mod tests {
             },
             personality: api::PersonalitySettingsView::default(),
             restart_required: Vec::new(),
+            caller_capability: None,
         }));
         let data = settings(Arc::clone(&t)).get_config().await.unwrap();
         assert_eq!(data.embeddings_connector, "openai");

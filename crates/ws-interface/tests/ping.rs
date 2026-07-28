@@ -139,6 +139,22 @@ impl WsAuthValidator for StaticJwtAuth {
     }
 }
 
+/// The same door, but for a subject the operator allowlisted (#728). Used by
+/// the tests that exercise operator-owned configuration, which the
+/// authorization tier reserves to an administrator.
+struct StaticAdminJwtAuth;
+
+#[async_trait::async_trait]
+impl WsAuthValidator for StaticAdminJwtAuth {
+    async fn validate_bearer_token(&self, token: &str) -> bool {
+        token == "test-jwt"
+    }
+
+    fn capability_for_subject(&self, _subject: &str) -> desktop_assistant_ws::Capability {
+        desktop_assistant_ws::Capability::Admin
+    }
+}
+
 struct StaticLogin;
 
 #[async_trait::async_trait]
@@ -962,7 +978,7 @@ async fn ws_set_config_roundtrip_emits_config_changed() {
         Arc::new(FakeKnowledge),
     ));
 
-    let app = router(handler, Arc::new(StaticJwtAuth));
+    let app = router(handler, Arc::new(StaticAdminJwtAuth));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
 

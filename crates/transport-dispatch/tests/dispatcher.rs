@@ -11,7 +11,9 @@ use desktop_assistant_api_model as api;
 use desktop_assistant_application::{ApiError, ApiResult, AssistantApiHandler, EventSink};
 use desktop_assistant_core::ports::request_scope::RequestScope;
 use desktop_assistant_core::ports::transport::{ClientContext, current_client_context};
-use desktop_assistant_transport_dispatch::{AuthContext, WsFrame, WsRequest, dispatch_loop};
+use desktop_assistant_transport_dispatch::{
+    AuthContext, Capability, WsFrame, WsRequest, dispatch_loop,
+};
 use futures::channel::mpsc;
 use futures::stream;
 
@@ -224,7 +226,7 @@ async fn invalid_inbound_json_yields_error_frame_with_empty_id_and_loop_survives
         .expect("expected an error frame for the malformed item, got silence")
         .expect("outbound closed early");
     match first {
-        WsFrame::Error { id, error } => {
+        WsFrame::Error { id, error, .. } => {
             assert_eq!(id, "", "no request id is known for a malformed frame");
             assert!(
                 error.to_lowercase().contains("json") || error.to_lowercase().contains("invalid"),
@@ -318,7 +320,7 @@ async fn lagged_event_subscription_emits_resync_error_frame() {
             break;
         };
         match frame {
-            WsFrame::Error { id, error } => {
+            WsFrame::Error { id, error, .. } => {
                 assert_eq!(
                     id, "",
                     "the resync notice is connection-level, not per-request"
@@ -563,6 +565,7 @@ fn config_with_restart_required(areas: &[&str]) -> api::Config {
         },
         personality: api::PersonalitySettingsView::default(),
         restart_required: areas.iter().map(|a| (*a).to_string()).collect(),
+        caller_capability: None,
     }
 }
 
@@ -592,6 +595,9 @@ impl AssistantApiHandler for WsAuthHandler {
 }
 
 /// Drive one command through the dispatcher and collect every frame it emits.
+///
+/// Runs as an administrator: the command under test rewrites the daemon's auth
+/// posture, which the authorization tier (#728) reserves to that capability.
 async fn frames_for(handler: Arc<dyn AssistantApiHandler>, command: api::Command) -> Vec<WsFrame> {
     use futures::StreamExt;
     let req = WsRequest {
@@ -602,7 +608,7 @@ async fn frames_for(handler: Arc<dyn AssistantApiHandler>, command: api::Command
     let (out_tx, mut out_rx) = mpsc::channel::<WsFrame>(8);
     let dispatch = tokio::spawn(dispatch_loop(
         handler,
-        AuthContext::anonymous(),
+        AuthContext::anonymous().with_capability(Capability::Admin),
         inbound,
         out_tx,
     ));

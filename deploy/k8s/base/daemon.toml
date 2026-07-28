@@ -58,6 +58,20 @@ allowed_origins = []
 [tls]
 enabled = false
 
+# [authz]
+# Who may change this instance's configuration over the network (#728). Empty by
+# default: with no entry here, a WebSocket client is a tenant and is refused
+# every service-configuration write, however it authenticated. A local Unix
+# socket peer running as the daemon's own account is an administrator by
+# construction, which is why a desktop needs no entry.
+#
+# This is the smoke-test base and it deliberately names nobody: the instance is
+# configured from this file, not from a client. Set it in your own overlay when
+# an operator administers the instance through a settings UI. File-only - no
+# command writes it - so a restart is required after a change.
+#
+# admin_subjects = ["operator"]
+
 [personality]
 professionalism = "always"
 warmth = "often"

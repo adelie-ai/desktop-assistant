@@ -70,6 +70,9 @@ pub enum RestartArea {
     Tls,
     /// `[profiling]`: the profiler is installed (or not) at startup.
     Profiling,
+    /// `[authz]`: the remote-administrator allowlist is read into the transport
+    /// validators once at startup, so an edit does not reach a live connection.
+    Authz,
 }
 
 impl RestartArea {
@@ -84,6 +87,7 @@ impl RestartArea {
             Self::WsAuth => "ws_auth",
             Self::Tls => "tls",
             Self::Profiling => "profiling",
+            Self::Authz => "authz",
         }
     }
 }
@@ -161,6 +165,9 @@ pub fn plan_reload(old: &DaemonConfig, new: &DaemonConfig) -> ReloadPlan {
     }
     if !areas_eq(&old.profiling, &new.profiling) {
         plan.restart_required.push(RestartArea::Profiling);
+    }
+    if old.authz != new.authz {
+        plan.restart_required.push(RestartArea::Authz);
     }
 
     plan
@@ -509,5 +516,25 @@ mod tests {
         assert_eq!(RestartArea::WsAuth.as_key(), "ws_auth");
         assert_eq!(RestartArea::Tls.as_key(), "tls");
         assert_eq!(RestartArea::Profiling.as_key(), "profiling");
+        assert_eq!(RestartArea::Authz.as_key(), "authz");
+    }
+
+    /// The admin allowlist is read into the transport validators once, so an
+    /// edit is reported honestly as pending a restart rather than looking live.
+    #[test]
+    fn changing_admin_subjects_requires_a_restart() {
+        let old = DaemonConfig::default();
+        let mut new = DaemonConfig::default();
+        new.authz.admin_subjects = vec!["operator".to_string()];
+        let plan = plan_reload(&old, &new);
+        assert!(plan.restart_required.contains(&RestartArea::Authz));
+        assert!(!plan.rebuild_registry);
+    }
+
+    /// An unchanged allowlist is not reported, so a desktop reload stays quiet.
+    #[test]
+    fn an_unchanged_authz_section_reports_nothing() {
+        let cfg = DaemonConfig::default();
+        assert!(plan_reload(&cfg, &cfg).is_empty());
     }
 }

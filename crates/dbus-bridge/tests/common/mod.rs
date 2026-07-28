@@ -139,10 +139,7 @@ async fn handle_daemon_connection(
     handshakes.lock().await.push(token);
 
     if let DaemonScript::RejectHandshake { ref error } = script {
-        let frame = api::WsFrame::Error {
-            id: String::new(),
-            error: error.clone(),
-        };
+        let frame = api::WsFrame::error(String::new(), error.clone());
         let body = serde_json::to_vec(&frame).unwrap();
         let _ = write_frame(&mut write_half, &body).await;
         return;

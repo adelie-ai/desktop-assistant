@@ -33,9 +33,11 @@ authorization gap, not only a modeling one.
 **Credentials.** Secrets resolve as `(service, account)` where the account derives
 from the connector name, so one provider key serves the entire instance. Decision 8
 accepts the sharing: users in one organization share the organization's account. The
-defect is narrower. Any client can rotate that key away from everyone else, because
-`set_api_key` takes no caller identity. That is the operator/tenant gap above, not a
-missing per-tenant credential store.
+defect is narrower. Any client could rotate that key away from everyone else, because
+`set_api_key` took no caller identity. That is the operator/tenant gap above, not a
+missing per-tenant credential store. Closed by #728: the write now needs the
+administrator capability, granted by the local peer uid or by
+`[authz] admin_subjects`.
 
 **Tool execution.** `terminal`, `command`, `fileio`, and `skills` run inside the
 daemon process, as one uid, against one filesystem. On the desktop that is exactly
@@ -132,6 +134,26 @@ through decision 1.
 
 The denylist depends on this split. Without an admin/tenant distinction, an "admin
 denylist" is a global setting any tenant can switch off.
+
+**As built (#728).** The capability is resolved at the transport and enforced by one
+gate in `dispatch_loop`, driven by an exhaustive `required_capability(&Command)` match
+with no wildcard arm. Two grants: a Unix-socket peer whose kernel-attested uid equals
+the daemon's own, and a subject named in the file-only `[authz] admin_subjects`. The
+desktop needs no configuration, which is this document's Constraint.
+
+The split landed as *writes* admin, *reads* tenant. Reading the operator sections is
+still open, for two reasons: the credentials they used to carry are redacted on the way
+out (#727), and the same values reach every client through `GetConfig`, which every
+settings panel and the personality surface already read. Gating the reads coherently
+means partitioning `Config` itself - the read half of this decision, tracked as
+#973 rather than half-done here.
+
+The global `[personality]` block is admin-gated for the same staging reason, not
+because it is an operator concern: decision 9 names personality and speech mode
+as the right candidates for decision 1's per-user override layer, and that layer
+does not exist yet. It is tracked as #986; when it lands a tenant edits their own
+personality and only the instance default stays admin. `SetConversationPersonality`
+is the tenant's lever in the meantime.
 
 ## Consequences
 

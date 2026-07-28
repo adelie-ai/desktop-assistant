@@ -91,6 +91,21 @@ allowed_origins = []
 [tls]
 enabled = false
 
+# Who may change this instance's configuration over the network (#728).
+#
+# Left EMPTY on purpose here. This repo is public and the example overlay is a
+# template, so it must not ship a subject that looks like a real account. Empty
+# means no WebSocket client can write service configuration - the right setting
+# for an instance whose config is declared in the overlay and re-seeded on
+# change.
+#
+# Set it in your private overlay when you administer the instance from a
+# client's settings UI. The subject is the JWT `sub`: the login username for the
+# built-in /login door, or the subject your OIDC provider issues.
+#
+# [authz]
+# admin_subjects = ["operator"]
+
 [personality]
 professionalism = "always"
 warmth = "often"

@@ -160,6 +160,48 @@ pub struct DaemonConfig {
     /// defaults (parent-wake on).
     #[serde(default, skip_serializing_if = "SubagentsConfig::is_default")]
     pub subagents: SubagentsConfig,
+    /// `[authz]` — who may administer this daemon from a remote transport
+    /// (#728). Absent section => nobody, which is what a single-user desktop
+    /// always wants: the local peer is an administrator by construction, so the
+    /// desktop never learns this section exists.
+    #[serde(default, skip_serializing_if = "AuthzConfig::is_default")]
+    pub authz: AuthzConfig,
+}
+
+/// `[authz]` configuration: the operator's remote-administrator allowlist.
+///
+/// The daemon grants administration two ways. A Unix-socket peer whose
+/// kernel-attested uid equals the daemon's own is an administrator by
+/// construction - unforgeable, and needing no configuration. Everyone else,
+/// including every WebSocket client, is a tenant unless named here.
+///
+/// This section is **file-only by design**. No command writes it, because a
+/// tenant must never be able to grant themselves the capability they are being
+/// denied. Change it by editing `daemon.toml` and restarting the daemon; the
+/// value is read once, into the transport validators, at startup.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AuthzConfig {
+    /// Authenticated subjects granted the administrator capability. A subject
+    /// is the JWT `sub` on a WebSocket connection, and the peer's login name on
+    /// a Unix socket. Empty by default: fail closed.
+    #[serde(default)]
+    pub admin_subjects: Vec<String>,
+}
+
+impl AuthzConfig {
+    /// Whether this equals the default section, so an unconfigured daemon never
+    /// writes an `[authz]` table into `daemon.toml`.
+    fn is_default(&self) -> bool {
+        self.admin_subjects.is_empty()
+    }
+}
+
+impl From<&AuthzConfig> for desktop_assistant_transport_dispatch::AdminSubjects {
+    /// Build the runtime allowlist the transports consult. Blank entries are
+    /// dropped there, so a stray line in the file admits nobody.
+    fn from(config: &AuthzConfig) -> Self {
+        Self::new(&config.admin_subjects)
+    }
 }
 
 /// `[subagents]` configuration: multi-agent behaviour knobs.
@@ -4377,5 +4419,80 @@ model = "claude-haiku-4-5-20251001"
         assert_eq!(dreaming.connection.to_string(), "backend_2");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- `[authz]`: the remote administrator allowlist (#728) --------------
+
+    mod authz {
+        use super::super::{AuthzConfig, DaemonConfig, load_daemon_config, save_daemon_config};
+
+        /// A daemon with no `[authz]` section grants nobody the administrator
+        /// capability over a remote transport. Fail closed.
+        #[test]
+        fn admin_subjects_default_to_empty() {
+            let cfg = DaemonConfig::default();
+            assert!(cfg.authz.admin_subjects.is_empty());
+            let parsed: DaemonConfig = toml::from_str("").expect("an empty config parses");
+            assert!(parsed.authz.admin_subjects.is_empty());
+        }
+
+        /// The single-user desktop must not acquire new configuration, so an
+        /// all-default config never writes an `[authz]` table.
+        #[test]
+        fn single_user_desktop_writes_no_authz_section() {
+            let serialized = toml::to_string(&DaemonConfig::default()).expect("serialize");
+            assert!(
+                !serialized.contains("[authz]"),
+                "a default config must not grow an authz table: {serialized}"
+            );
+        }
+
+        /// The operator's allowlist parses from the file and round-trips.
+        #[test]
+        fn admin_subjects_parse_from_the_config_file() {
+            let src = r#"
+[authz]
+admin_subjects = ["operator", "ops-oncall"]
+"#;
+            let cfg: DaemonConfig = toml::from_str(src).expect("parse");
+            assert_eq!(cfg.authz.admin_subjects, vec!["operator", "ops-oncall"]);
+
+            let serialized = toml::to_string(&cfg).expect("serialize");
+            assert!(serialized.contains("[authz]"), "{serialized}");
+            let reparsed: DaemonConfig = toml::from_str(&serialized).expect("reparse");
+            assert_eq!(reparsed.authz.admin_subjects, cfg.authz.admin_subjects);
+        }
+
+        /// The allowlist is file-only. No command writes it, and a settings
+        /// write that rewrites `daemon.toml` must preserve it verbatim - the
+        /// other half of "a tenant cannot grant themselves admin".
+        #[test]
+        fn admin_subjects_survive_a_config_rewrite() {
+            let dir = std::env::temp_dir().join(format!("da-authz-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).expect("create temp dir");
+            let path = dir.join("daemon.toml");
+
+            let cfg = DaemonConfig {
+                authz: AuthzConfig {
+                    admin_subjects: vec!["operator".to_string()],
+                },
+                ..DaemonConfig::default()
+            };
+            save_daemon_config(&path, &cfg).expect("write config");
+
+            let loaded = load_daemon_config(&path)
+                .expect("load config")
+                .expect("config present");
+            assert_eq!(loaded.authz.admin_subjects, vec!["operator".to_string()]);
+
+            // A later rewrite (what every settings command does) keeps it.
+            save_daemon_config(&path, &loaded).expect("rewrite config");
+            let reloaded = load_daemon_config(&path)
+                .expect("reload config")
+                .expect("config present");
+            assert_eq!(reloaded.authz.admin_subjects, vec!["operator".to_string()]);
+
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 }

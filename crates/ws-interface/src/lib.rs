@@ -21,6 +21,9 @@ use tracing::debug;
 use tracing::warn;
 
 pub use api::{WsFrame, WsRequest};
+// Re-exported so a validator implementation can name the capability it grants
+// without taking its own dependency on the dispatcher crate (#728).
+pub use desktop_assistant_transport_dispatch::Capability;
 
 /// Inbound WebSocket message / frame size cap. Mirrors the
 /// length-prefixed frame caps in `crates/uds-interface/src/lib.rs` and
@@ -69,6 +72,17 @@ pub trait WsAuthValidator: Send + Sync {
     async fn extract_user_id(&self, token: &str) -> Option<UserId> {
         let _ = token;
         None
+    }
+
+    /// What the authenticated `subject` is allowed to do (#728).
+    ///
+    /// The default is [`Capability::Tenant`]: a WebSocket door authenticates a
+    /// subject, and authenticating a subject never proves it owns the service.
+    /// A daemon overrides this to consult its operator allowlist. Fail closed -
+    /// a validator that does not implement it grants nothing.
+    fn capability_for_subject(&self, subject: &str) -> Capability {
+        let _ = subject;
+        Capability::Tenant
     }
 }
 
@@ -498,10 +512,16 @@ async fn handle_socket(
     // (#243). When the client reported a system id that matches the daemon's,
     // the #248 co-location result overrides that — co-located even over WS —
     // and an optional client host label makes the remote tool note friendlier.
+    // Authorization (#728): resolved once, from the same validator that just
+    // authenticated the token, so the subject and its capability cannot drift.
+    let capability = state
+        .auth_validator
+        .capability_for_subject(user_id.as_str());
     let auth = AuthContext::new(user_id.into_inner(), TransportKind::WebSocket)
         .with_co_location(co_located)
         .with_client_label(client_label)
-        .with_client_context(client_context);
+        .with_client_context(client_context)
+        .with_capability(capability);
 
     let handler = Arc::clone(&state.handler);
     let mut dispatcher = tokio::spawn(async move {

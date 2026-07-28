@@ -11,6 +11,7 @@ use std::sync::Arc;
 use desktop_assistant_api_model as api;
 use desktop_assistant_application::{ApiError, ApiResult, AssistantApiHandler, EventSink};
 use desktop_assistant_auth_jwt as jwt;
+use desktop_assistant_transport_dispatch::{Capability, capability_for_local_peer};
 use desktop_assistant_uds::{
     UdsAuthValidator, UdsServer, UdsServerConfig, read_frame, write_frame,
 };
@@ -562,7 +563,7 @@ async fn invalid_request_json_gets_error_frame_with_empty_id() {
         .expect("io error reading the error frame");
     let frame: api::WsFrame = serde_json::from_slice(&raw).unwrap();
     match frame {
-        api::WsFrame::Error { id, error } => {
+        api::WsFrame::Error { id, error, .. } => {
             assert_eq!(id, "", "no request id is known for a malformed frame");
             assert!(
                 error.to_lowercase().contains("json") || error.to_lowercase().contains("invalid"),
@@ -685,8 +686,34 @@ async fn socket_file_and_parent_dir_permissions_are_tightened() {
 // --- Peer-credential auth (#407) ---------------------------------------------
 
 /// A local-trust validator that mirrors the daemon's `PeerCredUdsAuth`:
-/// authenticate by the kernel peer identity, no bearer token required.
-struct PeerCredAuth;
+/// authenticate by the kernel peer identity, no bearer token required, and
+/// resolve the authorization capability from that same identity (#728).
+///
+/// The capability rule is the daemon's: a peer whose kernel-attested uid equals
+/// the daemon's own administers the daemon. Both ends of a `UnixStream::pair`
+/// belong to this process, so a test client always matches `daemon_uid` when it
+/// is set to the current uid - which is precisely the single-user desktop shape.
+struct PeerCredAuth {
+    /// The uid this "daemon" runs as.
+    daemon_uid: u32,
+}
+
+impl PeerCredAuth {
+    /// The desktop shape: the connecting peer runs the daemon, so it is an
+    /// administrator.
+    fn local_admin() -> Self {
+        Self {
+            daemon_uid: desktop_assistant_peer_cred::current_uid(),
+        }
+    }
+
+    /// A peer that is NOT the daemon's account, so it stays a tenant.
+    fn other_account() -> Self {
+        Self {
+            daemon_uid: desktop_assistant_peer_cred::current_uid().wrapping_add(1),
+        }
+    }
+}
 
 #[async_trait::async_trait]
 impl UdsAuthValidator for PeerCredAuth {
@@ -701,12 +728,66 @@ impl UdsAuthValidator for PeerCredAuth {
         peer: Option<&desktop_assistant_uds::PeerIdentity>,
     ) -> desktop_assistant_uds::UdsAuth {
         match peer {
-            Some(p) => desktop_assistant_uds::UdsAuth::Allow(
-                desktop_assistant_application::UserId::from(p.username.clone()),
-            ),
+            Some(p) => desktop_assistant_uds::UdsAuth::Allow {
+                user: desktop_assistant_application::UserId::from(p.username.clone()),
+                capability: capability_for_local_peer(p.uid, self.daemon_uid),
+            },
             None => desktop_assistant_uds::UdsAuth::Reject("auth: no peer credentials".to_string()),
         }
     }
+}
+
+/// Answers `Ping`, and `SetApiKey` - an administrator-only command - so a test
+/// can tell an authorization refusal from an unsupported command.
+struct AdminSurfaceHandler;
+
+#[async_trait::async_trait]
+impl AssistantApiHandler for AdminSurfaceHandler {
+    async fn handle_command(&self, cmd: api::Command) -> ApiResult<api::CommandResult> {
+        match cmd {
+            api::Command::Ping => Ok(api::CommandResult::Pong {
+                value: "pong".into(),
+            }),
+            api::Command::SetApiKey { .. } => Ok(api::CommandResult::Ack),
+            _ => Err(ApiError::Unsupported),
+        }
+    }
+
+    async fn handle_send_message(
+        &self,
+        _conversation_id: String,
+        _content: String,
+        _request_id: String,
+        _sink: Arc<dyn EventSink>,
+    ) -> ApiResult<()> {
+        Err(ApiError::Unsupported)
+    }
+}
+
+/// Connect, present a tokenless peer-cred handshake, send `SetApiKey`, and
+/// return the frame that comes back.
+async fn set_api_key_over_socket(path: &PathBuf) -> api::WsFrame {
+    let mut stream = UnixStream::connect(path).await.unwrap();
+    write_frame(
+        &mut stream,
+        &serde_json::to_vec(&serde_json::json!({})).unwrap(),
+    )
+    .await
+    .unwrap();
+    let req = api::WsRequest {
+        id: "admin-1".into(),
+        command: api::Command::SetApiKey {
+            api_key: "sk-test".into(),
+        },
+    };
+    write_frame(&mut stream, &serde_json::to_vec(&req).unwrap())
+        .await
+        .unwrap();
+    let raw = timeout(Duration::from_secs(2), read_frame(&mut stream))
+        .await
+        .expect("no response within 2s")
+        .expect("io error on read_frame");
+    serde_json::from_slice(&raw).unwrap()
 }
 
 fn start_server_with(
@@ -716,7 +797,17 @@ fn start_server_with(
     tokio::task::JoinHandle<anyhow::Result<()>>,
     tokio::sync::oneshot::Sender<()>,
 ) {
-    let handler: Arc<dyn AssistantApiHandler> = Arc::new(PingHandler);
+    start_server_with_handler(socket_path, auth, Arc::new(PingHandler))
+}
+
+fn start_server_with_handler(
+    socket_path: PathBuf,
+    auth: Arc<dyn UdsAuthValidator>,
+    handler: Arc<dyn AssistantApiHandler>,
+) -> (
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+    tokio::sync::oneshot::Sender<()>,
+) {
     let config = UdsServerConfig::new(socket_path);
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let server = UdsServer::new(handler, auth, config);
@@ -737,7 +828,7 @@ fn start_server_with(
 async fn uds_connection_without_jwt_proceeds_under_peer_cred() {
     let dir = TempDir::new().unwrap();
     let path = socket_path(&dir);
-    let (_join, shutdown) = start_server_with(path.clone(), Arc::new(PeerCredAuth));
+    let (_join, shutdown) = start_server_with(path.clone(), Arc::new(PeerCredAuth::local_admin()));
     wait_for_socket(&path).await;
 
     let mut stream = UnixStream::connect(&path).await.unwrap();
@@ -774,4 +865,71 @@ async fn uds_connection_without_jwt_proceeds_under_peer_cred() {
     }
 
     let _ = shutdown.send(());
+}
+
+/// The single-user desktop, end to end over a real socket (#728). The peer uid
+/// equals the daemon's, so the connection is an administrator and an
+/// administrator-only command succeeds.
+///
+/// This is the test that catches the capability being resolved but never
+/// carried onto the `AuthContext`: without that hand-off every UDS connection
+/// silently falls back to `Tenant`, and a desktop user is refused `SetApiKey`,
+/// `AddMcpServer`, and every connection and purpose write on their own machine.
+#[tokio::test]
+async fn uds_local_peer_is_admin_and_may_run_an_admin_command() {
+    let dir = TempDir::new().unwrap();
+    let path = socket_path(&dir);
+    let handler: Arc<dyn AssistantApiHandler> = Arc::new(AdminSurfaceHandler);
+    let (_join, shutdown) =
+        start_server_with_handler(path.clone(), Arc::new(PeerCredAuth::local_admin()), handler);
+    wait_for_socket(&path).await;
+
+    match set_api_key_over_socket(&path).await {
+        api::WsFrame::Result { id, result } => {
+            assert_eq!(id, "admin-1");
+            assert_eq!(result, api::CommandResult::Ack);
+        }
+        other => panic!("a local peer owning the daemon must not be refused, got {other:?}"),
+    }
+
+    let _ = shutdown.send(());
+}
+
+/// The other direction, so the test above cannot be satisfied by hard-coding
+/// admin: a local peer whose uid is NOT the daemon's is a tenant, and the same
+/// command over the same socket is refused with the structured code.
+#[tokio::test]
+async fn uds_peer_from_another_account_is_refused_an_admin_command() {
+    let dir = TempDir::new().unwrap();
+    let path = socket_path(&dir);
+    let handler: Arc<dyn AssistantApiHandler> = Arc::new(AdminSurfaceHandler);
+    let (_join, shutdown) = start_server_with_handler(
+        path.clone(),
+        Arc::new(PeerCredAuth::other_account()),
+        handler,
+    );
+    wait_for_socket(&path).await;
+
+    match set_api_key_over_socket(&path).await {
+        api::WsFrame::Error { id, detail, .. } => {
+            assert_eq!(id, "admin-1");
+            let detail = detail.expect("a refusal must carry its classification");
+            assert_eq!(detail.code, api::ErrorCode::NotAuthorized);
+            assert!(!detail.retryable);
+        }
+        other => panic!("a non-daemon account must be refused, got {other:?}"),
+    }
+
+    let _ = shutdown.send(());
+}
+
+/// The capability the validator renders is the one the dispatcher enforces.
+#[test]
+fn peer_cred_capability_rule_matches_the_daemons() {
+    let uid = desktop_assistant_peer_cred::current_uid();
+    assert_eq!(capability_for_local_peer(uid, uid), Capability::Admin);
+    assert_eq!(
+        capability_for_local_peer(uid, uid.wrapping_add(1)),
+        Capability::Tenant
+    );
 }

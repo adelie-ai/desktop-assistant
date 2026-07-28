@@ -18,6 +18,7 @@ that renders into the same namespace.
 - [Build and push](#build-and-push)
 - [How the manifests are laid out](#how-the-manifests-are-laid-out)
 - [Deploy an instance](#deploy-an-instance)
+- [Who may administer the instance](#who-may-administer-the-instance)
 - [Private overlays](#private-overlays)
 - [Worked example: a second instance](#worked-example-a-second-instance)
 - [Day-two operations](#day-two-operations)
@@ -212,6 +213,52 @@ kubectl -n adele-example port-forward svc/adele-daemon 11339:11339
 Expect `WebSocket listening on ws://0.0.0.0:11339` and the tool inventory in the
 startup log.
 
+## Who may administer the instance
+
+The daemon separates a **tenant** from an **administrator**. A tenant owns their
+own conversations, knowledge and preferences. An administrator additionally owns
+the service: provider credentials, connectors and purposes, the database, the
+WebSocket auth posture, and the MCP servers the daemon spawns. The full command
+split is in [API_TRANSPORT.md](API_TRANSPORT.md).
+
+On a desktop this needs no configuration: the local Unix-socket peer runs the
+daemon, so it administers the daemon. **In a pod there is no such peer.** Every
+client arrives over the WebSocket door, and a WebSocket client is a tenant
+unless you name it:
+
+```toml
+# daemon.toml, in your overlay
+[authz]
+# The JWT `sub` of each administrator. For the built-in /login door this is the
+# login username (DESKTOP_ASSISTANT_WS_LOGIN_USERNAME); under OIDC it is the
+# subject your provider issues.
+admin_subjects = ["adele"]
+```
+
+Leave it out - the default - and **nobody** can change this instance's
+configuration over the network. That is the right setting for an instance whose
+config is fully declared in the overlay and re-seeded on change. Set it when you
+administer the instance through a client's settings UI.
+
+The section is deliberately file-only. No command writes it, so a leaked WS
+login password no longer hands over the whole admin surface. It is read once at
+startup: edit it and restart the pod. A config reload reports `authz` in
+`restart_required` rather than pretending the edit is live.
+
+One caveat worth knowing before you enable extra MCP servers on a shared
+instance: the daemon-side `fileio`, `terminal` and `command` servers run inside
+the daemon process as its own uid, so a tool call could write `daemon.toml`
+directly. They ship disabled. Constraining daemon-side tool execution is the
+other half of `docs/design/multi-tenancy-boundary.md` (decisions 3 to 5).
+
+Remember the seed rule below: editing `daemon.toml` in the overlay does not
+reconfigure a running instance. Re-seed, or set the value before first boot.
+
+The shipped `deploy/k8s/base/daemon.toml` and
+`deploy/k8s/overlays/example/daemon.toml` both leave `[authz]` out on purpose.
+The base is the smoke-test shape and the example overlay is a public template;
+neither should ship a subject name that looks like a real account.
+
 ## Private overlays
 
 **This repo is public.** Real namespaces, registries, image tags, hostnames, and
@@ -345,6 +392,9 @@ kubectl -n adele-production rollout restart deploy/adele-daemon
 
 Re-seeding discards runtime config changes, including MCP server enable/disable
 state held in `mcp_servers.toml`.
+
+`[authz] admin_subjects` is the exception that proves the rule: it is file-only,
+so it can *only* change this way, and the daemon must restart to pick it up.
 
 ### What survives what
 

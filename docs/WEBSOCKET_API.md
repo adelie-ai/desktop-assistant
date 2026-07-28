@@ -98,6 +98,36 @@ Server frames are one of:
 }
 ```
 
+An error frame may also carry an optional `detail` object classifying the
+outcome, so a caller can act on it programmatically instead of reading prose:
+
+```json
+{
+  "error": {
+    "id": "req-123",
+    "error": "not authorized: 'set_api_key' requires the administrator capability; this connection holds tenant",
+    "detail": {
+      "code": "not_authorized",
+      "description": "not authorized: 'set_api_key' requires the administrator capability; this connection holds tenant",
+      "message": "Only a daemon administrator can do that. This connection is a tenant.",
+      "retryable": false
+    }
+  }
+}
+```
+
+- `code` is the stable identifier to branch on: `not_authorized`,
+  `unsupported`, `not_found`, `already_terminal`. Never match the message text.
+- `description` is for logs; `message` is fit to show a person; `retryable`
+  says whether repeating the identical request could plausibly succeed.
+- `detail` is **absent** when the daemon cannot classify the failure honestly.
+  Read that as "unclassified", not as "not an authorization problem".
+
+Backward compatible by construction: `detail` is an optional *field* on the
+existing `error` frame, not a new frame variant, so a client that knows only
+`{id, error}` parses it unchanged, and `error` repeats `detail.description`. A
+`code` a client does not recognize round-trips instead of failing the parse.
+
 3. Event frame (unsolicited/streaming)
 
 ```json
@@ -131,6 +161,12 @@ Current command variants:
     rather than dropping it. Additive and backward-compatible: an older daemon
     that omits the field deserializes as empty, and an empty report is omitted
     on the wire.
+  - The config view also carries `caller_capability`: `"admin"` or `"tenant"`
+    for the connection that asked. Read it at connect time and render the
+    sections this connection may not change as unavailable, with the reason,
+    rather than letting a write fail on submit. Absent from a daemon that
+    predates the authorization tier, which means "not reported" - keep the
+    prior behaviour then, not "tenant". See "Authorization" below.
   - One key is not an area: `"config_load_failed"` means `daemon.toml` itself
     would not load, so nothing in it is in force and the daemon is running
     built-in defaults. A settings UI should show that state instead of
@@ -249,6 +285,62 @@ Current event variants:
   `event -> config_changed`. Its `restart_required` is how the client that made
   the change learns that the new authentication methods, OIDC config, or allowed
   origins are written but not yet in force.
+
+## Authorization
+
+Authenticating a token says who you are. It does not say that you own the
+service. A WebSocket connection is a **tenant** unless `[authz] admin_subjects`
+in `daemon.toml` names its subject (the JWT `sub`), in which case it is an
+**administrator**. The allowlist is empty by default, and **no command writes
+it**: it is set by editing `daemon.toml`, so the API surface offers a tenant no
+way to grant themselves the capability. (Daemon-side file and shell MCP servers
+run as the daemon's own uid and could reach the file; they ship disabled, and
+constraining them belongs to the tool-execution design, not this tier.)
+
+A tenant may do everything with its own data: conversations, messages,
+knowledge, scratchpads, background tasks, personality, and every read on this
+API, including `list_connections`, `list_available_models` and `get_purposes`,
+which the model picker needs.
+
+An administrator is additionally required for the service-configuration writes:
+
+`set_api_key`, `set_embeddings_settings`, `set_persistence_settings`,
+`set_database_settings`, `set_backend_tasks_settings`, `set_ws_auth_settings`,
+`create_connection`, `update_connection`, `delete_connection`,
+`set_connection_secret`, `set_purpose`, `add_mcp_server`, `remove_mcp_server`,
+`set_mcp_server_enabled`, `upsert_mcp_server`, `set_mcp_secret`,
+`upsert_service_account`, `remove_service_account`,
+`start_knowledge_maintenance`, and `mcp_server_action` for every verb except
+`"status"`.
+
+`set_config` is decided by its payload, and every field it carries writes
+daemon-global state, so any non-empty change set needs the administrator
+capability - the personality traits included, because they are one global block
+that every conversation without an override resolves against. A tenant sets
+their own disposition with `set_conversation_personality`.
+
+`mcp_server_action` is split by its verb: `"status"` is a read and stays tenant;
+`"start"`, `"stop"`, `"restart"` and anything added later need the
+administrator capability.
+
+`start_knowledge_maintenance` needs the administrator capability: every
+operation reaches past the caller's own rows, up to nulling and re-deriving
+every tenant's embeddings through the operator's provider.
+
+Discover your own level from `caller_capability` on the `get_config` reply (and
+on every `config_changed` event) rather than probing with a write.
+
+A refused command returns the error frame shown above with
+`detail.code = "not_authorized"` and `retryable: false`. The connection stays
+open, and the command has no effect - the check runs before the handler.
+
+**This is a behaviour change for existing API consumers.** A remote caller that
+could previously issue any of the commands above will now be refused unless it
+is listed. If your integration configures the daemon, add its subject to
+`[authz] admin_subjects` and restart the daemon. Integrations that only send
+messages and read their own data are unaffected. So are local clients on the
+daemon's own account, which are administrators by construction over the Unix
+socket and D-Bus.
 
 ## Notes
 

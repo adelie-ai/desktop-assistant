@@ -39,7 +39,7 @@ use std::sync::Arc;
 use desktop_assistant_api_model as api;
 use desktop_assistant_application::{AssistantApiHandler, UserId};
 use desktop_assistant_peer_cred::extract_peer_identity;
-use desktop_assistant_transport_dispatch::{AuthContext, TransportKind, dispatch_loop};
+use desktop_assistant_transport_dispatch::{AuthContext, Capability, TransportKind, dispatch_loop};
 use futures::stream;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
@@ -61,9 +61,28 @@ pub fn default_desktop_socket_path() -> Option<PathBuf> {
 /// The listener owns the wire framing; the validator only renders a verdict.
 pub enum UdsAuth {
     /// Authenticated as this user — enter the dispatcher loop.
-    Allow(UserId),
+    Allow {
+        /// The identity every storage query on this connection is scoped by.
+        user: UserId,
+        /// What this connection is allowed to do (#728). The validator decides
+        /// it, because only the validator knows the daemon's own uid and the
+        /// operator's allowlist; the dispatcher then enforces it. Default
+        /// [`Capability::Tenant`] - the absence of a grant is never a grant.
+        capability: Capability,
+    },
     /// Rejected — the listener writes `reason` as an error frame and closes.
     Reject(String),
+}
+
+impl UdsAuth {
+    /// Admit `user` at the least-privileged capability. The shape a validator
+    /// wants when it has authenticated someone but grants them nothing extra.
+    pub fn allow_tenant(user: UserId) -> Self {
+        Self::Allow {
+            user,
+            capability: Capability::Tenant,
+        }
+    }
 }
 
 /// Result of the connection handshake.
@@ -107,7 +126,7 @@ pub trait UdsAuthValidator: Send + Sync {
         let _ = peer;
         match token {
             Some(t) if self.validate_bearer_token(t).await => {
-                UdsAuth::Allow(self.extract_user_id(t).await.unwrap_or_default())
+                UdsAuth::allow_tenant(self.extract_user_id(t).await.unwrap_or_default())
             }
             Some(_) => UdsAuth::Reject("auth: invalid jwt".to_string()),
             None => UdsAuth::Reject("auth: missing jwt in handshake".to_string()),
@@ -474,8 +493,10 @@ async fn handle_connection(
     // default validator requires a valid token; a local-trust daemon (#407)
     // accepts the peer identity. Identity (#105): the resolved `UserId` is
     // installed into the per-task task-local before each command runs.
-    let user_id = match auth.authenticate(token.as_deref(), peer.as_ref()).await {
-        UdsAuth::Allow(user_id) => user_id,
+    // The validator also renders the authorization verdict (#728): it is the
+    // only party that knows the daemon's own uid and the operator's allowlist.
+    let (user_id, capability) = match auth.authenticate(token.as_deref(), peer.as_ref()).await {
+        UdsAuth::Allow { user, capability } => (user, capability),
         UdsAuth::Reject(reason) => {
             write_error(&mut write_half, "", &reason).await?;
             return Ok(());
@@ -547,7 +568,8 @@ async fn handle_connection(
     let auth_ctx = AuthContext::new(user_id.into_inner(), TransportKind::Uds)
         .with_co_location(co_located)
         .with_client_label(client_label)
-        .with_client_context(client_context);
+        .with_client_context(client_context)
+        .with_capability(capability);
 
     dispatch_loop(handler, auth_ctx, inbound, sink).await;
 
@@ -580,10 +602,7 @@ async fn write_error<W>(write_half: &mut W, id: &str, error: &str) -> anyhow::Re
 where
     W: AsyncWriteExt + Unpin,
 {
-    let frame = WsFrame::Error {
-        id: id.to_string(),
-        error: error.to_string(),
-    };
+    let frame = WsFrame::error(id, error);
     let body = serde_json::to_vec(&frame)?;
     write_frame(write_half, &body).await?;
     write_half.flush().await?;
