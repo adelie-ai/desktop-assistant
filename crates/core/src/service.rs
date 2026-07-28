@@ -31,8 +31,8 @@ use crate::ports::tools::ToolExecutor;
 use crate::ports::transport::{current_client_label, current_co_location, current_transport_kind};
 use crate::sanitize::sanitize_assistant_text;
 use crate::tools::{
-    NoopToolExecutor, categorize_tool_namespaces, summarize_tool_text, summarize_tool_value,
-    tool_set_hash,
+    NoopToolExecutor, categorize_tool_namespaces, summarize_tool_name, summarize_tool_text,
+    summarize_tool_value, tool_set_hash,
 };
 use chrono::{Duration, Local};
 use std::collections::HashMap;
@@ -162,7 +162,10 @@ type ToolCompletionRun = Option<(String, u32)>;
 /// The line carries the tool's name and a count and nothing else. It reaches
 /// every subscribed client and the journal, so arguments and output must stay
 /// out of it (#776); `summarize_tool_value` feeds the activity feed, which is
-/// the surface for those.
+/// the surface for those. The name itself is model-supplied, so
+/// `summarize_tool_name` bounds it here - one line, capped length (#945) -
+/// while the run stays keyed on the raw name, so two long names that share a
+/// prefix are still two runs.
 ///
 /// Repeats of the same tool coalesce into one running count rather than one
 /// line each, because a client renders a status by replacing the previous one:
@@ -171,9 +174,10 @@ type ToolCompletionRun = Option<(String, u32)>;
 /// watching human than the successes around it, and folding it into a success
 /// count would hide it.
 fn advance_tool_completion_status(run: &mut ToolCompletionRun, name: &str, ok: bool) -> String {
+    let shown = summarize_tool_name(name);
     if !ok {
         *run = None;
-        return format!("{name} failed");
+        return format!("{shown} failed");
     }
     let count = match run {
         Some((running, count)) if running == name => {
@@ -186,8 +190,8 @@ fn advance_tool_completion_status(run: &mut ToolCompletionRun, name: &str, ok: b
         }
     };
     match count {
-        1 => format!("Ran {name}"),
-        n => format!("Ran {name} {n} times"),
+        1 => format!("Ran {shown}"),
+        n => format!("Ran {shown} {n} times"),
     }
 }
 
@@ -1813,11 +1817,11 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                         tool_call.name
                     );
                     notify_tool_event(ToolEvent::Started {
-                        name: tool_call.name.clone(),
+                        name: summarize_tool_name(&tool_call.name),
                         args: summarize_tool_value(&arguments),
                     });
                     notify_tool_event(ToolEvent::Finished {
-                        name: tool_call.name.clone(),
+                        name: summarize_tool_name(&tool_call.name),
                         ok: false,
                         output: "rejected: not on allowlist".to_string(),
                     });
@@ -1830,8 +1834,11 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 // panel's activity feed). Emitted here — after the step-control
                 // fast path, before either execution branch — so it covers real
                 // tool work (server-side and client-local alike) exactly once.
+                // The name is model-supplied, so it is bounded to one line of
+                // capped length before it leaves the process (#945), the same
+                // way the arguments beside it are.
                 notify_tool_event(ToolEvent::Started {
-                    name: tool_call.name.clone(),
+                    name: summarize_tool_name(&tool_call.name),
                     args: summarize_tool_value(&arguments),
                 });
 
@@ -1869,7 +1876,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                         // -finished row on the cancel path (issue #252).
                         Err(CoreError::Cancelled) => {
                             notify_tool_event(ToolEvent::Finished {
-                                name: tool_call.name.clone(),
+                                name: summarize_tool_name(&tool_call.name),
                                 ok: false,
                                 output: "cancelled".to_string(),
                             });
@@ -1912,7 +1919,13 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                         tokio::select! {
                             r = &mut exec => break r,
                             _ = tokio::time::sleep(SERVER_TOOL_KEEPALIVE_INTERVAL) => {
-                                on_status(format!("Still working on {}", tool_call.name));
+                                // Bounded like the completion status below: the
+                                // name comes from the model and the line reaches
+                                // every subscribed client and the journal (#945).
+                                on_status(format!(
+                                    "Still working on {}",
+                                    summarize_tool_name(&tool_call.name)
+                                ));
                             }
                         }
                     };
@@ -1965,7 +1978,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 };
 
                 notify_tool_event(ToolEvent::Finished {
-                    name: tool_call.name.clone(),
+                    name: summarize_tool_name(&tool_call.name),
                     ok: tool_ok,
                     output: summarize_tool_text(&stored),
                 });
