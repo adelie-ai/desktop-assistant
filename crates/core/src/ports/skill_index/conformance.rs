@@ -350,6 +350,19 @@ pub async fn upsert_ignores_caller_supplied_presence(store: &dyn SkillIndexStore
 /// "the caller's own" from the caller's real identity, never from the
 /// `owner` argument's string value (#911), so exercising it as anyone else
 /// would not prove this case.
+///
+/// The `bob names alice` case below is the one that actually distinguishes a
+/// compliant implementation from a pre-#911 one. Passing `Some("alice")`
+/// while installed as alice (the case above) proves nothing on its own: an
+/// implementation that still trusts the literal argument passes it
+/// identically to one that correctly consults the caller's real identity,
+/// because here the two happen to agree. Installing a *different* identity
+/// (bob, who has no "deploy" of his own) and naming a real, seeded owner
+/// (alice) as the argument is what forces disagreement: a compliant store
+/// resolves bob's own (empty) scope and returns nothing, while a store that
+/// still binds the argument literally returns alice's row -- exactly the
+/// leak #911 fixed. Any adapter's `get` must fail this specific case before
+/// its fix, or the case is not exercising the boundary at all.
 pub async fn get_is_scope_addressed(store: &dyn SkillIndexStore) {
     reconcile_scan(
         store,
@@ -372,6 +385,19 @@ pub async fn get_is_scope_addressed(store: &dyn SkillIndexStore) {
 
     let alice_own = with_user_id(UserId::new("alice"), fetch(store, "deploy", Some("alice"))).await;
     assert_eq!(alice_own.body, "alice's own");
+
+    // The discriminating case (see the doc comment above): bob has no
+    // "deploy" of his own, but names alice -- who genuinely has one -- as
+    // the `owner` argument.
+    let bob_naming_alice = with_user_id(UserId::new("bob"), async {
+        store.get("deploy", Some("alice")).await.expect("get")
+    })
+    .await;
+    assert!(
+        bob_naming_alice.is_none(),
+        "an owner argument naming a different, real, seeded owner must not surface that \
+         owner's row -- the caller's real identity decides scope, not the argument"
+    );
 
     assert!(
         store
