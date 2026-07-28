@@ -99,6 +99,16 @@ answer another way. It hands the way forward to the user rather than telling
 the model to retry later: the content that may be driving the call is still in
 the transcript on the next turn.
 
+Two durable surfaces are written outside the turn loop and are handled at the
+write rather than at the gate. Step-planning notes (`begin_step` /
+`complete_step`) are intercepted before the gate - the step stack has to close
+or the turn's compaction breaks - so the step structure is recorded and the
+model's wording is not. A subagent's answer is mirrored onto the session
+scratchpad from the completion path; it is kept, because
+`get_subagent_status` reads a detached delegation's result from that note and
+nowhere else, and stamped, so both routes that can read it back - that tool,
+and `builtin_scratchpad_search` - close the gate when they do.
+
 The gate protects the turn that read the content. It does not stop a model that
 acts on the same text one turn later - that needs a taint marker persisted on
 the ingesting message, which is a later phase.

@@ -3342,15 +3342,22 @@ where
                     // session conversation. Best-effort: a pad-write failure is
                     // logged, never fatal -- the sink still carries the text.
                     if let (Some(write), Some(scope)) = (&scratchpad_write, &scope_for_result) {
-                        // #741: when the child read outside content, its wording
-                        // does not go on the pad. The full answer still reaches
-                        // the parent through the result sink and
-                        // `get_subagent_status`, which is classified and taints
-                        // the parent's turn - so the recovery path survives and
-                        // the ungated one closes.
+                        // #741: when the child read outside content, its answer
+                        // is possibly-injected text landing on a durable pad,
+                        // outside the turn loop, where no classification covers
+                        // the write. It is kept and stamped rather than
+                        // withheld: this note is the ONLY place
+                        // `get_subagent_status` reads a result from, so
+                        // withholding would lose a detached (`wait: false`)
+                        // delegation's answer outright. The stamp is what the
+                        // read paths key on - `get_subagent_status` taints
+                        // unconditionally, and `builtin_scratchpad_search`
+                        // taints when it sees the stamp come back - and it
+                        // doubles as a disclosure to the model reading it.
                         let body = if child_ingested_external.load(Ordering::Relaxed) {
-                            desktop_assistant_core::tool_provenance::WITHHELD_SUBAGENT_RESULT
-                                .to_string()
+                            desktop_assistant_core::tool_provenance::mark_external_content(
+                                &outcome.response,
+                            )
                         } else {
                             outcome.response.clone()
                         };

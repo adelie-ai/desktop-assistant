@@ -2247,14 +2247,15 @@ async fn subagent_that_read_outside_content_withholds_its_answer_from_the_pad() 
         .iter()
         .find(|(key, _)| key == "result")
         .expect("a 'result' note was still written to the pad");
+    // The answer survives - destroying it would lose a detached delegation's
+    // only result - and carries the stamp the read paths key on.
     assert!(
-        !content.contains(PLANTED),
-        "the pad must not carry the child's wording out of its tainted turn: {content}"
+        content.contains(PLANTED),
+        "the child's answer must survive on the pad: {content}"
     );
-    assert_eq!(
-        content,
-        desktop_assistant_core::tool_provenance::WITHHELD_SUBAGENT_RESULT,
-        "the note must say why it is empty and where the answer is"
+    assert!(
+        desktop_assistant_core::tool_provenance::carries_external_marker(content),
+        "the note must be stamped so a later read taints: {content}"
     );
 }
 
@@ -2433,6 +2434,47 @@ async fn get_subagent_status_returns_completed_with_result_from_pad() {
     assert_eq!(
         json["result"], "child A answer",
         "surfaces the result note under THIS child's owner_todo, not a sibling's"
+    );
+}
+
+#[tokio::test]
+async fn detached_subagent_answer_survives_a_tainted_child_and_is_retrievable() {
+    // #741 regression. `get_subagent_status` reads the answer from the session
+    // pad and from nowhere else, so a fix that withheld the pad note destroyed
+    // the result of every detached (`wait: false`) delegation - the parent is
+    // woken, told to collect with `get_subagent_status`, and gets nothing back.
+    // The child's own transcript is no fallback: it carries the reserved
+    // subagent tag and is excluded from conversation search.
+    //
+    // The answer must therefore survive the child's tainted turn, stamped
+    // rather than removed.
+    use desktop_assistant_core::tool_provenance::mark_external_content;
+
+    const ANSWER: &str = "the three sources agree on the 2019 figure";
+
+    let user = unique_user("alice");
+    let mut rows = HashMap::new();
+    rows.insert(
+        "task-9".to_string(),
+        completed_subagent_row("task-9", &user, "1.1"),
+    );
+    let store = Arc::new(FixedStore { rows });
+    // What the completion path writes for a child that read a web page.
+    let tools = status_tools(
+        store,
+        vec![("1.1".to_string(), mark_external_content(ANSWER))],
+    );
+
+    let json = run_status(&tools, user, "task-9").await;
+    assert_eq!(json["status"], "completed");
+    let result = json["result"].as_str().expect("a result must come back");
+    assert!(
+        result.contains(ANSWER),
+        "the detached parent must be able to retrieve the child's answer, got: {result}"
+    );
+    assert!(
+        desktop_assistant_core::tool_provenance::carries_external_marker(result),
+        "and it must arrive disclosed as outside content, got: {result}"
     );
 }
 

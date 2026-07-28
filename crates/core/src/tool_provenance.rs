@@ -87,6 +87,11 @@
 //!
 //! ## Known limits
 //!
+//! - **The rolling context summary is durable and is not gated, and that is
+//!   fine.** It is written mid-turn without consulting the gate, and it
+//!   survives into later turns. It is built only from user and assistant
+//!   messages and skips tool results, so ingested bytes never reach it. Left
+//!   here so the next reader does not have to re-derive that.
 //! - **Second-order ingest is not tracked.** `builtin_conversation_search`
 //!   and the knowledge-base tools can return text that a web page put there
 //!   in an earlier turn. They count as trusted, because marking them
@@ -141,6 +146,7 @@
 use crate::ports::turn_interactivity::TurnInteractivity;
 use crate::tools::summarize_tool_name;
 
+use DeclaredReader::{ExternalContentMarker, SkillTrustTier};
 use ResultProvenance::{Declared, ExternallyControlled, Trusted};
 use ToolTier::{Egress, Execution, Mutate, Present, Read, Unclassified};
 
@@ -163,12 +169,29 @@ pub enum ResultProvenance {
     /// chose, the output of a command, the report of a child agent.
     ExternallyControlled,
     /// The tool states the provenance of its own result, and the answer
-    /// varies per call. The skill tools are the case: the platform already
-    /// models a skill's source as a
-    /// [`crate::domain::skill::TrustTier`], and the tool returns that tier
-    /// beside the body. [`skill_result_is_local_only`] reads it, and anything
-    /// that is not wholly local counts as externally controlled.
-    Declared,
+    /// varies per call. The named [`DeclaredReader`] is what reads the
+    /// statement out of the payload.
+    Declared(DeclaredReader),
+}
+
+/// How a [`ResultProvenance::Declared`] tool states its result's provenance.
+///
+/// A variant per shape rather than one clever parser, so adding a third
+/// declaring tool is a decision someone writes down and every `match` here
+/// has to account for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeclaredReader {
+    /// The payload carries the platform's own
+    /// [`crate::domain::skill::TrustTier`] beside the skill body, at the top
+    /// level for a single skill and once per hit for a search. Anything not
+    /// wholly `local` came from outside this machine. See
+    /// [`skill_result_is_local_only`].
+    SkillTrustTier,
+    /// The payload may contain notes stamped with
+    /// [`EXTERNAL_CONTENT_MARKER`] by a writer that had itself read outside
+    /// content - today, a subagent's answer landing on the session pad. See
+    /// [`carries_external_marker`].
+    ExternalContentMarker,
 }
 
 /// What a tool can do, at the granularity the gate needs.
@@ -361,7 +384,14 @@ pub const CLASSIFIED_SOURCES: &[ClassifiedSource] = &[
             tool("builtin_mcp_control", Execution, Trusted),
             tool("builtin_conversation_search", Read, Trusted),
             tool("builtin_scratchpad_write", Mutate, Trusted),
-            tool("builtin_scratchpad_search", Read, Trusted),
+            // The pad holds notes a subagent wrote from its own turn, and
+            // that turn may have read outside content. Such a note is
+            // stamped, and this read taints when it comes back.
+            tool(
+                "builtin_scratchpad_search",
+                Read,
+                Declared(ExternalContentMarker),
+            ),
             tool("builtin_scratchpad_delete", Mutate, Trusted),
             // A pinned note is re-injected verbatim into every round of
             // every later turn, which makes it the strongest place injected
@@ -370,8 +400,8 @@ pub const CLASSIFIED_SOURCES: &[ClassifiedSource] = &[
             // A skill body is third-party content whenever it came from
             // anywhere but this machine, and the daemon already knows which:
             // the result carries the indexed `trust_tier`.
-            tool("builtin_skill_search", Read, Declared),
-            tool("builtin_skill_get", Read, Declared),
+            tool("builtin_skill_search", Read, Declared(SkillTrustTier)),
+            tool("builtin_skill_get", Read, Declared(SkillTrustTier)),
         ],
         &[],
     ),
@@ -613,8 +643,15 @@ pub fn classify_tool(name: &str) -> ToolClassification {
 /// a `.well-known` fetch, or from a source the indexer could not classify -
 /// third-party bytes either way.
 ///
-/// Fails closed. A payload that does not parse, or that returns content
-/// without declaring a tier, counts as not-local.
+/// Fails closed on content it cannot grade: a payload that does not parse, or
+/// that returns a skill body without declaring a tier, counts as not-local.
+///
+/// It does **not** fail closed on a payload that returned nothing. A search
+/// that matched no skills, and a tool-level error, are routine and carry no
+/// third-party bytes; treating them as tainting would shut every acting tool
+/// off for the rest of the turn every time the model looked for a skill and
+/// found none. That is the failure this module's own doc warns about - a
+/// control that breaks normal work gets removed rather than tuned.
 #[must_use]
 pub fn skill_result_is_local_only(result: &str) -> bool {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(result) else {
@@ -626,8 +663,28 @@ pub fn skill_result_is_local_only(result: &str) -> bool {
     }
     let mut tiers = Vec::new();
     collect_trust_tiers(&value, &mut tiers);
-    // Content with no declared tier is content of unknown provenance.
-    !tiers.is_empty() && tiers.iter().all(|t| t == "local")
+    if !tiers.is_empty() {
+        return tiers.iter().all(|t| t == "local");
+    }
+    // No tier stated. Fail closed only if something actually came back.
+    !skill_payload_has_content(&value)
+}
+
+/// Whether a skill-tool payload actually returned skill content.
+///
+/// `body` is what `builtin_skill_get` returns; `results` is what
+/// `builtin_skill_search` returns. Neither present, or both empty, means the
+/// call produced nothing to be suspicious of.
+fn skill_payload_has_content(value: &serde_json::Value) -> bool {
+    let has_body = value
+        .get("body")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|b| !b.trim().is_empty());
+    let has_hits = value
+        .get("results")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|r| !r.is_empty());
+    has_body || has_hits
 }
 
 /// Every `trust_tier` string anywhere in `value`, at any depth.
@@ -666,21 +723,46 @@ fn collect_trust_tiers(value: &serde_json::Value, out: &mut Vec<String>) {
 /// `Role::System` block. That is a write, and in a tainted turn it is a write
 /// of possibly-injected text into a place the gate cannot see. So the
 /// structure survives and the text does not.
-pub const WITHHELD_STEP_TEXT: &str = "[text withheld: this step ran in a turn that had read content from outside the trust \
-     boundary, so the model's wording was not recorded]";
+///
+/// Deliberately terse. Unlike a refusal, which the model reads once and has to
+/// act on, this string is durable and re-rendered into every later turn, so
+/// anything it explains about the gate is explained again on every turn from
+/// here on. The refusal already carries the reasoning; this only has to say
+/// that a step ran and its wording is missing.
+pub const WITHHELD_STEP_TEXT: &str = "[step text not recorded]";
 
-/// What the loop writes to the session pad in place of a child agent's answer
-/// when that child read outside content (#741).
+/// Stamp put on durable text written by a turn that had read outside content.
 ///
 /// A subagent's final answer is mirrored onto the session scratchpad from the
 /// completion path rather than from a tool call, so no classification covers
-/// it and a later, clean turn can read it back through
-/// `builtin_scratchpad_search`. The full answer still reaches the parent
-/// through `get_subagent_status`, which *is* classified and does taint the
-/// parent's turn, so withholding here closes the ungated door without closing
-/// the gated one.
-pub const WITHHELD_SUBAGENT_RESULT: &str = "[result withheld from the pad: this agent read content from outside the trust boundary. \
-     Collect the full answer with get_subagent_status, which records that provenance.]";
+/// the write. Destroying the text is not an option: that note is the only
+/// place `get_subagent_status` reads the answer from, so a detached
+/// (`wait: false`) delegation would lose its result entirely and the parent
+/// would have no route to it at all. Instead the text is kept and stamped, and
+/// every route that can read it back accounts for the stamp -
+/// `get_subagent_status` taints unconditionally, and
+/// `builtin_scratchpad_search` taints when a returned note carries this.
+///
+/// The stamp is also a disclosure. It is prepended to the text the model
+/// reads, so the model is told where the content came from rather than left to
+/// treat it as the assistant's own words.
+pub const EXTERNAL_CONTENT_MARKER: &str =
+    "[provenance: written by a turn that had read content from outside the trust boundary]";
+
+/// `text` with [`EXTERNAL_CONTENT_MARKER`] prepended, ready to be stored.
+#[must_use]
+pub fn mark_external_content(text: &str) -> String {
+    format!("{EXTERNAL_CONTENT_MARKER}\n{text}")
+}
+
+/// Whether `text` carries [`EXTERNAL_CONTENT_MARKER`] anywhere in it.
+///
+/// Substring rather than prefix: a search result embeds a note's content in a
+/// larger payload, so the stamp arrives somewhere in the middle.
+#[must_use]
+pub fn carries_external_marker(text: &str) -> bool {
+    text.contains(EXTERNAL_CONTENT_MARKER)
+}
 
 /// What the gate decided about one model-chosen tool call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -758,7 +840,8 @@ impl TurnProvenance {
         let external = match classify_tool(name).provenance {
             Trusted => false,
             ExternallyControlled => true,
-            Declared => !skill_result_is_local_only(result),
+            Declared(SkillTrustTier) => !skill_result_is_local_only(result),
+            Declared(ExternalContentMarker) => carries_external_marker(result),
         };
         if !external {
             return GateChange::Unchanged;
@@ -870,10 +953,11 @@ mod tests {
     /// list is the independent half. Two statements that must agree catch a
     /// typo in either, which one statement cannot.
     ///
-    /// It covers every entry where a mistake is dangerous: everything gated
-    /// (`Mutate`, `Egress`, `Execution`) and everything that must taint. A
-    /// wrong `Read`/`Trusted` entry is caught by
-    /// `no_open_tool_looks_like_it_acts` below instead.
+    /// It covers **every** tool in the table, not only the ones the table
+    /// calls dangerous. Keying the requirement off the table's own
+    /// classification would let a tool authored straight into the safest cell
+    /// (`Read`/`Trusted`, or `Present`/`Trusted`) excuse itself from being
+    /// stated twice, which is exactly the entry a second opinion is for.
     const INDEPENDENT_EXPECTATIONS: &[(&str, ToolTier, ResultProvenance)] = &[
         // built-ins that change durable state or run code
         ("builtin_knowledge_base_write", Mutate, Trusted),
@@ -884,8 +968,8 @@ mod tests {
         ("builtin_scratchpad_delete", Mutate, Trusted),
         ("builtin_scratchpad_pin", Mutate, Trusted),
         // the skill tools state their own provenance per call
-        ("builtin_skill_search", Read, Declared),
-        ("builtin_skill_get", Read, Declared),
+        ("builtin_skill_search", Read, Declared(SkillTrustTier)),
+        ("builtin_skill_get", Read, Declared(SkillTrustTier)),
         // a child agent's report carries whatever the child read
         ("spawn_subagent", Execution, ExternallyControlled),
         ("get_subagent_status", Read, ExternallyControlled),
@@ -968,6 +1052,36 @@ mod tests {
         ("radio_search", Read, ExternallyControlled),
         ("radio_play", Egress, Trusted),
         ("radio_stop", Mutate, Trusted),
+        // The open cells are stated too. A wrong entry here is the one a
+        // table-keyed check could never catch, because the table would be
+        // claiming it is harmless.
+        ("builtin_knowledge_base_search", Read, Trusted),
+        ("builtin_knowledge_base_list", Read, Trusted),
+        ("builtin_tool_search", Read, Trusted),
+        ("builtin_notify", Present, Trusted),
+        ("builtin_sys_props", Read, Trusted),
+        ("builtin_conversation_search", Read, Trusted),
+        (
+            "builtin_scratchpad_search",
+            Read,
+            Declared(ExternalContentMarker),
+        ),
+        ("say_this", Present, Trusted),
+        ("request_voice", Present, Trusted),
+        ("stop_voice", Present, Trusted),
+        ("list_lists", Read, Trusted),
+        ("get_task", Read, Trusted),
+        ("list_tasks", Read, Trusted),
+        ("search_tasks", Read, Trusted),
+        ("timeclock_project_list", Read, Trusted),
+        ("timeclock_session_get_active", Read, Trusted),
+        ("timeclock_session_query", Read, Trusted),
+        ("terminal_list_scripts", Read, Trusted),
+        ("fileio_get_basename", Read, Trusted),
+        ("fileio_get_dirname", Read, Trusted),
+        ("fileio_get_canonical_path", Read, Trusted),
+        ("fileio_get_current_directory", Read, Trusted),
+        ("radio_now_playing", Read, Trusted),
     ];
 
     #[test]
@@ -988,10 +1102,14 @@ mod tests {
     }
 
     #[test]
-    fn every_gated_or_tainting_entry_is_independently_stated() {
-        // The list above is only a check if it stays complete. Anything the
-        // table gates, or that closes the gate, must appear in it - so adding
-        // a dangerous tool forces a second, independent decision about it.
+    fn every_shipped_tool_is_independently_stated() {
+        // Keyed off the tool-name universe, never off what the table claims
+        // about a tool. A check that asked "is this entry dangerous?" would
+        // read the answer from the very row it is meant to be checking, so a
+        // tool authored straight into the safest cell - `Read`/`Trusted`, or
+        // `Present`/`Trusted` - would excuse itself from a second opinion, and
+        // that is precisely the entry a second opinion exists for. Every name
+        // in the table needs an independent statement, whatever cell it is in.
         let stated: Vec<&str> = INDEPENDENT_EXPECTATIONS
             .iter()
             .map(|(n, _, _)| *n)
@@ -999,15 +1117,33 @@ mod tests {
         let mut missing = Vec::new();
         for src in CLASSIFIED_SOURCES {
             for entry in src.tools {
-                let dangerous = entry.tier.is_gated() || entry.provenance != Trusted;
-                if dangerous && !stated.contains(&entry.name) {
+                if !stated.contains(&entry.name) {
                     missing.push(entry.name);
                 }
             }
         }
         assert!(
             missing.is_empty(),
-            "these gated or tainting tools have no independent expectation: {missing:?}"
+            "these tools have no independent expectation: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn the_independent_list_names_no_tool_the_table_does_not_have() {
+        // The other direction, so the list cannot drift into stating tools
+        // that were renamed or removed and quietly stop covering anything.
+        let in_table: Vec<&str> = CLASSIFIED_SOURCES
+            .iter()
+            .flat_map(|s| s.tools.iter().map(|t| t.name))
+            .collect();
+        let stale: Vec<&str> = INDEPENDENT_EXPECTATIONS
+            .iter()
+            .map(|(n, _, _)| *n)
+            .filter(|n| !in_table.contains(n))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "stale independent expectations: {stale:?}"
         );
     }
 
@@ -1185,10 +1321,9 @@ mod tests {
     }
 
     #[test]
-    fn a_declared_provenance_fails_closed_on_anything_it_cannot_read() {
-        // Unparseable, or content with no declared tier: both are content of
-        // unknown provenance, so both close the gate. A clean not-found does
-        // not, because it returned nothing.
+    fn a_declared_provenance_fails_closed_on_content_it_cannot_grade() {
+        // Content that came back without a grade is content of unknown
+        // provenance, and so is a payload that will not parse.
         for payload in [
             "not json at all",
             r#"{"ok":true,"body":"steps"}"#,
@@ -1201,16 +1336,67 @@ mod tests {
                 "must fail closed on: {payload}"
             );
         }
+    }
 
-        let mut not_found = TurnProvenance::new();
+    #[test]
+    fn a_skill_lookup_that_returned_nothing_does_not_close_the_gate() {
+        // Searching for a skill and finding none is completely routine. If it
+        // closed the gate, every turn that looked for a playbook and came up
+        // empty would lose write, egress and execution for the rest of the
+        // turn - the shape of control this module's doc says gets removed
+        // rather than tuned. Nothing came back, so nothing can have been
+        // planted in it.
+        for payload in [
+            r#"{"ok":false,"reason":"no skill named x"}"#,
+            r#"{"ok":true,"results":[]}"#,
+            r#"{"error":"missing required argument 'name'"}"#,
+            r#"{"ok":true,"body":""}"#,
+        ] {
+            let mut turn = TurnProvenance::new();
+            assert_eq!(
+                turn.observe_result("builtin_skill_search", payload),
+                GateChange::Unchanged,
+                "an empty or failed lookup must not close the gate: {payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stamped_note_coming_back_through_scratchpad_search_taints() {
+        // The pad is the one durable surface a subagent writes to outside the
+        // turn loop, so the note is stamped at the write and this read is what
+        // keys on the stamp. Without it the parent could pull a tainted
+        // child's answer into a clean turn with every tier still open.
+        let mut turn = TurnProvenance::new();
+        let payload = format!(
+            r#"{{"notes":[{{"key":"result","content":"{} the answer"}}]}}"#,
+            EXTERNAL_CONTENT_MARKER
+        );
         assert_eq!(
-            not_found.observe_result(
-                "builtin_skill_get",
-                r#"{"ok":false,"reason":"no skill named x"}"#,
+            turn.observe_result("builtin_scratchpad_search", &payload),
+            GateChange::JustClosed
+        );
+
+        let mut clean = TurnProvenance::new();
+        assert_eq!(
+            clean.observe_result(
+                "builtin_scratchpad_search",
+                r#"{"notes":[{"key":"result","content":"the answer"}]}"#,
             ),
             GateChange::Unchanged,
-            "a not-found returned no content, so it cannot taint"
+            "an unstamped pad is the assistant's own notes and must not taint"
         );
+    }
+
+    #[test]
+    fn marking_text_makes_it_detectable_and_keeps_it_readable() {
+        let marked = mark_external_content("the three sources agree");
+        assert!(carries_external_marker(&marked));
+        assert!(
+            marked.contains("the three sources agree"),
+            "marking must not destroy the text: {marked}"
+        );
+        assert!(!carries_external_marker("the three sources agree"));
     }
 
     #[test]
