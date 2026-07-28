@@ -4848,6 +4848,66 @@ mod tests {
         assert!(matches!(&oversize, Err(ApiError::Core(m)) if m.contains("exceeds")));
     }
 
+    /// Pins the wire contract for `SetScratchpadNote` (#809). When the
+    /// storage layer's `write` reports no row changed - the shape a
+    /// cross-tenant conflict guard produces, see
+    /// `PgScratchpadStore::write` (`crates/storage/src/scratchpad.rs`) - the
+    /// handler must surface that as a well-formed empty success
+    /// (`CommandResult::Scratchpad(vec![])`), never an error and never a
+    /// fabricated note. This is a deliberately minimal `write` closure (not
+    /// `in_memory_scratchpad`, which cannot reproduce a real conflict - see
+    /// #955) so the handler's response shape is exercised in isolation from
+    /// any particular storage backend's reason for reporting zero rows.
+    #[tokio::test]
+    async fn set_scratchpad_note_surfaces_empty_success_when_the_store_reports_no_change() {
+        let write: ScratchpadWriteFn = Arc::new(|_conv: String, _notes: Vec<NewScratchpadNote>| {
+            Box::pin(async { Ok(vec![]) })
+        });
+        let get_many: ScratchpadGetManyFn =
+            Arc::new(|_conv: String, _keys: Vec<String>, _limit: usize| {
+                Box::pin(async { Ok(vec![]) })
+            });
+        let list: ScratchpadListFn =
+            Arc::new(|_conv: String, _note_type: Option<String>, _limit: usize| {
+                Box::pin(async { Ok(vec![]) })
+            });
+        let delete_many: ScratchpadDeleteManyFn = Arc::new(|_conv: String, keys: Vec<String>| {
+            Box::pin(async move { Ok(keys.len() as u64) })
+        });
+        let clear: ScratchpadClearFn = Arc::new(|_conv: String| Box::pin(async { Ok(0) }));
+
+        let h = DefaultAssistantApiHandler::new(
+            Arc::new(FakeAssistant),
+            Arc::new(FakeConversations),
+            Arc::new(FakeSettings),
+            Arc::new(FakeConnections),
+            Arc::new(FakeKnowledge),
+        )
+        .with_scratchpad(write, get_many, list, delete_many, clear);
+
+        let res = h
+            .handle_command_for(
+                RequestContext::from(UserId::new("bob")),
+                api::Command::SetScratchpadNote {
+                    conversation_id: "c1".into(),
+                    key: "goal".into(),
+                    content: "bob's injected content".into(),
+                    note_type: String::new(),
+                    sequence: None,
+                    done: false,
+                },
+            )
+            .await
+            .expect("a store-side no-op write must not be reported as an error");
+
+        assert_eq!(
+            res,
+            api::CommandResult::Scratchpad(vec![]),
+            "a write the store silently skipped must surface as an empty list, \
+             never a fabricated note and never an error"
+        );
+    }
+
     #[tokio::test]
     async fn send_message_emits_events_and_completes() {
         let h = DefaultAssistantApiHandler::new(

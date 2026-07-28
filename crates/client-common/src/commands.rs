@@ -483,7 +483,15 @@ pub trait AssistantCommands: Send + Sync {
     }
 
     /// Upsert a single scratchpad note (re-writing a key replaces its fields —
-    /// e.g. set `done` to check a todo off). Returns the saved note(s).
+    /// e.g. set `done` to check a todo off). Returns the saved note(s): a
+    /// one-element vec on a normal write.
+    ///
+    /// Returns an **empty** vec — `Ok(vec![])`, not an error — when the
+    /// write was silently refused. Today the only cause is `conversation_id`
+    /// naming a conversation this caller does not own: the daemon's
+    /// cross-tenant guard fails closed there rather than touching another
+    /// user's note, so nothing is written. Check the returned vec's length;
+    /// `Ok` alone does not mean the note was saved.
     #[allow(clippy::too_many_arguments)]
     async fn set_scratchpad_note(
         &self,

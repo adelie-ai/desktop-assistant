@@ -514,6 +514,17 @@ pub enum Command {
     /// Re-writing an existing key replaces its content/type/sequence/done —
     /// this is how a client checks a todo off (`done: true`). Returns the saved
     /// note(s) as `CommandResult::Scratchpad`.
+    ///
+    /// The returned list is normally exactly one note. It comes back
+    /// **empty** — as a normal `CommandResult::Scratchpad(vec![])`, not an
+    /// error — when the write was silently refused. Today the only cause is
+    /// `conversation_id` naming a conversation owned by a different user: the
+    /// storage layer's cross-tenant guard fails closed there instead of
+    /// overwriting that user's note, so no note is written and none is
+    /// returned. An empty list is therefore not proof the request was
+    /// malformed, only that nothing was saved — callers MUST check the
+    /// returned list's length rather than treat a non-error response as
+    /// confirmation the note was saved.
     SetScratchpadNote {
         conversation_id: String,
         key: String,
@@ -645,7 +656,9 @@ pub enum CommandResult {
     },
 
     /// Response to `GetConversationScratchpad` / `SetScratchpadNote` — the
-    /// requested (or just-saved) scratchpad notes for the conversation.
+    /// requested (or just-saved) scratchpad notes for the conversation. For
+    /// `SetScratchpadNote` specifically, an empty vec is a normal, non-error
+    /// response meaning no note was saved — see that command's doc for when.
     Scratchpad(Vec<ScratchpadNoteView>),
 
     /// Response to `SetConversationPersonality` — the conversation's stored
