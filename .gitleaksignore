@@ -1,25 +1,17 @@
-# Reviewed false positives for the working-tree secret scan (#811). Each
-# entry is a gitleaks fingerprint (`file:rule-id:start-line`, gitleaks/#811
-# review): the file, rule, and line must all still match for the entry to
-# apply, so an unrelated edit to one of these files does not silently widen
-# the exemption - it makes the finding reappear for re-review instead.
+# Reviewed false positives for the working-tree secret scan (#811), by
+# gitleaks fingerprint (`file:rule-id:start-line`).
 #
-# See AGENTS.md, "Secret scanning", for how to add an entry here.
-
-# Self-generated, test-only OIDC signing keys (crates/daemon's OIDC test
-# suite). Named and located as test fixtures; never used against a real
-# issuer.
-crates/daemon/src/config/testdata/oidc_test_key1.pem:private-key:1
-crates/daemon/src/config/testdata/oidc_test_key2.pem:private-key:1
-
-# Self-generated, test-only Google service-account key fixture
-# (crates/llm-google's service-account parsing tests).
-crates/llm-google/src/testdata/sa_test_key.pem:private-key:1
-
-# Truncated placeholder PEM inline in a unit test - "MII..." is a literal
-# ellipsis, not base64, so it cannot be a real key.
-crates/llm-google/src/token.rs:private-key:387
-
-# Truncated example JWT in API documentation - "..." is literal, not token
-# content.
-docs/WEBSOCKET_API.md:generic-api-key:36
+# Currently empty: the five known false positives in this repo (self-generated
+# test-only PEM key fixtures, and two truncated example tokens) all live in
+# .gitleaks.toml's [[allowlists]] instead, matched by repo-relative path
+# suffix or by content rather than by exact path. A path-exact fingerprint
+# here only ever matches ONE checkout of a tracked file, and this repo's own
+# .claude/worktrees/<session>/ nests full duplicate checkouts of itself
+# (deliberately not excluded from the scan - see AGENTS.md, "Secret
+# scanning") - so a fingerprint here would leave every duplicate of a known
+# fixture reported as a new finding.
+#
+# Use this file for a genuinely one-off false positive that does not fit a
+# general path-suffix or content pattern (see AGENTS.md, "Secret scanning",
+# for when to reach for which mechanism). Add an entry with a comment
+# explaining why it is not a real secret, same as .gitleaks.toml's entries.

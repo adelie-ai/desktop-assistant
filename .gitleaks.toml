@@ -7,11 +7,45 @@ title = "desktop-assistant secret scan"
 [extend]
 useDefault = true
 
-[allowlist]
-description = "Generated/vendored trees: never hand-authored, so never a place a secret gets typed, and large enough to make the scan slow for no security benefit (#811). .flatpak-builder/ and .claude/worktrees/ are deliberately NOT here - the #811 incident's own .env copies were found under BOTH: a live .env plus eight stale .claude/worktrees checkouts. Excluding either would reopen half the blind spot this gate exists to close."
+[[allowlists]]
+description = "Generated/vendored trees: never hand-authored, so never a place a secret gets typed, and large enough to make the scan slow for no security benefit (#811). .flatpak-builder/ and .claude/worktrees/ are deliberately NOT here - the #811 incident's own leak involved a live .env AND eight stale .claude/worktrees checkouts, so excluding either would reopen half the blind spot this gate exists to close."
 paths = [
   '''(^|/)\.git/''',
   '''(^|/)target/''',
   '''(^|/)build/''',
   '''(^|/)\.venv/''',
+]
+
+# The four allowlists below are #811's known, reviewed false positives -
+# this repo's own test-only fixtures and doc examples. They are matched by
+# REPO-RELATIVE PATH SUFFIX or by CONTENT, never by a bare filename and
+# never by a directory-wide exclusion, and deliberately NOT via
+# .gitleaksignore's path-exact fingerprints (file:rule:line): the checkout
+# this gate actually runs against nests full copies of this repo under
+# .claude/worktrees/<session>/ (a legitimate, expected, and NOT excluded
+# part of the tree - see the allowlist above), so a tracked fixture exists
+# at N+1 different paths at once, and a path-exact fingerprint only ever
+# matches one of them. Before this fix, that produced 27 false hard-failures
+# scanning the primary checkout (3 known fixtures x 9 stale worktrees) - a
+# clean tree that failed the gate is exactly the noise that trains people to
+# bypass it.
+
+[[allowlists]]
+description = "Whole-file, self-generated, test-only OIDC/service-account key fixtures (crates/daemon and crates/llm-google test suites). The entire file is a synthetic key and nothing else, so exempting the whole path is safe; matched by suffix so every duplicate of the tracked file is covered, wherever it is checked out."
+paths = [
+  '''(^|/)crates/daemon/src/config/testdata/oidc_test_key\d+\.pem$''',
+  '''(^|/)crates/llm-google/src/testdata/sa_test_key\.pem$''',
+]
+
+[[allowlists]]
+description = "Truncated placeholder PEM inline in a crates/llm-google unit test - \"MII...\" is a literal ellipsis, not base64, so it cannot be a real key. Matched on the exact LINE CONTENT, not the file path, so a duplicate of this line anywhere is exempt without exempting the rest of the file - a different, real private key elsewhere (even in this same file) still fires."
+regexTarget = "line"
+regexes = [
+  '''"private_key":\s*"-----BEGIN PRIVATE KEY-----\\nMII\.\.\.\\n-----END PRIVATE KEY-----\\n",''',
+]
+
+[[allowlists]]
+description = "Truncated example JWT in API documentation - \"...\" is literal, not token content. Matched on the extracted secret's content, not the file path, for the same duplication-survival reason as above."
+regexes = [
+  '''^eyJhbGciOiJIUzI1NiIs\.\.\.$''',
 ]

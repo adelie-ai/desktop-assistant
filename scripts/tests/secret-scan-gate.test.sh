@@ -226,6 +226,32 @@ secret_scan_detects_a_key_under_claude_worktrees() {
     assert_contains "$RUN_ERR" '.claude/worktrees' 'names the nested-worktree path holding the key'
 }
 
+secret_scan_does_not_flag_a_duplicated_known_fixture_under_claude_worktrees() {
+    # The other half of keeping .claude/worktrees/ in scope (review round 3):
+    # this repo's own known-fake fixtures (test-only PEM keys) are TRACKED
+    # files, so they exist byte-for-byte duplicated inside every nested
+    # .claude/worktrees/<session>/ checkout - 27 such duplicates were found
+    # scanning the primary checkout (3 fixtures x 9 stale worktrees). A
+    # path-EXACT exemption (.gitleaksignore's file:rule:line fingerprint)
+    # only ever matches ONE of those paths, so every duplicate reads as a
+    # new finding on an otherwise clean tree - exactly the noise that trains
+    # people to bypass the gate. The exemption must be shaped so the same
+    # tracked fixture is exempt at every path it is checked out to.
+    local fixture="$TEST_TMP/src" real_fixture canonical_rel dup_rel
+    real_fixture="$SCRIPT_TESTS_ROOT/crates/daemon/src/config/testdata/oidc_test_key1.pem"
+    [ -f "$real_fixture" ] || fail "fixture moved: $real_fixture no longer exists"
+    canonical_rel='crates/daemon/src/config/testdata/oidc_test_key1.pem'
+    dup_rel=".claude/worktrees/some-session/$canonical_rel"
+
+    mkdir -p "$fixture/$(dirname "$canonical_rel")" "$fixture/$(dirname "$dup_rel")"
+    cp "$real_fixture" "$fixture/$canonical_rel"
+    cp "$real_fixture" "$fixture/$dup_rel"
+
+    run_cmd "$SECRET_SCAN_SH" "$fixture"
+    assert_eq 0 "$RUN_STATUS" \
+        "a duplicated known-fixture under .claude/worktrees/ must not fail the scan: $RUN_ERR"
+}
+
 run_test secret_scan_passes_on_a_clean_report
 run_test secret_scan_fails_when_gitleaks_reports_a_leak
 run_test secret_scan_fails_loudly_when_gitleaks_is_not_installed
@@ -239,4 +265,5 @@ run_test check_gate_runs_the_secret_scan
 run_test secret_scan_detects_a_working_tree_key
 run_test secret_scan_does_not_flag_the_clean_tree
 run_test secret_scan_detects_a_key_under_claude_worktrees
+run_test secret_scan_does_not_flag_a_duplicated_known_fixture_under_claude_worktrees
 finish_tests 'secret-scan-gate'

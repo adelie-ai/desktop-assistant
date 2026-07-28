@@ -175,21 +175,41 @@ manager offers this week.
 
 Two files at the repo root configure the scan:
 
-- **`.gitleaks.toml`** extends (not replaces) gitleaks' default rule set and
-  allowlists a short list of generated/vendored directories - `target/`,
+- **`.gitleaks.toml`** extends (not replaces) gitleaks' default rule set.
+  `[[allowlists]]` #1 covers generated/vendored directories - `target/`,
   `build/`, `.git/`, `.venv/` - that are never hand-authored and only slow the
   scan down. `.flatpak-builder/` and `.claude/worktrees/` are deliberately
   **not** on that list: the #811 incident's own leak involved a live `.env`
   *and* eight stale `.claude/worktrees` checkouts, so excluding either
-  directory would reopen half the blind spot this gate exists to close.
+  directory would reopen half the blind spot this gate exists to close - and
+  because `.claude/worktrees/<session>/` nests full checkouts of this same
+  repo, its tracked files (including this repo's own known-fake test
+  fixtures) exist at N+1 different paths at once. The remaining
+  `[[allowlists]]` cover this repo's own reviewed false positives (test-only
+  PEM key fixtures, a truncated placeholder key inline in a unit test, a
+  truncated example JWT in docs), matched by **repo-relative path suffix**
+  (whole-file fixtures - the pattern names the tracked path, e.g.
+  `crates/daemon/src/config/testdata/oidc_test_key\d+\.pem$`, never a bare
+  filename and never a directory-wide exclusion) or by **content**
+  (`regexTarget = "line"` or the extracted secret itself, for a single
+  known-fake line inside an otherwise normal file, so nothing else in that
+  file is exempted). Either way the match survives duplication: the same
+  tracked fixture is exempt wherever `.claude/worktrees/` happens to have
+  checked it out, not just at its canonical path. A path-**exact**
+  `.gitleaksignore` fingerprint does not have this property - see below.
 - **`.gitleaksignore`** lists reviewed false positives by gitleaks fingerprint
-  (`file:rule-id:start-line`), one entry per finding, each with a comment
-  explaining why it is not a real secret (this repo's own test-only PEM
-  fixtures and a couple of truncated example tokens in docs, at the time of
-  writing). Because the fingerprint pins the line number too, an unrelated
-  edit that shifts the match makes the finding reappear rather than silently
-  keeping a stale exemption - re-add it once you have re-confirmed it is still
-  a fixture, not a regression.
+  (`file:rule-id:start-line`) - currently empty. This mechanism is
+  path-exact, which is right for a genuinely one-off finding but wrong for
+  any of this repo's own tracked fixtures: a fingerprint for
+  `crates/daemon/src/config/testdata/oidc_test_key1.pem` does not cover the
+  byte-identical tracked file at
+  `.claude/worktrees/<session>/crates/daemon/src/config/testdata/oidc_test_key1.pem`,
+  so every stale nested worktree reproduced the whole fixture set as "new"
+  findings - 27 false hard-failures scanning the primary checkout (3
+  known fixtures x 9 stale worktrees) before this was caught in review.
+  Reach for `.gitleaks.toml`'s path-suffix or content allowlists first;
+  reach for this file only when a finding truly cannot be expressed that
+  way.
 
 Like the advisory scan, the step is deliberately unable to pass by accident:
 
