@@ -14,6 +14,12 @@ pub enum PromptSectionKind {
     /// before trusting it, and roll results up level-by-level. Leans on the
     /// [`Self::Scratchpad`] step machinery rather than reinventing roll-up.
     Subagents,
+    /// Telling the user what is happening (#944): report what the work turned
+    /// up, in every turn, and say what you are starting only when somebody is
+    /// waiting for it. The wording is deliberately static rather than varying
+    /// with [`crate::ports::turn_interactivity::TurnInteractivity`]; see the
+    /// note on [`static_sections`].
+    Narration,
     // Dynamic (built per-turn):
     /// Configurable disposition blurb (issue #226). Rendered from the active
     /// [`Personality`] and injected before [`Self::ToolAvailability`] and the
@@ -272,8 +278,21 @@ const SECTION_DATABASE: &str = include_str!("sections/database.txt");
 const SECTION_LEARNING: &str = include_str!("sections/learning.txt");
 const SECTION_TOOL_USE: &str = include_str!("sections/tool_use.txt");
 const SECTION_SUBAGENTS: &str = include_str!("sections/subagents.txt");
+const SECTION_NARRATION: &str = include_str!("sections/narration.txt");
 
 /// Return the static (file-based) prompt sections in order.
+///
+/// Every section here is the same for every turn. [`PromptSectionKind::Narration`]
+/// is the one that could plausibly vary: a turn nobody watches needs no
+/// reassurance. It does not vary, for two reasons. A prompt that varies with
+/// the turn is a dynamic section, so it leaves the golden snapshot that
+/// `assembled_static_sections_match_original` holds, and two prompts to keep
+/// golden drift apart one edit at a time. And it would split the cached system
+/// block, which a conversation that mixes an interactive turn with a
+/// parent-wake turn pays for on every turn. The static wording states the
+/// condition instead and lets the model resolve it, the same way the subagent
+/// section says "If you are yourself a subagent". Cadence, which the model
+/// cannot judge, stays with the daemon (#943).
 pub fn static_sections() -> Vec<PromptSection> {
     vec![
         PromptSection::new(PromptSectionKind::Identity, SECTION_IDENTITY),
@@ -287,6 +306,7 @@ pub fn static_sections() -> Vec<PromptSection> {
         PromptSection::new(PromptSectionKind::Learning, SECTION_LEARNING),
         PromptSection::new(PromptSectionKind::ToolUse, SECTION_TOOL_USE),
         PromptSection::new(PromptSectionKind::Subagents, SECTION_SUBAGENTS),
+        PromptSection::new(PromptSectionKind::Narration, SECTION_NARRATION),
     ]
 }
 
@@ -317,7 +337,7 @@ mod tests {
 
     #[test]
     fn static_sections_count() {
-        assert_eq!(static_sections().len(), 8);
+        assert_eq!(static_sections().len(), 9);
     }
 
     #[test]
@@ -331,6 +351,7 @@ mod tests {
         assert_eq!(sections[5].kind, PromptSectionKind::Learning);
         assert_eq!(sections[6].kind, PromptSectionKind::ToolUse);
         assert_eq!(sections[7].kind, PromptSectionKind::Subagents);
+        assert_eq!(sections[8].kind, PromptSectionKind::Narration);
     }
 
     #[test]
