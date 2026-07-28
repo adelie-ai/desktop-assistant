@@ -208,7 +208,14 @@ fn random_state() -> String {
 /// Reject endpoints that would send credentials in the clear. HTTPS is required
 /// except for loopback (`localhost`/`127.0.0.1`/`::1`), which is safe and lets
 /// tests and local IdPs use plain HTTP.
-fn validate_endpoint_url(raw: &str) -> Result<(), OAuthError> {
+///
+/// `pub` (not `pub(crate)`): the daemon calls this directly at write time for
+/// an MCP server's inline `[servers.http.oauth]` block
+/// (`crates/daemon/src/settings_service.rs`), so a bad `token_url`/
+/// `authorize_url` is refused when the config is saved rather than failing
+/// later, fail-closed, the first time this crate's own `OAuthClient` uses it
+/// (#804/#895 review).
+pub fn validate_endpoint_url(raw: &str) -> Result<(), OAuthError> {
     let url =
         Url::parse(raw).map_err(|e| OAuthError::Config(format!("invalid URL '{raw}': {e}")))?;
     match url.scheme() {
