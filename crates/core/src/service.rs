@@ -30,7 +30,7 @@ use crate::ports::tool_observer::{ToolEvent, notify_tool_event};
 use crate::ports::tools::ToolExecutor;
 use crate::ports::transport::{current_client_label, current_co_location, current_transport_kind};
 use crate::ports::turn_capability::{
-    TurnCapabilityChange, TurnCapabilityReason, notify_turn_capability_change,
+    Delivery, TurnCapabilityChange, TurnCapabilityReason, notify_turn_capability_change,
 };
 use crate::ports::turn_interactivity::{TurnInteractivity, current_turn_interactivity};
 use crate::sanitize::sanitize_assistant_text;
@@ -1992,7 +1992,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                     turn_provenance.check(&tool_call.name, current_turn_interactivity())
                 {
                     tracing::warn!(
-                        tool = %tool_call.name,
+                        tool = %summarize_tool_name(&tool_call.name),
                         "tool call refused: this turn ingested externally-controlled content"
                     );
                     notify_tool_event(ToolEvent::Started {
@@ -2219,17 +2219,17 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 if turn_provenance.observe_result(&tool_call.name) == GateChange::JustClosed {
                     // Structured first: this is an API-first platform, and a
                     // caller driving the daemon has to be able to read the
-                    // change as data rather than parse a sentence. When no
-                    // observer is installed - a test, an embedder, a
-                    // background worker - fall back to the plain status line
-                    // every caller already has, so the signal degrades rather
-                    // than disappears.
-                    let delivered = notify_turn_capability_change(TurnCapabilityChange {
+                    // change as data rather than parse a sentence. When
+                    // nothing takes it - no observer installed, or an
+                    // installed one whose channel is full - fall back to the
+                    // plain status line every caller already has, so the
+                    // signal degrades rather than disappears.
+                    let delivery = notify_turn_capability_change(TurnCapabilityChange {
                         reason: TurnCapabilityReason::ExternalContentIngested,
                         closed_tiers: GATED_TIERS.to_vec(),
                         message: GATE_CLOSED_STATUS.to_string(),
                     });
-                    if !delivered {
+                    if delivery == Delivery::Dropped {
                         on_status(GATE_CLOSED_STATUS.to_string());
                     }
                 }
@@ -4383,7 +4383,7 @@ mod tests {
         // data. When it installs an observer, the typed change goes there and
         // the prose fallback stays quiet, so the fact is reported once.
         use crate::ports::turn_capability::{
-            TurnCapabilityChange, TurnCapabilityReason, with_turn_capability_observer,
+            Delivery, TurnCapabilityChange, TurnCapabilityReason, with_turn_capability_observer,
         };
 
         let responses = vec![
@@ -4414,7 +4414,10 @@ mod tests {
         let sink = Arc::clone(&seen);
         let (status_cb, statuses) = recording_status();
         with_turn_capability_observer(
-            Arc::new(move |c| sink.lock().unwrap().push(c)),
+            Arc::new(move |c| {
+                sink.lock().unwrap().push(c);
+                Delivery::Taken
+            }),
             handler.send_prompt(&conv.id, "go".into(), noop_callback(), status_cb),
         )
         .await
@@ -4445,6 +4448,41 @@ mod tests {
                 .iter()
                 .any(|s| s.as_str() == GATE_CLOSED_STATUS),
             "with an observer installed the prose fallback must not double-report"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dropped_capability_change_falls_back_to_the_status_line() {
+        // An observer can be installed and still fail - the transport's event
+        // buffer fills under a slow subscriber. Reading "installed" as
+        // "delivered" would leave the user watching unexplained refusals, so
+        // the loop must fall back on a drop exactly as it does with no
+        // observer at all.
+        use crate::ports::turn_capability::{Delivery, with_turn_capability_observer};
+
+        let handler = two_call_handler("weather_get_current", "web_read");
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
+
+        let (status_cb, statuses) = recording_status();
+        with_turn_capability_observer(
+            Arc::new(|_| Delivery::Dropped),
+            handler.send_prompt(&conv.id, "go".into(), noop_callback(), status_cb),
+        )
+        .await
+        .expect("the turn completes");
+
+        assert_eq!(
+            statuses
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|s| s.as_str() == GATE_CLOSED_STATUS)
+                .count(),
+            1,
+            "a dropped change must fall back to the status line, exactly once"
         );
     }
 
@@ -4490,7 +4528,10 @@ mod tests {
     #[tokio::test]
     async fn refusal_tells_the_user_how_to_proceed() {
         // The refusal is the user's only route to the way forward: the model
-        // reads it and relays it. It must name one.
+        // reads it and relays it. It must hand the decision to the person,
+        // and must not tell the model to run the call itself later - the
+        // content that may be driving it is still in the transcript on the
+        // next turn, and the next turn starts clean.
         let handler = two_call_handler("weather_get_current", "web_read");
         let conv = handler
             .create_conversation("t".into(), vec![])
@@ -4503,9 +4544,17 @@ mod tests {
             .expect("the turn continues after the refusal");
 
         let refusal = tool_results(&handler, &conv.id).await.remove(1);
+        let lower = refusal.to_lowercase();
+        // The test turn has no session installed, so it resolves headless.
+        // Both wordings hand the decision to a person; assert the shared word
+        // rather than pinning one branch's phrasing.
         assert!(
-            refusal.to_lowercase().contains("a new turn can do it"),
-            "the refusal must give the user a way forward, got: {refusal}"
+            lower.contains("decide"),
+            "the refusal must hand the decision to a person, got: {refusal}"
+        );
+        assert!(
+            lower.contains("do not run it yourself later"),
+            "the refusal must not leave an auto-retry open, got: {refusal}"
         );
     }
 

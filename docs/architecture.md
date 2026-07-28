@@ -87,10 +87,21 @@ influence what it returns, and what it can do - and the turn loop tracks
 whether the current turn has taken in externally-controlled bytes.
 
 Once it has, the acting tiers (`mutate`, `network_egress`, `code_execution`,
-and anything unclassified) refuse for the rest of that turn. Reading, the
-assistant's own note-keeping, and output to the user's own session stay open.
+and anything unclassified) refuse for the rest of that turn. Two things stay
+open: reading, and output to the user's own session. Writing does not, and that
+includes the assistant's own memory - a scratchpad note, a pinned note, or a
+knowledge-base entry is read back into a later turn, and that turn starts
+clean. The loop's own `begin_step` / `complete_step` are intercepted before
+dispatch, so planning still works in a tainted turn.
+
 A refusal is a recoverable tool result, so the turn continues and the model can
-answer another way; the next turn starts clean.
+answer another way. It hands the way forward to the user rather than telling
+the model to retry later: the content that may be driving the call is still in
+the transcript on the next turn.
+
+The gate protects the turn that read the content. It does not stop a model that
+acts on the same text one turn later - that needs a taint marker persisted on
+the ingesting message, which is a later phase.
 
 The change is reported once per turn:
 

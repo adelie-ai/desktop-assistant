@@ -31,6 +31,7 @@ use desktop_assistant_core::ports::scratchpad::{
 };
 use desktop_assistant_core::ports::store::{IdempotencyKeyStore, TurnStateStore};
 use desktop_assistant_core::ports::tool_observer::{ToolEvent, ToolObserver, with_tool_observer};
+use desktop_assistant_core::ports::turn_capability::Delivery;
 use desktop_assistant_core::ports::turn_interactivity::{
     TurnInteractivity, with_turn_interactivity,
 };
@@ -1367,7 +1368,6 @@ fn tool_tier_to_view(tier: desktop_assistant_core::tool_provenance::ToolTier) ->
     use desktop_assistant_core::tool_provenance::ToolTier as Core;
     match tier {
         Core::Read => api::ToolTier::Read,
-        Core::AssistantMemory => api::ToolTier::AssistantMemory,
         Core::Present => api::ToolTier::Present,
         Core::Mutate => api::ToolTier::Mutate,
         Core::Egress => api::ToolTier::Egress,
@@ -3624,7 +3624,7 @@ where
     let req_id_for_capability = request_id.clone();
     let capability_observer: desktop_assistant_core::ports::turn_capability::TurnCapabilityObserver =
         Arc::new(move |change: desktop_assistant_core::ports::turn_capability::TurnCapabilityChange| {
-            let _ = capability_tx.try_send(api::Event::AssistantStatus {
+            let frame = api::Event::AssistantStatus {
                 conversation_id: conv_id_for_capability.clone(),
                 request_id: req_id_for_capability.clone(),
                 message: change.message,
@@ -3636,7 +3636,18 @@ where
                         .map(tool_tier_to_view)
                         .collect(),
                 }),
-            });
+            };
+            // `try_send` can fail on a full buffer, and this frame is the
+            // user's only explanation for the refusals that follow. Report the
+            // drop so the core loop falls back to a plain status line, which
+            // takes the awaiting path and survives backpressure.
+            match capability_tx.try_send(frame) {
+                Ok(()) => Delivery::Taken,
+                Err(e) => {
+                    warn!("capability-change event dropped, falling back to a status line: {e}");
+                    Delivery::Dropped
+                }
+            }
         });
 
     let dispatched = async move {
@@ -3756,7 +3767,6 @@ mod tests {
         use desktop_assistant_core::tool_provenance::ToolTier as Core;
         let cores = [
             Core::Read,
-            Core::AssistantMemory,
             Core::Present,
             Core::Mutate,
             Core::Egress,
@@ -3784,7 +3794,6 @@ mod tests {
         use desktop_assistant_core::tool_provenance::ToolTier as Core;
         for core in [
             Core::Read,
-            Core::AssistantMemory,
             Core::Present,
             Core::Mutate,
             Core::Egress,
@@ -5224,6 +5233,145 @@ mod tests {
             on_chunk("ok".into());
             Ok("ok".into())
         }
+    }
+
+    /// A conversation service whose turn reports that the provenance gate
+    /// closed (#741), the way the core loop does when a tool result brings in
+    /// externally-controlled bytes.
+    struct GateClosingConversations;
+    #[async_trait::async_trait]
+    impl ConversationService for GateClosingConversations {
+        async fn create_conversation(
+            &self,
+            title: String,
+            _tags: Vec<String>,
+        ) -> Result<Conversation, CoreError> {
+            Ok(Conversation::new("c1", title))
+        }
+        async fn list_conversations(
+            &self,
+            _max_age_days: Option<u32>,
+            _include_archived: bool,
+        ) -> Result<Vec<ConversationSummary>, CoreError> {
+            Ok(vec![])
+        }
+        async fn get_conversation(&self, id: &ConversationId) -> Result<Conversation, CoreError> {
+            Ok(Conversation::new(id.as_str(), "t"))
+        }
+        async fn delete_conversation(&self, _id: &ConversationId) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn rename_conversation(
+            &self,
+            _id: &ConversationId,
+            _title: String,
+        ) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn archive_conversation(&self, _id: &ConversationId) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn unarchive_conversation(&self, _id: &ConversationId) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn clear_all_history(&self) -> Result<u32, CoreError> {
+            Ok(0)
+        }
+        async fn send_prompt(
+            &self,
+            _conversation_id: &ConversationId,
+            _prompt: String,
+            mut on_chunk: ChunkCallback,
+            mut on_status: StatusCallback,
+        ) -> Result<String, CoreError> {
+            use desktop_assistant_core::ports::turn_capability::{
+                TurnCapabilityChange, TurnCapabilityReason, notify_turn_capability_change,
+            };
+            use desktop_assistant_core::tool_provenance::{GATE_CLOSED_STATUS, GATED_TIERS};
+            // Mirrors what the core turn loop does when the gate closes.
+            let delivery = notify_turn_capability_change(TurnCapabilityChange {
+                reason: TurnCapabilityReason::ExternalContentIngested,
+                closed_tiers: GATED_TIERS.to_vec(),
+                message: GATE_CLOSED_STATUS.to_string(),
+            });
+            if delivery == Delivery::Dropped {
+                on_status(GATE_CLOSED_STATUS.to_string());
+            }
+            on_chunk("ok".into());
+            Ok("ok".into())
+        }
+    }
+
+    /// #741: the send path must install a turn-capability observer that turns
+    /// the core loop's change into a typed `Event::AssistantStatus`. Without
+    /// this test the whole wiring could be deleted and every other test on the
+    /// branch would still pass, because the core loop silently falls back to a
+    /// plain status line.
+    #[tokio::test]
+    async fn send_path_publishes_the_gate_closing_as_a_typed_event() {
+        let h = DefaultAssistantApiHandler::new(
+            Arc::new(FakeAssistant),
+            Arc::new(GateClosingConversations),
+            Arc::new(FakeSettings),
+            Arc::new(FakeConnections),
+            Arc::new(FakeKnowledge),
+        );
+
+        let sink = Arc::new(CollectSink(tokio::sync::Mutex::new(vec![])));
+        h.handle_send_message_with_override(
+            "c1".into(),
+            "read that page".into(),
+            None,
+            String::new(),
+            "r1".into(),
+            None,
+            sink.clone(),
+        )
+        .await
+        .unwrap();
+
+        let events = sink.0.lock().await;
+        let typed: Vec<&api::TurnCapabilityChange> = events
+            .iter()
+            .filter_map(|e| match e {
+                api::Event::AssistantStatus {
+                    capability_change: Some(c),
+                    ..
+                } => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            typed.len(),
+            1,
+            "the send path must publish exactly one typed capability change; got: {events:?}"
+        );
+        assert_eq!(
+            typed[0].reason,
+            api::TurnCapabilityReason::ExternalContentIngested
+        );
+        assert!(
+            typed[0].closed_tool_tiers.contains(&api::ToolTier::Egress),
+            "the frame must name the tiers that closed, got: {:?}",
+            typed[0].closed_tool_tiers
+        );
+        assert!(
+            typed[0].closed_tool_tiers.iter().all(|t| t.is_gated()),
+            "every published tier must be one a caller should expect a refusal from"
+        );
+        // The human line rides the same frame, so a text-only client still
+        // explains the change without a second event.
+        let carried_message = events.iter().any(|e| {
+            matches!(
+                e,
+                api::Event::AssistantStatus { message, capability_change: Some(_), .. }
+                    if message == desktop_assistant_core::tool_provenance::GATE_CLOSED_STATUS
+            )
+        });
+        assert!(
+            carried_message,
+            "the typed frame must carry the human-readable line too"
+        );
     }
 
     /// #570 Phase 1b wiring: the FOREGROUND send path installs the client's

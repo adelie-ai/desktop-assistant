@@ -23,11 +23,14 @@
 //! ## Contract
 //!
 //! [`with_turn_capability_observer`] installs the slot for one future;
-//! [`notify_turn_capability_change`] delivers to it and reports whether
-//! anybody took the event. The report is load-bearing: a caller that installs
-//! no observer (a test, a background worker, an embedder of the core service)
-//! still has to tell its user something, so the turn loop falls back to a
-//! plain status line. Absent capability, degraded path, never a silent drop.
+//! [`notify_turn_capability_change`] delivers to it and reports whether the
+//! change was **taken**, not merely whether a slot was filled. The
+//! distinction is load-bearing. An observer that forwards onto a bounded
+//! channel can fail while installed, and a caller that reads "installed" as
+//! "delivered" would drop the only explanation the user gets. So the observer
+//! itself returns a [`Delivery`], an absent slot reports
+//! [`Delivery::Dropped`], and the turn loop falls back to a plain status line
+//! in both cases. Absent capability, degraded path, never a silent drop.
 //!
 //! Like every `tokio::task_local!`, the slot does not cross a `tokio::spawn`.
 
@@ -59,9 +62,24 @@ pub struct TurnCapabilityChange {
     pub message: String,
 }
 
+/// Whether an observer took a change, or let it go.
+///
+/// An enum rather than a `bool` because the caller acts on it - it decides
+/// whether the user hears about the change at all - and a bare boolean at a
+/// call site reads as neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    /// The observer took the change and will report it.
+    Taken,
+    /// Nothing took the change. The caller must report it another way.
+    Dropped,
+}
+
 /// Sink for [`TurnCapabilityChange`]. Cheap to clone; called synchronously
-/// from the dispatch loop, so an implementation must not block.
-pub type TurnCapabilityObserver = Arc<dyn Fn(TurnCapabilityChange) + Send + Sync>;
+/// from the dispatch loop, so an implementation must not block. It returns
+/// [`Delivery::Dropped`] when it could not pass the change on, so the caller
+/// can fall back rather than assume success.
+pub type TurnCapabilityObserver = Arc<dyn Fn(TurnCapabilityChange) -> Delivery + Send + Sync>;
 
 tokio::task_local! {
     /// The observer for the current turn, installed by the send-turn body.
@@ -78,11 +96,14 @@ where
 
 /// Deliver `change` to the installed observer.
 ///
-/// Returns `false` when no observer is installed, so the caller can fall back
-/// to whatever channel it does have. Never panics, never blocks.
+/// Returns [`Delivery::Dropped`] when no observer is installed **or** when the
+/// installed one could not pass the change on, so the caller falls back to
+/// whatever channel it does have in either case. Never panics, never blocks.
 #[must_use]
-pub fn notify_turn_capability_change(change: TurnCapabilityChange) -> bool {
-    TURN_CAPABILITY_OBSERVER.try_with(|obs| obs(change)).is_ok()
+pub fn notify_turn_capability_change(change: TurnCapabilityChange) -> Delivery {
+    TURN_CAPABILITY_OBSERVER
+        .try_with(|obs| obs(change))
+        .unwrap_or(Delivery::Dropped)
 }
 
 #[cfg(test)]
@@ -102,15 +123,41 @@ mod tests {
     async fn an_installed_observer_takes_the_change() {
         let seen: Arc<Mutex<Vec<TurnCapabilityChange>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&seen);
-        let observer: TurnCapabilityObserver = Arc::new(move |c| sink.lock().unwrap().push(c));
+        let observer: TurnCapabilityObserver = Arc::new(move |c| {
+            sink.lock().unwrap().push(c);
+            Delivery::Taken
+        });
 
         let delivered = with_turn_capability_observer(observer, async {
             notify_turn_capability_change(change())
         })
         .await;
 
-        assert!(delivered, "an installed observer must take the change");
+        assert_eq!(
+            delivered,
+            Delivery::Taken,
+            "an installed observer must take the change"
+        );
         assert_eq!(seen.lock().unwrap().as_slice(), [change()]);
+    }
+
+    #[tokio::test]
+    async fn an_observer_that_drops_the_change_says_so() {
+        // The case that matters: a sink whose channel is full is installed but
+        // cannot pass the change on. Reporting that as delivered would lose
+        // the only explanation the user gets.
+        let observer: TurnCapabilityObserver = Arc::new(|_| Delivery::Dropped);
+
+        let delivered = with_turn_capability_observer(observer, async {
+            notify_turn_capability_change(change())
+        })
+        .await;
+
+        assert_eq!(
+            delivered,
+            Delivery::Dropped,
+            "an installed observer that drops must not report success"
+        );
     }
 
     #[tokio::test]
@@ -118,8 +165,9 @@ mod tests {
         // The turn loop reads this and falls back to a status line, so a
         // wrong answer here would lose the signal for a whole class of
         // callers.
-        assert!(
-            !notify_turn_capability_change(change()),
+        assert_eq!(
+            notify_turn_capability_change(change()),
+            Delivery::Dropped,
             "with no observer installed the change must report undelivered"
         );
     }

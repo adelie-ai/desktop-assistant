@@ -130,7 +130,8 @@ influence. Whether a turn is tainted is not known until the turn runs, so the
 decision can only be made at call time. The refusal therefore carries the
 weight this decision normally puts on advertisement: it names the tool, states
 that the turn took in outside content, names the tier that is closed and for
-how long, and gives the model a way to continue. The turn also emits one
+how long, and gives the model a way to continue that ends with the user rather
+than with a retry. The turn also emits one
 `TurnCapabilityChange` so a client sees the capability set narrow rather than
 inferring it from a decline.
 

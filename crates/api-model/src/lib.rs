@@ -901,12 +901,10 @@ pub enum CommandResult {
 pub enum ToolTier {
     /// Reads state and changes nothing.
     Read,
-    /// Adds to, or prunes, the assistant's own memory.
-    AssistantMemory,
     /// Delivers output to the user's own session, or changes how that session
     /// presents it.
     Present,
-    /// Changes state the user owns.
+    /// Changes durable state, including the assistant's own memory.
     Mutate,
     /// Can send bytes to a destination chosen at call time.
     Egress,
@@ -923,7 +921,6 @@ impl ToolTier {
     pub fn as_wire_str(self) -> &'static str {
         match self {
             Self::Read => "read",
-            Self::AssistantMemory => "assistant_memory",
             Self::Present => "present",
             Self::Mutate => "mutate",
             Self::Egress => "network_egress",
@@ -937,7 +934,7 @@ impl ToolTier {
     #[must_use]
     pub fn is_gated(self) -> bool {
         match self {
-            Self::Read | Self::AssistantMemory | Self::Present => false,
+            Self::Read | Self::Present => false,
             Self::Mutate | Self::Egress | Self::Execution | Self::Unclassified => true,
         }
     }
@@ -947,7 +944,6 @@ impl From<String> for ToolTier {
     fn from(raw: String) -> Self {
         match raw.as_str() {
             "read" => Self::Read,
-            "assistant_memory" => Self::AssistantMemory,
             "present" => Self::Present,
             "mutate" => Self::Mutate,
             "network_egress" => Self::Egress,
@@ -4800,7 +4796,6 @@ mod tests {
     fn every_tool_tier_round_trips_through_its_wire_string() {
         for tier in [
             ToolTier::Read,
-            ToolTier::AssistantMemory,
             ToolTier::Present,
             ToolTier::Mutate,
             ToolTier::Egress,
