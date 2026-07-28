@@ -10,7 +10,7 @@
 # this Job mounts it at /bootstrap. Apply via `just deploy-rls-bootstrap`, not a
 # bare `kubectl apply -f` (which would leave the ConfigMap absent).
 #
-# NOT folded into the postgres-init hook (10-postgres.yaml): that runs once on
+# NOT folded into the postgres-init hook (base/postgres.yaml): that runs once on
 # empty PGDATA before any app tables exist, so `GRANT SELECT ON ALL TABLES`
 # would grant on nothing. A postgres-ready-gated, re-runnable Job avoids that.
 apiVersion: batch/v1
@@ -32,7 +32,7 @@ spec:
       restartPolicy: OnFailure
       initContainers:
         # Gate the bootstrap on Postgres accepting connections, mirroring the
-        # daemon's wait-for-postgres initContainer (30-daemon.yaml).
+        # daemon's wait-for-postgres initContainer (base/daemon.yaml).
         - name: wait-for-postgres
           image: pgvector/pgvector:pg16
           command:
@@ -57,7 +57,7 @@ spec:
             - |
               set -eu
               # app_role=adele matches the daemon's connect role (POSTGRES_USER
-              # in 10-postgres.yaml, DATABASE_URL in 30-daemon.yaml). ON_ERROR_STOP
+              # in base/postgres.yaml, DATABASE_URL in base/daemon.yaml). ON_ERROR_STOP
               # makes a real SQL error fail the Job instead of exiting 0.
               psql "postgres://adele@postgres:5432/adele" \
                 -v ON_ERROR_STOP=1 \
