@@ -1238,6 +1238,9 @@ mod tests {
         // oauth), so the KCM can render an honest state + Sign-in action.
         let t = FakeTransport::replying(api::CommandResult::McpServers(vec![api::McpServerView {
             name: "gmail-work".into(),
+            title: None,
+            description: None,
+            website_url: None,
             command: String::new(),
             args: vec![],
             namespace: Some("gmail".into()),

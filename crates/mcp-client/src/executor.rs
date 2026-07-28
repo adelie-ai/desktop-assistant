@@ -12,7 +12,7 @@ pub use crate::builtin::BuiltinToolService;
 use crate::config::save_mcp_configs;
 #[cfg(feature = "http")]
 use crate::oauth::{InMemoryTokenStore, OAuthClient, TokenProvider, TokenStore};
-use crate::{ListChangeFlags, McpClient, McpError};
+use crate::{ListChangeFlags, McpClient, McpError, ServerMetadata};
 
 fn default_enabled() -> bool {
     true
@@ -239,27 +239,72 @@ pub struct McpServerConfig {
     /// spawning `command`. See [`HttpTransportConfig`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http: Option<HttpTransportConfig>,
-    /// Human-facing description of what this server offers, used as the fallback
-    /// seed for its provider description in tool-search surfacing when the server
-    /// sends no `initialize` instructions. Phase-1 stopgap until every server
-    /// emits its own instructions. Optional for TOML back-compat.
+    /// Operator-supplied description of what this server offers, contributed to
+    /// its searchable provider description in tool-search surfacing.
+    ///
+    /// Now a *supplement* rather than a substitute: it is indexed alongside
+    /// anything the server declares for itself, rather than only when the server
+    /// is silent. See [`resolve_provider_description`] for why every source is
+    /// combined. Optional for TOML back-compat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 }
 
-/// Resolve a provider's description for tool-search surfacing:
-/// server `initialize` instructions, else the configured `description`, else a
-/// generic boilerplate naming the server. Trimmed inputs are the caller's job
-/// (instructions arrive trimmed from [`crate::parse_server_instructions`]).
+/// Build a provider's description for tool-search surfacing.
+///
+/// **This string is indexed, not displayed.** It becomes the searchable text of
+/// the synthetic `provider:<source>:<name>` row, which is FTS-indexed (the
+/// `tool_definitions.tsv` generated column) and embedded by the vector backfill.
+/// More relevant text means better recall, so the two server-supplied sources
+/// are **combined** rather than ranked:
+///
+/// Every available source contributes, in this order, deduplicated:
+///
+/// 1. the server's declared `serverInfo.description` — it answers "what is this
+///    server" (SEP-973), so it leads
+/// 2. its `initialize` instructions — usage guidance, but rich vocabulary
+/// 3. the configured `description` from `mcp_servers.toml`
+///
+/// With no source at all, boilerplate naming the server.
+///
+/// **Why compose instead of rank.** `instructions` is often a long usage blob
+/// and a declared description a single line, and the configured description is
+/// operator-supplied ground truth about a server they chose to install. Picking
+/// one winner would *shrink* the indexed text for any server with more than one
+/// source, making it harder to find than before it declared anything. This
+/// function is therefore monotonic: adding a source never removes another's
+/// terms. `provider_description_never_shrinks_the_indexed_text` holds that line.
+///
+/// This widens the configured `description` from a *substitute* (used only when
+/// the server said nothing) to a *supplement* (always contributed). That is a
+/// deliberate change and strictly increases recall.
+///
+/// Identical values are not repeated, so a server setting two sources to the
+/// same string does not double its own terms and skew the ranking.
+///
+/// Trimmed inputs are the caller's job — both server-supplied values arrive
+/// trimmed from [`crate::parse_server_metadata`] and
+/// [`crate::parse_server_instructions`].
 pub(crate) fn resolve_provider_description(
+    server_description: Option<&str>,
     instructions: Option<&str>,
     config_description: Option<&str>,
     server_name: &str,
 ) -> String {
-    instructions
-        .or(config_description)
-        .map(String::from)
-        .unwrap_or_else(|| format!("Tools from the {server_name} MCP server"))
+    let mut parts: Vec<&str> = Vec::new();
+    for source in [server_description, instructions, config_description]
+        .into_iter()
+        .flatten()
+    {
+        if !parts.contains(&source) {
+            parts.push(source);
+        }
+    }
+    if parts.is_empty() {
+        format!("Tools from the {server_name} MCP server")
+    } else {
+        parts.join(" ")
+    }
 }
 
 /// Status information for an MCP server — the per-server *descriptor* the
@@ -268,6 +313,16 @@ pub(crate) fn resolve_provider_description(
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct McpServerStatusInfo {
     pub name: String,
+    /// What the server declared about itself in `serverInfo` (SEP-973).
+    /// Flattened onto the wire type rather than nested, matching the shape of
+    /// every neighbouring field. Untrusted: a renderer must treat these as
+    /// remote strings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub website_url: Option<String>,
     pub command: String,
     /// Configured launch arguments. Surfaced so the settings layer can project
     /// an `McpServerView` that round-trips what `add_mcp_server` wrote (#314).
@@ -345,13 +400,18 @@ struct ClientHandle {
     /// the already-initialized client at construction) so provider grouping for
     /// reindexing can read it without taking the per-client lock.
     instructions: Option<String>,
+    /// What the server declared about itself in `serverInfo` (SEP-973), cached
+    /// for the same reason as [`Self::instructions`].
+    metadata: ServerMetadata,
 }
 
 impl ClientHandle {
     fn new(client: McpClient) -> Self {
         let flags = client.list_change_flags();
         let instructions = client.server_instructions().map(String::from);
+        let metadata = client.server_metadata().clone();
         Self {
+            metadata,
             client: Arc::new(Mutex::new(client)),
             flags,
             instructions,
@@ -741,12 +801,10 @@ impl McpExecutorState {
                 .as_deref()
                 .unwrap_or(&config.name)
                 .to_string();
-            let instructions = clients
-                .get(idx)
-                .and_then(|slot| slot.as_ref())
-                .and_then(|handle| handle.instructions.as_deref());
+            let handle = clients.get(idx).and_then(|slot| slot.as_ref());
             let description = resolve_provider_description(
-                instructions,
+                handle.and_then(|h| h.metadata.description.as_deref()),
+                handle.and_then(|h| h.instructions.as_deref()),
                 config.description.as_deref(),
                 &config.name,
             );
@@ -916,6 +974,13 @@ impl McpControlHandle {
             .filter_map(|idx| {
                 let config = configs.get(idx)?;
                 let connected = clients.get(idx).is_some_and(|c| c.is_some());
+                // Only a connected server has declared anything: the metadata
+                // arrives in its `initialize` reply.
+                let declared = clients
+                    .get(idx)
+                    .and_then(|slot| slot.as_ref())
+                    .map(|handle| handle.metadata.clone())
+                    .unwrap_or_default();
                 let tool_count = routing
                     .values()
                     .filter(|(server_idx, _)| *server_idx == idx)
@@ -1041,6 +1106,9 @@ impl McpControlHandle {
 
                 Some(McpServerStatusInfo {
                     name: config.name.clone(),
+                    title: declared.title,
+                    description: declared.description,
+                    website_url: declared.website_url,
                     command: config.command.clone(),
                     args: config.args.clone(),
                     namespace: config.namespace.clone(),
@@ -1813,27 +1881,91 @@ mod tests {
         );
     }
 
+    /// The string is indexed, not displayed, so both server-supplied sources are
+    /// kept. The declared description leads because it answers "what is this
+    /// server" (SEP-973); the instructions follow and add vocabulary.
     #[test]
-    fn resolved_description_prefers_instructions() {
-        // instructions ?? config.description ?? boilerplate.
+    fn provider_description_combines_declared_description_and_instructions() {
         assert_eq!(
-            resolve_provider_description(Some("live instructions"), Some("cfg desc"), "weather"),
-            "live instructions"
+            resolve_provider_description(
+                Some("declared description"),
+                Some("live instructions"),
+                None,
+                "weather"
+            ),
+            "declared description live instructions"
+        );
+    }
+
+    /// A server setting both to the same string must not double its own terms
+    /// and skew its ranking against other providers.
+    #[test]
+    fn provider_description_does_not_repeat_identical_sources() {
+        assert_eq!(
+            resolve_provider_description(Some("same text"), Some("same text"), None, "weather"),
+            "same text"
+        );
+    }
+
+    /// The guarantee that matters: adopting SEP-973 must never make a provider
+    /// *harder* to find. For every combination, the indexed text still contains
+    /// everything the same server would have contributed before this change.
+    #[test]
+    fn provider_description_never_shrinks_the_indexed_text() {
+        for (declared, instructions, config) in [
+            (Some("d"), Some("i"), Some("c")),
+            (Some("d"), Some("i"), None),
+            (None, Some("i"), Some("c")),
+            (None, Some("i"), None),
+            (Some("d"), None, Some("c")),
+            (None, None, Some("c")),
+        ] {
+            let before = resolve_provider_description(None, instructions, config, "weather");
+            let after = resolve_provider_description(declared, instructions, config, "weather");
+            for term in before.split_whitespace() {
+                assert!(
+                    after.contains(term),
+                    "declaring a description dropped {term:?} from the indexed text \
+                     (before: {before:?}, after: {after:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn provider_description_includes_instructions_without_a_declared_description() {
+        assert_eq!(
+            resolve_provider_description(
+                None,
+                Some("live instructions"),
+                Some("cfg desc"),
+                "weather"
+            ),
+            "live instructions cfg desc"
         );
     }
 
     #[test]
-    fn resolved_description_falls_back_to_config() {
+    fn provider_description_falls_back_to_config_description() {
         assert_eq!(
-            resolve_provider_description(None, Some("cfg desc"), "weather"),
+            resolve_provider_description(None, None, Some("cfg desc"), "weather"),
             "cfg desc"
         );
     }
 
+    /// Every source contributes, in declared -> instructions -> configured order.
     #[test]
-    fn resolved_description_falls_back_to_boilerplate() {
+    fn provider_description_includes_all_available_sources() {
         assert_eq!(
-            resolve_provider_description(None, None, "weather"),
+            resolve_provider_description(Some("d"), Some("i"), Some("c"), "weather"),
+            "d i c"
+        );
+    }
+
+    #[test]
+    fn provider_description_falls_back_to_boilerplate() {
+        assert_eq!(
+            resolve_provider_description(None, None, None, "weather"),
             "Tools from the weather MCP server"
         );
     }

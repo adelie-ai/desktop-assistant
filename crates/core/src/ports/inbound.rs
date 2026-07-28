@@ -113,6 +113,15 @@ pub type PersonalitySettingsView = crate::prompts::Personality;
 #[derive(Debug, Clone, Default)]
 pub struct McpServerView {
     pub name: String,
+    /// Human-facing display name the server declared in `serverInfo.title`
+    /// (SEP-973). `name` stays the programmatic identity used in config,
+    /// namespacing and errors.
+    pub title: Option<String>,
+    /// What the server says it offers (`serverInfo.description`).
+    pub description: Option<String>,
+    /// The server's home page (`serverInfo.websiteUrl`). **Untrusted** — a
+    /// renderer must validate the scheme before offering it as a link.
+    pub website_url: Option<String>,
     pub command: String,
     pub args: Vec<String>,
     pub namespace: Option<String>,

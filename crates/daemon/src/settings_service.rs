@@ -351,6 +351,9 @@ impl SettingsService for DaemonSettingsService {
             .into_iter()
             .map(|s| McpServerView {
                 name: s.name,
+                title: s.title,
+                description: s.description,
+                website_url: s.website_url,
                 command: s.command,
                 args: s.args,
                 namespace: s.namespace,
@@ -465,6 +468,9 @@ impl SettingsService for DaemonSettingsService {
             .into_iter()
             .map(|s| McpServerView {
                 name: s.name,
+                title: s.title,
+                description: s.description,
+                website_url: s.website_url,
                 command: s.command,
                 args: s.args,
                 namespace: s.namespace,

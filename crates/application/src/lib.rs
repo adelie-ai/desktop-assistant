@@ -2025,6 +2025,9 @@ where
                         .into_iter()
                         .map(|s| api::McpServerView {
                             name: s.name,
+                            title: s.title,
+                            description: s.description,
+                            website_url: s.website_url,
                             command: s.command,
                             args: s.args,
                             namespace: s.namespace,
@@ -2090,6 +2093,9 @@ where
                         .into_iter()
                         .map(|s| api::McpServerView {
                             name: s.name,
+                            title: s.title,
+                            description: s.description,
+                            website_url: s.website_url,
                             command: s.command,
                             args: s.args,
                             namespace: s.namespace,

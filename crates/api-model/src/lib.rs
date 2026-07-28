@@ -1228,6 +1228,18 @@ pub struct PersistenceSettingsView {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct McpServerView {
     pub name: String,
+    /// Human-facing display name the server declared in `serverInfo.title`
+    /// (SEP-973). `name` remains the programmatic identity used in config,
+    /// namespacing and errors, so a renderer must keep it visible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// What the server says it offers (`serverInfo.description`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The server's home page (`serverInfo.websiteUrl`). **Untrusted** — a
+    /// renderer must validate the scheme before offering it as a link.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub website_url: Option<String>,
     pub command: String,
     pub args: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3230,6 +3242,52 @@ mod tests {
         assert_eq!(server.get("namespace"), Some(&serde_json::json!("jira")));
         let back: CommandResult = serde_json::from_value(v).unwrap();
         assert_eq!(res, back);
+    }
+
+    #[test]
+    fn mcp_server_view_carries_server_metadata() {
+        // SEP-973: what a server declared about itself reaches the clients.
+        let res = CommandResult::McpServers(vec![McpServerView {
+            name: "weather".into(),
+            title: Some("Weather Service".into()),
+            description: Some("Live weather and forecasts.".into()),
+            website_url: Some("https://example.com/weather".into()),
+            ..Default::default()
+        }]);
+        let v: serde_json::Value = serde_json::to_value(&res).unwrap();
+        let server = &v.get("mcp_servers").expect("mcp_servers key")[0];
+        assert_eq!(
+            server.get("title"),
+            Some(&serde_json::json!("Weather Service"))
+        );
+        assert_eq!(
+            server.get("description"),
+            Some(&serde_json::json!("Live weather and forecasts."))
+        );
+        assert_eq!(
+            server.get("website_url"),
+            Some(&serde_json::json!("https://example.com/weather"))
+        );
+        let back: CommandResult = serde_json::from_value(v).unwrap();
+        assert_eq!(res, back);
+    }
+
+    #[test]
+    fn mcp_server_view_omits_server_metadata_when_absent() {
+        // A server that declares nothing must produce a byte-identical payload
+        // to before this field existed, so an older client sees no change.
+        let res = CommandResult::McpServers(vec![McpServerView {
+            name: "weather".into(),
+            ..Default::default()
+        }]);
+        let v: serde_json::Value = serde_json::to_value(&res).unwrap();
+        let server = &v.get("mcp_servers").expect("mcp_servers key")[0];
+        for absent in ["title", "description", "website_url"] {
+            assert!(
+                server.get(absent).is_none(),
+                "{absent} must be omitted entirely, not null: {server}"
+            );
+        }
     }
 
     #[test]
