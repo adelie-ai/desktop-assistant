@@ -49,6 +49,10 @@
 //! legible refusal immediately instead of a failure the next time something
 //! tries to connect.
 
+use std::net::Ipv6Addr;
+
+use url::{Host, Url};
+
 /// Why a candidate remote URL was refused. Each variant is an independently
 /// testable rule, not a prose string a caller has to pattern-match:
 /// [`Self::code`] gives the stable, machine-readable identifier a wire
@@ -121,12 +125,70 @@ impl UrlPolicyError {
 
 /// Validate a URL arriving from a client payload before it is stored or
 /// dialed. See the module docs for the rule and why it is shaped this way.
-///
-/// Not yet implemented: this commit is the spec (#804, #895) — the failing
-/// tests below define the rule; the next commit implements it.
 pub fn validate_remote_url(raw: &str) -> Result<(), UrlPolicyError> {
-    let _ = raw;
-    unimplemented!("url_policy::validate_remote_url: see the following implementation commit")
+    let url = Url::parse(raw).map_err(|e| UrlPolicyError::Malformed {
+        url: raw.to_string(),
+        reason: e.to_string(),
+    })?;
+
+    // The SSRF floor runs before the scheme check: a typo'd scheme must not
+    // accidentally "save" a request to a blocked destination.
+    if is_blocked_target(&url) {
+        return Err(UrlPolicyError::BlockedTarget {
+            url: raw.to_string(),
+        });
+    }
+
+    match url.scheme() {
+        "https" => Ok(()),
+        "http" if is_private_target(&url) => Ok(()),
+        "http" => Err(UrlPolicyError::InsecureScheme {
+            url: raw.to_string(),
+        }),
+        other => Err(UrlPolicyError::SchemeNotAllowed {
+            url: raw.to_string(),
+            scheme: other.to_string(),
+        }),
+    }
+}
+
+/// A destination this policy always refuses, regardless of scheme: the
+/// link-local range (host to the cloud-metadata address `169.254.169.254`
+/// shared by AWS, Azure, and GCP's legacy metadata path lives here), the
+/// unspecified address, and GCP's metadata hostname alias.
+fn is_blocked_target(url: &Url) -> bool {
+    match url.host() {
+        Some(Host::Ipv4(ip)) => ip.is_link_local() || ip.is_unspecified(),
+        Some(Host::Ipv6(ip)) => match ip.to_ipv4_mapped() {
+            Some(mapped) => mapped.is_link_local() || mapped.is_unspecified(),
+            None => is_ipv6_link_local(&ip) || ip.is_unspecified(),
+        },
+        Some(Host::Domain(name)) => name.eq_ignore_ascii_case("metadata.google.internal"),
+        None => false,
+    }
+}
+
+/// A destination plain `http://` may reach without sending a secret onto
+/// the open network: loopback, an RFC1918 private range, or a bare
+/// (dot-free) hostname — the shape of a Kubernetes short Service name or a
+/// LAN `/etc/hosts` entry, neither of which leaves the operator's own
+/// network.
+fn is_private_target(url: &Url) -> bool {
+    match url.host() {
+        Some(Host::Ipv4(ip)) => ip.is_loopback() || ip.is_private(),
+        Some(Host::Ipv6(ip)) => match ip.to_ipv4_mapped() {
+            Some(mapped) => mapped.is_loopback() || mapped.is_private(),
+            None => ip.is_loopback(),
+        },
+        Some(Host::Domain(name)) => name.eq_ignore_ascii_case("localhost") || !name.contains('.'),
+        None => false,
+    }
+}
+
+/// `fe80::/10`. `std::net::Ipv6Addr` has no stable link-local predicate, so
+/// this checks the range directly rather than reaching for an unstable one.
+fn is_ipv6_link_local(ip: &Ipv6Addr) -> bool {
+    (ip.segments()[0] & 0xffc0) == 0xfe80
 }
 
 #[cfg(test)]
@@ -200,8 +262,8 @@ mod tests {
 
     #[test]
     fn rejects_gcp_metadata_hostname() {
-        let err = validate_remote_url("http://metadata.google.internal/computeMetadata/v1/")
-            .unwrap_err();
+        let err =
+            validate_remote_url("http://metadata.google.internal/computeMetadata/v1/").unwrap_err();
         assert_eq!(err.code(), "url_target_blocked");
     }
 

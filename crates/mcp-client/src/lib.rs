@@ -1058,11 +1058,13 @@ struct HttpTransport {
 #[cfg(feature = "http")]
 impl HttpTransport {
     fn new(url: &str, credential: Credential) -> Result<Self, McpError> {
-        if !(url.starts_with("https://") || url.starts_with("http://")) {
-            return Err(McpError::Http(format!(
-                "remote MCP url must be http(s): {url}"
-            )));
-        }
+        // #804: every request below attaches `credential` as `Authorization:
+        // Bearer` (or, for a static credential, may carry a live OAuth
+        // access token) — refuse a URL that would send it in the clear
+        // before ever attempting a connection.
+        crate::url_policy::validate_remote_url(url).map_err(|e| {
+            McpError::Http(format!("refusing remote MCP url (rule: {}): {e}", e.code()))
+        })?;
         let client = reqwest::Client::builder()
             .build()
             .map_err(|e| McpError::Http(format!("failed to build HTTP client: {e}")))?;
