@@ -53,6 +53,7 @@ for r in desktop-assistant command-mcp cve-mcp fileio-mcp geocode-mcp \
          tasks-mcp terminal-mcp timeclock-mcp weather-forecast-mcp web-mcp; do
   rsync -aL --exclude target --exclude .git --exclude build \
         --exclude '.flatpak-builder' --exclude .venv --exclude .worktrees \
+        --exclude .claude --exclude '.env' --exclude '.envrc' \
         "$ADELE/$r/" "$CTX/$r/"
 done
 
