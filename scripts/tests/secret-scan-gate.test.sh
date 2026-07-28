@@ -32,8 +32,31 @@ with_fake_gitleaks() {
     : >"$FAKE_GITLEAKS_LOG"
 }
 
+# A PATH with no gitleaks reachable anywhere, regardless of how THIS machine
+# happens to have installed it (~/.cargo/bin, ~/.local/bin, ~/go/bin, a
+# distro package in /usr/bin or /usr/local/bin). A naive
+# "$TEST_TMP/empty:/usr/bin:/bin" still resolves gitleaks on any machine that
+# followed this repo's own `pacman -S gitleaks` instructions, so it never
+# actually exercises the missing-binary path it is named for - it happens to
+# pass today only because this particular box does not have it there.
+# Symlinks in only the coreutils scripts/secret-scan.sh itself needs, so
+# nothing outside that directory is ever consulted.
+_hermetic_path_without_gitleaks() {
+    local bin="$TEST_TMP/hermetic-bin" tool
+    mkdir -p "$bin"
+    for tool in bash env dirname mktemp grep sed paste awk cat tr rm; do
+        ln -sf "$(command -v "$tool")" "$bin/$tool"
+    done
+    printf '%s' "$bin"
+}
+
 CLEAN_REPORT='[]'
 LEAK_REPORT='[{"RuleID":"openai-api-key","File":".env","StartLine":4,"Fingerprint":".env:openai-api-key:4","Secret":"REDACTED","Match":"REDACTED"}]'
+# gitleaks version, verbatim, from the CachyOS/Arch `pacman -S gitleaks`
+# package (confirmed 8.30.1-1.1 - the pinned version - on both plain Arch and
+# CachyOS): the distro build does not set the version ldflag, so even the
+# exact pinned release reports this instead of a real version number.
+UNVERSIONED_OUTPUT='version is set by build process'
 
 # --- wrapper-logic tests (mocked gitleaks) -----------------------------------
 
@@ -54,10 +77,10 @@ secret_scan_fails_when_gitleaks_reports_a_leak() {
 }
 
 secret_scan_fails_loudly_when_gitleaks_is_not_installed() {
-    mkdir -p "$TEST_TMP/empty"
-    run_cmd env PATH="$TEST_TMP/empty:/usr/bin:/bin" "$SECRET_SCAN_SH"
+    run_cmd env PATH="$(_hermetic_path_without_gitleaks)" "$SECRET_SCAN_SH"
     [ "$RUN_STATUS" -ne 0 ] || fail 'a missing gitleaks must fail the step'
-    assert_contains "$RUN_ERR" 'gitleaks' 'says what is missing'
+    assert_contains "$RUN_ERR" 'SECRET SCAN DID NOT RUN: gitleaks is not installed' \
+        'names the missing-binary failure specifically, not any message that merely mentions gitleaks'
     assert_not_contains "$RUN_OUT" 'clean' 'must not claim a clean scan'
 }
 
@@ -66,8 +89,53 @@ secret_scan_fails_when_the_installed_gitleaks_version_does_not_match_the_pin() {
     export FAKE_GITLEAKS_VERSION='7.0.0'
     run_cmd "$SECRET_SCAN_SH"
     [ "$RUN_STATUS" -ne 0 ] || fail 'an unpinned gitleaks version must fail the step'
+    assert_contains "$RUN_ERR" 'version does not match the pin' 'names the mismatch failure specifically'
     assert_contains "$RUN_ERR" '7.0.0' 'names the version found'
     assert_contains "$RUN_ERR" "$PINNED_GITLEAKS_VERSION" 'names the pinned version'
+    assert_not_contains "$RUN_ERR" 'no parseable version' \
+        'a real (if wrong) version number is not the same failure as an unparseable one'
+}
+
+secret_scan_fails_when_gitleaks_reports_no_parseable_version() {
+    # The CachyOS/Arch package's actual failure mode (confirmed against the
+    # real package on both distros): `gitleaks version` prints a sentence,
+    # not a version number, for the exact pinned release. This is a
+    # packaging defect, not version drift, and needs its own diagnosis - a
+    # gate that calls this "version does not match the pin" points the
+    # reader at the wrong fix (upgrade/downgrade gitleaks) instead of the
+    # right one (install from the release tarball, or opt in).
+    with_fake_gitleaks
+    export FAKE_GITLEAKS_VERSION="$UNVERSIONED_OUTPUT"
+    run_cmd "$SECRET_SCAN_SH"
+    [ "$RUN_STATUS" -ne 0 ] || fail 'an unparseable version must fail the step'
+    assert_contains "$RUN_ERR" 'no parseable version' 'names the real outcome, distinct from a version mismatch'
+    assert_contains "$RUN_ERR" 'packaging defect' 'explains this is a packaging bug, not drift'
+    assert_not_contains "$RUN_ERR" 'does not match the pin' \
+        'must not be phrased as a mismatch - there is no version to compare'
+}
+
+secret_scan_allows_an_unpinned_gitleaks_version_with_explicit_opt_in() {
+    # Mirrors ADELE_AUDIT_ALLOW_STALE's shape in scripts/audit.sh: the exact
+    # pin stays the default, but nobody should have to edit the gate to
+    # unblock unrelated work.
+    with_fake_gitleaks
+    export FAKE_GITLEAKS_VERSION='7.0.0'
+    export FAKE_GITLEAKS_REPORT="$CLEAN_REPORT" FAKE_GITLEAKS_STATUS=0
+    export ADELE_SECRET_SCAN_ALLOW_UNPINNED=1
+    run_cmd "$SECRET_SCAN_SH"
+    assert_eq 0 "$RUN_STATUS" "explicit opt-in must still complete: $RUN_ERR"
+    assert_contains "$RUN_ERR" 'ALLOW_UNPINNED' 'opt-in is loud about what it did'
+    assert_contains "$RUN_ERR" '7.0.0' 'names the version actually used'
+}
+
+secret_scan_allows_an_unparseable_gitleaks_version_with_explicit_opt_in() {
+    with_fake_gitleaks
+    export FAKE_GITLEAKS_VERSION="$UNVERSIONED_OUTPUT"
+    export FAKE_GITLEAKS_REPORT="$CLEAN_REPORT" FAKE_GITLEAKS_STATUS=0
+    export ADELE_SECRET_SCAN_ALLOW_UNPINNED=1
+    run_cmd "$SECRET_SCAN_SH"
+    assert_eq 0 "$RUN_STATUS" "explicit opt-in must still complete even without a parseable version: $RUN_ERR"
+    assert_contains "$RUN_ERR" 'ALLOW_UNPINNED' 'opt-in is loud about what it did'
 }
 
 secret_scan_fails_when_gitleaks_produces_no_report() {
@@ -138,13 +206,37 @@ secret_scan_does_not_flag_the_clean_tree() {
     assert_eq 0 "$RUN_STATUS" "the repo must scan clean: $RUN_ERR$RUN_OUT"
 }
 
+secret_scan_detects_a_key_under_claude_worktrees() {
+    # .claude/worktrees/ must NOT be allowlisted (AGENTS.md, "Secret
+    # scanning"): the #811 incident involved a live .env AND eight stale
+    # .claude/worktrees checkouts, so excluding this directory would reopen
+    # half the blind spot the gate exists to close. Same reasoning as keeping
+    # .flatpak-builder/ in scope, applied to the other directory the
+    # incident actually touched.
+    local fixture="$TEST_TMP/src"
+    mkdir -p "$fixture/.claude/worktrees/some-session"
+    local body_a body_b
+    body_a="$(printf 'adele-secret-scan-test-fixture-worktrees-alpha' | sha256sum | cut -c1-58)"
+    body_b="$(printf 'adele-secret-scan-test-fixture-worktrees-beta' | sha256sum | cut -c1-58)"
+    printf 'OPENAI_API_KEY=sk-proj-%sT3BlbkFJ%s\n' "$body_a" "$body_b" \
+        >"$fixture/.claude/worktrees/some-session/.env"
+
+    run_cmd "$SECRET_SCAN_SH" "$fixture"
+    [ "$RUN_STATUS" -ne 0 ] || fail 'a key under .claude/worktrees/ must still fail the scan'
+    assert_contains "$RUN_ERR" '.claude/worktrees' 'names the nested-worktree path holding the key'
+}
+
 run_test secret_scan_passes_on_a_clean_report
 run_test secret_scan_fails_when_gitleaks_reports_a_leak
 run_test secret_scan_fails_loudly_when_gitleaks_is_not_installed
 run_test secret_scan_fails_when_the_installed_gitleaks_version_does_not_match_the_pin
+run_test secret_scan_fails_when_gitleaks_reports_no_parseable_version
+run_test secret_scan_allows_an_unpinned_gitleaks_version_with_explicit_opt_in
+run_test secret_scan_allows_an_unparseable_gitleaks_version_with_explicit_opt_in
 run_test secret_scan_fails_when_gitleaks_produces_no_report
 run_test secret_scan_uses_the_filesystem_walk_not_the_git_history_walk
 run_test check_gate_runs_the_secret_scan
 run_test secret_scan_detects_a_working_tree_key
 run_test secret_scan_does_not_flag_the_clean_tree
+run_test secret_scan_detects_a_key_under_claude_worktrees
 finish_tests 'secret-scan-gate'
