@@ -21,6 +21,7 @@ use chrono::{DateTime, TimeZone, Utc};
 
 use super::SkillIndexStore;
 use crate::domain::{IndexedSkill, Locality, SkillKind, SkillScope, TrustTier};
+use crate::ports::auth::{UserId, with_user_id};
 use crate::skill_catalog::reconcile_scan;
 
 /// A fixed instant for the first pass; cases that need a later one use
@@ -194,7 +195,10 @@ pub async fn rescan_restores_presence_when_skill_returns(store: &dyn SkillIndexS
 }
 
 /// Presence is per-scope: reconciling one owner must not touch global skills or
-/// another owner's, present or absent.
+/// another owner's, present or absent. The owner-scoped reads below run as
+/// that owner via [`with_user_id`] -- `get` resolves "the caller's own" from
+/// the caller's real identity (#911), not from the `owner` argument, so a
+/// read of alice's or bob's row has to happen inside their own scope.
 pub async fn reconcile_leaves_other_scopes_untouched(store: &dyn SkillIndexStore) {
     let alice = SkillScope::Owner("alice".to_string());
     let bob = SkillScope::Owner("bob".to_string());
@@ -234,24 +238,30 @@ pub async fn reconcile_leaves_other_scopes_untouched(store: &dyn SkillIndexStore
     .await
     .expect("alice rescan");
 
-    let old = fetch(store, "alice-old", Some("alice")).await;
+    let (old, new_present) = with_user_id(UserId::new("alice"), async {
+        let old = fetch(store, "alice-old", Some("alice")).await;
+        let new_present = fetch(store, "alice-new", Some("alice"))
+            .await
+            .present_on_disk;
+        (old, new_present)
+    })
+    .await;
     assert!(
         !old.present_on_disk,
         "alice's earlier skill is retained and flagged"
     );
-    assert!(
-        fetch(store, "alice-new", Some("alice"))
-            .await
-            .present_on_disk
-    );
+    assert!(new_present);
+
     assert!(
         fetch(store, "shared", None).await.present_on_disk,
         "an owner scan must not mark global skills absent"
     );
-    assert!(
-        fetch(store, "bob-only", Some("bob")).await.present_on_disk,
-        "nor another owner's"
-    );
+
+    let bob_present = with_user_id(UserId::new("bob"), async {
+        fetch(store, "bob-only", Some("bob")).await.present_on_disk
+    })
+    .await;
+    assert!(bob_present, "nor another owner's");
 }
 
 /// An absent skill stays discoverable. Hiding it would quietly recreate the
@@ -335,7 +345,11 @@ pub async fn upsert_ignores_caller_supplied_presence(store: &dyn SkillIndexStore
 }
 
 /// `get` addresses one scope: the global skill and a user's skill of the same
-/// name are different rows, and neither answers for the other.
+/// name are different rows, and neither answers for the other. Reading the
+/// owner-scoped row happens as alice, via [`with_user_id`] -- `get` resolves
+/// "the caller's own" from the caller's real identity, never from the
+/// `owner` argument's string value (#911), so exercising it as anyone else
+/// would not prove this case.
 pub async fn get_is_scope_addressed(store: &dyn SkillIndexStore) {
     reconcile_scan(
         store,
@@ -355,17 +369,17 @@ pub async fn get_is_scope_addressed(store: &dyn SkillIndexStore) {
     .expect("alice scan");
 
     assert_eq!(fetch(store, "deploy", None).await.body, "the global one");
-    assert_eq!(
-        fetch(store, "deploy", Some("alice")).await.body,
-        "alice's own"
-    );
+
+    let alice_own = with_user_id(UserId::new("alice"), fetch(store, "deploy", Some("alice"))).await;
+    assert_eq!(alice_own.body, "alice's own");
+
     assert!(
         store
             .get("deploy", Some("nobody"))
             .await
             .expect("get")
             .is_none(),
-        "an unknown owner matches nothing"
+        "a caller with no matching scope gets nothing back"
     );
 }
 

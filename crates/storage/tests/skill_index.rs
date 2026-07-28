@@ -329,7 +329,11 @@ async fn backfill_embeds_null_model_rows() {
 async fn get_returns_a_global_skill() {
     with_fixture("get_returns_a_global_skill", |fx| async move {
         let store = PgSkillIndexStore::new(fx.pool.clone());
-        seed(&store, vec![skill("changelog", "publish notes", "h1", "steps")]).await;
+        seed(
+            &store,
+            vec![skill("changelog", "publish notes", "h1", "steps")],
+        )
+        .await;
 
         // A global skill (owner_user_id IS NULL) stays readable by any
         // caller, including one with a real, unrelated identity installed.
@@ -464,7 +468,11 @@ async fn get_ignores_a_spoofed_owner_argument() {
 async fn single_tenant_get_is_unaffected() {
     with_fixture("single_tenant_get_is_unaffected", |fx| async move {
         let store = PgSkillIndexStore::new(fx.pool.clone());
-        seed(&store, vec![skill("changelog", "publish notes", "h4", "steps")]).await;
+        seed(
+            &store,
+            vec![skill("changelog", "publish notes", "h4", "steps")],
+        )
+        .await;
 
         // No task-local identity installed at all -- the desktop,
         // single-tenant path. `current_user_id()` falls back to the schema
@@ -526,7 +534,10 @@ async fn get_scoping_matches_search_and_list() {
                 .unwrap();
             let names: std::collections::BTreeSet<_> =
                 hits.iter().map(|s| s.name.clone()).collect();
-            assert!(names.contains("global-runbook"), "search sees the global row");
+            assert!(
+                names.contains("global-runbook"),
+                "search sees the global row"
+            );
             assert!(names.contains("a-only"), "search sees A's own row");
             assert!(
                 !names.contains("b-only"),
@@ -537,7 +548,10 @@ async fn get_scoping_matches_search_and_list() {
             let listed = store.list(None).await.unwrap();
             let listed_names: std::collections::BTreeSet<_> =
                 listed.iter().map(|s| s.name.clone()).collect();
-            assert!(listed_names.contains("global-runbook"), "list sees the global row");
+            assert!(
+                listed_names.contains("global-runbook"),
+                "list sees the global row"
+            );
             assert!(listed_names.contains("a-only"), "list sees A's own row");
             assert!(
                 !listed_names.contains("b-only"),
