@@ -245,8 +245,13 @@ fn keys(source: Option<IpAddr>, username: &str) -> Vec<Counter> {
 }
 
 /// Narrow a source address to the prefix it is counted by.
+///
+/// An IPv4-mapped address is unmapped first. A listener on `[::]` reports every
+/// IPv4 peer as `::ffff:a.b.c.d`, and all of those share the same /64 (`::`), so
+/// counting them as IPv6 would put every IPv4 caller in one bucket: five wrong
+/// passwords from anywhere would lock out everyone else.
 fn counted_address(address: IpAddr) -> IpAddr {
-    match address {
+    match address.to_canonical() {
         IpAddr::V4(v4) => IpAddr::V4(v4),
         IpAddr::V6(v6) => {
             let mut octets = v6.octets();
@@ -512,6 +517,42 @@ mod tests {
             0x2001, 0xdb8, 0, 1, 0, 0, 0, 1,
         )));
         assert!(refusal(&throttle, other_prefix, "someone-else", now).is_none());
+    }
+
+    /// A dual-stack listener reports IPv4 peers as IPv4-mapped IPv6 addresses,
+    /// which all share the `::` /64. Counted as IPv6 they would be one bucket,
+    /// so five wrong passwords from anywhere would lock out every IPv4 caller.
+    #[test]
+    fn ipv4_mapped_callers_are_counted_apart() {
+        let throttle = LoginThrottle::default();
+        let now = Instant::now();
+        let mapped = |last: u8| {
+            Some(IpAddr::from(
+                std::net::Ipv4Addr::new(198, 51, 100, last).to_ipv6_mapped(),
+            ))
+        };
+        for _ in 0..FREE_ATTEMPTS {
+            throttle.begin_attempt(mapped(1), ALICE, now);
+        }
+        assert!(
+            refusal(&throttle, mapped(1), "someone-new", now).is_some(),
+            "the caller that spent the budget must be locked out"
+        );
+        assert!(
+            refusal(&throttle, mapped(2), "someone-else", now).is_none(),
+            "a different IPv4 caller must keep its own budget"
+        );
+        // The mapped form and the plain form are the same caller.
+        assert!(
+            refusal(
+                &throttle,
+                Some(IpAddr::from([198, 51, 100, 1])),
+                "another-name",
+                now
+            )
+            .is_some(),
+            "the mapped and unmapped forms of one address must share a counter"
+        );
     }
 
     /// One caller's failures must not lock a different caller out of a
