@@ -294,8 +294,18 @@ fn spawn_supervisor(
             // indefinitely (a single attempt at a time — no thundering herd)
             // until the daemon comes back or this task is aborted.
             let mut backoff = RECONNECT_BACKOFF_INITIAL;
+            // When the daemon refused a `/login` attempt because too many have
+            // failed recently (#808), it named the wait. Honour that instead of
+            // our own schedule: an early retry spends from the same budget and
+            // pushes the wait out again, so a client left running with a stale
+            // password would hold the door shut for whoever has the right one.
+            let mut throttled_for: Option<Duration> = None;
             loop {
-                tokio::time::sleep(jittered_backoff(backoff)).await;
+                let delay = throttled_for
+                    .take()
+                    .map(|wait| wait + Duration::from_secs(1))
+                    .unwrap_or_else(|| jittered_backoff(backoff));
+                tokio::time::sleep(delay).await;
                 match client.reconnect(&config).await {
                     Ok(()) => {
                         // Replay the last client-tool registration (#246) so a
@@ -324,7 +334,18 @@ fn spawn_supervisor(
                         // rather than spinning. Surface the reason at debug so an
                         // operator can see *why* it isn't reconnecting.
                         tracing::debug!(error = %e, "connector reconnect attempt failed; backing off");
-                        backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
+                        match crate::auth::login_retry_after(&e) {
+                            Some(wait) => {
+                                tracing::warn!(
+                                    "the daemon is refusing login attempts for now; waiting {} s \
+                                     before trying again. Check the credentials this client is \
+                                     configured with",
+                                    wait.as_secs()
+                                );
+                                throttled_for = Some(wait);
+                            }
+                            None => backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX),
+                        }
                     }
                 }
             }

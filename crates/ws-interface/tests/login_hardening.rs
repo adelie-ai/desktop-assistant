@@ -128,6 +128,18 @@ async fn post_login(
         .expect("the router must answer a login request")
 }
 
+/// The `Retry-After` a refusal carries, in whole seconds.
+fn retry_after_seconds(response: &axum::http::Response<axum::body::Body>) -> u64 {
+    response
+        .headers()
+        .get(axum::http::header::RETRY_AFTER)
+        .expect("a lockout must carry Retry-After")
+        .to_str()
+        .expect("Retry-After must be ASCII")
+        .parse::<u64>()
+        .expect("Retry-After must be whole seconds")
+}
+
 fn ws_request(url: &str, bearer: &str) -> tokio_tungstenite::tungstenite::http::Request<()> {
     let mut request = url.into_client_request().expect("valid ws url");
     request.headers_mut().insert(
@@ -247,22 +259,80 @@ async fn ws_upgrade_succeeds_when_the_token_names_a_subject() {
 /// Repeated wrong passwords stop being answered. Before this the endpoint
 /// answered at full request rate forever, which is what made it a usable
 /// password oracle against a real OS account.
+///
+/// The exact budget is the throttle's business, so this asserts the shape: a
+/// person who mistypes gets several tries, and a guessing loop is cut off long
+/// before it is useful.
 #[tokio::test]
 async fn login_locks_out_after_repeated_failures_from_one_source() {
     let app = login_app();
-    for attempt in 1..=6 {
-        let status = post_login(&app, "alice", "wrong").await.status();
-        assert_eq!(
-            status,
-            axum::http::StatusCode::UNAUTHORIZED,
-            "attempt {attempt} should still be answered with 401"
-        );
+    let mut answered = 0;
+    let mut refused = false;
+    for _ in 0..50 {
+        match post_login(&app, "alice", "wrong").await.status() {
+            axum::http::StatusCode::UNAUTHORIZED => answered += 1,
+            axum::http::StatusCode::TOO_MANY_REQUESTS => {
+                refused = true;
+                break;
+            }
+            other => panic!("unexpected status {other} from /login"),
+        }
     }
 
-    assert_eq!(
-        post_login(&app, "alice", "wrong").await.status(),
-        axum::http::StatusCode::TOO_MANY_REQUESTS,
-        "guessing must stop being answered once the failure budget is spent"
+    assert!(
+        refused,
+        "guessing must stop being answered; {answered} guesses were all answered"
+    );
+    assert!(
+        (3..=10).contains(&answered),
+        "the budget must leave room for a mistyped password without answering a \
+         guessing loop; {answered} guesses were answered"
+    );
+}
+
+/// A refused request costs the caller nothing, so polling a locked door cannot
+/// lengthen the lockout. Without this a client that retries on a schedule turns
+/// its own stale password into a permanent outage.
+#[tokio::test]
+async fn polling_a_locked_door_does_not_lengthen_the_lockout() {
+    let app = login_app();
+    while post_login(&app, "alice", "wrong").await.status()
+        != axum::http::StatusCode::TOO_MANY_REQUESTS
+    {}
+
+    let first = retry_after_seconds(&post_login(&app, "alice", "wrong").await);
+    for _ in 0..25 {
+        let _ = post_login(&app, "alice", "wrong").await;
+    }
+    let last = retry_after_seconds(&post_login(&app, "alice", "wrong").await);
+
+    assert!(
+        last <= first,
+        "polling grew the wait from {first} s to {last} s"
+    );
+}
+
+/// The ceiling on the wait is a promise to the legitimate user: the account
+/// name is not a secret, so anyone can aim the lockout at the operator's own
+/// door. However long an attacker keeps guessing, the wait stays short enough
+/// to be a delay rather than an outage.
+#[tokio::test]
+async fn the_lockout_never_grows_past_a_short_wait() {
+    let app = login_app();
+    let mut longest = 0;
+    for _ in 0..200 {
+        let response = post_login(&app, "alice", "wrong").await;
+        if response.status() == axum::http::StatusCode::TOO_MANY_REQUESTS {
+            longest = longest.max(retry_after_seconds(&response));
+        }
+    }
+    assert!(
+        longest > 0,
+        "the door must have refused at least once in 200 guesses"
+    );
+    assert!(
+        longest <= 60,
+        "a lockout of {longest} s is an outage, not a delay"
     );
 }
 
@@ -271,23 +341,14 @@ async fn login_locks_out_after_repeated_failures_from_one_source() {
 #[tokio::test]
 async fn login_lockout_reports_retry_after() {
     let app = login_app();
-    for _ in 0..7 {
-        let _ = post_login(&app, "alice", "wrong").await;
+    let mut response = post_login(&app, "alice", "wrong").await;
+    while response.status() != axum::http::StatusCode::TOO_MANY_REQUESTS {
+        response = post_login(&app, "alice", "wrong").await;
     }
 
-    let response = post_login(&app, "alice", "wrong").await;
-    assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
-    let retry_after = response
-        .headers()
-        .get(axum::http::header::RETRY_AFTER)
-        .expect("a lockout must carry Retry-After")
-        .to_str()
-        .expect("Retry-After must be ASCII")
-        .parse::<u64>()
-        .expect("Retry-After must be whole seconds");
     assert!(
-        retry_after > 0,
-        "Retry-After must name a real wait, got {retry_after}"
+        retry_after_seconds(&response) > 0,
+        "Retry-After must name a real wait"
     );
 }
 
@@ -296,7 +357,7 @@ async fn login_lockout_reports_retry_after() {
 #[tokio::test]
 async fn successful_login_clears_the_failure_count() {
     let app = login_app();
-    for _ in 0..5 {
+    for _ in 0..3 {
         let _ = post_login(&app, "alice", "wrong").await;
     }
 
@@ -306,7 +367,7 @@ async fn successful_login_clears_the_failure_count() {
         "the correct password must still work while the budget is unspent"
     );
 
-    for _ in 0..5 {
+    for _ in 0..3 {
         assert_eq!(
             post_login(&app, "alice", "wrong").await.status(),
             axum::http::StatusCode::UNAUTHORIZED,
@@ -321,17 +382,17 @@ async fn successful_login_clears_the_failure_count() {
 #[tokio::test]
 async fn login_lockout_counts_failures_across_usernames_from_one_source() {
     let app = login_app();
-    for _ in 0..4 {
+    for _ in 0..3 {
         let _ = post_login(&app, "alice", "wrong").await;
     }
-    for _ in 0..4 {
+    for _ in 0..3 {
         let _ = post_login(&app, "bob", "wrong").await;
     }
 
     assert_eq!(
         post_login(&app, "alice", "s3cr3t").await.status(),
         axum::http::StatusCode::TOO_MANY_REQUESTS,
-        "eight failures from one source must lock it out even though no single \
+        "failures from one source must add up even though no single \
          username reached the limit"
     );
 }

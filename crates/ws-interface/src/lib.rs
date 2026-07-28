@@ -21,9 +21,7 @@ use desktop_assistant_api_model as api;
 use desktop_assistant_application::{AssistantApiHandler, UserId};
 use desktop_assistant_transport_dispatch::{AuthContext, TransportKind, dispatch_loop};
 use futures::SinkExt;
-#[cfg(feature = "tls")]
-use tracing::debug;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use login_throttle::LoginThrottle;
 
@@ -82,7 +80,7 @@ pub trait WsAuthValidator: Send + Sync {
     /// The default therefore names nobody, which is the fail-closed
     /// answer. Every validator that accepts a token must override this
     /// and return the subject that same token carries, so acceptance and
-    /// identity cannot disagree. The current mapping rule is `sub` →
+    /// identity cannot disagree. The current mapping rule is `sub` ->
     /// `user_id` verbatim; future revisions may consult a different
     /// claim.
     async fn extract_user_id(&self, token: &str) -> Option<UserId> {
@@ -382,8 +380,8 @@ async fn ws_handler(
     // every command on this socket runs as the same user.
     //
     // A token that authenticates but names no subject is refused (#807). It
-    // used to collapse to the schema sentinel `"default"` — the primary data
-    // partition — with no log line, and the authorization tier then read that
+    // used to collapse to the schema sentinel `"default"` - the primary data
+    // partition - with no log line, and the authorization tier then read that
     // same sentinel as a name an operator could allowlist. An issuer that
     // accepts a token with no `sub` claim (an RS256 `Validation` only requires
     // `exp`) reached exactly this path.
@@ -442,9 +440,9 @@ struct LoginResponse {
 /// The connecting peer's address, when the server was wired to report it.
 ///
 /// [`ConnectInfo`] itself is a hard requirement: it rejects the request when the
-/// server was started without it. `POST /login` must still work in that case —
+/// server was started without it. `POST /login` must still work in that case -
 /// a caller that builds the router itself and serves it its own way is a
-/// supported shape — so this wraps it in an `Option`. The failed-login counters
+/// supported shape - so this wraps it in an `Option`. The failed-login counters
 /// then fall back to the username alone, which still bounds guessing; only the
 /// per-source counter is lost.
 ///
@@ -501,37 +499,51 @@ async fn login_handler(
         return (StatusCode::UNAUTHORIZED, "missing basic auth").into_response();
     };
 
-    // Refusals are not counted (see `login_throttle`): a client polling a
-    // locked door would otherwise extend its own lockout for ever.
-    if let Some(retry_after) = state
-        .login_throttle
-        .locked_for(source, &username, Instant::now())
-    {
-        warn!(
-            "login refused for {:?} from {}: too many recent failures, {} s remaining",
-            username,
-            source_label(source),
-            retry_after.as_secs()
+    // Say once, not per request, that this server does not report the peer
+    // address, so an operator can see why per-source counting is off rather
+    // than assume it is on.
+    if source.is_none() && state.login_throttle.note_missing_source() {
+        tracing::info!(
+            "login throttling counts by username only: this server was started without \
+             connection info, so it cannot tell one caller from another"
         );
-        return locked_out_response(retry_after);
     }
+
+    // The budget is spent here, before the password is checked, and the check
+    // and the count are one operation. See `login_throttle` for why.
+    let earned_lockout = match state
+        .login_throttle
+        .begin_attempt(source, &username, Instant::now())
+    {
+        login_throttle::Attempt::Allowed { earned_lockout } => earned_lockout,
+        login_throttle::Attempt::Refused { retry_after } => {
+            // Deliberately not `warn`. A refusal costs the caller nothing, so
+            // one warn line per refused request would let an attacker flood the
+            // log and push the real failed-login records out of it. The
+            // transition into the lockout is warned once, below.
+            debug!(
+                "login refused for {:?} from {}: {} s of lockout remaining",
+                login_throttle::short_name(&username),
+                source_label(source),
+                retry_after.as_secs()
+            );
+            return locked_out_response(retry_after);
+        }
+    };
 
     if !login_service.authenticate_basic(&username, &password).await {
         // Every failed attempt is recorded. Before this, a wrong password
         // produced no log line at all, so guessing left no trace.
-        let lockout = state
-            .login_throttle
-            .record_failure(source, &username, Instant::now());
-        match lockout {
+        match earned_lockout {
             Some(retry_after) => warn!(
                 "login failed for {:?} from {}; the door is now shut for {} s",
-                username,
+                login_throttle::short_name(&username),
                 source_label(source),
                 retry_after.as_secs()
             ),
             None => warn!(
                 "login failed for {:?} from {}",
-                username,
+                login_throttle::short_name(&username),
                 source_label(source)
             ),
         }
@@ -617,11 +629,11 @@ async fn handle_socket(
 
     let sink = PollSender::new(frame_tx);
 
-    // Per-connection identity resolved in `ws_handler` (#105): the bearer
-    // token's `sub` if the validator extracted one, otherwise the schema
-    // sentinel for single-tenant fallback. The dispatcher installs this into
-    // the per-task task-local on every dispatched command so storage queries
-    // scope correctly.
+    // Per-connection identity resolved in `ws_handler` (#105): the subject the
+    // validator read off the bearer token it accepted. A token that named
+    // nobody never reaches here - the upgrade was refused. The dispatcher
+    // installs this into the per-task task-local on every dispatched command so
+    // storage queries scope correctly.
     // A WebSocket connection may terminate on a different host, so by the
     // transport heuristic its client-registered tools are treated as remote
     // (#243). When the client reported a system id that matches the daemon's,

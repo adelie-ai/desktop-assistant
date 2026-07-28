@@ -167,8 +167,9 @@ Default login behavior:
 - `DESKTOP_ASSISTANT_WS_LOGIN_LOCAL_SYSTEM_AUTH=true` turns the OS-password mode
   on deliberately, including past loopback; `=false` turns it off everywhere.
   Leaving it unset lets the bind address decide.
-- `/login` throttles failed attempts per source address and per username, and
-  answers `429` with `Retry-After` once the budget is spent. See
+- `/login` throttles attempts per source address and per username, and answers
+  `429` with `Retry-After` once the budget is spent. The wait is capped at one
+  minute, and a daemon restart clears the counters. See
   `docs/WEBSOCKET_API.md`.
 
 TUI transport defaults to WebSocket and can be configured:

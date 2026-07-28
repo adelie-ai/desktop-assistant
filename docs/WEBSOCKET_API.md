@@ -30,6 +30,12 @@ used to file such a connection under the shared `"default"` identity - the same
 partition a single-tenant install keeps all its data in. Configure the issuer to
 put the caller's identity in `sub`.
 
+If an instance was running that way, its conversations and knowledge entries are
+already filed under `"default"`. Those rows stay where they are: once the issuer
+names a subject, the connection is scoped to that subject and no longer sees
+them. Move the data with a `user_id` update if it should follow the new
+identity, and do it before the new subject starts writing.
+
 Local clients need no token: the UDS door (which the D-Bus bridge also goes
 through) authenticates by kernel peer credentials, and the identity is the
 connecting peer's OS user. A JWT is a network-door concern, so `/login` is the
@@ -72,16 +78,34 @@ Successful response:
 
 ### Failed-attempt throttling
 
-`/login` counts failed attempts, per source address and per username. The first
-few failures are answered normally, so a mistyped password costs nothing. After
-that the endpoint answers `429 Too Many Requests` with a `Retry-After` header in
-whole seconds, and the wait doubles with each further failure up to fifteen
-minutes. One successful login clears both counters.
+`/login` counts attempts, per source address and per username. The first few are
+answered normally, so a mistyped password costs nothing. After that the endpoint
+answers `429 Too Many Requests` with a `Retry-After` header in whole seconds,
+and the wait doubles with each further attempt up to a ceiling of one minute.
+One successful login clears both counters.
 
-A `429` is not a credential verdict - it says the door is shut for now, not that
-the password was wrong. A client should wait for `Retry-After` and try again
-rather than re-prompting immediately. Failed attempts are logged at warn level
-with the source address and the username tried.
+A `429` is not a credential verdict - the daemon did not read the password. A
+client must wait for `Retry-After` and try again rather than re-prompting or
+retrying on its own schedule: an early retry spends from the same budget and
+pushes the wait out again, so a client left running with a stale password would
+hold the door shut for whoever has the right one. `client-common` does this for
+you; `auth::login_retry_after` reads the wait off the error.
+
+The ceiling is one minute on purpose. Every deployment authenticates one
+account and its name is not a secret, so a longer lockout would let anyone who
+can reach the port hold the operator's own door shut. A minute keeps sustained
+guessing to roughly one attempt per minute while capping what an attacker can
+cost a legitimate user.
+
+Failed attempts are logged at warn level with the source address and the
+username tried. Refusals are logged at debug, because they cost the caller
+nothing and one warn line each would let an attacker flood the log.
+
+Two limits worth knowing. The counters live in the daemon process, so a restart
+clears them. And the daemon does not read `X-Forwarded-For` or any other
+forwarding header, because a caller writes those: behind a reverse proxy every
+request carries the proxy's address and the per-source counter becomes one
+shared bucket, leaving the per-username counter to do the work.
 
 `/login` authenticates exactly one account, and the `subject` in the response is
 the account it authenticated — the same value carried in the token's `sub` claim.

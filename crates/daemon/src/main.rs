@@ -2837,8 +2837,21 @@ async fn main() -> Result<()> {
                         );
                     }
                     WsLoginMode::SystemPassword(_) => {
-                        tracing::info!(
-                            "Web login enabled (local system-password mode) for username={username}"
+                        // Say the assumption out loud, on every start, not only
+                        // when the bind address looks wrong. A loopback bind is
+                        // a proxy for "only this machine can reach it", and a
+                        // reverse proxy in front of the daemon breaks that
+                        // assumption without changing the bind address.
+                        tracing::warn!(
+                            "Web login enabled (local system-password mode) for \
+                             username={username}: POST /login on {ws_addr} checks that \
+                             account's real OS password through PAM. This is meant for a \
+                             door only this machine can reach. Anything that can reach \
+                             the port can use it, including through a reverse proxy - \
+                             set DESKTOP_ASSISTANT_WS_LOGIN_PASSWORD to use a separate \
+                             credential instead, or \
+                             DESKTOP_ASSISTANT_WS_LOGIN_LOCAL_SYSTEM_AUTH=false to turn \
+                             this off"
                         );
                     }
                 }

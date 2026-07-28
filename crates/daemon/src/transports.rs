@@ -43,7 +43,7 @@ impl<S: SettingsService + 'static> ws::WsAuthValidator for WsSettingsAuth<S> {
     }
 
     async fn extract_user_id(&self, token: &str) -> Option<desktop_assistant_application::UserId> {
-        // #105 mapping rule: JWT `sub` → `UserId`. Returns `None` for tokens
+        // #105 mapping rule: JWT `sub` -> `UserId`. Returns `None` for tokens
         // this validator would reject, and for a token that carries no usable
         // subject; the transport then refuses the connection rather than
         // filing it under the schema sentinel (#807). The locally minted
@@ -193,7 +193,7 @@ impl uds::UdsAuthValidator for PeerCredUdsAuth {
             Some(t) if self.jwt_fallback.validate_bearer_token(t).await => {
                 // Identity is part of acceptance (#807). A token that
                 // authenticates but names no subject used to collapse to the
-                // schema sentinel `"default"` — the primary data partition —
+                // schema sentinel `"default"` - the primary data partition -
                 // and the allowlist then read that sentinel as a name.
                 let Some(user) = self
                     .jwt_fallback
@@ -307,7 +307,11 @@ impl<S: SettingsService + 'static> ws::WsLoginService for WsBasicLogin<S> {
             WsLoginMode::SystemPassword(check) => {
                 let check = *check;
                 let username = username.to_string();
-                let password = password.to_string();
+                // The copy the blocking task owns is wiped when it is dropped,
+                // the same way the PAM bridge wipes its own (#38). It cannot
+                // borrow the caller's, because the task outlives this frame.
+                let password: zeroize::Zeroizing<String> =
+                    zeroize::Zeroizing::new(password.to_string());
                 let outcome =
                     tokio::task::spawn_blocking(move || check(&username, &password)).await;
                 match outcome {
@@ -353,17 +357,6 @@ pub(crate) fn env_bool(name: &str, default: bool) -> bool {
     parse_env_bool(std::env::var(name).ok().as_deref(), default)
 }
 
-/// Read a flag whose *unset* state is a third answer, not a default.
-///
-/// `DESKTOP_ASSISTANT_WS_LOGIN_LOCAL_SYSTEM_AUTH` is one: an operator who never
-/// set it has said nothing, and the daemon decides from the bind address; an
-/// operator who set it to `true` has said something, and it is honoured.
-/// Collapsing the two into a `bool` is what made the OS-password door
-/// default-on beyond loopback (#806).
-pub(crate) fn env_opt_bool(name: &str) -> Option<bool> {
-    parse_env_opt_bool(std::env::var(name).ok().as_deref())
-}
-
 /// The daemon's self-identity **display label** for server-side tool localities
 /// (#243) — the human-readable `host` shown in the tool note (e.g.
 /// `terminal — server 'daemon-host'`). Co-location is decided separately by the
@@ -397,8 +390,16 @@ pub(crate) fn parse_env_bool(value: Option<&str>, default: bool) -> bool {
     parse_env_opt_bool(value).unwrap_or(default)
 }
 
-/// Pure parser behind [`env_opt_bool`]. `None` (unset, blank, or a value this
-/// parser does not recognize) means the operator stated nothing.
+/// Read a flag whose *unset* state is a third answer, not a default.
+///
+/// `DESKTOP_ASSISTANT_WS_LOGIN_LOCAL_SYSTEM_AUTH` is one: an operator who never
+/// set it has said nothing, and the daemon decides from the bind address; an
+/// operator who set it to `true` has said something, and it is honoured.
+/// Collapsing the two into a `bool` is what made the OS-password door
+/// default-on beyond loopback (#806).
+///
+/// `None` (unset, blank, or a value this parser does not recognize) means the
+/// operator stated nothing. A caller that can tell those apart says so.
 pub(crate) fn parse_env_opt_bool(value: Option<&str>) -> Option<bool> {
     match value?.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Some(true),
@@ -489,7 +490,20 @@ pub(crate) fn resolve_ws_login_mode(
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
 
-    let local_system_auth = env_opt_bool("DESKTOP_ASSISTANT_WS_LOGIN_LOCAL_SYSTEM_AUTH");
+    let raw_system_auth = std::env::var("DESKTOP_ASSISTANT_WS_LOGIN_LOCAL_SYSTEM_AUTH").ok();
+    let local_system_auth = parse_env_opt_bool(raw_system_auth.as_deref());
+    // An operator who wrote `disabled` meant `false`. Reading that as "said
+    // nothing" would leave the mode on, so say what happened instead.
+    if local_system_auth.is_none()
+        && raw_system_auth
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+    {
+        tracing::warn!(
+            "DESKTOP_ASSISTANT_WS_LOGIN_LOCAL_SYSTEM_AUTH is set to a value this daemon \
+             does not recognize, so it is being ignored. Use true or false"
+        );
+    }
     resolve_ws_login_mode_decision(
         current_username,
         configured_username,
@@ -739,9 +753,14 @@ mod tests {
             )
         }
 
+        /// How long the stand-in check blocks for. Long enough that a timer
+        /// stalled behind it is unmistakable, short enough not to slow the
+        /// suite down.
+        const SLOW_CHECK: Duration = Duration::from_millis(300);
+
         /// Stands in for libpam's fail delay without needing a PAM stack.
         fn slow_check(_username: &str, _password: &str) -> anyhow::Result<bool> {
-            std::thread::sleep(Duration::from_millis(300));
+            std::thread::sleep(SLOW_CHECK);
             Ok(false)
         }
 
@@ -756,15 +775,20 @@ mod tests {
                 tokio::spawn(async move { door.authenticate_basic("local-user", "guess").await });
 
             // This test runtime is single-threaded, so an inline blocking call
-            // would hold its only worker for the whole 300 ms and this short
-            // timer could not fire.
-            tokio::time::timeout(
-                Duration::from_millis(120),
-                tokio::time::sleep(Duration::from_millis(10)),
-            )
-            .await
-            .expect("the runtime must stay responsive while the OS password check runs");
+            // would hold its only worker for the whole of `slow_check`. Measure
+            // how long a short timer actually took: `tokio::time::timeout`
+            // cannot express this, because it polls the inner future before it
+            // checks the deadline, so it returns `Ok` for a timer that was
+            // stalled far past it.
+            let started = std::time::Instant::now();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let elapsed = started.elapsed();
 
+            assert!(
+                elapsed < SLOW_CHECK / 2,
+                "a 10 ms timer took {elapsed:?}, so the OS password check ran on the \
+                 async runtime instead of the blocking pool"
+            );
             assert!(!check.await.expect("the check task must finish"));
         }
 

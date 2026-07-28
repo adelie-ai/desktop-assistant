@@ -198,8 +198,11 @@ What an integrator must do:
   now fails the handshake with `401` instead of connecting as `"default"`.
 - Read `Config.caller_capability` at connect time and adapt, instead of
   discovering the boundary from a refusal.
-- Handle `429` from `POST /login`: the endpoint throttles failed attempts per
-  source address and per username, and names the wait in `Retry-After`.
+- Handle `429` from `POST /login`: the endpoint throttles attempts per source
+  address and per username, and names the wait in `Retry-After`. Honour that
+  wait rather than retrying on your own schedule - an early retry spends from
+  the same budget and pushes the wait out again. It is not a credential verdict,
+  so do not re-prompt for the password on it.
 
 Local clients on the same account are unaffected: the peer-uid grant makes them
 administrators with no configuration.
