@@ -65,6 +65,23 @@ pub(crate) fn refusal_frame(
 
 /// Build the frame for a handler error, classifying it where the error type
 /// carries enough structure to do so honestly.
+/// A classified `Unsupported` decline whose description names the specific
+/// feature, rather than the generic "unsupported command".
+///
+/// The caller knows which capability was missing; the `ApiError` variant does
+/// not carry that, and every shipped client renders this string verbatim.
+pub(crate) fn unsupported_frame(id: String, description: &str, message: &str) -> api::WsFrame {
+    api::WsFrame::declined(
+        id,
+        api::ErrorDetail {
+            code: api::ErrorCode::Unsupported,
+            description: description.to_string(),
+            message: message.to_string(),
+            retryable: false,
+        },
+    )
+}
+
 pub(crate) fn api_error_frame(id: String, error: ApiError) -> api::WsFrame {
     match error {
         // Already flattened to a string upstream; see the module docs.
@@ -118,7 +135,7 @@ mod tests {
         let frame = refusal_frame(
             "r1".to_string(),
             &api::Command::SetApiKey {
-                api_key: "sk-secret-value".to_string(),
+                api_key: "sk-secret-value".into(),
             },
             &Capability::Admin,
             &Capability::Tenant,

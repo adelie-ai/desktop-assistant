@@ -432,7 +432,7 @@ fn command_samples() -> Vec<(api::Command, Capability)> {
         ),
         (
             api::Command::SetApiKey {
-                api_key: "k".to_string(),
+                api_key: "k".into(),
             },
             Admin,
         ),
@@ -840,7 +840,7 @@ fn absent_identity_fails_closed_to_tenant() {
 #[tokio::test]
 async fn set_api_key_refused_for_non_admin() {
     assert_refused_for_tenant(api::Command::SetApiKey {
-        api_key: "sk-not-yours".to_string(),
+        api_key: "sk-not-yours".into(),
     })
     .await;
 }
@@ -1086,7 +1086,7 @@ async fn daemon_global_config_changes_require_admin() {
             ..api::ConfigChanges::default()
         },
         api::ConfigChanges {
-            persistence_remote_url: Some("https://example.com/repo.git".to_string()),
+            persistence_remote_url: Some("https://example.com/repo.git".into()),
             ..api::ConfigChanges::default()
         },
         api::ConfigChanges {
@@ -1161,7 +1161,7 @@ async fn refused_command_returns_a_rendered_refusal_not_a_disconnect() {
         Capability::Tenant,
         vec![
             api::Command::SetApiKey {
-                api_key: "k".to_string(),
+                api_key: "k".into(),
             },
             api::Command::Ping,
         ],
@@ -1200,7 +1200,7 @@ async fn refusal_names_the_command_and_the_missing_capability() {
     let (frames, _) = dispatch_as(
         Capability::Tenant,
         vec![api::Command::SetApiKey {
-            api_key: "k".to_string(),
+            api_key: "k".into(),
         }],
     )
     .await;
@@ -1288,7 +1288,7 @@ async fn a_refusal_carries_the_stable_code_and_is_not_retryable() {
     let (frames, _) = dispatch_as(
         Capability::Tenant,
         vec![api::Command::SetApiKey {
-            api_key: "k".to_string(),
+            api_key: "k".into(),
         }],
     )
     .await;
@@ -1327,7 +1327,7 @@ async fn an_older_client_still_parses_a_refusal_frame() {
     let (frames, _) = dispatch_as(
         Capability::Tenant,
         vec![api::Command::SetApiKey {
-            api_key: "k".to_string(),
+            api_key: "k".into(),
         }],
     )
     .await;

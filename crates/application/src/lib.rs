@@ -930,7 +930,7 @@ where
             let enabled = persistence_enabled.unwrap_or(stored.enabled);
             let remote_url = match persistence_remote_url {
                 Some(submitted) => Self::normalize_optional_string(Some(
-                    Self::resolve_submitted_url(&submitted, &stored.remote_url)?,
+                    Self::resolve_submitted_url(submitted.as_str(), &stored.remote_url)?,
                 )),
                 None => Some(stored.remote_url.clone()),
             };
@@ -1622,7 +1622,7 @@ where
             // Settings
             api::Command::SetApiKey { api_key } => {
                 self.settings
-                    .set_api_key(api_key)
+                    .set_api_key(api_key.into_inner())
                     .await
                     .map_err(Self::map_core_err)?;
                 Ok(api::CommandResult::Ack)

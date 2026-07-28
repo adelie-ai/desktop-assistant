@@ -304,8 +304,15 @@ pub enum Command {
     // removed; use the named-connection commands below (`ListConnections`,
     // `CreateConnection`, `UpdateConnection`, `DeleteConnection`,
     // `GetPurposes`, `SetPurpose`) instead.
+    /// Store the provider credential for the legacy single-connection surface.
+    ///
+    /// `api_key` is a [`Secret`]: it (de)serializes transparently, so the wire
+    /// form is unchanged, but it redacts itself in `Debug` and cannot leak into
+    /// a log line that formats the command.
+    ///
+    /// Requires [`Capability::Admin`] - one credential serves the instance.
     SetApiKey {
-        api_key: String,
+        api_key: Secret,
     },
 
     GetEmbeddingsSettings,
@@ -1221,8 +1228,11 @@ pub struct ConfigChanges {
     /// when it is exactly the redaction of the stored remote, and then keeps
     /// the stored credential; otherwise the write is refused. See
     /// [`secret_url::resolve_submitted`].
+    /// A [`Secret`] for the same reason `SetPersistenceSettings::remote_url`
+    /// is: an HTTPS remote carries a token in its userinfo, and this is a write
+    /// path. Transparent on the wire, redacted in `Debug`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub persistence_remote_url: Option<String>,
+    pub persistence_remote_url: Option<Secret>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub persistence_remote_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2603,6 +2613,50 @@ mod tests {
             "the DSN password must not reach a log line: {rendered}"
         );
         assert!(rendered.contains("Secret(***)"), "{rendered}");
+    }
+
+    /// The credential-bearing write fields are consistently `Secret`, so none of
+    /// them can reach a log line through the derived `Debug`.
+    #[test]
+    fn every_credential_bearing_write_field_is_redacted_in_debug() {
+        let api_key = Command::SetApiKey {
+            api_key: "sk-live-secret".into(),
+        };
+        assert!(
+            !format!("{api_key:?}").contains("sk-live-secret"),
+            "SetApiKey must not print its key: {api_key:?}"
+        );
+
+        let patch = Command::SetConfig {
+            changes: ConfigChanges {
+                persistence_remote_url: Some(
+                    "https://user:ghp_patchtoken@git.example.com/repo.git".into(),
+                ),
+                ..ConfigChanges::default()
+            },
+        };
+        assert!(
+            !format!("{patch:?}").contains("ghp_patchtoken"),
+            "ConfigChanges must not print the remote token: {patch:?}"
+        );
+    }
+
+    /// Wrapping those two fields is source-only: the wire form is unchanged.
+    #[test]
+    fn the_newly_wrapped_secret_fields_keep_their_wire_form() {
+        let json = r#"{"set_api_key":{"api_key":"sk-1"}}"#;
+        let cmd: Command = serde_json::from_str(json).expect("legacy set_api_key parses");
+        assert_eq!(
+            cmd,
+            Command::SetApiKey {
+                api_key: "sk-1".into()
+            }
+        );
+        assert_eq!(serde_json::to_string(&cmd).unwrap(), json);
+
+        let patch = r#"{"set_config":{"changes":{"persistence_remote_url":"https://h/r.git"}}}"#;
+        let cmd: Command = serde_json::from_str(patch).expect("legacy config patch parses");
+        assert_eq!(serde_json::to_string(&cmd).unwrap(), patch);
     }
 
     /// Same for the git remote, whose HTTPS form carries a token.

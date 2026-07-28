@@ -197,7 +197,7 @@ impl<T: BridgeTransport + 'static> DbusSettingsAdapter<T> {
     async fn set_api_key(&self, api_key: &str) -> fdo::Result<()> {
         let result = self
             .dispatch(api::Command::SetApiKey {
-                api_key: api_key.to_string(),
+                api_key: api_key.into(),
             })
             .await?;
         match result {
@@ -339,7 +339,7 @@ impl<T: BridgeTransport + 'static> DbusSettingsAdapter<T> {
     ) -> fdo::Result<ConfigData> {
         if changes.set_llm_api_key {
             self.dispatch(api::Command::SetApiKey {
-                api_key: changes.llm_api_key.clone(),
+                api_key: changes.llm_api_key.clone().into(),
             })
             .await?;
         }
@@ -358,7 +358,8 @@ impl<T: BridgeTransport + 'static> DbusSettingsAdapter<T> {
             wire_changes.persistence_enabled = Some(changes.persistence_enabled);
         }
         if changes.set_persistence_remote_url {
-            wire_changes.persistence_remote_url = Some(changes.persistence_remote_url.clone());
+            wire_changes.persistence_remote_url =
+                Some(changes.persistence_remote_url.clone().into());
         }
         if changes.set_persistence_remote_name {
             wire_changes.persistence_remote_name = Some(changes.persistence_remote_name.clone());
@@ -1088,7 +1089,9 @@ mod tests {
             .set_api_key("sk-123")
             .await
             .unwrap();
-        assert!(matches!(t.last(), api::Command::SetApiKey { api_key } if api_key == "sk-123"));
+        assert!(
+            matches!(t.last(), api::Command::SetApiKey { api_key } if api_key.as_str() == "sk-123")
+        );
     }
 
     #[tokio::test]

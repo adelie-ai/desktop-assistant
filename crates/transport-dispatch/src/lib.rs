@@ -38,7 +38,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use desktop_assistant_api_model as api;
-use desktop_assistant_application::{ApiError, AssistantApiHandler, EventSink};
+use desktop_assistant_application::{AssistantApiHandler, EventSink};
 use desktop_assistant_core::ports::auth::{UserId, with_user_id};
 use desktop_assistant_core::ports::session::{SessionId, with_session_id};
 use desktop_assistant_core::ports::transport::{
@@ -596,7 +596,11 @@ pub async fn dispatch_loop<R, W>(
                     // clean error frame so the client knows
                     // subscription is unsupported here.
                     if out_tx
-                        .send(errors::api_error_frame(req.id, ApiError::Unsupported))
+                        .send(errors::unsupported_frame(
+                            req.id,
+                            "background-task subscription not supported by this handler",
+                            "This daemon does not stream background-task updates.",
+                        ))
                         .await
                         .is_err()
                     {
