@@ -200,10 +200,13 @@ pub fn validate_ws_jwt(token: &str) -> anyhow::Result<bool> {
 /// Used by the WS auth path (#105) to map a validated bearer token to
 /// the `user_id` that scopes every subsequent storage query. Returns
 /// `None` when the token is missing, malformed, expired, or otherwise
-/// rejected by the same checks [`validate_ws_jwt`] applies — a caller
-/// that wants to distinguish "valid but no sub" from "invalid" should
-/// call this AFTER `validate_ws_jwt` and treat `None` as "validator
-/// opted out of identity extraction".
+/// rejected by the same checks [`validate_ws_jwt`] applies.
+///
+/// `None` means this token names nobody, and a transport treats that as a
+/// reason to refuse the connection (#807) rather than as a reason to fall back
+/// to the shared `"default"` identity. A caller that wants to tell "valid but
+/// no sub" from "invalid" calls this AFTER `validate_ws_jwt`; either way the
+/// answer is the same, because a connection with no subject is not admitted.
 pub fn ws_jwt_sub(token: &str) -> Option<String> {
     let token = token.trim();
     if token.is_empty() {

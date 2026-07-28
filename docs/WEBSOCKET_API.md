@@ -84,18 +84,34 @@ answers `429 Too Many Requests` with a `Retry-After` header in whole seconds,
 and the wait doubles with each further attempt up to a ceiling of one minute.
 One successful login clears both counters.
 
+The two counters do not refuse the same callers. The per-source counter refuses
+the address that spent it. The per-username counter refuses only a caller that
+has itself failed recently, for the reason below; where the server reports no
+source address it applies to every caller, because nothing else can tell them
+apart.
+
 A `429` is not a credential verdict - the daemon did not read the password. A
 client must wait for `Retry-After` and try again rather than re-prompting or
 retrying on its own schedule: an early retry spends from the same budget and
 pushes the wait out again, so a client left running with a stale password would
-hold the door shut for whoever has the right one. `client-common` does this for
-you; `auth::login_retry_after` reads the wait off the error.
+hold the door shut for whoever has the right one. In `client-common` the
+auto-reconnect loop already waits; a first connect, and any caller of
+`request_ws_login_token`, gets the error back and must wait itself.
+`auth::login_retry_after` reads the wait off the error without matching its
+text.
 
-The ceiling is one minute on purpose. Every deployment authenticates one
-account and its name is not a secret, so a longer lockout would let anyone who
-can reach the port hold the operator's own door shut. A minute keeps sustained
-guessing to roughly one attempt per minute while capping what an attacker can
-cost a legitimate user.
+Two rules keep the throttle from becoming a way to lock the account's owner out.
+The wait is capped at one minute, so a client with a stale password recovers
+quickly. And the per-username counter refuses only a caller that has itself
+failed recently: the account name is not a secret, so without that rule anyone
+who could reach the port could spend the budget and then send one request per
+lockout, and the owner's correct password would be refused before it was read.
+
+The cost of the second rule is that a caller from an address with no failure
+record of its own gets one attempt before its own counter exists, so an attacker
+with an endless supply of source addresses buys one guess per address. That is
+the deliberate trade: the person who owns the account cannot be shut out by
+somebody else's guessing.
 
 Failed attempts are logged at warn level with the source address and the
 username tried. Refusals are logged at debug, because they cost the caller

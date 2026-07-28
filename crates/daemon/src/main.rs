@@ -47,7 +47,8 @@ use settings_service::DaemonSettingsService;
 use store::PersistentConversationStore;
 use transports::{
     OidcAwareAuth, PeerCredUdsAuth, WsAuthDiscoveryProvider, WsBasicLogin, WsLoginMode,
-    WsSettingsAuth, daemon_host_label, env_bool, resolve_uds_socket_path, resolve_ws_login_mode,
+    WsSettingsAuth, daemon_host_label, env_bool, is_container_environment, resolve_uds_socket_path,
+    resolve_ws_login_mode,
 };
 
 async fn shutdown_signal() {
@@ -2863,12 +2864,26 @@ async fn main() -> Result<()> {
                 )) as Arc<dyn ws::WsLoginService>
             });
         if ws_login_service.is_none() {
+            // Name the condition that actually applies. "One of these three
+            // things" makes an operator check all three; the daemon knows which
+            // one it was.
+            let reason = if is_container_environment() {
+                "this daemon runs in a container, which has no local user account to \
+                 check against"
+                    .to_string()
+            } else if env_bool("DESKTOP_ASSISTANT_WS_LOGIN_LOCAL_SYSTEM_AUTH", true) {
+                format!(
+                    "this daemon is bound to {ws_addr}, which is not loopback, so the \
+                     OS-password mode is off unless \
+                     DESKTOP_ASSISTANT_WS_LOGIN_LOCAL_SYSTEM_AUTH=true asks for it"
+                )
+            } else {
+                "DESKTOP_ASSISTANT_WS_LOGIN_LOCAL_SYSTEM_AUTH is false".to_string()
+            };
             tracing::warn!(
-                "Web login disabled: set DESKTOP_ASSISTANT_WS_LOGIN_PASSWORD. The \
-                 local system-password mode is off here because this daemon is bound to \
-                 {ws_addr}, which is not loopback, or because it runs in a container, or \
-                 because DESKTOP_ASSISTANT_WS_LOGIN_LOCAL_SYSTEM_AUTH is false. Setting \
-                 that variable to true turns it on deliberately"
+                "Web login disabled: {reason}. Set DESKTOP_ASSISTANT_WS_LOGIN_PASSWORD to \
+                 use a separate credential, which is the right mode for a door reachable \
+                 over a network"
             );
         }
 

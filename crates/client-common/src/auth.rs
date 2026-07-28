@@ -10,6 +10,16 @@ use crate::config::ConnectionConfig;
 /// enough that a client recovers promptly once the door reopens.
 const DEFAULT_LOGIN_RETRY_AFTER: Duration = Duration::from_secs(60);
 
+/// Longest wait this client will honour from a `Retry-After` header.
+///
+/// The header arrives over the wire, and `/login` runs over plain HTTP when the
+/// daemon serves `ws://`, so an on-path attacker or a broken proxy writes it.
+/// Unclamped, a huge value parks the client for years, and one near
+/// `u64::MAX` panics the reconnect task outright, because `Duration`'s `Add`
+/// aborts on overflow. Five minutes is far longer than any wait this daemon
+/// asks for and short enough to recover from.
+const MAX_LOGIN_RETRY_AFTER: Duration = Duration::from_secs(5 * 60);
+
 /// The daemon refused a `/login` attempt because too many have failed recently
 /// (#808).
 ///
@@ -49,7 +59,8 @@ pub fn login_retry_after(error: &anyhow::Error) -> Option<Duration> {
 ///
 /// The HTTP-date form is not read: the daemon always sends seconds, and a date
 /// would need a clock both ends agree on. An unreadable value yields `None`, and
-/// the caller falls back to [`DEFAULT_LOGIN_RETRY_AFTER`].
+/// the caller falls back to [`DEFAULT_LOGIN_RETRY_AFTER`]. The caller also
+/// clamps whatever comes back to [`MAX_LOGIN_RETRY_AFTER`].
 fn retry_after_from(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     headers
         .get(reqwest::header::RETRY_AFTER)?
@@ -139,7 +150,9 @@ pub async fn request_ws_login_token(
         // running with a stale password would otherwise hold the door shut for
         // everyone, including whoever has the right password.
         let throttled = LoginThrottled {
-            retry_after: retry_after.unwrap_or(DEFAULT_LOGIN_RETRY_AFTER),
+            retry_after: retry_after
+                .unwrap_or(DEFAULT_LOGIN_RETRY_AFTER)
+                .min(MAX_LOGIN_RETRY_AFTER),
         };
         return Err(anyhow::Error::new(throttled)
             .context("remote /login is refusing attempts for now".to_string()));
@@ -308,6 +321,28 @@ mod tests {
         .context("outer again");
         assert_eq!(login_retry_after(&error), Some(Duration::from_secs(7)));
         assert_eq!(login_retry_after(&anyhow::anyhow!("unrelated")), None);
+    }
+
+    /// The header comes off the wire, so a hostile or broken value must not be
+    /// able to park the client for years or overflow the reconnect delay.
+    #[tokio::test]
+    async fn an_absurd_retry_after_is_clamped() {
+        let ws_url = one_shot_http(
+            "429 Too Many Requests",
+            "Retry-After: 18446744073709551615\r\n",
+        )
+        .await;
+        let error = request_ws_login_token(&ws_url, "alice", "wrong", None)
+            .await
+            .expect_err("a 429 must not be read as a token");
+        let wait = login_retry_after(&error).expect("a refusal names a wait");
+        assert!(
+            wait <= MAX_LOGIN_RETRY_AFTER,
+            "a wire-supplied wait of {wait:?} must be clamped"
+        );
+        // The clamped value must still be safe to add to, which is what the
+        // reconnect loop does before it sleeps.
+        let _ = wait + Duration::from_secs(1);
     }
 
     #[test]

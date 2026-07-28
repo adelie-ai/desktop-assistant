@@ -11,10 +11,31 @@
 //! - **per source address** - one caller walking a list of usernames;
 //! - **per username** - many callers converging on one account.
 //!
-//! An attempt spends from both. Either being locked refuses the request, and
-//! one success clears both, so an ordinary mistyped password costs nothing
-//! lasting. The lockout starts at [`BASE_LOCKOUT`] and doubles with each
-//! further failure, up to [`MAX_LOCKOUT`].
+//! An attempt spends from both, and one success clears both, so an ordinary
+//! mistyped password costs nothing lasting. The lockout starts at
+//! [`BASE_LOCKOUT`] and doubles with each further attempt, up to
+//! [`MAX_LOCKOUT`].
+//!
+//! ## Why an account lockout does not fall on a caller that never failed
+//!
+//! A lockout counted per **account** is a weapon anyone can pick up. Every
+//! deployment authenticates one account and its name is not a secret, so an
+//! attacker who spends the budget and then sends one request per lockout keeps
+//! the counter armed for ever - and the person whose account it is has their
+//! correct password refused before it is read. Shortening the lockout does not
+//! fix that; it only sets the rate the attacker has to send at.
+//!
+//! So the account counter refuses a caller that has itself failed here
+//! recently, and does not refuse one that has not. The source counter is
+//! unchanged and always applies.
+//!
+//! What that costs: a caller from an address with no record of its own gets one
+//! attempt before its own counter exists, so an attacker with an endless supply
+//! of fresh source prefixes buys one guess per prefix. What it buys: the person
+//! who owns the account cannot be shut out by somebody else's guessing, which is
+//! the failure that actually takes the door away. `docs/design/
+//! multi-tenancy-boundary.md` decision 7 sets the bar at one organization
+//! rather than hostile isolation, and that is the trade it points to.
 //!
 //! ## Why the budget is spent before the password is checked
 //!
@@ -36,13 +57,11 @@
 //!
 //! ## Why the lockout stays short
 //!
-//! [`MAX_LOCKOUT`] is a minute, not an hour. Every deployment authenticates one
-//! account and its name is not a secret, so a long lockout is a denial of
-//! service anyone on the network can aim at the operator's own door: the
-//! legitimate password is refused before it is even read. A minute keeps the
-//! sustained guess rate at roughly one per minute - useless against any real
-//! password - while the worst an attacker can cost a legitimate user is one
-//! minute of waiting.
+//! [`MAX_LOCKOUT`] is a minute, not an hour. A caller that trips its own source
+//! counter is usually a client with a stale password, not an attacker, and an
+//! hour of silence for a misconfiguration is an outage. A minute holds the
+//! sustained guess rate from one source to about one per minute - useless
+//! against any real password - and keeps the cost of getting it wrong small.
 //!
 //! The caller supplies `now` rather than the module reading the clock, so the
 //! policy is testable without sleeping and without a paused runtime.
@@ -87,8 +106,10 @@ const IDLE_RESET: Duration = Duration::from_secs(15 * 60);
 /// Upper bound on tracked counters. The keys are attacker-supplied (any source
 /// address, any username), so the map needs a ceiling or the throttle becomes
 /// its own memory-exhaustion path. At the cap the least recently active counter
-/// is dropped, and a counter serving a live lockout is kept in preference to
-/// one that is not.
+/// is dropped, and a counter serving a live lockout goes last - only once
+/// nothing else is left to drop, which needs the map filled with live lockouts
+/// and so [`FREE_ATTEMPTS`] times this many attempts inside one
+/// [`MAX_LOCKOUT`] window. Memory is the harder bound of the two.
 const MAX_TRACKED: usize = 4096;
 
 /// Longest username kept as a counter key. A caller cannot grow the map with
@@ -145,6 +166,13 @@ impl Attempts {
     fn is_locked(&self, now: Instant) -> bool {
         self.locked_until.is_some_and(|until| until > now)
     }
+
+    /// How much longer this counter refuses, or `None` if it does not.
+    fn remaining(&self, now: Instant) -> Option<Duration> {
+        self.locked_until
+            .map(|until| until.saturating_duration_since(now))
+            .filter(|left| !left.is_zero())
+    }
 }
 
 /// The `/login` attempt counters for one server.
@@ -169,20 +197,31 @@ impl LoginThrottle {
         now: Instant,
     ) -> Attempt {
         let mut counters = self.counters();
+        let spends_from = keys(source, username);
+        let source_key = spends_from
+            .iter()
+            .find(|key| matches!(key, Counter::Source(_)));
+        let account_key = spends_from
+            .iter()
+            .find(|key| matches!(key, Counter::Username(_)));
 
-        let refused = keys(source, username)
-            .into_iter()
-            .filter_map(|key| counters.get(&key)?.locked_until)
-            .map(|until| until.saturating_duration_since(now))
-            .filter(|left| !left.is_zero())
-            .max();
-        if let Some(retry_after) = refused {
+        // The caller's own counter always refuses it.
+        let own = source_key.and_then(|key| counters.get(key)?.remaining(now));
+        // The account's counter refuses only a caller that has failed here
+        // recently, so nobody can shut the account's owner out by guessing at
+        // it. With no source address to tell callers apart, it applies to all
+        // of them - that is the only counter left.
+        let has_own_record = source_key.is_none_or(|key| counters.contains_key(key));
+        let account = has_own_record
+            .then(|| account_key.and_then(|key| counters.get(key)?.remaining(now)))
+            .flatten();
+        if let Some(retry_after) = own.max(account) {
             return Attempt::Refused { retry_after };
         }
 
         make_room(&mut counters, now);
         let mut earned_lockout: Option<Duration> = None;
-        for key in keys(source, username) {
+        for key in spends_from {
             let entry = counters.entry(key).or_insert(Attempts {
                 attempts: 0,
                 last_attempt: now,
@@ -277,9 +316,10 @@ fn lockout_for(attempts: u32) -> Option<Duration> {
 /// the least recently active ones, so there is room for the two this attempt
 /// will insert.
 ///
-/// A counter serving a live lockout is never dropped by the quiet sweep, and is
-/// the last to go at the cap. Dropping one would release a lockout early, which
-/// is the one thing eviction must not be able to do.
+/// A counter serving a live lockout is never dropped by the quiet sweep, and at
+/// the cap it is the last to go: dropping one releases a lockout early. Memory
+/// still wins if nothing else is left, because an unbounded map is the worse
+/// failure - see [`MAX_TRACKED`] for what reaching that state costs.
 fn make_room(counters: &mut HashMap<Counter, Attempts>, now: Instant) {
     counters.retain(|_, entry| {
         entry.is_locked(now) || now.saturating_duration_since(entry.last_attempt) < IDLE_RESET
@@ -411,16 +451,51 @@ mod tests {
     /// against a legitimate user. It is a policy promise, so it is pinned.
     #[test]
     fn no_lockout_ever_exceeds_a_minute() {
+        // A literal, not `MAX_LOCKOUT`: asserting against the constant would
+        // only restate the `.min` inside `lockout_for` and would survive any
+        // change to the policy this test exists to pin.
+        let ceiling = Duration::from_secs(60);
         for attempts in 0..2_000u32 {
             let lockout = lockout_for(attempts).unwrap_or_default();
             assert!(
-                lockout <= MAX_LOCKOUT,
-                "attempt {attempts} earned {lockout:?}, past the {MAX_LOCKOUT:?} ceiling"
+                lockout <= ceiling,
+                "attempt {attempts} earned {lockout:?}, past the {ceiling:?} ceiling"
             );
         }
+        assert!(lockout_for(u32::MAX).expect("an absurd count still earns one") <= ceiling);
         assert!(
             MAX_LOCKOUT < IDLE_RESET,
             "a counter must never reopen and reset in the same instant"
+        );
+    }
+
+    /// Drive the escalation the way an attacker does - wait out each lockout,
+    /// then attempt again - and watch it climb to the ceiling and stop there.
+    /// The other tests never see past the first step, because a refused attempt
+    /// spends nothing and their clock never moves.
+    #[test]
+    fn waiting_out_a_lockout_and_trying_again_climbs_to_the_ceiling_and_stops() {
+        let throttle = LoginThrottle::default();
+        let mut now = Instant::now();
+        spend(&throttle, source(), ALICE, FREE_ATTEMPTS, now);
+
+        let ceiling = Duration::from_secs(60);
+        let mut longest = Duration::ZERO;
+        for _ in 0..40 {
+            let wait = refusal(&throttle, source(), ALICE, now)
+                .expect("the door must be shut right after an attempt");
+            longest = longest.max(wait);
+            assert!(
+                wait <= ceiling,
+                "waiting out each lockout grew the wait to {wait:?}"
+            );
+            // Wait it out, then spend the one attempt that reopening buys.
+            now += wait;
+            allow(&throttle, source(), ALICE, now);
+        }
+        assert_eq!(
+            longest, ceiling,
+            "the escalation must actually reach the ceiling, or this proves nothing"
         );
     }
 
@@ -470,26 +545,51 @@ mod tests {
         );
     }
 
-    /// Many sources converging on one account are caught by the username
-    /// counter, even though no single source reaches the budget.
+    /// Many sources converging on one account arm the account counter, and it
+    /// then refuses each of them - none has reached its own budget.
     #[test]
     fn the_username_counter_adds_up_across_sources() {
         let throttle = LoginThrottle::default();
         let now = Instant::now();
+        let guesser = |index: u32| Some(IpAddr::from([203, 0, 113, index as u8]));
         for index in 0..FREE_ATTEMPTS {
-            let address = IpAddr::from([203, 0, 113, index as u8]);
-            throttle.begin_attempt(Some(address), ALICE, now);
+            throttle.begin_attempt(guesser(index), ALICE, now);
         }
         assert!(
-            refusal(
-                &throttle,
-                Some(IpAddr::from([203, 0, 113, 200])),
-                ALICE,
-                now
-            )
-            .is_some(),
-            "the account must be protected however many addresses tried it"
+            refusal(&throttle, guesser(0), ALICE, now).is_some(),
+            "a source that helped spend the account's budget must be refused, even \
+             though it made only one attempt of its own"
         );
+    }
+
+    /// The account counter must not become a weapon. An attacker who spends the
+    /// budget, then sends one request per lockout, would otherwise keep the
+    /// account's own owner shut out for ever - the account name is not a secret,
+    /// so anyone can aim it. A caller with no failures of its own is let through.
+    #[test]
+    fn a_clean_source_is_not_shut_out_by_someone_elses_guessing() {
+        let throttle = LoginThrottle::default();
+        let now = Instant::now();
+        spend(&throttle, source(), ALICE, FREE_ATTEMPTS + 3, now);
+        assert!(
+            refusal(&throttle, source(), ALICE, now).is_some(),
+            "the guesser itself must be locked out"
+        );
+        assert!(
+            refusal(&throttle, other_source(), ALICE, now).is_none(),
+            "the owner of the account, arriving from an address that has not failed \
+             here, must still be able to log in"
+        );
+    }
+
+    /// With no source address there is nothing to tell callers apart, so the
+    /// account counter is the only protection left and applies to everyone.
+    #[test]
+    fn without_a_source_address_the_account_counter_applies_to_all_callers() {
+        let throttle = LoginThrottle::default();
+        let now = Instant::now();
+        spend(&throttle, None, ALICE, FREE_ATTEMPTS, now);
+        assert!(refusal(&throttle, None, ALICE, now).is_some());
     }
 
     /// A routed /64 is one subscriber. Counted by the full address, an attacker

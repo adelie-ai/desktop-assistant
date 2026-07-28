@@ -15,6 +15,8 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use axum::extract::connect_info::MockConnectInfo;
 use desktop_assistant_api_model as api;
 use desktop_assistant_application::{ApiError, ApiResult, AssistantApiHandler, EventSink, UserId};
@@ -73,6 +75,26 @@ impl WsAuthValidator for SubjectAuth {
 /// The `/login` door under test: one account, one password.
 struct StaticLogin;
 
+/// A door that counts how many requests reached the credential check, and stays
+/// inside it long enough for the rest to race the budget. Standing in for the
+/// real slow half: a PAM call parks for the whole of libpam's fail delay.
+struct SlowCountingLogin {
+    reached: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl WsLoginService for SlowCountingLogin {
+    async fn authenticate_basic(&self, _username: &str, _password: &str) -> bool {
+        self.reached.fetch_add(1, Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        false
+    }
+
+    async fn issue_token_for_subject(&self, subject: &str) -> Result<String, String> {
+        Ok(format!("jwt-for-{subject}"))
+    }
+}
+
 #[async_trait::async_trait]
 impl WsLoginService for StaticLogin {
     async fn authenticate_basic(&self, username: &str, password: &str) -> bool {
@@ -126,6 +148,18 @@ async fn post_login(
         )
         .await
         .expect("the router must answer a login request")
+}
+
+/// Guess until the door refuses, and return that refusal. Bounded, so a
+/// regression names the requirement instead of hanging the suite.
+async fn lock_the_door(app: &axum::Router) -> axum::http::Response<axum::body::Body> {
+    for _ in 0..50 {
+        let response = post_login(app, "alice", "wrong").await;
+        if response.status() == axum::http::StatusCode::TOO_MANY_REQUESTS {
+            return response;
+        }
+    }
+    panic!("the door answered 50 wrong passwords without ever refusing one");
 }
 
 /// The `Retry-After` a refusal carries, in whole seconds.
@@ -290,15 +324,58 @@ async fn login_locks_out_after_repeated_failures_from_one_source() {
     );
 }
 
+/// The budget has to hold when the requests arrive together, which is the case
+/// it exists for: checking the lockout and then counting the failure afterwards
+/// leaves the whole credential check as a window in which every concurrent
+/// request passes a check against counters nothing has recorded yet. One budget
+/// then buys as many guesses as an attacker can open sockets.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_guesses_cannot_outrun_the_budget() {
+    let reached = Arc::new(AtomicUsize::new(0));
+    let handler: Arc<dyn AssistantApiHandler> = Arc::new(PingHandler);
+    let app = router_full(
+        handler,
+        Arc::new(SubjectAuth {
+            subject: Some("alice"),
+        }),
+        Some(Arc::new(SlowCountingLogin {
+            reached: Arc::clone(&reached),
+        })),
+        None,
+        Vec::new(),
+    )
+    .layer(MockConnectInfo(SocketAddr::from(([192, 0, 2, 10], 4242))));
+
+    let attempts = 50;
+    let statuses = futures_util::future::join_all((0..attempts).map(|_| {
+        let app = app.clone();
+        async move { post_login(&app, "alice", "wrong").await.status() }
+    }))
+    .await;
+
+    let checked = reached.load(Ordering::SeqCst);
+    assert!(
+        checked >= 1,
+        "at least one request must have reached the credential check"
+    );
+    assert!(
+        checked <= 10,
+        "{checked} of {attempts} concurrent guesses reached the password check; the \
+         budget must bound them however many arrive at once"
+    );
+    assert!(
+        statuses.contains(&axum::http::StatusCode::TOO_MANY_REQUESTS),
+        "the requests past the budget must be refused, not answered"
+    );
+}
+
 /// A refused request costs the caller nothing, so polling a locked door cannot
 /// lengthen the lockout. Without this a client that retries on a schedule turns
 /// its own stale password into a permanent outage.
 #[tokio::test]
 async fn polling_a_locked_door_does_not_lengthen_the_lockout() {
     let app = login_app();
-    while post_login(&app, "alice", "wrong").await.status()
-        != axum::http::StatusCode::TOO_MANY_REQUESTS
-    {}
+    lock_the_door(&app).await;
 
     let first = retry_after_seconds(&post_login(&app, "alice", "wrong").await);
     for _ in 0..25 {
@@ -312,12 +389,16 @@ async fn polling_a_locked_door_does_not_lengthen_the_lockout() {
     );
 }
 
-/// The ceiling on the wait is a promise to the legitimate user: the account
-/// name is not a secret, so anyone can aim the lockout at the operator's own
-/// door. However long an attacker keeps guessing, the wait stays short enough
-/// to be a delay rather than an outage.
+/// A refusal names a wait a client can sit out, not one that reads as an
+/// outage. Guessing in a tight loop cannot make it grow, because a refused
+/// request spends nothing.
+///
+/// This cannot observe the escalation itself - the wait only grows for a caller
+/// that waits each lockout out, and this test's clock never moves. The unit
+/// test `waiting_out_a_lockout_and_trying_again_climbs_to_the_ceiling_and_stops`
+/// drives that with a clock it controls.
 #[tokio::test]
-async fn the_lockout_never_grows_past_a_short_wait() {
+async fn a_refusal_names_a_wait_a_client_can_sit_out() {
     let app = login_app();
     let mut longest = 0;
     for _ in 0..200 {
@@ -341,10 +422,7 @@ async fn the_lockout_never_grows_past_a_short_wait() {
 #[tokio::test]
 async fn login_lockout_reports_retry_after() {
     let app = login_app();
-    let mut response = post_login(&app, "alice", "wrong").await;
-    while response.status() != axum::http::StatusCode::TOO_MANY_REQUESTS {
-        response = post_login(&app, "alice", "wrong").await;
-    }
+    let response = lock_the_door(&app).await;
 
     assert!(
         retry_after_seconds(&response) > 0,
