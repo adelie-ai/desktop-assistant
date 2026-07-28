@@ -406,6 +406,32 @@ mod tests {
         );
     }
 
+    /// #807: `"default"` is the schema sentinel every subject-less path used to
+    /// collapse to. It is not blank, so the blank filter did not stop it, and an
+    /// operator reading the list as "the default user" on a single-user box
+    /// would have promoted every subject-less connection to administrator. It is
+    /// therefore not representable on the allowlist at all.
+    #[test]
+    fn the_default_sentinel_cannot_be_allowlisted_as_an_administrator() {
+        let allowlist = AdminSubjects::new(["default", " default ", "alice"]);
+        assert_eq!(
+            allowlist.capability_for("default"),
+            Capability::Tenant,
+            "the sentinel must never carry the administrator capability"
+        );
+        assert_eq!(allowlist.capability_for("alice"), Capability::Admin);
+        assert_eq!(allowlist.len(), 1, "only the real subject is admitted");
+    }
+
+    /// The blank filter that was already there, pinned as its own requirement.
+    #[test]
+    fn a_blank_subject_is_never_an_administrator() {
+        let allowlist = AdminSubjects::new(["", "   ", "alice"]);
+        assert_eq!(allowlist.capability_for(""), Capability::Tenant);
+        assert_eq!(allowlist.capability_for("   "), Capability::Tenant);
+        assert_eq!(allowlist.len(), 1);
+    }
+
     #[test]
     fn capability_labels_are_stable() {
         assert_eq!(Capability::Tenant.label(), "tenant");

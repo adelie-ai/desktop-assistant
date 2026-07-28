@@ -453,8 +453,9 @@ mod tests {
             "local-user".to_string(),
             Some("api-user".to_string()),
             Some("secret".to_string()),
-            true,
+            None,
             false,
+            true,
         );
 
         match result {
@@ -472,8 +473,9 @@ mod tests {
             "local-user".to_string(),
             None,
             Some("secret".to_string()),
-            true,
+            None,
             false,
+            true,
         );
 
         match result {
@@ -491,12 +493,13 @@ mod tests {
             "local-user".to_string(),
             Some("other-user".to_string()),
             None,
-            true,
+            None,
             false,
+            true,
         );
 
         match result {
-            Some((username, WsLoginMode::SystemPassword)) => {
+            Some((username, WsLoginMode::SystemPassword(_))) => {
                 assert_eq!(username, "local-user");
             }
             _ => panic!("expected system password mode"),
@@ -506,15 +509,173 @@ mod tests {
     #[test]
     fn login_mode_disabled_in_container_without_static_password() {
         let result =
-            resolve_ws_login_mode_decision("local-user".to_string(), None, None, true, true);
+            resolve_ws_login_mode_decision("local-user".to_string(), None, None, None, true, true);
         assert!(result.is_none());
     }
 
     #[test]
     fn login_mode_disabled_when_local_system_auth_is_off() {
-        let result =
-            resolve_ws_login_mode_decision("local-user".to_string(), None, None, false, false);
+        let result = resolve_ws_login_mode_decision(
+            "local-user".to_string(),
+            None,
+            None,
+            Some(false),
+            false,
+            true,
+        );
         assert!(result.is_none());
+    }
+
+    /// #806: the OS-password door is a *local* convenience, and the bind
+    /// address is what says whether the door is local. A daemon bound past
+    /// loopback with the flag untouched must not turn `/login` into a
+    /// network-reachable PAM oracle for a real system account.
+    mod system_password_needs_a_local_door {
+        use super::super::{WsLoginMode, resolve_ws_login_mode_decision};
+
+        fn decide(
+            local_system_auth: Option<bool>,
+            is_container: bool,
+            bind_is_loopback: bool,
+        ) -> Option<(String, WsLoginMode)> {
+            resolve_ws_login_mode_decision(
+                "local-user".to_string(),
+                None,
+                None,
+                local_system_auth,
+                is_container,
+                bind_is_loopback,
+            )
+        }
+
+        #[test]
+        fn system_password_login_is_off_by_default_on_a_non_loopback_bind() {
+            assert!(
+                decide(None, false, false).is_none(),
+                "a daemon bound past loopback must not accept the host account password \
+                 unless the operator asked for it"
+            );
+        }
+
+        #[test]
+        fn system_password_login_on_a_non_loopback_bind_needs_an_explicit_opt_in() {
+            assert!(
+                matches!(decide(Some(true), false, false), Some((_, WsLoginMode::SystemPassword(_)))),
+                "an operator who sets the flag deliberately still gets the mode"
+            );
+        }
+
+        /// The single-user desktop case, which must not change: the daemon
+        /// binds loopback, so the OS-password door stays on with no
+        /// configuration at all.
+        #[test]
+        fn system_password_login_stays_on_for_a_loopback_bind() {
+            assert!(
+                matches!(decide(None, false, true), Some((_, WsLoginMode::SystemPassword(_)))),
+                "the loopback door is the case this mode was designed for"
+            );
+        }
+
+        #[test]
+        fn an_explicit_no_disables_system_password_login_on_every_bind() {
+            assert!(decide(Some(false), false, true).is_none());
+            assert!(decide(Some(false), false, false).is_none());
+        }
+
+        #[test]
+        fn a_container_never_gets_system_password_login() {
+            assert!(decide(None, true, true).is_none());
+            assert!(decide(Some(true), true, false).is_none());
+        }
+
+        /// The static-password door is the deployed shape and is unrelated to
+        /// the host's OS accounts, so the bind address does not gate it.
+        #[test]
+        fn static_password_login_is_unaffected_by_the_bind_address() {
+            let decided = resolve_ws_login_mode_decision(
+                "local-user".to_string(),
+                Some("api-user".to_string()),
+                Some("secret".to_string()),
+                None,
+                false,
+                false,
+            );
+            assert!(matches!(decided, Some((_, WsLoginMode::StaticPassword(_)))));
+        }
+    }
+
+    /// The flag now has three states, not two: an operator who never set it is
+    /// not the same as one who set it to `false`, because only the first can be
+    /// overridden by the bind address.
+    #[test]
+    fn parse_env_opt_bool_distinguishes_unset_from_a_stated_value() {
+        use super::parse_env_opt_bool;
+        assert_eq!(parse_env_opt_bool(None), None);
+        assert_eq!(parse_env_opt_bool(Some("")), None);
+        assert_eq!(parse_env_opt_bool(Some("maybe")), None);
+        assert_eq!(parse_env_opt_bool(Some("true")), Some(true));
+        assert_eq!(parse_env_opt_bool(Some(" ON ")), Some(true));
+        assert_eq!(parse_env_opt_bool(Some("0")), Some(false));
+    }
+
+    /// #806: the blocking PAM call must not run on the async runtime. Each
+    /// failed guess used to park a tokio worker thread for the whole of
+    /// libpam's fail delay, so an attacker throttled the daemon itself.
+    mod os_password_check_is_blocking_work {
+        use std::path::PathBuf;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use desktop_assistant_ws::WsLoginService;
+
+        use crate::settings_service::DaemonSettingsService;
+        use crate::transports::{WsBasicLogin, WsLoginMode};
+
+        fn login(mode: WsLoginMode) -> WsBasicLogin<DaemonSettingsService> {
+            WsBasicLogin::new(
+                Arc::new(DaemonSettingsService::new(PathBuf::from(
+                    "/nonexistent/desktop-assistant-ws-login-806.toml",
+                ))),
+                "local-user".to_string(),
+                mode,
+            )
+        }
+
+        /// Stands in for libpam's fail delay without needing a PAM stack.
+        fn slow_check(_username: &str, _password: &str) -> anyhow::Result<bool> {
+            std::thread::sleep(Duration::from_millis(300));
+            Ok(false)
+        }
+
+        fn broken_check(_username: &str, _password: &str) -> anyhow::Result<bool> {
+            Err(anyhow::anyhow!("PAM is not available on this host"))
+        }
+
+        #[tokio::test]
+        async fn the_os_password_check_does_not_block_the_async_runtime() {
+            let door = login(WsLoginMode::SystemPassword(slow_check));
+            let check = tokio::spawn(async move { door.authenticate_basic("local-user", "guess").await });
+
+            // This test runtime is single-threaded, so an inline blocking call
+            // would hold its only worker for the whole 300 ms and this short
+            // timer could not fire.
+            tokio::time::timeout(
+                Duration::from_millis(120),
+                tokio::time::sleep(Duration::from_millis(10)),
+            )
+            .await
+            .expect("the runtime must stay responsive while the OS password check runs");
+
+            assert!(!check.await.expect("the check task must finish"));
+        }
+
+        /// PAM unavailable is not an authentication. The check reports the
+        /// error and the door stays shut.
+        #[tokio::test]
+        async fn a_failing_os_password_check_is_not_an_authentication() {
+            let door = login(WsLoginMode::SystemPassword(broken_check));
+            assert!(!door.authenticate_basic("local-user", "whatever").await);
+        }
     }
 
     /// The `/login` door's end of the tenant boundary (#726): the token it hands
@@ -626,17 +787,23 @@ mod tests {
             }
         }
 
-        /// JWT fallback stub: accepts only the literal token `"good"`, whose
-        /// `sub` is `"jwtuser"`.
+        /// JWT fallback stub. `"good"` is the ordinary case: accepted, `sub` is
+        /// `"jwtuser"`. The other two accepted tokens reproduce the identity
+        /// fail-open this work closes - a token an issuer signs correctly but
+        /// that names no usable subject.
         struct StubJwt;
 
         #[async_trait]
         impl ws::WsAuthValidator for StubJwt {
             async fn validate_bearer_token(&self, token: &str) -> bool {
-                token == "good"
+                matches!(token, "good" | "no-subject" | "blank-subject")
             }
             async fn extract_user_id(&self, token: &str) -> Option<UserId> {
-                (token == "good").then(|| UserId::from("jwtuser"))
+                match token {
+                    "good" => Some(UserId::from("jwtuser")),
+                    "blank-subject" => Some(UserId::from("   ")),
+                    _ => None,
+                }
             }
         }
 
@@ -701,6 +868,28 @@ mod tests {
         async fn valid_token_is_accepted_when_peer_cred_is_unavailable() {
             let outcome = auth().authenticate(Some("good"), None).await;
             assert_eq!(allowed(outcome), UserId::from("jwtuser"));
+        }
+
+        /// #807: identity resolution is part of acceptance. A token the
+        /// validator accepts but whose subject it cannot name must be rejected,
+        /// not collapsed to the schema sentinel `"default"` - which on a
+        /// desktop-originated database is the operator's own partition, and
+        /// which an allowlist can name.
+        #[tokio::test]
+        async fn token_fallback_is_rejected_when_the_token_names_no_subject() {
+            assert!(matches!(
+                auth().authenticate(Some("no-subject"), None).await,
+                UdsAuth::Reject(_)
+            ));
+        }
+
+        /// A blank subject is no subject.
+        #[tokio::test]
+        async fn token_fallback_is_rejected_when_the_subject_is_blank() {
+            assert!(matches!(
+                auth().authenticate(Some("blank-subject"), None).await,
+                UdsAuth::Reject(_)
+            ));
         }
 
         /// Neither peer-cred nor a valid token → rejected.

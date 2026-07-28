@@ -694,4 +694,54 @@ mod tests {
         // to attach.
         assert_eq!(resolve_local_client_context(None, None), None);
     }
+
+    /// #807: the trait's own token-only policy resolved identity with
+    /// `unwrap_or_default()`, so a validator that accepted a token but could not
+    /// name its subject admitted the caller to the schema sentinel `"default"` -
+    /// the primary data partition. Identity is now part of acceptance.
+    mod token_only_policy_needs_a_subject {
+        use super::*;
+
+        struct SubjectStub {
+            subject: Option<&'static str>,
+        }
+
+        #[async_trait::async_trait]
+        impl UdsAuthValidator for SubjectStub {
+            async fn validate_bearer_token(&self, token: &str) -> bool {
+                token == "good"
+            }
+            async fn extract_user_id(&self, _token: &str) -> Option<UserId> {
+                self.subject.map(UserId::from)
+            }
+        }
+
+        fn stub(subject: Option<&'static str>) -> SubjectStub {
+            SubjectStub { subject }
+        }
+
+        #[tokio::test]
+        async fn a_token_that_names_a_subject_is_admitted_as_that_subject() {
+            match stub(Some("alice")).authenticate(Some("good"), None).await {
+                UdsAuth::Allow { user, .. } => assert_eq!(user, UserId::from("alice")),
+                UdsAuth::Reject(reason) => panic!("expected Allow, got Reject({reason})"),
+            }
+        }
+
+        #[tokio::test]
+        async fn a_token_with_no_subject_is_rejected() {
+            assert!(matches!(
+                stub(None).authenticate(Some("good"), None).await,
+                UdsAuth::Reject(_)
+            ));
+        }
+
+        #[tokio::test]
+        async fn a_token_with_a_blank_subject_is_rejected() {
+            assert!(matches!(
+                stub(Some("   ")).authenticate(Some("good"), None).await,
+                UdsAuth::Reject(_)
+            ));
+        }
+    }
 }
