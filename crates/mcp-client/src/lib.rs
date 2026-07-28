@@ -1061,8 +1061,17 @@ impl HttpTransport {
         // #804: every request below attaches `credential` as `Authorization:
         // Bearer` (or, for a static credential, may carry a live OAuth
         // access token) — refuse a URL that would send it in the clear
-        // before ever attempting a connection.
-        crate::url_policy::validate_remote_url(url).map_err(|e| {
+        // before ever attempting a connection. `credential` is already
+        // resolved here, so whether it carries anything at all is a direct
+        // fact rather than a guess (see url_policy's module docs on why
+        // that distinction narrows the bare-hostname exemption).
+        let request_credential = match credential {
+            Credential::None => crate::url_policy::RequestCredential::None,
+            Credential::Static(_) | Credential::OAuth(_) => {
+                crate::url_policy::RequestCredential::Attached
+            }
+        };
+        crate::url_policy::validate_remote_url(url, request_credential).map_err(|e| {
             McpError::Http(format!("refusing remote MCP url (rule: {}): {e}", e.code()))
         })?;
         let client = reqwest::Client::builder()
