@@ -1204,10 +1204,24 @@ impl BuiltinToolService {
         // the global one, the same "global plus mine, mine wins" view
         // `builtin_skill_search` presents without asking the caller to pick
         // a scope either.
+        //
+        // A live personal row wins outright, with no second lookup. A
+        // personal row that is a TOMBSTONE (`present_on_disk: false` -- its
+        // files are gone, but the append-only catalog keeps it) must not
+        // permanently shadow a live global skill of the same name: there is
+        // no `owner` argument any more for the caller to reach past it with,
+        // so the fallback has to reach past a dead personal row on its own.
+        // Only when the global lookup also comes up empty does the personal
+        // tombstone stand, since it is then the only record that ever
+        // existed for this name.
         let mine = get_fn(name.clone(), Some(SKILL_GET_OWN_SCOPE.to_string())).await?;
-        let found = match mine {
-            Some(skill) => Some(skill),
-            None => get_fn(name.clone(), None).await?,
+        let found = if mine.as_ref().is_some_and(|s| s.present_on_disk) {
+            mine
+        } else {
+            match get_fn(name.clone(), None).await? {
+                Some(global) => Some(global),
+                None => mine,
+            }
         };
 
         match found {
