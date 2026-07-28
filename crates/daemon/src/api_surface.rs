@@ -1859,13 +1859,18 @@ fn constrain_base_url(conn: &ConnectionConfig) -> Result<(), CoreError> {
     let Some(base_url) = conn.base_url() else {
         return Ok(());
     };
-    desktop_assistant_mcp_client::url_policy::validate_remote_url(base_url).map_err(|e| {
-        CoreError::InvalidInput {
+    let credential = if conn.carries_credential() {
+        desktop_assistant_mcp_client::url_policy::RequestCredential::Attached
+    } else {
+        desktop_assistant_mcp_client::url_policy::RequestCredential::None
+    };
+    desktop_assistant_mcp_client::url_policy::validate_remote_url(base_url, credential).map_err(
+        |e| CoreError::InvalidInput {
             code: e.code(),
             description: format!("connection base_url {base_url:?} refused: {e}"),
             message: e.user_message(),
-        }
-    })
+        },
+    )
 }
 
 /// Project a client-supplied [`ConnectionConfigPayload`] onto the stored
@@ -2690,6 +2695,49 @@ mod tests {
         )
         .await
         .expect("a loopback http base_url must be accepted");
+    }
+
+    /// The exact shipped deployment: `deploy/k8s/base/daemon.toml` reaches
+    /// Ollama at `http://ollama:11434`, a bare in-cluster Service name.
+    /// Ollama has no credential concept, so the bare-hostname exemption
+    /// applies regardless (#804 review: this must stay pinned once the
+    /// exemption becomes credential-gated).
+    #[tokio::test]
+    async fn create_connection_accepts_a_bare_hostname_base_url_for_ollama() {
+        let svc = DaemonConnectionsService::new(make_handle_with(DaemonConfig::default()));
+        svc.create_connection(
+            "cluster-ollama".to_string(),
+            ConnectionConfigPayload::Ollama {
+                base_url: Some("http://ollama:11434".into()),
+                connect_timeout_secs: None,
+                stream_timeout_secs: None,
+                keep_warm: None,
+                max_context_tokens: None,
+            },
+        )
+        .await
+        .expect("a bare in-cluster service name must be accepted for a credential-less connector");
+    }
+
+    /// #804 review (F1/F5): a bare hostname is not "a network the operator
+    /// controls" once a credential is attached — every non-Ollama connector
+    /// carries one (or is meant to). Without this, an admin could point a
+    /// credentialed connector's `base_url` at a name resolved by search-
+    /// domain append or LLMNR, neither of which the operator authenticated.
+    #[tokio::test]
+    async fn create_connection_rejects_a_bare_hostname_base_url_for_a_credentialed_connector() {
+        let svc = DaemonConnectionsService::new(make_handle_with(DaemonConfig::default()));
+        let err = svc
+            .create_connection(
+                "work".to_string(),
+                openai_payload_with_base_url("http://internal-proxy:8080/v1"),
+            )
+            .await
+            .unwrap_err();
+        match err {
+            CoreError::InvalidInput { code, .. } => assert_eq!(code, "url_insecure_scheme"),
+            other => panic!("expected CoreError::InvalidInput, got {other}"),
+        }
     }
 
     #[tokio::test]
