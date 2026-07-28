@@ -79,6 +79,12 @@ impl AdminSubjects {
         self.0.is_empty()
     }
 
+    /// How many subjects are allowlisted. For an operator-facing startup log:
+    /// the count is the useful signal, the names are not the daemon's to shout.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
     /// The capability this allowlist grants `subject`. Exact match on the
     /// authenticated subject (the JWT `sub` remotely, the peer's login name
     /// locally); an unlisted or blank subject is a tenant.

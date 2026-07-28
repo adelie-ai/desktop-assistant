@@ -2740,15 +2740,32 @@ async fn main() -> Result<()> {
     // allowlist and never notices - its local peer is an administrator by
     // construction (see `PeerCredUdsAuth`). File-only: nothing on the wire
     // writes it, so a tenant cannot grant themselves the capability.
+    //
+    // Read from the config already loaded at startup rather than re-reading the
+    // file. A second read could fail where the first succeeded (or vice versa),
+    // and its failure would be silent: an empty allowlist is indistinguishable
+    // from a deliberately empty one, so an operator who mistyped `daemon.toml`
+    // would see no signal at all about why nobody is an administrator.
     let admin_subjects: Arc<desktop_assistant_transport_dispatch::AdminSubjects> = Arc::new(
-        config::load_daemon_config(&config_path)
-            .ok()
-            .flatten()
+        daemon_config
+            .as_ref()
             .map(|cfg| desktop_assistant_transport_dispatch::AdminSubjects::from(&cfg.authz))
             .unwrap_or_default(),
     );
-    if !admin_subjects.is_empty() {
-        tracing::info!("[authz] admin_subjects configured; remote administrators are allowlisted");
+    match daemon_config.as_ref() {
+        // The file did not load at all; the error above already named it. Say
+        // what that means for authorization, because the consequence is not
+        // obvious from a parse error.
+        None => tracing::warn!(
+            "[authz] daemon.toml did not load, so admin_subjects is empty: no remote client              can administer this daemon. Local peers running as this daemon's own user are              unaffected - they are administrators by construction"
+        ),
+        Some(_) if admin_subjects.is_empty() => tracing::info!(
+            "[authz] no admin_subjects configured: remote clients are tenants. This is the              default, and is correct for a desktop or for an instance configured from its              own daemon.toml"
+        ),
+        Some(_) => tracing::info!(
+            "[authz] {} admin subject(s) allowlisted for remote administration",
+            admin_subjects.len()
+        ),
     }
 
     let ws_auth: Arc<dyn ws::WsAuthValidator> = if let Some(oidc) = &oidc_config {

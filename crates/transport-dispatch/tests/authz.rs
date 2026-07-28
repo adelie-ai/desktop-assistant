@@ -246,174 +246,101 @@ fn operator_changes() -> api::ConfigChanges {
     }
 }
 
-/// The number of distinct `Command` variants [`command_samples`] must cover.
+/// The capability table: one row per `Command` variant, pairing the variant
+/// with the sample the behaviour tests drive through the dispatcher and the
+/// capability it must require.
 ///
-/// Kept honest by `every_command_variant_has_a_sample` together with the
-/// compile-time probe below: adding a variant breaks the probe, and the count
-/// assertion then names the number to raise this to.
-const COMMAND_VARIANT_COUNT: usize = 68;
+/// `command_table!` generates **both** the exhaustive match and the sample list
+/// from these rows, so the two cannot diverge. That is the point, and it took
+/// two attempts to get right:
+///
+/// - A separate or-pattern probe plus a hand-maintained count was defeated by
+///   the shortest fix available: appending `| api::Command::NewThing` to the
+///   probe satisfied the compiler while the sample list stayed at its old
+///   length and the count assertion still held. A new variant sailed through
+///   classified but exercised by none of the sweep tests.
+/// - Generating both from one table closed that, but a row taking a general
+///   `pat` could still be folded (`Ping | NewThing => (ping_sample, ...)`),
+///   which also compiled green.
+///
+/// So a row takes a bare **identifier**, and the macro builds the pattern. One
+/// variant per row is now enforced by the grammar: there is no pattern position
+/// to fold into, and the only way to satisfy the build error a new variant
+/// causes is to add a row - which produces its sample as a side effect.
+macro_rules! command_table {
+    ($( $variant:ident => ($sample:expr, $capability:expr) ),+ $(,)?) => {
+        /// One sample of every `Command` variant with the capability it requires.
+        fn command_samples() -> Vec<(api::Command, Capability)> {
+            vec![ $( ($sample, $capability) ),+ ]
+        }
 
-/// Compile-time guard for [`command_samples`]. Never called, and deliberately
-/// has **no wildcard arm**.
-///
-/// Adding a `Command` variant is otherwise invisible to this file: the
-/// production `required_capability` match forces the author to classify it, but
-/// nothing forced them to add a sample here - so four behaviour tests would
-/// quietly stop covering it. This match makes the omission a build error that
-/// points at this file.
-#[allow(dead_code)]
-fn every_variant_needs_a_sample(cmd: &api::Command) {
-    match cmd {
-        api::Command::Ping
-        | api::Command::GetStatus
-        | api::Command::GetConfig
-        | api::Command::SetConfig { .. }
-        | api::Command::CreateConversation { .. }
-        | api::Command::ListConversations { .. }
-        | api::Command::GetConversation { .. }
-        | api::Command::GetMessages { .. }
-        | api::Command::DeleteConversation { .. }
-        | api::Command::RenameConversation { .. }
-        | api::Command::ArchiveConversation { .. }
-        | api::Command::UnarchiveConversation { .. }
-        | api::Command::ClearAllHistory
-        | api::Command::SendMessage { .. }
-        | api::Command::SetConversationPersonality { .. }
-        | api::Command::SetApiKey { .. }
-        | api::Command::GetEmbeddingsSettings
-        | api::Command::SetEmbeddingsSettings { .. }
-        | api::Command::GetConnectorDefaults { .. }
-        | api::Command::GetPersistenceSettings
-        | api::Command::SetPersistenceSettings { .. }
-        | api::Command::GetDatabaseSettings
-        | api::Command::SetDatabaseSettings { .. }
-        | api::Command::GetBackendTasksSettings
-        | api::Command::SetBackendTasksSettings { .. }
-        | api::Command::GetWsAuthSettings
-        | api::Command::SetWsAuthSettings { .. }
-        | api::Command::ListConnections
-        | api::Command::CreateConnection { .. }
-        | api::Command::UpdateConnection { .. }
-        | api::Command::DeleteConnection { .. }
-        | api::Command::SetConnectionSecret { .. }
-        | api::Command::ListAvailableModels { .. }
-        | api::Command::GetPurposes
-        | api::Command::SetPurpose { .. }
-        | api::Command::GetToolUsage { .. }
-        | api::Command::ListKnowledgeEntries { .. }
-        | api::Command::GetKnowledgeEntry { .. }
-        | api::Command::SearchKnowledgeEntries { .. }
-        | api::Command::CreateKnowledgeEntry { .. }
-        | api::Command::UpdateKnowledgeEntry { .. }
-        | api::Command::DeleteKnowledgeEntry { .. }
-        | api::Command::GetKnowledgeTrashCount
-        | api::Command::EmptyKnowledgeTrash
-        | api::Command::StartKnowledgeMaintenance { .. }
-        | api::Command::ListMcpServers
-        | api::Command::AddMcpServer { .. }
-        | api::Command::RemoveMcpServer { .. }
-        | api::Command::SetMcpServerEnabled { .. }
-        | api::Command::McpServerAction { .. }
-        | api::Command::UpsertMcpServer { .. }
-        | api::Command::SetMcpSecret { .. }
-        | api::Command::ListServiceAccounts
-        | api::Command::UpsertServiceAccount { .. }
-        | api::Command::RemoveServiceAccount { .. }
-        | api::Command::ListBackgroundTasks { .. }
-        | api::Command::GetBackgroundTask { .. }
-        | api::Command::CancelBackgroundTask { .. }
-        | api::Command::GetBackgroundTaskLogs { .. }
-        | api::Command::SubscribeBackgroundTasks
-        | api::Command::UnsubscribeBackgroundTasks
-        | api::Command::SubscribeConversations { .. }
-        | api::Command::SpawnStandaloneAgent { .. }
-        | api::Command::GetConversationScratchpad { .. }
-        | api::Command::SetScratchpadNote { .. }
-        | api::Command::DeleteScratchpadNotes { .. }
-        | api::Command::RegisterClientTools { .. }
-        | api::Command::ClientToolResult { .. } => {}
-    }
+        /// Never called. Its only job is to fail the build when a `Command`
+        /// variant has no row above.
+        ///
+        /// The row grammar takes a bare variant **identifier**, not a pattern,
+        /// and builds `api::Command::$variant { .. }` itself - a form rustc
+        /// accepts for unit, tuple and struct variants alike. So a row cannot
+        /// name two variants: `A | B => (...)` is a syntax error here, not a
+        /// working shortcut. That is deliberate, and it is the hole the
+        /// previous shape left open.
+        #[allow(dead_code)]
+        fn every_variant_is_in_the_table(cmd: &api::Command) {
+            match cmd { $( api::Command::$variant { .. } => {} ),+ }
+        }
+    };
 }
 
-/// One sample of every `Command` variant with the capability it requires.
-///
-/// `SetConfig` appears twice on purpose: it is the mixed command, carrying both
-/// daemon-global knobs and the personality traits.
-fn command_samples() -> Vec<(api::Command, Capability)> {
-    use Capability::{Admin, Tenant};
-    vec![
-        (api::Command::Ping, Tenant),
-        (api::Command::GetStatus, Tenant),
-        (api::Command::GetConfig, Tenant),
-        (
-            api::Command::SetConfig {
+// The table below is dense; the bare names keep one row per line readable.
+use desktop_assistant_transport_dispatch::Capability::{Admin, Tenant};
+
+command_table! {
+    Ping => (api::Command::Ping, Tenant),
+    GetStatus => (api::Command::GetStatus, Tenant),
+    GetConfig => (api::Command::GetConfig, Tenant),
+    SetConfig => (api::Command::SetConfig {
                 changes: personality_changes(),
             },
-            Admin,
-        ),
-        (
-            api::Command::SetConfig {
-                changes: operator_changes(),
-            },
-            Admin,
-        ),
-        (
-            api::Command::CreateConversation {
+            Admin),
+    CreateConversation => (api::Command::CreateConversation {
                 title: "t".to_string(),
                 tags: vec![],
             },
-            Tenant,
-        ),
-        (
-            api::Command::ListConversations {
+            Tenant),
+    ListConversations => (api::Command::ListConversations {
                 max_age_days: None,
                 include_archived: false,
             },
-            Tenant,
-        ),
-        (
-            api::Command::GetConversation {
+            Tenant),
+    GetConversation => (api::Command::GetConversation {
                 id: "c".to_string(),
             },
-            Tenant,
-        ),
-        (
-            api::Command::GetMessages {
+            Tenant),
+    GetMessages => (api::Command::GetMessages {
                 conversation_id: "c".to_string(),
                 tail: 10,
                 after_count: -1,
                 include_roles: vec![],
             },
-            Tenant,
-        ),
-        (
-            api::Command::DeleteConversation {
+            Tenant),
+    DeleteConversation => (api::Command::DeleteConversation {
                 id: "c".to_string(),
             },
-            Tenant,
-        ),
-        (
-            api::Command::RenameConversation {
+            Tenant),
+    RenameConversation => (api::Command::RenameConversation {
                 id: "c".to_string(),
                 title: "t".to_string(),
             },
-            Tenant,
-        ),
-        (
-            api::Command::ArchiveConversation {
+            Tenant),
+    ArchiveConversation => (api::Command::ArchiveConversation {
                 id: "c".to_string(),
             },
-            Tenant,
-        ),
-        (
-            api::Command::UnarchiveConversation {
+            Tenant),
+    UnarchiveConversation => (api::Command::UnarchiveConversation {
                 id: "c".to_string(),
             },
-            Tenant,
-        ),
-        (api::Command::ClearAllHistory, Tenant),
-        (
-            api::Command::SendMessage {
+            Tenant),
+    ClearAllHistory => (api::Command::ClearAllHistory, Tenant),
+    SendMessage => (api::Command::SendMessage {
                 conversation_id: "c".to_string(),
                 content: "hi".to_string(),
                 override_selection: None,
@@ -421,57 +348,43 @@ fn command_samples() -> Vec<(api::Command, Capability)> {
                 client_context: None,
                 idempotency_key: None,
             },
-            Tenant,
-        ),
-        (
-            api::Command::SetConversationPersonality {
+            Tenant),
+    SetConversationPersonality => (api::Command::SetConversationPersonality {
                 conversation_id: "c".to_string(),
                 personality: api::ConversationPersonalityView::default(),
             },
-            Tenant,
-        ),
-        (
-            api::Command::SetApiKey {
+            Tenant),
+    SetApiKey => (api::Command::SetApiKey {
                 api_key: "k".into(),
             },
-            Admin,
-        ),
-        (api::Command::GetEmbeddingsSettings, Tenant),
-        (
-            api::Command::SetEmbeddingsSettings {
+            Admin),
+    GetEmbeddingsSettings => (api::Command::GetEmbeddingsSettings, Tenant),
+    SetEmbeddingsSettings => (api::Command::SetEmbeddingsSettings {
                 connector: None,
                 model: None,
                 base_url: None,
             },
-            Admin,
-        ),
-        (
-            api::Command::GetConnectorDefaults {
+            Admin),
+    GetConnectorDefaults => (api::Command::GetConnectorDefaults {
                 connector: "ollama".to_string(),
             },
-            Tenant,
-        ),
-        (api::Command::GetPersistenceSettings, Tenant),
-        (
-            api::Command::SetPersistenceSettings {
+            Tenant),
+    GetPersistenceSettings => (api::Command::GetPersistenceSettings, Tenant),
+    SetPersistenceSettings => (api::Command::SetPersistenceSettings {
                 enabled: true,
                 remote_url: None,
                 remote_name: None,
                 push_on_update: false,
             },
-            Admin,
-        ),
-        (api::Command::GetDatabaseSettings, Tenant),
-        (
-            api::Command::SetDatabaseSettings {
+            Admin),
+    GetDatabaseSettings => (api::Command::GetDatabaseSettings, Tenant),
+    SetDatabaseSettings => (api::Command::SetDatabaseSettings {
                 url: api::Secret(String::new()),
                 max_connections: 5,
             },
-            Admin,
-        ),
-        (api::Command::GetBackendTasksSettings, Tenant),
-        (
-            api::Command::SetBackendTasksSettings {
+            Admin),
+    GetBackendTasksSettings => (api::Command::GetBackendTasksSettings, Tenant),
+    SetBackendTasksSettings => (api::Command::SetBackendTasksSettings {
                 llm_connector: String::new(),
                 llm_model: String::new(),
                 llm_base_url: String::new(),
@@ -479,11 +392,9 @@ fn command_samples() -> Vec<(api::Command, Capability)> {
                 dreaming_interval_secs: 60,
                 archive_after_days: 7,
             },
-            Admin,
-        ),
-        (api::Command::GetWsAuthSettings, Tenant),
-        (
-            api::Command::SetWsAuthSettings {
+            Admin),
+    GetWsAuthSettings => (api::Command::GetWsAuthSettings, Tenant),
+    SetWsAuthSettings => (api::Command::SetWsAuthSettings {
                 methods: vec!["password".to_string()],
                 oidc_issuer: String::new(),
                 oidc_auth_endpoint: String::new(),
@@ -491,225 +402,161 @@ fn command_samples() -> Vec<(api::Command, Capability)> {
                 oidc_client_id: String::new(),
                 oidc_scopes: String::new(),
             },
-            Admin,
-        ),
-        (api::Command::ListConnections, Tenant),
-        (
-            api::Command::CreateConnection {
+            Admin),
+    ListConnections => (api::Command::ListConnections, Tenant),
+    CreateConnection => (api::Command::CreateConnection {
                 id: "c".to_string(),
                 config: connection_config(),
             },
-            Admin,
-        ),
-        (
-            api::Command::UpdateConnection {
+            Admin),
+    UpdateConnection => (api::Command::UpdateConnection {
                 id: "c".to_string(),
                 config: connection_config(),
             },
-            Admin,
-        ),
-        (
-            api::Command::DeleteConnection {
+            Admin),
+    DeleteConnection => (api::Command::DeleteConnection {
                 id: "c".to_string(),
                 force: false,
             },
-            Admin,
-        ),
-        (
-            api::Command::SetConnectionSecret {
+            Admin),
+    SetConnectionSecret => (api::Command::SetConnectionSecret {
                 id: "c".to_string(),
                 credential: api::Secret("s".to_string()),
             },
-            Admin,
-        ),
-        (
-            api::Command::ListAvailableModels {
+            Admin),
+    ListAvailableModels => (api::Command::ListAvailableModels {
                 connection_id: None,
                 refresh: false,
             },
-            Tenant,
-        ),
-        (api::Command::GetPurposes, Tenant),
-        (
-            api::Command::SetPurpose {
+            Tenant),
+    GetPurposes => (api::Command::GetPurposes, Tenant),
+    SetPurpose => (api::Command::SetPurpose {
                 purpose: api::PurposeKindApi::Interactive,
                 config: purpose_config(),
             },
-            Admin,
-        ),
-        (
-            api::Command::GetToolUsage {
+            Admin),
+    GetToolUsage => (api::Command::GetToolUsage {
                 conversation_id: "c".to_string(),
             },
-            Tenant,
-        ),
-        (
-            api::Command::ListKnowledgeEntries {
+            Tenant),
+    ListKnowledgeEntries => (api::Command::ListKnowledgeEntries {
                 limit: 10,
                 offset: 0,
                 tag_filter: None,
             },
-            Tenant,
-        ),
-        (
-            api::Command::GetKnowledgeEntry {
+            Tenant),
+    GetKnowledgeEntry => (api::Command::GetKnowledgeEntry {
                 id: "k".to_string(),
             },
-            Tenant,
-        ),
-        (
-            api::Command::SearchKnowledgeEntries {
+            Tenant),
+    SearchKnowledgeEntries => (api::Command::SearchKnowledgeEntries {
                 query: "q".to_string(),
                 tag_filter: None,
                 limit: 10,
             },
-            Tenant,
-        ),
-        (
-            api::Command::CreateKnowledgeEntry {
+            Tenant),
+    CreateKnowledgeEntry => (api::Command::CreateKnowledgeEntry {
                 content: "c".to_string(),
                 tags: vec![],
                 metadata: serde_json::Value::Null,
             },
-            Tenant,
-        ),
-        (
-            api::Command::UpdateKnowledgeEntry {
+            Tenant),
+    UpdateKnowledgeEntry => (api::Command::UpdateKnowledgeEntry {
                 id: "k".to_string(),
                 content: "c".to_string(),
                 tags: vec![],
                 metadata: serde_json::Value::Null,
             },
-            Tenant,
-        ),
-        (
-            api::Command::DeleteKnowledgeEntry {
+            Tenant),
+    DeleteKnowledgeEntry => (api::Command::DeleteKnowledgeEntry {
                 id: "k".to_string(),
             },
-            Tenant,
-        ),
-        (api::Command::GetKnowledgeTrashCount, Tenant),
-        (api::Command::EmptyKnowledgeTrash, Tenant),
-        // Admin, not tenant: every arm reaches past the caller's own rows. See
-        // `knowledge_maintenance_is_admin_because_it_touches_every_tenant`.
-        (
-            api::Command::StartKnowledgeMaintenance {
+            Tenant),
+    GetKnowledgeTrashCount => (api::Command::GetKnowledgeTrashCount, Tenant),
+    EmptyKnowledgeTrash => (api::Command::EmptyKnowledgeTrash, Tenant),
+    StartKnowledgeMaintenance => (api::Command::StartKnowledgeMaintenance {
                 op: api::MaintenanceOp::Extraction,
             },
-            Admin,
-        ),
-        (api::Command::ListMcpServers, Tenant),
-        (
-            api::Command::AddMcpServer {
+            Admin),
+    ListMcpServers => (api::Command::ListMcpServers, Tenant),
+    AddMcpServer => (api::Command::AddMcpServer {
                 name: "s".to_string(),
                 command: "/bin/true".to_string(),
                 args: vec![],
                 namespace: None,
                 enabled: true,
             },
-            Admin,
-        ),
-        (
-            api::Command::RemoveMcpServer {
+            Admin),
+    RemoveMcpServer => (api::Command::RemoveMcpServer {
                 name: "s".to_string(),
             },
-            Admin,
-        ),
-        (
-            api::Command::SetMcpServerEnabled {
+            Admin),
+    SetMcpServerEnabled => (api::Command::SetMcpServerEnabled {
                 name: "s".to_string(),
                 enabled: true,
             },
-            Admin,
-        ),
-        // The sample is the process-spawning action; `"status"` is a read and
-        // is covered by `mcp_status_is_a_read_and_stays_tenant`.
-        (
-            api::Command::McpServerAction {
+            Admin),
+    McpServerAction => (api::Command::McpServerAction {
                 action: "restart".to_string(),
                 server: None,
             },
-            Admin,
-        ),
-        (
-            api::Command::UpsertMcpServer {
+            Admin),
+    UpsertMcpServer => (api::Command::UpsertMcpServer {
                 config_json: "{}".to_string(),
             },
-            Admin,
-        ),
-        (
-            api::Command::SetMcpSecret {
+            Admin),
+    SetMcpSecret => (api::Command::SetMcpSecret {
                 id: "s".to_string(),
                 value: api::Secret("v".to_string()),
             },
-            Admin,
-        ),
-        (api::Command::ListServiceAccounts, Tenant),
-        (
-            api::Command::UpsertServiceAccount {
+            Admin),
+    ListServiceAccounts => (api::Command::ListServiceAccounts, Tenant),
+    UpsertServiceAccount => (api::Command::UpsertServiceAccount {
                 config_json: "{}".to_string(),
             },
-            Admin,
-        ),
-        (
-            api::Command::RemoveServiceAccount {
+            Admin),
+    RemoveServiceAccount => (api::Command::RemoveServiceAccount {
                 id: "a".to_string(),
             },
-            Admin,
-        ),
-        (
-            api::Command::ListBackgroundTasks {
+            Admin),
+    ListBackgroundTasks => (api::Command::ListBackgroundTasks {
                 include_finished: false,
                 limit: None,
             },
-            Tenant,
-        ),
-        (
-            api::Command::GetBackgroundTask {
+            Tenant),
+    GetBackgroundTask => (api::Command::GetBackgroundTask {
                 id: "t".to_string(),
             },
-            Tenant,
-        ),
-        (
-            api::Command::CancelBackgroundTask {
+            Tenant),
+    CancelBackgroundTask => (api::Command::CancelBackgroundTask {
                 id: "t".to_string(),
             },
-            Tenant,
-        ),
-        (
-            api::Command::GetBackgroundTaskLogs {
+            Tenant),
+    GetBackgroundTaskLogs => (api::Command::GetBackgroundTaskLogs {
                 id: "t".to_string(),
                 after_seq: None,
                 limit: None,
             },
-            Tenant,
-        ),
-        (api::Command::SubscribeBackgroundTasks, Tenant),
-        (api::Command::UnsubscribeBackgroundTasks, Tenant),
-        (
-            api::Command::SubscribeConversations {
+            Tenant),
+    SubscribeBackgroundTasks => (api::Command::SubscribeBackgroundTasks, Tenant),
+    UnsubscribeBackgroundTasks => (api::Command::UnsubscribeBackgroundTasks, Tenant),
+    SubscribeConversations => (api::Command::SubscribeConversations {
                 conversation_ids: vec![],
             },
-            Tenant,
-        ),
-        (
-            api::Command::SpawnStandaloneAgent {
+            Tenant),
+    SpawnStandaloneAgent => (api::Command::SpawnStandaloneAgent {
                 name: "a".to_string(),
                 initial_prompt: "p".to_string(),
                 override_selection: None,
                 tools: None,
             },
-            Tenant,
-        ),
-        (
-            api::Command::GetConversationScratchpad {
+            Tenant),
+    GetConversationScratchpad => (api::Command::GetConversationScratchpad {
                 conversation_id: "c".to_string(),
                 max_results: None,
             },
-            Tenant,
-        ),
-        (
-            api::Command::SetScratchpadNote {
+            Tenant),
+    SetScratchpadNote => (api::Command::SetScratchpadNote {
                 conversation_id: "c".to_string(),
                 key: "k".to_string(),
                 content: "v".to_string(),
@@ -717,31 +564,57 @@ fn command_samples() -> Vec<(api::Command, Capability)> {
                 sequence: None,
                 done: false,
             },
-            Tenant,
-        ),
-        (
-            api::Command::DeleteScratchpadNotes {
+            Tenant),
+    DeleteScratchpadNotes => (api::Command::DeleteScratchpadNotes {
                 conversation_id: "c".to_string(),
                 keys: vec![],
                 all: false,
             },
-            Tenant,
-        ),
-        (api::Command::RegisterClientTools { tools: vec![] }, Tenant),
-        (
-            api::Command::ClientToolResult {
+            Tenant),
+    RegisterClientTools => (api::Command::RegisterClientTools { tools: vec![] }, Tenant),
+    ClientToolResult => (api::Command::ClientToolResult {
                 task_id: api::TaskId("t".to_string()),
                 tool_call_id: "tc".to_string(),
                 result: Some("r".to_string()),
                 error: None,
             },
-            Tenant,
+            Tenant),
+}
+
+/// Classifications that depend on the command's *payload* rather than its
+/// variant, so one row in the table above cannot express them.
+///
+/// The table carries the personality-only `SetConfig` and the process-spawning
+/// `McpServerAction`; these are the other side of each split. Both also have
+/// their own named tests.
+fn payload_dependent_samples() -> Vec<(api::Command, Capability)> {
+    vec![
+        (
+            api::Command::SetConfig {
+                changes: operator_changes(),
+            },
+            Admin,
+        ),
+        (
+            api::Command::McpServerAction {
+                action: "status".to_string(),
+                server: None,
+            },
+            Capability::Tenant,
         ),
     ]
 }
 
+/// Every sample the sweep tests drive: one per variant, plus the
+/// payload-dependent cases.
+fn all_samples() -> Vec<(api::Command, Capability)> {
+    let mut all = command_samples();
+    all.extend(payload_dependent_samples());
+    all
+}
+
 fn admin_commands() -> Vec<api::Command> {
-    command_samples()
+    all_samples()
         .into_iter()
         .filter(|(_, cap)| *cap == Capability::Admin)
         .map(|(cmd, _)| cmd)
@@ -815,7 +688,7 @@ fn admin_subjects_ignores_blank_entries() {
 /// themselves the capability they are being denied.
 #[test]
 fn admin_subjects_cannot_be_set_over_the_wire() {
-    for (command, _) in command_samples() {
+    for (command, _) in all_samples() {
         let json = serde_json::to_string(&command).expect("a Command always serializes");
         assert!(
             !json.contains("admin_subjects") && !json.contains("authz"),
@@ -983,11 +856,16 @@ async fn get_purposes_allowed_for_tenant() {
 /// operator's `daemon.toml` and every conversation without an override resolves
 /// against it, so a tenant writing a trait would change every other tenant's
 /// assistant. The tenant lever is the per-conversation override, which is
-/// genuinely user-scoped - so this test asserts the criterion's intent (a
-/// tenant can still set their assistant's personality) against the command that
+/// genuinely user-scoped - so this asserts the criterion's *intent* (a tenant
+/// can still set their assistant's personality) against the command that
 /// honours it.
+///
+/// Named for what it asserts, not for the criterion. A run that printed
+/// `personality_traits_writable_by_tenant ... ok` would tell a reader the
+/// opposite of the truth: a tenant is refused exactly those global traits, which
+/// `global_personality_is_instance_configuration_and_needs_admin` pins.
 #[tokio::test]
-async fn personality_traits_writable_by_tenant() {
+async fn tenant_sets_their_own_personality_per_conversation() {
     // The per-conversation override is the tenant's own, and stays open.
     assert_eq!(
         required_capability(&api::Command::SetConversationPersonality {
@@ -1134,7 +1012,7 @@ async fn single_user_desktop_needs_no_authz_config() {
         .strongest(allowlist.capability_for("dave"));
     assert_eq!(capability, Capability::Admin);
 
-    let commands: Vec<api::Command> = command_samples().into_iter().map(|(c, _)| c).collect();
+    let commands: Vec<api::Command> = all_samples().into_iter().map(|(c, _)| c).collect();
     let expected = expected_handler_calls(&commands);
 
     let (frames, seen) = dispatch_as(capability, commands).await;
@@ -1212,7 +1090,7 @@ async fn refusal_names_the_command_and_the_missing_capability() {
 /// The declared table above and the dispatcher agree for every variant.
 #[tokio::test]
 async fn every_declared_capability_matches_the_dispatcher_gate() {
-    for (command, expected) in command_samples() {
+    for (command, expected) in all_samples() {
         assert_eq!(
             required_capability(&command),
             expected,
@@ -1344,21 +1222,28 @@ async fn an_older_client_still_parses_a_refusal_frame() {
     }
 }
 
-/// The sample table covers every `Command` variant exactly once, so the
-/// behaviour tests driven from it cannot silently narrow.
+/// Each row names a distinct command, and its sample really is that command.
+///
+/// The macro's grammar already makes one-variant-per-row structural, and a
+/// duplicate row is an unreachable-pattern error. This is the cheap belt on top:
+/// it catches a row whose *sample* was copied from a neighbour and not updated,
+/// which nothing else would notice.
 #[test]
-fn every_command_variant_has_a_sample() {
+fn each_row_carries_a_distinct_and_correct_sample() {
     let samples = command_samples();
-    let mut names: Vec<String> = samples.iter().map(|(c, _)| command_key(c)).collect();
-    names.sort();
-    names.dedup();
+    let mut counts = std::collections::BTreeMap::new();
+    for (cmd, _) in &samples {
+        *counts.entry(command_key(cmd)).or_insert(0usize) += 1;
+    }
+    let duplicated: Vec<_> = counts.iter().filter(|(_, n)| **n > 1).collect();
+    assert!(
+        duplicated.is_empty(),
+        "a row's sample was copied from another row: {duplicated:?}"
+    );
     assert_eq!(
-        names.len(),
-        COMMAND_VARIANT_COUNT,
-        "command_samples() covers {} of {COMMAND_VARIANT_COUNT} variants. \
-         Add the missing sample, or raise COMMAND_VARIANT_COUNT if a variant \
-         was added. Covered: {names:?}",
-        names.len()
+        samples.len(),
+        counts.len(),
+        "every row must contribute exactly one distinct command"
     );
 }
 
@@ -1367,7 +1252,7 @@ fn every_command_variant_has_a_sample() {
 /// path read a name without materialising a copy of the command.
 #[test]
 fn commands_report_their_wire_name() {
-    for (command, _) in command_samples() {
+    for (command, _) in all_samples() {
         assert_eq!(
             command_name(&command),
             command_key(&command),
