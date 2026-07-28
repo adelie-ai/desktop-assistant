@@ -2803,169 +2803,202 @@ async fn main() -> Result<()> {
     // and its TLS/login/origin machinery — is opt-in via
     // DESKTOP_ASSISTANT_WS_ENABLED=true.
     let ws_enabled = env_bool("DESKTOP_ASSISTANT_WS_ENABLED", transports_config.ws_enabled);
-    let (ws_shutdown_tx, ws_task) = if ws_enabled {
-        let ws_bind = std::env::var("DESKTOP_ASSISTANT_WS_BIND")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| transports_config.ws_bind.clone());
-        let ws_addr: std::net::SocketAddr = ws_bind
-            .parse()
-            .map_err(|e| anyhow::anyhow!("invalid DESKTOP_ASSISTANT_WS_BIND '{ws_bind}': {e}"))?;
 
-        // Build auth discovery provider
-        let auth_discovery: Option<Arc<dyn ws::WsAuthDiscovery>> =
-            match config::get_ws_auth_discovery(&config_path) {
-                Ok(discovery) => {
-                    tracing::info!("auth discovery: methods={:?}", discovery.methods);
-                    Some(Arc::new(WsAuthDiscoveryProvider { discovery }))
-                }
-                Err(e) => {
-                    tracing::warn!("failed to load auth discovery config: {e}");
-                    None
-                }
-            };
+    // TLS configuration. Read unconditionally — cheap, no I/O — so
+    // `transports::resolve_ws_door_plan` below is the single place that
+    // decides whether the door binds and how, including the
+    // `ws_enabled = false` case, where TLS is never resolved at all
+    // (#805 review: this is what lets a desktop user's stale or broken
+    // `[tls]` section stay irrelevant when they never turned the door on).
+    let tls_config = daemon_config
+        .as_ref()
+        .map(|c| c.tls.clone())
+        .unwrap_or_default();
+    let tls_env_override = std::env::var("DESKTOP_ASSISTANT_WS_TLS")
+        .ok()
+        .map(|v| !matches!(v.trim().to_lowercase().as_str(), "false" | "0" | "no"));
+    let tls_enabled = tls_env_override.unwrap_or(tls_config.enabled);
 
-        // The bind address decides whether the OS-password door is a local
-        // convenience or a network-reachable PAM oracle (#806), so it is an
-        // input to the decision rather than something the door ignores.
-        let ws_login_service: Option<Arc<dyn ws::WsLoginService>> = resolve_ws_login_mode(ws_addr)
-            .map(|(username, mode)| {
-                match &mode {
-                    WsLoginMode::StaticPassword(_) => {
-                        tracing::info!(
-                            "Web login enabled (env-password mode) for username={username}"
-                        );
-                    }
-                    WsLoginMode::SystemPassword(_) => {
-                        // Say the assumption out loud, on every start, not only
-                        // when the bind address looks wrong. A loopback bind is
-                        // a proxy for "only this machine can reach it", and a
-                        // reverse proxy in front of the daemon breaks that
-                        // assumption without changing the bind address.
-                        tracing::warn!(
-                            "Web login enabled (local system-password mode) for \
-                             username={username}: POST /login on {ws_addr} checks that \
-                             account's real OS password through PAM. This is meant for a \
-                             door only this machine can reach. Anything that can reach \
-                             the port can use it, including through a reverse proxy - \
-                             set DESKTOP_ASSISTANT_WS_LOGIN_PASSWORD to use a separate \
-                             credential instead, or \
-                             DESKTOP_ASSISTANT_WS_LOGIN_LOCAL_SYSTEM_AUTH=false to turn \
-                             this off"
-                        );
-                    }
-                }
+    // #805: TLS setup failure must not silently downgrade this door to
+    // plaintext. `resolve_ws_door_plan` returns `Err` when the door is on
+    // and TLS is enabled but cannot be delivered; `?` aborts daemon startup
+    // on that path rather than falling back, because the remote WebSocket
+    // door now carries the bearer token for an administrator (#728) and a
+    // config that asked for TLS is asking for that token to stay encrypted
+    // in transit. Deliberate plaintext (`[tls] enabled = false`) is
+    // unaffected — that is an operator choice, not a downgrade.
+    //
+    // Tradeoff, recorded deliberately: this aborts the *whole* daemon, not
+    // only the WS listener, so an instance also serving local UDS loses
+    // that too on a bad remote TLS config. Every shipped config disables
+    // either the remote door or TLS, so no shipped deployment exercises
+    // this; it is unmissable in k8s (CrashLoopBackOff beats a remote door
+    // nobody notices is silently dead), but it is a real cost for a
+    // self-hoster who enables the remote door on an otherwise-desktop
+    // install and loses their local assistant to an unrelated cert expiry.
+    let ws_door_plan = transports::resolve_ws_door_plan(
+        ws_enabled,
+        tls_enabled,
+        tls_config.cert_file.as_deref(),
+        tls_config.key_file.as_deref(),
+    )
+    .inspect_err(|e| {
+        tracing::error!(
+            "TLS setup failed: {e:#}; refusing to start the remote WebSocket door in plaintext"
+        );
+    })?;
 
-                Arc::new(WsBasicLogin::new(
-                    Arc::clone(&settings_service),
-                    username,
-                    mode,
-                )) as Arc<dyn ws::WsLoginService>
-            });
-        if ws_login_service.is_none() {
-            // Name the condition that actually applies. "One of these three
-            // things" makes an operator check all three; the daemon knows which
-            // one it was.
-            let reason = if is_container_environment() {
-                "this daemon runs in a container, which has no local user account to \
-                 check against"
-                    .to_string()
-            } else if env_bool("DESKTOP_ASSISTANT_WS_LOGIN_LOCAL_SYSTEM_AUTH", true) {
-                format!(
-                    "this daemon is bound to {ws_addr}, which is not loopback, so the \
-                     OS-password mode is off unless \
-                     DESKTOP_ASSISTANT_WS_LOGIN_LOCAL_SYSTEM_AUTH=true asks for it"
-                )
-            } else {
-                "DESKTOP_ASSISTANT_WS_LOGIN_LOCAL_SYSTEM_AUTH is false".to_string()
-            };
-            tracing::warn!(
-                "Web login disabled: {reason}. Set DESKTOP_ASSISTANT_WS_LOGIN_PASSWORD to \
-                 use a separate credential, which is the right mode for a door reachable \
-                 over a network"
-            );
-        }
-
-        let allowed_origins = ws_auth_config
-            .as_ref()
-            .map(|c| c.allowed_origins.clone())
-            .unwrap_or_default();
-        if allowed_origins.is_empty() {
+    let (ws_shutdown_tx, ws_task) = match ws_door_plan {
+        transports::WsDoorPlan::Disabled => {
             tracing::info!(
-                "WebSocket origin policy: browser clients blocked (no allowed_origins configured)"
+                "WebSocket frontend disabled (set DESKTOP_ASSISTANT_WS_ENABLED=true to expose the remote WebSocket API)"
             );
-        } else {
-            tracing::info!("WebSocket allowed origins: {allowed_origins:?}");
+            (None, None)
         }
+        transports::WsDoorPlan::Enabled { tls } => {
+            let ws_bind = std::env::var("DESKTOP_ASSISTANT_WS_BIND")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| transports_config.ws_bind.clone());
+            let ws_addr: std::net::SocketAddr = ws_bind.parse().map_err(|e| {
+                anyhow::anyhow!("invalid DESKTOP_ASSISTANT_WS_BIND '{ws_bind}': {e}")
+            })?;
 
-        // TLS configuration
-        let tls_config = daemon_config
-            .as_ref()
-            .map(|c| c.tls.clone())
-            .unwrap_or_default();
-        let tls_env_override = std::env::var("DESKTOP_ASSISTANT_WS_TLS")
-            .ok()
-            .map(|v| !matches!(v.trim().to_lowercase().as_str(), "false" | "0" | "no"));
-        let tls_enabled = tls_env_override.unwrap_or(tls_config.enabled);
+            // Build auth discovery provider
+            let auth_discovery: Option<Arc<dyn ws::WsAuthDiscovery>> =
+                match config::get_ws_auth_discovery(&config_path) {
+                    Ok(discovery) => {
+                        tracing::info!("auth discovery: methods={:?}", discovery.methods);
+                        Some(Arc::new(WsAuthDiscoveryProvider { discovery }))
+                    }
+                    Err(e) => {
+                        tracing::warn!("failed to load auth discovery config: {e}");
+                        None
+                    }
+                };
 
-        let tls_acceptor = if tls_enabled {
-            match tls::setup(
-                tls_config.cert_file.as_deref(),
-                tls_config.key_file.as_deref(),
-            ) {
-                Ok(server_config) => {
+            // The bind address decides whether the OS-password door is a local
+            // convenience or a network-reachable PAM oracle (#806), so it is an
+            // input to the decision rather than something the door ignores.
+            let ws_login_service: Option<Arc<dyn ws::WsLoginService>> =
+                resolve_ws_login_mode(ws_addr).map(|(username, mode)| {
+                    match &mode {
+                        WsLoginMode::StaticPassword(_) => {
+                            tracing::info!(
+                                "Web login enabled (env-password mode) for username={username}"
+                            );
+                        }
+                        WsLoginMode::SystemPassword(_) => {
+                            // Say the assumption out loud, on every start, not
+                            // only when the bind address looks wrong. A loopback
+                            // bind is a proxy for "only this machine can reach
+                            // it", and a reverse proxy in front of the daemon
+                            // breaks that assumption without changing the bind
+                            // address.
+                            tracing::warn!(
+                                "Web login enabled (local system-password mode) for \
+                                 username={username}: POST /login on {ws_addr} checks that \
+                                 account's real OS password through PAM. This is meant for \
+                                 a door only this machine can reach. Anything that can \
+                                 reach the port can use it, including through a reverse \
+                                 proxy - set DESKTOP_ASSISTANT_WS_LOGIN_PASSWORD to use a \
+                                 separate credential instead, or \
+                                 DESKTOP_ASSISTANT_WS_LOGIN_LOCAL_SYSTEM_AUTH=false to \
+                                 turn this off"
+                            );
+                        }
+                    }
+
+                    Arc::new(WsBasicLogin::new(
+                        Arc::clone(&settings_service),
+                        username,
+                        mode,
+                    )) as Arc<dyn ws::WsLoginService>
+                });
+            if ws_login_service.is_none() {
+                // Name the condition that actually applies. "One of these three
+                // things" makes an operator check all three; the daemon knows
+                // which one it was.
+                let reason = if is_container_environment() {
+                    "this daemon runs in a container, which has no local user account \
+                     to check against"
+                        .to_string()
+                } else if env_bool("DESKTOP_ASSISTANT_WS_LOGIN_LOCAL_SYSTEM_AUTH", true) {
+                    format!(
+                        "this daemon is bound to {ws_addr}, which is not loopback, so the \
+                         OS-password mode is off unless \
+                         DESKTOP_ASSISTANT_WS_LOGIN_LOCAL_SYSTEM_AUTH=true asks for it"
+                    )
+                } else {
+                    "DESKTOP_ASSISTANT_WS_LOGIN_LOCAL_SYSTEM_AUTH is false".to_string()
+                };
+                tracing::warn!(
+                    "Web login disabled: {reason}. Set DESKTOP_ASSISTANT_WS_LOGIN_PASSWORD \
+                     to use a separate credential, which is the right mode for a door \
+                     reachable over a network"
+                );
+            }
+
+            let allowed_origins = ws_auth_config
+                .as_ref()
+                .map(|c| c.allowed_origins.clone())
+                .unwrap_or_default();
+            if allowed_origins.is_empty() {
+                tracing::info!(
+                    "WebSocket origin policy: browser clients blocked (no allowed_origins configured)"
+                );
+            } else {
+                tracing::info!("WebSocket allowed origins: {allowed_origins:?}");
+            }
+
+            let tls_acceptor = match tls {
+                Some(server_config) => {
                     tracing::info!(
                         "TLS enabled; CA cert at {}",
                         tls::default_ca_cert_path().display()
                     );
                     Some(tokio_rustls::TlsAcceptor::from(server_config))
                 }
-                Err(e) => {
-                    tracing::error!("TLS setup failed: {e:#}; falling back to plain ws://");
+                None => {
+                    tracing::info!("TLS disabled; serving plain ws:// deliberately");
                     None
                 }
-            }
-        } else {
-            tracing::info!("TLS disabled; serving plain ws://");
-            None
-        };
+            };
 
-        let (ws_shutdown_tx, ws_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        let ws_task = {
-            let api_handler = Arc::clone(&api_handler);
-            let ws_auth = Arc::clone(&ws_auth);
-            // The daemon system id (#248) so the WS upgrade handler can compare
-            // it to the client-reported header and co-locate same-machine WS
-            // connections.
-            let ws_daemon_system_id = daemon_system_id.clone();
-            tokio::spawn(async move {
-                let shutdown = async {
-                    let _ = ws_shutdown_rx.await;
-                };
-                let ws_config = ws::WsServeConfig::new(api_handler, ws_auth)
-                    .with_login_service(ws_login_service)
-                    .with_auth_discovery(auth_discovery)
-                    .with_allowed_origins(allowed_origins)
-                    .with_daemon_system_id(ws_daemon_system_id);
-                let result = if let Some(acceptor) = tls_acceptor {
-                    tracing::info!("WebSocket listening on wss://{ws_addr} (/ws, /auth/config)");
-                    ws_config.serve_tls(acceptor, ws_addr, shutdown).await
-                } else {
-                    tracing::info!("WebSocket listening on ws://{ws_addr} (/ws, /auth/config)");
-                    ws_config.serve(ws_addr, shutdown).await
-                };
-                if let Err(e) = result {
-                    tracing::error!("WebSocket server error: {e}");
-                }
-            })
-        };
-        (Some(ws_shutdown_tx), Some(ws_task))
-    } else {
-        tracing::info!(
-            "WebSocket frontend disabled (set DESKTOP_ASSISTANT_WS_ENABLED=true to expose the remote WebSocket API)"
-        );
-        (None, None)
+            let (ws_shutdown_tx, ws_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+            let ws_task = {
+                let api_handler = Arc::clone(&api_handler);
+                let ws_auth = Arc::clone(&ws_auth);
+                // The daemon system id (#248) so the WS upgrade handler can compare
+                // it to the client-reported header and co-locate same-machine WS
+                // connections.
+                let ws_daemon_system_id = daemon_system_id.clone();
+                tokio::spawn(async move {
+                    let shutdown = async {
+                        let _ = ws_shutdown_rx.await;
+                    };
+                    let ws_config = ws::WsServeConfig::new(api_handler, ws_auth)
+                        .with_login_service(ws_login_service)
+                        .with_auth_discovery(auth_discovery)
+                        .with_allowed_origins(allowed_origins)
+                        .with_daemon_system_id(ws_daemon_system_id);
+                    let result = if let Some(acceptor) = tls_acceptor {
+                        tracing::info!(
+                            "WebSocket listening on wss://{ws_addr} (/ws, /auth/config)"
+                        );
+                        ws_config.serve_tls(acceptor, ws_addr, shutdown).await
+                    } else {
+                        tracing::info!("WebSocket listening on ws://{ws_addr} (/ws, /auth/config)");
+                        ws_config.serve(ws_addr, shutdown).await
+                    };
+                    if let Err(e) = result {
+                        tracing::error!("WebSocket server error: {e}");
+                    }
+                })
+            };
+            (Some(ws_shutdown_tx), Some(ws_task))
+        }
     };
 
     // UDS frontend (#103). Local clients (D-Bus bridge, CLI, future

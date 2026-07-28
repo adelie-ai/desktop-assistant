@@ -18,6 +18,7 @@ that renders into the same namespace.
 - [Build and push](#build-and-push)
 - [How the manifests are laid out](#how-the-manifests-are-laid-out)
 - [Deploy an instance](#deploy-an-instance)
+- [TLS on the WebSocket door](#tls-on-the-websocket-door)
 - [Who may administer the instance](#who-may-administer-the-instance)
 - [Private overlays](#private-overlays)
 - [Worked example: a second instance](#worked-example-a-second-instance)
@@ -211,7 +212,45 @@ kubectl -n adele-example port-forward svc/adele-daemon 11339:11339
 ```
 
 Expect `WebSocket listening on ws://0.0.0.0:11339` and the tool inventory in the
-startup log.
+startup log. That is a plaintext `ws://` listener because the shipped
+`daemon.toml` sets `[tls] enabled = false` for this smoke-test example - see
+the next section before you point a real deployment at it.
+
+## TLS on the WebSocket door
+
+`[tls] enabled` defaults to `true`. Both `deploy/k8s/base/daemon.toml` and
+`deploy/k8s/overlays/example/daemon.toml` set `[tls] enabled = false`
+deliberately, which is why step 6 above shows plain `ws://` with no
+certificate anywhere in the example. Turn TLS on for a real deployment by
+removing that line (or setting it back to `true`) and either:
+
+- leaving `cert_file` and `key_file` unset, so the daemon generates and
+  reuses a local CA and server certificate under
+  `$XDG_DATA_HOME/desktop-assistant/tls/` - `/state/data/desktop-assistant/tls/`
+  in this base's Deployment, which is on the `/state` PVC and so survives a
+  pod restart; or
+- pointing `cert_file` and `key_file` at a certificate you manage yourself,
+  for example a `cert-manager` Secret mounted into the pod.
+
+**Behaviour change.** If `[tls] enabled` is `true` and the daemon cannot set
+up TLS - a missing or unreadable cert/key file, a certificate that fails to
+parse, or a PVC the daemon cannot write to on the auto-generate path - the
+daemon now **refuses to start** instead of falling back to plaintext. Before
+this change it logged one error line and served the WebSocket door
+(including `/login`) in plaintext on the same address instead. That mattered
+too little to fail startup over before the authorization tier; it matters
+enough to refuse now, because that door carries the bearer token for an
+administrator (`[authz] admin_subjects`, see
+[Who may administer the instance](#who-may-administer-the-instance)).
+
+If a pod goes into `CrashLoopBackOff` after enabling TLS or rotating a
+certificate, check `kubectl logs` for a `TLS setup failed` line naming the
+underlying error, then restore a readable, valid cert/key pair and roll the
+pod. If you want this instance to serve plaintext deliberately - for example
+behind an ingress or a tailnet that already terminates TLS, as in
+[`docs/remote-brain-setup.md`](remote-brain-setup.md) - set
+`[tls] enabled = false` (or `DESKTOP_ASSISTANT_WS_TLS=false`) instead of
+leaving a broken TLS configuration in place.
 
 ## Who may administer the instance
 
@@ -429,6 +468,14 @@ rather than failing loudly. Check `[purposes.embedding]` names something like
 **Daemon starts but every turn fails to authenticate upstream.** The connection
 secret is not set on this instance's `/state` PVC - see step 5. Each namespace
 needs its own; it does not come from the image or a Kubernetes Secret.
+
+**Daemon pod `CrashLoopBackOff` after enabling TLS or rotating a
+certificate.** `[tls] enabled = true` and TLS setup failed - see
+[TLS on the WebSocket door](#tls-on-the-websocket-door). Check `kubectl logs`
+for the `TLS setup failed` line naming the underlying error, then fix the
+cert/key and roll the pod. This is deliberate: the daemon refuses to serve
+the remote WebSocket door in plaintext when TLS was requested and cannot be
+delivered.
 
 **`rls-bootstrap` Job pod hangs in `Init`.** It gates on `pg_isready`. If
 Postgres is up, check that the `rls-bootstrap-sql` ConfigMap exists - the Job
