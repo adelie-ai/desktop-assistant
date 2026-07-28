@@ -242,10 +242,20 @@ mod tests {
             name: &str,
             owner: Option<&str>,
         ) -> Result<Option<IndexedSkill>, CoreError> {
+            // Same contract as the real adapters (#911): `owner`'s string is
+            // untrusted and only its `Some`-ness matters. `Some(_)` always
+            // resolves to `current_user_id()`, never to the argument, so the
+            // reference implementation cannot silently regress the contract
+            // it exists to pin down.
+            let user = crate::ports::auth::current_user_id();
+            let scoped_owner = owner.map(|_| user);
             let rows = self.rows.lock().expect("lock");
             Ok(rows
                 .iter()
-                .find(|r| r.name == name && r.owner_user_id.as_deref() == owner)
+                .find(|r| {
+                    r.name == name
+                        && r.owner_user_id.as_deref() == scoped_owner.as_ref().map(|u| u.as_str())
+                })
                 .cloned())
         }
 
