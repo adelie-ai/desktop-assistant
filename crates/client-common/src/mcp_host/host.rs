@@ -386,11 +386,13 @@ impl McpHost {
     /// Results are capped to the daemon's client-tool limit.
     ///
     /// In-process built-ins are mapped to be byte-for-byte indistinguishable
-    /// from a subprocess: a [`CallError::Tool`](mcp_core::CallError::Tool)
-    /// becomes `Ok(text)` (the `isError` content path), while
-    /// [`InvalidParams`](mcp_core::CallError::InvalidParams) /
-    /// [`Internal`](mcp_core::CallError::Internal) are protocol-level faults and
-    /// become `Err` — the same split `McpClient` produces from the wire.
+    /// from a subprocess, which is the whole point of the built-in path:
+    /// [`CallError::Tool`](mcp_core::CallError::Tool) and
+    /// [`InvalidParams`](mcp_core::CallError::InvalidParams) both become
+    /// `Ok(text)` (the `isError` content path, per SEP-1303 — bad arguments are
+    /// something the model can correct, so it has to see them), while
+    /// [`Internal`](mcp_core::CallError::Internal) is a server fault and becomes
+    /// `Err` — the same split `McpClient` produces from the wire.
     pub async fn call(
         &self,
         tool_name: &str,
@@ -409,7 +411,11 @@ impl McpHost {
             }
             ServerBackend::InProcess(svc) => match svc.call_tool(original, &arguments).await {
                 Ok(reply) => Ok(cap_result(render_reply(&reply))),
-                Err(mcp_core::CallError::Tool(m)) => Ok(cap_result(m)),
+                // Both reach a subprocess caller as `isError` content, so both
+                // reach the model here as the result text (SEP-1303).
+                Err(mcp_core::CallError::Tool(m) | mcp_core::CallError::InvalidParams(m)) => {
+                    Ok(cap_result(m))
+                }
                 Err(err) => Err(format!("client MCP tool '{tool_name}' failed: {err}")),
             },
         }
