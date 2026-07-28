@@ -244,6 +244,53 @@ Current event variants:
 - `assistant_delta { conversation_id, request_id, chunk }`
 - `assistant_completed { conversation_id, request_id, full_response }`
 - `assistant_error { conversation_id, request_id, error }`
+- `assistant_status { conversation_id, request_id, message, capability_change? }`
+
+### Tool-provenance gating (behaviour change)
+
+A turn that has taken in content from outside the trust boundary - a fetched
+web page, a third-party API result, a file read at a path the model chose -
+refuses the tools that could act on it for the remainder of that turn. The
+closed tiers are `mutate`, `network_egress`, `code_execution`, and anything the
+daemon cannot classify. Reading, and output to the user's own session, stay
+open. The next turn starts clean.
+
+**What an integrator must do.** A model-chosen tool call that would previously
+have run may now come back refused. The refusal arrives as an ordinary tool
+result, not an error, and the turn keeps going - so a client that does nothing
+still works and simply sees the assistant take another path. To handle it
+deliberately:
+
+1. Watch `assistant_status` for `capability_change`. It is present only on the
+   one status per turn that reports the narrowing, and absent on ordinary
+   progress:
+
+   ```json
+   {"assistant_status": {
+     "conversation_id": "c1",
+     "request_id": "r1",
+     "message": "Read outside content - sending, changing and running are off for the rest of this turn",
+     "capability_change": {
+       "reason": "external_content_ingested",
+       "closed_tool_tiers": ["mutate", "network_egress", "code_execution", "unclassified"]
+     }
+   }}
+   ```
+
+   The change holds for the turn named by that `request_id`.
+
+2. Read `tool_tier` on `ToolUsageView` to know in advance which of the tools a
+   conversation uses can be refused. Tier values: `read`, `present`, `mutate`,
+   `network_egress`, `code_execution`, `unclassified`. The last four are the
+   ones that close.
+
+3. To get a refused action done, start a new turn that does not read outside
+   content first.
+
+Both fields are optional additions. A client built before them keeps parsing
+every frame unchanged, and a tier or reason string it does not recognise must
+be treated as `unclassified` / `unknown` - which is to say, assume it can be
+refused.
 
 ## Typical Session Flow
 

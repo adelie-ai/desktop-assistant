@@ -35,6 +35,7 @@ use desktop_assistant_core::ports::turn_capability::Delivery;
 use desktop_assistant_core::ports::turn_interactivity::{
     TurnInteractivity, with_turn_interactivity,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 use tracing::warn;
 
@@ -3255,6 +3256,26 @@ where
             // Mirror this agent's tool/MCP calls into its task log so the panel
             // shows what the agent is doing, same as the foreground send path
             // (shared observer install — #256).
+            // #741: a child agent runs its own turn with its own provenance
+            // gate, and its final answer is written to the SESSION pad below -
+            // a durable note, outside the turn loop, that no classification
+            // covers. If the child read outside content, that answer is
+            // possibly-injected text landing where a later, clean turn can read
+            // it back through `builtin_scratchpad_search`. Record whether the
+            // child's gate closed so the write below can withhold the wording.
+            let child_ingested_external = Arc::new(AtomicBool::new(false));
+            let child_taint_flag = Arc::clone(&child_ingested_external);
+            let capability_observer:
+                desktop_assistant_core::ports::turn_capability::TurnCapabilityObserver =
+                Arc::new(move |_change| {
+                    child_taint_flag.store(true, Ordering::Relaxed);
+                    // The change is recorded, not forwarded: an agent run has
+                    // nobody watching, so there is no status channel to put it
+                    // on. Reporting `Taken` keeps the core loop from emitting a
+                    // status line into an empty room.
+                    Delivery::Taken
+                });
+
             let inner = with_task_observer(Some(ctx), async move {
                 conversations
                     .send_prompt_with_override(
@@ -3279,6 +3300,11 @@ where
             // sentinel, so no future change that gives a child a connection can
             // quietly turn its live narration back on (#942).
             let inner = with_turn_interactivity(TurnInteractivity::Headless, inner);
+            let inner =
+                desktop_assistant_core::ports::turn_capability::with_turn_capability_observer(
+                    capability_observer,
+                    inner,
+                );
             // Compose the run's task-local scopes around `inner`, awaiting in each
             // arm so their differing future types unify at the `Result`. The #287
             // subagent scope (session pad + owner_todo + snapshot marker) is
@@ -3316,10 +3342,21 @@ where
                     // session conversation. Best-effort: a pad-write failure is
                     // logged, never fatal -- the sink still carries the text.
                     if let (Some(write), Some(scope)) = (&scratchpad_write, &scope_for_result) {
+                        // #741: when the child read outside content, its wording
+                        // does not go on the pad. The full answer still reaches
+                        // the parent through the result sink and
+                        // `get_subagent_status`, which is classified and taints
+                        // the parent's turn - so the recovery path survives and
+                        // the ungated one closes.
+                        let body = if child_ingested_external.load(Ordering::Relaxed) {
+                            desktop_assistant_core::tool_provenance::WITHHELD_SUBAGENT_RESULT
+                                .to_string()
+                        } else {
+                            outcome.response.clone()
+                        };
                         let note =
                             desktop_assistant_core::ports::scratchpad::NewScratchpadNote::new(
-                                "result",
-                                outcome.response.clone(),
+                                "result", body,
                             );
                         let session = scope.session_conversation_id.as_str().to_string();
                         let scoped = with_subagent_scope(scope.clone(), write(session, vec![note]));
