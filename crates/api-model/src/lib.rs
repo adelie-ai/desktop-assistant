@@ -298,6 +298,22 @@ pub enum Command {
         personality: ConversationPersonalityView,
     },
 
+    /// Set (or clear) a conversation's tool-provenance-gate override (issue
+    /// #1007). The gate (`crates/core/src/tool_provenance.rs`) refuses acting
+    /// tools for the rest of a turn once that turn has read
+    /// externally-controlled content; `disabled = true` disables that
+    /// refusal for every turn in this conversation, `disabled = false`
+    /// leaves it enforced (the default). Resolved fresh on every send, so
+    /// flipping it takes effect on the conversation's next turn. Returns
+    /// [`CommandResult::ConversationToolGate`] echoing the stored value.
+    /// Mirrors the per-conversation personality override end to end: storage
+    /// column, store accessor, this dedicated command, a task-local read at
+    /// dispatch.
+    SetConversationToolGate {
+        conversation_id: String,
+        disabled: bool,
+    },
+
     // Settings (legacy `[llm]`-block single-connection surface).
     //
     // The legacy `SetLlmSettings` / `GetLlmSettings` commands have been
@@ -829,6 +845,14 @@ pub enum CommandResult {
     /// means the override was cleared and the conversation falls back to the
     /// global personality on every send.
     ConversationPersonality(ConversationPersonalityView),
+
+    /// Response to `SetConversationToolGate` — the conversation's stored
+    /// tool-provenance-gate override after the write (#1007). `disabled =
+    /// true` means the gate is disabled for this conversation's turns;
+    /// `false` means it stays enforced.
+    ConversationToolGate {
+        disabled: bool,
+    },
 
     // --- Background tasks (issue #110) ------------------------------------
     /// Response to `ListBackgroundTasks`.
@@ -1438,6 +1462,13 @@ pub struct ConversationView {
     /// a partial override resolved against the global config on each send.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation_personality: Option<ConversationPersonalityView>,
+    /// The conversation's stored tool-provenance-gate override (#1007).
+    /// `true` means the gate is disabled for every turn in this
+    /// conversation; `false` (the default, and omitted from the wire) means
+    /// it stays enforced. An old client that predates this field parses an
+    /// old-shaped or new-shaped payload identically.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tool_gate_disabled: bool,
 }
 
 /// Advisory conditions attached to a conversation view. Modeled as an enum
@@ -4612,6 +4643,7 @@ mod tests {
             warnings: vec![],
             model_selection: None,
             conversation_personality: None,
+            tool_gate_disabled: false,
         };
         let json = serde_json::to_string(&view).unwrap();
         assert!(
@@ -4650,10 +4682,7 @@ mod tests {
     fn conversation_tool_gate_result_round_trips() {
         let res = CommandResult::ConversationToolGate { disabled: true };
         let json = serde_json::to_string(&res).unwrap();
-        assert!(
-            json.contains("\"conversation_tool_gate\""),
-            "json: {json}"
-        );
+        assert!(json.contains("\"conversation_tool_gate\""), "json: {json}");
         let back: CommandResult = serde_json::from_str(&json).unwrap();
         assert_eq!(res, back);
     }

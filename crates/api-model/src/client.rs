@@ -101,6 +101,10 @@ pub struct ConversationDetail {
     /// The conversation's stored personality override (#227), or `None` when it
     /// uses the global personality. A picker pre-fills its sliders from this.
     pub conversation_personality: Option<api::ConversationPersonalityView>,
+    /// The conversation's stored tool-provenance-gate override (#1007).
+    /// `true` means the gate is disabled for every turn in this
+    /// conversation; `false` (the default) means it stays enforced.
+    pub tool_gate_disabled: bool,
 }
 
 impl From<api::ConversationSummary> for ConversationSummary {
@@ -144,6 +148,7 @@ impl From<api::ConversationView> for ConversationDetail {
             messages: value.messages.into_iter().map(ChatMessage::from).collect(),
             model_selection: value.model_selection,
             conversation_personality: value.conversation_personality,
+            tool_gate_disabled: value.tool_gate_disabled,
         }
     }
 }
