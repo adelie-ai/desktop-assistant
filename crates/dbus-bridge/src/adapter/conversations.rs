@@ -844,6 +844,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_conversation_tool_gate_builds_command_and_returns_stored() {
+        // Mirrors `set_conversation_personality_builds_command_and_maps_ordinals`:
+        // a plain bool this time, no ordinal translation needed.
+        let transport = Arc::new(CannedTransport::new(
+            api::CommandResult::ConversationToolGate { disabled: true },
+        ));
+        let adapter = DbusConversationsAdapter::new(Arc::clone(&transport));
+
+        let stored = adapter
+            .set_conversation_tool_gate("conv-1", true)
+            .await
+            .unwrap();
+        assert!(stored);
+
+        let commands = transport.commands.lock().await;
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            api::Command::SetConversationToolGate {
+                conversation_id,
+                disabled,
+            } => {
+                assert_eq!(conversation_id, "conv-1");
+                assert!(*disabled);
+            }
+            other => panic!("expected SetConversationToolGate, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn set_conversation_personality_rejects_out_of_range_before_dispatch() {
         let transport = Arc::new(CannedTransport::new(
             api::CommandResult::ConversationPersonality(api::PersonalityOverride::default()),
