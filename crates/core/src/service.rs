@@ -15,7 +15,7 @@ use crate::ports::conversation_ctx::with_conversation_id;
 use crate::ports::inbound::ConversationService;
 use crate::ports::llm::{
     ChunkCallback, LlmClient, ReasoningConfig, StatusCallback, current_cancellation_token,
-    current_context_budget, current_tool_allowlist,
+    current_context_budget, current_tool_allowlist, current_tool_gate_disabled,
 };
 use crate::ports::scratchpad::{
     MAX_NOTE_BYTES, NewScratchpadNote, PINNED_BLOCK_BYTE_BUDGET, SCRATCHPAD_GOAL_KEY,
@@ -35,7 +35,8 @@ use crate::ports::turn_capability::{
 use crate::ports::turn_interactivity::{TurnInteractivity, current_turn_interactivity};
 use crate::sanitize::sanitize_assistant_text;
 use crate::tool_provenance::{
-    GATE_CLOSED_STATUS, GATED_TIERS, GateChange, ToolGate, TurnProvenance, WITHHELD_STEP_TEXT,
+    GATE_BYPASSED_STATUS, GATE_CLOSED_STATUS, GATED_TIERS, GateChange, ToolGate, TurnProvenance,
+    WITHHELD_STEP_TEXT,
 };
 use crate::tools::{
     NoopToolExecutor, categorize_tool_namespaces, summarize_tool_name, summarize_tool_text,
@@ -1344,7 +1345,14 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         // acting tiers close for the rest of THIS turn, and a new turn builds
         // a new value. Nothing outside this function can reach it, which is
         // the whole of the no-leak-across-turns property.
-        let mut turn_provenance = TurnProvenance::new();
+        //
+        // The per-conversation override (#1007) is read fresh here, at
+        // construction, from the task-local the daemon's dispatch wrapper
+        // installs from the conversation's stored setting. Outside that
+        // wrapper (tests, dreaming jobs) it defaults to `false` - the gate
+        // stays enforced.
+        let mut turn_provenance =
+            TurnProvenance::new_with_gate_disabled(current_tool_gate_disabled());
 
         // No turn-start filler. A quick/direct answer narrates nothing and just
         // streams its reply. Progress is narrated when the model declares a
@@ -2255,20 +2263,30 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 if turn_provenance.observe_result(&tool_call.name, &stored)
                     == GateChange::JustClosed
                 {
-                    // Structured first: this is an API-first platform, and a
-                    // caller driving the daemon has to be able to read the
-                    // change as data rather than parse a sentence. When
-                    // nothing takes it - no observer installed, or an
-                    // installed one whose channel is full - fall back to the
-                    // plain status line every caller already has, so the
-                    // signal degrades rather than disappears.
-                    let delivery = notify_turn_capability_change(TurnCapabilityChange {
-                        reason: TurnCapabilityReason::ExternalContentIngested,
-                        closed_tiers: GATED_TIERS.to_vec(),
-                        message: GATE_CLOSED_STATUS.to_string(),
-                    });
-                    if delivery == Delivery::Dropped {
-                        on_status(GATE_CLOSED_STATUS.to_string());
+                    if turn_provenance.gate_disabled() {
+                        // The override (#1007) is a deliberate safety-off
+                        // switch, not a silent one: nothing actually closed
+                        // (every acting tier stays open), so the structured
+                        // `closed_tiers` channel would be empty and
+                        // misleading here. Say so once, in plain text, on
+                        // the status channel every client already renders.
+                        on_status(GATE_BYPASSED_STATUS.to_string());
+                    } else {
+                        // Structured first: this is an API-first platform, and a
+                        // caller driving the daemon has to be able to read the
+                        // change as data rather than parse a sentence. When
+                        // nothing takes it - no observer installed, or an
+                        // installed one whose channel is full - fall back to the
+                        // plain status line every caller already has, so the
+                        // signal degrades rather than disappears.
+                        let delivery = notify_turn_capability_change(TurnCapabilityChange {
+                            reason: TurnCapabilityReason::ExternalContentIngested,
+                            closed_tiers: GATED_TIERS.to_vec(),
+                            message: GATE_CLOSED_STATUS.to_string(),
+                        });
+                        if delivery == Delivery::Dropped {
+                            on_status(GATE_CLOSED_STATUS.to_string());
+                        }
                     }
                 }
 
@@ -4098,6 +4116,55 @@ mod tests {
             tool_results(&handler, &conv.id).await,
             vec!["PAGE BODY".to_string()],
             "an egress tool must run normally in a turn that ingested nothing external"
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_disabled_override_allows_the_gated_tool_and_announces_the_bypass_once() {
+        // With the per-conversation override on, a tool that would normally
+        // be refused after reading outside content runs anyway, and the
+        // person watching sees exactly one status line saying so (issue
+        // #1007) — a deliberate safety-off switch, not a silent one.
+        use crate::ports::llm::with_tool_gate_disabled;
+
+        let handler = two_call_handler("weather_get_current", "web_read");
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
+
+        let (status_cb, statuses) = recording_status();
+        with_tool_gate_disabled(
+            true,
+            handler.send_prompt(&conv.id, "go".into(), noop_callback(), status_cb),
+        )
+        .await
+        .expect("the turn completes with the override on");
+
+        let results = tool_results(&handler, &conv.id).await;
+        assert_eq!(results[0], "RAN weather_get_current");
+        assert_eq!(
+            results[1], "RAN web_read",
+            "the gated tool must run when the override is on, got: {}",
+            results[1]
+        );
+        assert_eq!(
+            statuses
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|s| s.as_str() == crate::tool_provenance::GATE_BYPASSED_STATUS)
+                .count(),
+            1,
+            "the bypass must be announced exactly once"
+        );
+        assert!(
+            !statuses
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|s| s.as_str() == GATE_CLOSED_STATUS),
+            "a bypassed gate must not also report itself as closed"
         );
     }
 

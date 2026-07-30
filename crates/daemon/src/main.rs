@@ -426,6 +426,27 @@ impl api_surface::ConversationSelectionStore for SharedConversationStore {
         <AnyConversationStore as api_surface::ConversationSelectionStore>::get_tags(&self.0, id)
             .await
     }
+
+    async fn get_tool_gate_disabled(
+        &self,
+        id: &desktop_assistant_core::domain::ConversationId,
+    ) -> Result<bool, CoreError> {
+        <AnyConversationStore as api_surface::ConversationSelectionStore>::get_tool_gate_disabled(
+            &self.0, id,
+        )
+        .await
+    }
+
+    async fn set_tool_gate_disabled(
+        &self,
+        id: &desktop_assistant_core::domain::ConversationId,
+        disabled: bool,
+    ) -> Result<(), CoreError> {
+        <AnyConversationStore as api_surface::ConversationSelectionStore>::set_tool_gate_disabled(
+            &self.0, id, disabled,
+        )
+        .await
+    }
 }
 
 // Per-conversation model selection. Only the Postgres backend persists
@@ -497,6 +518,34 @@ impl api_surface::ConversationSelectionStore for AnyConversationStore {
             Self::Postgres(s) => s.get_conversation_tags(id).await,
             // No durable storage — no tags, so no tag-based voice routing.
             Self::Json(_) => Ok(Vec::new()),
+        }
+    }
+
+    // Per-conversation tool-provenance-gate override (#1007). Same backend
+    // split as the personality override above: only Postgres persists; the
+    // JSON fallback never stored these either, so it reports the fail-closed
+    // default and no-ops the write.
+    async fn get_tool_gate_disabled(
+        &self,
+        id: &desktop_assistant_core::domain::ConversationId,
+    ) -> Result<bool, CoreError> {
+        match self {
+            Self::Postgres(s) => s.get_conversation_tool_gate_disabled(id).await,
+            Self::Json(_) => Ok(false),
+        }
+    }
+
+    async fn set_tool_gate_disabled(
+        &self,
+        id: &desktop_assistant_core::domain::ConversationId,
+        disabled: bool,
+    ) -> Result<(), CoreError> {
+        match self {
+            Self::Postgres(s) => s.set_conversation_tool_gate_disabled(id, disabled).await,
+            Self::Json(_) => {
+                let _ = disabled;
+                Ok(())
+            }
         }
     }
 }

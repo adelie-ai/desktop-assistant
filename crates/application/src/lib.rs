@@ -1608,6 +1608,13 @@ where
                     .get_conversation_personality(&conv_id)
                     .await
                     .map_err(Self::map_core_err)?;
+                // #1007: surface the conversation's tool-provenance-gate
+                // override. `false` = no override (gate stays enforced).
+                let tool_gate_disabled = self
+                    .conversations
+                    .get_conversation_tool_gate_disabled(&conv_id)
+                    .await
+                    .map_err(Self::map_core_err)?;
 
                 Ok(api::CommandResult::Conversation(api::ConversationView {
                     id: conv.id.0,
@@ -1625,6 +1632,7 @@ where
                     warnings: Vec::new(),
                     model_selection,
                     conversation_personality,
+                    tool_gate_disabled,
                 }))
             }
 
@@ -1678,6 +1686,25 @@ where
                     .map_err(Self::map_core_err)?
                     .unwrap_or_default();
                 Ok(api::CommandResult::ConversationPersonality(stored))
+            }
+
+            api::Command::SetConversationToolGate {
+                conversation_id,
+                disabled,
+            } => {
+                let conv_id =
+                    desktop_assistant_core::domain::ConversationId::from(conversation_id.as_str());
+                self.conversations
+                    .set_conversation_tool_gate_disabled(&conv_id, disabled)
+                    .await
+                    .map_err(Self::map_core_err)?;
+                // Echo the stored value, mirroring `SetConversationPersonality`.
+                let stored = self
+                    .conversations
+                    .get_conversation_tool_gate_disabled(&conv_id)
+                    .await
+                    .map_err(Self::map_core_err)?;
+                Ok(api::CommandResult::ConversationToolGate { disabled: stored })
             }
 
             api::Command::DeleteConversation { id } => {

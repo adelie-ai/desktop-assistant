@@ -634,6 +634,35 @@ pub trait AssistantCommands: Send + Sync {
         Ok(stored)
     }
 
+    // --- Per-conversation tool-provenance-gate override (issue #1007) ------
+
+    /// Set the conversation's tool-provenance-gate override (#1007).
+    ///
+    /// `true` disables the gate (`crates/core/src/tool_provenance.rs`) for
+    /// every turn in this conversation, so a turn that reads outside content
+    /// may still call an acting tool afterward. `false` leaves it enforced.
+    /// Returns the stored value after the write. The current value is also
+    /// surfaced on [`ConversationDetail::tool_gate_disabled`] from
+    /// `get_conversation`.
+    async fn set_conversation_tool_gate(
+        &self,
+        conversation_id: &str,
+        disabled: bool,
+    ) -> Result<bool> {
+        let result = self
+            .send_command(api::Command::SetConversationToolGate {
+                conversation_id: conversation_id.to_string(),
+                disabled,
+            })
+            .await?;
+        let api::CommandResult::ConversationToolGate { disabled: stored } = result else {
+            return Err(anyhow!(
+                "unexpected response for set_conversation_tool_gate"
+            ));
+        };
+        Ok(stored)
+    }
+
     // --- Client-side tool execution (issue #107 / #231) -------------------
 
     /// Advertise the set of client-local MCP tools this connection can run
@@ -1190,6 +1219,31 @@ mod tests {
                 assert!(!all);
             }
             other => panic!("expected DeleteScratchpadNotes, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_conversation_tool_gate_emits_command_and_returns_stored() {
+        // Mirrors `set_conversation_personality_emits_command_and_returns_stored`:
+        // the client-facing method must emit `SetConversationToolGate` with
+        // the requested value and unwrap the stored bool from
+        // `ConversationToolGate`.
+        let client =
+            RecordingClient::new(api::CommandResult::ConversationToolGate { disabled: true });
+        let got = client
+            .set_conversation_tool_gate("conv-1", true)
+            .await
+            .unwrap();
+        assert!(got);
+        match client.last() {
+            api::Command::SetConversationToolGate {
+                conversation_id,
+                disabled,
+            } => {
+                assert_eq!(conversation_id, "conv-1");
+                assert!(disabled);
+            }
+            other => panic!("expected SetConversationToolGate, got {other:?}"),
         }
     }
 

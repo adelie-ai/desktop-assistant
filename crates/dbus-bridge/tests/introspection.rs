@@ -163,6 +163,11 @@ const ADDITIONS: &[(&str, &str)] = &[
         "org.desktopAssistant.Settings",
         "method RemoveServiceAccount(in:s:id)",
     ),
+    // #1007 — per-conversation override for the tool-provenance gate.
+    (
+        "org.desktopAssistant.Conversations",
+        "method SetConversationToolGate(in:s:conversation_id, in:b:disabled, out:b:)",
+    ),
 ];
 
 // --- fake transport ---------------------------------------------------------

@@ -188,6 +188,8 @@ const MIGRATIONS: &[Migration] = &[
     // Tombstones record why they were retired: merge (with the superseding id)
     // or prune (with the model's stated reason).
     migration!("038_kb_delete_provenance.sql"),
+    // Per-conversation override for the tool-provenance gate (#1007).
+    migration!("039_conversation_tool_gate.sql"),
 ];
 
 /// Second half of the advisory-lock key: the schema the migrations write to.

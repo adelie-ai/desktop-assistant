@@ -41,6 +41,14 @@ payload and what an integrator does about it; the same contract reaches D-Bus
 clients through `ResponseStatus`, minus the structured field
 (`docs/dbus-api.md`).
 
+A conversation can turn that gate off for itself with
+`SetConversationToolGate { conversation_id, disabled }`. With the override
+on, a gated tool runs even after the turn ingests outside content, and the
+one-time status line reads differently - "Live dangerously is on for this
+conversation..." rather than the closed-gate line - and carries no
+`capability_change`, because nothing actually closed. `docs/WEBSOCKET_API.md`
+documents the full wire shape and the fail-closed resolution rule.
+
 ## Config
 Settings are expected to be small in number (~10). Prefer a **typed config struct** for v1:
 - `GetConfig -> Config`
@@ -121,6 +129,11 @@ tenant's assistant. A tenant sets their own disposition with
 tenant work. This is staging, not a judgement that personality is an operator
 concern: the per-user override layer (#986) is where the traits belong, and when
 it lands a tenant edits their own while the instance default stays admin.
+
+`SetConversationToolGate` is a per-conversation, tenant-level lever from the
+start: unlike the personality traits it has no global counterpart in
+`daemon.toml` to weigh against, so it stays tenant work with no staging
+period.
 
 `McpServerAction` is split the same way, by its verb. `"status"` is a read
 returning exactly what `ListMcpServers` returns and stays tenant; `"start"`,

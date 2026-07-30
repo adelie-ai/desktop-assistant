@@ -149,6 +149,65 @@ impl PgConversationStore {
         Ok(Some(ovr))
     }
 
+    /// Set the conversation's tool-provenance-gate override (#1007).
+    ///
+    /// A plain `BOOLEAN` column rather than JSON, since there is nothing to
+    /// partially merge: `true` disables the gate for this conversation,
+    /// `false` (the column default) leaves it enforced. Mirrors
+    /// [`Self::set_conversation_model_selection`]: user-scoped,
+    /// `ConversationNotFound` on a missing/cross-user row (#105: don't leak
+    /// existence).
+    pub async fn set_conversation_tool_gate_disabled(
+        &self,
+        conversation_id: &ConversationId,
+        disabled: bool,
+    ) -> Result<(), CoreError> {
+        let user_id = current_user_id();
+        let result = sqlx::query(
+            "UPDATE conversations SET tool_gate_disabled = $3 \
+             WHERE user_id = $1 AND id = $2",
+        )
+        .bind(user_id.as_str())
+        .bind(&conversation_id.0)
+        .bind(disabled)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CoreError::Storage(e.to_string()))?;
+        if result.rows_affected() == 0 {
+            return Err(CoreError::ConversationNotFound(conversation_id.0.clone()));
+        }
+        Ok(())
+    }
+
+    /// Read the conversation's tool-provenance-gate override (#1007).
+    ///
+    /// Returns `Ok(false)` for a conversation that exists and has no override
+    /// (the column's `NOT NULL DEFAULT FALSE` means an unset value already
+    /// reads as `false` — the gate stays enforced). Returns
+    /// `ConversationNotFound` when the id is unknown OR belongs to a
+    /// different user, exactly like [`Self::get_conversation_model_selection`]
+    /// and [`Self::get_conversation_personality`] — the daemon-side resolver
+    /// is what maps that lookup failure onto the fail-closed `false` default,
+    /// so this accessor must not swallow it here.
+    pub async fn get_conversation_tool_gate_disabled(
+        &self,
+        conversation_id: &ConversationId,
+    ) -> Result<bool, CoreError> {
+        let user_id = current_user_id();
+        let row: Option<(bool,)> = sqlx::query_as(
+            "SELECT tool_gate_disabled FROM conversations \
+             WHERE user_id = $1 AND id = $2",
+        )
+        .bind(user_id.as_str())
+        .bind(&conversation_id.0)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| CoreError::Storage(e.to_string()))?;
+
+        let row = row.ok_or_else(|| CoreError::ConversationNotFound(conversation_id.0.clone()))?;
+        Ok(row.0)
+    }
+
     /// Read the conversation's tags (e.g. `"voice"`). Empty when the id is
     /// unknown or belongs to another user — fail-closed: an unroutable turn
     /// simply doesn't get tag-based routing rather than erroring. Mirrors

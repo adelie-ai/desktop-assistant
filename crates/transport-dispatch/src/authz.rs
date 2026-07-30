@@ -205,6 +205,10 @@ fn classify(cmd: &api::Command) -> (&'static str, Capability) {
         api::Command::ClearAllHistory => ("clear_all_history", Tenant),
         api::Command::SendMessage { .. } => ("send_message", Tenant),
         api::Command::SetConversationPersonality { .. } => ("set_conversation_personality", Tenant),
+        // #1007: a per-conversation, tenant-level lever from the start —
+        // there is no global counterpart to weigh against, unlike the
+        // personality traits' staged path through `SetConfig` above.
+        api::Command::SetConversationToolGate { .. } => ("set_conversation_tool_gate", Tenant),
 
         // Provider credentials and the embedding backend: operator config.
         api::Command::SetApiKey { .. } => ("set_api_key", Admin),
@@ -464,5 +468,21 @@ mod tests {
     fn capability_labels_are_stable() {
         assert_eq!(Capability::Tenant.label(), "tenant");
         assert_eq!(Capability::Admin.label(), "administrator");
+    }
+
+    /// #1007: the tool-gate override is a per-conversation, tenant-level
+    /// lever, exactly like `SetConversationPersonality` — not an
+    /// admin-only setting. This is the ticket's whole point: giving the
+    /// tenant back a lever the blanket provenance gate took away.
+    #[test]
+    fn set_conversation_tool_gate_is_tenant_capability() {
+        let cmd = api::Command::SetConversationToolGate {
+            conversation_id: "c1".into(),
+            disabled: true,
+        };
+        assert_eq!(
+            classify(&cmd),
+            ("set_conversation_tool_gate", Capability::Tenant)
+        );
     }
 }

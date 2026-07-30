@@ -377,6 +377,39 @@ every frame unchanged, and a tier or reason string it does not recognise must
 be treated as `unclassified` / `unknown` - which is to say, assume it can be
 refused.
 
+#### Per-conversation override ("live dangerously")
+
+A conversation that legitimately wants to read a page and then act on it in
+the same turn can turn the gate off for itself. Send
+`set_conversation_tool_gate { conversation_id, disabled: true }` and expect
+`result -> conversation_tool_gate { disabled: true }` echoing the stored
+value. `disabled` is resolved fresh on every send, so flipping it takes
+effect starting with the conversation's next turn; `GetConversation` also
+reports the live value as `tool_gate_disabled` on the conversation view
+(omitted from the wire when `false`).
+
+With the override on, a gated tool call runs even after the turn has read
+outside content - `check()` never refuses. The turn still tracks whether it
+ingested outside content, so the person watching is told once per turn, on
+the same `assistant_status` channel, with no `capability_change` payload
+(nothing actually closed, so `closed_tool_tiers` would be empty and
+misleading):
+
+```json
+{"assistant_status": {
+  "conversation_id": "c1",
+  "request_id": "r1",
+  "message": "Live dangerously is on for this conversation: a tool that would normally be refused after reading outside content ran anyway."
+}}
+```
+
+This is a deliberate, per-conversation hole in the gate, not a bug: with it
+on, a turn that reads attacker-controlled content and then acts on it is
+indistinguishable from a turn the user actually asked to act. Fails closed at
+every layer: an unset value, a missing conversation row, a cross-user row, or
+a store error all resolve to the gate staying enforced. Only an explicit
+stored `true` disables it.
+
 ## Typical Session Flow
 
 1. Acquire JWT (local clients)
@@ -452,6 +485,10 @@ daemon-global state, so any non-empty change set needs the administrator
 capability - the personality traits included, because they are one global block
 that every conversation without an override resolves against. A tenant sets
 their own disposition with `set_conversation_personality`.
+
+`set_conversation_tool_gate` is a per-conversation, tenant-level lever from
+the start - there is no global counterpart to weigh against here, unlike the
+personality traits' staged path through `set_config` above.
 
 `mcp_server_action` is split by its verb: `"status"` is a read and stays tenant;
 `"start"`, `"stop"`, `"restart"` and anything added later need the

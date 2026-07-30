@@ -461,6 +461,31 @@ impl<T: BridgeTransport + 'static> DbusConversationsAdapter<T> {
         }
     }
 
+    /// Set the conversation's tool-provenance-gate override (#1007). `true`
+    /// disables the gate (`crates/core/src/tool_provenance.rs`) for every
+    /// turn in this conversation; `false` leaves it enforced. Returns the
+    /// stored value after the write. Mirrors
+    /// `set_conversation_personality`'s adapter method, simplified to a
+    /// plain bool.
+    async fn set_conversation_tool_gate(
+        &self,
+        conversation_id: &str,
+        disabled: bool,
+    ) -> fdo::Result<bool> {
+        let result = self
+            .dispatch(api::Command::SetConversationToolGate {
+                conversation_id: conversation_id.to_string(),
+                disabled,
+            })
+            .await?;
+        match result {
+            api::CommandResult::ConversationToolGate { disabled } => Ok(disabled),
+            other => Err(fdo::Error::Failed(format!(
+                "unexpected SetConversationToolGate result: {other:?}"
+            ))),
+        }
+    }
+
     /// Send a prompt; daemon streams back via `AssistantDelta` events
     /// which the event forwarder turns into `ResponseChunk` /
     /// `ResponseComplete` / `ResponseError` signals.
@@ -844,6 +869,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_conversation_tool_gate_builds_command_and_returns_stored() {
+        // Mirrors `set_conversation_personality_builds_command_and_maps_ordinals`:
+        // a plain bool this time, no ordinal translation needed.
+        let transport = Arc::new(CannedTransport::new(
+            api::CommandResult::ConversationToolGate { disabled: true },
+        ));
+        let adapter = DbusConversationsAdapter::new(Arc::clone(&transport));
+
+        let stored = adapter
+            .set_conversation_tool_gate("conv-1", true)
+            .await
+            .unwrap();
+        assert!(stored);
+
+        let commands = transport.commands.lock().await;
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            api::Command::SetConversationToolGate {
+                conversation_id,
+                disabled,
+            } => {
+                assert_eq!(conversation_id, "conv-1");
+                assert!(*disabled);
+            }
+            other => panic!("expected SetConversationToolGate, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn set_conversation_personality_rejects_out_of_range_before_dispatch() {
         let transport = Arc::new(CannedTransport::new(
             api::CommandResult::ConversationPersonality(api::PersonalityOverride::default()),
@@ -879,6 +933,7 @@ mod tests {
             warnings: Vec::new(),
             model_selection: None,
             conversation_personality: None,
+            tool_gate_disabled: false,
         })
     }
 

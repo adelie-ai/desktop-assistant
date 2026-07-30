@@ -242,6 +242,31 @@ tokio::task_local! {
     /// so the value threads to `send_prompt` without changing the
     /// `ConversationService`/`LlmClient` signatures.
     static IDEMPOTENCY_KEY: Option<String>;
+
+    /// The per-conversation tool-provenance gate override for this turn
+    /// (issue #1007). Installed by the daemon's dispatch wrapper via
+    /// [`with_tool_gate_disabled`] from the conversation's stored override,
+    /// resolved fresh on every send; read by [`current_tool_gate_disabled`]
+    /// at the point `TurnProvenance` is constructed
+    /// (`ConversationHandler::send_prompt`), which passes the value to
+    /// [`crate::tool_provenance::TurnProvenance::new_with_gate_disabled`].
+    ///
+    /// `true` means the tool-provenance gate never refuses for this turn,
+    /// whatever it ingests - a deliberate, per-conversation safety-off
+    /// switch. Fail-closed by construction: unset outside the scope (tests,
+    /// dreaming jobs, any caller that doesn't route through the daemon
+    /// dispatch wrapper), which [`current_tool_gate_disabled`] returns as
+    /// `false` — the gate stays enforced. The daemon-side resolver
+    /// (`RoutingConversationHandler::resolve_tool_gate_disabled`) applies the
+    /// same fail-closed rule one layer up: a missing row, a cross-user row,
+    /// or a store error all resolve to `false` before this scope is even
+    /// installed.
+    ///
+    /// Why a task-local: mirrors [`PERSONALITY`] and the other per-turn
+    /// task-locals in this module so the value threads to
+    /// `ConversationHandler::send_prompt` without changing the
+    /// `ConversationService`/`LlmClient` signatures.
+    static TOOL_GATE_DISABLED: bool;
 }
 
 /// Run `fut` with the given reasoning config installed as the current
@@ -337,6 +362,26 @@ where
 /// send). Safe to call from any async context.
 pub fn current_idempotency_key() -> Option<String> {
     IDEMPOTENCY_KEY.try_with(|k| k.clone()).ok().flatten()
+}
+
+/// Run `fut` with `disabled` installed as the current turn's tool-provenance
+/// gate override. `ConversationHandler::send_prompt` reads it via
+/// [`current_tool_gate_disabled`] when constructing `TurnProvenance`. See
+/// [`TOOL_GATE_DISABLED`].
+pub async fn with_tool_gate_disabled<F, T>(disabled: bool, fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    TOOL_GATE_DISABLED.scope(disabled, fut).await
+}
+
+/// The current turn's tool-provenance gate override, or `false` when no
+/// [`with_tool_gate_disabled`] scope is installed. `false` means the gate
+/// stays enforced — the fail-closed default for callers that don't route
+/// through the daemon dispatch wrapper (tests, dreaming jobs, agent runs).
+/// Safe to call from any async context.
+pub fn current_tool_gate_disabled() -> bool {
+    TOOL_GATE_DISABLED.try_with(|d| *d).unwrap_or(false)
 }
 
 /// Run `fut` with `model` installed as the current turn's model override.
@@ -1970,6 +2015,33 @@ mod tests {
         })
         .await;
         assert_eq!(observed, inner);
+    }
+
+    // --- TOOL_GATE_DISABLED tests (issue #1007) ---
+
+    #[tokio::test]
+    async fn current_tool_gate_disabled_is_false_outside_scope() {
+        // Callers that never install the scope (tests, dreaming jobs, any
+        // path not routed through the daemon dispatch wrapper) must see the
+        // gate enforced — the fail-closed default.
+        assert!(!current_tool_gate_disabled());
+    }
+
+    #[tokio::test]
+    async fn current_tool_gate_disabled_observes_installed_scope() {
+        let observed = with_tool_gate_disabled(true, async { current_tool_gate_disabled() }).await;
+        assert!(observed);
+        // After the scope exits the task-local is unset again (back to false).
+        assert!(!current_tool_gate_disabled());
+    }
+
+    #[tokio::test]
+    async fn nested_tool_gate_disabled_shadows_outer() {
+        let observed = with_tool_gate_disabled(true, async {
+            with_tool_gate_disabled(false, async { current_tool_gate_disabled() }).await
+        })
+        .await;
+        assert!(!observed);
     }
 
     // --- MODEL_OVERRIDE tests (issue #34) ---
