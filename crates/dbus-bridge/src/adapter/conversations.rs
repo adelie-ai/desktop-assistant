@@ -461,6 +461,31 @@ impl<T: BridgeTransport + 'static> DbusConversationsAdapter<T> {
         }
     }
 
+    /// Set the conversation's tool-provenance-gate override (#1007). `true`
+    /// disables the gate (`crates/core/src/tool_provenance.rs`) for every
+    /// turn in this conversation; `false` leaves it enforced. Returns the
+    /// stored value after the write. Mirrors
+    /// `set_conversation_personality`'s adapter method, simplified to a
+    /// plain bool.
+    async fn set_conversation_tool_gate(
+        &self,
+        conversation_id: &str,
+        disabled: bool,
+    ) -> fdo::Result<bool> {
+        let result = self
+            .dispatch(api::Command::SetConversationToolGate {
+                conversation_id: conversation_id.to_string(),
+                disabled,
+            })
+            .await?;
+        match result {
+            api::CommandResult::ConversationToolGate { disabled } => Ok(disabled),
+            other => Err(fdo::Error::Failed(format!(
+                "unexpected SetConversationToolGate result: {other:?}"
+            ))),
+        }
+    }
+
     /// Send a prompt; daemon streams back via `AssistantDelta` events
     /// which the event forwarder turns into `ResponseChunk` /
     /// `ResponseComplete` / `ResponseError` signals.
@@ -908,6 +933,7 @@ mod tests {
             warnings: Vec::new(),
             model_selection: None,
             conversation_personality: None,
+            tool_gate_disabled: false,
         })
     }
 
