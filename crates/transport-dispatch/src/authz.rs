@@ -205,6 +205,10 @@ fn classify(cmd: &api::Command) -> (&'static str, Capability) {
         api::Command::ClearAllHistory => ("clear_all_history", Tenant),
         api::Command::SendMessage { .. } => ("send_message", Tenant),
         api::Command::SetConversationPersonality { .. } => ("set_conversation_personality", Tenant),
+        // #1007: a per-conversation, tenant-level lever from the start —
+        // there is no global counterpart to weigh against, unlike the
+        // personality traits' staged path through `SetConfig` above.
+        api::Command::SetConversationToolGate { .. } => ("set_conversation_tool_gate", Tenant),
 
         // Provider credentials and the embedding backend: operator config.
         api::Command::SetApiKey { .. } => ("set_api_key", Admin),

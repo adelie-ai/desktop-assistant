@@ -354,6 +354,11 @@ command_table! {
                 personality: api::ConversationPersonalityView::default(),
             },
             Tenant),
+    SetConversationToolGate => (api::Command::SetConversationToolGate {
+                conversation_id: "c".to_string(),
+                disabled: true,
+            },
+            Tenant),
     SetApiKey => (api::Command::SetApiKey {
                 api_key: "k".into(),
             },
