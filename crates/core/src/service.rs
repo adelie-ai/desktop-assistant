@@ -4102,6 +4102,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gate_disabled_override_allows_the_gated_tool_and_announces_the_bypass_once() {
+        // With the per-conversation override on, a tool that would normally
+        // be refused after reading outside content runs anyway, and the
+        // person watching sees exactly one status line saying so (issue
+        // #1007) — a deliberate safety-off switch, not a silent one.
+        use crate::ports::llm::with_tool_gate_disabled;
+
+        let handler = two_call_handler("weather_get_current", "web_read");
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
+
+        let (status_cb, statuses) = recording_status();
+        with_tool_gate_disabled(
+            true,
+            handler.send_prompt(&conv.id, "go".into(), noop_callback(), status_cb),
+        )
+        .await
+        .expect("the turn completes with the override on");
+
+        let results = tool_results(&handler, &conv.id).await;
+        assert_eq!(results[0], "RAN weather_get_current");
+        assert_eq!(
+            results[1], "RAN web_read",
+            "the gated tool must run when the override is on, got: {}",
+            results[1]
+        );
+        assert_eq!(
+            statuses
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|s| s.as_str() == crate::tool_provenance::GATE_BYPASSED_STATUS)
+                .count(),
+            1,
+            "the bypass must be announced exactly once"
+        );
+        assert!(
+            !statuses
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|s| s.as_str() == GATE_CLOSED_STATUS),
+            "a bypassed gate must not also report itself as closed"
+        );
+    }
+
+    #[tokio::test]
     async fn turn_that_ingested_external_bytes_refuses_egress_tool() {
         // `weather_get_current` returns bytes from a third-party service, so
         // it taints the turn. `web_read` can then send those bytes to a

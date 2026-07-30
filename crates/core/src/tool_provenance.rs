@@ -1801,4 +1801,58 @@ mod tests {
             crate::tools::TOOL_NAME_MAX
         );
     }
+
+    // --- per-conversation gate override (issue #1007) ----------------------
+
+    #[test]
+    fn a_gate_disabled_turn_allows_a_gated_tool_after_ingesting_external_content() {
+        // The whole point of the override: a turn that would normally refuse
+        // an acting tool after reading outside content runs it anyway.
+        let mut turn = TurnProvenance::new_with_gate_disabled(true);
+        assert!(turn.gate_disabled());
+        turn.observe_result("web_read", "body");
+        assert_eq!(
+            turn.check("fileio_remove", TurnInteractivity::Interactive),
+            ToolGate::Allow,
+            "a gate-disabled turn must allow a gated tool even after ingesting \
+             external content"
+        );
+    }
+
+    #[test]
+    fn observe_result_still_reports_just_closed_once_when_gate_disabled() {
+        // The override turns off the *refusal*, not the bookkeeping: the turn
+        // still tracks whether it ingested external content, so the loop can
+        // still announce the one-time bypass status.
+        let mut turn = TurnProvenance::new_with_gate_disabled(true);
+        assert_eq!(turn.observe_result("web_read", "body"), GateChange::JustClosed);
+        assert_eq!(
+            turn.observe_result("web_read", "body again"),
+            GateChange::Unchanged,
+            "the change must still fire at most once per turn"
+        );
+    }
+
+    #[test]
+    fn default_turn_provenance_behaviour_is_unchanged_by_the_override_field() {
+        // `TurnProvenance::new()` — every existing call site — must still
+        // build a turn with the gate enforced.
+        let mut turn = TurnProvenance::new();
+        assert!(!turn.gate_disabled());
+        turn.observe_result("web_read", "body");
+        assert!(
+            matches!(
+                turn.check("fileio_remove", TurnInteractivity::Interactive),
+                ToolGate::Refuse(_)
+            ),
+            "the default constructor must keep the gate enforced"
+        );
+    }
+
+    #[test]
+    fn gate_bypassed_status_is_a_plain_ascii_sentence_distinct_from_gate_closed() {
+        assert!(GATE_BYPASSED_STATUS.is_ascii());
+        assert_ne!(GATE_BYPASSED_STATUS, GATE_CLOSED_STATUS);
+        assert!(!GATE_BYPASSED_STATUS.is_empty());
+    }
 }

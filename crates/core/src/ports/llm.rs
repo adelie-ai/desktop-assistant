@@ -1972,6 +1972,33 @@ mod tests {
         assert_eq!(observed, inner);
     }
 
+    // --- TOOL_GATE_DISABLED tests (issue #1007) ---
+
+    #[tokio::test]
+    async fn current_tool_gate_disabled_is_false_outside_scope() {
+        // Callers that never install the scope (tests, dreaming jobs, any
+        // path not routed through the daemon dispatch wrapper) must see the
+        // gate enforced — the fail-closed default.
+        assert!(!current_tool_gate_disabled());
+    }
+
+    #[tokio::test]
+    async fn current_tool_gate_disabled_observes_installed_scope() {
+        let observed = with_tool_gate_disabled(true, async { current_tool_gate_disabled() }).await;
+        assert!(observed);
+        // After the scope exits the task-local is unset again (back to false).
+        assert!(!current_tool_gate_disabled());
+    }
+
+    #[tokio::test]
+    async fn nested_tool_gate_disabled_shadows_outer() {
+        let observed = with_tool_gate_disabled(true, async {
+            with_tool_gate_disabled(false, async { current_tool_gate_disabled() }).await
+        })
+        .await;
+        assert!(!observed);
+    }
+
     // --- MODEL_OVERRIDE tests (issue #34) ---
 
     #[tokio::test]
