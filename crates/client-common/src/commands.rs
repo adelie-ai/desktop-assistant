@@ -1194,6 +1194,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_conversation_tool_gate_emits_command_and_returns_stored() {
+        // Mirrors `set_conversation_personality_emits_command_and_returns_stored`:
+        // the client-facing method must emit `SetConversationToolGate` with
+        // the requested value and unwrap the stored bool from
+        // `ConversationToolGate`.
+        let client = RecordingClient::new(api::CommandResult::ConversationToolGate {
+            disabled: true,
+        });
+        let got = client
+            .set_conversation_tool_gate("conv-1", true)
+            .await
+            .unwrap();
+        assert!(got);
+        match client.last() {
+            api::Command::SetConversationToolGate {
+                conversation_id,
+                disabled,
+            } => {
+                assert_eq!(conversation_id, "conv-1");
+                assert!(disabled);
+            }
+            other => panic!("expected SetConversationToolGate, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn set_conversation_personality_emits_command_and_returns_stored() {
         // The picker-facing client method must emit the
         // `SetConversationPersonality` command with the partial override and
