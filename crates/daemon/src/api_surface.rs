@@ -1018,6 +1018,21 @@ pub trait ConversationSelectionStore: Send + Sync {
         personality: Option<&PersonalityOverride>,
     ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
 
+    /// Read the conversation's stored tool-provenance-gate override (#1007),
+    /// or `false` when none is stored. Mirrors [`Self::get_personality`].
+    fn get_tool_gate_disabled(
+        &self,
+        id: &ConversationId,
+    ) -> impl std::future::Future<Output = Result<bool, CoreError>> + Send;
+
+    /// Set the conversation's tool-provenance-gate override (#1007). Mirrors
+    /// [`Self::set_personality`].
+    fn set_tool_gate_disabled(
+        &self,
+        id: &ConversationId,
+        disabled: bool,
+    ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
+
     /// Read the conversation's tags (e.g. `"voice"`, set by the voice daemon),
     /// or an empty list when the backend doesn't track them. Used to route
     /// voice-originated turns to the Voice purpose (voice#126). Defaults to
@@ -1182,6 +1197,27 @@ where
                     "failed to read conversation personality override; using global: {e}"
                 );
                 global
+            }
+        }
+    }
+
+    /// Resolve the effective tool-provenance-gate override for a send
+    /// (#1007). Fails closed: any store error logs a warning and resolves to
+    /// `false` — the gate stays enforced. A broken read must never fail open
+    /// into bypassing the gate.
+    async fn resolve_tool_gate_disabled(&self, conversation_id: &ConversationId) -> bool {
+        match self
+            .selection_store
+            .get_tool_gate_disabled(conversation_id)
+            .await
+        {
+            Ok(disabled) => disabled,
+            Err(e) => {
+                tracing::warn!(
+                    conversation_id = %conversation_id.0,
+                    "failed to read conversation tool-gate override; gate stays enforced: {e}"
+                );
+                false
             }
         }
     }
@@ -1482,6 +1518,23 @@ where
         self.selection_store.set_personality(id, to_store).await
     }
 
+    async fn get_conversation_tool_gate_disabled(
+        &self,
+        id: &ConversationId,
+    ) -> Result<bool, CoreError> {
+        self.selection_store.get_tool_gate_disabled(id).await
+    }
+
+    async fn set_conversation_tool_gate_disabled(
+        &self,
+        id: &ConversationId,
+        disabled: bool,
+    ) -> Result<(), CoreError> {
+        self.selection_store
+            .set_tool_gate_disabled(id, disabled)
+            .await
+    }
+
     async fn delete_conversation(&self, id: &ConversationId) -> Result<(), CoreError> {
         self.inner.delete_conversation(id).await
     }
@@ -1686,6 +1739,11 @@ where
         // doesn't outlive the `'static` dispatch future.
         let effective_personality = self.resolve_personality(conversation_id).await;
 
+        // Resolve the per-conversation tool-provenance-gate override (#1007),
+        // fresh on every send, the same way as the personality above. Fails
+        // closed inside `resolve_tool_gate_disabled` itself.
+        let effective_tool_gate_disabled = self.resolve_tool_gate_disabled(conversation_id).await;
+
         // Capture the ambient "now" once per turn and render the line the core
         // assembler surfaces as a `[Now]` system message, giving the assistant a
         // standing sense of the current date/time. Rendered from the same
@@ -1713,6 +1771,15 @@ where
             // personality, identical to Phase-1 behaviour; the core read side
             // (`current_personality`) is unchanged.
             let dispatch = with_personality(effective_personality, dispatch);
+            // Install the resolved tool-gate override (#1007) so the core
+            // dispatch loop constructs this turn's `TurnProvenance` disabled
+            // when the conversation has one stored. The core read side
+            // (`current_tool_gate_disabled`) fails closed to `false` outside
+            // this scope.
+            let dispatch = desktop_assistant_core::ports::llm::with_tool_gate_disabled(
+                effective_tool_gate_disabled,
+                dispatch,
+            );
             // Install the ambient "now" line so the core assembler surfaces a
             // `[Now]` system message for this turn. Request-scoped, never
             // persisted; see `NOW_CONTEXT`.
@@ -2150,6 +2217,7 @@ mod tests {
         inner: Mutex<std::collections::HashMap<String, ConversationModelSelection>>,
         personality: Mutex<std::collections::HashMap<String, PersonalityOverride>>,
         tags: Mutex<std::collections::HashMap<String, Vec<String>>>,
+        tool_gate_disabled: Mutex<std::collections::HashMap<String, bool>>,
     }
 
     impl Default for InMemoryConversationSelectionStore {
@@ -2158,6 +2226,7 @@ mod tests {
                 inner: Mutex::new(std::collections::HashMap::new()),
                 personality: Mutex::new(std::collections::HashMap::new()),
                 tags: Mutex::new(std::collections::HashMap::new()),
+                tool_gate_disabled: Mutex::new(std::collections::HashMap::new()),
             }
         }
     }
@@ -2228,6 +2297,28 @@ mod tests {
                     map.remove(&id.0);
                 }
             }
+            Ok(())
+        }
+
+        async fn get_tool_gate_disabled(&self, id: &ConversationId) -> Result<bool, CoreError> {
+            Ok(self
+                .tool_gate_disabled
+                .lock()
+                .expect("tool-gate store poisoned")
+                .get(&id.0)
+                .copied()
+                .unwrap_or(false))
+        }
+
+        async fn set_tool_gate_disabled(
+            &self,
+            id: &ConversationId,
+            disabled: bool,
+        ) -> Result<(), CoreError> {
+            self.tool_gate_disabled
+                .lock()
+                .expect("tool-gate store poisoned")
+                .insert(id.0.clone(), disabled);
             Ok(())
         }
 
@@ -4877,7 +4968,8 @@ url = postgres://adele:hunter2@db.example/adele
                 self.captured_personality.lock().unwrap().push(personality);
                 let budget = desktop_assistant_core::ports::llm::current_context_budget();
                 self.captured_budget.lock().unwrap().push(budget);
-                let gate_disabled = desktop_assistant_core::ports::llm::current_tool_gate_disabled();
+                let gate_disabled =
+                    desktop_assistant_core::ports::llm::current_tool_gate_disabled();
                 self.captured_tool_gate_disabled
                     .lock()
                     .unwrap()
@@ -5050,7 +5142,10 @@ url = postgres://adele:hunter2@db.example/adele
                 Ok(())
             }
 
-            async fn get_tool_gate_disabled(&self, _id: &ConversationId) -> Result<bool, CoreError> {
+            async fn get_tool_gate_disabled(
+                &self,
+                _id: &ConversationId,
+            ) -> Result<bool, CoreError> {
                 Err(CoreError::Storage("simulated store failure".into()))
             }
 
