@@ -125,6 +125,25 @@
 //!   tier and a trusted provenance. The server identity is not available at
 //!   the dispatch chokepoint today. Until it is, the fail-closed default can
 //!   be bypassed by name choice.
+//! - **A per-conversation override can disable the gate outright.** Issue
+//!   #1007 adds a stored, per-conversation boolean that, when set, constructs
+//!   [`TurnProvenance`] with [`TurnProvenance::new_with_gate_disabled`]:
+//!   [`TurnProvenance::check`] then always returns [`ToolGate::Allow`],
+//!   whatever the turn has ingested. This is a deliberate hole in the gate,
+//!   not an oversight - a conversation that legitimately wants to read a page
+//!   and act on it in the same turn has no other way to say so, and the
+//!   alternative (no override at all) pushed some ordinary workflows into
+//!   needless friction. The accepted risk is exactly what the rest of this
+//!   module defends against: with the override on, a turn that reads
+//!   attacker-controlled content and then acts on it is indistinguishable
+//!   from a turn the user actually asked to act, for as long as the override
+//!   stays on. The turn still tracks whether it ingested external content
+//!   (`observe_result` is unchanged), so the loop still tells the person
+//!   watching, once per turn, that a call which would normally have been
+//!   refused ran anyway - see [`GATE_BYPASSED_STATUS`]. Resolution fails
+//!   closed at every layer above this module: an unset value, a missing row,
+//!   a cross-user row, or a store error all resolve to the gate staying
+//!   enforced. Only an explicit stored `true` disables it.
 //! - **Any namespace can claim a shipped tool's classification.** Stripping is
 //!   namespace-agnostic on purpose, because an operator chooses the namespace
 //!   freely (`fs__fileio_read_lines` is the documented example), so this
@@ -879,6 +898,18 @@ pub const GATED_TIERS: &[ToolTier] = &[Mutate, Egress, Execution, Unclassified];
 pub const GATE_CLOSED_STATUS: &str =
     "Read outside content - sending, changing and running are off for the rest of this turn";
 
+/// The status line the turn loop emits when the per-conversation override
+/// (issue #1007) lets a gated tool run in a turn that would otherwise have
+/// refused it.
+///
+/// Emitted once per turn, at the same moment [`GATE_CLOSED_STATUS`] would
+/// have fired had the override been off - see
+/// [`TurnProvenance::observe_result`]. A safety-off switch must not be a
+/// silent one: the person watching needs to know a call that would normally
+/// have been refused ran anyway.
+pub const GATE_BYPASSED_STATUS: &str = "Live dangerously is on for this conversation: a tool \
+     that would normally be refused after reading outside content ran anyway.";
+
 /// Whether the current turn has taken in externally-controlled bytes.
 ///
 /// One turn owns one of these, as a plain local of the turn loop. That is the
@@ -887,19 +918,43 @@ pub const GATE_CLOSED_STATUS: &str =
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct TurnProvenance {
     ingested_external: bool,
+    /// The per-conversation override (issue #1007). When `true`,
+    /// [`Self::check`] always returns [`ToolGate::Allow`] regardless of
+    /// [`Self::ingested_external`]. Defaults to `false` — every existing
+    /// caller of [`Self::new`] keeps the gate enforced.
+    gate_disabled: bool,
 }
 
 impl TurnProvenance {
-    /// A turn that has taken in nothing.
+    /// A turn that has taken in nothing, with the gate enforced.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A turn that has taken in nothing, with the per-conversation override
+    /// (issue #1007) applied. `disabled = true` means [`Self::check`] always
+    /// allows, whatever the turn ingests; `disabled = false` is identical to
+    /// [`Self::new`].
+    #[must_use]
+    pub fn new_with_gate_disabled(disabled: bool) -> Self {
+        Self {
+            ingested_external: false,
+            gate_disabled: disabled,
+        }
     }
 
     /// Whether any tool has returned externally-controlled bytes in this turn.
     #[must_use]
     pub fn ingested_external(self) -> bool {
         self.ingested_external
+    }
+
+    /// Whether the per-conversation override (issue #1007) is disabling the
+    /// gate for this turn.
+    #[must_use]
+    pub fn gate_disabled(self) -> bool {
+        self.gate_disabled
     }
 
     /// Fold a completed tool's result into the turn's provenance.
@@ -938,6 +993,12 @@ impl TurnProvenance {
     /// report the limit rather than wait for a person who is not there.
     #[must_use]
     pub fn check(self, name: &str, interactivity: TurnInteractivity) -> ToolGate {
+        // The per-conversation override (issue #1007): skip the tier/ingested
+        // check entirely rather than special-casing it below, so a future
+        // gated tier is covered by the same bypass without a second edit.
+        if self.gate_disabled {
+            return ToolGate::Allow;
+        }
         let tier = classify_tool(name).tier;
         if !self.ingested_external || !tier.is_gated() {
             return ToolGate::Allow;
@@ -1825,7 +1886,10 @@ mod tests {
         // still tracks whether it ingested external content, so the loop can
         // still announce the one-time bypass status.
         let mut turn = TurnProvenance::new_with_gate_disabled(true);
-        assert_eq!(turn.observe_result("web_read", "body"), GateChange::JustClosed);
+        assert_eq!(
+            turn.observe_result("web_read", "body"),
+            GateChange::JustClosed
+        );
         assert_eq!(
             turn.observe_result("web_read", "body again"),
             GateChange::Unchanged,
