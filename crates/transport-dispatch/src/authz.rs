@@ -465,4 +465,20 @@ mod tests {
         assert_eq!(Capability::Tenant.label(), "tenant");
         assert_eq!(Capability::Admin.label(), "administrator");
     }
+
+    /// #1007: the tool-gate override is a per-conversation, tenant-level
+    /// lever, exactly like `SetConversationPersonality` — not an
+    /// admin-only setting. This is the ticket's whole point: giving the
+    /// tenant back a lever the blanket provenance gate took away.
+    #[test]
+    fn set_conversation_tool_gate_is_tenant_capability() {
+        let cmd = api::Command::SetConversationToolGate {
+            conversation_id: "c1".into(),
+            disabled: true,
+        };
+        assert_eq!(
+            classify(&cmd),
+            ("set_conversation_tool_gate", Capability::Tenant)
+        );
+    }
 }
