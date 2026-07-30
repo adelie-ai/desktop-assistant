@@ -290,6 +290,36 @@ pub trait ConversationService: Send + Sync {
         Ok(())
     }
 
+    /// Read the conversation's stored tool-provenance-gate override (#1007),
+    /// or `false` when no override is stored. `true` disables the gate for
+    /// every turn in this conversation; `false` (the default) leaves it
+    /// enforced.
+    ///
+    /// The default implementation returns `Ok(false)` — fail-closed, so a
+    /// caller that never wires the daemon's persistent store still gets the
+    /// gate enforced. The daemon's routing wrapper overrides this to consult
+    /// the persistent store, mirroring
+    /// [`Self::get_conversation_personality`].
+    async fn get_conversation_tool_gate_disabled(
+        &self,
+        id: &ConversationId,
+    ) -> Result<bool, CoreError> {
+        let _ = id;
+        Ok(false)
+    }
+
+    /// Set (or clear) the conversation's tool-provenance-gate override
+    /// (#1007). Default is a no-op; the routing wrapper overrides it to
+    /// persist through the store.
+    async fn set_conversation_tool_gate_disabled(
+        &self,
+        id: &ConversationId,
+        disabled: bool,
+    ) -> Result<(), CoreError> {
+        let _ = (id, disabled);
+        Ok(())
+    }
+
     async fn delete_conversation(&self, id: &ConversationId) -> Result<(), CoreError>;
 
     async fn rename_conversation(
