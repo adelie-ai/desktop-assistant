@@ -355,8 +355,10 @@ promises what the code does not honour is a false contract.
 ### 9.1 Tracker for this project
 
 GitHub Issues on `github.com/adelie-ai/desktop-assistant`, together with the shared `adelie-ai` project
-board. Manage entries with the `gh` CLI (`gh issue create`, `gh issue list`, `gh issue edit`,
-`gh pr create`). The board states in use are In Progress, In Review, and Done.
+board `Adelie AI Roadmap` (project number 1). Manage entries with the `gh` CLI
+(`gh issue create`, `gh issue list`, `gh issue edit`, `gh pr create`). Put a new issue on the
+board with `gh project item-add 1 --owner adelie-ai --url <issue-url>`, which lands it in
+Todo. The board states are Todo, In Progress, and Done.
 
 ### Platform, not a single product (addition)
 
