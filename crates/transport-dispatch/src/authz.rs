@@ -37,6 +37,7 @@
 use std::collections::BTreeSet;
 
 use desktop_assistant_api_model as api;
+use desktop_assistant_core::ports::auth::DEFAULT_USER_ID;
 
 /// Leading text of every authorization refusal, so a client can tell a refusal
 /// from an operational error without parsing prose.
@@ -53,24 +54,51 @@ pub use api::Capability;
 /// daemon that was never configured grants administration to nobody over a
 /// remote transport. Blank and whitespace-only entries are dropped, so a stray
 /// line in `daemon.toml` cannot admit the empty subject.
+///
+/// The schema sentinel [`DEFAULT_USER_ID`] (`"default"`) is dropped for the
+/// same reason, and it is the one an operator is likely to write by hand. It is
+/// not a person: it is the `user_id` the storage schema backfills, and it is
+/// what a transport falls back to when it cannot name a subject. Reading it as
+/// "the default user" on a single-user box and putting it on this list would
+/// hand the administrator capability to every connection whose subject could
+/// not be resolved. The transports now refuse such a connection outright
+/// (#807); dropping the sentinel here is the second layer, so one regression on
+/// either side cannot promote anybody.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AdminSubjects(BTreeSet<String>);
 
 impl AdminSubjects {
-    /// Build the allowlist from configured subjects, dropping blanks and
-    /// trimming surrounding whitespace.
+    /// Build the allowlist from configured subjects, dropping blanks and the
+    /// schema sentinel, and trimming surrounding whitespace.
+    ///
+    /// A dropped sentinel is logged at warn: the operator wrote a line that
+    /// does nothing, and silence would read as "it worked".
     pub fn new<I, S>(subjects: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        Self(
-            subjects
-                .into_iter()
-                .map(|s| s.as_ref().trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect(),
-        )
+        let mut dropped_sentinel = false;
+        let admitted = subjects
+            .into_iter()
+            .map(|s| s.as_ref().trim().to_string())
+            .filter(|s| !s.is_empty())
+            .filter(|s| {
+                if s == DEFAULT_USER_ID {
+                    dropped_sentinel = true;
+                    return false;
+                }
+                true
+            })
+            .collect();
+        if dropped_sentinel {
+            tracing::warn!(
+                "[authz] admin_subjects lists {DEFAULT_USER_ID:?}, which is the storage \
+                 sentinel rather than a person, so it is ignored. Name the real subject \
+                 (the JWT `sub` remotely, the peer login name locally) instead"
+            );
+        }
+        Self(admitted)
     }
 
     /// Whether the allowlist names nobody - the default, and the shape a
@@ -404,6 +432,32 @@ mod tests {
             Capability::Admin,
             "an unrecognized level must not outrank a real grant"
         );
+    }
+
+    /// #807: `"default"` is the schema sentinel every subject-less path used to
+    /// collapse to. It is not blank, so the blank filter did not stop it, and an
+    /// operator reading the list as "the default user" on a single-user box
+    /// would have promoted every subject-less connection to administrator. It is
+    /// therefore not representable on the allowlist at all.
+    #[test]
+    fn the_default_sentinel_cannot_be_allowlisted_as_an_administrator() {
+        let allowlist = AdminSubjects::new(["default", " default ", "alice"]);
+        assert_eq!(
+            allowlist.capability_for("default"),
+            Capability::Tenant,
+            "the sentinel must never carry the administrator capability"
+        );
+        assert_eq!(allowlist.capability_for("alice"), Capability::Admin);
+        assert_eq!(allowlist.len(), 1, "only the real subject is admitted");
+    }
+
+    /// The blank filter that was already there, pinned as its own requirement.
+    #[test]
+    fn a_blank_subject_is_never_an_administrator() {
+        let allowlist = AdminSubjects::new(["", "   ", "alice"]);
+        assert_eq!(allowlist.capability_for(""), Capability::Tenant);
+        assert_eq!(allowlist.capability_for("   "), Capability::Tenant);
+        assert_eq!(allowlist.len(), 1);
     }
 
     #[test]

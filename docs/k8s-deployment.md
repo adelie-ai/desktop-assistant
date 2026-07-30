@@ -274,6 +274,12 @@ unless you name it:
 admin_subjects = ["adele"]
 ```
 
+Name the real subject. `"default"` is not one: it is the storage schema's own
+sentinel, and the daemon drops it from this list with a warning. Under OIDC,
+check that your provider puts the caller's identity in `sub` - a token with no
+`sub` claim is now refused at the handshake with `401` rather than connecting as
+that sentinel.
+
 Leave it out - the default - and **nobody** can change this instance's
 configuration over the network. That is the right setting for an instance whose
 config is fully declared in the overlay and re-seeded on change. Set it when you

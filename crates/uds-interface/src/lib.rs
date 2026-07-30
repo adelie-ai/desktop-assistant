@@ -106,11 +106,16 @@ pub trait UdsAuthValidator: Send + Sync {
     /// Extract the user id ([JWT `sub`]) from a bearer token that
     /// [`Self::validate_bearer_token`] already accepted (#105).
     ///
-    /// Default returns `None`, which collapses the connection to the
-    /// schema sentinel `UserId::default()`. Single-tenant desktop
-    /// installs that don't care about identity can keep the default;
-    /// multi-tenant or multi-user-host deploys override this method
-    /// to return the JWT subject so storage queries scope per-user.
+    /// Returning `None` means "this token names no subject", and it **rejects
+    /// the connection** (#807). Identity resolution is part of accepting a
+    /// caller, not a best-effort afterthought: a `None` that fell through to
+    /// the schema sentinel `UserId::default()` admitted the caller to the
+    /// primary data partition, and - since the authorization tier landed - to
+    /// whatever capability the allowlist grants that name.
+    ///
+    /// The default therefore names nobody, which is the fail-closed answer. A
+    /// validator that accepts tokens overrides this to return the subject the
+    /// same token carries, so acceptance and identity cannot disagree.
     async fn extract_user_id(&self, token: &str) -> Option<UserId> {
         let _ = token;
         None
@@ -120,13 +125,27 @@ pub trait UdsAuthValidator: Send + Sync {
     /// kernel-attested `peer` credentials (if the OS provided them).
     ///
     /// The default implementation is the historical token-only policy: require
-    /// a valid bearer token and ignore peer credentials. Local-trust daemons
-    /// override this to authenticate by `peer` instead (#407).
+    /// a valid bearer token **that names a subject**, and ignore peer
+    /// credentials. Local-trust daemons override this to authenticate by `peer`
+    /// instead (#407).
     async fn authenticate(&self, token: Option<&str>, peer: Option<&PeerIdentity>) -> UdsAuth {
         let _ = peer;
         match token {
             Some(t) if self.validate_bearer_token(t).await => {
-                UdsAuth::allow_tenant(self.extract_user_id(t).await.unwrap_or_default())
+                match self
+                    .extract_user_id(t)
+                    .await
+                    .filter(UserId::names_a_subject)
+                {
+                    Some(user) => UdsAuth::allow_tenant(user),
+                    None => {
+                        tracing::warn!(
+                            "auth: a bearer token validated but names no subject; refusing the \
+                             connection rather than filing it under the shared default identity"
+                        );
+                        UdsAuth::Reject("auth: token names no subject".to_string())
+                    }
+                }
             }
             Some(_) => UdsAuth::Reject("auth: invalid jwt".to_string()),
             None => UdsAuth::Reject("auth: missing jwt in handshake".to_string()),
@@ -693,5 +712,55 @@ mod tests {
         // A remote connection (no peer-cred) that sent no context yields nothing
         // to attach.
         assert_eq!(resolve_local_client_context(None, None), None);
+    }
+
+    /// #807: the trait's own token-only policy resolved identity with
+    /// `unwrap_or_default()`, so a validator that accepted a token but could not
+    /// name its subject admitted the caller to the schema sentinel `"default"` -
+    /// the primary data partition. Identity is now part of acceptance.
+    mod token_only_policy_needs_a_subject {
+        use super::*;
+
+        struct SubjectStub {
+            subject: Option<&'static str>,
+        }
+
+        #[async_trait::async_trait]
+        impl UdsAuthValidator for SubjectStub {
+            async fn validate_bearer_token(&self, token: &str) -> bool {
+                token == "good"
+            }
+            async fn extract_user_id(&self, _token: &str) -> Option<UserId> {
+                self.subject.map(UserId::from)
+            }
+        }
+
+        fn stub(subject: Option<&'static str>) -> SubjectStub {
+            SubjectStub { subject }
+        }
+
+        #[tokio::test]
+        async fn a_token_that_names_a_subject_is_admitted_as_that_subject() {
+            match stub(Some("alice")).authenticate(Some("good"), None).await {
+                UdsAuth::Allow { user, .. } => assert_eq!(user, UserId::from("alice")),
+                UdsAuth::Reject(reason) => panic!("expected Allow, got Reject({reason})"),
+            }
+        }
+
+        #[tokio::test]
+        async fn a_token_with_no_subject_is_rejected() {
+            assert!(matches!(
+                stub(None).authenticate(Some("good"), None).await,
+                UdsAuth::Reject(_)
+            ));
+        }
+
+        #[tokio::test]
+        async fn a_token_with_a_blank_subject_is_rejected() {
+            assert!(matches!(
+                stub(Some("   ")).authenticate(Some("good"), None).await,
+                UdsAuth::Reject(_)
+            ));
+        }
     }
 }

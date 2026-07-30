@@ -53,6 +53,12 @@ No rate limiting on inbound messages. An authenticated client could spam the ser
 
 **Recommendation:** Implement per-connection rate limiting and send error frames for malformed input.
 
+**Scope note:** This covers the post-authentication message stream only. The
+pre-authentication `POST /login` endpoint is a separate concern and is throttled
+(`crates/ws-interface/src/login_throttle.rs`): failed attempts are counted per
+source address and per username, and the endpoint answers `429` with
+`Retry-After` once the budget is spent.
+
 ---
 
 ### 6. FNV-1a Hash for Secret Fingerprinting (LOW)

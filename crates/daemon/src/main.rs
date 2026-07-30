@@ -47,7 +47,8 @@ use settings_service::DaemonSettingsService;
 use store::PersistentConversationStore;
 use transports::{
     OidcAwareAuth, PeerCredUdsAuth, WsAuthDiscoveryProvider, WsBasicLogin, WsLoginMode,
-    WsSettingsAuth, daemon_host_label, env_bool, resolve_uds_socket_path, resolve_ws_login_mode,
+    WsSettingsAuth, daemon_host_label, env_bool, is_container_environment, resolve_uds_socket_path,
+    resolve_ws_login_mode,
 };
 
 async fn shutdown_signal() {
@@ -2877,17 +2878,34 @@ async fn main() -> Result<()> {
                     }
                 };
 
+            // The bind address decides whether the OS-password door is a local
+            // convenience or a network-reachable PAM oracle (#806), so it is an
+            // input to the decision rather than something the door ignores.
             let ws_login_service: Option<Arc<dyn ws::WsLoginService>> =
-                resolve_ws_login_mode().map(|(username, mode)| {
+                resolve_ws_login_mode(ws_addr).map(|(username, mode)| {
                     match &mode {
                         WsLoginMode::StaticPassword(_) => {
                             tracing::info!(
                                 "Web login enabled (env-password mode) for username={username}"
                             );
                         }
-                        WsLoginMode::SystemPassword => {
-                            tracing::info!(
-                                "Web login enabled (local system-password mode) for username={username}"
+                        WsLoginMode::SystemPassword(_) => {
+                            // Say the assumption out loud, on every start, not
+                            // only when the bind address looks wrong. A loopback
+                            // bind is a proxy for "only this machine can reach
+                            // it", and a reverse proxy in front of the daemon
+                            // breaks that assumption without changing the bind
+                            // address.
+                            tracing::warn!(
+                                "Web login enabled (local system-password mode) for \
+                                 username={username}: POST /login on {ws_addr} checks that \
+                                 account's real OS password through PAM. This is meant for \
+                                 a door only this machine can reach. Anything that can \
+                                 reach the port can use it, including through a reverse \
+                                 proxy - set DESKTOP_ASSISTANT_WS_LOGIN_PASSWORD to use a \
+                                 separate credential instead, or \
+                                 DESKTOP_ASSISTANT_WS_LOGIN_LOCAL_SYSTEM_AUTH=false to \
+                                 turn this off"
                             );
                         }
                     }
@@ -2899,8 +2917,26 @@ async fn main() -> Result<()> {
                     )) as Arc<dyn ws::WsLoginService>
                 });
             if ws_login_service.is_none() {
+                // Name the condition that actually applies. "One of these three
+                // things" makes an operator check all three; the daemon knows
+                // which one it was.
+                let reason = if is_container_environment() {
+                    "this daemon runs in a container, which has no local user account \
+                     to check against"
+                        .to_string()
+                } else if env_bool("DESKTOP_ASSISTANT_WS_LOGIN_LOCAL_SYSTEM_AUTH", true) {
+                    format!(
+                        "this daemon is bound to {ws_addr}, which is not loopback, so the \
+                         OS-password mode is off unless \
+                         DESKTOP_ASSISTANT_WS_LOGIN_LOCAL_SYSTEM_AUTH=true asks for it"
+                    )
+                } else {
+                    "DESKTOP_ASSISTANT_WS_LOGIN_LOCAL_SYSTEM_AUTH is false".to_string()
+                };
                 tracing::warn!(
-                    "Web login disabled: set DESKTOP_ASSISTANT_WS_LOGIN_PASSWORD or enable local auth via DESKTOP_ASSISTANT_WS_LOGIN_LOCAL_SYSTEM_AUTH=true"
+                    "Web login disabled: {reason}. Set DESKTOP_ASSISTANT_WS_LOGIN_PASSWORD \
+                     to use a separate credential, which is the right mode for a door \
+                     reachable over a network"
                 );
             }
 

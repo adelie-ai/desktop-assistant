@@ -21,7 +21,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use desktop_assistant_application::DefaultAssistantApiHandler;
+use desktop_assistant_application::{DefaultAssistantApiHandler, UserId};
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{
     Conversation, ConversationId, ConversationSummary, KnowledgeEntry,
@@ -163,6 +163,14 @@ struct StaticJwtAuth;
 impl WsAuthValidator for StaticJwtAuth {
     async fn validate_bearer_token(&self, token: &str) -> bool {
         token == "test-jwt"
+    }
+
+    /// Identity is part of acceptance (#807): a validator that accepts a
+    /// token must name the subject it belongs to, or the upgrade is refused.
+    async fn extract_user_id(&self, token: &str) -> Option<UserId> {
+        self.validate_bearer_token(token)
+            .await
+            .then(|| UserId::from("test-user"))
     }
 }
 

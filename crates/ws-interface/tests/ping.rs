@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use desktop_assistant_application::DefaultAssistantApiHandler;
+use desktop_assistant_application::{DefaultAssistantApiHandler, UserId};
 use desktop_assistant_ws::{
     WsAuthValidator, WsFrame, WsLoginService, WsRequest, router, router_full, router_with_login,
 };
@@ -137,6 +137,14 @@ impl WsAuthValidator for StaticJwtAuth {
     async fn validate_bearer_token(&self, token: &str) -> bool {
         token == "test-jwt"
     }
+
+    /// Identity is part of acceptance (#807): a validator that accepts a
+    /// token must name the subject it belongs to, or the upgrade is refused.
+    async fn extract_user_id(&self, token: &str) -> Option<UserId> {
+        self.validate_bearer_token(token)
+            .await
+            .then(|| UserId::from("test-user"))
+    }
 }
 
 /// The same door, but for a subject the operator allowlisted (#728). Used by
@@ -148,6 +156,14 @@ struct StaticAdminJwtAuth;
 impl WsAuthValidator for StaticAdminJwtAuth {
     async fn validate_bearer_token(&self, token: &str) -> bool {
         token == "test-jwt"
+    }
+
+    /// Identity is part of acceptance (#807): a validator that accepts a
+    /// token must name the subject it belongs to, or the upgrade is refused.
+    async fn extract_user_id(&self, token: &str) -> Option<UserId> {
+        self.validate_bearer_token(token)
+            .await
+            .then(|| UserId::from("test-user"))
     }
 
     fn capability_for_subject(&self, _subject: &str) -> desktop_assistant_ws::Capability {

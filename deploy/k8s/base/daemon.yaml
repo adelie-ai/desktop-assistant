@@ -108,8 +108,12 @@ spec:
               value: "false"
             - name: DESKTOP_ASSISTANT_WS_LOGIN_USERNAME
               value: "adele"
+            # Pure static-password; no PAM/local users in-pod. The daemon would
+            # refuse the OS-password mode here anyway - it is off in a container
+            # and off on a non-loopback bind - but stating it keeps the manifest
+            # readable without knowing that rule.
             - name: DESKTOP_ASSISTANT_WS_LOGIN_LOCAL_SYSTEM_AUTH
-              value: "false" # pure static-password; no PAM/local users in-pod
+              value: "false"
             - name: DESKTOP_ASSISTANT_WS_LOGIN_PASSWORD
               valueFrom:
                 secretKeyRef:
