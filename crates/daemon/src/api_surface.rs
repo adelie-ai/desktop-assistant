@@ -4794,6 +4794,11 @@ url = postgres://adele:hunter2@db.example/adele
             /// budget reaches the dispatch scope.
             captured_budget:
                 StdMutex<Vec<Option<desktop_assistant_core::ports::llm::ContextBudget>>>,
+            /// Snapshot of the `TOOL_GATE_DISABLED` task-local (#1007) at each
+            /// `send_prompt` — proves the routing wrapper resolved the
+            /// conversation's stored tool-gate override and installed it on
+            /// the dispatch scope.
+            captured_tool_gate_disabled: StdMutex<Vec<bool>>,
         }
 
         impl CapturingInner {
@@ -4804,6 +4809,7 @@ url = postgres://adele:hunter2@db.example/adele
                     captured_model_override: StdMutex::new(Vec::new()),
                     captured_personality: StdMutex::new(Vec::new()),
                     captured_budget: StdMutex::new(Vec::new()),
+                    captured_tool_gate_disabled: StdMutex::new(Vec::new()),
                 }
             }
         }
@@ -4871,6 +4877,11 @@ url = postgres://adele:hunter2@db.example/adele
                 self.captured_personality.lock().unwrap().push(personality);
                 let budget = desktop_assistant_core::ports::llm::current_context_budget();
                 self.captured_budget.lock().unwrap().push(budget);
+                let gate_disabled = desktop_assistant_core::ports::llm::current_tool_gate_disabled();
+                self.captured_tool_gate_disabled
+                    .lock()
+                    .unwrap()
+                    .push(gate_disabled);
                 Ok("ok".to_string())
             }
         }
@@ -4947,6 +4958,139 @@ url = postgres://adele:hunter2@db.example/adele
             assert_eq!(
                 captured[0], global,
                 "no override → the global personality must be installed verbatim"
+            );
+        }
+
+        // ─── Issue #1007: per-conversation tool-gate override at send ─────
+
+        #[tokio::test]
+        async fn send_installs_gate_enforced_by_default_when_no_override_stored() {
+            // With no stored override, the resolved value must be `false` —
+            // the gate stays enforced. This is the fail-closed default.
+            let (routing, inner, _registry, _store) = make_handler();
+
+            let (on_chunk, on_status) = noop_cb();
+            routing
+                .send_prompt(
+                    &ConversationId::from("c1"),
+                    "hi".into(),
+                    on_chunk,
+                    on_status,
+                )
+                .await
+                .expect("plain send_prompt should succeed via interactive purpose");
+
+            let captured = inner.captured_tool_gate_disabled.lock().unwrap();
+            assert_eq!(captured.len(), 1);
+            assert!(
+                !captured[0],
+                "no stored override must resolve to the gate enforced"
+            );
+        }
+
+        #[tokio::test]
+        async fn send_installs_the_stored_tool_gate_override() {
+            // Once `SetConversationToolGate` has pinned `true` on a
+            // conversation, the next send must install that resolved value on
+            // the dispatch scope.
+            let (routing, inner, _registry, store) = make_handler();
+            let id = ConversationId::from("c1");
+            store
+                .set_tool_gate_disabled(&id, true)
+                .await
+                .expect("set stored override");
+
+            let (on_chunk, on_status) = noop_cb();
+            routing
+                .send_prompt(&id, "hi".into(), on_chunk, on_status)
+                .await
+                .expect("plain send_prompt should succeed via interactive purpose");
+
+            let captured = inner.captured_tool_gate_disabled.lock().unwrap();
+            assert_eq!(captured.len(), 1);
+            assert!(
+                captured[0],
+                "a stored `true` override must resolve to the gate disabled"
+            );
+        }
+
+        /// A `ConversationSelectionStore` whose tool-gate accessor always
+        /// errors, so `resolve_tool_gate_disabled` must fail closed rather
+        /// than propagate the error into the send path.
+        struct ErroringToolGateStore;
+
+        impl ConversationSelectionStore for ErroringToolGateStore {
+            async fn get_selection(
+                &self,
+                _id: &ConversationId,
+            ) -> Result<Option<ConversationModelSelection>, CoreError> {
+                Ok(None)
+            }
+
+            async fn set_selection(
+                &self,
+                _id: &ConversationId,
+                _selection: Option<&ConversationModelSelection>,
+            ) -> Result<(), CoreError> {
+                Ok(())
+            }
+
+            async fn get_personality(
+                &self,
+                _id: &ConversationId,
+            ) -> Result<Option<PersonalityOverride>, CoreError> {
+                Ok(None)
+            }
+
+            async fn set_personality(
+                &self,
+                _id: &ConversationId,
+                _personality: Option<&PersonalityOverride>,
+            ) -> Result<(), CoreError> {
+                Ok(())
+            }
+
+            async fn get_tool_gate_disabled(&self, _id: &ConversationId) -> Result<bool, CoreError> {
+                Err(CoreError::Storage("simulated store failure".into()))
+            }
+
+            async fn set_tool_gate_disabled(
+                &self,
+                _id: &ConversationId,
+                _disabled: bool,
+            ) -> Result<(), CoreError> {
+                Err(CoreError::Storage("simulated store failure".into()))
+            }
+        }
+
+        #[tokio::test]
+        async fn resolve_tool_gate_disabled_fails_closed_on_a_store_error() {
+            let cfg = local_ollama_cfg();
+            let registry = make_handle_with(cfg);
+            let inner = Arc::new(CapturingInner::new());
+            let store = Arc::new(ErroringToolGateStore);
+            let routing = Arc::new(RoutingConversationHandler::new(
+                Arc::clone(&inner),
+                Arc::clone(&store),
+                Arc::clone(&registry),
+            ));
+
+            let (on_chunk, on_status) = noop_cb();
+            routing
+                .send_prompt(
+                    &ConversationId::from("c1"),
+                    "hi".into(),
+                    on_chunk,
+                    on_status,
+                )
+                .await
+                .expect("a broken store must not fail the turn");
+
+            let captured = inner.captured_tool_gate_disabled.lock().unwrap();
+            assert_eq!(captured.len(), 1);
+            assert!(
+                !captured[0],
+                "a store error must resolve to the gate enforced, never disabled"
             );
         }
 
