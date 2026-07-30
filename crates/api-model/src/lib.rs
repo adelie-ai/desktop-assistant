@@ -4629,6 +4629,79 @@ mod tests {
         assert_eq!(view, back);
     }
 
+    // --- Per-conversation tool-gate override wire types (#1007) -------------
+
+    #[test]
+    fn set_conversation_tool_gate_command_round_trips() {
+        let cmd = Command::SetConversationToolGate {
+            conversation_id: "conv-1".into(),
+            disabled: true,
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(
+            json.contains("\"set_conversation_tool_gate\""),
+            "json: {json}"
+        );
+        let back: Command = serde_json::from_str(&json).unwrap();
+        assert_eq!(cmd, back);
+    }
+
+    #[test]
+    fn conversation_tool_gate_result_round_trips() {
+        let res = CommandResult::ConversationToolGate { disabled: true };
+        let json = serde_json::to_string(&res).unwrap();
+        assert!(
+            json.contains("\"conversation_tool_gate\""),
+            "json: {json}"
+        );
+        let back: CommandResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(res, back);
+    }
+
+    #[test]
+    fn conversation_view_carries_tool_gate_disabled_omitted_when_false() {
+        // `tool_gate_disabled` is omitted from the wire when `false` (the
+        // fail-closed default), so an old client that predates the field
+        // parses an old-shaped payload identically — mirrors
+        // `conversation_personality`'s round-trip test.
+        let mut view = ConversationView {
+            id: "c1".into(),
+            title: "t".into(),
+            messages: vec![],
+            warnings: vec![],
+            model_selection: None,
+            conversation_personality: None,
+            tool_gate_disabled: false,
+        };
+        let json = serde_json::to_string(&view).unwrap();
+        assert!(
+            !json.contains("tool_gate_disabled"),
+            "false must not appear on the wire: {json}"
+        );
+        let back: ConversationView = serde_json::from_str(&json).unwrap();
+        assert_eq!(view, back);
+
+        view.tool_gate_disabled = true;
+        let json = serde_json::to_string(&view).unwrap();
+        assert!(json.contains("tool_gate_disabled"), "json: {json}");
+        let back: ConversationView = serde_json::from_str(&json).unwrap();
+        assert_eq!(view, back);
+    }
+
+    #[test]
+    fn an_old_shaped_conversation_view_without_tool_gate_disabled_still_parses() {
+        // Proves back-compat the other direction: a payload from a daemon
+        // that predates #1007 (no `tool_gate_disabled` key at all) must still
+        // deserialize, defaulting to `false` — the gate stays enforced.
+        let old_shaped = serde_json::json!({
+            "id": "c1",
+            "title": "t",
+            "messages": [],
+        });
+        let view: ConversationView = serde_json::from_value(old_shaped).unwrap();
+        assert!(!view.tool_gate_disabled);
+    }
+
     fn remove_key_recursive(v: &mut serde_json::Value, key: &str) {
         match v {
             serde_json::Value::Object(map) => {
