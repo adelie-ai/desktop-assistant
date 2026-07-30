@@ -21,6 +21,9 @@ Interface: `org.desktopAssistant.Settings`
 - `DeleteConversation(id: s) -> ()`
 - `ClearAllHistory() -> deleted_count: u`
 - `SendPrompt(conversation_id: s, prompt: s) -> request_id: s`
+- `SetConversationToolGate(conversation_id: s, disabled: b) -> b`
+  - Per-conversation override for the tool-provenance gate (see "Tool-provenance
+    gating" below). Returns the stored value after the write.
 
 ### Settings Methods
 
@@ -70,7 +73,8 @@ name. A tenant is refused the service-configuration writes - `SetApiKey`,
 `SetBackendTasksSettings`, `SetWsAuthSettings`, the connection and purpose
 writes, the MCP lifecycle writes, and `SetConfig` (whose personality traits are
 one global block, not a per-user preference). Reads and conversations are
-unaffected, and a tenant still sets their own disposition per conversation.
+unaffected, and a tenant still sets their own disposition per conversation,
+and their own tool-provenance-gate override (`SetConversationToolGate`).
 
 A refusal reaches D-Bus as an `org.freedesktop.DBus.Error.Failed` whose message
 begins `not authorized:` and names the command. The structured classification
@@ -102,6 +106,15 @@ WebSocket `assistant_status` event and is **not** projected onto the D-Bus
 signal, which carries only the text. A D-Bus client that needs the structured
 value reads it over the WebSocket transport instead
 (`docs/WEBSOCKET_API.md`).
+
+A conversation can turn the gate off for itself: `SetConversationToolGate`
+above. With the override on, a gated tool runs even after the turn reads
+outside content, and the `Status` signal instead carries "Live dangerously is
+on for this conversation: a tool that would normally be refused after reading
+outside content ran anyway." - once per turn, the same channel as the
+closed-gate line. Fails closed everywhere a lookup can fail: an unset value,
+a missing conversation row, a cross-user row, or a store error all resolve
+to the gate staying enforced.
 
 ## Quick `busctl` examples
 
