@@ -505,7 +505,12 @@ impl DbusClient {
                 })
                 .collect(),
             model_selection: None,
+            // This reduced D-Bus tuple (role, content) predates both the
+            // personality override (#227) and the tool-gate override
+            // (#1007); this client (voice) is a turn producer, not a
+            // settings surface, so neither is exposed here.
             conversation_personality: None,
+            tool_gate_disabled: false,
         })
     }
 
