@@ -11,3 +11,4 @@ __pycache__/
 
 # Gate and build output, never committed.
 *.log
+.obsidian
