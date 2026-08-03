@@ -1355,6 +1355,59 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
             vec![]
         };
 
+        // Restrict the deferred set to the caller's allowlist, the same way
+        // `tool_defs` is restricted below (issues #291 / #133). Without this
+        // the comment there - "a restricted subagent's LLM only ever sees the
+        // tools it may use" - held only for connectors with hosted tool search
+        // off: hosted search sends its tools through `namespaces`, which never
+        // passed that filter, so a restricted subagent's provider-side tool
+        // search still received the whole fleet's names, descriptions and
+        // schemas. Dispatch refuses execution, so that was disclosure rather
+        // than unauthorized use, but the promise has to hold on every path.
+        //
+        // Filtered here, once, rather than at each use. Three predicates below
+        // ask "are there namespaces?" - whether `builtin_tool_search` comes out
+        // of the core tools, whether the namespaced dispatch is taken, and
+        // whether a text-only response demotes. They must agree: a turn that
+        // takes the plain path while the other two still believe hosted search
+        // is live loses `builtin_tool_search` anyway and then trips a demotion
+        // it never earned, which re-answers a turn that already streamed. One
+        // filtered value read by all three is the only way to guarantee they
+        // cannot drift.
+        //
+        // After the categorization cache, deliberately: the cache stays keyed
+        // on the unfiltered tool set, so one subagent's restriction never
+        // narrows what another conversation is shown.
+        //
+        // A namespace left with no allowed tools is dropped whole - a name and
+        // a description with nothing behind them is disclosure with no use.
+        let namespaces: Vec<ToolNamespace> = match current_tool_allowlist() {
+            None => namespaces,
+            Some(allowed) => namespaces
+                .into_iter()
+                .filter_map(|ns| {
+                    let ToolNamespace {
+                        name,
+                        description,
+                        tools,
+                    } = ns;
+                    let tools: Vec<ToolDefinition> = tools
+                        .into_iter()
+                        .filter(|t| allowed.iter().any(|a| a == &t.name))
+                        .collect();
+                    if tools.is_empty() {
+                        None
+                    } else {
+                        Some(ToolNamespace {
+                            name,
+                            description,
+                            tools,
+                        })
+                    }
+                })
+                .collect(),
+        };
+
         let core_tools = self.tools.core_tools().await;
         // When hosted search is active and we have namespaces, remove
         // builtin_tool_search from core tools — the provider handles discovery.
@@ -8524,6 +8577,10 @@ mod tests {
         /// Artificial delay applied inside the categorization branch so a test
         /// can widen the window two concurrent cold turns overlap in.
         categorization_delay: std::time::Duration,
+        /// Namespaces handed to `stream_completion_with_namespaces` on the last
+        /// turn. This is what the turn's provider is shown, so it is what an
+        /// allowlist has to constrain.
+        observed_namespaces: Mutex<Vec<ToolNamespace>>,
     }
 
     impl CategorizingLlm {
@@ -8532,7 +8589,34 @@ mod tests {
                 categorization_calls: Arc::new(AtomicU32::new(0)),
                 category_payload: Mutex::new(category_payload),
                 categorization_delay: std::time::Duration::ZERO,
+                observed_namespaces: Mutex::new(Vec::new()),
             }
+        }
+
+        /// Every tool name the last turn's namespaces carried, sorted.
+        fn observed_namespace_tools(&self) -> Vec<String> {
+            let mut names: Vec<String> = self
+                .observed_namespaces
+                .lock()
+                .unwrap()
+                .iter()
+                .flat_map(|ns| ns.tools.iter().map(|t| t.name.clone()))
+                .collect();
+            names.sort();
+            names
+        }
+
+        /// Names of the namespaces the last turn carried, sorted.
+        fn observed_namespace_names(&self) -> Vec<String> {
+            let mut names: Vec<String> = self
+                .observed_namespaces
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|ns| ns.name.clone())
+                .collect();
+            names.sort();
+            names
         }
 
         fn with_categorization_delay(mut self, delay: std::time::Duration) -> Self {
@@ -8572,6 +8656,25 @@ mod tests {
             let text = "ok".to_string();
             on_chunk(text.clone());
             Ok(LlmResponse::text(text))
+        }
+
+        /// Records what the turn's provider was shown, then behaves exactly as
+        /// the trait's default does - flatten into `stream_completion`.
+        async fn stream_completion_with_namespaces(
+            &self,
+            messages: Vec<Message>,
+            core_tools: &[ToolDefinition],
+            namespaces: &[ToolNamespace],
+            reasoning: ReasoningConfig,
+            on_chunk: ChunkCallback,
+        ) -> Result<LlmResponse, CoreError> {
+            *self.observed_namespaces.lock().unwrap() = namespaces.to_vec();
+            let mut all: Vec<ToolDefinition> = core_tools.to_vec();
+            for ns in namespaces {
+                all.extend(ns.tools.iter().cloned());
+            }
+            self.stream_completion(messages, &all, reasoning, on_chunk)
+                .await
         }
     }
 
@@ -8662,6 +8765,151 @@ mod tests {
                 format!("conv-{n}")
             }),
         )
+    }
+
+    use crate::ports::llm::with_tool_allowlist;
+
+    /// Collect every chunk a turn emits, so a test can count answers.
+    fn recording_callback(sink: Arc<Mutex<Vec<String>>>) -> ChunkCallback {
+        Box::new(move |c| {
+            sink.lock().unwrap().push(c);
+            true
+        })
+    }
+
+    // --- The allowlist has to reach the deferred set too (#291 / #133) -----
+    //
+    // `tool_defs` is filtered by `current_tool_allowlist`, and the comment
+    // there promises "a restricted subagent's LLM only ever sees the tools it
+    // may use". Hosted tool search sends its tools through `namespaces`
+    // instead, which bypassed that filter, so the promise held only for
+    // connectors with hosted search off.
+
+    #[tokio::test]
+    async fn restricted_turn_shows_the_provider_only_allowed_namespace_tools() {
+        let count = 12;
+        let executor = NamespacedToolExecutor::new(vec![make_oversized_namespace(count)]);
+        let llm = CategorizingLlm::new(make_categorization_payload(count));
+        let handler = build_categorization_handler(executor, llm);
+
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+
+        with_tool_allowlist(vec!["tool_3".into()], async {
+            handler
+                .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
+                .await
+                .expect("invariant: send_prompt with a valid conv must succeed");
+        })
+        .await;
+
+        assert_eq!(
+            handler.llm.observed_namespace_tools(),
+            vec!["tool_3".to_string()],
+            "a restricted subagent must not be shown the names, descriptions \
+             and schemas of tools outside its allowlist"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_namespace_with_no_allowed_tools_is_not_shown_at_all() {
+        let count = 12;
+        let executor = NamespacedToolExecutor::new(vec![make_oversized_namespace(count)]);
+        let llm = CategorizingLlm::new(make_categorization_payload(count));
+        let handler = build_categorization_handler(executor, llm);
+
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+
+        with_tool_allowlist(vec!["not_a_real_tool".into()], async {
+            handler
+                .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
+                .await
+                .expect("invariant: send_prompt with a valid conv must succeed");
+        })
+        .await;
+
+        assert!(
+            handler.llm.observed_namespace_names().is_empty(),
+            "an emptied namespace is a name and a description with nothing \
+             behind it, so it is disclosure with no use"
+        );
+    }
+
+    /// The turn that empties the deferred set must still answer exactly once.
+    ///
+    /// Three predicates decide the hosted-search path: whether
+    /// `builtin_tool_search` is removed from the core tools, whether the
+    /// namespaced dispatch is taken, and whether a text-only response demotes.
+    /// If they disagree about what "there are namespaces" means, a restricted
+    /// subagent takes the plain path, loses `builtin_tool_search` anyway,
+    /// answers text-only, and trips the demotion - which logs a hosted-search
+    /// failure for a turn that never used it, injects a system message
+    /// promising a tool the allowlist strips, and answers again. Round 0 has
+    /// already streamed, so the caller gets two answers.
+    #[tokio::test]
+    async fn a_restricted_turn_with_no_allowed_tools_answers_once() {
+        let count = 12;
+        let executor = NamespacedToolExecutor::new(vec![make_oversized_namespace(count)]);
+        let llm = CategorizingLlm::new(make_categorization_payload(count));
+        let handler = build_categorization_handler(executor, llm);
+
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+
+        let chunks = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&chunks);
+        with_tool_allowlist(vec!["not_a_real_tool".into()], async {
+            handler
+                .send_prompt(
+                    &conv.id,
+                    "go".into(),
+                    recording_callback(sink),
+                    noop_status(),
+                )
+                .await
+                .expect("invariant: send_prompt with a valid conv must succeed");
+        })
+        .await;
+
+        let answers = chunks.lock().unwrap().len();
+        assert_eq!(
+            answers, 1,
+            "the caller must receive one answer; {answers} means the demotion \
+             fired for a turn that never used hosted tool search"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unrestricted_turn_still_shows_every_namespace_tool() {
+        // The other direction: the filter must not withhold from a turn that
+        // was never restricted.
+        let count = 12;
+        let executor = NamespacedToolExecutor::new(vec![make_oversized_namespace(count)]);
+        let llm = CategorizingLlm::new(make_categorization_payload(count));
+        let handler = build_categorization_handler(executor, llm);
+
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+
+        handler
+            .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
+            .await
+            .expect("invariant: send_prompt with a valid conv must succeed");
+
+        assert_eq!(
+            handler.llm.observed_namespace_tools().len(),
+            count,
+            "an unrestricted turn keeps the whole deferred set"
+        );
     }
 
     #[tokio::test]
