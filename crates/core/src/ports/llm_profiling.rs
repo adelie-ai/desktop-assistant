@@ -744,6 +744,115 @@ mod tests {
         );
     }
 
+    // --- Decorators must stay in the path for a namespaced turn (#1033) ---
+    //
+    // Answering the capability correctly is not enough. A decorator that
+    // reports hosted tool search and then hands the caller its *inner*
+    // client's dispatch object is skipped for exactly the turns that carry
+    // the most tools. These tests observe the decorator's own effect on a
+    // namespaced turn, so a bypass fails them.
+
+    /// Profiling log path for the in-path tests, which do dispatch and so do
+    /// write a file. Same shape as [`capability_log_path`]; kept separate so
+    /// a reader is not misled by that helper's "never dispatch" contract.
+    fn dispatch_log_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "llm_profile_dispatch_{}_{label}.jsonl",
+            std::process::id()
+        ))
+    }
+
+    #[tokio::test]
+    async fn profiling_decorator_stays_in_the_namespaced_path() {
+        use crate::ports::llm::dispatch_namespaced;
+        use crate::ports::llm::hosted_search_test_support::*;
+
+        let path = dispatch_log_path("profiling_in_path");
+        let _ = std::fs::remove_file(&path);
+        let inner = ProbeLlm::new(true);
+        let probe = std::sync::Arc::clone(&inner.probe);
+        let client = ProfilingLlmClient::new(inner, path.clone(), false);
+
+        dispatch_namespaced(
+            &client,
+            vec![],
+            &[],
+            &[namespace("ns", vec![tool("deferred")])],
+            ReasoningConfig::default(),
+            noop_chunk(),
+        )
+        .await
+        .expect("probe turn");
+
+        assert_eq!(
+            probe.namespaced_calls(),
+            1,
+            "the turn reached the inner client's hosted dispatch"
+        );
+        let logged = std::fs::read_to_string(&path).unwrap_or_default();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            logged.contains("deferred"),
+            "the profiling decorator must profile a namespaced turn, and it \
+             cannot if the caller was handed the inner client's dispatch \
+             object. Log was: {logged:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn maybe_profiled_stays_in_the_namespaced_path() {
+        use crate::ports::llm::dispatch_namespaced;
+        use crate::ports::llm::hosted_search_test_support::*;
+
+        // Profiled arm: the effect is the log line.
+        let path = dispatch_log_path("maybe_profiled_in_path");
+        let _ = std::fs::remove_file(&path);
+        let profiled = MaybeProfiled::Profiled(ProfilingLlmClient::new(
+            ProbeLlm::new(true),
+            path.clone(),
+            false,
+        ));
+        dispatch_namespaced(
+            &profiled,
+            vec![],
+            &[],
+            &[namespace("ns", vec![tool("deferred")])],
+            ReasoningConfig::default(),
+            noop_chunk(),
+        )
+        .await
+        .expect("probe turn");
+        let logged = std::fs::read_to_string(&path).unwrap_or_default();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            logged.contains("deferred"),
+            "the Profiled arm must keep profiling in the namespaced path. \
+             Log was: {logged:?}"
+        );
+
+        // Plain arm: the effect is that the turn still reaches hosted
+        // dispatch rather than falling back to a flattened request.
+        let inner = ProbeLlm::new(true);
+        let probe = std::sync::Arc::clone(&inner.probe);
+        let plain = MaybeProfiled::Plain(inner);
+        dispatch_namespaced(
+            &plain,
+            vec![],
+            &[],
+            &[namespace("ns", vec![tool("deferred")])],
+            ReasoningConfig::default(),
+            noop_chunk(),
+        )
+        .await
+        .expect("probe turn");
+        assert_eq!(
+            probe.namespaced_calls(),
+            1,
+            "the Plain arm must pass a namespaced turn through to hosted dispatch"
+        );
+        assert_eq!(probe.plain_calls(), 0, "the turn never flattened");
+    }
+
     #[test]
     fn arc_blanket_impl_answers_hosted_tool_search_from_inner() {
         use std::sync::Arc;

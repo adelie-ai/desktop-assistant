@@ -932,6 +932,48 @@ mod tests {
         );
     }
 
+    /// Decorator-in-the-path criterion for `RoutingLlmClient` (#1033).
+    ///
+    /// The router's job is to send the turn to the per-turn active client.
+    /// If it hands the caller its fallback client's hosted-search dispatch
+    /// object, the namespaced turn goes to the wrong connection - billed to
+    /// the wrong account, and against a model the user did not choose.
+    #[tokio::test]
+    async fn routing_decorator_stays_in_the_namespaced_path() {
+        use crate::hosted_search_probe::{NamespaceProbe, noop_chunk, probe_namespace};
+        use desktop_assistant_core::domain::Role;
+        use desktop_assistant_core::ports::llm::dispatch_namespaced;
+
+        let fallback = Arc::new(NamespaceProbe::plain());
+        let active = Arc::new(NamespaceProbe::hosted());
+        let router = RoutingLlmClient::new(Arc::clone(&fallback) as Arc<dyn LlmClient>);
+
+        with_active_client(Arc::clone(&active) as Arc<dyn LlmClient>, async {
+            dispatch_namespaced(
+                &router,
+                vec![Message::new(Role::User, "hi")],
+                &[],
+                &[probe_namespace()],
+                ReasoningConfig::default(),
+                noop_chunk(),
+            )
+            .await
+            .expect("probe turn");
+        })
+        .await;
+
+        assert_eq!(
+            active.namespaced_calls(),
+            1,
+            "the namespaced turn must go to the per-turn active client"
+        );
+        assert_eq!(
+            fallback.plain_calls() + fallback.namespaced_calls(),
+            0,
+            "the fallback client must see nothing while an override is installed"
+        );
+    }
+
     // --- End-to-end turn through `send_prompt` ------------------------------
 
     /// In-memory conversation store for the end-to-end turn test.

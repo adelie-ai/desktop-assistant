@@ -19,6 +19,8 @@ mod config;
 mod connections;
 mod embedding_client;
 mod embedding_probe;
+#[cfg(test)]
+mod hosted_search_probe;
 mod knowledge_service;
 mod maintenance_service;
 mod mcp_token_store;

@@ -753,6 +753,45 @@ mod tests {
         .await
     }
 
+    /// Decorator-in-the-path criterion for `ClassifyingLlmClient` (#1033).
+    ///
+    /// The decorator's whole job is to turn an opaque provider error into a
+    /// structured one. If it hands the caller its inner client's
+    /// hosted-search dispatch object, a namespaced turn skips it and the
+    /// caller sees the raw `CoreError::Llm` - so the context-overflow
+    /// recovery ladder never runs on the turns carrying the most tools.
+    #[tokio::test]
+    async fn classifying_decorator_stays_in_the_namespaced_path() {
+        use crate::hosted_search_probe::{NamespaceProbe, noop_chunk, probe_namespace};
+        use desktop_assistant_core::ports::llm::dispatch_namespaced;
+
+        let probe = Arc::new(NamespaceProbe::hosted_opaque_error(
+            "Input is too long for requested model.",
+        ));
+        let client = ClassifyingLlmClient::new(Arc::clone(&probe), "bedrock");
+
+        let err = dispatch_namespaced(
+            &client,
+            vec![Message::new(Role::User, "hi")],
+            &[],
+            &[probe_namespace()],
+            ReasoningConfig::default(),
+            noop_chunk(),
+        )
+        .await
+        .expect_err("the probe always errors");
+
+        assert!(
+            matches!(err, CoreError::ContextOverflow { .. }),
+            "the classifier must reclassify a namespaced turn's error too; got {err:?}"
+        );
+        assert_eq!(
+            probe.namespaced_calls(),
+            1,
+            "the turn reached the inner client's hosted dispatch"
+        );
+    }
+
     // --- Tier 1 (no deps) ---
 
     #[tokio::test]

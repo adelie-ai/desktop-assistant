@@ -2511,6 +2511,14 @@ pub(crate) mod hosted_search_test_support {
             }
         }
 
+        /// A probe that returns a retryable error `times` times before it
+        /// succeeds, on whichever path the turn arrives through.
+        pub fn failing(hosted: bool, times: usize) -> Self {
+            let client = Self::new(hosted);
+            client.fail_times.store(times, Ordering::SeqCst);
+            client
+        }
+
         fn maybe_fail(&self) -> Option<CoreError> {
             let remaining = self.fail_times.load(Ordering::SeqCst);
             if remaining == 0 {
@@ -2642,6 +2650,41 @@ mod hosted_search_dispatch_tests {
         );
         let names: Vec<&str> = flat.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, ["core_a", "core_b", "n1", "n2", "n3"]);
+    }
+
+    /// Decorator-in-the-path criterion for [`RetryingLlmClient`].
+    ///
+    /// The inner client fails once with a retryable error, then succeeds. If
+    /// the retry decorator is in the namespaced path the turn succeeds after
+    /// two hosted-search dispatches. If the decorator handed back the inner
+    /// client's hosted-search object, the first error reaches the caller and
+    /// a turn carrying the whole tool fleet loses its retry.
+    #[tokio::test]
+    async fn retrying_decorator_stays_in_the_namespaced_path() {
+        let inner = ProbeLlm::failing(true, 1);
+        let probe = Arc::clone(&inner.probe);
+        let client = RetryingLlmClient::new(inner, 3);
+
+        let result = dispatch_namespaced(
+            &client,
+            vec![],
+            &[],
+            &[namespace("ns", vec![tool("deferred")])],
+            ReasoningConfig::default(),
+            noop_chunk(),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "the retry decorator must retry a namespaced turn: {result:?}"
+        );
+        assert_eq!(
+            probe.namespaced_calls(),
+            2,
+            "one failed hosted dispatch and one retry"
+        );
+        assert_eq!(probe.plain_calls(), 0, "the turn never flattened");
     }
 
     #[tokio::test]

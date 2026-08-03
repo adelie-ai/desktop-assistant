@@ -292,6 +292,45 @@ mod tests {
         assert_eq!(wrapped.inner.last(), Some(configured));
     }
 
+    /// Decorator-in-the-path criterion for `FixedReasoningLlmClient` (#1033).
+    ///
+    /// The decorator's only job is to substitute the reasoning config. If it
+    /// hands the caller its inner client's hosted-search dispatch object, a
+    /// namespaced turn reaches the connector with the caller's reasoning
+    /// instead of the configured one.
+    #[tokio::test]
+    async fn fixed_reasoning_decorator_stays_in_the_namespaced_path() {
+        use crate::hosted_search_probe::{NamespaceProbe, noop_chunk, probe_namespace};
+        use desktop_assistant_core::ports::llm::dispatch_namespaced;
+        use std::sync::Arc;
+
+        let probe = Arc::new(NamespaceProbe::hosted());
+        let configured = ReasoningConfig::with_reasoning_effort(ReasoningLevel::Medium);
+        let wrapped = FixedReasoningLlmClient::new(Arc::clone(&probe), configured);
+
+        dispatch_namespaced(
+            &wrapped,
+            user_msg("hi"),
+            &[],
+            &[probe_namespace()],
+            ReasoningConfig::default(),
+            noop_chunk(),
+        )
+        .await
+        .expect("probe turn");
+
+        assert_eq!(
+            probe.namespaced_calls(),
+            1,
+            "the turn reached the inner client's hosted dispatch"
+        );
+        assert_eq!(
+            probe.seen_reasoning(),
+            Some(configured),
+            "the wrapper must substitute reasoning on a namespaced turn too"
+        );
+    }
+
     #[test]
     fn forwards_capability_flags_to_inner() {
         let inner = CapturingClient::default();
