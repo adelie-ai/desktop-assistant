@@ -29,8 +29,13 @@ unconfigured connection gets it. Anthropic defaults the same way.
 An endpoint that serves the Responses API but rejects the `tool_search` tool
 type does not fail the turn. The client re-sends the same turn with every tool
 inline and memoizes the model, so later turns send one request instead of two.
-The retry is narrow: it answers a client error that is not authentication, a
-timeout, throttling, quota, or a context overflow.
+
+The retry is narrow, and it reads the response body rather than the status class
+alone: the refusal must name `tool_search`, `defer_loading` or `namespace`, and
+the status must be one that can describe a request's shape. A rejected tool
+schema, a `base_url` typo, a body limit, a throttle, or a context overflow
+therefore surface as themselves instead of switching the connection to inline
+tools. The model is recorded only after the inline retry succeeds.
 
 Setting `hosted_tool_search = false` on the connection is still the cheaper
 answer for an endpoint known never to serve it, because it also skips the first

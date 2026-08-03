@@ -250,16 +250,62 @@ failures:
   turns send one request instead of two. `llm-openai` implements this;
   `llm-anthropic` does not yet.
 
-The connector-level fallback is deliberately narrow. It answers a client error
-that is not authentication, a timeout, throttling, quota, or a context overflow.
-The first two say nothing about the request shape, and a context overflow must
-not be answered with a larger request - flattening deferred tools makes the
-prompt bigger, and the core service already truncates and retries that variant.
+The connector-level fallback is deliberately narrow, and it is **corroborated on
+the response body, never on the status class alone**. Two things must hold:
+
+- The status must be one that can carry a statement about the request's shape.
+  401, 402, 403, 408, 409, 413 and 429 cannot - they refuse the caller, the
+  account, or the moment. 413 is excluded for a second reason: the fallback body
+  is larger, so a body limit would refuse it again.
+- The body must name a construct only the hosted request carries -
+  `tool_search`, `defer_loading`, or `namespace`. A provider that refuses an
+  unknown value names it.
+
+A status class is not evidence. A 400 comes just as easily from one MCP tool
+shipping a JSON Schema the provider will not accept, a 404 from a `base_url`
+typo. Reading either as "this endpoint does not serve hosted tool search" would
+turn the capability off for that model and send the whole fleet inline on every
+later turn - the cost the capability exists to avoid, caused by an unrelated
+fault. A refusal that names none of the constructs therefore leaves the turn to
+fail, which is the safe direction: a missed degradation costs one turn, a wrong
+one costs every later turn on the connection.
+
+A context overflow never degrades, in any endpoint's wording. Flattening
+deferred tools makes the prompt bigger, so degrading would answer an overflow
+with a larger request, and the core's truncate-and-retry ladder runs on
+`CoreError::ContextOverflow` and on nothing else. Overflow detection therefore
+reads three shapes, not one: OpenAI's `context_length_exceeded`, LiteLLM's
+`context_window_exceeded`, and vLLM's flat body with no `error` key at all.
+Reading only the first would leave the exclusion inapplicable to exactly the
+endpoints the fallback exists for.
+
+**The memo is a conclusion, and it waits for one.** The model is recorded only
+after the flattened retry has succeeded - a fallback that failed too taught
+nothing. Two limits are accepted: nothing removes an entry, so an endpoint that
+gains hosted tool search keeps sending its tools inline until the client is
+rebuilt (a config reload or a daemon restart does that), and the memo belongs to
+one client instance, so the interactive and backend clients each learn it once.
+Both cost one extra request, not correctness.
+
+**Not covered.** An endpoint that accepts the request with HTTP 200 and then
+reports the unsupported tool type inside the stream degrades nothing and
+memoizes nothing, so it fails the same way on every turn. Recovering from that
+means re-sending after chunks have already reached the user, which is a
+different design question. Set `hosted_tool_search = false` for such an
+endpoint.
 
 **When to turn it off.** Setting `hosted_tool_search = false` on the connection
 is still the cheaper answer for an endpoint known never to serve it: it skips
 the first refused request on the very first turn, which the memo can only skip
 from the second turn onward.
+
+#### The allowlist reaches the deferred set
+
+A restricted subagent's allowlist filters the namespaces as well as the flat
+tool list (`core/src/service.rs`). Without that, provider-side tool search would
+surface the whole fleet's names, descriptions and schemas to a caller allowed
+none of it, and the connector's flattened retry would send every one of them as
+a callable definition. A namespace left with no allowed tools is dropped whole.
 
 ### 6. Reasoning / extended thinking
 
