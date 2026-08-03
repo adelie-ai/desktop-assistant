@@ -81,8 +81,15 @@ pub struct OpenAiClient {
     /// `base_url` is configurable, so this client also serves endpoints that
     /// speak the Responses API without being OpenAI. Such an endpoint may
     /// serve `/responses` and still reject the `tool_search` tool type.
-    /// Populated at runtime from that rejection; the guard is never held
-    /// across an `.await`.
+    /// Populated at runtime from that rejection, and only once the flattened
+    /// retry has succeeded; the guard is never held across an `.await`.
+    ///
+    /// Two limits, both deliberate. Nothing removes an entry, so an endpoint
+    /// that gains hosted tool search keeps sending its tools inline until the
+    /// client is rebuilt - which a config reload or a daemon restart does. And
+    /// the memo belongs to one client instance, so the interactive and backend
+    /// clients each learn it once. Both cost one extra request, not
+    /// correctness.
     no_hosted_search_models: Arc<Mutex<HashSet<String>>>,
 }
 
@@ -92,8 +99,8 @@ pub struct OpenAiClient {
 /// Exists so a caller can tell "this endpoint will not accept a request shaped
 /// like this" from every other failure, and retry with a different shape.
 enum SendError {
-    /// The endpoint refused the request itself: a client error that is not
-    /// authentication, throttling, quota, or a context overflow. A
+    /// The endpoint refused the hosted tool-search request shape, as decided
+    /// by [`refuses_hosted_tool_search`] from the status *and* the body. A
     /// differently-shaped request could still succeed.
     Rejected(String),
     /// Everything else, already classified.
@@ -112,22 +119,56 @@ impl SendError {
     }
 }
 
-/// Whether `status` says the endpoint refused the shape of the request, rather
-/// than refusing the caller or the moment.
+/// Whether `status` and `body` together say the endpoint refused the *hosted
+/// tool-search request shape*.
 ///
-/// Excluded on purpose, each because retrying with a different shape is the
-/// wrong answer: 401/403 (the credential, not the request), 408 (a timeout,
-/// which is transient), and 429 (throttling, already classified before this is
-/// reached, and a larger retry would make it worse). A context overflow is
-/// also classified earlier, because flattening deferred tools into the prompt
-/// answers an overflow with a bigger request.
-fn is_request_shape_rejection(status: reqwest::StatusCode) -> bool {
-    status.is_client_error() && !matches!(status.as_u16(), 401 | 403 | 408 | 429)
+/// Corroborated on the body, never on the status class alone. A status class is
+/// not evidence: a 400 comes just as easily from one MCP tool shipping a JSON
+/// Schema the provider will not accept, a 404 from a `base_url` typo, a 413
+/// from a proxy body limit. Concluding "this endpoint does not serve hosted
+/// tool search" from any of those would turn the capability off for the model
+/// until the daemon restarts, and send the whole fleet inline on every later
+/// turn - the cost the capability exists to avoid, caused by an unrelated
+/// fault.
+///
+/// So two things must hold. The status must be one that can carry a statement
+/// about the request's shape, and the body must name something only the hosted
+/// request carries.
+fn refuses_hosted_tool_search(status: reqwest::StatusCode, body: &str) -> bool {
+    if !status.is_client_error() {
+        return false;
+    }
+    // Statuses that are never about the shape. 401/403 refuse the caller, 402
+    // refuses the account, 408 is transient, 409 is state, 429 is throttling -
+    // and 413 is a body limit, where the fallback's larger body guarantees the
+    // second failure.
+    if matches!(status.as_u16(), 401 | 402 | 403 | 408 | 409 | 413 | 429) {
+        return false;
+    }
+    // Shape problems this fallback would make worse or misreport. An overflow
+    // must reach `CoreError::ContextOverflow` so the core can truncate and
+    // retry; flattening would answer it with a larger request. A quota refusal
+    // is about the account, whatever status carries it.
+    if detect_openai_context_overflow(body).is_some() || detect_openai_insufficient_quota(body) {
+        return false;
+    }
+    body_names_a_hosted_search_construct(body)
 }
 
-/// Placeholder so the new tests compile against the intended signature.
-fn refuses_hosted_tool_search(status: reqwest::StatusCode, _body: &str) -> bool {
-    is_request_shape_rejection(status)
+/// Whether `body` names one of the constructs only the hosted tool-search
+/// request carries.
+///
+/// A provider that refuses an unknown value names it - "Invalid value:
+/// 'tool_search'", "unknown field 'defer_loading'" - so this is the
+/// corroboration that separates "refuses hosted tool search" from "refuses
+/// something else in this request". A refusal that names none of them leaves
+/// the turn to fail, which is the safe direction: a missed degradation costs
+/// one turn, while a wrong one costs every later turn on the connection.
+fn body_names_a_hosted_search_construct(body: &str) -> bool {
+    let lowered = body.to_ascii_lowercase();
+    ["tool_search", "defer_loading", "namespace"]
+        .iter()
+        .any(|marker| lowered.contains(marker))
 }
 
 impl OpenAiClient {
@@ -677,7 +718,7 @@ impl OpenAiClient {
                 }));
             }
             let detail = format!("OpenAI API error (HTTP {status}): {body}");
-            if is_request_shape_rejection(status) {
+            if refuses_hosted_tool_search(status, &body) {
                 return Err(SendError::Rejected(detail));
             }
             return Err(SendError::Failed(CoreError::Llm(detail)));
@@ -835,25 +876,74 @@ struct OpenAiErrorBody {
     error_type: Option<String>,
 }
 
-/// Detect an OpenAI context-overflow rejection in an HTTP error body.
+/// A rejection body with no `error` envelope, as vLLM and several other
+/// OpenAI-compatible servers emit: `{"object":"error","message":"...",
+/// "type":"BadRequestError","code":400}`. `code` is a number here, not a
+/// string, so it is not read.
+#[derive(Deserialize, Default)]
+struct FlatErrorBody {
+    #[serde(default)]
+    message: String,
+}
+
+/// Whether an error code or type names a context-window rejection.
+///
+/// `context_length_exceeded` is OpenAI's; `context_window_exceeded` is
+/// LiteLLM's for the same condition.
+fn is_context_overflow_code(code: Option<&str>) -> bool {
+    matches!(
+        code,
+        Some("context_length_exceeded") | Some("context_window_exceeded")
+    )
+}
+
+/// Whether a message states a context-window limit. Both OpenAI and the
+/// compatible servers word it "maximum context length is N tokens"; some
+/// proxies say "context window" instead.
+fn message_names_a_context_limit(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    lowered.contains("maximum context length") || lowered.contains("context window")
+}
+
+/// Detect a context-overflow rejection in an HTTP error body.
 ///
 /// Returns `Some((prompt_tokens, max_tokens))` (each may itself be `None`
-/// when the wording doesn't carry numbers) when the body parses as the
-/// OpenAI error envelope and `error.code == "context_length_exceeded"`.
-/// Returns `None` for any other shape so the caller can fall through to
-/// a generic `CoreError::Llm`.
+/// when the wording doesn't carry numbers), or `None` for any other shape so
+/// the caller can fall through to a generic `CoreError::Llm`.
 ///
-/// Why: pattern-matching on error message strings is normally banned
-/// (see `AGENTS.md`), but at the connector boundary this is the only
-/// signal OpenAI provides for context-window rejections — converting
-/// it into structured `CoreError::ContextOverflow` here is exactly what
-/// the rule carves out, since downstream code never has to.
+/// Reads three wordings, because `base_url` is configurable and this client
+/// therefore also serves endpoints that speak the Responses API without being
+/// OpenAI:
+///
+/// - OpenAI: the `error` envelope with `code = "context_length_exceeded"`.
+/// - LiteLLM: the same envelope with its own `type =
+///   "context_window_exceeded"`.
+/// - vLLM: no `error` key at all, and the limit stated only in the message.
+///
+/// Reading only the first would leave every compatible endpoint's overflow
+/// misclassified as a generic error, which costs more than the misclassifying:
+/// the core's truncate-and-retry ladder runs on `CoreError::ContextOverflow`
+/// and on nothing else.
+///
+/// Why match on the message at all: pattern-matching on error message strings
+/// is normally banned (see `AGENTS.md`), but at the connector boundary this is
+/// the only signal these servers provide - converting it into a structured
+/// `CoreError::ContextOverflow` here is exactly what the rule carves out,
+/// since downstream code never has to.
 fn detect_openai_context_overflow(body: &str) -> Option<(Option<u64>, Option<u64>)> {
-    let envelope: OpenAiErrorEnvelope = serde_json::from_str(body).ok()?;
-    if envelope.error.code.as_deref() != Some("context_length_exceeded") {
+    if let Ok(envelope) = serde_json::from_str::<OpenAiErrorEnvelope>(body) {
+        let error = envelope.error;
+        if is_context_overflow_code(error.code.as_deref())
+            || is_context_overflow_code(error.error_type.as_deref())
+            || message_names_a_context_limit(&error.message)
+        {
+            return Some(parse_openai_context_length_message(&error.message));
+        }
         return None;
     }
-    Some(parse_openai_context_length_message(&envelope.error.message))
+    let flat = serde_json::from_str::<FlatErrorBody>(body).ok()?;
+    message_names_a_context_limit(&flat.message)
+        .then(|| parse_openai_context_length_message(&flat.message))
 }
 
 /// Detect OpenAI's `insufficient_quota` billing error in an HTTP error
@@ -1183,15 +1273,22 @@ impl LlmClient for OpenAiClient {
                     "endpoint refused the hosted tool-search request; sending the \
                      tools inline instead and memoizing the model"
                 );
-                {
+                let outcome = self
+                    .stream_flattened(messages, core_tools, namespaces, reasoning, on_chunk)
+                    .await;
+                // Memoize only once the flattened request has proved the
+                // point. A fallback that failed too taught nothing about
+                // hosted tool search, and a permanent verdict written from one
+                // bad minute would send the whole fleet inline on every later
+                // turn.
+                if outcome.is_ok() {
                     let mut memo = self
                         .no_hosted_search_models
                         .lock()
                         .expect("no_hosted_search_models mutex poisoned");
                     memo.insert(model);
                 }
-                self.stream_flattened(messages, core_tools, namespaces, reasoning, on_chunk)
-                    .await
+                outcome
             }
             Err(e) => Err(e.into_core()),
         }
