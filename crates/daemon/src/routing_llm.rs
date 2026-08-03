@@ -1013,6 +1013,230 @@ mod tests {
         );
     }
 
+    // --- Backend-tasks slot: the turn must not reach it ---------------------
+
+    /// `LlmClient` double that records, for every dispatch, the
+    /// `MODEL_OVERRIDE` task-local a real connector would have read.
+    ///
+    /// Every connector resolves its wire model as
+    /// `current_model_override().unwrap_or(self.model)`, so this recorded
+    /// value is exactly what decides which model the request is billed to.
+    /// Recording it (rather than answering a fixed capability) is what makes
+    /// these tests fail in both directions: a slot that starts reading the
+    /// task-local again, and a slot that stops reading it.
+    #[derive(Default)]
+    struct ModelRecordingLlm {
+        seen: std::sync::Mutex<Vec<Option<String>>>,
+    }
+
+    impl ModelRecordingLlm {
+        /// One entry per dispatch: the model override in force at the time.
+        fn seen(&self) -> Vec<Option<String>> {
+            self.seen.lock().unwrap().clone()
+        }
+
+        fn dispatches(&self) -> usize {
+            self.seen.lock().unwrap().len()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for ModelRecordingLlm {
+        async fn stream_completion(
+            &self,
+            _messages: Vec<Message>,
+            _tools: &[ToolDefinition],
+            _reasoning: ReasoningConfig,
+            _on_chunk: ChunkCallback,
+        ) -> Result<LlmResponse, CoreError> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(desktop_assistant_core::ports::llm::current_model_override());
+            Ok(LlmResponse::text("done"))
+        }
+    }
+
+    fn one_user_message() -> Vec<Message> {
+        vec![Message::new(
+            desktop_assistant_core::domain::Role::User,
+            "hi",
+        )]
+    }
+
+    /// Acceptance criterion (#1031): with an `ACTIVE_CLIENT` installed, a
+    /// legacy `[backend_tasks.llm]` slot dispatches to its own configured
+    /// client, never to the turn's interactive client.
+    #[tokio::test]
+    async fn legacy_backend_tasks_slot_ignores_the_per_turn_client() {
+        let backend = Arc::new(ModelRecordingLlm::default());
+        let interactive = Arc::new(ModelRecordingLlm::default());
+
+        // Built exactly the way `main.rs` builds the legacy
+        // `[backend_tasks.llm]` slot today.
+        let slot = RoutingLlmClient::new(Arc::clone(&backend) as Arc<dyn LlmClient>);
+
+        with_active_client(Arc::clone(&interactive) as Arc<dyn LlmClient>, async {
+            slot.stream_completion(
+                one_user_message(),
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await
+        })
+        .await
+        .expect("the backend dispatch completes");
+
+        assert_eq!(
+            backend.dispatches(),
+            1,
+            "the backend-tasks slot must dispatch to its own configured client"
+        );
+        assert_eq!(
+            interactive.dispatches(),
+            0,
+            "the turn's interactive client must never serve a backend task"
+        );
+    }
+
+    /// Acceptance criterion (#1031): the turn's `MODEL_OVERRIDE` must not
+    /// reach the legacy backend-tasks slot. The connector must see the
+    /// configured backend model instead.
+    #[tokio::test]
+    async fn legacy_backend_tasks_slot_ignores_the_per_turn_model_override() {
+        let backend = Arc::new(ModelRecordingLlm::default());
+        let interactive = Arc::new(ModelRecordingLlm::default());
+
+        // Built exactly the way `main.rs` builds the legacy
+        // `[backend_tasks.llm]` slot today.
+        let slot = RoutingLlmClient::new(Arc::clone(&backend) as Arc<dyn LlmClient>);
+
+        with_model_override(
+            "interactive-model".to_string(),
+            with_active_client(Arc::clone(&interactive) as Arc<dyn LlmClient>, async {
+                slot.stream_completion(
+                    one_user_message(),
+                    &[],
+                    ReasoningConfig::default(),
+                    Box::new(|_| true),
+                )
+                .await
+            }),
+        )
+        .await
+        .expect("the backend dispatch completes");
+
+        assert_eq!(
+            backend.seen(),
+            vec![Some("backend-model".to_string())],
+            "the backend-tasks slot must pin its configured model, not the turn's"
+        );
+    }
+
+    /// The mirror case (#1021, which must keep working): the *primary* slot
+    /// is supposed to read both task-locals. A change that stopped it
+    /// following the turn fails here.
+    #[tokio::test]
+    async fn primary_slot_still_follows_the_per_turn_client_and_model_override() {
+        let startup_default = Arc::new(ModelRecordingLlm::default());
+        let interactive = Arc::new(ModelRecordingLlm::default());
+
+        let primary = RoutingLlmClient::new(Arc::clone(&startup_default) as Arc<dyn LlmClient>);
+
+        with_model_override(
+            "interactive-model".to_string(),
+            with_active_client(Arc::clone(&interactive) as Arc<dyn LlmClient>, async {
+                primary
+                    .stream_completion(
+                        one_user_message(),
+                        &[],
+                        ReasoningConfig::default(),
+                        Box::new(|_| true),
+                    )
+                    .await
+            }),
+        )
+        .await
+        .expect("the turn dispatch completes");
+
+        assert_eq!(
+            interactive.seen(),
+            vec![Some("interactive-model".to_string())],
+            "the primary slot must dispatch to the turn's client with the turn's model"
+        );
+        assert_eq!(
+            startup_default.dispatches(),
+            0,
+            "the startup default must not serve a turn that resolved a client"
+        );
+    }
+
+    /// The reported configuration, end to end: a legacy `[backend_tasks.llm]`
+    /// naming a different connector/model, no `[purposes.titling]`, and a turn
+    /// that installs the interactive client and model. Title generation runs
+    /// inside `send_prompt`, so it must still reach the backend slot.
+    #[tokio::test]
+    async fn legacy_backend_tasks_titling_runs_on_the_configured_backend_model() {
+        use desktop_assistant_core::ports::inbound::ConversationService;
+        use desktop_assistant_core::service::ConversationHandler;
+
+        let startup_default = Arc::new(ModelRecordingLlm::default());
+        let interactive = Arc::new(ModelRecordingLlm::default());
+        let backend = Arc::new(ModelRecordingLlm::default());
+
+        let primary = RoutingLlmClient::new(Arc::clone(&startup_default) as Arc<dyn LlmClient>);
+        let backend_slot = RoutingLlmClient::new(Arc::clone(&backend) as Arc<dyn LlmClient>);
+
+        let handler = ConversationHandler::with_tools(
+            MemStore::default(),
+            primary,
+            FleetTools,
+            Box::new(|| "conv-1".to_string()),
+        )
+        .with_backend_llm(backend_slot);
+
+        let conv = handler
+            .create_conversation("routing".to_string(), vec![])
+            .await
+            .expect("conversation is created");
+
+        with_model_override(
+            "interactive-model".to_string(),
+            with_active_client(
+                Arc::clone(&interactive) as Arc<dyn LlmClient>,
+                handler.send_prompt(
+                    &conv.id,
+                    "hello".to_string(),
+                    Box::new(|_| true),
+                    Box::new(|_| {}),
+                ),
+            ),
+        )
+        .await
+        .expect("the turn completes");
+
+        let billed = backend.seen();
+        assert!(
+            !billed.is_empty(),
+            "title generation must reach the configured backend-tasks client"
+        );
+        assert!(
+            billed.iter().all(|m| m.as_deref() == Some("backend-model")),
+            "every backend-task request must carry the configured backend model; got {billed:?}"
+        );
+        assert_eq!(
+            interactive.seen(),
+            vec![Some("interactive-model".to_string())],
+            "the turn's own request must still go to the interactive client and model"
+        );
+        assert_eq!(
+            startup_default.dispatches(),
+            0,
+            "neither slot may fall through to the startup default here"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn no_hang_fails_fast_when_inner_call_times_out() {
         // The backstop must *fail* (panic) — never hang — when a wrapped call
