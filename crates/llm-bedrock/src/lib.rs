@@ -1278,10 +1278,11 @@ fn supports_streaming_with_tools(base_id: &str) -> bool {
 /// field, and so reports a refused `cachePoint` block rather than something
 /// else.
 ///
-/// Every marker is a name of the field itself, in one of the spellings the
-/// service uses: `cachePoint` for Converse, `cache_control` for the Anthropic
-/// shape Bedrock forwards, and the two prose forms. Nothing here is a status
-/// code, a generic "unsupported", or a schema path, because none of those is
+/// Every marker names the feature itself, in one of the spellings the service
+/// uses: `cachePoint` for Converse, `cache_control` for the Anthropic shape
+/// Bedrock forwards, and the prose forms - "cache point", "cache checkpoint",
+/// and the bare "caching", which also covers "prompt caching". Nothing here is
+/// a status code, a generic "unsupported", or a schema path, because none of those is
 /// evidence about the checkpoint: a validation failure arrives just as easily
 /// from a tool schema (#336), an over-long prompt, or a bad model id, and
 /// reading one of those as a cache refusal would disable caching on a model
@@ -1299,9 +1300,10 @@ fn names_the_cache_field(message: &str) -> bool {
     let lc = message.to_ascii_lowercase();
     [
         "cachepoint",
+        "cache point",
         "cache_control",
         "cache checkpoint",
-        "prompt caching",
+        "caching",
     ]
     .iter()
     .any(|marker| lc.contains(marker))
@@ -5807,6 +5809,11 @@ mod tests {
             "Invalid value at 'system[1].cachePoint'",
             "cache_control is not supported for this model",
             "This model does not support prompt caching.",
+            // Space-separated prose, and the bare gerund. Both name the
+            // feature and nothing else; a miss here is the failure this
+            // recovery exists to remove.
+            "The cache point block is not supported by this model.",
+            "Caching is not available for this model.",
         ] {
             assert!(
                 names_the_cache_field(names_it),
