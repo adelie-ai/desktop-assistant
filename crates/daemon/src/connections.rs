@@ -282,9 +282,9 @@ impl ConnectionConfig {
     ///
     /// Exhaustive with no catch-all, like [`Self::set_secret`]: a new connector
     /// states what it keeps in the file rather than inheriting silence.
-    /// [`Connector::has_file_only_fields`] carries the same answer for callers
-    /// that need to ask without a connection in hand, and a test sweep holds
-    /// the two together.
+    /// [`Connector::file_only_fields`] names the same fields for callers that
+    /// need to ask without a connection in hand, and test sweeps hold the two
+    /// together.
     ///
     /// A new *field* is caught one step earlier, by the compiler: the payload
     /// conversion in [`crate::api_surface`] builds each connection struct with
@@ -670,17 +670,23 @@ impl Connector {
         }
     }
 
-    /// Whether a connection of this type carries settings that the connection
-    /// payload has no field for, and which an edit from a client would
-    /// therefore delete unless they are carried forward.
+    /// The settings a connection of this type keeps in `daemon.toml` only:
+    /// the fields the connection payload has no place for, and which an edit
+    /// from a client would therefore delete unless they are carried forward.
+    ///
+    /// Named rather than counted, so a test can compare this list against the
+    /// fields that actually differ across a payload round trip. A bare "yes,
+    /// some" would be satisfied by any one surviving difference, which is how a
+    /// second file-only field could be added, dropped on every client edit, and
+    /// never noticed - the original defect, one field later.
     ///
     /// Bedrock keeps `cache_policy` in the file only. Putting it on the wire is
     /// source-breaking for every client that constructs the payload variant, so
     /// it waits for its own change (#1053).
     ///
     /// [`ConnectionConfig::carry_forward_file_only_fields`] does the carrying;
-    /// this answers the same question for a caller with no connection in hand.
-    /// A test sweep pins the two against each other in both directions, so
+    /// this states what must be carried, for a caller with no connection in
+    /// hand. Test sweeps pin the two against each other in both directions, so
     /// neither can become a stale claim.
     ///
     /// Exhaustive with no catch-all.
@@ -690,15 +696,15 @@ impl Connector {
         not(test),
         expect(dead_code, reason = "read by the per-connector test sweeps")
     )]
-    pub fn has_file_only_fields(self) -> bool {
+    pub fn file_only_fields(self) -> &'static [&'static str] {
         match self {
-            Self::Bedrock => true,
+            Self::Bedrock => &["cache_policy"],
             Self::Anthropic
             | Self::OpenAi
             | Self::OpenRouter
             | Self::Azure
             | Self::Google
-            | Self::Ollama => false,
+            | Self::Ollama => &[],
         }
     }
 }
