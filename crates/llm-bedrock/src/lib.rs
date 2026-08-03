@@ -102,6 +102,11 @@ pub struct BedrockClient {
     /// `ListInferenceProfiles` against a local mock. Always `None` in
     /// production, where the endpoint is derived from the region.
     control_endpoint_override: Option<String>,
+    /// Test-only override for the Bedrock runtime endpoint, so the dispatch
+    /// tests can drive `Converse` / `ConverseStream` against a local socket.
+    /// Always `None` in production, where the endpoint is derived from the
+    /// region.
+    runtime_endpoint_override: Option<String>,
 }
 
 impl BedrockClient {
@@ -132,6 +137,7 @@ impl BedrockClient {
             event_timeout: STREAM_EVENT_TIMEOUT,
             context_cap: None,
             control_endpoint_override: None,
+            runtime_endpoint_override: None,
         }
     }
 
@@ -224,6 +230,20 @@ impl BedrockClient {
         self
     }
 
+    /// Test-only: point the Bedrock runtime plane (`Converse` /
+    /// `ConverseStream`) at `url` instead of the regional AWS endpoint, so
+    /// the dispatch behaviour can be exercised against a local socket rather
+    /// than a live account.
+    ///
+    /// Only the runtime plane is redirected; the control (model-listing)
+    /// client is untouched.
+    #[doc(hidden)]
+    pub fn __with_runtime_endpoint_for_test(mut self, url: impl Into<String>) -> Self {
+        self.runtime_endpoint_override = Some(url.into());
+        self.client = OnceCell::new();
+        self
+    }
+
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
         self.model = model.into();
         self
@@ -288,7 +308,13 @@ impl BedrockClient {
         self.client
             .get_or_try_init(|| async {
                 let shared_config = self.load_shared_config().await;
-                Ok(Client::new(&shared_config))
+                let Some(endpoint) = self.runtime_endpoint_override.as_ref() else {
+                    return Ok(Client::new(&shared_config));
+                };
+                let config = aws_sdk_bedrockruntime::config::Builder::from(&shared_config)
+                    .endpoint_url(endpoint)
+                    .build();
+                Ok(Client::from_conf(config))
             })
             .await
     }
@@ -4006,6 +4032,144 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_secs(1),
             "pre-cancelled token should short-circuit before AWS dispatch; took {elapsed:?}"
+        );
+    }
+
+    // --- Non-streaming dispatch: timeout and cancellation (#1024) --------
+    //
+    // The non-streaming path is not a rare fallback. It is taken for every
+    // model on the `supports_streaming_with_tools` deny list and for every
+    // model the runtime memo has learned rejects tools in streaming mode. A
+    // stalled request on that path must fail the turn on its own budget, and
+    // must answer the cancellation token, exactly as the streaming path does.
+
+    /// A TCP endpoint that completes the connection and then answers nothing.
+    /// This is what a hung Bedrock request looks like from the client side:
+    /// the socket is open, so no layer below the connector reports a failure,
+    /// and the response future never resolves.
+    struct StalledEndpoint {
+        url: String,
+        accept_loop: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for StalledEndpoint {
+        fn drop(&mut self) {
+            self.accept_loop.abort();
+        }
+    }
+
+    async fn stalled_endpoint() -> StalledEndpoint {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback port");
+        let addr = listener.local_addr().expect("read the bound port");
+        let accept_loop = tokio::spawn(async move {
+            // Hold every accepted socket open for the life of the task. A
+            // dropped socket would close the connection and turn the stall
+            // into a transport error, which is a different test.
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        StalledEndpoint {
+            url: format!("http://{addr}"),
+            accept_loop,
+        }
+    }
+
+    /// A client that dispatches `Converse` at `endpoint`, with `secs` for
+    /// both stall budgets.
+    ///
+    /// The model is a Llama 4 profile id: Llama 4 is on the
+    /// non-streaming-with-tools deny list, so a turn that carries tools takes
+    /// `dispatch_non_streaming` without a streaming attempt first.
+    fn stalled_non_streaming_client(endpoint: &StalledEndpoint, secs: u64) -> BedrockClient {
+        BedrockClient::new(format!("AKIAIOSFODNN7EXAMPLE:{TEST_SECRET_ACCESS_KEY}"))
+            .with_base_url("us-east-1")
+            .__with_runtime_endpoint_for_test(&endpoint.url)
+            .with_model("us.meta.llama4-maverick-17b-instruct-v1:0")
+            .with_connect_timeout(Some(secs))
+            .with_event_timeout(Some(secs))
+    }
+
+    /// One tool, which is what puts the turn on the non-streaming path.
+    fn one_tool() -> Vec<ToolDefinition> {
+        vec![ToolDefinition::new(
+            "weather",
+            "look up the weather",
+            serde_json::json!({"type": "object"}),
+        )]
+    }
+
+    #[tokio::test]
+    async fn non_streaming_dispatch_that_exceeds_the_timeout_returns_a_timeout_error() {
+        let endpoint = stalled_endpoint().await;
+        let client = stalled_non_streaming_client(&endpoint, 1);
+
+        // The outer bound only stops a hang from becoming a suite-wide stall.
+        // The assertion is that the connector's own budget ended the call.
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(20),
+            client.stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &one_tool(),
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            ),
+        )
+        .await
+        .expect("a stalled non-streaming dispatch must end on its own timeout, not hang");
+
+        let error = outcome.expect_err("a stalled request cannot produce a response");
+        assert!(
+            matches!(&error, CoreError::Llm(detail) if detail.contains("timed out")),
+            "the failure must name the timeout so an operator can raise the budget, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_during_a_non_streaming_dispatch_returns_promptly() {
+        use desktop_assistant_core::ports::llm::with_cancellation_token;
+        use tokio_util::sync::CancellationToken;
+
+        let endpoint = stalled_endpoint().await;
+        // Budgets far longer than the test: the timeout must not be what ends
+        // this call, or the test would pass without any cancellation support.
+        let client = stalled_non_streaming_client(&endpoint, 600);
+
+        let token = CancellationToken::new();
+        let trip = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            trip.cancel();
+        });
+
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(20),
+            with_cancellation_token(token, async {
+                client
+                    .stream_completion(
+                        vec![Message::new(Role::User, "hi")],
+                        &one_tool(),
+                        ReasoningConfig::default(),
+                        Box::new(|_| true),
+                    )
+                    .await
+            }),
+        )
+        .await
+        .expect("cancelling must end the dispatch, not leave it running");
+
+        assert!(
+            matches!(outcome, Err(CoreError::Cancelled)),
+            "a cancelled non-streaming dispatch reports Cancelled, got {outcome:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "cancellation must be answered promptly; took {:?}",
+            started.elapsed()
         );
     }
 }
