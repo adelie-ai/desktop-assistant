@@ -1255,6 +1255,42 @@ region = "us-west-2"
     }
 
     #[test]
+    fn bedrock_cache_policy_is_configurable_and_survives_a_write_back() {
+        // Prompt caching bills a cache write above the uncached input rate, and
+        // pays back only when a later turn reads it. `cache_policy = "none"` is
+        // how an operator stops paying for it, and how a bad turn is diagnosed
+        // with caching ruled out (#1027).
+        let toml_src = r#"
+type = "bedrock"
+region = "us-east-1"
+cache_policy = "none"
+"#;
+        let parsed: ConnectionConfig = toml::from_str(toml_src).expect("cache_policy parses");
+        match &parsed {
+            ConnectionConfig::Bedrock(c) => assert_eq!(
+                c.cache_policy,
+                Some(desktop_assistant_llm_bedrock::CachePolicy::None)
+            ),
+            other => panic!("expected Bedrock, got {other:?}"),
+        }
+
+        // The daemon rewrites daemon.toml from this struct, so a field it
+        // cannot serialise is a field an unrelated edit silently deletes.
+        let serialized = toml::to_string(&parsed).expect("serialises");
+        let reparsed: ConnectionConfig = toml::from_str(&serialized).expect("reparses");
+        assert_eq!(parsed, reparsed);
+
+        // An unset field keeps the connector default, which is the behaviour
+        // every existing connection already has.
+        let without: ConnectionConfig =
+            toml::from_str("type = \"bedrock\"\n").expect("the field is optional");
+        match &without {
+            ConnectionConfig::Bedrock(c) => assert!(c.cache_policy.is_none()),
+            other => panic!("expected Bedrock, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn roundtrip_ollama_toml() {
         let toml_src = r#"
 type = "ollama"

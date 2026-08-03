@@ -4399,7 +4399,7 @@ mod tests {
         // Map built from the CURRENT tool set (which still offers the tool).
         let map = ToolNameMap::from_names(["weather.lookup"]);
         let (_system, messages) =
-            convert_messages(&history, &map, "us.anthropic.claude-sonnet-4-6").expect("convert ok");
+            convert_messages(&history, &map, checkpoint_for("us.anthropic.claude-sonnet-4-6")).expect("convert ok");
 
         let names = tool_use_names(&messages);
         assert_eq!(names.len(), 1, "expected one toolUse in history");
@@ -4428,7 +4428,7 @@ mod tests {
         // Empty map: the tool isn't offered this turn.
         let map = ToolNameMap::from_names(Vec::<&str>::new());
         let (_system, messages) =
-            convert_messages(&history, &map, "us.anthropic.claude-sonnet-4-6").expect("convert ok");
+            convert_messages(&history, &map, checkpoint_for("us.anthropic.claude-sonnet-4-6")).expect("convert ok");
         let names = tool_use_names(&messages);
         assert_eq!(names.len(), 1);
         assert!(
@@ -4460,7 +4460,7 @@ mod tests {
             "c1", tool, "{}",
         )])];
         let (_s, messages) =
-            convert_messages(&history, &map, "us.anthropic.claude-sonnet-4-6").expect("ok");
+            convert_messages(&history, &map, checkpoint_for("us.anthropic.claude-sonnet-4-6")).expect("ok");
         let hist_name = tool_use_names(&messages).into_iter().next().expect("one");
 
         assert_eq!(
@@ -4514,6 +4514,13 @@ mod tests {
         ]
     }
 
+    /// Whether a request for `model_id` carries a checkpoint under the default
+    /// cache policy. This is the decision `stream_completion` makes before it
+    /// builds the request.
+    fn checkpoint_for(model_id: &str) -> bool {
+        wants_cache_checkpoint(CachePolicy::default(), model_id)
+    }
+
     /// Indices of the cache checkpoints in a system block list.
     fn cache_point_indices(system: &[SystemContentBlock]) -> Vec<usize> {
         system
@@ -4528,7 +4535,7 @@ mod tests {
     fn cache_point_emitted_for_anthropic_model() {
         let map = ToolNameMap::from_names(Vec::<&str>::new());
         let (system, _messages) =
-            convert_messages(&caching_history(), &map, "us.anthropic.claude-sonnet-4-6")
+            convert_messages(&caching_history(), &map, checkpoint_for("us.anthropic.claude-sonnet-4-6"))
                 .expect("convert ok");
 
         assert_eq!(
@@ -4555,7 +4562,7 @@ mod tests {
     fn cache_point_emitted_for_amazon_nova_model() {
         let map = ToolNameMap::from_names(Vec::<&str>::new());
         let (system, _messages) =
-            convert_messages(&caching_history(), &map, "us.amazon.nova-pro-v1:0")
+            convert_messages(&caching_history(), &map, checkpoint_for("us.amazon.nova-pro-v1:0"))
                 .expect("convert ok");
         assert_eq!(cache_point_indices(&system), vec![1], "{system:?}");
     }
@@ -4568,7 +4575,7 @@ mod tests {
         let (system, messages) = convert_messages(
             &caching_history(),
             &map,
-            "us.meta.llama4-maverick-17b-instruct-v1:0",
+            checkpoint_for("us.meta.llama4-maverick-17b-instruct-v1:0"),
         )
         .expect("a model without caching support still converts");
 
@@ -4592,7 +4599,7 @@ mod tests {
             "us.anthropic.claude-3-haiku-20240307-v1:0",
         ] {
             let (system, _messages) =
-                convert_messages(&caching_history(), &map, profile_id).expect("convert ok");
+                convert_messages(&caching_history(), &map, checkpoint_for(profile_id)).expect("convert ok");
             assert!(
                 cache_point_indices(&system).is_empty(),
                 "{profile_id} must get no checkpoint: {system:?}"
@@ -4723,7 +4730,7 @@ mod tests {
         let (system, _messages) = convert_messages(
             &[Message::new(Role::User, "hi")],
             &map,
-            "us.anthropic.claude-sonnet-4-6",
+            checkpoint_for("us.anthropic.claude-sonnet-4-6"),
         )
         .expect("convert ok");
         assert!(system.is_empty(), "no system blocks, no checkpoint");
@@ -5019,6 +5026,182 @@ mod tests {
             started.elapsed() < Duration::from_secs(5),
             "cancellation must be answered promptly; took {:?}",
             started.elapsed()
+        );
+    }
+
+    // --- Cache policy (#1027) --------------------------------------------
+    //
+    // Caching is not free. A cache write is billed above the uncached input
+    // rate and pays back only when a later turn reads it, so a workload of
+    // short one-turn conversations pays the premium every turn. `CachePolicy`
+    // is the lever that stops it, and it is also how an operator rules caching
+    // out while diagnosing a bad turn.
+
+    /// A model that accepts checkpoints, reached through an inference profile.
+    const CACHING_MODEL: &str = "us.anthropic.claude-sonnet-4-6";
+
+    /// The JSON marker a `cachePoint` block leaves in a Converse request body.
+    const CACHE_POINT_MARKER: &str = "cachePoint";
+
+    /// A client that dispatches at `url` with `policy` in force. `None` keeps
+    /// whatever the connector defaults to, which is the shape the daemon's
+    /// builder call uses for an unset connection field.
+    fn caching_client(url: &str, policy: Option<CachePolicy>) -> BedrockClient {
+        BedrockClient::new(format!("AKIAIOSFODNN7EXAMPLE:{TEST_SECRET_ACCESS_KEY}"))
+            .with_base_url("us-east-1")
+            .__with_runtime_endpoint_for_test(url)
+            .with_model(CACHING_MODEL)
+            .with_cache_policy(policy)
+    }
+
+    /// A Bedrock `ValidationException` as the runtime returns it: the error
+    /// type in `__type` and in the `x-amzn-errortype` header, the human text in
+    /// `message`. Status 400, which the AWS SDK does not retry.
+    fn validation_exception_body(message: &str) -> String {
+        serde_json::json!({
+            "__type": "com.amazon.bedrock#ValidationException",
+            "message": message,
+        })
+        .to_string()
+    }
+
+    /// Run one turn against a mock that only answers when the request body
+    /// matches `expect_checkpoint`, and report whether the mock was hit. The
+    /// mock answers with a validation error, because what is under test is the
+    /// request that went out, not the reply that came back.
+    async fn wire_carries_checkpoint(policy: Option<CachePolicy>, expect_checkpoint: bool) -> bool {
+        let server = httpmock::MockServer::start();
+        let converse_stream = server.mock(|when, then| {
+            let when = when
+                .method(httpmock::Method::POST)
+                .path_matches(r"/converse-stream$");
+            if expect_checkpoint {
+                when.body_includes(CACHE_POINT_MARKER);
+            } else {
+                when.body_excludes(CACHE_POINT_MARKER);
+            }
+            then.status(400)
+                .header("x-amzn-errortype", "ValidationException")
+                .header("content-type", "application/json")
+                .body(validation_exception_body("mock endpoint: request observed"));
+        });
+
+        let client = caching_client(&server.url(""), policy);
+        let _ = client
+            .stream_completion(
+                caching_history(),
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await;
+
+        converse_stream.calls() == 1
+    }
+
+    #[test]
+    fn cache_policy_none_emits_no_checkpoint_for_a_model_that_supports_caching() {
+        let map = ToolNameMap::from_names(Vec::<&str>::new());
+        for model in [CACHING_MODEL, "us.amazon.nova-pro-v1:0"] {
+            let (system, _messages) = convert_messages(
+                &caching_history(),
+                &map,
+                wants_cache_checkpoint(CachePolicy::None, model),
+            )
+            .expect("convert ok");
+
+            assert!(
+                cache_point_indices(&system).is_empty(),
+                "{model} must get no checkpoint under cache_policy = \"none\": {system:?}"
+            );
+            assert_eq!(
+                system.len(),
+                2,
+                "both system blocks survive without the checkpoint: {system:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_default_cache_policy_emits_the_checkpoint_exactly_as_it_does_today() {
+        // The default must not change behaviour: a caching model still gets one
+        // checkpoint directly behind the stable system prefix, and a model
+        // without support still gets none.
+        assert_eq!(CachePolicy::default(), CachePolicy::SystemPromptOnly);
+
+        let map = ToolNameMap::from_names(Vec::<&str>::new());
+        for model in [CACHING_MODEL, "us.amazon.nova-pro-v1:0"] {
+            let (system, _messages) = convert_messages(
+                &caching_history(),
+                &map,
+                wants_cache_checkpoint(CachePolicy::default(), model),
+            )
+            .expect("convert ok");
+            assert_eq!(
+                cache_point_indices(&system),
+                vec![1],
+                "{model} keeps its one checkpoint behind the stable prefix: {system:?}"
+            );
+        }
+
+        for model in [
+            "us.meta.llama4-maverick-17b-instruct-v1:0",
+            "us.anthropic.claude-3-haiku-20240307-v1:0",
+            "future.unknown-model",
+        ] {
+            let (system, _messages) = convert_messages(
+                &caching_history(),
+                &map,
+                wants_cache_checkpoint(CachePolicy::default(), model),
+            )
+            .expect("convert ok");
+            assert!(
+                cache_point_indices(&system).is_empty(),
+                "{model} still gets no checkpoint under the default: {system:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cache_policy_spellings_match_the_documented_configuration() {
+        // `docs/connectors/bedrock.md` documents these two values. A drift here
+        // makes a configuration file that reads correctly fail to load.
+        for (spelling, expected) in [
+            ("none", CachePolicy::None),
+            ("system_prompt_only", CachePolicy::SystemPromptOnly),
+        ] {
+            let parsed: CachePolicy = serde_json::from_value(serde_json::json!(spelling))
+                .unwrap_or_else(|e| panic!("cache_policy = \"{spelling}\" must parse: {e}"));
+            assert_eq!(parsed, expected);
+            assert_eq!(
+                serde_json::to_value(expected).expect("serialises"),
+                serde_json::json!(spelling),
+                "the value written back must be the value documented"
+            );
+        }
+
+        // A value that is not one of the two is a configuration mistake, and
+        // must be reported rather than silently taken as the default.
+        assert!(
+            serde_json::from_value::<CachePolicy>(serde_json::json!("system_prompt_and_tools"))
+                .is_err(),
+            "an unshipped policy name must not parse"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_policy_none_sends_no_checkpoint_on_the_wire() {
+        assert!(
+            wire_carries_checkpoint(Some(CachePolicy::None), false).await,
+            "the request that reached Bedrock still carried a checkpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_default_cache_policy_sends_the_checkpoint_on_the_wire() {
+        assert!(
+            wire_carries_checkpoint(None, true).await,
+            "the default must keep sending the checkpoint a caching model accepts"
         );
     }
 }
