@@ -5282,4 +5282,259 @@ mod tests {
             "the default must keep sending the checkpoint a caching model accepts"
         );
     }
+
+    // --- Recovery from a refused checkpoint (#1028) -----------------------
+    //
+    // The caching allow-list is read from AWS documentation that lists only
+    // the models absent from "Models at a glance", so it is a best reading and
+    // not an enumeration. A model on the list that refuses a checkpoint would
+    // fail every turn. The connector retries the turn once without the
+    // checkpoint and remembers the model, which turns a permanent failure into
+    // one wasted call.
+
+    /// The refusal, as Bedrock words it. **Unverified against a live account**:
+    /// no Converse-caching model was reachable to capture the real text, so
+    /// this is built from the documented shape. What the classifier requires is
+    /// the field name, and that is what a refusal of the block must carry.
+    const CACHE_REFUSAL_MESSAGE: &str =
+        "The model returned the following errors: This model doesn't support the cachePoint block.";
+
+    /// A validation failure with nothing to do with caching. Naming a tool
+    /// schema is the realistic case: this repo has lived it (#336).
+    const UNRELATED_VALIDATION_MESSAGE: &str =
+        "The json schema for tool weather is invalid: top-level oneOf is not supported.";
+
+    /// A client on the non-streaming path, so a whole turn can be driven
+    /// against a `Converse` mock. The model supports caching, so the first
+    /// request carries a checkpoint; the memo puts it on the non-streaming
+    /// path without a stream attempt first.
+    async fn cache_recovery_client(url: &str, policy: Option<CachePolicy>) -> BedrockClient {
+        let client = caching_client(url, policy).with_non_streaming_timeout(Some(10));
+        client
+            .__force_non_streaming_tools_for_test(CACHING_MODEL)
+            .await;
+        client
+    }
+
+    /// A `Converse` mock that answers `message` as a validation failure for
+    /// every request whose body carries a checkpoint.
+    fn refuse_checkpoint<'a>(
+        server: &'a httpmock::MockServer,
+        message: &str,
+    ) -> httpmock::Mock<'a> {
+        let body = validation_exception_body(message);
+        server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path_matches(r"/converse$")
+                .body_includes(CACHE_POINT_MARKER);
+            then.status(400)
+                .header("x-amzn-errortype", "ValidationException")
+                .header("content-type", "application/json")
+                .body(body);
+        })
+    }
+
+    /// A `Converse` mock that answers normally for every request whose body
+    /// carries no checkpoint.
+    fn accept_without_checkpoint(server: &httpmock::MockServer) -> httpmock::Mock<'_> {
+        server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path_matches(r"/converse$")
+                .body_excludes(CACHE_POINT_MARKER);
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(CONVERSE_RESPONSE_BODY);
+        })
+    }
+
+    async fn one_turn(client: &BedrockClient) -> Result<LlmResponse, CoreError> {
+        client
+            .stream_completion(
+                caching_history(),
+                &one_tool(),
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn a_refused_cache_checkpoint_retries_the_turn_once_without_it() {
+        let server = httpmock::MockServer::start();
+        let refused = refuse_checkpoint(&server, CACHE_REFUSAL_MESSAGE);
+        let accepted = accept_without_checkpoint(&server);
+
+        let client = cache_recovery_client(&server.url(""), None).await;
+        let response = one_turn(&client)
+            .await
+            .expect("the turn must survive a refused checkpoint");
+
+        assert_eq!(response.text, "the whole answer, in one piece");
+        assert_eq!(refused.calls(), 1, "exactly one doomed attempt");
+        assert_eq!(
+            accepted.calls(),
+            1,
+            "exactly one retry, and it carried none"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_model_that_refused_a_checkpoint_sends_none_on_the_next_turn() {
+        let server = httpmock::MockServer::start();
+        let refused = refuse_checkpoint(&server, CACHE_REFUSAL_MESSAGE);
+        let accepted = accept_without_checkpoint(&server);
+
+        let client = cache_recovery_client(&server.url(""), None).await;
+        one_turn(&client).await.expect("first turn recovers");
+        one_turn(&client).await.expect("second turn succeeds");
+
+        assert_eq!(
+            refused.calls(),
+            1,
+            "the second turn must not repeat the doomed attempt"
+        );
+        assert_eq!(
+            accepted.calls(),
+            2,
+            "both turns answered without a checkpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unrelated_validation_error_is_not_swallowed_by_the_cache_recovery() {
+        let server = httpmock::MockServer::start();
+        // The failure has nothing to do with caching, so it must reach the
+        // caller, and it must not teach the connector anything about this
+        // model. A 400 is not evidence about a cache checkpoint.
+        let refused = refuse_checkpoint(&server, UNRELATED_VALIDATION_MESSAGE);
+        let accepted = accept_without_checkpoint(&server);
+
+        let client = cache_recovery_client(&server.url(""), None).await;
+        let error = one_turn(&client)
+            .await
+            .expect_err("an unrelated validation failure must fail the turn");
+        assert!(
+            matches!(&error, CoreError::Llm(detail) if detail.contains("oneOf")),
+            "the provider's own message must survive, got {error:?}"
+        );
+        assert_eq!(refused.calls(), 1, "one attempt, no retry");
+        assert_eq!(
+            accepted.calls(),
+            0,
+            "nothing may be retried without the checkpoint"
+        );
+
+        // And the model must not have been memoised: the next turn still sends
+        // the checkpoint the model in fact accepts.
+        let _ = one_turn(&client).await;
+        assert_eq!(
+            refused.calls(),
+            2,
+            "an unrelated failure must not disable caching for this model"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refusal_naming_the_cache_field_is_ignored_when_the_request_carried_none() {
+        // The trap this guard closes: a request that sent no checkpoint cannot
+        // have had one refused, so a message naming the field is about
+        // something else - and a retry that omits a field it never sent proves
+        // nothing. Classifying here would let the fallback manufacture the
+        // evidence for its own verdict.
+        let server = httpmock::MockServer::start();
+        let refused_anything = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path_matches(r"/converse$");
+            then.status(400)
+                .header("x-amzn-errortype", "ValidationException")
+                .header("content-type", "application/json")
+                .body(validation_exception_body(CACHE_REFUSAL_MESSAGE));
+        });
+
+        let client = cache_recovery_client(&server.url(""), Some(CachePolicy::None)).await;
+        one_turn(&client)
+            .await
+            .expect_err("the validation failure must reach the caller");
+
+        assert_eq!(
+            refused_anything.calls(),
+            1,
+            "no retry: there was no checkpoint to withdraw"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_streaming_path_also_retries_without_the_checkpoint() {
+        // Both dispatch paths carry the checkpoint, so both must recover. The
+        // retry's own reply is another failure, because a `ConverseStream`
+        // success is an AWS event stream; what this pins is that the second
+        // request went out without the checkpoint.
+        let server = httpmock::MockServer::start();
+        let refused = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path_matches(r"/converse-stream$")
+                .body_includes(CACHE_POINT_MARKER);
+            then.status(400)
+                .header("x-amzn-errortype", "ValidationException")
+                .header("content-type", "application/json")
+                .body(validation_exception_body(CACHE_REFUSAL_MESSAGE));
+        });
+        let retried = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path_matches(r"/converse-stream$")
+                .body_excludes(CACHE_POINT_MARKER);
+            then.status(400)
+                .header("x-amzn-errortype", "ValidationException")
+                .header("content-type", "application/json")
+                .body(validation_exception_body(UNRELATED_VALIDATION_MESSAGE));
+        });
+
+        let client = caching_client(&server.url(""), None);
+        let error = client
+            .stream_completion(
+                caching_history(),
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await
+            .expect_err("the retry fails in this test, on purpose");
+
+        assert_eq!(refused.calls(), 1, "one doomed streaming attempt");
+        assert_eq!(retried.calls(), 1, "one retry, without the checkpoint");
+        assert!(
+            matches!(&error, CoreError::Llm(detail) if detail.contains("oneOf")),
+            "the retry's own failure is what the caller sees, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn only_a_message_naming_the_cache_field_counts_as_a_checkpoint_refusal() {
+        // The classifier is the whole guard against a wrong verdict, so it is
+        // pinned in both directions.
+        for names_it in [
+            CACHE_REFUSAL_MESSAGE,
+            "Invalid value at 'system[1].cachePoint'",
+            "cache_control is not supported for this model",
+            "This model does not support prompt caching.",
+        ] {
+            assert!(
+                names_the_cache_field(names_it),
+                "must be recognised as a checkpoint refusal: {names_it}"
+            );
+        }
+
+        for names_something_else in [
+            UNRELATED_VALIDATION_MESSAGE,
+            "Input is too long for requested model.",
+            "The provided model identifier is invalid.",
+            "Malformed input request: #/system/1: subject must not be valid against schema",
+            "",
+        ] {
+            assert!(
+                !names_the_cache_field(names_something_else),
+                "must not be read as a checkpoint refusal: {names_something_else}"
+            );
+        }
+    }
 }
