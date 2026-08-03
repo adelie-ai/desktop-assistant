@@ -313,6 +313,36 @@ The connector decides where checkpoints go. The backend writes them in its own
 API's spelling. A backend serving a model without caching support ignores the
 policy.
 
+**Recovery when a model refuses a checkpoint.** The support list above is read
+from AWS documentation, and that documentation lists only the models absent
+from "Models at a glance", so it is a best reading rather than an enumeration.
+A model on the list that rejects a checkpoint would otherwise fail every turn.
+So the Converse path catches the `ValidationException` that **names the cache
+field**, retries the same turn once without the checkpoint, and records the
+model so later turns omit it. The recovery is logged at `warn!` with the model
+and the provider's message.
+
+Three limits, each deliberate:
+
+- The error must name the cache field (`cachePoint`, `cache_control`, "cache
+  checkpoint" or "prompt caching"). A validation failure that names anything
+  else is returned to the caller unchanged. A status code is not evidence.
+- The retry is classified only when the request that failed actually carried a
+  checkpoint. The retry does not, so the retry can never be read as a second
+  refusal, and the memo can never be written on evidence the fallback itself
+  produced.
+- The memo is written from the refusal, not from the retry's success. A
+  fallback that succeeds proves only that the request without the field works,
+  which is true whatever the real cause was.
+
+A model whose refusal names none of those markers is not recovered. That turn
+fails, and `cache_policy = "none"` is the remedy. The fail-safe direction is
+deliberate: a wrongly-disabled cache costs input tokens, and a wrongly-kept
+checkpoint costs the whole turn.
+
+A prefix below the model's caching minimum is not this case. AWS states the
+inference still succeeds and simply does not cache.
+
 ## Cross-cutting concerns
 
 **Retry** is not implemented here. `RetryingLlmClient` in `core` wraps any

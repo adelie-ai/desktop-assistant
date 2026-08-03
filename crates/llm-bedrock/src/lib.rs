@@ -148,6 +148,16 @@ pub struct BedrockClient {
     /// mode" validation error. Per-instance so each client warms its
     /// own cache; not shared across `BedrockClient` instances. (#67)
     non_streaming_tools_models: Arc<Mutex<HashSet<String>>>,
+    /// Models discovered at runtime to reject a `cachePoint` block, although
+    /// [`supports_prompt_caching`] accepts them. That list is read from AWS
+    /// documentation which states it covers only the models absent from
+    /// "Models at a glance", so it is a best reading and not an enumeration;
+    /// this set is how a wrong entry costs one call instead of every turn.
+    ///
+    /// Written only from a refusal that names the cache field, on a request
+    /// that carried a checkpoint. Per-instance, like
+    /// [`Self::non_streaming_tools_models`]. (#1028)
+    cache_unsupported_models: Arc<Mutex<HashSet<String>>>,
     /// First-response (connect) stall budget; defaults to
     /// [`STREAM_CONNECT_TIMEOUT`], overridable per-connection.
     connect_timeout: Duration,
@@ -208,6 +218,7 @@ impl BedrockClient {
             model_cache_ttl: DEFAULT_MODEL_CACHE_TTL,
             clock: Arc::new(SystemClock),
             non_streaming_tools_models: Arc::new(Mutex::new(HashSet::new())),
+            cache_unsupported_models: Arc::new(Mutex::new(HashSet::new())),
             connect_timeout: STREAM_CONNECT_TIMEOUT,
             event_timeout: STREAM_EVENT_TIMEOUT,
             non_streaming_timeout: NON_STREAMING_REQUEST_TIMEOUT,
@@ -312,6 +323,20 @@ impl BedrockClient {
         let now = self.clock.now();
         let mut cache = self.model_cache.lock().await;
         cache.entry = Some((now, ModelListingReport::complete(models)));
+    }
+
+    /// Test-only: record `model` as rejecting tools in streaming mode, so a
+    /// turn that carries tools takes the non-streaming (`Converse`) path with
+    /// no stream attempt first. Exists so a whole turn can be driven against a
+    /// `Converse` mock for a model that supports prompt caching; the
+    /// `ConverseStream` reply is an AWS event stream, which a plain HTTP mock
+    /// cannot produce.
+    #[doc(hidden)]
+    pub async fn __force_non_streaming_tools_for_test(&self, model: &str) {
+        self.non_streaming_tools_models
+            .lock()
+            .await
+            .insert(model.to_string());
     }
 
     /// Test-only: peek at the cache contents.
@@ -1249,6 +1274,39 @@ fn supports_streaming_with_tools(base_id: &str) -> bool {
     true
 }
 
+/// Whether a Bedrock validation message positively names the prompt-cache
+/// field, and so reports a refused `cachePoint` block rather than something
+/// else.
+///
+/// Every marker is a name of the field itself, in one of the spellings the
+/// service uses: `cachePoint` for Converse, `cache_control` for the Anthropic
+/// shape Bedrock forwards, and the two prose forms. Nothing here is a status
+/// code, a generic "unsupported", or a schema path, because none of those is
+/// evidence about the checkpoint: a validation failure arrives just as easily
+/// from a tool schema (#336), an over-long prompt, or a bad model id, and
+/// reading one of those as a cache refusal would disable caching on a model
+/// that caches perfectly well.
+///
+/// The classifier is one half of the guard. The other half is the caller,
+/// which only asks this question about a request that actually carried a
+/// checkpoint. A message about a field the request did not send is about
+/// something else, whatever it names.
+///
+/// A refusal that names none of these is not recovered, and the turn fails as
+/// it does today. That direction is deliberate: withholding a checkpoint costs
+/// input tokens, and sending one the model refuses costs the whole turn.
+fn names_the_cache_field(message: &str) -> bool {
+    let lc = message.to_ascii_lowercase();
+    [
+        "cachepoint",
+        "cache_control",
+        "cache checkpoint",
+        "prompt caching",
+    ]
+    .iter()
+    .any(|marker| lc.contains(marker))
+}
+
 /// Detect the Bedrock validation error that signals "this model accepts
 /// tools via Converse but not ConverseStream". The exact message text is
 /// documented on the Bedrock supported-features page; matching is
@@ -1729,87 +1787,65 @@ impl LlmClient for BedrockClient {
         // system prompt carries a cache checkpoint.
         let model = current_model_override().unwrap_or_else(|| self.model.clone());
 
-        let cache_checkpoint = wants_cache_checkpoint(self.cache_policy, &model);
-        let (system, api_messages) = convert_messages(&messages, &tool_names, cache_checkpoint)?;
-        let tool_config = convert_tools(tools, &tool_names)?;
+        // Two independent reasons to withhold the checkpoint: the operator's
+        // policy, and a refusal this connector has already met on this model.
+        let cache_checkpoint = wants_cache_checkpoint(self.cache_policy, &model)
+            && !self.cache_unsupported_models.lock().await.contains(&model);
 
-        let msg_count = api_messages.len();
-        let tool_count = tools.len();
-        // Count prompt content only. A cache checkpoint is a control marker
-        // with no prompt text, so counting its `Debug` form would inflate the
-        // reported prompt size on exactly the models that cache.
-        let system_chars: usize = system
-            .iter()
-            .filter(|b| !matches!(b, SystemContentBlock::CachePoint(_)))
-            .map(|b| format!("{b:?}").len())
-            .sum();
-        let msg_chars: usize = api_messages.iter().map(|m| format!("{m:?}").len()).sum();
-        tracing::info!(
-            msg_chars,
-            msg_count,
-            tool_count,
-            system_chars,
-            model = %model,
-            "LLM request payload"
-        );
-
-        let inputs = BedrockRequestInputs {
-            model: model.clone(),
-            api_messages,
-            system,
-            tool_config,
-            inference_cfg: self.build_inference_config(),
-            additional_request_fields: build_additional_model_request_fields(&model, reasoning),
-            tool_names,
-        };
-
-        // Path selection (#67):
-        // - No tools: streaming is always safe; use the streaming path.
-        // - Tools + model on the static deny-list: skip the stream attempt
-        //   and go straight to non-streaming.
-        // - Tools + runtime cache says non-streaming: same.
-        // - Otherwise: try streaming first; on the specific
-        //   "doesn't support tool use in streaming" validation error,
-        //   memoize the model and retry via non-streaming.
-        let base_model = strip_region_prefix(&model);
-        let cache_says_non_streaming = !tools.is_empty() && {
-            let cache = self.non_streaming_tools_models.lock().await;
-            cache.contains(&model)
-        };
-        let allowlist_says_non_streaming =
-            !tools.is_empty() && !supports_streaming_with_tools(base_model);
-        if cache_says_non_streaming || allowlist_says_non_streaming {
-            if allowlist_says_non_streaming {
-                tracing::debug!(
-                    model = %model,
-                    "skipping ConverseStream: model on the non-streaming-with-tools deny-list"
-                );
-            }
-            return self
-                .dispatch_non_streaming(client, inputs, on_chunk, &cancellation)
-                .await;
-        }
+        let inputs = self.build_request_inputs(
+            &messages,
+            tools,
+            &tool_names,
+            &model,
+            reasoning,
+            cache_checkpoint,
+        )?;
 
         match self
-            .dispatch_streaming(client, &inputs, on_chunk, &cancellation)
+            .dispatch_attempt(client, inputs, on_chunk, &cancellation, !tools.is_empty())
             .await
         {
             Ok(response) => Ok(response),
-            Err(StreamingDispatchError::StreamingToolsUnsupported { on_chunk, detail }) => {
+            Err(AttemptError::CachePointRejected { on_chunk, detail }) => {
+                // The refusal named the cache field, on a request that carried
+                // a checkpoint. That is the evidence, and it is the whole of
+                // it: the memo is written here, from what the service said,
+                // and never from a retry that succeeded - a request without
+                // the field succeeds whatever the real cause was, so treating
+                // that as proof would certify a wrong verdict.
                 tracing::warn!(
                     model = %model,
                     detail,
-                    "Bedrock rejected ConverseStream with tools; retrying via Converse \
-                     and memoizing the model so future turns skip the stream attempt"
+                    "Bedrock refused the prompt-cache checkpoint; retrying this turn \
+                     without it and omitting it for later turns on this model"
                 );
-                self.non_streaming_tools_models
+                self.cache_unsupported_models
                     .lock()
                     .await
                     .insert(model.clone());
-                self.dispatch_non_streaming(client, inputs, on_chunk, &cancellation)
+
+                let retry = self.build_request_inputs(
+                    &messages,
+                    tools,
+                    &tool_names,
+                    &model,
+                    reasoning,
+                    false,
+                )?;
+                self.dispatch_attempt(client, retry, on_chunk, &cancellation, !tools.is_empty())
                     .await
+                    .map_err(|e| match e {
+                        AttemptError::Other(err) => err,
+                        // Unreachable in practice: the retry carries no
+                        // checkpoint, and a refusal is only classified for a
+                        // request that sent one. Reported rather than retried
+                        // again, so a second attempt is the last one.
+                        AttemptError::CachePointRejected { detail, .. } => {
+                            CoreError::Llm(format!("Bedrock converse request failed: {detail}"))
+                        }
+                    })
             }
-            Err(StreamingDispatchError::Other(err)) => Err(err),
+            Err(AttemptError::Other(err)) => Err(err),
         }
     }
 }
@@ -1835,6 +1871,27 @@ enum StreamingDispatchError {
         on_chunk: ChunkCallback,
         detail: String,
     },
+    /// Bedrock refused the `cachePoint` block this request carried. Same
+    /// callback-carrying reason as the arm above. (#1028)
+    CachePointRejected {
+        on_chunk: ChunkCallback,
+        detail: String,
+    },
+    Other(CoreError),
+}
+
+/// Outcome of one complete dispatch attempt, after the streaming ->
+/// non-streaming fallback has been resolved inside
+/// [`BedrockClient::dispatch_attempt`].
+///
+/// Only one failure is actionable at this level, and it is the one the caller
+/// can answer by changing the request: a refused cache checkpoint, which the
+/// caller retries once without it. (#1028)
+enum AttemptError {
+    CachePointRejected {
+        on_chunk: ChunkCallback,
+        detail: String,
+    },
     Other(CoreError),
 }
 
@@ -1852,6 +1909,15 @@ struct BedrockRequestInputs {
     /// the (sanitized) name the model returns in a `toolUse` back to the real
     /// tool so the upstream dispatch can execute it. (#198)
     tool_names: ToolNameMap,
+    /// Whether `system` carries a `cachePoint` block.
+    ///
+    /// This is what makes a refusal attributable. A request that sent no
+    /// checkpoint cannot have had one refused, so the dispatch paths do not
+    /// even ask whether the failure names the cache field. The retry is built
+    /// with this `false`, which is why the retry can never be read as a second
+    /// refusal, and why the memo can never rest on evidence the fallback
+    /// itself produced. (#1028)
+    cache_checkpoint: bool,
 }
 
 impl BedrockClient {
@@ -1872,6 +1938,125 @@ impl BedrockClient {
             inference_cfg = inference_cfg.max_tokens(m as i32);
         }
         Some(inference_cfg.build())
+    }
+
+    /// Translate one turn into the Converse request shape.
+    ///
+    /// Called a second time, with `cache_checkpoint` forced to `false`, when
+    /// Bedrock refuses the checkpoint. It is a pure translation of the same
+    /// turn, so the retry differs from the first attempt in that one field and
+    /// nothing else - which is what makes the retry's outcome readable.
+    fn build_request_inputs(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+        tool_names: &ToolNameMap,
+        model: &str,
+        reasoning: ReasoningConfig,
+        cache_checkpoint: bool,
+    ) -> Result<BedrockRequestInputs, CoreError> {
+        let (system, api_messages) = convert_messages(messages, tool_names, cache_checkpoint)?;
+        let tool_config = convert_tools(tools, tool_names)?;
+
+        let msg_count = api_messages.len();
+        let tool_count = tools.len();
+        // Count prompt content only. A cache checkpoint is a control marker
+        // with no prompt text, so counting its `Debug` form would inflate the
+        // reported prompt size on exactly the models that cache.
+        let system_chars: usize = system
+            .iter()
+            .filter(|b| !matches!(b, SystemContentBlock::CachePoint(_)))
+            .map(|b| format!("{b:?}").len())
+            .sum();
+        let msg_chars: usize = api_messages.iter().map(|m| format!("{m:?}").len()).sum();
+        tracing::info!(
+            msg_chars,
+            msg_count,
+            tool_count,
+            system_chars,
+            cache_checkpoint,
+            model = %model,
+            "LLM request payload"
+        );
+
+        Ok(BedrockRequestInputs {
+            model: model.to_string(),
+            api_messages,
+            system,
+            tool_config,
+            inference_cfg: self.build_inference_config(),
+            additional_request_fields: build_additional_model_request_fields(model, reasoning),
+            tool_names: tool_names.clone(),
+            cache_checkpoint,
+        })
+    }
+
+    /// Dispatch one request, choosing the path and answering the one
+    /// per-model restriction that path selection cannot predict.
+    ///
+    /// Path selection (#67):
+    /// - No tools: streaming is always safe; use the streaming path.
+    /// - Tools + model on the static deny-list: skip the stream attempt
+    ///   and go straight to non-streaming.
+    /// - Tools + runtime memo says non-streaming: same.
+    /// - Otherwise: try streaming first; on the specific
+    ///   "doesn't support tool use in streaming" validation error,
+    ///   memoize the model and retry via non-streaming.
+    ///
+    /// A refused cache checkpoint is **not** answered here. It changes the
+    /// request rather than the path, so it goes back to the caller, which owns
+    /// the request. (#1028)
+    async fn dispatch_attempt(
+        &self,
+        client: &Client,
+        inputs: BedrockRequestInputs,
+        on_chunk: ChunkCallback,
+        cancellation: &tokio_util::sync::CancellationToken,
+        has_tools: bool,
+    ) -> Result<LlmResponse, AttemptError> {
+        let model = inputs.model.clone();
+        let base_model = strip_region_prefix(&model);
+        let memo_says_non_streaming = has_tools && {
+            let memo = self.non_streaming_tools_models.lock().await;
+            memo.contains(&model)
+        };
+        let allowlist_says_non_streaming = has_tools && !supports_streaming_with_tools(base_model);
+        if memo_says_non_streaming || allowlist_says_non_streaming {
+            if allowlist_says_non_streaming {
+                tracing::debug!(
+                    model = %model,
+                    "skipping ConverseStream: model on the non-streaming-with-tools deny-list"
+                );
+            }
+            return self
+                .dispatch_non_streaming(client, inputs, on_chunk, cancellation)
+                .await;
+        }
+
+        match self
+            .dispatch_streaming(client, &inputs, on_chunk, cancellation)
+            .await
+        {
+            Ok(response) => Ok(response),
+            Err(StreamingDispatchError::StreamingToolsUnsupported { on_chunk, detail }) => {
+                tracing::warn!(
+                    model = %model,
+                    detail,
+                    "Bedrock rejected ConverseStream with tools; retrying via Converse \
+                     and memoizing the model so future turns skip the stream attempt"
+                );
+                self.non_streaming_tools_models
+                    .lock()
+                    .await
+                    .insert(model.clone());
+                self.dispatch_non_streaming(client, inputs, on_chunk, cancellation)
+                    .await
+            }
+            Err(StreamingDispatchError::CachePointRejected { on_chunk, detail }) => {
+                Err(AttemptError::CachePointRejected { on_chunk, detail })
+            }
+            Err(StreamingDispatchError::Other(err)) => Err(AttemptError::Other(err)),
+        }
     }
 
     /// Attempt the streaming dispatch. The success path mirrors the
@@ -1940,6 +2125,17 @@ impl BedrockClient {
                 Err(e) => {
                     if let Some(detail) = streaming_tools_unsupported_detail(&e) {
                         return Err(StreamingDispatchError::StreamingToolsUnsupported {
+                            on_chunk,
+                            detail,
+                        });
+                    }
+                    // Asked only of a request that carried a checkpoint: a
+                    // refusal of a field this request did not send is a
+                    // refusal of something else.
+                    if inputs.cache_checkpoint
+                        && let Some(detail) = cache_point_rejected_detail_stream(&e)
+                    {
+                        return Err(StreamingDispatchError::CachePointRejected {
                             on_chunk,
                             detail,
                         });
@@ -2030,7 +2226,8 @@ impl BedrockClient {
         inputs: BedrockRequestInputs,
         mut on_chunk: ChunkCallback,
         cancellation: &tokio_util::sync::CancellationToken,
-    ) -> Result<LlmResponse, CoreError> {
+    ) -> Result<LlmResponse, AttemptError> {
+        let cache_checkpoint = inputs.cache_checkpoint;
         let mut request = client
             .converse()
             .model_id(inputs.model.clone())
@@ -2056,7 +2253,7 @@ impl BedrockClient {
         let response = tokio::select! {
             _ = cancellation.cancelled() => {
                 tracing::debug!(model = %inputs.model, "Bedrock converse cancelled by token");
-                return Err(CoreError::Cancelled);
+                return Err(AttemptError::Other(CoreError::Cancelled));
             }
             _ = tokio::time::sleep(request_timeout) => {
                 tracing::error!(
@@ -2064,12 +2261,23 @@ impl BedrockClient {
                     timeout_s = request_timeout.as_secs(),
                     "Bedrock converse send() timed out (no response)"
                 );
-                return Err(CoreError::Llm(format!(
+                return Err(AttemptError::Other(CoreError::Llm(format!(
                     "Bedrock converse request timed out after {}s",
                     request_timeout.as_secs()
-                )));
+                ))));
             }
-            r = send_fut => r.map_err(map_converse_error)?,
+            r = send_fut => match r {
+                Ok(r) => r,
+                Err(e) => {
+                    // Asked only of a request that carried a checkpoint: a
+                    // refusal of a field this request did not send is a
+                    // refusal of something else.
+                    if cache_checkpoint && let Some(detail) = cache_point_rejected_detail(&e) {
+                        return Err(AttemptError::CachePointRejected { on_chunk, detail });
+                    }
+                    return Err(AttemptError::Other(map_converse_error(e)));
+                }
+            },
         };
 
         let mut text = String::new();
@@ -2117,6 +2325,37 @@ impl BedrockClient {
         }
         Ok(llm_response)
     }
+}
+
+/// If the `Converse` SDK error refuses the cache checkpoint, return the raw
+/// message; otherwise `None`. The caller asks this only of a request that
+/// carried one. (#1028)
+fn cache_point_rejected_detail(
+    e: &aws_sdk_bedrockruntime::error::SdkError<
+        aws_sdk_bedrockruntime::operation::converse::ConverseError,
+    >,
+) -> Option<String> {
+    use aws_sdk_bedrockruntime::operation::converse::ConverseError;
+    let ConverseError::ValidationException(ve) = e.as_service_error()? else {
+        return None;
+    };
+    let raw = ve.message().unwrap_or("");
+    names_the_cache_field(raw).then(|| raw.to_string())
+}
+
+/// The `ConverseStream` twin of [`cache_point_rejected_detail`]. Both dispatch
+/// paths send the checkpoint, so both recover from a refusal.
+fn cache_point_rejected_detail_stream(
+    e: &aws_sdk_bedrockruntime::error::SdkError<
+        aws_sdk_bedrockruntime::operation::converse_stream::ConverseStreamError,
+    >,
+) -> Option<String> {
+    use aws_sdk_bedrockruntime::operation::converse_stream::ConverseStreamError;
+    let ConverseStreamError::ValidationException(ve) = e.as_service_error()? else {
+        return None;
+    };
+    let raw = ve.message().unwrap_or("");
+    names_the_cache_field(raw).then(|| raw.to_string())
 }
 
 /// Map a Bedrock `Converse` SDK error to `CoreError`. Mirrors
