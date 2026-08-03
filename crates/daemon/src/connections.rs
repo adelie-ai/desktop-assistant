@@ -264,6 +264,48 @@ impl ConnectionConfig {
         }
         Ok(())
     }
+
+    /// Copy `stored`'s **file-only** fields onto this connection: the settings
+    /// a [`crate::api_surface`] connection payload has no field for, and which
+    /// rebuilding a connection from a payload would therefore delete.
+    ///
+    /// Why it exists: an edit from a client sends the whole connection, so the
+    /// daemon replaces the stored one with a connection built from the payload.
+    /// A setting the payload cannot carry is gone from that moment - not
+    /// refused, not warned about, just absent on the next load. The stored
+    /// credential coordinate has the same shape, and
+    /// [`crate::api_surface`]'s update path re-attaches it the same way.
+    ///
+    /// Nothing is carried across a connector switch. A connection that changed
+    /// type is a different connection, and its old type's settings are not
+    /// meaningful on the new one.
+    ///
+    /// Exhaustive with no catch-all, like [`Self::set_secret`]: a new connector
+    /// states what it keeps in the file rather than inheriting silence.
+    /// [`Connector::file_only_fields`] names the same fields for callers that
+    /// need to ask without a connection in hand, and test sweeps hold the two
+    /// together.
+    ///
+    /// A new *field* is caught one step earlier, by the compiler: the payload
+    /// conversion in [`crate::api_surface`] builds each connection struct with
+    /// an explicit field list, so adding a field there fails to build until
+    /// somebody decides whether the payload can express it. If it cannot, it
+    /// belongs here.
+    pub fn carry_forward_file_only_fields(&mut self, stored: &Self) {
+        match self {
+            Self::Bedrock(replacement) => {
+                if let Self::Bedrock(stored) = stored {
+                    replacement.cache_policy = stored.cache_policy;
+                }
+            }
+            Self::Anthropic(_)
+            | Self::OpenAi(_)
+            | Self::OpenRouter(_)
+            | Self::Azure(_)
+            | Self::Google(_)
+            | Self::Ollama(_) => {}
+        }
+    }
 }
 
 /// Declare the [`Connector`] enum together with everything that has to list
@@ -627,6 +669,44 @@ impl Connector {
             Self::Bedrock | Self::Ollama => false,
         }
     }
+
+    /// The settings a connection of this type keeps in `daemon.toml` only:
+    /// the fields the connection payload has no place for, and which an edit
+    /// from a client would therefore delete unless they are carried forward.
+    ///
+    /// Named rather than counted, so a test can compare this list against the
+    /// fields that actually differ across a payload round trip. A bare "yes,
+    /// some" would be satisfied by any one surviving difference, which is how a
+    /// second file-only field could be added, dropped on every client edit, and
+    /// never noticed - the original defect, one field later.
+    ///
+    /// Bedrock keeps `cache_policy` in the file only. Putting it on the wire is
+    /// source-breaking for every client that constructs the payload variant, so
+    /// it waits for its own change (#1053).
+    ///
+    /// [`ConnectionConfig::carry_forward_file_only_fields`] does the carrying;
+    /// this states what must be carried, for a caller with no connection in
+    /// hand. Test sweeps pin the two against each other in both directions, so
+    /// neither can become a stale claim.
+    ///
+    /// Exhaustive with no catch-all.
+    // The test sweeps in `api_surface` are the readers today; the carry itself
+    // answers the same question by matching on the connection.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by the per-connector test sweeps")
+    )]
+    pub fn file_only_fields(self) -> &'static [&'static str] {
+        match self {
+            Self::Bedrock => &["cache_policy"],
+            Self::Anthropic
+            | Self::OpenAi
+            | Self::OpenRouter
+            | Self::Azure
+            | Self::Google
+            | Self::Ollama => &[],
+        }
+    }
 }
 
 impl fmt::Display for Connector {
@@ -851,6 +931,13 @@ pub struct BedrockConnection {
     /// available". See [`AnthropicConnection::max_context_tokens`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_context_tokens: Option<u64>,
+    /// How much of a request this connection marks for prompt caching:
+    /// `system_prompt_only` (the default) or `none`. `None` keeps the
+    /// connector default. Bedrock bills a cache write above the uncached input
+    /// rate, so a workload of short one-turn conversations is cheaper with
+    /// `none`; `none` also rules caching out while diagnosing a bad turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_policy: Option<desktop_assistant_llm_bedrock::CachePolicy>,
 }
 
 /// Ollama (local or self-hosted) connection fields.
@@ -1252,6 +1339,42 @@ region = "us-west-2"
         let reparsed: ConnectionConfig = toml::from_str(&serialized).unwrap();
         assert_eq!(parsed, reparsed);
         assert_eq!(parsed.connector_type(), "bedrock");
+    }
+
+    #[test]
+    fn bedrock_cache_policy_is_configurable_and_survives_a_write_back() {
+        // Prompt caching bills a cache write above the uncached input rate, and
+        // pays back only when a later turn reads it. `cache_policy = "none"` is
+        // how an operator stops paying for it, and how a bad turn is diagnosed
+        // with caching ruled out (#1027).
+        let toml_src = r#"
+type = "bedrock"
+region = "us-east-1"
+cache_policy = "none"
+"#;
+        let parsed: ConnectionConfig = toml::from_str(toml_src).expect("cache_policy parses");
+        match &parsed {
+            ConnectionConfig::Bedrock(c) => assert_eq!(
+                c.cache_policy,
+                Some(desktop_assistant_llm_bedrock::CachePolicy::None)
+            ),
+            other => panic!("expected Bedrock, got {other:?}"),
+        }
+
+        // The daemon rewrites daemon.toml from this struct, so a field it
+        // cannot serialise is a field an unrelated edit silently deletes.
+        let serialized = toml::to_string(&parsed).expect("serialises");
+        let reparsed: ConnectionConfig = toml::from_str(&serialized).expect("reparses");
+        assert_eq!(parsed, reparsed);
+
+        // An unset field keeps the connector default, which is the behaviour
+        // every existing connection already has.
+        let without: ConnectionConfig =
+            toml::from_str("type = \"bedrock\"\n").expect("the field is optional");
+        match &without {
+            ConnectionConfig::Bedrock(c) => assert!(c.cache_policy.is_none()),
+            other => panic!("expected Bedrock, got {other:?}"),
+        }
     }
 
     #[test]

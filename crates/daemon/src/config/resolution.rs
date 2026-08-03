@@ -809,6 +809,9 @@ pub fn resolve_connection_llm_config(
             auth_mode: c.auth_mode.clone(),
             api_version: c.api_version.clone(),
         },
+        ConnectionConfig::Bedrock(c) => ConnectorExtras::Bedrock {
+            cache_policy: c.cache_policy,
+        },
         ConnectionConfig::Google(c) => ConnectorExtras::Google {
             project: field_or_env(
                 c.project.as_deref(),
@@ -885,5 +888,38 @@ mod tests {
                 "{emb} is a valid embedding model and must not be rejected"
             );
         }
+    }
+
+    #[test]
+    fn bedrock_cache_policy_reaches_the_resolved_config() {
+        use crate::connections::BedrockConnection;
+        use desktop_assistant_llm_bedrock::CachePolicy;
+
+        // A configured policy that stops at the config file is a setting that
+        // does nothing (#1027). It has to arrive where the client is built.
+        let configured = ConnectionConfig::Bedrock(BedrockConnection {
+            region: Some("us-east-1".to_string()),
+            cache_policy: Some(CachePolicy::None),
+            ..BedrockConnection::default()
+        });
+        assert!(
+            matches!(
+                resolve_connection_llm_config(&configured, None).extras,
+                ConnectorExtras::Bedrock {
+                    cache_policy: Some(CachePolicy::None)
+                }
+            ),
+            "cache_policy = \"none\" must reach the client builder"
+        );
+
+        // Unset means "whatever the connector defaults to", not "off".
+        let unset = ConnectionConfig::Bedrock(BedrockConnection::default());
+        assert!(
+            matches!(
+                resolve_connection_llm_config(&unset, None).extras,
+                ConnectorExtras::Bedrock { cache_policy: None }
+            ),
+            "an unset policy must leave the connector default in force"
+        );
     }
 }

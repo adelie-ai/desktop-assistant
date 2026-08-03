@@ -757,10 +757,15 @@ impl Default for SecretConfig {
 /// `Option<..>` fields that only one connector ever reads.
 #[derive(Debug, Clone, Default)]
 pub enum ConnectorExtras {
-    /// No provider-specific config (Ollama, Anthropic, Bedrock, OpenAI,
-    /// OpenRouter).
+    /// No provider-specific config (Ollama, Anthropic, OpenAI, OpenRouter).
     #[default]
     None,
+    /// Bedrock prompt-caching policy. `None` keeps the connector default
+    /// (`system_prompt_only`), which is what an unset connection field means.
+    Bedrock {
+        /// How much of the request is marked for prompt caching.
+        cache_policy: Option<desktop_assistant_llm_bedrock::CachePolicy>,
+    },
     /// Azure OpenAI surface/auth/version knobs. Strings are the raw config
     /// values; the factory parses them into the connector's typed enums
     /// (`ApiSurface`, `AuthMode`) so an invalid value fails loudly there.
@@ -1193,7 +1198,61 @@ fn read_daemon_config_file(path: &Path) -> anyhow::Result<Option<(String, Daemon
     }
 
     let parsed: DaemonConfig = toml::from_str(&content)?;
+    report_unknown_config_keys(path, &content);
     Ok(Some((content, parsed)))
+}
+
+/// Name, at `warn!`, every key in `content` the daemon does not understand.
+///
+/// Why this exists: `DaemonConfig` has no `deny_unknown_fields`, so serde
+/// parses an unrecognised table and throws it away without a word. A
+/// misspelled table name therefore configures nothing and reports nothing -
+/// which is how `docs/connectors/bedrock.md` came to document
+/// `[connection.name]`, singular, for long enough that the setting it
+/// documents could never have taken effect on any install that followed it.
+///
+/// Reported rather than refused, deliberately. The daemon rewrites daemon.toml
+/// from `DaemonConfig` whenever a settings command runs, so an unknown key is
+/// already destined to be dropped; refusing to start over one would turn a
+/// stale key left behind by an older release into a boot loop an operator can
+/// only break by editing the file on the host. The defect here was the
+/// silence, not the acceptance.
+fn report_unknown_config_keys(path: &Path, content: &str) {
+    let unknown = unknown_config_keys(content);
+    if unknown.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        config = %path.display(),
+        keys = %unknown.join(", "),
+        "ignoring configuration this daemon does not recognise: these keys set nothing, \
+         and a settings change will delete them. Check the spelling against \
+         docs/ - `[connections.<name>]` is plural"
+    );
+}
+
+/// The keys in `content` that deserializing a [`DaemonConfig`] discards.
+///
+/// Paths are reported as serde sees them, so a nested key reads as
+/// `purposes.typo`. Returns nothing when `content` is not valid TOML: the
+/// caller has already reported that, with a line and column this cannot
+/// improve on.
+fn unknown_config_keys(content: &str) -> Vec<String> {
+    let Ok(deserializer) = toml::de::Deserializer::parse(content) else {
+        return Vec::new();
+    };
+    let mut unknown = Vec::new();
+    // A second deserialize of a small file at startup. Deliberate: the first
+    // one owns the error reporting, and repeating it here would report the
+    // same fault twice.
+    if serde_ignored::deserialize::<_, _, DaemonConfig>(deserializer, |path| {
+        unknown.push(path.to_string())
+    })
+    .is_err()
+    {
+        return Vec::new();
+    }
+    unknown
 }
 
 /// Reject an unusable `[connections]` table. Two cases trigger validation:
@@ -4630,5 +4689,230 @@ admin_subjects = ["operator", "ops-oncall"]
 
             std::fs::remove_dir_all(&dir).ok();
         }
+    }
+
+    // --- Unrecognised configuration keys (#1027 review) ------------------
+    //
+    // `DaemonConfig` carries no `deny_unknown_fields`, so a top-level table
+    // the daemon does not know is parsed and thrown away in silence. That is
+    // how `docs/connectors/bedrock.md` came to document `[connection.name]`,
+    // singular, for long enough that the setting it documents could never
+    // have taken effect. The keys are still discarded - the fix is that the
+    // operator is told.
+
+    /// Every fenced `toml` block in the repository's prose that is an example
+    /// of the daemon's own configuration file, with the path it came from.
+    ///
+    /// These blocks are the only place an operator is told how to configure the
+    /// daemon, and nothing else checks them. `docs/connectors/bedrock.md`
+    /// documented `[connection.my-bedrock]`, singular, alongside three field
+    /// names no connection has - a block that configured nothing, silently, for
+    /// anyone who followed it. `docs/cloud-providers.md` put `model` inside
+    /// three `[connections.*]` tables, which every connection type refuses, so
+    /// all three of its examples failed at load.
+    ///
+    /// Every block is classified, and nothing is skipped by accident. The
+    /// repository documents three TOML files, and only one of them is this one:
+    /// `mcp_servers.toml` carries `[[servers]]`, and `secrets.toml` carries
+    /// `[secrets]`. Both are read elsewhere, against their own types.
+    fn documented_daemon_config_examples() -> Vec<(String, String)> {
+        fn walk(root: &std::path::Path, dir: &std::path::Path, found: &mut Vec<(String, String)>) {
+            let entries = std::fs::read_dir(dir).expect("the docs tree must be readable");
+            for entry in entries {
+                let path = entry.expect("a readable directory entry").path();
+                if path.is_dir() {
+                    walk(root, &path, found);
+                } else if path.extension().is_some_and(|e| e == "md") {
+                    collect(root, &path, found);
+                }
+            }
+        }
+
+        fn collect(
+            root: &std::path::Path,
+            path: &std::path::Path,
+            found: &mut Vec<(String, String)>,
+        ) {
+            let text = std::fs::read_to_string(path).expect("a readable doc");
+            // Reported repo-relative, so a failure names the file to edit
+            // rather than one machine's checkout.
+            let name = path
+                .strip_prefix(root)
+                .unwrap_or(path)
+                .display()
+                .to_string();
+            for block in toml_blocks(&text) {
+                if is_daemon_config_example(&block) {
+                    found.push((name.clone(), block));
+                }
+            }
+        }
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut found = Vec::new();
+        walk(&root, &root.join("docs"), &mut found);
+        collect(&root, &root.join("README.md"), &mut found);
+        found.sort();
+        assert!(
+            found.len() > 5,
+            "too few daemon config examples found ({}) - this test has stopped checking \
+             what it was written to check",
+            found.len()
+        );
+        found
+    }
+
+    /// Whether a documented TOML block is an example of `daemon.toml` rather
+    /// than one of the other two files the repository documents.
+    fn is_daemon_config_example(block: &str) -> bool {
+        !block.contains("[[servers]]") && !block.contains("[secrets]")
+    }
+
+    /// The contents of each fenced ```toml block in `doc`.
+    fn toml_blocks(doc: &str) -> Vec<String> {
+        let mut blocks = Vec::new();
+        let mut current: Option<String> = None;
+        for line in doc.lines() {
+            match (&mut current, line.trim()) {
+                (None, "```toml") => current = Some(String::new()),
+                (Some(_), "```") => blocks.push(current.take().expect("inside a block")),
+                (Some(block), _) => {
+                    block.push_str(line);
+                    block.push('\n');
+                }
+                _ => {}
+            }
+        }
+        blocks
+    }
+
+    #[test]
+    fn every_documented_daemon_config_example_is_configuration_the_daemon_reads() {
+        // A doc that parses to nothing is worse than no doc: it is followed,
+        // and it fails in silence. So each example is loaded exactly as
+        // written, and every key in it must be a key the daemon understands.
+        for (source, toml_src) in documented_daemon_config_examples() {
+            let unknown = unknown_config_keys(&toml_src);
+            assert!(
+                unknown.is_empty(),
+                "{source} documents keys the daemon discards: {unknown:?}"
+            );
+
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let path = dir.path().join("daemon.toml");
+            std::fs::write(&path, &toml_src).expect("write the documented config");
+            load_daemon_config(&path)
+                .unwrap_or_else(|e| panic!("the example in {source} does not load: {e}"))
+                .unwrap_or_else(|| panic!("the example in {source} loaded as nothing"));
+        }
+    }
+
+    #[test]
+    fn the_other_documented_toml_files_are_recognised_and_left_alone() {
+        // The classifier decides what the test above checks, so a change that
+        // quietly widened it to "nothing" would leave the guard passing while
+        // checking no daemon config at all - and one that narrowed it would
+        // hand `mcp_servers.toml` examples to the wrong loader.
+        assert!(is_daemon_config_example(
+            "[connections.x]\ntype = \"ollama\"\n"
+        ));
+        assert!(is_daemon_config_example(
+            "[database]\nmax_connections = 5\n"
+        ));
+        assert!(!is_daemon_config_example("[[servers]]\nname = \"web\"\n"));
+        assert!(!is_daemon_config_example("[secrets]\ntoken = \"x\"\n"));
+    }
+
+    #[test]
+    fn the_documented_bedrock_example_sets_the_cache_policy() {
+        // The setting #1027 adds is reachable only through this block, so the
+        // block has to carry it into a real connection.
+        let (source, toml_src) = documented_daemon_config_examples()
+            .into_iter()
+            .find(|(source, _)| source.ends_with("connectors/bedrock.md"))
+            .expect("the bedrock connector doc must carry a configuration example");
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("daemon.toml");
+        std::fs::write(&path, &toml_src).expect("write the documented config");
+        let loaded = load_daemon_config(&path)
+            .unwrap_or_else(|e| panic!("{source} does not load: {e}"))
+            .expect("config present");
+
+        let connection = loaded
+            .connections
+            .values()
+            .next()
+            .expect("the documented block must declare a connection");
+        match connection {
+            crate::connections::ConnectionConfig::Bedrock(c) => {
+                assert_eq!(
+                    c.cache_policy,
+                    Some(desktop_assistant_llm_bedrock::CachePolicy::SystemPromptOnly),
+                    "the documented cache_policy must reach the connection"
+                );
+                assert_eq!(c.region.as_deref(), Some("us-east-1"));
+                assert_eq!(c.aws_profile.as_deref(), Some("production"));
+            }
+            other => panic!("expected a bedrock connection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unrecognised_top_level_table_is_named() {
+        // The exact mistake the doc made: singular `[connection.…]`. Serde
+        // discards the whole table, so nothing downstream can notice.
+        let keys = unknown_config_keys(
+            "[connection.my-bedrock]\ntype = \"bedrock\"\ncache_policy = \"none\"\n",
+        );
+        assert_eq!(keys, vec!["connection".to_string()]);
+
+        // A misspelled scalar is the same class of mistake.
+        assert_eq!(
+            unknown_config_keys("[embeddings]\n\n[personalty]\nwarmth = \"often\"\n"),
+            vec!["personalty".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_configuration_the_daemon_understands_names_nothing() {
+        // The other direction, against the shipped deployment config rather
+        // than a hand-written sample, so a new field cannot make this pass by
+        // being absent from both.
+        let shipped = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../deploy/k8s/base/daemon.toml"),
+        )
+        .expect("the deployed base config must be readable");
+        assert!(
+            unknown_config_keys(&shipped).is_empty(),
+            "the shipped config names keys the daemon discards: {:?}",
+            unknown_config_keys(&shipped)
+        );
+    }
+
+    #[test]
+    fn an_unrecognised_key_is_reported_but_does_not_stop_the_daemon() {
+        // Deliberately not a hard failure. The daemon rewrites daemon.toml
+        // from `DaemonConfig` on any settings write, so an unknown key is
+        // already destined to be dropped; refusing to boot over one would turn
+        // a stale key left by an older release into a boot loop the operator
+        // can only fix by editing the file on the host. The defect was the
+        // silence, not the acceptance.
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("daemon.toml");
+        std::fs::write(
+            &path,
+            "[connections.default]\ntype = \"ollama\"\n\n[nonsense]\nfoo = 1\n",
+        )
+        .expect("write config");
+
+        let loaded = load_daemon_config(&path)
+            .expect("an unknown key must not fail the load")
+            .expect("config present");
+        assert!(
+            loaded.connections.contains_key("default"),
+            "the keys the daemon does understand must still arrive"
+        );
     }
 }

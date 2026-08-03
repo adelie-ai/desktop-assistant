@@ -280,26 +280,72 @@ therefore invalidate the system cache on every turn the tool list moves, and
 cost more than it saves. The Anthropic connector marks the system prefix only,
 for this same reason.
 
-`CachePolicy` is designed and not built. There is no `CachePolicy` type and no
-`cache_policy` configuration field today, and nothing turns caching off: the
-Converse path always behaves as `SystemPromptOnly` on a model that accepts a
-checkpoint. The intended shape is:
+**The policy.** `cache_policy` on a Bedrock connection selects how much of the
+request is marked:
 
 ```rust
-enum CachePolicy {
-    /// Emit no cache checkpoints.
+pub enum CachePolicy {
+    /// Emit no cache checkpoints, whatever the model supports.
     None,
     /// One checkpoint after the stable system prefix. The default.
     SystemPromptOnly,
-    /// System prefix and tool list. Sound only where the tool list is fixed
-    /// for the whole conversation.
-    SystemPromptAndTools,
 }
 ```
+
+The default keeps the behaviour every connection had before the setting
+existed. `none` exists because caching is not free: Bedrock bills a cache
+**write** above the uncached input rate, and the write pays back only when a
+later turn reads the same prefix. A conversation of several turns reads it
+every turn and comes out ahead. A workload of many short one-turn
+conversations pays the premium every turn and reads it rarely, and `none` is
+how that workload stops paying. `none` is also the way to rule caching out of
+a misbehaving turn without a code change.
+
+There is no "system prefix and tool list" value. It would be sound only where
+the tool list is fixed for a whole conversation, and this daemon's is not: tool
+search activates and deactivates namespaces inside a conversation. Bedrock
+evaluates checkpoints in the order `tools` -> `system` -> `messages`, so a
+checkpoint on `tools` would invalidate the system cache on every turn the list
+moves, and would cost more than it saves. Adding the value would ship a setting
+that quietly bills more.
 
 The connector decides where checkpoints go. The backend writes them in its own
 API's spelling. A backend serving a model without caching support ignores the
 policy.
+
+**Recovery when a model refuses a checkpoint.** The support list above is read
+from AWS documentation, and that documentation lists only the models absent
+from "Models at a glance", so it is a best reading rather than an enumeration.
+A model on the list that rejects a checkpoint would otherwise fail every turn.
+So the Converse path catches the `ValidationException` that **names the cache
+field**, retries the same turn once without the checkpoint, and records the
+model so later turns omit it. The recovery is logged at `warn!` with the model
+and the provider's message.
+
+Three limits, each deliberate:
+
+- The error must name the cache feature: `cachePoint`, `cache_control`, or the
+  prose forms "cache point", "cache checkpoint" and "prompt caching". A
+  validation failure that names anything else is returned to the caller
+  unchanged. A status code is not evidence. The bare word "caching" is
+  deliberately not a marker: matching is a substring test over the whole
+  message, and Bedrock quotes the offending schema path, so a tool whose input
+  schema has a property named `caching` would be read as a cache refusal.
+- The retry is classified only when the request that failed actually carried a
+  checkpoint. The retry does not, so the retry can never be read as a second
+  refusal, and the memo can never be written on evidence the fallback itself
+  produced.
+- The memo is written from the refusal, not from the retry's success. A
+  fallback that succeeds proves only that the request without the field works,
+  which is true whatever the real cause was.
+
+A model whose refusal names none of those markers is not recovered. That turn
+fails, and `cache_policy = "none"` is the remedy. The fail-safe direction is
+deliberate: a wrongly-disabled cache costs input tokens, and a wrongly-kept
+checkpoint costs the whole turn.
+
+A prefix below the model's caching minimum is not this case. AWS states the
+inference still succeeds and simply does not cache.
 
 ## Cross-cutting concerns
 
@@ -359,14 +405,31 @@ Credentials come from the static key above, or from the standard AWS provider
 chain: environment, profile, SSO, instance role.
 
 ```toml
-[connection.my-bedrock]
+[connections.my-bedrock]
 type = "bedrock"
 region = "us-east-1"
-profile = "production"
-default_model = "us.anthropic.claude-opus-4-1"
+aws_profile = "production"
 connect_timeout_secs = 30
-event_timeout_secs = 120
+stream_timeout_secs = 120
+# "system_prompt_only" (the default) or "none". See "Prompt caching".
+cache_policy = "system_prompt_only"
+
+# A connection is an endpoint and a credential. The model is chosen per
+# purpose, so the same connection can serve a large interactive model and a
+# small one for background work.
+[purposes.interactive]
+connection = "my-bedrock"
+model = "us.anthropic.claude-opus-4-1"
 ```
+
+The table is `[connections.<name>]`, plural. A misspelled table name configures
+nothing: `DaemonConfig` accepts unknown keys, so the whole block is discarded.
+The daemon names every discarded key at `warn!` on load, which is the only
+signal that a block did nothing.
+
+`cache_policy` is a file setting. The connection commands on the API carry no
+field for it, so a client cannot read or write it, and an edit made through a
+client leaves the configured value in place rather than clearing it.
 
 ## IAM
 

@@ -675,6 +675,14 @@ impl ConnectionsService for DaemonConnectionsService {
                 );
             }
 
+            // Same hazard, wider than one field. Every setting the payload has
+            // no field for is absent from `new_conn`, so a client editing any
+            // other field would delete it - for Bedrock's `cache_policy`, that
+            // quietly puts the cache writes back on the bill (#1027). The
+            // connection type states what it keeps in the file; a test sweep
+            // holds every connector to its answer.
+            new_conn.carry_forward_file_only_fields(existing);
+
             cfg.connections
                 .insert(id_valid.as_str().to_string(), new_conn);
             Ok(())
@@ -2066,6 +2074,10 @@ fn payload_to_connection(payload: ConnectionConfigPayload) -> ConnectionConfig {
             connect_timeout_secs,
             stream_timeout_secs,
             max_context_tokens,
+            // The payload cannot express a cache policy, so this conversion
+            // cannot either. `update_connection` carries the stored one
+            // forward, the same way it re-attaches the secret coordinate.
+            cache_policy: None,
         }),
         ConnectionConfigPayload::Ollama {
             base_url,
@@ -2974,7 +2986,10 @@ mod tests {
             },
             Connector::Bedrock => bedrock_payload("eu-west-1"),
             Connector::Ollama => ConnectionConfigPayload::Ollama {
-                base_url: Some("http://ollama.example.invalid".into()),
+                // Loopback: Ollama is the one connector the URL policy lets
+                // reach a plain-http endpoint, and only on a network the
+                // operator already controls.
+                base_url: Some("http://127.0.0.1:11434".into()),
                 connect_timeout_secs: None,
                 stream_timeout_secs: None,
                 keep_warm: None,
@@ -3031,6 +3046,330 @@ mod tests {
                 Some("eu-west-1"),
                 "the requested edit should still apply"
             ),
+            other => panic!("expected a bedrock connection, got {other:?}"),
+        }
+    }
+
+    use std::collections::BTreeSet;
+
+    /// A stored connection of each connector type whose **file-only** fields -
+    /// the ones no `ConnectionConfigPayload` can express - are set to a value
+    /// that is not the default, and which carries no secret, so a payload
+    /// round trip differs from it in those fields and nothing else.
+    ///
+    /// Exhaustive with no catch-all, like [`stored_connection`]: a new
+    /// connector must state what it keeps in the file before this compiles.
+    /// `the_file_only_fixture_sets_every_field_a_connection_carries` holds it
+    /// to every *field*, which the compiler cannot.
+    fn stored_with_file_only_fields(connector: Connector) -> ConnectionConfig {
+        match connector {
+            Connector::Bedrock => ConnectionConfig::Bedrock(BedrockConnection {
+                aws_profile: Some("work".into()),
+                region: Some("us-west-2".into()),
+                base_url: Some("https://bedrock-runtime.example.com".into()),
+                secret: None,
+                connect_timeout_secs: Some(11),
+                stream_timeout_secs: Some(12),
+                max_context_tokens: Some(4096),
+                cache_policy: Some(desktop_assistant_llm_bedrock::CachePolicy::None),
+            }),
+            Connector::Anthropic => ConnectionConfig::Anthropic(AnthropicConnection {
+                base_url: Some("https://api.anthropic.com".into()),
+                api_key_env: Some("ANTHROPIC_API_KEY".into()),
+                secret: None,
+                connect_timeout_secs: Some(11),
+                stream_timeout_secs: Some(12),
+                max_context_tokens: Some(4096),
+            }),
+            Connector::OpenAi => ConnectionConfig::OpenAi(OpenAiConnection {
+                base_url: Some("https://api.openai.com/v1".into()),
+                api_key_env: Some("OPENAI_API_KEY".into()),
+                secret: None,
+                connect_timeout_secs: Some(11),
+                stream_timeout_secs: Some(12),
+                max_context_tokens: Some(4096),
+            }),
+            Connector::OpenRouter => ConnectionConfig::OpenRouter(OpenRouterConnection {
+                base_url: Some("https://openrouter.ai/api/v1".into()),
+                api_key_env: Some("OPENROUTER_API_KEY".into()),
+                secret: None,
+                connect_timeout_secs: Some(11),
+                stream_timeout_secs: Some(12),
+                max_context_tokens: Some(4096),
+            }),
+            Connector::Azure => ConnectionConfig::Azure(AzureConnection {
+                base_url: Some("https://example-resource.openai.azure.com".into()),
+                api_key_env: Some("AZURE_OPENAI_API_KEY".into()),
+                secret: None,
+                api_surface: Some("v1".into()),
+                auth_mode: Some("api_key".into()),
+                api_version: Some("2026-01-01".into()),
+                connect_timeout_secs: Some(11),
+                stream_timeout_secs: Some(12),
+                max_context_tokens: Some(4096),
+            }),
+            Connector::Google => ConnectionConfig::Google(GoogleConnection {
+                base_url: Some("https://us-central1-aiplatform.googleapis.com".into()),
+                api_key_env: Some("GOOGLE_API_KEY".into()),
+                secret: None,
+                project: Some("example-project".into()),
+                location: Some("us-central1".into()),
+                auth_mode: Some("vertex".into()),
+                credentials_path: Some("/etc/example/credentials.json".into()),
+                connect_timeout_secs: Some(11),
+                stream_timeout_secs: Some(12),
+                max_context_tokens: Some(4096),
+            }),
+            Connector::Ollama => ConnectionConfig::Ollama(OllamaConnection {
+                base_url: Some("http://127.0.0.1:11434".into()),
+                connect_timeout_secs: Some(11),
+                stream_timeout_secs: Some(12),
+                keep_warm: Some(true),
+                max_context_tokens: Some(4096),
+            }),
+        }
+    }
+
+    /// The fields of a stored connection, as serde writes them. Absent means
+    /// the field is `None` and skipped, which is itself a value: a field that
+    /// survived a round trip and one that did not are distinguishable.
+    fn field_values(connection: &ConnectionConfig) -> serde_json::Map<String, serde_json::Value> {
+        match serde_json::to_value(connection).expect("a connection serialises") {
+            serde_json::Value::Object(fields) => fields,
+            other => panic!("a connection must serialise to an object, got {other:?}"),
+        }
+    }
+
+    /// The names of the fields on which two connections differ.
+    ///
+    /// Field-granular on purpose. `ConnectionConfig`'s `PartialEq` is
+    /// whole-struct, so "these differ" is satisfied by any one surviving
+    /// difference - a second file-only field could then be added, dropped on
+    /// every client edit, and never noticed, because the first one still made
+    /// the structs unequal.
+    fn differing_fields(a: &ConnectionConfig, b: &ConnectionConfig) -> BTreeSet<String> {
+        let (a, b) = (field_values(a), field_values(b));
+        a.keys()
+            .chain(b.keys())
+            .filter(|key| a.get(*key) != b.get(*key))
+            .cloned()
+            .collect()
+    }
+
+    fn declared_file_only(connector: Connector) -> BTreeSet<String> {
+        connector
+            .file_only_fields()
+            .iter()
+            .map(|f| (*f).to_string())
+            .collect()
+    }
+
+    /// The field names a struct's derived `Deserialize` declares.
+    ///
+    /// Read from serde rather than from a hand-written list: the derive hands
+    /// the field list to `Deserializer::deserialize_struct`, so recording that
+    /// argument is reflection over the real struct. A field added to a
+    /// connection therefore reaches the fixture check with no edit, which is
+    /// the one thing the compiler cannot force.
+    fn declared_fields<'de, T: serde::Deserialize<'de>>() -> BTreeSet<String> {
+        use serde::de::value::Error as ValueError;
+
+        struct FieldRecorder<'a>(&'a mut BTreeSet<String>);
+
+        impl<'de> serde::Deserializer<'de> for FieldRecorder<'_> {
+            type Error = ValueError;
+
+            fn deserialize_struct<V: serde::de::Visitor<'de>>(
+                self,
+                _name: &'static str,
+                fields: &'static [&'static str],
+                _visitor: V,
+            ) -> Result<V::Value, Self::Error> {
+                self.0.extend(fields.iter().map(|f| (*f).to_string()));
+                Err(serde::de::Error::custom("fields recorded"))
+            }
+
+            fn deserialize_any<V: serde::de::Visitor<'de>>(
+                self,
+                _visitor: V,
+            ) -> Result<V::Value, Self::Error> {
+                Err(serde::de::Error::custom("not a struct"))
+            }
+
+            serde::forward_to_deserialize_any! {
+                bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+                bytes byte_buf option unit unit_struct newtype_struct seq tuple
+                tuple_struct map enum identifier ignored_any
+            }
+        }
+
+        let mut fields = BTreeSet::new();
+        let _ = T::deserialize(FieldRecorder(&mut fields));
+        assert!(
+            !fields.is_empty(),
+            "no fields recorded - the reflection this check rests on has stopped working"
+        );
+        fields
+    }
+
+    /// Every field a connection of this type carries. Exhaustive with no
+    /// catch-all.
+    fn connection_struct_fields(connector: Connector) -> BTreeSet<String> {
+        match connector {
+            Connector::Anthropic => declared_fields::<AnthropicConnection>(),
+            Connector::OpenAi => declared_fields::<OpenAiConnection>(),
+            Connector::OpenRouter => declared_fields::<OpenRouterConnection>(),
+            Connector::Azure => declared_fields::<AzureConnection>(),
+            Connector::Google => declared_fields::<GoogleConnection>(),
+            Connector::Bedrock => declared_fields::<BedrockConnection>(),
+            Connector::Ollama => declared_fields::<OllamaConnection>(),
+        }
+    }
+
+    #[test]
+    fn the_file_only_fixture_sets_every_field_a_connection_carries() {
+        // The sweeps below can only see a field the fixture sets to something
+        // the payload does not reproduce. A new field that nobody adds here is
+        // therefore a field no sweep checks - and the compiler cannot force it,
+        // because a struct literal in a test is not the payload conversion.
+        // So the fixture is checked against the struct itself.
+        for &connector in Connector::ALL {
+            let mut expected = connection_struct_fields(connector);
+            // The credential coordinate is deliberately unset: it is dropped by
+            // the payload for every connector, and `update_connection` carries
+            // it forward on its own path, with its own sweep.
+            expected.remove("secret");
+
+            let mut present: BTreeSet<String> =
+                field_values(&stored_with_file_only_fields(connector))
+                    .keys()
+                    .cloned()
+                    .collect();
+            // The enum tag, not a field of the struct.
+            present.remove("type");
+
+            assert_eq!(
+                present, expected,
+                "{connector}: the fixture must set every field the connection carries, \
+                 or a field it misses is a field no sweep can see"
+            );
+        }
+    }
+
+    #[test]
+    fn a_payload_round_trip_loses_exactly_the_fields_a_connector_declares_file_only() {
+        // `Connector::file_only_fields` is the claim; this is the check of it,
+        // field by field and in both directions. A connector that declares none
+        // must survive the round trip whole, and one that declares some must
+        // lose those and nothing else - so neither an undeclared file-only
+        // field nor a stale declaration can pass.
+        for &connector in Connector::ALL {
+            let stored = stored_with_file_only_fields(connector);
+            let round_tripped = payload_to_connection(connection_to_payload(&stored));
+            assert_eq!(
+                differing_fields(&stored, &round_tripped),
+                declared_file_only(connector),
+                "{connector}: the fields a payload round trip loses must be exactly the \
+                 fields declared file-only - anything else is deleted on every client edit"
+            );
+        }
+    }
+
+    /// Store `stored` as connection `c`, apply `connector`'s update payload,
+    /// and return the connection that resulted.
+    async fn update_and_read_back(
+        connector: Connector,
+        stored: ConnectionConfig,
+    ) -> ConnectionConfig {
+        let handle = make_handle_with(config_with_connections(&[("c", stored)]));
+        let svc = DaemonConnectionsService::new(handle.clone());
+        svc.update_connection("c".to_string(), update_payload(connector))
+            .await
+            .unwrap_or_else(|e| panic!("{connector}: updating an existing connection: {e}"));
+        handle
+            .snapshot_config()
+            .connections
+            .get("c")
+            .expect("connection still exists")
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn update_connection_preserves_file_only_fields_across_all_connectors() {
+        // The behavioural half. An edit through the API rebuilds the connection
+        // from a payload that cannot carry these fields, so `update_connection`
+        // must put them back - the same obligation, and the same sweep, as the
+        // stored credential coordinate.
+        //
+        // The expected connection is built from the payload alone. Deliberately
+        // not with the carry-forward itself, which would move both sides of the
+        // assertion together and pass whatever the carry did.
+        for &connector in Connector::ALL {
+            let stored = stored_with_file_only_fields(connector);
+            let after = update_and_read_back(connector, stored.clone()).await;
+            let from_payload_alone = payload_to_connection(update_payload(connector));
+
+            assert_eq!(
+                differing_fields(&after, &from_payload_alone),
+                declared_file_only(connector),
+                "{connector}: exactly the declared file-only fields may survive an edit"
+            );
+
+            // And they carry the value that was stored, not merely some value.
+            let (after_fields, stored_fields) = (field_values(&after), field_values(&stored));
+            for field in connector.file_only_fields() {
+                assert_eq!(
+                    after_fields.get(*field),
+                    stored_fields.get(*field),
+                    "{connector}: {field} must survive an edit with the value it was stored with"
+                );
+            }
+
+            // And the edit itself landed, whole.
+            assert_eq!(
+                connection_to_payload(&after),
+                update_payload(connector),
+                "{connector}: the requested edit must apply"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn update_connection_preserves_a_configured_bedrock_cache_policy() {
+        // `cache_policy` is a daemon.toml setting with no field on the wire
+        // payload, so an edit from a client rebuilds the connection without it.
+        // Losing it silently puts the cache writes back on the bill (#1027).
+        let stored = ConnectionConfig::Bedrock(crate::connections::BedrockConnection {
+            aws_profile: Some("work".into()),
+            region: Some("us-west-2".into()),
+            cache_policy: Some(desktop_assistant_llm_bedrock::CachePolicy::None),
+            ..Default::default()
+        });
+        let handle = make_handle_with(config_with_connections(&[("aws", stored)]));
+        let svc = DaemonConnectionsService::new(handle.clone());
+
+        svc.update_connection("aws".to_string(), bedrock_payload("eu-west-1"))
+            .await
+            .expect("updating an existing connection should succeed");
+
+        let cfg = handle.snapshot_config();
+        match cfg
+            .connections
+            .get("aws")
+            .expect("connection should still exist after update")
+        {
+            ConnectionConfig::Bedrock(c) => {
+                assert_eq!(
+                    c.cache_policy,
+                    Some(desktop_assistant_llm_bedrock::CachePolicy::None),
+                    "editing an unrelated field must not turn caching back on"
+                );
+                assert_eq!(
+                    c.region.as_deref(),
+                    Some("eu-west-1"),
+                    "the requested edit should still apply"
+                );
+            }
             other => panic!("expected a bedrock connection, got {other:?}"),
         }
     }
