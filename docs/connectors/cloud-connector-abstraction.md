@@ -323,13 +323,17 @@ Compile-forced (a new variant breaks the build until every arm exists):
 - `ConnectionConfig` (`connector()` + `set_secret()`) and the `Connector` enum
   (`default_base_url/default_chat_model/default_backend_chat_model/
   default_embedding_model/default_http_base_url/supports_embeddings/
-  type_offers_hosted_tool_search`), plus a `<Provider>Connection` struct
-  (`daemon/src/connections.rs`). The variant's canonical name and its aliases
-  go on the `declare_connectors!` line itself, which also emits `as_str`,
-  `parse` and `Connector::ALL` - see "The variant list is generated" below.
+  type_offers_hosted_tool_search/carries_credential/carries_api_key_env`), plus
+  a `<Provider>Connection` struct (`daemon/src/connections.rs`). The variant's
+  canonical name and its aliases go on the `declare_connectors!` line itself,
+  which also emits `as_str`, `parse`, `names` and `Connector::ALL` - see "The
+  variant list is generated" below.
+- The embedding-client dispatch (`embedding_client.rs`).
 - Every sweep that walks `Connector::ALL`: the hosted-tool-search invariant
   sweep and `probe_target` (`registry.rs`), the model-kind sweep
-  (`model_defaults.rs`), and the connector tests in `connections.rs`. A new
+  (`model_defaults.rs`), the connector tests in `connections.rs`, the
+  credential-class sweep in `embedding_client.rs`, and `stored_connection` /
+  `update_payload` / `payload_with_api_key_env` (`api_surface.rs`). A new
   variant joins each of them as soon as it is declared, and the arms with no
   catch-all then refuse to compile until it is classified.
 - The two resolution matches (`daemon/src/config/resolution.rs`)
@@ -351,11 +355,6 @@ Silent if omitted (compiles, misbehaves - each MUST be added):
 - `map_effort_to_reasoning_config` (`api_surface.rs`): the `_` arm drops reasoning
   silently.
 - `connection_from_legacy_llm` (`connections.rs`): legacy `[llm]` path.
-- The hand-kept connector subsets in the test modules. Each names a class
-  narrower than `Connector::ALL`, so a new connector in that class must be added
-  to it by hand or its behaviour goes untested: the credential-taking list in
-  `credential_missing` / `build_embedding_client` (`embedding_client.rs`), and
-  `credential_connectors` and `API_KEY_ENV_CONNECTORS` (`api_surface.rs`).
 
 Better: where practical, route the factory / sanity / embeddings / reasoning
 dispatch through the typed `Connector` enum (issue #47's direction) so a new
