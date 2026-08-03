@@ -92,7 +92,11 @@ impl OpenAiClient {
             temperature: None,
             top_p: None,
             max_tokens: None,
-            hosted_tool_search: false,
+            // On by default, matching Anthropic and the `Option<bool>` config
+            // field's documented "None = the connector's built-in capability".
+            // This client implements hosted tool search, so an unconfigured
+            // connection gets it; see `docs/connectors/openai.md`.
+            hosted_tool_search: true,
             connect_timeout: OPENAI_CONNECT_TIMEOUT,
             event_timeout: OPENAI_EVENT_TIMEOUT,
             context_cap: None,

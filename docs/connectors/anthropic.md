@@ -19,6 +19,18 @@ Crate: `desktop-assistant-llm-anthropic`
 | Environment | `ANTHROPIC_BASE_URL` | No |
 | Config file | `daemon.toml` [anthropic] section | No |
 
+## Hosted Tool Search
+
+On by default. `AnthropicClient` implements hosted tool search
+(`supports_hosted_tool_search()` plus `stream_completion_with_namespaces()`,
+which sends namespace tools as deferred and adds the
+`tool_search_tool_regex_20251119` sentinel), so an unconfigured connection gets
+it. OpenAI defaults the same way.
+
+Set `hosted_tool_search = false` on the connection to turn it off.
+`docs/connectors/cloud-connector-abstraction.md`, section 5, records the decision
+and what an operator sees on each setting.
+
 ## Prompt Caching
 
 The Anthropic API supports [prompt caching](https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching)

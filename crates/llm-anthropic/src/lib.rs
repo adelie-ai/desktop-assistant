@@ -103,6 +103,10 @@ impl AnthropicClient {
             max_tokens: 8192,
             temperature: None,
             top_p: None,
+            // On by default, matching OpenAI and the `Option<bool>` config
+            // field's documented "None = the connector's built-in capability".
+            // This client implements hosted tool search, so an unconfigured
+            // connection gets it; see `docs/connectors/anthropic.md`.
             hosted_tool_search: true,
             connect_timeout: ANTHROPIC_CONNECT_TIMEOUT,
             event_timeout: ANTHROPIC_EVENT_TIMEOUT,

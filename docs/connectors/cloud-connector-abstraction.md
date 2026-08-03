@@ -206,6 +206,41 @@ not, and Gemini uses function declarations. All three inherit the trait's defaul
 The seam is kept so a later version (e.g. Azure on the Responses surface) can opt
 in without a core change.
 
+#### The default is on, for every connector that implements it
+
+`[llm].hosted_tool_search` is an `Option<bool>`. `None` means "the connector's
+built-in capability", and `build_llm_client` calls `.with_hosted_tool_search(...)`
+only for `Some`. An operator who configures nothing is therefore answered by the
+client constructor alone, so the constructor default *is* the product default.
+
+**A connector that implements hosted tool search defaults it on.** Anthropic and
+OpenAI both do. `Connector::type_offers_hosted_tool_search()` names that set, and
+`connector_clients_default_hosted_tool_search_to_the_type_claim`
+(`daemon/src/connections.rs`) holds the two answers together for every variant in
+`Connector::ALL`, in both directions.
+
+The reasons, in order:
+
+1. It is what the configuration field already promises. Any other default makes
+   the same absent setting mean two things.
+2. Deferred tool loading is the point of the capability. This deployment runs a
+   large MCP fleet, and hosted search keeps that fleet out of every prompt.
+3. The alternative - default off - would cost the connectors that work today
+   nothing except the capability itself, which is the thing being paid for.
+
+**What an operator sees when the default applies.** With namespaces to defer, the
+turn sends namespace entries plus the connector's tool-search sentinel instead of
+the full tool list, drops `builtin_tool_search` from the core tools, and first
+runs one tool-categorization call on the backend model (cached by tool-set hash).
+With no namespaces - an empty tool fleet - nothing changes: `send_prompt` takes
+the namespaced path only when the namespace list is non-empty.
+
+**When to turn it off.** Set `hosted_tool_search = false` on the connection for a
+third-party endpoint that speaks the connector's API but rejects its tool-search
+request shape. The daemon's own demotion path (a text-only first response falls
+back to `builtin_tool_search`) does not cover a transport error, so such an
+endpoint fails the turn rather than degrading.
+
 ### 6. Reasoning / extended thinking
 
 `ReasoningConfig` (task-local) carries `thinking_budget_tokens` and

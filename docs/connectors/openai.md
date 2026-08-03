@@ -18,6 +18,18 @@ Crate: `desktop-assistant-llm-openai`
 | Environment | `OPENAI_BASE_URL` | No |
 | Config file | `daemon.toml` [openai] section | No |
 
+## Hosted Tool Search
+
+On by default. `OpenAiClient` implements hosted tool search
+(`supports_hosted_tool_search()` plus `stream_completion_with_namespaces()`,
+which adds a `{"type": "tool_search"}` sentinel to the `tools` array), so an
+unconfigured connection gets it. Anthropic defaults the same way.
+
+Set `hosted_tool_search = false` on the connection to turn it off - for example
+for a third-party endpoint that serves the Responses API but rejects the
+tool-search tool type. `docs/connectors/cloud-connector-abstraction.md`, section
+5, records the decision and what an operator sees on each setting.
+
 ## Prompt Caching
 
 OpenAI applies [automatic prompt caching](https://platform.openai.com/docs/guides/prompt-caching)
