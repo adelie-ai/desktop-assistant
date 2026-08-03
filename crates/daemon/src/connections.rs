@@ -551,13 +551,13 @@ impl Connector {
     ///   `get_connector_defaults` needs - it is given a connector name, not a
     ///   connection id, so it has no instance to inspect. The model-defaults
     ///   view uses the answer to gate the toggle in the KCM.
-    /// - [`LlmClient::supports_hosted_tool_search`](desktop_assistant_core::ports::llm::LlmClient::supports_hosted_tool_search)
+    /// - [`LlmClient::hosted_tool_search`](desktop_assistant_core::ports::llm::LlmClient::hosted_tool_search)
     ///   answers the instance question: does this configured client do it? That
     ///   is the one a turn obeys.
     ///
     /// This one is the wider claim. A connector named here still has to
-    /// implement the capability in its client, and its client still has to
-    /// override `stream_completion_with_namespaces` to honour it.
+    /// implement `HostedToolSearch` in its client, and its client still has to
+    /// hand that implementation back, for a turn to take the hosted path.
     ///
     /// Exhaustive with no catch-all, like [`Self::supports_embeddings`]: a new
     /// connector states its answer rather than inheriting `false` in silence.

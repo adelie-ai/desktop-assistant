@@ -137,9 +137,10 @@ Map `usageMetadata`: `promptTokenCount` -> `input_tokens`, `candidatesTokenCount
 
 ## Hosted tool search
 
-Not applicable; Gemini uses function declarations.
-`supports_hosted_tool_search()` -> `false`; namespaces flatten. (Gemini's own
-server-side tools like Search grounding are out of scope for v1.)
+Not applicable; Gemini uses function declarations. The client does not
+implement `HostedToolSearch`, so `hosted_tool_search()` answers `None` and
+namespaces flatten. (Gemini's own server-side tools like Search grounding are
+out of scope for v1.)
 
 ## Reasoning
 

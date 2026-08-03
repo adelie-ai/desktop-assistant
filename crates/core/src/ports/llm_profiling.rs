@@ -6,8 +6,8 @@ use serde::Serialize;
 use crate::CoreError;
 use crate::domain::{Message, Role, ToolDefinition, ToolNamespace};
 use crate::ports::llm::{
-    ChunkCallback, LlmClient, LlmResponse, ModelInfo, ModelListingReport, ReasoningConfig,
-    TokenUsage,
+    ChunkCallback, HostedToolSearch, LlmClient, LlmResponse, ModelInfo, ModelListingReport,
+    ReasoningConfig, TokenUsage, dispatch_namespaced,
 };
 
 /// JSONL profiling entry written for each LLM call.
@@ -250,10 +250,19 @@ impl<L: LlmClient> LlmClient for ProfilingLlmClient<L> {
         result
     }
 
-    fn supports_hosted_tool_search(&self) -> bool {
-        self.inner.supports_hosted_tool_search()
+    /// Hands back `self`, never the inner client's object, so this
+    /// decorator stays in the call path for a namespaced turn. See
+    /// [`LlmClient::hosted_tool_search`].
+    fn hosted_tool_search(&self) -> Option<&dyn HostedToolSearch> {
+        self.inner
+            .hosted_tool_search()
+            .is_some()
+            .then_some(self as &dyn HostedToolSearch)
     }
+}
 
+#[async_trait::async_trait]
+impl<L: LlmClient> HostedToolSearch for ProfilingLlmClient<L> {
     async fn stream_completion_with_namespaces(
         &self,
         messages: Vec<Message>,
@@ -273,12 +282,15 @@ impl<L: LlmClient> LlmClient for ProfilingLlmClient<L> {
         let profile_messages = self.profile_messages(&messages);
 
         let start = Instant::now();
-        let result = self
-            .inner
-            .stream_completion_with_namespaces(
-                messages, core_tools, namespaces, reasoning, on_chunk,
-            )
-            .await;
+        let result = dispatch_namespaced(
+            &self.inner,
+            messages,
+            core_tools,
+            namespaces,
+            reasoning,
+            on_chunk,
+        )
+        .await;
         let duration_ms = start.elapsed().as_millis();
 
         self.log_result(
@@ -441,34 +453,25 @@ impl<L: LlmClient> LlmClient for MaybeProfiled<L> {
         }
     }
 
-    fn supports_hosted_tool_search(&self) -> bool {
+    /// Hands back the selected arm's object, not `self`, because this type
+    /// is a transparent forwarder rather than a decorator - the same
+    /// classification as the `Arc<T>` blanket impl.
+    ///
+    /// The rule in [`LlmClient::hosted_tool_search`] - a decorator returns
+    /// `self` - exists so a decorator's own per-call work is not skipped on a
+    /// namespaced turn. This enum has no per-call work: it only picks an arm.
+    /// The `Profiled` arm hands back [`ProfilingLlmClient`]'s own object, so
+    /// profiling stays in the path; the `Plain` arm hands back the inner
+    /// client's. Both are the object the turn should reach, so inserting this
+    /// enum between them would add a hop that can only be neutral.
+    ///
+    /// The one thing this must not do is answer `None` when an arm has hosted
+    /// search, which would silently flatten every namespaced turn. That is
+    /// what `maybe_profiled_forwards_the_hosted_search_object` pins.
+    fn hosted_tool_search(&self) -> Option<&dyn HostedToolSearch> {
         match self {
-            Self::Plain(l) => l.supports_hosted_tool_search(),
-            Self::Profiled(l) => l.supports_hosted_tool_search(),
-        }
-    }
-
-    async fn stream_completion_with_namespaces(
-        &self,
-        messages: Vec<Message>,
-        core_tools: &[ToolDefinition],
-        namespaces: &[ToolNamespace],
-        reasoning: ReasoningConfig,
-        on_chunk: ChunkCallback,
-    ) -> Result<LlmResponse, CoreError> {
-        match self {
-            Self::Plain(l) => {
-                l.stream_completion_with_namespaces(
-                    messages, core_tools, namespaces, reasoning, on_chunk,
-                )
-                .await
-            }
-            Self::Profiled(l) => {
-                l.stream_completion_with_namespaces(
-                    messages, core_tools, namespaces, reasoning, on_chunk,
-                )
-                .await
-            }
+            Self::Plain(l) => l.hosted_tool_search(),
+            Self::Profiled(l) => l.hosted_tool_search(),
         }
     }
 }
@@ -660,8 +663,22 @@ mod tests {
             Ok(LlmResponse::text("hosted"))
         }
 
-        fn supports_hosted_tool_search(&self) -> bool {
-            true
+        fn hosted_tool_search(&self) -> Option<&dyn HostedToolSearch> {
+            Some(self)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl HostedToolSearch for HostedSearchLlm {
+        async fn stream_completion_with_namespaces(
+            &self,
+            _messages: Vec<Message>,
+            _core_tools: &[ToolDefinition],
+            _namespaces: &[ToolNamespace],
+            _reasoning: ReasoningConfig,
+            _on_chunk: ChunkCallback,
+        ) -> Result<LlmResponse, CoreError> {
+            Ok(LlmResponse::text("hosted namespaced"))
         }
     }
 
@@ -688,11 +705,14 @@ mod tests {
         let path = capability_log_path("profiling");
         assert!(
             ProfilingLlmClient::new(HostedSearchLlm, path.clone(), false)
-                .supports_hosted_tool_search(),
+                .hosted_tool_search()
+                .is_some(),
             "must forward the inner capability"
         );
         assert!(
-            !ProfilingLlmClient::new(MockLlm, path, false).supports_hosted_tool_search(),
+            !ProfilingLlmClient::new(MockLlm, path, false)
+                .hosted_tool_search()
+                .is_some(),
             "must not invent a capability the inner client does not have"
         );
     }
@@ -700,11 +720,13 @@ mod tests {
     #[test]
     fn maybe_profiled_plain_answers_hosted_tool_search_from_inner() {
         assert!(
-            MaybeProfiled::Plain(HostedSearchLlm).supports_hosted_tool_search(),
+            MaybeProfiled::Plain(HostedSearchLlm)
+                .hosted_tool_search()
+                .is_some(),
             "must forward the inner capability"
         );
         assert!(
-            !MaybeProfiled::Plain(MockLlm).supports_hosted_tool_search(),
+            !MaybeProfiled::Plain(MockLlm).hosted_tool_search().is_some(),
             "must not invent a capability the inner client does not have"
         );
     }
@@ -718,12 +740,14 @@ mod tests {
                 path.clone(),
                 false
             ))
-            .supports_hosted_tool_search(),
+            .hosted_tool_search()
+            .is_some(),
             "must forward the inner capability"
         );
         assert!(
             !MaybeProfiled::Profiled(ProfilingLlmClient::new(MockLlm, path, false))
-                .supports_hosted_tool_search(),
+                .hosted_tool_search()
+                .is_some(),
             "must not invent a capability the inner client does not have"
         );
     }
@@ -735,12 +759,160 @@ mod tests {
         use crate::ports::llm::RetryingLlmClient;
 
         assert!(
-            RetryingLlmClient::new(HostedSearchLlm, 1).supports_hosted_tool_search(),
+            RetryingLlmClient::new(HostedSearchLlm, 1)
+                .hosted_tool_search()
+                .is_some(),
             "must forward the inner capability"
         );
         assert!(
-            !RetryingLlmClient::new(MockLlm, 1).supports_hosted_tool_search(),
+            !RetryingLlmClient::new(MockLlm, 1)
+                .hosted_tool_search()
+                .is_some(),
             "must not invent a capability the inner client does not have"
+        );
+    }
+
+    // --- Decorators must stay in the path for a namespaced turn (#1033) ---
+    //
+    // Answering the capability correctly is not enough. A decorator that
+    // reports hosted tool search and then hands the caller its *inner*
+    // client's dispatch object is skipped for exactly the turns that carry
+    // the most tools. `profiling_decorator_stays_in_the_namespaced_path`
+    // observes the decorator's own effect on a namespaced turn, so that
+    // bypass fails it.
+    //
+    // `MaybeProfiled` is deliberately not in that group. It is a transparent
+    // forwarder with no per-call work, so it hands back the selected arm's
+    // object and there is nothing to lose by not being in the path. Its test
+    // pins the failure it *can* have: hiding an arm's hosted search.
+
+    /// Profiling log path for the in-path tests, which do dispatch and so do
+    /// write a file. Same shape as [`capability_log_path`]; kept separate so
+    /// a reader is not misled by that helper's "never dispatch" contract.
+    fn dispatch_log_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "llm_profile_dispatch_{}_{label}.jsonl",
+            std::process::id()
+        ))
+    }
+
+    #[tokio::test]
+    async fn profiling_decorator_stays_in_the_namespaced_path() {
+        use crate::ports::llm::dispatch_namespaced;
+        use crate::ports::llm::hosted_search_test_support::*;
+
+        let path = dispatch_log_path("profiling_in_path");
+        let _ = std::fs::remove_file(&path);
+        let inner = ProbeLlm::new(true);
+        let probe = std::sync::Arc::clone(&inner.probe);
+        let client = ProfilingLlmClient::new(inner, path.clone(), false);
+
+        dispatch_namespaced(
+            &client,
+            vec![],
+            &[],
+            &[namespace("ns", vec![tool("deferred")])],
+            ReasoningConfig::default(),
+            noop_chunk(),
+        )
+        .await
+        .expect("probe turn");
+
+        assert_eq!(
+            probe.namespaced_calls(),
+            1,
+            "the turn reached the inner client's hosted dispatch"
+        );
+        let logged = std::fs::read_to_string(&path).unwrap_or_default();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            logged.contains("deferred"),
+            "the profiling decorator must profile a namespaced turn, and it \
+             cannot if the caller was handed the inner client's dispatch \
+             object. Log was: {logged:?}"
+        );
+    }
+
+    /// `MaybeProfiled` must not hide an arm's hosted tool search.
+    ///
+    /// Not an in-the-path test, and it could not be one: this enum has no
+    /// per-call work, so handing back an arm's object rather than `self`
+    /// loses nothing and no assertion could tell the two apart. What it can
+    /// get wrong is answering `None` while an arm has hosted search, which
+    /// silently flattens every namespaced turn - the whole tool fleet in one
+    /// request with no discovery tool. Both arms are checked, because the
+    /// enum answers them separately.
+    #[tokio::test]
+    async fn maybe_profiled_forwards_the_hosted_search_object() {
+        use crate::ports::llm::dispatch_namespaced;
+        use crate::ports::llm::hosted_search_test_support::*;
+
+        // Profiled arm: the turn reaches hosted dispatch, and the profiling
+        // that arm carries is still applied.
+        let path = dispatch_log_path("maybe_profiled_forwarding");
+        let _ = std::fs::remove_file(&path);
+        let inner = ProbeLlm::new(true);
+        let probe = std::sync::Arc::clone(&inner.probe);
+        let profiled = MaybeProfiled::Profiled(ProfilingLlmClient::new(inner, path.clone(), false));
+        assert!(
+            profiled.hosted_tool_search().is_some(),
+            "the Profiled arm's hosted search must not be hidden"
+        );
+        dispatch_namespaced(
+            &profiled,
+            vec![],
+            &[],
+            &[namespace("ns", vec![tool("deferred")])],
+            ReasoningConfig::default(),
+            noop_chunk(),
+        )
+        .await
+        .expect("probe turn");
+        let logged = std::fs::read_to_string(&path).unwrap_or_default();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            probe.namespaced_calls(),
+            1,
+            "the Profiled arm must reach hosted dispatch, not flatten"
+        );
+        assert!(
+            logged.contains("deferred"),
+            "the Profiled arm carries a ProfilingLlmClient, whose profiling must \
+             still apply to a namespaced turn. Log was: {logged:?}"
+        );
+
+        // Plain arm.
+        let inner = ProbeLlm::new(true);
+        let probe = std::sync::Arc::clone(&inner.probe);
+        let plain = MaybeProfiled::Plain(inner);
+        assert!(
+            plain.hosted_tool_search().is_some(),
+            "the Plain arm's hosted search must not be hidden"
+        );
+        dispatch_namespaced(
+            &plain,
+            vec![],
+            &[],
+            &[namespace("ns", vec![tool("deferred")])],
+            ReasoningConfig::default(),
+            noop_chunk(),
+        )
+        .await
+        .expect("probe turn");
+        assert_eq!(
+            probe.namespaced_calls(),
+            1,
+            "the Plain arm must pass a namespaced turn through to hosted dispatch"
+        );
+        assert_eq!(probe.plain_calls(), 0, "the turn never flattened");
+
+        // A client with no hosted search must still answer `None`, so the
+        // forward cannot be a hardcoded `Some`.
+        assert!(
+            MaybeProfiled::Plain(ProbeLlm::new(false))
+                .hosted_tool_search()
+                .is_none(),
+            "must not invent a capability the arm does not have"
         );
     }
 
@@ -750,12 +922,12 @@ mod tests {
 
         let hosted: Arc<dyn LlmClient> = Arc::new(HostedSearchLlm);
         assert!(
-            hosted.supports_hosted_tool_search(),
+            hosted.hosted_tool_search().is_some(),
             "must forward the inner capability"
         );
         let plain: Arc<dyn LlmClient> = Arc::new(MockLlm);
         assert!(
-            !plain.supports_hosted_tool_search(),
+            !plain.hosted_tool_search().is_some(),
             "must not invent a capability the inner client does not have"
         );
     }

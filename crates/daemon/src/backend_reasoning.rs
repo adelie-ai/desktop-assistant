@@ -27,7 +27,8 @@
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Message, ToolDefinition, ToolNamespace};
 use desktop_assistant_core::ports::llm::{
-    ChunkCallback, LlmClient, LlmResponse, ModelInfo, ModelListingReport, ReasoningConfig,
+    ChunkCallback, HostedToolSearch, LlmClient, LlmResponse, ModelInfo, ModelListingReport,
+    ReasoningConfig, dispatch_namespaced,
 };
 
 /// Wraps an [`LlmClient`] and substitutes a fixed [`ReasoningConfig`]
@@ -92,10 +93,19 @@ impl<L: LlmClient> LlmClient for FixedReasoningLlmClient<L> {
             .await
     }
 
-    fn supports_hosted_tool_search(&self) -> bool {
-        self.inner.supports_hosted_tool_search()
+    /// Hands back `self`, never the inner client's object, so this
+    /// decorator stays in the call path for a namespaced turn. See
+    /// [`LlmClient::hosted_tool_search`].
+    fn hosted_tool_search(&self) -> Option<&dyn HostedToolSearch> {
+        self.inner
+            .hosted_tool_search()
+            .is_some()
+            .then_some(self as &dyn HostedToolSearch)
     }
+}
 
+#[async_trait::async_trait]
+impl<L: LlmClient> HostedToolSearch for FixedReasoningLlmClient<L> {
     async fn stream_completion_with_namespaces(
         &self,
         messages: Vec<Message>,
@@ -109,11 +119,15 @@ impl<L: LlmClient> LlmClient for FixedReasoningLlmClient<L> {
         } else {
             self.reasoning
         };
-        self.inner
-            .stream_completion_with_namespaces(
-                messages, core_tools, namespaces, effective, on_chunk,
-            )
-            .await
+        dispatch_namespaced(
+            &self.inner,
+            messages,
+            core_tools,
+            namespaces,
+            effective,
+            on_chunk,
+        )
+        .await
     }
 }
 
@@ -127,28 +141,16 @@ mod tests {
     /// Test double that records the `ReasoningConfig` it receives so we
     /// can prove the wrapper substitutes its own value.
     ///
-    /// `hosted` makes the hosted-tool-search answer settable, because the
-    /// wrapper must be checked against an inner client that says `true` and
-    /// one that says `false`. A double with a fixed answer can only catch
-    /// one of the two ways the wrapper can answer for the wrong client.
+    /// It has no hosted tool search. The hosted-search tests use
+    /// `NamespaceProbe`, which offers both answers.
     #[derive(Default)]
     struct CapturingClient {
         last_seen: Mutex<Option<ReasoningConfig>>,
-        hosted: bool,
     }
 
     impl CapturingClient {
         fn last(&self) -> Option<ReasoningConfig> {
             *self.last_seen.lock().unwrap()
-        }
-
-        /// A double that supports hosted tool search. `default()` gives one
-        /// that does not.
-        fn hosted() -> Self {
-            Self {
-                hosted: true,
-                ..Default::default()
-            }
         }
     }
 
@@ -187,10 +189,6 @@ mod tests {
                 tool_calls: vec![],
                 usage: Some(TokenUsage::default()),
             })
-        }
-
-        fn supports_hosted_tool_search(&self) -> bool {
-            self.hosted
         }
     }
 
@@ -268,28 +266,66 @@ mod tests {
     #[tokio::test]
     async fn substitutes_for_with_namespaces_path_too() {
         // The handler's tool-routing dispatch goes through
-        // `stream_completion_with_namespaces`. Backend tasks don't
-        // currently use namespaces, but the trait surface must stay
-        // consistent: the wrapper has to pin reasoning on both methods.
+        // `dispatch_namespaced`. Backend tasks don't currently use
+        // namespaces, but the wrapper has to pin reasoning on both paths.
         let inner = CapturingClient::default();
         let configured = ReasoningConfig::with_reasoning_effort(ReasoningLevel::Medium);
         let wrapped = FixedReasoningLlmClient::new(inner, configured);
 
-        // Default `stream_completion_with_namespaces` from the trait
-        // delegates to `stream_completion` for clients that haven't
-        // overridden it, so the same captured value applies.
-        wrapped
-            .stream_completion_with_namespaces(
-                user_msg("hi"),
-                &[],
-                &[],
-                ReasoningConfig::default(),
-                Box::new(|_| true),
-            )
-            .await
-            .expect("inner client returns Ok");
+        // The inner client has no hosted tool search, so the namespaced turn
+        // flattens into `stream_completion` and the same captured value
+        // applies.
+        dispatch_namespaced(
+            &wrapped,
+            user_msg("hi"),
+            &[],
+            &[],
+            ReasoningConfig::default(),
+            Box::new(|_| true),
+        )
+        .await
+        .expect("inner client returns Ok");
 
         assert_eq!(wrapped.inner.last(), Some(configured));
+    }
+
+    /// Decorator-in-the-path criterion for `FixedReasoningLlmClient` (#1033).
+    ///
+    /// The decorator's only job is to substitute the reasoning config. If it
+    /// hands the caller its inner client's hosted-search dispatch object, a
+    /// namespaced turn reaches the connector with the caller's reasoning
+    /// instead of the configured one.
+    #[tokio::test]
+    async fn fixed_reasoning_decorator_stays_in_the_namespaced_path() {
+        use crate::hosted_search_probe::{NamespaceProbe, noop_chunk, probe_namespace};
+        use desktop_assistant_core::ports::llm::dispatch_namespaced;
+        use std::sync::Arc;
+
+        let probe = Arc::new(NamespaceProbe::hosted());
+        let configured = ReasoningConfig::with_reasoning_effort(ReasoningLevel::Medium);
+        let wrapped = FixedReasoningLlmClient::new(Arc::clone(&probe), configured);
+
+        dispatch_namespaced(
+            &wrapped,
+            user_msg("hi"),
+            &[],
+            &[probe_namespace()],
+            ReasoningConfig::default(),
+            noop_chunk(),
+        )
+        .await
+        .expect("probe turn");
+
+        assert_eq!(
+            probe.namespaced_calls(),
+            1,
+            "the turn reached the inner client's hosted dispatch"
+        );
+        assert_eq!(
+            probe.seen_reasoning(),
+            Some(configured),
+            "the wrapper must substitute reasoning on a namespaced turn too"
+        );
     }
 
     #[test]
@@ -309,17 +345,19 @@ mod tests {
     /// this module's sibling tests exist for.
     #[test]
     fn fixed_reasoning_client_answers_hosted_tool_search_from_inner() {
+        use crate::hosted_search_probe::NamespaceProbe;
+
         let wrapped =
-            FixedReasoningLlmClient::new(CapturingClient::hosted(), ReasoningConfig::default());
+            FixedReasoningLlmClient::new(NamespaceProbe::hosted(), ReasoningConfig::default());
         assert!(
-            wrapped.supports_hosted_tool_search(),
+            wrapped.hosted_tool_search().is_some(),
             "must forward the inner capability"
         );
 
         let wrapped =
-            FixedReasoningLlmClient::new(CapturingClient::default(), ReasoningConfig::default());
+            FixedReasoningLlmClient::new(NamespaceProbe::plain(), ReasoningConfig::default());
         assert!(
-            !wrapped.supports_hosted_tool_search(),
+            wrapped.hosted_tool_search().is_none(),
             "must not invent a capability the inner client does not have"
         );
     }

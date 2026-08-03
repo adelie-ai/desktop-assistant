@@ -26,7 +26,7 @@ pub trait ToolExecutor: Send + Sync {
     ///
     /// Default returns empty — connectors that don't support hosted tool search
     /// ignore this entirely. When non-empty, the service layer can pass these
-    /// to `LlmClient::stream_completion_with_namespaces()`.
+    /// to `desktop_assistant_core::ports::llm::dispatch_namespaced()`.
     fn tool_namespaces(&self) -> impl std::future::Future<Output = Vec<ToolNamespace>> + Send {
         async { vec![] }
     }

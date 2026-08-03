@@ -75,8 +75,8 @@ pub struct OpenRouterClient {
     top_p: Option<f64>,
     max_tokens: Option<u32>,
     /// Stored per the builder contract; OpenRouter's routed API does not expose
-    /// hosted tool search uniformly, so [`Self::supports_hosted_tool_search`]
-    /// returns `false` in v1 regardless of this flag.
+    /// hosted tool search uniformly, so this client does not implement
+    /// `HostedToolSearch` in v1 and the flag never reaches a request.
     hosted_tool_search: bool,
     /// First-response (connect) stall budget; defaults to
     /// [`OPENROUTER_CONNECT_TIMEOUT`], overridable per-connection.
@@ -229,8 +229,8 @@ impl OpenRouterClient {
     }
 
     /// Record the hosted-tool-search preference from the builder. Stored for
-    /// forward compatibility only; [`Self::supports_hosted_tool_search`] returns
-    /// `false` in v1, so this never enables the namespace path.
+    /// forward compatibility only; this client does not implement
+    /// `HostedToolSearch` in v1, so this never enables the namespace path.
     pub fn with_hosted_tool_search(mut self, enabled: bool) -> Self {
         self.hosted_tool_search = enabled;
         self
@@ -751,13 +751,6 @@ impl LlmClient for OpenRouterClient {
         }
     }
 
-    fn supports_hosted_tool_search(&self) -> bool {
-        // Off in v1 -- OpenRouter's routed API does not expose hosted tool
-        // search uniformly. Namespaces flatten into the standard `tools` array
-        // via the trait's default `stream_completion_with_namespaces`.
-        false
-    }
-
     async fn list_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
         // Serve a warm, unexpired listing straight from the cache; on a miss,
         // fetch live (degrading to curated on failure) and cache the result.
@@ -826,7 +819,7 @@ mod tests {
         assert_eq!(client.max_tokens, Some(1024));
         // Stored, but the trait still reports no hosted tool search in v1.
         assert!(client.hosted_tool_search);
-        assert!(!client.supports_hosted_tool_search());
+        assert!(!client.hosted_tool_search().is_some());
     }
 
     #[test]

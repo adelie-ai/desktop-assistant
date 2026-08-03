@@ -31,8 +31,8 @@ use std::sync::Arc;
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Message, ToolDefinition, ToolNamespace};
 use desktop_assistant_core::ports::llm::{
-    ChunkCallback, LlmClient, LlmResponse, ModelInfo, ModelListingReport, ReasoningConfig,
-    with_model_override,
+    ChunkCallback, HostedToolSearch, LlmClient, LlmResponse, ModelInfo, ModelListingReport,
+    ReasoningConfig, dispatch_namespaced, with_model_override,
 };
 
 use crate::api_surface::RegistryHandle;
@@ -120,8 +120,8 @@ pub enum FallbackMode {
 ///
 /// Two groups of accessors resolve differently, and the split is
 /// deliberate. Anything that changes what a request contains or where it
-/// goes — `stream_completion`, `stream_completion_with_namespaces`,
-/// `supports_hosted_tool_search`, `max_context_tokens`, the model-listing
+/// goes — `stream_completion`, the hosted-search dispatch,
+/// `hosted_tool_search`, `max_context_tokens`, the model-listing
 /// calls — resolves through the per-turn active client, so the answer
 /// always describes the client the turn dispatches to. The borrowing
 /// accessors `get_default_model` and `get_default_base_url` return
@@ -403,38 +403,23 @@ impl LlmClient for RoutingLlmClient {
         }
     }
 
-    fn supports_hosted_tool_search(&self) -> bool {
-        // This answer must describe the client the turn will actually
-        // dispatch to, so PerTurn mode resolves the same way
-        // `stream_completion_with_namespaces` does. `ConversationHandler`
-        // reads the flag near the start of `send_prompt`, inside the scope
-        // the daemon's dispatch wrapper installs, so the task-local is
-        // already set for a turn that carries a per-turn model override.
-        //
-        // Answering from the captured client instead let the two disagree:
-        // a fallback with hosted search would strip `builtin_tool_search`
-        // from the tool list, then send the request to a connection without
-        // hosted search, whose default `stream_completion_with_namespaces`
-        // flattens every namespace tool into one call. The turn then paid
-        // for the whole fleet in one request and had no way to discover
-        // tools either.
-        //
-        // Dynamic-purpose mode is only used for backend tasks
-        // (title/summary), which don't traverse the hosted-search path, so
-        // reporting `false` is safe and matches the connector default. It
-        // must also ignore the task-local, for the same reason its dispatch
-        // path does: a backend task must not inherit the user's per-turn
-        // model override.
-        //
-        // Pinned mode holds the same invariant, and does have a client to
-        // ask, so it answers from the one it dispatches to.
-        match &self.fallback {
-            FallbackMode::PerTurn { .. } => self.resolve_per_turn().supports_hosted_tool_search(),
-            FallbackMode::Pinned { client, .. } => client.supports_hosted_tool_search(),
+    /// Hands back `self`, never the resolved client's object, so the router
+    /// stays in the call path for a namespaced turn. Handing back the
+    /// resolved client's object would also freeze the resolution at the
+    /// moment of the capability read, while dispatch must resolve again at
+    /// the moment it sends. See [`LlmClient::hosted_tool_search`].
+    fn hosted_tool_search(&self) -> Option<&dyn HostedToolSearch> {
+        let resolved_has = match &self.fallback {
+            FallbackMode::PerTurn { .. } => self.resolve_per_turn().hosted_tool_search().is_some(),
+            FallbackMode::Pinned { client, .. } => client.hosted_tool_search().is_some(),
             FallbackMode::DynamicPurpose { .. } => false,
-        }
+        };
+        resolved_has.then_some(self as &dyn HostedToolSearch)
     }
+}
 
+#[async_trait::async_trait]
+impl HostedToolSearch for RoutingLlmClient {
     async fn stream_completion_with_namespaces(
         &self,
         messages: Vec<Message>,
@@ -446,34 +431,37 @@ impl LlmClient for RoutingLlmClient {
         match &self.fallback {
             FallbackMode::PerTurn { .. } => {
                 let client = self.resolve_per_turn();
-                client
-                    .stream_completion_with_namespaces(
-                        messages, core_tools, namespaces, reasoning, on_chunk,
-                    )
-                    .await
+                dispatch_namespaced(
+                    &client, messages, core_tools, namespaces, reasoning, on_chunk,
+                )
+                .await
             }
             FallbackMode::Pinned { .. } => {
                 self.dispatch_pinned(|client| async move {
-                    client
-                        .stream_completion_with_namespaces(
-                            messages, core_tools, namespaces, reasoning, on_chunk,
-                        )
-                        .await
+                    dispatch_namespaced(
+                        &client, messages, core_tools, namespaces, reasoning, on_chunk,
+                    )
+                    .await
                 })
                 .await
             }
+            // Unreachable through `dispatch_namespaced`, because
+            // `hosted_tool_search` answers `None` in this mode: a backend
+            // task must not inherit the user's per-turn model override. The
+            // arm still dispatches correctly, so a direct call cannot send a
+            // backend task somewhere else.
             FallbackMode::DynamicPurpose { .. } => {
                 let _ = reasoning;
                 self.dispatch_dynamic(|client, resolved_reasoning| async move {
-                    client
-                        .stream_completion_with_namespaces(
-                            messages,
-                            core_tools,
-                            namespaces,
-                            resolved_reasoning,
-                            on_chunk,
-                        )
-                        .await
+                    dispatch_namespaced(
+                        &client,
+                        messages,
+                        core_tools,
+                        namespaces,
+                        resolved_reasoning,
+                        on_chunk,
+                    )
+                    .await
                 })
                 .await
             }
@@ -827,11 +815,11 @@ mod tests {
     /// construction. It records the tool names each dispatch offered, so a
     /// test can assert what the request actually carried.
     ///
-    /// `stream_completion_with_namespaces` is deliberately not overridden. A
-    /// connector without hosted search (Bedrock, Ollama) inherits the trait
-    /// default, which flattens every namespace tool into one
-    /// `stream_completion` call. That default is what makes a wrong
-    /// capability answer expensive, so the double must keep it.
+    /// Its hosted dispatch flattens on purpose. A connector without hosted
+    /// search (Bedrock, Ollama) sends every namespace tool in one ordinary
+    /// request, and that is what makes a wrong capability answer expensive,
+    /// so the double reproduces it on both paths and lets `offered()` compare
+    /// them.
     struct CapabilityLlm {
         hosted: bool,
         offered: std::sync::Mutex<Vec<Vec<String>>>,
@@ -867,8 +855,25 @@ mod tests {
             Ok(LlmResponse::text("done"))
         }
 
-        fn supports_hosted_tool_search(&self) -> bool {
-            self.hosted
+        fn hosted_tool_search(&self) -> Option<&dyn HostedToolSearch> {
+            self.hosted.then_some(self as &dyn HostedToolSearch)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl HostedToolSearch for CapabilityLlm {
+        async fn stream_completion_with_namespaces(
+            &self,
+            messages: Vec<Message>,
+            core_tools: &[ToolDefinition],
+            namespaces: &[ToolNamespace],
+            reasoning: ReasoningConfig,
+            on_chunk: ChunkCallback,
+        ) -> Result<LlmResponse, CoreError> {
+            let all =
+                desktop_assistant_core::ports::llm::flatten_namespaces(core_tools, namespaces);
+            self.stream_completion(messages, &all, reasoning, on_chunk)
+                .await
         }
     }
 
@@ -878,7 +883,7 @@ mod tests {
         let router = RoutingLlmClient::new(Arc::new(CapabilityLlm::new(true)));
         let without_search: Arc<dyn LlmClient> = Arc::new(CapabilityLlm::new(false));
         let answer = with_active_client(without_search, async {
-            router.supports_hosted_tool_search()
+            router.hosted_tool_search().is_some()
         })
         .await;
         assert!(
@@ -890,7 +895,7 @@ mod tests {
         let router = RoutingLlmClient::new(Arc::new(CapabilityLlm::new(false)));
         let with_search: Arc<dyn LlmClient> = Arc::new(CapabilityLlm::new(true));
         let answer =
-            with_active_client(with_search, async { router.supports_hosted_tool_search() }).await;
+            with_active_client(with_search, async { router.hosted_tool_search().is_some() }).await;
         assert!(
             answer,
             "capability must come from the active client, which has hosted search"
@@ -901,13 +906,13 @@ mod tests {
     async fn hosted_tool_search_uses_the_fallback_when_no_override_is_installed() {
         let router = RoutingLlmClient::new(Arc::new(CapabilityLlm::new(true)));
         assert!(
-            router.supports_hosted_tool_search(),
+            router.hosted_tool_search().is_some(),
             "with no override installed the static fallback answers"
         );
 
         let router = RoutingLlmClient::new(Arc::new(CapabilityLlm::new(false)));
         assert!(
-            !router.supports_hosted_tool_search(),
+            !router.hosted_tool_search().is_some(),
             "with no override installed the static fallback answers"
         );
     }
@@ -917,7 +922,7 @@ mod tests {
         let handle = build_handle_with_titling("titling-model");
         let client = RoutingLlmClient::new_dynamic_purpose(handle, PurposeKind::Titling);
         assert!(
-            !client.supports_hosted_tool_search(),
+            !client.hosted_tool_search().is_some(),
             "dynamic-purpose wrappers report the connector default"
         );
 
@@ -925,10 +930,105 @@ mod tests {
         // when they start inside a `send_prompt` scope.
         let hosted: Arc<dyn LlmClient> = Arc::new(CapabilityLlm::new(true));
         let answer =
-            with_active_client(hosted, async { client.supports_hosted_tool_search() }).await;
+            with_active_client(hosted, async { client.hosted_tool_search().is_some() }).await;
         assert!(
             !answer,
             "dynamic-purpose wrappers must ignore the per-turn override"
+        );
+    }
+
+    /// Decorator-in-the-path criterion for `RoutingLlmClient`, PerTurn arm
+    /// (#1033).
+    ///
+    /// The router's job is to send the turn to the per-turn active client, so
+    /// this asserts the namespaced turn reaches that client and the static
+    /// fallback sees nothing.
+    ///
+    /// What this arm cannot lose, and why the sibling Pinned test exists:
+    /// `resolve_per_turn` returns an owned `Arc`, so handing the caller the
+    /// resolved client's dispatch object would borrow from a temporary and
+    /// fail to compile. The borrow checker forecloses the bypass here. The
+    /// Pinned arm holds its client in a field, where the same mistake does
+    /// compile, so that is the arm a runtime test has to cover.
+    #[tokio::test]
+    async fn routing_decorator_stays_in_the_namespaced_path() {
+        use crate::hosted_search_probe::{NamespaceProbe, noop_chunk, probe_namespace};
+        use desktop_assistant_core::domain::Role;
+        use desktop_assistant_core::ports::llm::dispatch_namespaced;
+
+        let fallback = Arc::new(NamespaceProbe::plain());
+        let active = Arc::new(NamespaceProbe::hosted());
+        let router = RoutingLlmClient::new(Arc::clone(&fallback) as Arc<dyn LlmClient>);
+
+        with_active_client(Arc::clone(&active) as Arc<dyn LlmClient>, async {
+            dispatch_namespaced(
+                &router,
+                vec![Message::new(Role::User, "hi")],
+                &[],
+                &[probe_namespace()],
+                ReasoningConfig::default(),
+                noop_chunk(),
+            )
+            .await
+            .expect("probe turn");
+        })
+        .await;
+
+        assert_eq!(
+            active.namespaced_calls(),
+            1,
+            "the namespaced turn must go to the per-turn active client"
+        );
+        assert_eq!(
+            fallback.plain_calls() + fallback.namespaced_calls(),
+            0,
+            "the fallback client must see nothing while an override is installed"
+        );
+    }
+
+    /// The same criterion for the router's other dispatching mode.
+    ///
+    /// Pinned mode exists to install its own model override, so a backend
+    /// task asks the connection it was pinned to for the model it serves. If
+    /// the router handed the caller its pinned client's dispatch object, the
+    /// namespaced turn would skip `with_model_override` and ask that
+    /// connection for the caller's model instead. PerTurn mode is covered by
+    /// the sibling test; the two arms answer separately, so one passing does
+    /// not cover the other.
+    #[tokio::test]
+    async fn routing_decorator_stays_in_the_namespaced_path_in_pinned_mode() {
+        use crate::hosted_search_probe::{NamespaceProbe, noop_chunk, probe_namespace};
+        use desktop_assistant_core::domain::Role;
+        use desktop_assistant_core::ports::llm::dispatch_namespaced;
+
+        let pinned = Arc::new(NamespaceProbe::hosted());
+        let router = RoutingLlmClient::new_pinned(
+            Arc::clone(&pinned) as Arc<dyn LlmClient>,
+            "pinned-model".to_string(),
+        );
+
+        dispatch_namespaced(
+            &router,
+            vec![Message::new(Role::User, "hi")],
+            &[],
+            &[probe_namespace()],
+            ReasoningConfig::default(),
+            noop_chunk(),
+        )
+        .await
+        .expect("probe turn");
+
+        assert_eq!(
+            pinned.namespaced_calls(),
+            1,
+            "the namespaced turn must reach the pinned client's hosted dispatch"
+        );
+        assert_eq!(
+            pinned.seen_model_override(),
+            Some("pinned-model".to_string()),
+            "the router must install its pinned model override on a namespaced \
+             turn too; without it the backend task asks this connection for a \
+             model it does not serve"
         );
     }
 

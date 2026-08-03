@@ -141,8 +141,8 @@ pub struct AzureClient {
     top_p: Option<f64>,
     max_tokens: Option<u32>,
     /// Stored per the builder contract; Azure Chat Completions has no
-    /// hosted-search request shape, so [`Self::supports_hosted_tool_search`]
-    /// returns `false` in v1 regardless of this flag.
+    /// hosted-search request shape, so this client does not implement
+    /// `HostedToolSearch` in v1 and the flag never reaches a request.
     hosted_tool_search: bool,
     connect_timeout: Duration,
     event_timeout: Duration,
@@ -294,8 +294,8 @@ impl AzureClient {
     }
 
     /// Record the hosted-tool-search preference from the builder. Stored for
-    /// factory-shape parity only; [`Self::supports_hosted_tool_search`] returns
-    /// `false` in v1, so this never enables the namespace path.
+    /// factory-shape parity only; this client does not implement
+    /// `HostedToolSearch` in v1, so this never enables the namespace path.
     pub fn with_hosted_tool_search(mut self, enabled: bool) -> Self {
         self.hosted_tool_search = enabled;
         self
@@ -1044,16 +1044,6 @@ impl LlmClient for AzureClient {
             }
             Err(StreamingDispatchError::Other(e)) => Err(e),
         }
-    }
-
-    fn supports_hosted_tool_search(&self) -> bool {
-        // Off in v1 -- Azure Chat Completions has no hosted-search request
-        // shape, and this client does not override
-        // `stream_completion_with_namespaces`. A `true` here would take the
-        // turn down the hosted-search path, where the service layer drops
-        // `builtin_tool_search` and the trait's flattening default then sends
-        // the whole tool fleet in one request with no way to search it.
-        false
     }
 }
 
@@ -2200,13 +2190,13 @@ mod tests {
 
     #[test]
     fn azure_never_reports_hosted_tool_search() {
-        // Azure Chat Completions has no hosted-search request shape, and this
-        // client does not override `stream_completion_with_namespaces`, so a
-        // `true` here would send the whole tool fleet in one flattened request
+        // Azure Chat Completions has no hosted-search request shape, so this
+        // client does not implement `HostedToolSearch`. Reporting the
+        // capability would send the whole tool fleet in one flattened request
         // with no tool-search entry. The builder still accepts the flag for
-        // factory-shape parity; the trait must ignore it.
+        // factory-shape parity; the client must ignore it.
         let plain = AzureClient::new("k".into());
-        assert!(!plain.supports_hosted_tool_search());
+        assert!(plain.hosted_tool_search().is_none());
 
         let opted_in = AzureClient::new("k".into()).with_hosted_tool_search(true);
         assert!(
@@ -2214,7 +2204,7 @@ mod tests {
             "the builder still records the preference"
         );
         assert!(
-            !opted_in.supports_hosted_tool_search(),
+            !opted_in.hosted_tool_search().is_some(),
             "Azure must never advertise a capability it does not implement"
         );
     }

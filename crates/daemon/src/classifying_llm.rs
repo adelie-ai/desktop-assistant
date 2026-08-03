@@ -37,9 +37,9 @@ use desktop_assistant_core::error_classify::{
     derive_input_ceiling, extract_overflow_fields,
 };
 use desktop_assistant_core::ports::llm::{
-    ChunkCallback, LlmClient, LlmResponse, ModelInfo, ModelListingReport, ReasoningConfig,
-    current_context_budget, current_model_override, is_classification_in_progress,
-    with_classification_in_progress,
+    ChunkCallback, HostedToolSearch, LlmClient, LlmResponse, ModelInfo, ModelListingReport,
+    ReasoningConfig, current_context_budget, current_model_override, dispatch_namespaced,
+    is_classification_in_progress, with_classification_in_progress,
 };
 use desktop_assistant_core::ports::store::{ErrorClassificationStore, LearnedWindowStore};
 use desktop_assistant_core::sanitize::redact_secrets;
@@ -516,8 +516,14 @@ impl<L: LlmClient> LlmClient for ClassifyingLlmClient<L> {
         self.inner.estimate_tokens(text)
     }
 
-    fn supports_hosted_tool_search(&self) -> bool {
-        self.inner.supports_hosted_tool_search()
+    /// Hands back `self`, never the inner client's object, so this
+    /// decorator stays in the call path for a namespaced turn. See
+    /// [`LlmClient::hosted_tool_search`].
+    fn hosted_tool_search(&self) -> Option<&dyn HostedToolSearch> {
+        self.inner
+            .hosted_tool_search()
+            .is_some()
+            .then_some(self as &dyn HostedToolSearch)
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
@@ -553,7 +559,10 @@ impl<L: LlmClient> LlmClient for ClassifyingLlmClient<L> {
             .await;
         self.reclassify(result).await
     }
+}
 
+#[async_trait::async_trait]
+impl<L: LlmClient> HostedToolSearch for ClassifyingLlmClient<L> {
     async fn stream_completion_with_namespaces(
         &self,
         messages: Vec<Message>,
@@ -562,12 +571,15 @@ impl<L: LlmClient> LlmClient for ClassifyingLlmClient<L> {
         reasoning: ReasoningConfig,
         on_chunk: ChunkCallback,
     ) -> Result<LlmResponse, CoreError> {
-        let result = self
-            .inner
-            .stream_completion_with_namespaces(
-                messages, core_tools, namespaces, reasoning, on_chunk,
-            )
-            .await;
+        let result = dispatch_namespaced(
+            &self.inner,
+            messages,
+            core_tools,
+            namespaces,
+            reasoning,
+            on_chunk,
+        )
+        .await;
         self.reclassify(result).await
     }
 }
@@ -638,10 +650,6 @@ mod tests {
                 }),
             }
         }
-
-        fn supports_hosted_tool_search(&self) -> bool {
-            false
-        }
     }
 
     /// Tier-3 classifier double: returns canned text and counts calls.
@@ -694,9 +702,6 @@ mod tests {
             } else {
                 Err(CoreError::Llm("classifier exploded".into()))
             }
-        }
-        fn supports_hosted_tool_search(&self) -> bool {
-            false
         }
     }
 
@@ -751,6 +756,45 @@ mod tests {
             Box::new(|_| true),
         )
         .await
+    }
+
+    /// Decorator-in-the-path criterion for `ClassifyingLlmClient` (#1033).
+    ///
+    /// The decorator's whole job is to turn an opaque provider error into a
+    /// structured one. If it hands the caller its inner client's
+    /// hosted-search dispatch object, a namespaced turn skips it and the
+    /// caller sees the raw `CoreError::Llm` - so the context-overflow
+    /// recovery ladder never runs on the turns carrying the most tools.
+    #[tokio::test]
+    async fn classifying_decorator_stays_in_the_namespaced_path() {
+        use crate::hosted_search_probe::{NamespaceProbe, noop_chunk, probe_namespace};
+        use desktop_assistant_core::ports::llm::dispatch_namespaced;
+
+        let probe = Arc::new(NamespaceProbe::hosted_opaque_error(
+            "Input is too long for requested model.",
+        ));
+        let client = ClassifyingLlmClient::new(Arc::clone(&probe), "bedrock");
+
+        let err = dispatch_namespaced(
+            &client,
+            vec![Message::new(Role::User, "hi")],
+            &[],
+            &[probe_namespace()],
+            ReasoningConfig::default(),
+            noop_chunk(),
+        )
+        .await
+        .expect_err("the probe always errors");
+
+        assert!(
+            matches!(err, CoreError::ContextOverflow { .. }),
+            "the classifier must reclassify a namespaced turn's error too; got {err:?}"
+        );
+        assert_eq!(
+            probe.namespaced_calls(),
+            1,
+            "the turn reached the inner client's hosted dispatch"
+        );
     }
 
     // --- Tier 1 (no deps) ---
@@ -1304,31 +1348,6 @@ mod tests {
         assert!(window.recorded().is_empty());
     }
 
-    /// Connector double that reports hosted tool search. A decorator that
-    /// drops the forward reports the trait default `false` instead.
-    struct HostedSearchClient;
-
-    #[async_trait::async_trait]
-    impl LlmClient for HostedSearchClient {
-        async fn stream_completion(
-            &self,
-            _messages: Vec<Message>,
-            _tools: &[ToolDefinition],
-            _reasoning: ReasoningConfig,
-            _on_chunk: ChunkCallback,
-        ) -> Result<LlmResponse, CoreError> {
-            Ok(LlmResponse {
-                text: "ok".into(),
-                tool_calls: vec![],
-                usage: None,
-            })
-        }
-
-        fn supports_hosted_tool_search(&self) -> bool {
-            true
-        }
-    }
-
     /// The connector labels are crossed on purpose. `ClassifyingLlmClient`
     /// carries a connector name, so "answers from the inner client" and
     /// "answers from the connector name" are two different rules that agree
@@ -1337,15 +1356,17 @@ mod tests {
     /// that answered from the name it was given fails here.
     #[test]
     fn classifying_client_forwards_hosted_tool_search_from_inner() {
-        let wrapped = ClassifyingLlmClient::new(HostedSearchClient, "bedrock");
+        use crate::hosted_search_probe::NamespaceProbe;
+
+        let wrapped = ClassifyingLlmClient::new(NamespaceProbe::hosted(), "bedrock");
         assert!(
-            wrapped.supports_hosted_tool_search(),
+            wrapped.hosted_tool_search().is_some(),
             "the answer must come from the inner client, not the connector name"
         );
 
         let wrapped = ClassifyingLlmClient::new(StubClient::new(Behavior::Ok), "openai");
         assert!(
-            !wrapped.supports_hosted_tool_search(),
+            wrapped.hosted_tool_search().is_none(),
             "the answer must come from the inner client, not the connector name"
         );
     }

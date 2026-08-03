@@ -885,6 +885,106 @@ impl LlmResponse {
     }
 }
 
+/// Server-side hosted tool search: the connector sends namespaces to the
+/// provider with deferred loading and lets the provider's own search entry
+/// pull individual tools in, instead of putting every tool in the request.
+///
+/// This is a separate trait, not a pair of methods on [`LlmClient`], because
+/// the capability answer and the implementation have to travel together. A
+/// client offers hosted tool search exactly when
+/// [`LlmClient::hosted_tool_search`] hands back one of these, so the answer
+/// cannot be a claim about code sitting beside it.
+///
+/// What that buys, precisely: a connector's only candidate object is `self`,
+/// and `Some(self)` does not compile without `impl HostedToolSearch for Self`.
+/// So a connector cannot report the capability and inherit a flattening body
+/// by omission - the combination that produced a turn carrying the whole tool
+/// fleet inline *and* no discovery tool, because the service layer strips
+/// `builtin_tool_search` whenever hosted search is active (#1033).
+///
+/// What it does not buy: the return type is `Option<&dyn HostedToolSearch>`,
+/// so any reference reachable from `&self` type-checks, including some other
+/// object that only flattens. That latitude is load-bearing - a decorator
+/// needs it - and it makes pointing elsewhere a deliberate act someone has to
+/// write and a reviewer can see, rather than a default nobody chose. What the
+/// object then puts on the wire is checked by the cross-connector sweep in
+/// the daemon's `registry.rs`, which the type system cannot reach.
+///
+/// Decorators implement this trait for themselves rather than handing back
+/// their inner client's object; see [`LlmClient::hosted_tool_search`].
+#[async_trait::async_trait]
+pub trait HostedToolSearch: Send + Sync {
+    /// Stream a completion with namespaced tool definitions.
+    ///
+    /// The implementation is expected to serialize `namespaces` in the
+    /// provider's deferred-loading shape and append the provider's
+    /// tool-search entry. An implementation that simply flattens the
+    /// namespaces into an ordinary tool list is a deliberate, reviewable
+    /// choice - see [`flatten_namespaces`] - not something a connector can
+    /// fall into by not writing the method.
+    async fn stream_completion_with_namespaces(
+        &self,
+        messages: Vec<Message>,
+        core_tools: &[ToolDefinition],
+        namespaces: &[ToolNamespace],
+        reasoning: ReasoningConfig,
+        on_chunk: ChunkCallback,
+    ) -> Result<LlmResponse, CoreError>;
+}
+
+/// Collapse core tools and namespace tools into one ordinary tool list.
+///
+/// This is what a turn sends to a connector without hosted tool search: every
+/// tool inline, no discovery entry. It used to be the default body of a trait
+/// method, where a connector inherited it silently; it is now a named helper
+/// a caller reaches for on purpose.
+pub fn flatten_namespaces(
+    core_tools: &[ToolDefinition],
+    namespaces: &[ToolNamespace],
+) -> Vec<ToolDefinition> {
+    let mut all: Vec<ToolDefinition> = core_tools.to_vec();
+    for ns in namespaces {
+        all.extend(ns.tools.iter().cloned());
+    }
+    all
+}
+
+/// Send one namespaced turn to `client`.
+///
+/// Routes through the client's [`HostedToolSearch`] implementation when it has
+/// one, and flattens every namespace into a plain [`LlmClient::stream_completion`]
+/// call when it does not. Every caller of a namespaced turn goes through here,
+/// so the choice between the two paths is made in exactly one place from
+/// exactly one fact.
+///
+/// A decorator calls this on its *inner* client, which is what keeps a
+/// decorator chain intact for a namespaced turn: each link decorates, then
+/// hands down to the next.
+pub async fn dispatch_namespaced(
+    client: &(impl LlmClient + ?Sized),
+    messages: Vec<Message>,
+    core_tools: &[ToolDefinition],
+    namespaces: &[ToolNamespace],
+    reasoning: ReasoningConfig,
+    on_chunk: ChunkCallback,
+) -> Result<LlmResponse, CoreError> {
+    match client.hosted_tool_search() {
+        Some(hosted) => {
+            hosted
+                .stream_completion_with_namespaces(
+                    messages, core_tools, namespaces, reasoning, on_chunk,
+                )
+                .await
+        }
+        None => {
+            let all = flatten_namespaces(core_tools, namespaces);
+            client
+                .stream_completion(messages, &all, reasoning, on_chunk)
+                .await
+        }
+    }
+}
+
 /// Outbound port for LLM completion requests.
 ///
 /// Uses [`async_trait::async_trait`] so the trait is dyn-compatible
@@ -938,31 +1038,39 @@ pub trait LlmClient: Send + Sync {
         on_chunk: ChunkCallback,
     ) -> Result<LlmResponse, CoreError>;
 
-    /// Whether this connector supports server-side hosted tool search
-    /// (e.g. OpenAI namespaces with deferred loading).
-    fn supports_hosted_tool_search(&self) -> bool {
-        false
-    }
-
-    /// Stream a completion with namespaced tool definitions.
+    /// This client's server-side hosted tool search, if it has one.
     ///
-    /// Connectors that support hosted tool search (e.g. OpenAI) serialize
-    /// namespaces with `defer_loading: true` and append a `tool_search` entry.
-    /// The default implementation flattens everything into `stream_completion`.
-    async fn stream_completion_with_namespaces(
-        &self,
-        messages: Vec<Message>,
-        core_tools: &[ToolDefinition],
-        namespaces: &[ToolNamespace],
-        reasoning: ReasoningConfig,
-        on_chunk: ChunkCallback,
-    ) -> Result<LlmResponse, CoreError> {
-        let mut all: Vec<ToolDefinition> = core_tools.to_vec();
-        for ns in namespaces {
-            all.extend(ns.tools.iter().cloned());
-        }
-        self.stream_completion(messages, &all, reasoning, on_chunk)
-            .await
+    /// `Some` is both the capability answer and the dispatch object, so a
+    /// connector cannot answer one way and behave another: `Some(self)`
+    /// requires `Self` to implement [`HostedToolSearch`], and implementing
+    /// that trait means writing the namespaced request. A client with no
+    /// hosted search answers `None` by leaving this method alone, and its
+    /// namespaced turns flatten (see [`dispatch_namespaced`]).
+    ///
+    /// **A decorator returns `Some(self)`, never its inner client's object.**
+    /// Handing back the inner object drops the decorator from the call path
+    /// for exactly the turns that carry the most tools - losing retry,
+    /// profiling, classification, reasoning substitution or per-turn routing.
+    /// Nothing in the type system stops that, which is why each decorator has
+    /// a named test asserting its own effect on a namespaced turn. The shape
+    /// to copy:
+    ///
+    /// ```ignore
+    /// fn hosted_tool_search(&self) -> Option<&dyn HostedToolSearch> {
+    ///     self.inner.hosted_tool_search().is_some().then_some(self as &dyn HostedToolSearch)
+    /// }
+    /// ```
+    ///
+    /// with a [`HostedToolSearch`] implementation that decorates and then
+    /// calls [`dispatch_namespaced`] on `self.inner`.
+    ///
+    /// A *transparent forwarder* is the exception and hands back its inner
+    /// object directly, because it has no per-call work to lose: the `Arc<T>`
+    /// blanket impl below and
+    /// [`MaybeProfiled`](crate::ports::llm_profiling::MaybeProfiled), which
+    /// only selects an arm. Adding a hop there could only be neutral.
+    fn hosted_tool_search(&self) -> Option<&dyn HostedToolSearch> {
+        None
     }
 
     /// Enumerate the models this connector can serve.
@@ -1036,8 +1144,8 @@ impl<T: LlmClient + ?Sized> LlmClient for Arc<T> {
         (**self).estimate_tokens(text)
     }
 
-    fn supports_hosted_tool_search(&self) -> bool {
-        (**self).supports_hosted_tool_search()
+    fn hosted_tool_search(&self) -> Option<&dyn HostedToolSearch> {
+        (**self).hosted_tool_search()
     }
 
     async fn stream_completion(
@@ -1049,21 +1157,6 @@ impl<T: LlmClient + ?Sized> LlmClient for Arc<T> {
     ) -> Result<LlmResponse, CoreError> {
         (**self)
             .stream_completion(messages, tools, reasoning, on_chunk)
-            .await
-    }
-
-    async fn stream_completion_with_namespaces(
-        &self,
-        messages: Vec<Message>,
-        core_tools: &[ToolDefinition],
-        namespaces: &[ToolNamespace],
-        reasoning: ReasoningConfig,
-        on_chunk: ChunkCallback,
-    ) -> Result<LlmResponse, CoreError> {
-        (**self)
-            .stream_completion_with_namespaces(
-                messages, core_tools, namespaces, reasoning, on_chunk,
-            )
             .await
     }
 
@@ -1325,10 +1418,19 @@ impl<L: LlmClient> LlmClient for RetryingLlmClient<L> {
         .await
     }
 
-    fn supports_hosted_tool_search(&self) -> bool {
-        self.inner.supports_hosted_tool_search()
+    /// Hands back `self`, never the inner client's object, so this
+    /// decorator stays in the call path for a namespaced turn. See
+    /// [`LlmClient::hosted_tool_search`].
+    fn hosted_tool_search(&self) -> Option<&dyn HostedToolSearch> {
+        self.inner
+            .hosted_tool_search()
+            .is_some()
+            .then_some(self as &dyn HostedToolSearch)
     }
+}
 
+#[async_trait::async_trait]
+impl<L: LlmClient> HostedToolSearch for RetryingLlmClient<L> {
     async fn stream_completion_with_namespaces(
         &self,
         messages: Vec<Message>,
@@ -1341,15 +1443,15 @@ impl<L: LlmClient> LlmClient for RetryingLlmClient<L> {
         let forwarded = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         (|| async {
-            self.inner
-                .stream_completion_with_namespaces(
-                    messages.clone(),
-                    core_tools,
-                    namespaces,
-                    reasoning,
-                    proxy_callback(&shared_cb, &forwarded),
-                )
-                .await
+            dispatch_namespaced(
+                &self.inner,
+                messages.clone(),
+                core_tools,
+                namespaces,
+                reasoning,
+                proxy_callback(&shared_cb, &forwarded),
+            )
+            .await
         })
         .retry(self.backoff())
         .when(retry_unless_stream_started(&forwarded))
@@ -2334,6 +2436,247 @@ mod tests {
             current_idempotency_key(),
             None,
             "the key must not leak past the scope boundary"
+        );
+    }
+}
+
+/// Test doubles and tests for the hosted-tool-search seam (#1033).
+///
+/// The headline property of that seam - a connector cannot report hosted
+/// tool search without implementing the dispatch, because `Some(self)` needs
+/// the impl - is a compile-time property and has no runtime test. What is
+/// tested here is the runtime half: that [`dispatch_namespaced`] picks the
+/// right path, and that every decorator with per-call work of its own stays
+/// in the call path for a namespaced turn.
+#[cfg(test)]
+pub(crate) mod hosted_search_test_support {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Records which entry point a turn arrived through, and how many times.
+    #[derive(Default)]
+    pub(crate) struct Probe {
+        pub plain: AtomicUsize,
+        pub namespaced: AtomicUsize,
+        /// Tool names seen by the plain path, joined with `,`.
+        pub flattened: Mutex<String>,
+    }
+
+    impl Probe {
+        pub fn plain_calls(&self) -> usize {
+            self.plain.load(Ordering::SeqCst)
+        }
+
+        pub fn namespaced_calls(&self) -> usize {
+            self.namespaced.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Leaf client whose hosted-search support is chosen at construction.
+    ///
+    /// `hosted = false` leaves [`LlmClient::hosted_tool_search`] answering
+    /// `None`, which is how the great majority of clients (and every test
+    /// double that does not care) behave.
+    pub(crate) struct ProbeLlm {
+        pub probe: Arc<Probe>,
+        pub hosted: bool,
+        /// Errors this many times before succeeding. Lets a retry decorator
+        /// be observed doing its job on the namespaced path.
+        pub fail_times: AtomicUsize,
+    }
+
+    impl ProbeLlm {
+        pub fn new(hosted: bool) -> Self {
+            Self {
+                probe: Arc::new(Probe::default()),
+                hosted,
+                fail_times: AtomicUsize::new(0),
+            }
+        }
+
+        /// A probe that returns a retryable error `times` times before it
+        /// succeeds, on whichever path the turn arrives through.
+        pub fn failing(hosted: bool, times: usize) -> Self {
+            let client = Self::new(hosted);
+            client.fail_times.store(times, Ordering::SeqCst);
+            client
+        }
+
+        fn maybe_fail(&self) -> Option<CoreError> {
+            let remaining = self.fail_times.load(Ordering::SeqCst);
+            if remaining == 0 {
+                return None;
+            }
+            self.fail_times.store(remaining - 1, Ordering::SeqCst);
+            Some(CoreError::RateLimited {
+                retry_after: None,
+                detail: "probe: transient".into(),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for ProbeLlm {
+        async fn stream_completion(
+            &self,
+            _messages: Vec<Message>,
+            tools: &[ToolDefinition],
+            _reasoning: ReasoningConfig,
+            _on_chunk: ChunkCallback,
+        ) -> Result<LlmResponse, CoreError> {
+            self.probe.plain.fetch_add(1, Ordering::SeqCst);
+            *self.probe.flattened.lock().unwrap() = tools
+                .iter()
+                .map(|t| t.name.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            if let Some(e) = self.maybe_fail() {
+                return Err(e);
+            }
+            Ok(LlmResponse::text("plain"))
+        }
+
+        fn hosted_tool_search(&self) -> Option<&dyn HostedToolSearch> {
+            self.hosted.then_some(self as &dyn HostedToolSearch)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl HostedToolSearch for ProbeLlm {
+        async fn stream_completion_with_namespaces(
+            &self,
+            _messages: Vec<Message>,
+            _core_tools: &[ToolDefinition],
+            _namespaces: &[ToolNamespace],
+            _reasoning: ReasoningConfig,
+            _on_chunk: ChunkCallback,
+        ) -> Result<LlmResponse, CoreError> {
+            self.probe.namespaced.fetch_add(1, Ordering::SeqCst);
+            if let Some(e) = self.maybe_fail() {
+                return Err(e);
+            }
+            Ok(LlmResponse::text("namespaced"))
+        }
+    }
+
+    pub(crate) fn tool(name: &str) -> ToolDefinition {
+        ToolDefinition::new(name, "probe tool", serde_json::json!({"type": "object"}))
+    }
+
+    pub(crate) fn namespace(name: &str, tools: Vec<ToolDefinition>) -> ToolNamespace {
+        ToolNamespace::new(name, "probe namespace", tools)
+    }
+
+    pub(crate) fn noop_chunk() -> ChunkCallback {
+        Box::new(|_| true)
+    }
+}
+
+#[cfg(test)]
+mod hosted_search_dispatch_tests {
+    use super::hosted_search_test_support::*;
+    use super::*;
+
+    #[tokio::test]
+    async fn dispatch_namespaced_uses_hosted_search_when_the_client_has_it() {
+        let client = ProbeLlm::new(true);
+        let probe = Arc::clone(&client.probe);
+
+        dispatch_namespaced(
+            &client,
+            vec![],
+            &[tool("core")],
+            &[namespace("ns", vec![tool("deferred")])],
+            ReasoningConfig::default(),
+            noop_chunk(),
+        )
+        .await
+        .expect("probe turn");
+
+        assert_eq!(probe.namespaced_calls(), 1, "hosted dispatch was used");
+        assert_eq!(probe.plain_calls(), 0, "the flattening path was not used");
+    }
+
+    #[tokio::test]
+    async fn dispatch_namespaced_flattens_when_the_client_has_no_hosted_search() {
+        let client = ProbeLlm::new(false);
+        let probe = Arc::clone(&client.probe);
+
+        dispatch_namespaced(
+            &client,
+            vec![],
+            &[tool("core")],
+            &[namespace("ns", vec![tool("deferred")])],
+            ReasoningConfig::default(),
+            noop_chunk(),
+        )
+        .await
+        .expect("probe turn");
+
+        assert_eq!(probe.namespaced_calls(), 0, "no hosted dispatch exists");
+        assert_eq!(probe.plain_calls(), 1, "the turn went out flattened");
+        assert_eq!(
+            *probe.flattened.lock().unwrap(),
+            "core,deferred",
+            "core tools first, then every namespace tool inline"
+        );
+    }
+
+    #[test]
+    fn flatten_namespaces_appends_namespace_tools_after_core_tools() {
+        let flat = flatten_namespaces(
+            &[tool("core_a"), tool("core_b")],
+            &[
+                namespace("one", vec![tool("n1")]),
+                namespace("two", vec![tool("n2"), tool("n3")]),
+            ],
+        );
+        let names: Vec<&str> = flat.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["core_a", "core_b", "n1", "n2", "n3"]);
+    }
+
+    /// Decorator-in-the-path criterion for [`RetryingLlmClient`].
+    ///
+    /// The inner client fails once with a retryable error, then succeeds. If
+    /// the retry decorator is in the namespaced path the turn succeeds after
+    /// two hosted-search dispatches. If the decorator handed back the inner
+    /// client's hosted-search object, the first error reaches the caller and
+    /// a turn carrying the whole tool fleet loses its retry.
+    #[tokio::test]
+    async fn retrying_decorator_stays_in_the_namespaced_path() {
+        let inner = ProbeLlm::failing(true, 1);
+        let probe = Arc::clone(&inner.probe);
+        let client = RetryingLlmClient::new(inner, 3);
+
+        let result = dispatch_namespaced(
+            &client,
+            vec![],
+            &[],
+            &[namespace("ns", vec![tool("deferred")])],
+            ReasoningConfig::default(),
+            noop_chunk(),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "the retry decorator must retry a namespaced turn: {result:?}"
+        );
+        assert_eq!(
+            probe.namespaced_calls(),
+            2,
+            "one failed hosted dispatch and one retry"
+        );
+        assert_eq!(probe.plain_calls(), 0, "the turn never flattened");
+    }
+
+    #[tokio::test]
+    async fn an_arc_forwards_the_hosted_search_object() {
+        let client: Arc<dyn LlmClient> = Arc::new(ProbeLlm::new(true));
+        assert!(
+            client.hosted_tool_search().is_some(),
+            "Arc is a transparent forwarder, not a decorator: it must not \
+             hide the inner client's hosted search"
         );
     }
 }
