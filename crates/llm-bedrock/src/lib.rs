@@ -8,9 +8,9 @@ use aws_credential_types::Credentials;
 use aws_sdk_bedrock::Client as BedrockControlClient;
 use aws_sdk_bedrockruntime::Client;
 use aws_sdk_bedrockruntime::types::{
-    ContentBlock, ConversationRole, Message as BedrockMessage, SystemContentBlock, Tool,
-    ToolConfiguration, ToolInputSchema, ToolResultBlock, ToolResultContentBlock, ToolSpecification,
-    ToolUseBlock,
+    CachePointBlock, CachePointType, ContentBlock, ConversationRole, Message as BedrockMessage,
+    SystemContentBlock, Tool, ToolConfiguration, ToolInputSchema, ToolResultBlock,
+    ToolResultContentBlock, ToolSpecification, ToolUseBlock,
 };
 use aws_smithy_types::{Document, Number};
 use desktop_assistant_core::CoreError;
@@ -433,9 +433,41 @@ fn static_credentials_from_api_key(api_key: &str) -> Option<Credentials> {
     ))
 }
 
+/// Convert domain messages into Converse messages, hoisting the system prompt.
+///
+/// Every `Role::System` message becomes an entry of the returned
+/// `Vec<SystemContentBlock>`, in order; the rest become Converse messages.
+///
+/// # Cache checkpoints
+///
+/// Exactly one `cachePoint` block is emitted, directly after the *leading*
+/// system block, and only when `model_id` names a model that supports prompt
+/// caching. Two reasons, and either alone is sufficient:
+///
+/// - **Correctness.** Caching is a prefix match, so a checkpoint pays off only
+///   when everything in front of it is byte-identical on the next turn. The
+///   leading block is the assembler's system instruction, which is stable for
+///   the lifetime of a conversation. Every later system block is a per-turn
+///   `[..]` block the assembler refills each round (a timestamp, a plan, a
+///   pin), so a checkpoint behind one is written and never read.
+/// - **Acceptance.** Bedrock allows at most four checkpoints per request. The
+///   assembler can surface eight system blocks in one turn, so marking each
+///   one would make the combination unusable. One checkpoint keeps the count
+///   at one however many blocks arrive.
+///
+/// The same reasoning excludes the tool list. Bedrock evaluates checkpoints in
+/// the order `tools` -> `system` -> `messages`, and a change in an earlier
+/// section invalidates the cache for every later section. Tool search moves the
+/// tool list inside a conversation, so a checkpoint on `tools` would invalidate
+/// the system cache on every turn the list moves. See
+/// `docs/connectors/bedrock.md`, "Prompt caching".
+///
+/// `model_id` may carry a cross-region inference-profile prefix; the support
+/// check strips it.
 fn convert_messages(
     messages: &[Message],
     tool_names: &ToolNameMap,
+    model_id: &str,
 ) -> Result<(Vec<SystemContentBlock>, Vec<BedrockMessage>), CoreError> {
     let mut system = Vec::new();
     let mut api_messages = Vec::new();
@@ -575,7 +607,27 @@ fn convert_messages(
         }
     }
 
+    // The one checkpoint: immediately behind the stable prefix. Volatile
+    // per-turn blocks follow it unmarked, so a change in one of them leaves
+    // the cached prefix intact.
+    if !system.is_empty() && supports_prompt_caching(strip_region_prefix(model_id)) {
+        system.insert(1, SystemContentBlock::CachePoint(default_cache_point()?));
+    }
+
     Ok((system, api_messages))
+}
+
+/// A five-minute cache checkpoint, the Converse default.
+///
+/// Why the default TTL: the one-hour TTL costs more per cache write and only
+/// pays back over gaps longer than five minutes. A conversation refreshes the
+/// five-minute cache on every turn at no extra charge, which is the shape of
+/// an interactive assistant turn.
+fn default_cache_point() -> Result<CachePointBlock, CoreError> {
+    CachePointBlock::builder()
+        .r#type(CachePointType::Default)
+        .build()
+        .map_err(|e| CoreError::Llm(format!("failed to build Bedrock cache checkpoint: {e}")))
 }
 
 fn convert_tools(
@@ -610,6 +662,33 @@ fn convert_tools(
         .map_err(|e| CoreError::Llm(format!("failed to build Bedrock tool config: {e}")))?;
 
     Ok(Some(cfg))
+}
+
+/// Map Converse token accounting onto the core `TokenUsage`.
+///
+/// One function for both dispatch paths: `ConverseStream` reports usage in its
+/// metadata event, `Converse` on the response, and the two must not drift.
+///
+/// Why the cache counters stay `Option`: a model without prompt caching
+/// returns no cache fields at all. `Some(0)` would tell a caller that caching
+/// ran and saved nothing, which is a different statement from "caching did not
+/// run". Note also that with caching on, Bedrock's `inputTokens` counts only
+/// the tokens that were neither read from nor written to the cache, so the
+/// three fields sum to the real input size.
+///
+/// The counts are clamped at zero. The wire type is a signed `i32`, the domain
+/// type is unsigned, and a negative count is meaningless either way.
+fn map_token_usage(usage: &aws_sdk_bedrockruntime::types::TokenUsage) -> TokenUsage {
+    fn non_negative(value: i32) -> u64 {
+        value.max(0) as u64
+    }
+
+    TokenUsage {
+        input_tokens: Some(non_negative(usage.input_tokens())),
+        output_tokens: Some(non_negative(usage.output_tokens())),
+        cache_creation_input_tokens: usage.cache_write_input_tokens().map(non_negative),
+        cache_read_input_tokens: usage.cache_read_input_tokens().map(non_negative),
+    }
 }
 
 /// Bedrock indexes streamed content blocks with `i32`. Use the shared
@@ -655,11 +734,7 @@ fn apply_stream_event(
         }
         aws_sdk_bedrockruntime::types::ConverseStreamOutput::Metadata(meta) => {
             if let Some(usage) = meta.usage() {
-                *token_usage = Some(TokenUsage {
-                    input_tokens: Some(usage.input_tokens() as u64),
-                    output_tokens: Some(usage.output_tokens() as u64),
-                    ..Default::default()
-                });
+                *token_usage = Some(map_token_usage(usage));
             }
         }
         _ => {}
@@ -892,6 +967,52 @@ fn strip_region_prefix(id: &str) -> &str {
         .or_else(|| id.strip_prefix("eu."))
         .or_else(|| id.strip_prefix("apac."))
         .unwrap_or(id)
+}
+
+/// Whether a Bedrock model accepts `cachePoint` prompt-cache checkpoints.
+///
+/// `base_id` must be the region-prefix-stripped foundation model id --
+/// `anthropic.claude-sonnet-4-6`, not `us.anthropic.claude-sonnet-4-6`. The
+/// caller strips it with [`strip_region_prefix`], the same contract
+/// [`supports_streaming_with_tools`] uses.
+///
+/// Why an allow-list, and why it defaults to `false`: support is a property of
+/// the model, not of the Converse API, and Bedrock rejects a request that
+/// carries a checkpoint the model does not accept. The two errors are not
+/// symmetric. A checkpoint the model refuses fails the whole turn; a
+/// checkpoint we withhold only costs input tokens. So an unrecognised model
+/// gets no checkpoint.
+///
+/// The supported families, per the Bedrock prompt-caching documentation:
+/// Anthropic Claude 3.5 and later (3.5, 3.7, and the 4.x line) and Amazon
+/// Nova. Claude 3 predates the feature. Meta, Mistral, Cohere and DeepSeek do
+/// not support it at all.
+fn supports_prompt_caching(base_id: &str) -> bool {
+    let lc = base_id.to_ascii_lowercase();
+
+    // Amazon Nova: Micro, Lite, Pro and Premier all accept explicit
+    // checkpoints.
+    if lc.starts_with("amazon.nova") {
+        return true;
+    }
+
+    let Some(claude) = lc.strip_prefix("anthropic.claude-") else {
+        return false;
+    };
+
+    // Claude 3.x ids spell the minor version into the name
+    // (`3-5-sonnet-...`, `3-7-sonnet-...`); 3 with no minor part is the
+    // pre-caching generation.
+    if let Some(three) = claude.strip_prefix("3-") {
+        return three.starts_with("5-") || three.starts_with("7-");
+    }
+
+    // Claude 4 and later put the family first (`sonnet-4-5-...`,
+    // `opus-4-1-...`, `haiku-4-5-...`). Match the family, not the version, so
+    // a later minor release needs no edit here.
+    ["sonnet-", "opus-", "haiku-"]
+        .iter()
+        .any(|family| claude.starts_with(family))
 }
 
 /// Whether a Bedrock model accepts tool-use requests via `ConverseStream`.
@@ -1289,19 +1410,29 @@ impl LlmClient for BedrockClient {
         // `toolUse.name`s, and reverse it when the model echoes a name back so
         // dispatch still hits the real (possibly `.`/`:`/`/`-containing) tool.
         let tool_names = ToolNameMap::from_names(tools.iter().map(|t| t.name.as_str()));
-        let (system, api_messages) = convert_messages(&messages, &tool_names)?;
-        let tool_config = convert_tools(tools, &tool_names)?;
 
         // Per-turn model override (issue #34): when the daemon-side routing
         // layer has set `MODEL_OVERRIDE`, dispatch the user-chosen model id
-        // instead of the connector's baked-in `self.model`. Used both for
-        // the request `model_id` and for keying reasoning support /
-        // context-window heuristics below.
+        // instead of the connector's baked-in `self.model`. Used for the
+        // request `model_id`, for the prompt-cache and reasoning support
+        // checks, and for the context-window heuristics below. It is resolved
+        // before the request is built, because the model decides whether the
+        // system prompt carries a cache checkpoint.
         let model = current_model_override().unwrap_or_else(|| self.model.clone());
+
+        let (system, api_messages) = convert_messages(&messages, &tool_names, &model)?;
+        let tool_config = convert_tools(tools, &tool_names)?;
 
         let msg_count = api_messages.len();
         let tool_count = tools.len();
-        let system_chars: usize = system.iter().map(|b| format!("{b:?}").len()).sum();
+        // Count prompt content only. A cache checkpoint is a control marker
+        // with no prompt text, so counting its `Debug` form would inflate the
+        // reported prompt size on exactly the models that cache.
+        let system_chars: usize = system
+            .iter()
+            .filter(|b| !matches!(b, SystemContentBlock::CachePoint(_)))
+            .map(|b| format!("{b:?}").len())
+            .sum();
         let msg_chars: usize = api_messages.iter().map(|m| format!("{m:?}").len()).sum();
         tracing::info!(
             msg_chars,
@@ -1634,11 +1765,7 @@ impl BedrockClient {
             let _ = on_chunk(text.clone());
         }
 
-        let token_usage = response.usage.as_ref().map(|usage| TokenUsage {
-            input_tokens: Some(usage.input_tokens() as u64),
-            output_tokens: Some(usage.output_tokens() as u64),
-            ..Default::default()
-        });
+        let token_usage = response.usage.as_ref().map(map_token_usage);
 
         let mut llm_response = if tool_calls.is_empty() {
             LlmResponse::text(text)
@@ -3497,7 +3624,8 @@ mod tests {
         ];
         // Map built from the CURRENT tool set (which still offers the tool).
         let map = ToolNameMap::from_names(["weather.lookup"]);
-        let (_system, messages) = convert_messages(&history, &map).expect("convert ok");
+        let (_system, messages) =
+            convert_messages(&history, &map, "us.anthropic.claude-sonnet-4-6").expect("convert ok");
 
         let names = tool_use_names(&messages);
         assert_eq!(names.len(), 1, "expected one toolUse in history");
@@ -3525,7 +3653,8 @@ mod tests {
         )])];
         // Empty map: the tool isn't offered this turn.
         let map = ToolNameMap::from_names(Vec::<&str>::new());
-        let (_system, messages) = convert_messages(&history, &map).expect("convert ok");
+        let (_system, messages) =
+            convert_messages(&history, &map, "us.anthropic.claude-sonnet-4-6").expect("convert ok");
         let names = tool_use_names(&messages);
         assert_eq!(names.len(), 1);
         assert!(
@@ -3556,7 +3685,8 @@ mod tests {
         let history = vec![Message::assistant_with_tool_calls(vec![ToolCall::new(
             "c1", tool, "{}",
         )])];
-        let (_s, messages) = convert_messages(&history, &map).expect("ok");
+        let (_s, messages) =
+            convert_messages(&history, &map, "us.anthropic.claude-sonnet-4-6").expect("ok");
         let hist_name = tool_use_names(&messages).into_iter().next().expect("one");
 
         assert_eq!(
@@ -3586,6 +3716,243 @@ mod tests {
         // ids and arguments survive untouched.
         assert_eq!(restored[0].id, "id1");
         assert_eq!(restored[0].arguments, r#"{"p":1}"#);
+    }
+
+    // --- Prompt caching (#462) -------------------------------------------
+    //
+    // Bedrock's Converse API caches a prompt prefix when the request carries a
+    // `cachePoint` block. Support is per model, not per API: a model that does
+    // not support it rejects the request. So the connector emits the block only
+    // where the model accepts it, and reads the two cache counters back out of
+    // the response usage.
+
+    /// The system blocks the daemon actually sends: one stable assembler
+    /// instruction, then a volatile per-turn block.
+    ///
+    /// The checkpoint belongs between the two. Caching is a prefix match, so a
+    /// checkpoint after the volatile block is written every turn and read
+    /// never.
+    fn caching_history() -> Vec<Message> {
+        vec![
+            Message::new(Role::System, "stable assembler instruction"),
+            Message::new(Role::System, "[Scratchpad] volatile per-turn state"),
+            Message::new(Role::User, "hi"),
+        ]
+    }
+
+    /// Indices of the cache checkpoints in a system block list.
+    fn cache_point_indices(system: &[SystemContentBlock]) -> Vec<usize> {
+        system
+            .iter()
+            .enumerate()
+            .filter(|(_, block)| matches!(block, SystemContentBlock::CachePoint(_)))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    #[test]
+    fn cache_point_emitted_for_anthropic_model() {
+        let map = ToolNameMap::from_names(Vec::<&str>::new());
+        let (system, _messages) =
+            convert_messages(&caching_history(), &map, "us.anthropic.claude-sonnet-4-6")
+                .expect("convert ok");
+
+        assert_eq!(
+            cache_point_indices(&system),
+            vec![1],
+            "exactly one checkpoint, directly after the stable system prefix: {system:?}"
+        );
+        // The prefix itself must survive unchanged in front of the checkpoint.
+        assert!(
+            matches!(&system[0], SystemContentBlock::Text(t) if t == "stable assembler instruction"),
+            "leading block must stay the stable prefix: {:?}",
+            system[0]
+        );
+        // The volatile block follows the checkpoint, so a change in it does
+        // not invalidate the cached prefix.
+        assert!(
+            matches!(&system[2], SystemContentBlock::Text(t) if t.starts_with("[Scratchpad]")),
+            "volatile block must follow the checkpoint: {:?}",
+            system[2]
+        );
+    }
+
+    #[test]
+    fn cache_point_emitted_for_amazon_nova_model() {
+        let map = ToolNameMap::from_names(Vec::<&str>::new());
+        let (system, _messages) =
+            convert_messages(&caching_history(), &map, "us.amazon.nova-pro-v1:0")
+                .expect("convert ok");
+        assert_eq!(cache_point_indices(&system), vec![1], "{system:?}");
+    }
+
+    #[test]
+    fn cache_point_omitted_for_meta_llama() {
+        let map = ToolNameMap::from_names(Vec::<&str>::new());
+        // Bedrock rejects a checkpoint on a Meta model, so the request must go
+        // out without one - and it must still be built successfully.
+        let (system, messages) = convert_messages(
+            &caching_history(),
+            &map,
+            "us.meta.llama4-maverick-17b-instruct-v1:0",
+        )
+        .expect("a model without caching support still converts");
+
+        assert!(
+            cache_point_indices(&system).is_empty(),
+            "no checkpoint for Meta: {system:?}"
+        );
+        assert_eq!(system.len(), 2, "both system blocks survive: {system:?}");
+        assert_eq!(messages.len(), 1, "the user turn survives: {messages:?}");
+    }
+
+    #[test]
+    fn cache_point_omitted_for_inference_profile_whose_base_model_lacks_support() {
+        let map = ToolNameMap::from_names(Vec::<&str>::new());
+        // The region prefix must not hide the base model from the check.
+        for profile_id in [
+            "us.deepseek.r1-v1:0",
+            "eu.mistral.mistral-large-2407-v1:0",
+            "apac.cohere.command-r-plus-v1:0",
+            // Claude 3 (not 3.5) predates prompt caching on Bedrock.
+            "us.anthropic.claude-3-haiku-20240307-v1:0",
+        ] {
+            let (system, _messages) =
+                convert_messages(&caching_history(), &map, profile_id).expect("convert ok");
+            assert!(
+                cache_point_indices(&system).is_empty(),
+                "{profile_id} must get no checkpoint: {system:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cache_point_never_emitted_on_tool_list() {
+        // Bedrock evaluates checkpoints `tools` -> `system` -> `messages`, and
+        // a change in an earlier section invalidates every later one. Tool
+        // search moves the tool list inside a conversation, so a checkpoint on
+        // `tools` would invalidate the system cache on every such turn.
+        let cfg = convert_tools(
+            &[ToolDefinition::new("weather", "d", serde_json::json!({}))],
+            &ToolNameMap::from_names(["weather"]),
+        )
+        .expect("convert ok")
+        .expect("one tool config");
+
+        assert!(
+            !cfg.tools()
+                .iter()
+                .any(|tool| matches!(tool, Tool::CachePoint(_))),
+            "the tool list must carry no checkpoint: {:?}",
+            cfg.tools()
+        );
+    }
+
+    /// Converse usage carrying both cache counters.
+    fn sdk_usage_with_cache_counters() -> aws_sdk_bedrockruntime::types::TokenUsage {
+        aws_sdk_bedrockruntime::types::TokenUsage::builder()
+            .input_tokens(120)
+            .output_tokens(30)
+            .total_tokens(150)
+            .cache_read_input_tokens(4096)
+            .cache_write_input_tokens(2048)
+            .build()
+            .expect("usage builds")
+    }
+
+    #[test]
+    fn usage_maps_cache_read_and_write_tokens_on_the_non_streaming_path() {
+        // `dispatch_non_streaming` maps `response.usage` through here. The AWS
+        // SDK is not mockable at the HTTP level the way `httpmock` stubs the
+        // other connectors, so the mapper is exercised directly; it is the
+        // whole of that path's usage mapping.
+        let mapped = map_token_usage(&sdk_usage_with_cache_counters());
+        assert_eq!(mapped.input_tokens, Some(120));
+        assert_eq!(mapped.output_tokens, Some(30));
+        assert_eq!(mapped.cache_read_input_tokens, Some(4096));
+        assert_eq!(mapped.cache_creation_input_tokens, Some(2048));
+    }
+
+    #[test]
+    fn usage_maps_cache_read_and_write_tokens_on_the_streaming_path() {
+        use aws_sdk_bedrockruntime::types::{ConverseStreamMetadataEvent, ConverseStreamOutput};
+
+        // `dispatch_streaming` reads usage from the metadata event, through
+        // the real `apply_stream_event`.
+        let mut text = String::new();
+        let mut tool_acc = ToolCallAccumulator::default();
+        let mut on_chunk: ChunkCallback = Box::new(|_| true);
+        let mut token_usage = None;
+        apply_stream_event(
+            ConverseStreamOutput::Metadata(
+                ConverseStreamMetadataEvent::builder()
+                    .usage(sdk_usage_with_cache_counters())
+                    .build(),
+            ),
+            &mut text,
+            &mut tool_acc,
+            &mut on_chunk,
+            &mut token_usage,
+        );
+        let streamed = token_usage.expect("metadata event yields usage");
+        assert_eq!(streamed.input_tokens, Some(120));
+        assert_eq!(streamed.output_tokens, Some(30));
+        assert_eq!(streamed.cache_read_input_tokens, Some(4096));
+        assert_eq!(streamed.cache_creation_input_tokens, Some(2048));
+    }
+
+    #[test]
+    fn usage_omits_cache_counters_when_the_response_has_none() {
+        use aws_sdk_bedrockruntime::types::TokenUsage as SdkTokenUsage;
+
+        // A model without caching returns no cache fields. `Some(0)` would
+        // read to a caller as "caching ran and saved nothing", which is a
+        // different claim from "caching did not run".
+        let sdk_usage = SdkTokenUsage::builder()
+            .input_tokens(10)
+            .output_tokens(5)
+            .total_tokens(15)
+            .build()
+            .expect("usage builds");
+
+        let mapped = map_token_usage(&sdk_usage);
+        assert_eq!(mapped.cache_read_input_tokens, None);
+        assert_eq!(mapped.cache_creation_input_tokens, None);
+    }
+
+    #[test]
+    fn supports_prompt_caching_reads_the_stripped_base_id() {
+        // The caller strips the region prefix, as it does for
+        // `supports_streaming_with_tools`.
+        assert!(supports_prompt_caching(strip_region_prefix(
+            "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+        )));
+        assert!(supports_prompt_caching(strip_region_prefix(
+            "eu.anthropic.claude-3-7-sonnet-20250219-v1:0"
+        )));
+        assert!(supports_prompt_caching(strip_region_prefix(
+            "apac.amazon.nova-lite-v1:0"
+        )));
+        assert!(!supports_prompt_caching(strip_region_prefix(
+            "us.meta.llama4-maverick-17b-instruct-v1:0"
+        )));
+        // Unknown models default to "no checkpoint": an unwanted checkpoint
+        // fails the whole request, a missing one only costs tokens.
+        assert!(!supports_prompt_caching("future.unknown-model"));
+    }
+
+    #[test]
+    fn cache_point_omitted_when_there_is_no_system_prompt() {
+        // A checkpoint on an empty `system` list has nothing to cache and
+        // would be the only element of the list.
+        let map = ToolNameMap::from_names(Vec::<&str>::new());
+        let (system, _messages) = convert_messages(
+            &[Message::new(Role::User, "hi")],
+            &map,
+            "us.anthropic.claude-sonnet-4-6",
+        )
+        .expect("convert ok");
+        assert!(system.is_empty(), "no system blocks, no checkpoint");
     }
 
     // --- Cancellation (issue #109) ---------------------------------------

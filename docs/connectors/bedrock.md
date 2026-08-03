@@ -215,10 +215,15 @@ models, and `cachePoint` for Nova models.
 **Responses** accepts `prompt_cache_breakpoint` on content blocks for the
 GPT-5.6 family, and caches automatically for earlier OpenAI models.
 
-Support is per model, not per API. Anthropic and Nova models honour cache
-checkpoints. Meta, Mistral and Cohere models do not. The connector detects
-support per model and emits no checkpoint where support is absent, rather than
-sending a marker that the service ignores or rejects.
+Support is per model, not per API. Anthropic Claude 3.5 and later, and Amazon
+Nova, accept cache checkpoints. Claude 3, Meta, Mistral, Cohere and DeepSeek do
+not, and reject a request that carries one. The connector detects support from
+the model id, with the region prefix stripped so an inference profile resolves
+to its base model.
+
+An unrecognised model gets no checkpoint. The two errors are not equal: a
+checkpoint the model refuses fails the whole turn, while a checkpoint withheld
+only costs input tokens. So the connector withholds when it is unsure.
 
 **Where the checkpoint goes.** One checkpoint, after the stable system prefix.
 Not on the tool list. Bedrock evaluates checkpoints in the order `tools`, then
@@ -229,7 +234,10 @@ therefore invalidate the system cache on every turn the tool list moves, and
 cost more than it saves. The Anthropic connector marks the system prefix only,
 for this same reason.
 
-`CachePolicy` selects the behaviour:
+`CachePolicy` is designed and not built. There is no `CachePolicy` type and no
+`cache_policy` configuration field today, and nothing turns caching off: the
+Converse path always behaves as `SystemPromptOnly` on a model that accepts a
+checkpoint. The intended shape is:
 
 ```rust
 enum CachePolicy {
@@ -286,7 +294,6 @@ type = "bedrock"
 region = "us-east-1"
 profile = "production"
 default_model = "us.anthropic.claude-opus-4-1"
-cache_policy = "system_prompt_only"
 connect_timeout_secs = 30
 event_timeout_secs = 120
 ```
