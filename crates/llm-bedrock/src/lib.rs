@@ -1909,12 +1909,15 @@ struct BedrockRequestInputs {
     /// the (sanitized) name the model returns in a `toolUse` back to the real
     /// tool so the upstream dispatch can execute it. (#198)
     tool_names: ToolNameMap,
-    /// Whether `system` carries a `cachePoint` block.
+    /// Whether `system` carries a `cachePoint` block. Read off `system` itself
+    /// in [`BedrockClient::build_request_inputs`], not from the policy that
+    /// asked for one, so it cannot claim a checkpoint the request does not
+    /// hold - a turn with no system prompt has no prefix to mark.
     ///
     /// This is what makes a refusal attributable. A request that sent no
     /// checkpoint cannot have had one refused, so the dispatch paths do not
     /// even ask whether the failure names the cache field. The retry is built
-    /// with this `false`, which is why the retry can never be read as a second
+    /// without one, which is why the retry can never be read as a second
     /// refusal, and why the memo can never rest on evidence the fallback
     /// itself produced. (#1028)
     cache_checkpoint: bool,
@@ -1942,10 +1945,17 @@ impl BedrockClient {
 
     /// Translate one turn into the Converse request shape.
     ///
-    /// Called a second time, with `cache_checkpoint` forced to `false`, when
-    /// Bedrock refuses the checkpoint. It is a pure translation of the same
-    /// turn, so the retry differs from the first attempt in that one field and
-    /// nothing else - which is what makes the retry's outcome readable.
+    /// `want_cache_checkpoint` is what the caller asks for. Whether a
+    /// checkpoint is actually emitted is read back off the built request, so
+    /// `BedrockRequestInputs::cache_checkpoint` describes the bytes that go out
+    /// rather than the intent behind them. The two differ: a turn with no
+    /// system prompt has no prefix to mark, so it sends no checkpoint however
+    /// the policy is set.
+    ///
+    /// Called a second time, with `want_cache_checkpoint` forced to `false`,
+    /// when Bedrock refuses the checkpoint. It is a pure translation of the
+    /// same turn, so the retry differs from the first attempt in that one field
+    /// and nothing else - which is what makes the retry's outcome readable.
     fn build_request_inputs(
         &self,
         messages: &[Message],
@@ -1953,10 +1963,15 @@ impl BedrockClient {
         tool_names: &ToolNameMap,
         model: &str,
         reasoning: ReasoningConfig,
-        cache_checkpoint: bool,
+        want_cache_checkpoint: bool,
     ) -> Result<BedrockRequestInputs, CoreError> {
-        let (system, api_messages) = convert_messages(messages, tool_names, cache_checkpoint)?;
+        let (system, api_messages) = convert_messages(messages, tool_names, want_cache_checkpoint)?;
         let tool_config = convert_tools(tools, tool_names)?;
+
+        // Read from the request, never from the request we meant to build.
+        let cache_checkpoint = system
+            .iter()
+            .any(|block| matches!(block, SystemContentBlock::CachePoint(_)));
 
         let msg_count = api_messages.len();
         let tool_count = tools.len();
@@ -5699,6 +5714,42 @@ mod tests {
             refused_anything.calls(),
             1,
             "no retry: there was no checkpoint to withdraw"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turn_with_no_system_prompt_sends_no_checkpoint_and_so_cannot_have_one_refused() {
+        // The policy allows a checkpoint and the model accepts one, but there
+        // is no system prefix to mark, so nothing goes out. The guard has to
+        // read the request that was built, not the intent to build one: a
+        // refusal of a field this request did not carry is a refusal of
+        // something else, and acting on it would memoise the model on evidence
+        // about nothing.
+        let server = httpmock::MockServer::start();
+        let refused_anything = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path_matches(r"/converse$");
+            then.status(400)
+                .header("x-amzn-errortype", "ValidationException")
+                .header("content-type", "application/json")
+                .body(validation_exception_body(CACHE_REFUSAL_MESSAGE));
+        });
+
+        let client = cache_recovery_client(&server.url(""), None).await;
+        client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &one_tool(),
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await
+            .expect_err("the validation failure must reach the caller");
+
+        assert_eq!(
+            refused_anything.calls(),
+            1,
+            "no retry: the request carried no checkpoint to withdraw"
         );
     }
 
