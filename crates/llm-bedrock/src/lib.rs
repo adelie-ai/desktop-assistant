@@ -1501,7 +1501,9 @@ impl LlmClient for BedrockClient {
                     "skipping ConverseStream: model on the non-streaming-with-tools deny-list"
                 );
             }
-            return self.dispatch_non_streaming(client, inputs, on_chunk).await;
+            return self
+                .dispatch_non_streaming(client, inputs, on_chunk, &cancellation)
+                .await;
         }
 
         match self
@@ -1520,7 +1522,8 @@ impl LlmClient for BedrockClient {
                     .lock()
                     .await
                     .insert(model.clone());
-                self.dispatch_non_streaming(client, inputs, on_chunk).await
+                self.dispatch_non_streaming(client, inputs, on_chunk, &cancellation)
+                    .await
             }
             Err(StreamingDispatchError::Other(err)) => Err(err),
         }
@@ -1568,6 +1571,23 @@ struct BedrockRequestInputs {
 }
 
 impl BedrockClient {
+    /// Whole-request budget for the non-streaming (`Converse`) path.
+    ///
+    /// Why the two stream budgets added together: `Converse` returns one
+    /// response, after generation is complete, so there is no separate
+    /// connect phase to bound. The equivalent allowance is what the streaming
+    /// path grants a turn that produces a single event - the connect budget
+    /// plus one event budget. Both come from the same per-connection settings
+    /// an operator already controls, so a model that needs longer is a
+    /// configuration change and not a code change.
+    ///
+    /// This does cap total generation time on this path, which the streaming
+    /// path does not cap. That is the trade: an unbounded request hangs the
+    /// turn until the AWS SDK's own defaults give up, and ignores a stop.
+    fn non_streaming_timeout(&self) -> Duration {
+        self.connect_timeout.saturating_add(self.event_timeout)
+    }
+
     fn build_inference_config(
         &self,
     ) -> Option<aws_sdk_bedrockruntime::types::InferenceConfiguration> {
@@ -1733,11 +1753,16 @@ impl BedrockClient {
     /// single `on_chunk` call with the full text so the upstream
     /// service contract — "the callback fires at least once with the
     /// model's prose output" — is preserved.
+    ///
+    /// The request is bounded by [`Self::non_streaming_timeout`] and raced
+    /// against `cancellation`, so this path fails a stalled turn and answers
+    /// a stop the same way [`Self::dispatch_streaming`] does.
     async fn dispatch_non_streaming(
         &self,
         client: &Client,
         inputs: BedrockRequestInputs,
         mut on_chunk: ChunkCallback,
+        cancellation: &tokio_util::sync::CancellationToken,
     ) -> Result<LlmResponse, CoreError> {
         let mut request = client
             .converse()
@@ -1756,7 +1781,29 @@ impl BedrockClient {
             request = request.additional_model_request_fields(extra);
         }
 
-        let response = request.send().await.map_err(map_converse_error)?;
+        // `Converse` answers once, when generation is complete, so one bound
+        // covers the whole call. Race it against cancellation as well, so a
+        // stop drops the in-flight request instead of waiting the request out.
+        let request_timeout = self.non_streaming_timeout();
+        let send_fut = request.send();
+        let response = tokio::select! {
+            _ = cancellation.cancelled() => {
+                tracing::debug!(model = %inputs.model, "Bedrock converse cancelled by token");
+                return Err(CoreError::Cancelled);
+            }
+            _ = tokio::time::sleep(request_timeout) => {
+                tracing::error!(
+                    model = %inputs.model,
+                    timeout_s = request_timeout.as_secs(),
+                    "Bedrock converse send() timed out (no response)"
+                );
+                return Err(CoreError::Llm(format!(
+                    "Bedrock converse request timed out after {}s",
+                    request_timeout.as_secs()
+                )));
+            }
+            r = send_fut => r.map_err(map_converse_error)?,
+        };
 
         let mut text = String::new();
         let mut tool_calls = Vec::new();

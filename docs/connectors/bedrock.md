@@ -269,7 +269,13 @@ API concerns:
 - `event_timeout` - the time between streaming events before the stream counts
   as stalled.
 
-Both apply to every backend, and to the streaming and the non-streaming path.
+Both apply to every backend. On the streaming path they bound the two phases
+separately: the connect race, then each gap between events. The non-streaming
+path answers once, when generation is complete, so it takes the sum of the two
+as a single whole-request budget - 90 seconds on the defaults. A model that
+needs longer than that to answer in one shot raises both values on its
+connection. Each path also races its request against the cancellation token, so
+a stop ends the turn rather than waiting the request out.
 
 **Tool-schema sanitisation** runs above the backend boundary, in the shared
 request conversion. Top-level `oneOf`, `anyOf` and `allOf` are removed and a
