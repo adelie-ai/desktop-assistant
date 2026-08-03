@@ -93,10 +93,6 @@ impl<L: LlmClient> LlmClient for FixedReasoningLlmClient<L> {
             .await
     }
 
-    fn supports_hosted_tool_search(&self) -> bool {
-        self.inner.supports_hosted_tool_search()
-    }
-
     /// Hands back `self`, never the inner client's object, so this
     /// decorator stays in the call path for a namespaced turn. See
     /// [`LlmClient::hosted_tool_search`].
@@ -105,25 +101,6 @@ impl<L: LlmClient> LlmClient for FixedReasoningLlmClient<L> {
             .hosted_tool_search()
             .is_some()
             .then_some(self as &dyn HostedToolSearch)
-    }
-
-    async fn stream_completion_with_namespaces(
-        &self,
-        messages: Vec<Message>,
-        core_tools: &[ToolDefinition],
-        namespaces: &[ToolNamespace],
-        caller_reasoning: ReasoningConfig,
-        on_chunk: ChunkCallback,
-    ) -> Result<LlmResponse, CoreError> {
-        HostedToolSearch::stream_completion_with_namespaces(
-            self,
-            messages,
-            core_tools,
-            namespaces,
-            caller_reasoning,
-            on_chunk,
-        )
-        .await
     }
 }
 
@@ -164,28 +141,16 @@ mod tests {
     /// Test double that records the `ReasoningConfig` it receives so we
     /// can prove the wrapper substitutes its own value.
     ///
-    /// `hosted` makes the hosted-tool-search answer settable, because the
-    /// wrapper must be checked against an inner client that says `true` and
-    /// one that says `false`. A double with a fixed answer can only catch
-    /// one of the two ways the wrapper can answer for the wrong client.
+    /// It has no hosted tool search. The hosted-search tests use
+    /// `NamespaceProbe`, which offers both answers.
     #[derive(Default)]
     struct CapturingClient {
         last_seen: Mutex<Option<ReasoningConfig>>,
-        hosted: bool,
     }
 
     impl CapturingClient {
         fn last(&self) -> Option<ReasoningConfig> {
             *self.last_seen.lock().unwrap()
-        }
-
-        /// A double that supports hosted tool search. `default()` gives one
-        /// that does not.
-        fn hosted() -> Self {
-            Self {
-                hosted: true,
-                ..Default::default()
-            }
         }
     }
 
@@ -224,10 +189,6 @@ mod tests {
                 tool_calls: vec![],
                 usage: Some(TokenUsage::default()),
             })
-        }
-
-        fn supports_hosted_tool_search(&self) -> bool {
-            self.hosted
         }
     }
 
@@ -384,17 +345,19 @@ mod tests {
     /// this module's sibling tests exist for.
     #[test]
     fn fixed_reasoning_client_answers_hosted_tool_search_from_inner() {
+        use crate::hosted_search_probe::NamespaceProbe;
+
         let wrapped =
-            FixedReasoningLlmClient::new(CapturingClient::hosted(), ReasoningConfig::default());
+            FixedReasoningLlmClient::new(NamespaceProbe::hosted(), ReasoningConfig::default());
         assert!(
-            wrapped.supports_hosted_tool_search(),
+            wrapped.hosted_tool_search().is_some(),
             "must forward the inner capability"
         );
 
         let wrapped =
-            FixedReasoningLlmClient::new(CapturingClient::default(), ReasoningConfig::default());
+            FixedReasoningLlmClient::new(NamespaceProbe::plain(), ReasoningConfig::default());
         assert!(
-            !wrapped.supports_hosted_tool_search(),
+            wrapped.hosted_tool_search().is_none(),
             "must not invent a capability the inner client does not have"
         );
     }

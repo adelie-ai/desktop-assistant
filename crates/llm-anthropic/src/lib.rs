@@ -878,27 +878,9 @@ impl LlmClient for AnthropicClient {
             .await
     }
 
-    fn supports_hosted_tool_search(&self) -> bool {
-        self.hosted_tool_search
-    }
-
     fn hosted_tool_search(&self) -> Option<&dyn HostedToolSearch> {
         self.hosted_tool_search
             .then_some(self as &dyn HostedToolSearch)
-    }
-
-    async fn stream_completion_with_namespaces(
-        &self,
-        messages: Vec<Message>,
-        core_tools: &[ToolDefinition],
-        namespaces: &[ToolNamespace],
-        reasoning: ReasoningConfig,
-        on_chunk: ChunkCallback,
-    ) -> Result<LlmResponse, CoreError> {
-        HostedToolSearch::stream_completion_with_namespaces(
-            self, messages, core_tools, namespaces, reasoning, on_chunk,
-        )
-        .await
     }
 }
 
@@ -2434,22 +2416,24 @@ mod tests {
     fn anthropic_reports_hosted_tool_search_when_enabled() {
         // Anthropic is one of only two connectors that implement hosted tool
         // search, and this client's override of
-        // `stream_completion_with_namespaces` is what makes the claim honest.
+        // `HostedToolSearch` implementation is what makes the claim honest.
         // Pinned here as well as in the daemon's cross-connector sweep, so
         // hardening this crate cannot quietly turn the capability off with the
         // sweep's expectation as the only thing left to edit.
         let on = AnthropicClient::new("k".into()).with_hosted_tool_search(true);
-        assert!(on.supports_hosted_tool_search());
+        assert!(on.hosted_tool_search().is_some());
 
         let off = AnthropicClient::new("k".into()).with_hosted_tool_search(false);
         assert!(
-            !off.supports_hosted_tool_search(),
+            !off.hosted_tool_search().is_some(),
             "the configured preference must drive the claim, not a constant"
         );
 
         // Constructor default, pinned because the two connectors differ.
         assert!(
-            AnthropicClient::new("k".into()).supports_hosted_tool_search(),
+            AnthropicClient::new("k".into())
+                .hosted_tool_search()
+                .is_some(),
             "the constructor default is on, and the two connectors differ"
         );
     }

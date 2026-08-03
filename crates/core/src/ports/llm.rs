@@ -1054,33 +1054,6 @@ pub trait LlmClient: Send + Sync {
         None
     }
 
-    /// Whether this connector supports server-side hosted tool search
-    /// (e.g. OpenAI namespaces with deferred loading).
-    fn supports_hosted_tool_search(&self) -> bool {
-        false
-    }
-
-    /// Stream a completion with namespaced tool definitions.
-    ///
-    /// Connectors that support hosted tool search (e.g. OpenAI) serialize
-    /// namespaces with `defer_loading: true` and append a `tool_search` entry.
-    /// The default implementation flattens everything into `stream_completion`.
-    async fn stream_completion_with_namespaces(
-        &self,
-        messages: Vec<Message>,
-        core_tools: &[ToolDefinition],
-        namespaces: &[ToolNamespace],
-        reasoning: ReasoningConfig,
-        on_chunk: ChunkCallback,
-    ) -> Result<LlmResponse, CoreError> {
-        let mut all: Vec<ToolDefinition> = core_tools.to_vec();
-        for ns in namespaces {
-            all.extend(ns.tools.iter().cloned());
-        }
-        self.stream_completion(messages, &all, reasoning, on_chunk)
-            .await
-    }
-
     /// Enumerate the models this connector can serve.
     ///
     /// Connectors should return every model the caller could reasonably
@@ -1156,10 +1129,6 @@ impl<T: LlmClient + ?Sized> LlmClient for Arc<T> {
         (**self).hosted_tool_search()
     }
 
-    fn supports_hosted_tool_search(&self) -> bool {
-        (**self).supports_hosted_tool_search()
-    }
-
     async fn stream_completion(
         &self,
         messages: Vec<Message>,
@@ -1169,21 +1138,6 @@ impl<T: LlmClient + ?Sized> LlmClient for Arc<T> {
     ) -> Result<LlmResponse, CoreError> {
         (**self)
             .stream_completion(messages, tools, reasoning, on_chunk)
-            .await
-    }
-
-    async fn stream_completion_with_namespaces(
-        &self,
-        messages: Vec<Message>,
-        core_tools: &[ToolDefinition],
-        namespaces: &[ToolNamespace],
-        reasoning: ReasoningConfig,
-        on_chunk: ChunkCallback,
-    ) -> Result<LlmResponse, CoreError> {
-        (**self)
-            .stream_completion_with_namespaces(
-                messages, core_tools, namespaces, reasoning, on_chunk,
-            )
             .await
     }
 
@@ -1445,10 +1399,6 @@ impl<L: LlmClient> LlmClient for RetryingLlmClient<L> {
         .await
     }
 
-    fn supports_hosted_tool_search(&self) -> bool {
-        self.inner.supports_hosted_tool_search()
-    }
-
     /// Hands back `self`, never the inner client's object, so this
     /// decorator stays in the call path for a namespaced turn. See
     /// [`LlmClient::hosted_tool_search`].
@@ -1457,20 +1407,6 @@ impl<L: LlmClient> LlmClient for RetryingLlmClient<L> {
             .hosted_tool_search()
             .is_some()
             .then_some(self as &dyn HostedToolSearch)
-    }
-
-    async fn stream_completion_with_namespaces(
-        &self,
-        messages: Vec<Message>,
-        core_tools: &[ToolDefinition],
-        namespaces: &[ToolNamespace],
-        reasoning: ReasoningConfig,
-        on_chunk: ChunkCallback,
-    ) -> Result<LlmResponse, CoreError> {
-        HostedToolSearch::stream_completion_with_namespaces(
-            self, messages, core_tools, namespaces, reasoning, on_chunk,
-        )
-        .await
     }
 }
 

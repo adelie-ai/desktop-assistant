@@ -1292,7 +1292,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         // the read runs in the task the caller scoped, so a routing `llm`
         // resolves the same per-turn client here as it does at dispatch. See
         // the task-local warning above the compaction block.
-        let use_hosted_search = self.llm.supports_hosted_tool_search();
+        let use_hosted_search = self.llm.hosted_tool_search().is_some();
         let namespaces: Vec<ToolNamespace> = if use_hosted_search {
             let raw_namespaces = self.tools.tool_namespaces().await;
             if raw_namespaces.is_empty() {
@@ -1718,13 +1718,14 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
             // unaffected: the call still resolves and breaks the loop.
             let mut llm_call =
                 if use_hosted_search && !namespaces.is_empty() && !hosted_search_demoted {
-                    self.llm.stream_completion_with_namespaces(
+                    Box::pin(crate::ports::llm::dispatch_namespaced(
+                        &self.llm,
                         llm_messages,
                         &tool_defs,
                         &namespaces,
                         reasoning,
                         filtered_chunk_callback,
-                    )
+                    ))
                 } else {
                     self.llm.stream_completion(
                         llm_messages,
@@ -2531,7 +2532,9 @@ mod tests {
     use super::*;
     use crate::context::MIN_TRUNCATION_TOKENS;
     use crate::domain::{ToolCall, ToolDefinition, TransportKind};
-    use crate::ports::llm::{BudgetSource, ContextBudget, LlmResponse, TokenUsage};
+    use crate::ports::llm::{
+        BudgetSource, ContextBudget, HostedToolSearch, LlmResponse, TokenUsage,
+    };
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
@@ -8577,7 +8580,7 @@ mod tests {
         /// Artificial delay applied inside the categorization branch so a test
         /// can widen the window two concurrent cold turns overlap in.
         categorization_delay: std::time::Duration,
-        /// Namespaces handed to `stream_completion_with_namespaces` on the last
+        /// Namespaces handed to the hosted-search dispatch on the last
         /// turn. This is what the turn's provider is shown, so it is what an
         /// allowlist has to constrain.
         observed_namespaces: Mutex<Vec<ToolNamespace>>,
@@ -8651,8 +8654,8 @@ mod tests {
 
     #[async_trait::async_trait]
     impl LlmClient for CategorizingLlm {
-        fn supports_hosted_tool_search(&self) -> bool {
-            true
+        fn hosted_tool_search(&self) -> Option<&dyn HostedToolSearch> {
+            Some(self)
         }
 
         async fn stream_completion(
@@ -8681,9 +8684,12 @@ mod tests {
             on_chunk(text.clone());
             Ok(LlmResponse::text(text))
         }
+    }
 
-        /// Records what the turn's provider was shown, then behaves exactly as
-        /// the trait's default does - flatten into `stream_completion`.
+    #[async_trait::async_trait]
+    impl HostedToolSearch for CategorizingLlm {
+        /// Records what the turn's provider was shown, then flattens - the
+        /// explicit form of what a connector without hosted search does.
         async fn stream_completion_with_namespaces(
             &self,
             messages: Vec<Message>,
@@ -8693,10 +8699,7 @@ mod tests {
             on_chunk: ChunkCallback,
         ) -> Result<LlmResponse, CoreError> {
             *self.observed_namespaces.lock().unwrap() = namespaces.to_vec();
-            let mut all: Vec<ToolDefinition> = core_tools.to_vec();
-            for ns in namespaces {
-                all.extend(ns.tools.iter().cloned());
-            }
+            let all = crate::ports::llm::flatten_namespaces(core_tools, namespaces);
             self.stream_completion(messages, &all, reasoning, on_chunk)
                 .await
         }
@@ -9801,8 +9804,8 @@ mod tests {
         }
         #[async_trait::async_trait]
         impl LlmClient for HostedSearchLlm {
-            fn supports_hosted_tool_search(&self) -> bool {
-                true
+            fn hosted_tool_search(&self) -> Option<&dyn HostedToolSearch> {
+                Some(self)
             }
             async fn stream_completion(
                 &self,
@@ -9822,6 +9825,24 @@ mod tests {
                     on_chunk(resp.text.clone());
                 }
                 Ok(resp)
+            }
+        }
+
+        // The hosted request shape does not matter to this test, only that
+        // the turn takes the hosted path, so it flattens.
+        #[async_trait::async_trait]
+        impl HostedToolSearch for HostedSearchLlm {
+            async fn stream_completion_with_namespaces(
+                &self,
+                messages: Vec<Message>,
+                core_tools: &[ToolDefinition],
+                namespaces: &[ToolNamespace],
+                reasoning: ReasoningConfig,
+                on_chunk: ChunkCallback,
+            ) -> Result<LlmResponse, CoreError> {
+                let all = crate::ports::llm::flatten_namespaces(core_tools, namespaces);
+                self.stream_completion(messages, &all, reasoning, on_chunk)
+                    .await
             }
         }
 

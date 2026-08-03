@@ -516,10 +516,6 @@ impl<L: LlmClient> LlmClient for ClassifyingLlmClient<L> {
         self.inner.estimate_tokens(text)
     }
 
-    fn supports_hosted_tool_search(&self) -> bool {
-        self.inner.supports_hosted_tool_search()
-    }
-
     /// Hands back `self`, never the inner client's object, so this
     /// decorator stays in the call path for a namespaced turn. See
     /// [`LlmClient::hosted_tool_search`].
@@ -562,20 +558,6 @@ impl<L: LlmClient> LlmClient for ClassifyingLlmClient<L> {
             .stream_completion(messages, tools, reasoning, on_chunk)
             .await;
         self.reclassify(result).await
-    }
-
-    async fn stream_completion_with_namespaces(
-        &self,
-        messages: Vec<Message>,
-        core_tools: &[ToolDefinition],
-        namespaces: &[ToolNamespace],
-        reasoning: ReasoningConfig,
-        on_chunk: ChunkCallback,
-    ) -> Result<LlmResponse, CoreError> {
-        HostedToolSearch::stream_completion_with_namespaces(
-            self, messages, core_tools, namespaces, reasoning, on_chunk,
-        )
-        .await
     }
 }
 
@@ -668,10 +650,6 @@ mod tests {
                 }),
             }
         }
-
-        fn supports_hosted_tool_search(&self) -> bool {
-            false
-        }
     }
 
     /// Tier-3 classifier double: returns canned text and counts calls.
@@ -724,9 +702,6 @@ mod tests {
             } else {
                 Err(CoreError::Llm("classifier exploded".into()))
             }
-        }
-        fn supports_hosted_tool_search(&self) -> bool {
-            false
         }
     }
 
@@ -1373,31 +1348,6 @@ mod tests {
         assert!(window.recorded().is_empty());
     }
 
-    /// Connector double that reports hosted tool search. A decorator that
-    /// drops the forward reports the trait default `false` instead.
-    struct HostedSearchClient;
-
-    #[async_trait::async_trait]
-    impl LlmClient for HostedSearchClient {
-        async fn stream_completion(
-            &self,
-            _messages: Vec<Message>,
-            _tools: &[ToolDefinition],
-            _reasoning: ReasoningConfig,
-            _on_chunk: ChunkCallback,
-        ) -> Result<LlmResponse, CoreError> {
-            Ok(LlmResponse {
-                text: "ok".into(),
-                tool_calls: vec![],
-                usage: None,
-            })
-        }
-
-        fn supports_hosted_tool_search(&self) -> bool {
-            true
-        }
-    }
-
     /// The connector labels are crossed on purpose. `ClassifyingLlmClient`
     /// carries a connector name, so "answers from the inner client" and
     /// "answers from the connector name" are two different rules that agree
@@ -1406,15 +1356,17 @@ mod tests {
     /// that answered from the name it was given fails here.
     #[test]
     fn classifying_client_forwards_hosted_tool_search_from_inner() {
-        let wrapped = ClassifyingLlmClient::new(HostedSearchClient, "bedrock");
+        use crate::hosted_search_probe::NamespaceProbe;
+
+        let wrapped = ClassifyingLlmClient::new(NamespaceProbe::hosted(), "bedrock");
         assert!(
-            wrapped.supports_hosted_tool_search(),
+            wrapped.hosted_tool_search().is_some(),
             "the answer must come from the inner client, not the connector name"
         );
 
         let wrapped = ClassifyingLlmClient::new(StubClient::new(Behavior::Ok), "openai");
         assert!(
-            !wrapped.supports_hosted_tool_search(),
+            wrapped.hosted_tool_search().is_none(),
             "the answer must come from the inner client, not the connector name"
         );
     }

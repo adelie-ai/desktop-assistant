@@ -120,8 +120,8 @@ pub enum FallbackMode {
 ///
 /// Two groups of accessors resolve differently, and the split is
 /// deliberate. Anything that changes what a request contains or where it
-/// goes — `stream_completion`, `stream_completion_with_namespaces`,
-/// `supports_hosted_tool_search`, `max_context_tokens`, the model-listing
+/// goes — `stream_completion`, the hosted-search dispatch,
+/// `hosted_tool_search`, `max_context_tokens`, the model-listing
 /// calls — resolves through the per-turn active client, so the answer
 /// always describes the client the turn dispatches to. The borrowing
 /// accessors `get_default_model` and `get_default_base_url` return
@@ -403,38 +403,6 @@ impl LlmClient for RoutingLlmClient {
         }
     }
 
-    fn supports_hosted_tool_search(&self) -> bool {
-        // This answer must describe the client the turn will actually
-        // dispatch to, so PerTurn mode resolves the same way
-        // `stream_completion_with_namespaces` does. `ConversationHandler`
-        // reads the flag near the start of `send_prompt`, inside the scope
-        // the daemon's dispatch wrapper installs, so the task-local is
-        // already set for a turn that carries a per-turn model override.
-        //
-        // Answering from the captured client instead let the two disagree:
-        // a fallback with hosted search would strip `builtin_tool_search`
-        // from the tool list, then send the request to a connection without
-        // hosted search, whose default `stream_completion_with_namespaces`
-        // flattens every namespace tool into one call. The turn then paid
-        // for the whole fleet in one request and had no way to discover
-        // tools either.
-        //
-        // Dynamic-purpose mode is only used for backend tasks
-        // (title/summary), which don't traverse the hosted-search path, so
-        // reporting `false` is safe and matches the connector default. It
-        // must also ignore the task-local, for the same reason its dispatch
-        // path does: a backend task must not inherit the user's per-turn
-        // model override.
-        //
-        // Pinned mode holds the same invariant, and does have a client to
-        // ask, so it answers from the one it dispatches to.
-        match &self.fallback {
-            FallbackMode::PerTurn { .. } => self.resolve_per_turn().supports_hosted_tool_search(),
-            FallbackMode::Pinned { client, .. } => client.supports_hosted_tool_search(),
-            FallbackMode::DynamicPurpose { .. } => false,
-        }
-    }
-
     /// Hands back `self`, never the resolved client's object, so the router
     /// stays in the call path for a namespaced turn. Handing back the
     /// resolved client's object would also freeze the resolution at the
@@ -447,20 +415,6 @@ impl LlmClient for RoutingLlmClient {
             FallbackMode::DynamicPurpose { .. } => false,
         };
         resolved_has.then_some(self as &dyn HostedToolSearch)
-    }
-
-    async fn stream_completion_with_namespaces(
-        &self,
-        messages: Vec<Message>,
-        core_tools: &[ToolDefinition],
-        namespaces: &[ToolNamespace],
-        reasoning: ReasoningConfig,
-        on_chunk: ChunkCallback,
-    ) -> Result<LlmResponse, CoreError> {
-        HostedToolSearch::stream_completion_with_namespaces(
-            self, messages, core_tools, namespaces, reasoning, on_chunk,
-        )
-        .await
     }
 }
 
@@ -856,11 +810,11 @@ mod tests {
     /// construction. It records the tool names each dispatch offered, so a
     /// test can assert what the request actually carried.
     ///
-    /// `stream_completion_with_namespaces` is deliberately not overridden. A
-    /// connector without hosted search (Bedrock, Ollama) inherits the trait
-    /// default, which flattens every namespace tool into one
-    /// `stream_completion` call. That default is what makes a wrong
-    /// capability answer expensive, so the double must keep it.
+    /// Its hosted dispatch flattens on purpose. A connector without hosted
+    /// search (Bedrock, Ollama) sends every namespace tool in one ordinary
+    /// request, and that is what makes a wrong capability answer expensive,
+    /// so the double reproduces it on both paths and lets `offered()` compare
+    /// them.
     struct CapabilityLlm {
         hosted: bool,
         offered: std::sync::Mutex<Vec<Vec<String>>>,
@@ -896,8 +850,25 @@ mod tests {
             Ok(LlmResponse::text("done"))
         }
 
-        fn supports_hosted_tool_search(&self) -> bool {
-            self.hosted
+        fn hosted_tool_search(&self) -> Option<&dyn HostedToolSearch> {
+            self.hosted.then_some(self as &dyn HostedToolSearch)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl HostedToolSearch for CapabilityLlm {
+        async fn stream_completion_with_namespaces(
+            &self,
+            messages: Vec<Message>,
+            core_tools: &[ToolDefinition],
+            namespaces: &[ToolNamespace],
+            reasoning: ReasoningConfig,
+            on_chunk: ChunkCallback,
+        ) -> Result<LlmResponse, CoreError> {
+            let all =
+                desktop_assistant_core::ports::llm::flatten_namespaces(core_tools, namespaces);
+            self.stream_completion(messages, &all, reasoning, on_chunk)
+                .await
         }
     }
 
@@ -907,7 +878,7 @@ mod tests {
         let router = RoutingLlmClient::new(Arc::new(CapabilityLlm::new(true)));
         let without_search: Arc<dyn LlmClient> = Arc::new(CapabilityLlm::new(false));
         let answer = with_active_client(without_search, async {
-            router.supports_hosted_tool_search()
+            router.hosted_tool_search().is_some()
         })
         .await;
         assert!(
@@ -919,7 +890,7 @@ mod tests {
         let router = RoutingLlmClient::new(Arc::new(CapabilityLlm::new(false)));
         let with_search: Arc<dyn LlmClient> = Arc::new(CapabilityLlm::new(true));
         let answer =
-            with_active_client(with_search, async { router.supports_hosted_tool_search() }).await;
+            with_active_client(with_search, async { router.hosted_tool_search().is_some() }).await;
         assert!(
             answer,
             "capability must come from the active client, which has hosted search"
@@ -930,13 +901,13 @@ mod tests {
     async fn hosted_tool_search_uses_the_fallback_when_no_override_is_installed() {
         let router = RoutingLlmClient::new(Arc::new(CapabilityLlm::new(true)));
         assert!(
-            router.supports_hosted_tool_search(),
+            router.hosted_tool_search().is_some(),
             "with no override installed the static fallback answers"
         );
 
         let router = RoutingLlmClient::new(Arc::new(CapabilityLlm::new(false)));
         assert!(
-            !router.supports_hosted_tool_search(),
+            !router.hosted_tool_search().is_some(),
             "with no override installed the static fallback answers"
         );
     }
@@ -946,7 +917,7 @@ mod tests {
         let handle = build_handle_with_titling("titling-model");
         let client = RoutingLlmClient::new_dynamic_purpose(handle, PurposeKind::Titling);
         assert!(
-            !client.supports_hosted_tool_search(),
+            !client.hosted_tool_search().is_some(),
             "dynamic-purpose wrappers report the connector default"
         );
 
@@ -954,7 +925,7 @@ mod tests {
         // when they start inside a `send_prompt` scope.
         let hosted: Arc<dyn LlmClient> = Arc::new(CapabilityLlm::new(true));
         let answer =
-            with_active_client(hosted, async { client.supports_hosted_tool_search() }).await;
+            with_active_client(hosted, async { client.hosted_tool_search().is_some() }).await;
         assert!(
             !answer,
             "dynamic-purpose wrappers must ignore the per-turn override"

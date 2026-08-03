@@ -1259,26 +1259,39 @@ mod tests {
         .expect("Azure Entra without an api key should pass preflight");
     }
 
-    // --- hosted tool search: a claim must be backed by an implementation ---
+    // --- hosted tool search: what a claim puts on the wire ---
     //
-    // Two independent things have to agree for hosted tool search to work:
-    // `LlmClient::supports_hosted_tool_search` says the connector does it, and
-    // `LlmClient::stream_completion_with_namespaces` is what actually does it.
-    // The trait ships a default for the second that flattens every namespace
-    // into one ordinary tool list, so a connector that claims the capability
-    // without overriding it sends the whole tool fleet in a single request and
-    // no tool-search entry at all - the service layer has already stripped
-    // `builtin_tool_search` by then. The sweep below drives every production
-    // client, by both construction paths, and refuses that combination.
+    // A client reports hosted tool search by returning its own
+    // `HostedToolSearch` object from `LlmClient::hosted_tool_search`, so the
+    // claim and the implementation are one fact and the compiler holds them
+    // together. Three things are still outside the type system, and this
+    // sweep is what holds each of them:
+    //
+    // 1. What the implementation puts on the wire. The compiler requires a
+    //    body, not a correct request. A body that flattens every namespace
+    //    into an ordinary tool list compiles, and produces exactly the turn
+    //    this capability exists to avoid: the whole tool fleet in one
+    //    request, and no tool-search entry, because the service layer strips
+    //    `builtin_tool_search` as soon as hosted search is active. The
+    //    marker assertions below read the captured request body.
+    // 2. The registry wiring. A connector arm that stops calling
+    //    `.with_hosted_tool_search(...)` takes the capability away from every
+    //    configured connection while every type still checks. The factory
+    //    path is what notices.
+    // 3. That the claim did not quietly disappear. A connector that used to
+    //    claim and now does not is almost always a wiring path gone dark, so
+    //    a missing claim fails as loudly as a false one.
     //
     // "Every" is `Connector::ALL`, which `declare_connectors!` emits from the
     // same token list that declares the variants. So the sweep reaches a new
     // connector as soon as it exists, and `probe_target` - exhaustive, no
     // catch-all - refuses to compile until it is classified.
     //
-    // The sweep is a guard, not the fix. Removing the trait's default body
-    // would make the invariant unrepresentable rather than merely tested, and
-    // #1033 tracks that.
+    // What this sweep no longer has to prove: that a client claiming the
+    // capability implements the dispatch at all, and that a decorator
+    // forwarding the claim also forwards the dispatch. Neither is
+    // representable now. The decorators' own in-the-path tests cover what
+    // replaced the second.
 
     /// Name of the single tool the probe turn carries. It appears in both the
     /// namespaced and the flattened request body, which is how a captured body
@@ -1408,13 +1421,13 @@ mod tests {
     /// The same connector built through the production factory with the config
     /// asking for hosted tool search.
     ///
-    /// What this second path is worth today: it drives the decorator stack
-    /// `build_llm_client` wraps around every client, so a decorator that
-    /// forwards `supports_hosted_tool_search` while forgetting to forward
-    /// `stream_completion_with_namespaces` fails here. It also holds the
-    /// registry's own wiring - a connector arm that stops calling
+    /// What this second path is worth today: it holds the registry's own
+    /// wiring. A connector arm that stops calling
     /// `.with_hosted_tool_search(...)` takes the capability away from every
-    /// configured connection, and this path is what notices.
+    /// configured connection while every type still checks, and this path is
+    /// what notices. It also drives the whole decorator stack
+    /// `build_llm_client` wraps around each client, so the request the sweep
+    /// reads is the one a real turn produces.
     ///
     /// What it is not, yet: extra connector coverage. It reaches the same two
     /// connectors the direct path reaches and is inert for the other five,
@@ -1444,9 +1457,9 @@ mod tests {
     }
 
     /// Run one turn and report what reached the mock server. `namespaced`
-    /// selects `stream_completion_with_namespaces` over `stream_completion`;
-    /// both carry the same single probe tool, so a client that inherits the
-    /// trait's flattening default produces the same bytes twice.
+    /// selects the hosted-search dispatch over `stream_completion`; both
+    /// carry the same single probe tool, so a client whose hosted dispatch
+    /// only flattens produces the same bytes twice.
     ///
     /// The count in [`ProbeOutcome::NoProbeRequest`] can include traffic the
     /// turn did not send. `build_llm_client` spawns a background
@@ -1467,15 +1480,15 @@ mod tests {
         )];
         let reasoning = desktop_assistant_core::ports::llm::ReasoningConfig::default();
         let _ = if namespaced {
-            client
-                .stream_completion_with_namespaces(
-                    messages,
-                    &[],
-                    &[probe_namespace()],
-                    reasoning,
-                    Box::new(|_| true),
-                )
-                .await
+            desktop_assistant_core::ports::llm::dispatch_namespaced(
+                client,
+                messages,
+                &[],
+                &[probe_namespace()],
+                reasoning,
+                Box::new(|_| true),
+            )
+            .await
         } else {
             client
                 .stream_completion(messages, &[probe_tool()], reasoning, Box::new(|_| true))
@@ -1604,7 +1617,7 @@ mod tests {
                 ("its own builder", &target.direct),
                 ("the registry factory", &factory),
             ] {
-                let claims = client.supports_hosted_tool_search();
+                let claims = client.hosted_tool_search().is_some();
 
                 if claims {
                     let marker = target.hosted_search_marker.unwrap_or_else(|| {
@@ -1646,11 +1659,10 @@ mod tests {
                     );
                     assert_ne!(
                         namespaced, flattened,
-                        "{connector} (built by {path}) reports \
-                         supports_hosted_tool_search() == true, but its namespaced request \
-                         is byte-identical to a plain request with the namespace tools \
-                         flattened in: it inherits the trait's flattening default instead \
-                         of overriding stream_completion_with_namespaces"
+                        "{connector} (built by {path}) reports hosted tool search, but its \
+                         namespaced request is byte-identical to a plain request with the \
+                         namespace tools flattened in: its `HostedToolSearch` body only \
+                         flattens, which is the turn the capability exists to avoid"
                     );
                 }
 
@@ -1660,11 +1672,11 @@ mod tests {
                         "{connector} (built by {path}) no longer claims hosted tool search. \
                          A connector that used to do this and stopped almost always means a \
                          wiring path went dark: check that `build_llm_client`'s {connector} \
-                         arm still calls `.with_hosted_tool_search(...)`, and that the \
-                         client still returns its configured flag rather than a hardcoded \
-                         `false`. Recording a `no_claim_reason` here is correct only if the \
-                         capability was deliberately removed from this connector - then say \
-                         so in its arm."
+                         arm still calls `.with_hosted_tool_search(...)`, and that \
+                         `hosted_tool_search()` still reads its configured flag rather than \
+                         answering `None` outright. Recording a `no_claim_reason` here is \
+                         correct only if the capability was deliberately removed from this \
+                         connector - then say so in its arm."
                     ),
                     (Some(reason), true) => panic!(
                         "{connector} (built by {path}) claims hosted tool search, but is \

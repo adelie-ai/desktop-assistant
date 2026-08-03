@@ -250,10 +250,6 @@ impl<L: LlmClient> LlmClient for ProfilingLlmClient<L> {
         result
     }
 
-    fn supports_hosted_tool_search(&self) -> bool {
-        self.inner.supports_hosted_tool_search()
-    }
-
     /// Hands back `self`, never the inner client's object, so this
     /// decorator stays in the call path for a namespaced turn. See
     /// [`LlmClient::hosted_tool_search`].
@@ -262,20 +258,6 @@ impl<L: LlmClient> LlmClient for ProfilingLlmClient<L> {
             .hosted_tool_search()
             .is_some()
             .then_some(self as &dyn HostedToolSearch)
-    }
-
-    async fn stream_completion_with_namespaces(
-        &self,
-        messages: Vec<Message>,
-        core_tools: &[ToolDefinition],
-        namespaces: &[ToolNamespace],
-        reasoning: ReasoningConfig,
-        on_chunk: ChunkCallback,
-    ) -> Result<LlmResponse, CoreError> {
-        HostedToolSearch::stream_completion_with_namespaces(
-            self, messages, core_tools, namespaces, reasoning, on_chunk,
-        )
-        .await
     }
 }
 
@@ -471,13 +453,6 @@ impl<L: LlmClient> LlmClient for MaybeProfiled<L> {
         }
     }
 
-    fn supports_hosted_tool_search(&self) -> bool {
-        match self {
-            Self::Plain(l) => l.supports_hosted_tool_search(),
-            Self::Profiled(l) => l.supports_hosted_tool_search(),
-        }
-    }
-
     /// Hands back `self`, never the inner client's object, so this
     /// decorator stays in the call path for a namespaced turn. See
     /// [`LlmClient::hosted_tool_search`].
@@ -487,20 +462,6 @@ impl<L: LlmClient> LlmClient for MaybeProfiled<L> {
             Self::Profiled(l) => l.hosted_tool_search().is_some(),
         };
         inner_has.then_some(self as &dyn HostedToolSearch)
-    }
-
-    async fn stream_completion_with_namespaces(
-        &self,
-        messages: Vec<Message>,
-        core_tools: &[ToolDefinition],
-        namespaces: &[ToolNamespace],
-        reasoning: ReasoningConfig,
-        on_chunk: ChunkCallback,
-    ) -> Result<LlmResponse, CoreError> {
-        HostedToolSearch::stream_completion_with_namespaces(
-            self, messages, core_tools, namespaces, reasoning, on_chunk,
-        )
-        .await
     }
 }
 
@@ -712,8 +673,22 @@ mod tests {
             Ok(LlmResponse::text("hosted"))
         }
 
-        fn supports_hosted_tool_search(&self) -> bool {
-            true
+        fn hosted_tool_search(&self) -> Option<&dyn HostedToolSearch> {
+            Some(self)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl HostedToolSearch for HostedSearchLlm {
+        async fn stream_completion_with_namespaces(
+            &self,
+            _messages: Vec<Message>,
+            _core_tools: &[ToolDefinition],
+            _namespaces: &[ToolNamespace],
+            _reasoning: ReasoningConfig,
+            _on_chunk: ChunkCallback,
+        ) -> Result<LlmResponse, CoreError> {
+            Ok(LlmResponse::text("hosted namespaced"))
         }
     }
 
@@ -740,11 +715,14 @@ mod tests {
         let path = capability_log_path("profiling");
         assert!(
             ProfilingLlmClient::new(HostedSearchLlm, path.clone(), false)
-                .supports_hosted_tool_search(),
+                .hosted_tool_search()
+                .is_some(),
             "must forward the inner capability"
         );
         assert!(
-            !ProfilingLlmClient::new(MockLlm, path, false).supports_hosted_tool_search(),
+            !ProfilingLlmClient::new(MockLlm, path, false)
+                .hosted_tool_search()
+                .is_some(),
             "must not invent a capability the inner client does not have"
         );
     }
@@ -752,11 +730,13 @@ mod tests {
     #[test]
     fn maybe_profiled_plain_answers_hosted_tool_search_from_inner() {
         assert!(
-            MaybeProfiled::Plain(HostedSearchLlm).supports_hosted_tool_search(),
+            MaybeProfiled::Plain(HostedSearchLlm)
+                .hosted_tool_search()
+                .is_some(),
             "must forward the inner capability"
         );
         assert!(
-            !MaybeProfiled::Plain(MockLlm).supports_hosted_tool_search(),
+            !MaybeProfiled::Plain(MockLlm).hosted_tool_search().is_some(),
             "must not invent a capability the inner client does not have"
         );
     }
@@ -770,12 +750,14 @@ mod tests {
                 path.clone(),
                 false
             ))
-            .supports_hosted_tool_search(),
+            .hosted_tool_search()
+            .is_some(),
             "must forward the inner capability"
         );
         assert!(
             !MaybeProfiled::Profiled(ProfilingLlmClient::new(MockLlm, path, false))
-                .supports_hosted_tool_search(),
+                .hosted_tool_search()
+                .is_some(),
             "must not invent a capability the inner client does not have"
         );
     }
@@ -787,11 +769,15 @@ mod tests {
         use crate::ports::llm::RetryingLlmClient;
 
         assert!(
-            RetryingLlmClient::new(HostedSearchLlm, 1).supports_hosted_tool_search(),
+            RetryingLlmClient::new(HostedSearchLlm, 1)
+                .hosted_tool_search()
+                .is_some(),
             "must forward the inner capability"
         );
         assert!(
-            !RetryingLlmClient::new(MockLlm, 1).supports_hosted_tool_search(),
+            !RetryingLlmClient::new(MockLlm, 1)
+                .hosted_tool_search()
+                .is_some(),
             "must not invent a capability the inner client does not have"
         );
     }
@@ -911,12 +897,12 @@ mod tests {
 
         let hosted: Arc<dyn LlmClient> = Arc::new(HostedSearchLlm);
         assert!(
-            hosted.supports_hosted_tool_search(),
+            hosted.hosted_tool_search().is_some(),
             "must forward the inner capability"
         );
         let plain: Arc<dyn LlmClient> = Arc::new(MockLlm);
         assert!(
-            !plain.supports_hosted_tool_search(),
+            !plain.hosted_tool_search().is_some(),
             "must not invent a capability the inner client does not have"
         );
     }
