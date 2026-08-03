@@ -84,10 +84,22 @@ pub enum FallbackMode {
 /// one is installed (Static mode only), or to the configured fallback
 /// otherwise.
 ///
-/// Note that `list_models`, capability flags, and default-model accessors
-/// always delegate to the Static fallback — they describe the handler's
-/// configured interactive model and are not meaningfully per-turn. The
-/// DynamicPurpose mode is only useful for `stream_completion` paths.
+/// Two groups of accessors resolve differently, and the split is
+/// deliberate. Anything that changes what a request contains or where it
+/// goes — `stream_completion`, `stream_completion_with_namespaces`,
+/// `supports_hosted_tool_search`, `max_context_tokens`, the model-listing
+/// calls — resolves through the per-turn active client, so the answer
+/// always describes the client the turn dispatches to. The borrowing
+/// accessors `get_default_model` and `get_default_base_url` return
+/// `Option<&str>` tied to `self`, which no task-local lookup can satisfy,
+/// so they report the statically configured value. The DynamicPurpose mode
+/// has no single captured client and answers `None`/`false`/empty for all
+/// of them.
+///
+/// One method sits in neither group: `estimate_tokens` is not overridden
+/// here at all, so the trait's own `chars/4` estimate answers whatever
+/// client is resolved. That is harmless while no connector overrides it
+/// with a better tokeniser, and wrong the moment one does.
 #[derive(Clone)]
 pub struct RoutingLlmClient {
     fallback: FallbackMode,
@@ -298,15 +310,31 @@ impl LlmClient for RoutingLlmClient {
     }
 
     fn supports_hosted_tool_search(&self) -> bool {
-        // The flag gates how `ConversationHandler` assembles the tool
-        // list at the start of a turn, before any task-local is
-        // consulted. Static mode reports the fallback's capability;
-        // dynamic-purpose mode is only used for backend tasks
-        // (title/summary), which don't traverse the hosted-search path,
-        // so reporting `false` is safe and matches the connector-default.
-        self.static_fallback()
-            .map(|c| c.supports_hosted_tool_search())
-            .unwrap_or(false)
+        // This answer must describe the client the turn will actually
+        // dispatch to, so Static mode resolves the same way
+        // `stream_completion_with_namespaces` does. `ConversationHandler`
+        // reads the flag near the start of `send_prompt`, inside the scope
+        // the daemon's dispatch wrapper installs, so the task-local is
+        // already set for a turn that carries a per-turn model override.
+        //
+        // Answering from the static fallback instead let the two disagree:
+        // a fallback with hosted search would strip `builtin_tool_search`
+        // from the tool list, then send the request to a connection without
+        // hosted search, whose default `stream_completion_with_namespaces`
+        // flattens every namespace tool into one call. The turn then paid
+        // for the whole fleet in one request and had no way to discover
+        // tools either.
+        //
+        // Dynamic-purpose mode is only used for backend tasks
+        // (title/summary), which don't traverse the hosted-search path, so
+        // reporting `false` is safe and matches the connector default. It
+        // must also ignore the task-local, for the same reason its dispatch
+        // path does: a backend task must not inherit the user's per-turn
+        // model override.
+        match &self.fallback {
+            FallbackMode::Static { .. } => self.resolve_static().supports_hosted_tool_search(),
+            FallbackMode::DynamicPurpose { .. } => false,
+        }
     }
 
     async fn stream_completion_with_namespaces(
@@ -683,6 +711,306 @@ mod tests {
         let (resolved2, _) = resolve_purpose_dispatch(Some(&cfg2), PurposeKind::Titling)
             .expect("titling resolves after mutation");
         assert_eq!(resolved2.model, "model-v2");
+    }
+
+    // --- Hosted-tool-search capability --------------------------------------
+
+    /// `LlmClient` double whose hosted-tool-search answer is fixed at
+    /// construction. It records the tool names each dispatch offered, so a
+    /// test can assert what the request actually carried.
+    ///
+    /// `stream_completion_with_namespaces` is deliberately not overridden. A
+    /// connector without hosted search (Bedrock, Ollama) inherits the trait
+    /// default, which flattens every namespace tool into one
+    /// `stream_completion` call. That default is what makes a wrong
+    /// capability answer expensive, so the double must keep it.
+    struct CapabilityLlm {
+        hosted: bool,
+        offered: std::sync::Mutex<Vec<Vec<String>>>,
+    }
+
+    impl CapabilityLlm {
+        fn new(hosted: bool) -> Self {
+            Self {
+                hosted,
+                offered: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        /// One entry per dispatch: the tool names that request carried.
+        fn offered(&self) -> Vec<Vec<String>> {
+            self.offered.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for CapabilityLlm {
+        async fn stream_completion(
+            &self,
+            _messages: Vec<Message>,
+            tools: &[ToolDefinition],
+            _reasoning: ReasoningConfig,
+            _on_chunk: ChunkCallback,
+        ) -> Result<LlmResponse, CoreError> {
+            self.offered
+                .lock()
+                .unwrap()
+                .push(tools.iter().map(|t| t.name.clone()).collect());
+            Ok(LlmResponse::text("done"))
+        }
+
+        fn supports_hosted_tool_search(&self) -> bool {
+            self.hosted
+        }
+    }
+
+    #[tokio::test]
+    async fn hosted_tool_search_follows_the_active_client_override() {
+        // Fallback supports hosted search; the turn's override does not.
+        let router = RoutingLlmClient::new(Arc::new(CapabilityLlm::new(true)));
+        let without_search: Arc<dyn LlmClient> = Arc::new(CapabilityLlm::new(false));
+        let answer = with_active_client(without_search, async {
+            router.supports_hosted_tool_search()
+        })
+        .await;
+        assert!(
+            !answer,
+            "capability must come from the active client, which has no hosted search"
+        );
+
+        // The other direction, so a constant answer cannot pass this test.
+        let router = RoutingLlmClient::new(Arc::new(CapabilityLlm::new(false)));
+        let with_search: Arc<dyn LlmClient> = Arc::new(CapabilityLlm::new(true));
+        let answer =
+            with_active_client(with_search, async { router.supports_hosted_tool_search() }).await;
+        assert!(
+            answer,
+            "capability must come from the active client, which has hosted search"
+        );
+    }
+
+    #[tokio::test]
+    async fn hosted_tool_search_uses_the_fallback_when_no_override_is_installed() {
+        let router = RoutingLlmClient::new(Arc::new(CapabilityLlm::new(true)));
+        assert!(
+            router.supports_hosted_tool_search(),
+            "with no override installed the static fallback answers"
+        );
+
+        let router = RoutingLlmClient::new(Arc::new(CapabilityLlm::new(false)));
+        assert!(
+            !router.supports_hosted_tool_search(),
+            "with no override installed the static fallback answers"
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_purpose_mode_still_reports_false() {
+        let handle = build_handle_with_titling("titling-model");
+        let client = RoutingLlmClient::new_dynamic_purpose(handle, PurposeKind::Titling);
+        assert!(
+            !client.supports_hosted_tool_search(),
+            "dynamic-purpose wrappers report the connector default"
+        );
+
+        // Backend tasks must not inherit the user's per-turn override even
+        // when they start inside a `send_prompt` scope.
+        let hosted: Arc<dyn LlmClient> = Arc::new(CapabilityLlm::new(true));
+        let answer =
+            with_active_client(hosted, async { client.supports_hosted_tool_search() }).await;
+        assert!(
+            !answer,
+            "dynamic-purpose wrappers must ignore the per-turn override"
+        );
+    }
+
+    // --- End-to-end turn through `send_prompt` ------------------------------
+
+    /// In-memory conversation store for the end-to-end turn test.
+    #[derive(Default)]
+    struct MemStore {
+        data: std::sync::Mutex<
+            std::collections::HashMap<String, desktop_assistant_core::domain::Conversation>,
+        >,
+    }
+
+    impl desktop_assistant_core::ports::store::ConversationStore for MemStore {
+        async fn create(
+            &self,
+            conv: desktop_assistant_core::domain::Conversation,
+        ) -> Result<(), CoreError> {
+            self.data.lock().unwrap().insert(conv.id.0.clone(), conv);
+            Ok(())
+        }
+
+        async fn get(
+            &self,
+            id: &desktop_assistant_core::domain::ConversationId,
+        ) -> Result<desktop_assistant_core::domain::Conversation, CoreError> {
+            self.data
+                .lock()
+                .unwrap()
+                .get(&id.0)
+                .cloned()
+                .ok_or_else(|| CoreError::ConversationNotFound(id.0.clone()))
+        }
+
+        async fn list(
+            &self,
+        ) -> Result<Vec<desktop_assistant_core::domain::ConversationSummary>, CoreError> {
+            Ok(Vec::new())
+        }
+
+        async fn update(
+            &self,
+            conv: desktop_assistant_core::domain::Conversation,
+        ) -> Result<(), CoreError> {
+            self.data.lock().unwrap().insert(conv.id.0.clone(), conv);
+            Ok(())
+        }
+
+        async fn delete(
+            &self,
+            id: &desktop_assistant_core::domain::ConversationId,
+        ) -> Result<(), CoreError> {
+            self.data.lock().unwrap().remove(&id.0);
+            Ok(())
+        }
+
+        async fn archive(
+            &self,
+            _id: &desktop_assistant_core::domain::ConversationId,
+        ) -> Result<(), CoreError> {
+            Ok(())
+        }
+
+        async fn unarchive(
+            &self,
+            _id: &desktop_assistant_core::domain::ConversationId,
+        ) -> Result<(), CoreError> {
+            Ok(())
+        }
+
+        async fn create_summary(
+            &self,
+            _conversation_id: &desktop_assistant_core::domain::ConversationId,
+            _summary: String,
+            _start_ordinal: usize,
+            _end_ordinal: usize,
+        ) -> Result<String, CoreError> {
+            Ok("summary-1".to_string())
+        }
+
+        async fn expand_summary(&self, _summary_id: &str) -> Result<(), CoreError> {
+            Ok(())
+        }
+    }
+
+    /// Tool executor with one core tool and a small namespaced fleet.
+    ///
+    /// The fleet has three tools on purpose. `categorize_tool_namespaces`
+    /// returns its input unchanged when the namespaced set holds ten tools
+    /// or fewer (`crates/core/src/tools.rs`), so the turn under test needs no
+    /// categorization LLM round-trip and the namespaces reach dispatch as
+    /// written. Raising that threshold is safe, and so is lowering it to
+    /// three. Lowering it below three turns this into a categorization test,
+    /// and the failure would name the tool list rather than the threshold
+    /// that changed.
+    struct FleetTools;
+
+    impl FleetTools {
+        fn tool(name: &str) -> ToolDefinition {
+            ToolDefinition::new(name, "test tool", serde_json::json!({"type": "object"}))
+        }
+    }
+
+    impl desktop_assistant_core::ports::tools::ToolExecutor for FleetTools {
+        async fn core_tools(&self) -> Vec<ToolDefinition> {
+            vec![Self::tool("builtin_tool_search")]
+        }
+
+        async fn search_tools(&self, _query: &str) -> Result<Vec<ToolDefinition>, CoreError> {
+            Ok(Vec::new())
+        }
+
+        async fn tool_definition(&self, _name: &str) -> Result<Option<ToolDefinition>, CoreError> {
+            Ok(None)
+        }
+
+        async fn tool_namespaces(&self) -> Vec<ToolNamespace> {
+            vec![ToolNamespace::new(
+                "fleet",
+                "the whole tool fleet",
+                vec![
+                    Self::tool("fleet_alpha"),
+                    Self::tool("fleet_beta"),
+                    Self::tool("fleet_gamma"),
+                ],
+            )]
+        }
+
+        async fn execute_tool(
+            &self,
+            _name: &str,
+            _arguments: serde_json::Value,
+        ) -> Result<String, CoreError> {
+            Ok(String::new())
+        }
+    }
+
+    /// The #1021 failure, end to end. The static fallback supports hosted
+    /// tool search, the turn overrides to a connection that does not, and
+    /// the request must therefore keep `builtin_tool_search` and must not
+    /// flatten the namespaced fleet into one call.
+    #[tokio::test]
+    async fn per_turn_override_keeps_tool_search_and_does_not_flatten_the_fleet() {
+        use desktop_assistant_core::ports::inbound::ConversationService;
+        use desktop_assistant_core::service::ConversationHandler;
+
+        let hosted_fallback = Arc::new(CapabilityLlm::new(true));
+        let overridden = Arc::new(CapabilityLlm::new(false));
+
+        let router = RoutingLlmClient::new(Arc::clone(&hosted_fallback) as Arc<dyn LlmClient>);
+        let handler = ConversationHandler::with_tools(
+            MemStore::default(),
+            router,
+            FleetTools,
+            Box::new(|| "conv-1".to_string()),
+        );
+        let conv = handler
+            .create_conversation("routing".to_string(), vec![])
+            .await
+            .expect("conversation is created");
+
+        with_active_client(
+            Arc::clone(&overridden) as Arc<dyn LlmClient>,
+            handler.send_prompt(
+                &conv.id,
+                "hello".to_string(),
+                Box::new(|_| true),
+                Box::new(|_| {}),
+            ),
+        )
+        .await
+        .expect("the turn completes");
+
+        assert!(
+            hosted_fallback.offered().is_empty(),
+            "the turn must dispatch to the override, not the fallback"
+        );
+
+        // Later dispatches in the turn are the title-generation round, which
+        // carries no tools. The turn's own request is the first one.
+        let offered = overridden.offered();
+        let first = offered.first().expect("the turn dispatched to the LLM");
+        assert!(
+            first.iter().any(|n| n == "builtin_tool_search"),
+            "a connection without hosted search keeps builtin_tool_search; got {first:?}"
+        );
+        assert!(
+            !offered.iter().flatten().any(|n| n.starts_with("fleet_")),
+            "the namespaced fleet must not be flattened into a request; got {offered:?}"
+        );
     }
 
     #[tokio::test(start_paused = true)]

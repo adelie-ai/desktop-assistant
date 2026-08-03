@@ -632,4 +632,131 @@ mod tests {
             .unwrap();
         assert_eq!(response.text, "mock response");
     }
+
+    /// Connector double that reports hosted tool search, paired with
+    /// [`MockLlm`], which reports the trait default `false`. Every decorator
+    /// below is asserted against both, because the two ways a decorator can
+    /// answer for the wrong client fail in opposite directions:
+    ///
+    /// - Dropping the forward falls through to the trait default `false`,
+    ///   which only the `HostedSearchLlm` case detects.
+    /// - Hardcoding `true` invents a capability the inner client does not
+    ///   have, which only the `MockLlm` case detects. This is the harmful
+    ///   direction, and the shape of the defect this module's tests exist
+    ///   for: a turn that believes in hosted search strips
+    ///   `builtin_tool_search` and then sends the whole tool fleet to a
+    ///   connector that cannot do hosted search.
+    struct HostedSearchLlm;
+
+    #[async_trait::async_trait]
+    impl LlmClient for HostedSearchLlm {
+        async fn stream_completion(
+            &self,
+            _messages: Vec<Message>,
+            _tools: &[ToolDefinition],
+            _reasoning: ReasoningConfig,
+            _on_chunk: ChunkCallback,
+        ) -> Result<LlmResponse, CoreError> {
+            Ok(LlmResponse::text("hosted"))
+        }
+
+        fn supports_hosted_tool_search(&self) -> bool {
+            true
+        }
+    }
+
+    /// Profiling log path for the capability tests. They never dispatch, so
+    /// nothing is written; the path still goes under the temp directory so a
+    /// later edit that does dispatch cannot drop a file in the working
+    /// directory.
+    ///
+    /// `label` names the calling test. It cannot be `line!()` here: that
+    /// macro expands where it is written, so a call inside this helper
+    /// yields this line for every caller and the paths collide.
+    fn capability_log_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "llm_profile_capability_{}_{label}.jsonl",
+            std::process::id()
+        ))
+    }
+
+    /// One test per decorator, so a mutation of one decorator names that
+    /// decorator in the failure output rather than stopping the whole sweep
+    /// at its first assertion.
+    #[test]
+    fn profiling_client_answers_hosted_tool_search_from_inner() {
+        let path = capability_log_path("profiling");
+        assert!(
+            ProfilingLlmClient::new(HostedSearchLlm, path.clone(), false)
+                .supports_hosted_tool_search(),
+            "must forward the inner capability"
+        );
+        assert!(
+            !ProfilingLlmClient::new(MockLlm, path, false).supports_hosted_tool_search(),
+            "must not invent a capability the inner client does not have"
+        );
+    }
+
+    #[test]
+    fn maybe_profiled_plain_answers_hosted_tool_search_from_inner() {
+        assert!(
+            MaybeProfiled::Plain(HostedSearchLlm).supports_hosted_tool_search(),
+            "must forward the inner capability"
+        );
+        assert!(
+            !MaybeProfiled::Plain(MockLlm).supports_hosted_tool_search(),
+            "must not invent a capability the inner client does not have"
+        );
+    }
+
+    #[test]
+    fn maybe_profiled_profiled_answers_hosted_tool_search_from_inner() {
+        let path = capability_log_path("maybe_profiled");
+        assert!(
+            MaybeProfiled::Profiled(ProfilingLlmClient::new(
+                HostedSearchLlm,
+                path.clone(),
+                false
+            ))
+            .supports_hosted_tool_search(),
+            "must forward the inner capability"
+        );
+        assert!(
+            !MaybeProfiled::Profiled(ProfilingLlmClient::new(MockLlm, path, false))
+                .supports_hosted_tool_search(),
+            "must not invent a capability the inner client does not have"
+        );
+    }
+
+    /// This wrapper sits around every client the daemon builds, so a wrong
+    /// answer here reaches the whole fleet at once.
+    #[test]
+    fn retrying_client_answers_hosted_tool_search_from_inner() {
+        use crate::ports::llm::RetryingLlmClient;
+
+        assert!(
+            RetryingLlmClient::new(HostedSearchLlm, 1).supports_hosted_tool_search(),
+            "must forward the inner capability"
+        );
+        assert!(
+            !RetryingLlmClient::new(MockLlm, 1).supports_hosted_tool_search(),
+            "must not invent a capability the inner client does not have"
+        );
+    }
+
+    #[test]
+    fn arc_blanket_impl_answers_hosted_tool_search_from_inner() {
+        use std::sync::Arc;
+
+        let hosted: Arc<dyn LlmClient> = Arc::new(HostedSearchLlm);
+        assert!(
+            hosted.supports_hosted_tool_search(),
+            "must forward the inner capability"
+        );
+        let plain: Arc<dyn LlmClient> = Arc::new(MockLlm);
+        assert!(
+            !plain.supports_hosted_tool_search(),
+            "must not invent a capability the inner client does not have"
+        );
+    }
 }

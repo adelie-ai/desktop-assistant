@@ -1303,4 +1303,50 @@ mod tests {
         .await;
         assert!(window.recorded().is_empty());
     }
+
+    /// Connector double that reports hosted tool search. A decorator that
+    /// drops the forward reports the trait default `false` instead.
+    struct HostedSearchClient;
+
+    #[async_trait::async_trait]
+    impl LlmClient for HostedSearchClient {
+        async fn stream_completion(
+            &self,
+            _messages: Vec<Message>,
+            _tools: &[ToolDefinition],
+            _reasoning: ReasoningConfig,
+            _on_chunk: ChunkCallback,
+        ) -> Result<LlmResponse, CoreError> {
+            Ok(LlmResponse {
+                text: "ok".into(),
+                tool_calls: vec![],
+                usage: None,
+            })
+        }
+
+        fn supports_hosted_tool_search(&self) -> bool {
+            true
+        }
+    }
+
+    /// The connector labels are crossed on purpose. `ClassifyingLlmClient`
+    /// carries a connector name, so "answers from the inner client" and
+    /// "answers from the connector name" are two different rules that agree
+    /// on every straight pairing. Pairing the hosted double with `"bedrock"`
+    /// and the plain one with `"openai"` makes them disagree, so a decorator
+    /// that answered from the name it was given fails here.
+    #[test]
+    fn classifying_client_forwards_hosted_tool_search_from_inner() {
+        let wrapped = ClassifyingLlmClient::new(HostedSearchClient, "bedrock");
+        assert!(
+            wrapped.supports_hosted_tool_search(),
+            "the answer must come from the inner client, not the connector name"
+        );
+
+        let wrapped = ClassifyingLlmClient::new(StubClient::new(Behavior::Ok), "openai");
+        assert!(
+            !wrapped.supports_hosted_tool_search(),
+            "the answer must come from the inner client, not the connector name"
+        );
+    }
 }

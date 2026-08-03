@@ -1709,6 +1709,16 @@ where
             .resolve_turn(user_driven_selection.as_ref(), effective_selection.as_ref())
             .await?;
 
+        // The turn's tool-discovery mode is NOT logged here, deliberately.
+        // `active_client` is the raw registry client, and the turn asks the
+        // decorator chain that wraps it
+        // (`Arc` -> `MaybeProfiled` -> `Retrying` -> `FixedReasoning` ->
+        // `RoutingLlmClient`). The two answers agree only while every
+        // decorator forwards the capability correctly, which is precisely the
+        // invariant that breaks. Logging the raw client here would print the
+        // right answer while the turn used the wrong one, and point an
+        // operator away from the cause. `ConversationHandler::send_prompt`
+        // logs the mode from the value it actually used instead.
         tracing::info!(
             purpose = ?if routed_via_voice { PurposeKind::Voice } else { PurposeKind::Interactive },
             connection = ?chosen.as_ref().map(|(c, _)| c.as_str()),
