@@ -1261,11 +1261,11 @@ mod tests {
 
     // --- hosted tool search: what a claim puts on the wire ---
     //
-    // A client reports hosted tool search by returning its own
-    // `HostedToolSearch` object from `LlmClient::hosted_tool_search`, so the
-    // claim and the implementation are one fact and the compiler holds them
-    // together. Three things are still outside the type system, and this
-    // sweep is what holds each of them:
+    // A client reports hosted tool search by returning a `HostedToolSearch`
+    // object from `LlmClient::hosted_tool_search`, and a connector's only
+    // candidate is `self`, so a connector cannot report the capability
+    // without implementing it. Three things are still outside the type
+    // system, and this sweep is what holds each of them:
     //
     // 1. What the implementation puts on the wire. The compiler requires a
     //    body, not a correct request. A body that flattens every namespace
@@ -1287,7 +1287,7 @@ mod tests {
     // connector as soon as it exists, and `probe_target` - exhaustive, no
     // catch-all - refuses to compile until it is classified.
     //
-    // What this sweep no longer has to prove: that a client claiming the
+    // What this sweep no longer has to prove: that a connector claiming the
     // capability implements the dispatch at all, and that a decorator
     // forwarding the claim also forwards the dispatch. Neither is
     // representable now. The decorators' own in-the-path tests cover what

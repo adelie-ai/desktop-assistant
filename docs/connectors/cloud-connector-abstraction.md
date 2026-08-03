@@ -206,11 +206,12 @@ not, and Gemini uses function declarations. All three leave
 the call site (`dispatch_namespaced`). The seam is kept so a later version (e.g.
 Azure on the Responses surface) can opt in without a core change.
 
-The claim and the implementation are one fact, so there is no way to report the
-capability and inherit a flattening body: a connector that answers `Some` must
-implement `HostedToolSearch`, and the compiler enforces it. A connector that
-wants the capability builds a real hosted request; one that does not, does
-nothing.
+A connector cannot report the capability and inherit a flattening body. Its only
+candidate object is `self`, and `Some(self)` does not compile without
+`impl HostedToolSearch for Self`. So a connector that wants the capability
+builds a real hosted request; one that does not, writes nothing at all. What
+that request puts on the wire is a separate question, checked by the
+cross-connector sweep in the daemon's `registry.rs`.
 
 ### 6. Reasoning / extended thinking
 
