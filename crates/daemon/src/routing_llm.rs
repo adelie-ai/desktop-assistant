@@ -412,6 +412,26 @@ impl LlmClient for RoutingLlmClient {
         let resolved_has = match &self.fallback {
             FallbackMode::PerTurn { .. } => self.resolve_per_turn().hosted_tool_search().is_some(),
             FallbackMode::Pinned { client, .. } => client.hosted_tool_search().is_some(),
+            // A fixed answer, not a resolved one, and it is wrong whenever
+            // the purpose resolves to a connection that does offer hosted
+            // search. It is harmless only while a dynamic-purpose router
+            // serves the backend-task slot alone, because a backend task
+            // never takes the namespaced path. Nothing in the type system
+            // holds that precondition: `ConversationHandler` declares
+            // `llm: L` and `backend_llm: Option<L>` with one type
+            // parameter, and the daemon erases both to
+            // `Arc<dyn LlmClient>`, so the two slots are indistinguishable
+            // at the point a check would have to run.
+            //
+            // The hazard, stated as a failure: give a purpose-scoped router
+            // a real conversational turn - the shape scheduled agent runs
+            // and subagent orchestration both want - against a connection
+            // that does support hosted tool search. This answers "no", the
+            // turn keeps `builtin_tool_search`, and every namespace is
+            // discovered a round at a time on a connector that could have
+            // done it server-side. It costs more; it never fails, so
+            // nothing says so. See #1032, which holds the open decision on
+            // whether to resolve the answer here instead.
             FallbackMode::DynamicPurpose { .. } => false,
         };
         resolved_has.then_some(self as &dyn HostedToolSearch)
@@ -917,17 +937,72 @@ mod tests {
         );
     }
 
+    /// A `RegistryHandle` whose `[purposes.titling]` resolves to a connection
+    /// whose client **does** offer hosted tool search. The client is injected
+    /// directly, so the answer depends on nothing but the double.
+    fn build_handle_with_hosted_search_purpose() -> Arc<crate::api_surface::RegistryHandle> {
+        use crate::purposes::{ConnectionRef, ModelRef, PurposeConfig, Purposes};
+        let id = ConnectionId::new("cloud").unwrap();
+        let mut purposes = Purposes::default();
+        purposes.set(
+            PurposeKind::Titling,
+            Some(PurposeConfig {
+                connection: ConnectionRef::Named(id.clone()),
+                model: ModelRef::Named("cloud-model".to_string()),
+                effort: None,
+                max_context_tokens: None,
+            }),
+        );
+        let cfg = crate::config::DaemonConfig {
+            connections: IndexMap::from([(
+                "cloud".to_string(),
+                ConnectionConfig::OpenAi(Default::default()),
+            )]),
+            purposes,
+            ..crate::config::DaemonConfig::default()
+        };
+        let hosted: Arc<dyn LlmClient> = Arc::new(CapabilityLlm::new(true));
+        let reg = crate::registry::ConnectionRegistry::from_test_clients(vec![(
+            id,
+            "openai".to_string(),
+            hosted,
+        )]);
+        Arc::new(crate::api_surface::RegistryHandle::new(cfg, reg))
+    }
+
+    /// Pins a known-wrong answer, on purpose (#1032).
+    ///
+    /// A dynamic-purpose router answers "no hosted tool search" from a fixed
+    /// value, not from the connection the purpose resolves to. Here the
+    /// purpose resolves to a client that does offer hosted search, and the
+    /// router still answers no. Nothing breaks: the turn keeps
+    /// `builtin_tool_search` and discovers every namespace a round at a time
+    /// on a connector that could have done it server-side, so the cost is
+    /// silent.
+    ///
+    /// The answer is harmless only while a dynamic-purpose router serves the
+    /// backend-task slot alone, because a backend task never takes the
+    /// namespaced path. Nothing enforces that. Resolve the answer here and
+    /// this test fails - which is the intent: read #1032 before changing it.
     #[tokio::test]
-    async fn dynamic_purpose_mode_still_reports_false() {
-        let handle = build_handle_with_titling("titling-model");
+    async fn dynamic_purpose_answers_no_even_when_the_purpose_offers_hosted_search() {
+        let handle = build_handle_with_hosted_search_purpose();
         let client = RoutingLlmClient::new_dynamic_purpose(handle, PurposeKind::Titling);
         assert!(
-            !client.hosted_tool_search().is_some(),
-            "dynamic-purpose wrappers report the connector default"
+            client.hosted_tool_search().is_none(),
+            "the dynamic-purpose answer is fixed, not resolved (#1032)"
         );
+    }
 
-        // Backend tasks must not inherit the user's per-turn override even
-        // when they start inside a `send_prompt` scope.
+    /// A backend task must not inherit the user's per-turn client, even when
+    /// it starts inside a `send_prompt` scope - so the capability answer
+    /// follows the purpose, never `ACTIVE_CLIENT`. Holds whatever #1032
+    /// decides, because the purpose here resolves to Ollama, which offers no
+    /// hosted search either way.
+    #[tokio::test]
+    async fn dynamic_purpose_hosted_search_never_follows_the_per_turn_override() {
+        let handle = build_handle_with_titling("titling-model");
+        let client = RoutingLlmClient::new_dynamic_purpose(handle, PurposeKind::Titling);
         let hosted: Arc<dyn LlmClient> = Arc::new(CapabilityLlm::new(true));
         let answer =
             with_active_client(hosted, async { client.hosted_tool_search().is_some() }).await;
