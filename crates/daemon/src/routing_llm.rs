@@ -445,6 +445,11 @@ impl HostedToolSearch for RoutingLlmClient {
                 })
                 .await
             }
+            // Unreachable through `dispatch_namespaced`, because
+            // `hosted_tool_search` answers `None` in this mode: a backend
+            // task must not inherit the user's per-turn model override. The
+            // arm still dispatches correctly, so a direct call cannot send a
+            // backend task somewhere else.
             FallbackMode::DynamicPurpose { .. } => {
                 let _ = reasoning;
                 self.dispatch_dynamic(|client, resolved_reasoning| async move {
