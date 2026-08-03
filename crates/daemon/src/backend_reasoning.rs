@@ -174,8 +174,10 @@ mod tests {
             })
         }
 
+        /// `true`, not the trait default. A wrapper that fails to forward
+        /// this answer reports `false`, so the difference is visible.
         fn supports_hosted_tool_search(&self) -> bool {
-            false
+            true
         }
     }
 
@@ -281,7 +283,7 @@ mod tests {
     fn forwards_capability_flags_to_inner() {
         let inner = CapturingClient::default();
         let wrapped = FixedReasoningLlmClient::new(inner, ReasoningConfig::default());
-        assert!(!wrapped.supports_hosted_tool_search());
+        assert!(wrapped.supports_hosted_tool_search());
         assert_eq!(wrapped.get_default_model(), Some("captured"));
         assert_eq!(wrapped.max_context_tokens(), Some(8_000));
     }

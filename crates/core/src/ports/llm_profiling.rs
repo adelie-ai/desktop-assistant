@@ -632,4 +632,69 @@ mod tests {
             .unwrap();
         assert_eq!(response.text, "mock response");
     }
+
+    /// Connector double that reports hosted tool search. A decorator that
+    /// drops the forward reports the trait default `false` instead, so this
+    /// double makes the difference visible.
+    struct HostedSearchLlm;
+
+    #[async_trait::async_trait]
+    impl LlmClient for HostedSearchLlm {
+        async fn stream_completion(
+            &self,
+            _messages: Vec<Message>,
+            _tools: &[ToolDefinition],
+            _reasoning: ReasoningConfig,
+            _on_chunk: ChunkCallback,
+        ) -> Result<LlmResponse, CoreError> {
+            Ok(LlmResponse::text("hosted"))
+        }
+
+        fn supports_hosted_tool_search(&self) -> bool {
+            true
+        }
+    }
+
+    /// Every wrapper in the chain answers the hosted-tool-search question
+    /// from the client it dispatches to. A wrapper that answers for a
+    /// different client makes the turn assemble a tool list the receiving
+    /// connector cannot honour.
+    #[test]
+    fn llm_decorators_forward_hosted_tool_search_from_inner() {
+        use crate::ports::llm::RetryingLlmClient;
+        use std::sync::Arc;
+
+        let log_path = PathBuf::from("profile.jsonl");
+        assert!(
+            ProfilingLlmClient::new(HostedSearchLlm, log_path.clone(), false)
+                .supports_hosted_tool_search(),
+            "ProfilingLlmClient must forward the inner capability"
+        );
+        assert!(
+            !ProfilingLlmClient::new(MockLlm, log_path.clone(), false)
+                .supports_hosted_tool_search(),
+            "ProfilingLlmClient must not invent a capability"
+        );
+
+        assert!(
+            MaybeProfiled::Plain(HostedSearchLlm).supports_hosted_tool_search(),
+            "MaybeProfiled::Plain must forward the inner capability"
+        );
+        assert!(
+            MaybeProfiled::Profiled(ProfilingLlmClient::new(HostedSearchLlm, log_path, false))
+                .supports_hosted_tool_search(),
+            "MaybeProfiled::Profiled must forward the inner capability"
+        );
+
+        assert!(
+            RetryingLlmClient::new(HostedSearchLlm, 1).supports_hosted_tool_search(),
+            "RetryingLlmClient must forward the inner capability"
+        );
+
+        let arced: Arc<dyn LlmClient> = Arc::new(HostedSearchLlm);
+        assert!(
+            arced.supports_hosted_tool_search(),
+            "the Arc blanket impl must forward the inner capability"
+        );
+    }
 }

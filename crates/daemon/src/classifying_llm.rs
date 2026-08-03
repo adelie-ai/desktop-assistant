@@ -1303,4 +1303,44 @@ mod tests {
         .await;
         assert!(window.recorded().is_empty());
     }
+
+    /// Connector double that reports hosted tool search. A decorator that
+    /// drops the forward reports the trait default `false` instead.
+    struct HostedSearchClient;
+
+    #[async_trait::async_trait]
+    impl LlmClient for HostedSearchClient {
+        async fn stream_completion(
+            &self,
+            _messages: Vec<Message>,
+            _tools: &[ToolDefinition],
+            _reasoning: ReasoningConfig,
+            _on_chunk: ChunkCallback,
+        ) -> Result<LlmResponse, CoreError> {
+            Ok(LlmResponse {
+                text: "ok".into(),
+                tool_calls: vec![],
+                usage: None,
+            })
+        }
+
+        fn supports_hosted_tool_search(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn classifying_client_forwards_hosted_tool_search_from_inner() {
+        let wrapped = ClassifyingLlmClient::new(HostedSearchClient, "openai");
+        assert!(
+            wrapped.supports_hosted_tool_search(),
+            "the decorator must report the connector's capability, not the default"
+        );
+
+        let wrapped = ClassifyingLlmClient::new(StubClient::new(Behavior::Ok), "bedrock");
+        assert!(
+            !wrapped.supports_hosted_tool_search(),
+            "a connector without hosted search must stay without it"
+        );
+    }
 }
