@@ -937,12 +937,19 @@ mod tests {
         );
     }
 
-    /// Decorator-in-the-path criterion for `RoutingLlmClient` (#1033).
+    /// Decorator-in-the-path criterion for `RoutingLlmClient`, PerTurn arm
+    /// (#1033).
     ///
-    /// The router's job is to send the turn to the per-turn active client.
-    /// If it hands the caller its fallback client's hosted-search dispatch
-    /// object, the namespaced turn goes to the wrong connection - billed to
-    /// the wrong account, and against a model the user did not choose.
+    /// The router's job is to send the turn to the per-turn active client, so
+    /// this asserts the namespaced turn reaches that client and the static
+    /// fallback sees nothing.
+    ///
+    /// What this arm cannot lose, and why the sibling Pinned test exists:
+    /// `resolve_per_turn` returns an owned `Arc`, so handing the caller the
+    /// resolved client's dispatch object would borrow from a temporary and
+    /// fail to compile. The borrow checker forecloses the bypass here. The
+    /// Pinned arm holds its client in a field, where the same mistake does
+    /// compile, so that is the arm a runtime test has to cover.
     #[tokio::test]
     async fn routing_decorator_stays_in_the_namespaced_path() {
         use crate::hosted_search_probe::{NamespaceProbe, noop_chunk, probe_namespace};
