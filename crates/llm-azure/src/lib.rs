@@ -140,6 +140,9 @@ pub struct AzureClient {
     temperature: Option<f64>,
     top_p: Option<f64>,
     max_tokens: Option<u32>,
+    /// Stored per the builder contract; Azure Chat Completions has no
+    /// hosted-search request shape, so [`Self::supports_hosted_tool_search`]
+    /// returns `false` in v1 regardless of this flag.
     hosted_tool_search: bool,
     connect_timeout: Duration,
     event_timeout: Duration,
@@ -290,8 +293,9 @@ impl AzureClient {
         self
     }
 
-    /// Kept for factory-shape parity; Azure Chat Completions does not expose
-    /// hosted tool search, so v1 always passes `false`.
+    /// Record the hosted-tool-search preference from the builder. Stored for
+    /// factory-shape parity only; [`Self::supports_hosted_tool_search`] returns
+    /// `false` in v1, so this never enables the namespace path.
     pub fn with_hosted_tool_search(mut self, enabled: bool) -> Self {
         self.hosted_tool_search = enabled;
         self
@@ -1043,7 +1047,13 @@ impl LlmClient for AzureClient {
     }
 
     fn supports_hosted_tool_search(&self) -> bool {
-        self.hosted_tool_search
+        // Off in v1 -- Azure Chat Completions has no hosted-search request
+        // shape, and this client does not override
+        // `stream_completion_with_namespaces`. A `true` here would take the
+        // turn down the hosted-search path, where the service layer drops
+        // `builtin_tool_search` and the trait's flattening default then sends
+        // the whole tool fleet in one request with no way to search it.
+        false
     }
 }
 

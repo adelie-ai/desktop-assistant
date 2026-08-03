@@ -462,9 +462,18 @@ impl Connector {
         }
     }
 
-    /// Whether this connector supports server-side hosted tool search
-    /// (used by the model-defaults view to gate the toggle in the KCM).
-    pub fn supports_hosted_tool_search(self) -> bool {
+    /// Whether a connector of *this type* can ever do server-side hosted tool
+    /// search. It answers a question about the connector kind, not about any
+    /// one configured connection, because `get_connector_defaults` is given a
+    /// connector name and has no connection to inspect. The model-defaults view
+    /// uses it to gate the toggle in the KCM.
+    ///
+    /// The per-client answer is
+    /// [`LlmClient::supports_hosted_tool_search`](desktop_assistant_core::ports::llm::LlmClient::supports_hosted_tool_search),
+    /// which a turn obeys. The two must agree for a live connection; this one
+    /// is the wider claim, so a connector listed here still has to implement
+    /// the capability in its client.
+    pub fn hosted_tool_search_available(self) -> bool {
         matches!(self, Self::OpenAi | Self::Anthropic)
     }
 }
@@ -1285,14 +1294,14 @@ mystery_key = "x"
         assert!(Connector::Azure.supports_embeddings());
         assert!(Connector::Google.supports_embeddings());
 
-        assert!(!Connector::Ollama.supports_hosted_tool_search());
-        assert!(!Connector::Bedrock.supports_hosted_tool_search());
-        assert!(Connector::OpenAi.supports_hosted_tool_search());
-        assert!(Connector::Anthropic.supports_hosted_tool_search());
+        assert!(!Connector::Ollama.hosted_tool_search_available());
+        assert!(!Connector::Bedrock.hosted_tool_search_available());
+        assert!(Connector::OpenAi.hosted_tool_search_available());
+        assert!(Connector::Anthropic.hosted_tool_search_available());
         // None of the new connectors expose hosted tool search in v1.
-        assert!(!Connector::OpenRouter.supports_hosted_tool_search());
-        assert!(!Connector::Azure.supports_hosted_tool_search());
-        assert!(!Connector::Google.supports_hosted_tool_search());
+        assert!(!Connector::OpenRouter.hosted_tool_search_available());
+        assert!(!Connector::Azure.hosted_tool_search_available());
+        assert!(!Connector::Google.hosted_tool_search_available());
     }
 
     #[test]

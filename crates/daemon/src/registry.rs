@@ -1362,10 +1362,7 @@ mod tests {
     }
 
     fn clear_bodies(bodies: &Arc<std::sync::Mutex<Vec<String>>>) {
-        bodies
-            .lock()
-            .expect("probe body sink poisoned")
-            .clear();
+        bodies.lock().expect("probe body sink poisoned").clear();
     }
 
     #[tokio::test]
