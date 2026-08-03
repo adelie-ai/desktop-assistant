@@ -979,6 +979,52 @@ mod tests {
         );
     }
 
+    /// The same criterion for the router's other dispatching mode.
+    ///
+    /// Pinned mode exists to install its own model override, so a backend
+    /// task asks the connection it was pinned to for the model it serves. If
+    /// the router handed the caller its pinned client's dispatch object, the
+    /// namespaced turn would skip `with_model_override` and ask that
+    /// connection for the caller's model instead. PerTurn mode is covered by
+    /// the sibling test; the two arms answer separately, so one passing does
+    /// not cover the other.
+    #[tokio::test]
+    async fn routing_decorator_stays_in_the_namespaced_path_in_pinned_mode() {
+        use crate::hosted_search_probe::{NamespaceProbe, noop_chunk, probe_namespace};
+        use desktop_assistant_core::domain::Role;
+        use desktop_assistant_core::ports::llm::dispatch_namespaced;
+
+        let pinned = Arc::new(NamespaceProbe::hosted());
+        let router = RoutingLlmClient::new_pinned(
+            Arc::clone(&pinned) as Arc<dyn LlmClient>,
+            "pinned-model".to_string(),
+        );
+
+        dispatch_namespaced(
+            &router,
+            vec![Message::new(Role::User, "hi")],
+            &[],
+            &[probe_namespace()],
+            ReasoningConfig::default(),
+            noop_chunk(),
+        )
+        .await
+        .expect("probe turn");
+
+        assert_eq!(
+            pinned.namespaced_calls(),
+            1,
+            "the namespaced turn must reach the pinned client's hosted dispatch"
+        );
+        assert_eq!(
+            pinned.seen_model_override(),
+            Some("pinned-model".to_string()),
+            "the router must install its pinned model override on a namespaced \
+             turn too; without it the backend task asks this connection for a \
+             model it does not serve"
+        );
+    }
+
     // --- End-to-end turn through `send_prompt` ------------------------------
 
     /// In-memory conversation store for the end-to-end turn test.

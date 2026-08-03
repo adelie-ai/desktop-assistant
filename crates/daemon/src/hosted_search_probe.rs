@@ -19,6 +19,7 @@ use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Message, ToolDefinition, ToolNamespace};
 use desktop_assistant_core::ports::llm::{
     ChunkCallback, HostedToolSearch, LlmClient, LlmResponse, ReasoningConfig,
+    current_model_override,
 };
 
 /// Leaf `LlmClient` double for namespaced turns.
@@ -36,6 +37,9 @@ pub struct NamespaceProbe {
     opaque_error: Option<String>,
     /// Reasoning config seen by the most recent call, whichever path.
     seen_reasoning: Mutex<Option<ReasoningConfig>>,
+    /// Per-turn model override in force when the most recent call ran.
+    /// A decorator that installs one is only observable from inside the call.
+    seen_model_override: Mutex<Option<String>>,
 }
 
 impl NamespaceProbe {
@@ -61,6 +65,7 @@ impl NamespaceProbe {
             namespaced: AtomicUsize::new(0),
             opaque_error,
             seen_reasoning: Mutex::new(None),
+            seen_model_override: Mutex::new(None),
         }
     }
 
@@ -79,8 +84,14 @@ impl NamespaceProbe {
         *self.seen_reasoning.lock().expect("probe lock")
     }
 
+    /// Model override in force during the last turn, whichever path it took.
+    pub fn seen_model_override(&self) -> Option<String> {
+        self.seen_model_override.lock().expect("probe lock").clone()
+    }
+
     fn record(&self, reasoning: ReasoningConfig) -> Result<LlmResponse, CoreError> {
         *self.seen_reasoning.lock().expect("probe lock") = Some(reasoning);
+        *self.seen_model_override.lock().expect("probe lock") = current_model_override();
         match &self.opaque_error {
             Some(detail) => Err(CoreError::Llm(detail.clone())),
             None => Ok(LlmResponse::text("probe")),
