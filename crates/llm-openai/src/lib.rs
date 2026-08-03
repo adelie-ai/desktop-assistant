@@ -1931,4 +1931,225 @@ mod tests {
              client implements"
         );
     }
+
+    // --- Hosted-search degradation + per-model memo -----------------------
+    //
+    // `base_url` is configurable so an operator can point this client at an
+    // endpoint that speaks the Responses API without being OpenAI. Such an
+    // endpoint may serve `/responses` and still refuse the `tool_search` tool
+    // type. Because hosted tool search is on by default, that refusal must
+    // degrade to the flattened tool list rather than fail the turn.
+
+    /// An endpoint refusing the tool-search request shape.
+    const TOOL_SEARCH_REJECTED_BODY: &str = r#"{"error":{"code":"invalid_value","type":"invalid_request_error","message":"Invalid value: 'tool_search'. Supported values are: 'function'."}}"#;
+
+    fn probe_namespace() -> ToolNamespace {
+        ToolNamespace::new(
+            "jira",
+            "Jira project tools",
+            vec![ToolDefinition::new(
+                "jira__list",
+                "List issues",
+                serde_json::json!({"type":"object"}),
+            )],
+        )
+    }
+
+    /// The hosted attempt: the only request carrying the tool-search sentinel.
+    fn hosted_attempt<'a>(
+        server: &'a httpmock::MockServer,
+        status: u16,
+        body: &str,
+    ) -> httpmock::Mock<'a> {
+        let owned = body.to_string();
+        server.mock(move |when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/responses")
+                .body_includes(r#""type":"tool_search""#);
+            then.status(status)
+                .header("content-type", "application/json")
+                .body(&owned);
+        })
+    }
+
+    /// The flattened fallback: no sentinel, and every namespace tool inline.
+    fn flattened_attempt(server: &httpmock::MockServer) -> httpmock::Mock<'_> {
+        server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/responses")
+                .body_excludes(r#""type":"tool_search""#)
+                .body_includes("jira__list");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(STUB_SSE_BODY);
+        })
+    }
+
+    async fn namespaced_turn(client: &OpenAiClient) -> Result<LlmResponse, CoreError> {
+        client
+            .stream_completion_with_namespaces(
+                vec![Message::new(Role::User, "hi")],
+                &[],
+                &[probe_namespace()],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn hosted_search_rejection_degrades_to_flattened_tools() {
+        let server = httpmock::MockServer::start();
+        let hosted = hosted_attempt(&server, 400, TOOL_SEARCH_REJECTED_BODY);
+        let flattened = flattened_attempt(&server);
+        let client = OpenAiClient::new("key".into()).with_base_url(server.url(""));
+
+        namespaced_turn(&client)
+            .await
+            .expect("a refused tool-search shape must degrade, not fail the turn");
+
+        hosted.assert_calls(1);
+        // The fallback matched on `jira__list`, so the deferred tool reached
+        // the model inline. Without that the turn would have no way to reach
+        // it: the daemon removes `builtin_tool_search` when hosted search is
+        // active.
+        flattened.assert_calls(1);
+    }
+
+    #[tokio::test]
+    async fn hosted_search_rejection_memoizes_the_model() {
+        let server = httpmock::MockServer::start();
+        let hosted = hosted_attempt(&server, 400, TOOL_SEARCH_REJECTED_BODY);
+        let flattened = flattened_attempt(&server);
+        let client = OpenAiClient::new("key".into()).with_base_url(server.url(""));
+
+        for _ in 0..2 {
+            namespaced_turn(&client).await.expect("both turns degrade");
+        }
+
+        hosted.assert_calls(1);
+        flattened.assert_calls(2);
+    }
+
+    #[tokio::test]
+    async fn hosted_search_success_never_degrades() {
+        // The other direction: a working endpoint must keep the capability.
+        let server = httpmock::MockServer::start();
+        let hosted = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/responses")
+                .body_includes(r#""type":"tool_search""#);
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(STUB_SSE_BODY);
+        });
+        let flattened = flattened_attempt(&server);
+        let client = OpenAiClient::new("key".into()).with_base_url(server.url(""));
+
+        namespaced_turn(&client).await.expect("hosted search works");
+
+        hosted.assert_calls(1);
+        flattened.assert_calls(0);
+    }
+
+    #[tokio::test]
+    async fn hosted_search_context_overflow_is_not_degraded() {
+        // Flattening sends every deferred tool inline, which makes the prompt
+        // larger. Degrading here would answer an overflow by overflowing
+        // harder, and would rob the core service of the truncate-and-retry it
+        // performs on this variant.
+        let server = httpmock::MockServer::start();
+        let hosted = hosted_attempt(
+            &server,
+            400,
+            r#"{"error":{"code":"context_length_exceeded","type":"invalid_request_error","message":"This model's maximum context length is 128000 tokens."}}"#,
+        );
+        let flattened = flattened_attempt(&server);
+        let client = OpenAiClient::new("key".into()).with_base_url(server.url(""));
+
+        let err = namespaced_turn(&client)
+            .await
+            .expect_err("an overflow must surface");
+
+        assert!(
+            matches!(err, CoreError::ContextOverflow { .. }),
+            "expected ContextOverflow, got {err:?}"
+        );
+        hosted.assert_calls(1);
+        flattened.assert_calls(0);
+    }
+
+    #[tokio::test]
+    async fn hosted_search_rate_limit_is_not_degraded() {
+        // Throttling says nothing about the request shape, and retrying it
+        // immediately as a larger request would make the throttling worse.
+        let server = httpmock::MockServer::start();
+        let hosted = hosted_attempt(
+            &server,
+            429,
+            r#"{"error":{"code":"rate_limit_exceeded","type":"rate_limit_error","message":"slow down"}}"#,
+        );
+        let flattened = flattened_attempt(&server);
+        let client = OpenAiClient::new("key".into()).with_base_url(server.url(""));
+
+        let err = namespaced_turn(&client)
+            .await
+            .expect_err("throttling must surface");
+
+        assert!(
+            matches!(err, CoreError::RateLimited { .. }),
+            "expected RateLimited, got {err:?}"
+        );
+        hosted.assert_calls(1);
+        flattened.assert_calls(0);
+    }
+
+    #[tokio::test]
+    async fn hosted_search_degradation_surfaces_a_failing_fallback() {
+        // The fallback is attempted once. Its own failure is the turn's
+        // failure - it never loops back to the hosted shape.
+        let server = httpmock::MockServer::start();
+        let hosted = hosted_attempt(&server, 400, TOOL_SEARCH_REJECTED_BODY);
+        let flattened = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/responses")
+                .body_excludes(r#""type":"tool_search""#);
+            then.status(500)
+                .header("content-type", "application/json")
+                .body(r#"{"error":{"message":"boom"}}"#);
+        });
+        let client = OpenAiClient::new("key".into()).with_base_url(server.url(""));
+
+        let err = namespaced_turn(&client)
+            .await
+            .expect_err("a failing fallback must surface");
+
+        assert!(
+            matches!(err, CoreError::Llm(_)),
+            "expected a generic LLM error, got {err:?}"
+        );
+        hosted.assert_calls(1);
+        flattened.assert_calls(1);
+    }
+
+    #[tokio::test]
+    async fn hosted_search_authentication_failure_is_not_degraded() {
+        // A rejected credential is not a rejected request shape, and a second
+        // request would just burn another rejected call.
+        let server = httpmock::MockServer::start();
+        let hosted = hosted_attempt(
+            &server,
+            401,
+            r#"{"error":{"code":"invalid_api_key","type":"invalid_request_error","message":"bad key"}}"#,
+        );
+        let flattened = flattened_attempt(&server);
+        let client = OpenAiClient::new("key".into()).with_base_url(server.url(""));
+
+        namespaced_turn(&client)
+            .await
+            .expect_err("a bad credential must surface");
+
+        hosted.assert_calls(1);
+        flattened.assert_calls(0);
+    }
 }
