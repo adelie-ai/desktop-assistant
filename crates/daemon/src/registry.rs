@@ -1550,6 +1550,46 @@ mod tests {
         }
     }
 
+    /// A new `Connector` variant cannot be omitted from the hosted-tool-search
+    /// sweep.
+    ///
+    /// The guarantee is structural, and it has two halves. The sweep iterates
+    /// [`Connector::ALL`], which the `declare_connectors!` macro emits from the
+    /// same token list that declares the variants, so a variant that exists is
+    /// swept. And [`probe_target`] has no catch-all arm, so a variant that is
+    /// swept fails to compile until it is classified. Neither half is a list
+    /// anyone maintains by hand.
+    ///
+    /// This test pins the halves: the list is non-empty, it holds no connector
+    /// twice, and every entry in it has a `probe_target` arm.
+    #[test]
+    fn hosted_tool_search_sweep_reaches_every_connector() {
+        assert!(
+            !Connector::ALL.is_empty(),
+            "the sweep would pass vacuously over an empty connector list"
+        );
+
+        let mut names: Vec<&str> = Connector::ALL.iter().map(|c| c.as_str()).collect();
+        let declared = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            declared,
+            "a connector appears twice in the sweep: {names:?}"
+        );
+
+        // Classification is total: `probe_target` answers for every declared
+        // connector. The base URL is never dialled here - only the client is
+        // constructed - so an unroutable address is enough.
+        let mut classified = 0;
+        for &connector in Connector::ALL {
+            let _target = probe_target(connector, "http://127.0.0.1:1");
+            classified += 1;
+        }
+        assert_eq!(classified, Connector::ALL.len());
+    }
+
     #[tokio::test]
     async fn connector_claiming_hosted_tool_search_must_override_namespace_dispatch() {
         let server = httpmock::MockServer::start_async().await;

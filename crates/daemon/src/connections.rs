@@ -1271,9 +1271,15 @@ mystery_key = "x"
         assert_eq!(Connector::parse("anthrop"), None);
     }
 
+    /// [`Connector::ALL`] holds every variant, in declaration order.
+    ///
+    /// This is a pin, not the guarantee. The guarantee is structural: the
+    /// `declare_connectors!` invocation above emits the enum and `ALL` from one
+    /// token list, so a variant that exists is in `ALL`. The pin catches a
+    /// mistake in the macro itself, and states the order every sweep observes.
     #[test]
-    fn connector_as_str_round_trips_through_parse() {
-        for &c in &[
+    fn connector_all_lists_every_declared_variant_in_declaration_order() {
+        let expected: &[Connector] = &[
             Connector::Ollama,
             Connector::Anthropic,
             Connector::Bedrock,
@@ -1281,8 +1287,46 @@ mystery_key = "x"
             Connector::OpenRouter,
             Connector::Azure,
             Connector::Google,
-        ] {
+        ];
+        assert_eq!(Connector::ALL, expected);
+    }
+
+    #[test]
+    fn connector_as_str_round_trips_through_parse() {
+        for &c in Connector::ALL {
             assert_eq!(Connector::parse(c.as_str()), Some(c));
+        }
+    }
+
+    #[test]
+    fn connector_canonical_names_are_unique() {
+        let mut names: Vec<&str> = Connector::ALL.iter().map(|c| c.as_str()).collect();
+        let declared = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            declared,
+            "two connectors share a canonical name, so `parse` cannot tell them apart: {names:?}"
+        );
+    }
+
+    /// Every connector that claims embeddings must ship a default embedding
+    /// model, and every connector that ships none must not claim them.
+    ///
+    /// Driven from [`Connector::ALL`], so a new variant is held to it the
+    /// moment it is declared.
+    #[test]
+    fn connector_embedding_claim_agrees_with_its_default_model() {
+        for &c in Connector::ALL {
+            assert_eq!(
+                c.supports_embeddings(),
+                !c.default_embedding_model().is_empty(),
+                "{c} disagrees with itself: supports_embeddings() is {}, \
+                 default_embedding_model() is {:?}",
+                c.supports_embeddings(),
+                c.default_embedding_model(),
+            );
         }
     }
 
