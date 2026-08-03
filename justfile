@@ -47,15 +47,15 @@ build:
 # We run these locally instead of GitHub Actions. `install-hooks` wires `check`
 # into a git pre-push hook so it runs automatically before every push.
 
-# Full local gate: dependency scan, secret scan, formatting, lints, build,
-# tests, and the tests for the gate's own shell steps (on the pinned
-# toolchain).
+# Full local gate: dependency scan, secret scan, formatting, lints,
+# documentation, build, tests, and the tests for the gate's own shell steps
+# (on the pinned toolchain).
 # `audit` and `secret-scan` come first on purpose: build scripts execute at
 # first compile - under `clippy` as much as under `build` - so both scans have
 # to precede either. The `-sqlite` and `-mcp-host` steps are separate because
 # that adapter/module is compiled out of the workspace steps entirely; see
 # `lint-sqlite` and `lint-mcp-host`.
-check: audit secret-scan fmt-check lint lint-sqlite lint-mcp-host build test test-sqlite test-mcp-host test-scripts
+check: audit secret-scan fmt-check lint lint-sqlite lint-mcp-host doc doc-sqlite doc-mcp-host build test test-sqlite test-mcp-host test-scripts
 
 # RustSec advisory scan of Cargo.lock. Fails loudly when cargo-audit is missing
 # or the advisory database cannot be fetched, rather than passing on silence
@@ -100,6 +100,26 @@ lint-sqlite:
 # spawned client-side server receives) can break it with no signal at all.
 lint-mcp-host:
     cargo clippy -p desktop-assistant-client-common --features mcp-host --all-targets -- -D warnings
+
+# Rustdoc across the workspace; warnings are errors (#1046). `clippy` does not
+# evaluate rustdoc lints, so without this step a doc link to a renamed,
+# privatised or deleted item passes the whole gate. Fails loudly when the run
+# produces no documentation, rather than reading an empty run as clean; see
+# scripts/doc.sh.
+doc:
+    ./scripts/doc.sh --workspace
+
+# Rustdoc the SQLite adapter with its own feature enabled (#1046), for the same
+# reason `lint-sqlite` exists: without `--features sqlite` the crate is an empty
+# shell and the workspace step documents none of it.
+doc-sqlite:
+    ./scripts/doc.sh -p desktop-assistant-storage-sqlite --features sqlite
+
+# Rustdoc the client-side MCP host with its own feature enabled (#1046), for the
+# same reason `lint-mcp-host` exists: nothing enables `mcp-host` in a workspace
+# build, so the workspace step documents none of that module.
+doc-mcp-host:
+    ./scripts/doc.sh -p desktop-assistant-client-common --features mcp-host
 
 # Run the workspace test suite (excludes #[ignore] integration tests)
 test:
