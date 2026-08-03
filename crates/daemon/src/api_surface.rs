@@ -1709,24 +1709,22 @@ where
             .resolve_turn(user_driven_selection.as_ref(), effective_selection.as_ref())
             .await?;
 
-        // `hosted_tool_search` records which tool-discovery mode this turn
-        // takes, beside the connection and model that decide it. `true` means
-        // the provider searches the tool set server-side and the turn drops
-        // `builtin_tool_search`; `false` means the turn keeps
-        // `builtin_tool_search` and sends only the core tools. `None` means
-        // no per-turn client was resolved, so the statically configured
-        // primary answers and this line cannot see which. Without this field
-        // the mode is invisible in the logs, and a turn that picks the wrong
-        // one just looks expensive.
+        // The turn's tool-discovery mode is NOT logged here, deliberately.
+        // `active_client` is the raw registry client, and the turn asks the
+        // decorator chain that wraps it
+        // (`Arc` -> `MaybeProfiled` -> `Retrying` -> `FixedReasoning` ->
+        // `RoutingLlmClient`). The two answers agree only while every
+        // decorator forwards the capability correctly, which is precisely the
+        // invariant that breaks. Logging the raw client here would print the
+        // right answer while the turn used the wrong one, and point an
+        // operator away from the cause. `ConversationHandler::send_prompt`
+        // logs the mode from the value it actually used instead.
         tracing::info!(
             purpose = ?if routed_via_voice { PurposeKind::Voice } else { PurposeKind::Interactive },
             connection = ?chosen.as_ref().map(|(c, _)| c.as_str()),
             model = ?chosen.as_ref().map(|(_, m)| m.as_str()),
             source = ?budget.source,
             max_input_tokens = budget.max_input_tokens,
-            hosted_tool_search = ?active_client
-                .as_ref()
-                .map(|c| c.supports_hosted_tool_search()),
             "context budget resolved"
         );
 

@@ -95,6 +95,11 @@ pub enum FallbackMode {
 /// so they report the statically configured value. The DynamicPurpose mode
 /// has no single captured client and answers `None`/`false`/empty for all
 /// of them.
+///
+/// One method sits in neither group: `estimate_tokens` is not overridden
+/// here at all, so the trait's own `chars/4` estimate answers whatever
+/// client is resolved. That is harmless while no connector overrides it
+/// with a better tokeniser, and wrong the moment one does.
 #[derive(Clone)]
 pub struct RoutingLlmClient {
     fallback: FallbackMode,
@@ -904,12 +909,13 @@ mod tests {
     /// Tool executor with one core tool and a small namespaced fleet.
     ///
     /// The fleet has three tools on purpose. `categorize_tool_namespaces`
-    /// returns its input unchanged when the whole set holds ten tools or
-    /// fewer (`crates/core/src/tools.rs`), so the turn under test needs no
+    /// returns its input unchanged when the namespaced set holds ten tools
+    /// or fewer (`crates/core/src/tools.rs`), so the turn under test needs no
     /// categorization LLM round-trip and the namespaces reach dispatch as
-    /// written. Raising that threshold is safe. Lowering it below four turns
-    /// this into a categorization test, and the failure would name the tool
-    /// list rather than the threshold that changed.
+    /// written. Raising that threshold is safe, and so is lowering it to
+    /// three. Lowering it below three turns this into a categorization test,
+    /// and the failure would name the tool list rather than the threshold
+    /// that changed.
     struct FleetTools;
 
     impl FleetTools {

@@ -1248,21 +1248,32 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
 
         // Run compaction if enough messages have been dropped by windowing.
         //
-        // This block, and everything else from here to the
-        // `supports_hosted_tool_search` read below, must run in THIS task.
-        // Do not move any of it into `tokio::spawn`, `spawn_blocking`, or a
-        // `JoinSet`, however tempting the latency win looks — the summary
-        // below is a whole LLM round-trip and reads as an obvious candidate.
+        // This block, the capability read below it, and the whole tool
+        // discovery block after that — up to and including
+        // `categorize_tool_namespaces` — must run in THIS task. Do not move
+        // any of it into `tokio::spawn`, `spawn_blocking`, or a `JoinSet`,
+        // however tempting the latency win looks. Two parts of that range
+        // read as obvious candidates, because both are whole LLM
+        // round-trips: the summary immediately below, and the
+        // categorization call further down.
         //
         // Why: the daemon passes this turn's LLM client, its model override,
         // its context budget and its reasoning config through
         // `tokio::task_local!` slots, which a spawned task does not inherit.
-        // A spawn here would silently drop them. The summary would go to the
-        // wrong model, and the capability read below would answer for the
-        // wrong client, which decides the entire turn's tool list. Nothing
-        // fails loudly; the turn just gets more expensive and less capable.
-        // Run such work inside the current task, or carry the task-locals
-        // across the boundary by hand.
+        // A spawn anywhere in that range silently drops them, and each slot
+        // fails differently and quietly:
+        //
+        // - `task_llm()` falls through to the static fallback, so the summary
+        //   or the categorization goes to the wrong model.
+        // - The capability read answers for the wrong client, which decides
+        //   the entire turn's tool list.
+        // - `current_context_budget()` returns `None`, so the fit-ratio
+        //   check that skips categorization never fires and the turn pays for
+        //   a categorization call it did not need.
+        //
+        // None of these fail loudly. The turn just gets more expensive and
+        // less capable. Run such work inside the current task, or carry the
+        // task-locals across the boundary by hand.
         if let Some((from, to)) = compaction_range(&conv, target_window) {
             let summary = generate_context_summary(
                 &conv.context_summary,
@@ -1357,6 +1368,27 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         } else {
             core_tools.clone()
         };
+
+        // Record which tool-discovery mode this turn opens with, from the
+        // values the turn actually used rather than from a capability read
+        // taken somewhere else. Nothing else in the logs distinguishes the
+        // two modes, so a turn that picks the wrong one only looks
+        // expensive.
+        //
+        // `hosted_tool_search` is what the client the turn dispatches to
+        // answered. `tool_search_offered` is what the model can really do
+        // about it, and the two differ: the discovery tool survives a `true`
+        // answer when there are no namespaces to defer. This is the opening
+        // state only — the demotion path below can turn hosted search off
+        // part-way through the turn, and logs its own warning when it does.
+        tracing::info!(
+            hosted_tool_search = use_hosted_search,
+            namespace_count = namespaces.len(),
+            tool_search_offered = core_tools_for_llm
+                .iter()
+                .any(|t| t.name == "builtin_tool_search"),
+            "tool discovery mode resolved"
+        );
 
         let mut activated_tools: std::collections::HashMap<String, ToolDefinition> =
             std::collections::HashMap::new();
