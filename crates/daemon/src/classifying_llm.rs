@@ -1329,18 +1329,24 @@ mod tests {
         }
     }
 
+    /// The connector labels are crossed on purpose. `ClassifyingLlmClient`
+    /// carries a connector name, so "answers from the inner client" and
+    /// "answers from the connector name" are two different rules that agree
+    /// on every straight pairing. Pairing the hosted double with `"bedrock"`
+    /// and the plain one with `"openai"` makes them disagree, so a decorator
+    /// that answered from the name it was given fails here.
     #[test]
     fn classifying_client_forwards_hosted_tool_search_from_inner() {
-        let wrapped = ClassifyingLlmClient::new(HostedSearchClient, "openai");
+        let wrapped = ClassifyingLlmClient::new(HostedSearchClient, "bedrock");
         assert!(
             wrapped.supports_hosted_tool_search(),
-            "the decorator must report the connector's capability, not the default"
+            "the answer must come from the inner client, not the connector name"
         );
 
-        let wrapped = ClassifyingLlmClient::new(StubClient::new(Behavior::Ok), "bedrock");
+        let wrapped = ClassifyingLlmClient::new(StubClient::new(Behavior::Ok), "openai");
         assert!(
             !wrapped.supports_hosted_tool_search(),
-            "a connector without hosted search must stay without it"
+            "the answer must come from the inner client, not the connector name"
         );
     }
 }

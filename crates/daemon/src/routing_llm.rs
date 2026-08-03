@@ -901,9 +901,15 @@ mod tests {
         }
     }
 
-    /// Tool executor with one core tool and a small namespaced fleet. The
-    /// fleet stays under the categorization threshold so the turn needs no
-    /// extra LLM round-trip.
+    /// Tool executor with one core tool and a small namespaced fleet.
+    ///
+    /// The fleet has three tools on purpose. `categorize_tool_namespaces`
+    /// returns its input unchanged when the whole set holds ten tools or
+    /// fewer (`crates/core/src/tools.rs`), so the turn under test needs no
+    /// categorization LLM round-trip and the namespaces reach dispatch as
+    /// written. Raising that threshold is safe. Lowering it below four turns
+    /// this into a categorization test, and the failure would name the tool
+    /// list rather than the threshold that changed.
     struct FleetTools;
 
     impl FleetTools {
