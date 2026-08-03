@@ -669,11 +669,14 @@ mod tests {
     /// nothing is written; the path still goes under the temp directory so a
     /// later edit that does dispatch cannot drop a file in the working
     /// directory.
-    fn capability_log_path() -> PathBuf {
+    ///
+    /// `label` names the calling test. It cannot be `line!()` here: that
+    /// macro expands where it is written, so a call inside this helper
+    /// yields this line for every caller and the paths collide.
+    fn capability_log_path(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
-            "llm_profile_capability_{}_{}.jsonl",
-            std::process::id(),
-            line!()
+            "llm_profile_capability_{}_{label}.jsonl",
+            std::process::id()
         ))
     }
 
@@ -682,7 +685,7 @@ mod tests {
     /// at its first assertion.
     #[test]
     fn profiling_client_answers_hosted_tool_search_from_inner() {
-        let path = capability_log_path();
+        let path = capability_log_path("profiling");
         assert!(
             ProfilingLlmClient::new(HostedSearchLlm, path.clone(), false)
                 .supports_hosted_tool_search(),
@@ -708,7 +711,7 @@ mod tests {
 
     #[test]
     fn maybe_profiled_profiled_answers_hosted_tool_search_from_inner() {
-        let path = capability_log_path();
+        let path = capability_log_path("maybe_profiled");
         assert!(
             MaybeProfiled::Profiled(ProfilingLlmClient::new(
                 HostedSearchLlm,

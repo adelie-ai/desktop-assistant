@@ -126,14 +126,29 @@ mod tests {
 
     /// Test double that records the `ReasoningConfig` it receives so we
     /// can prove the wrapper substitutes its own value.
+    ///
+    /// `hosted` makes the hosted-tool-search answer settable, because the
+    /// wrapper must be checked against an inner client that says `true` and
+    /// one that says `false`. A double with a fixed answer can only catch
+    /// one of the two ways the wrapper can answer for the wrong client.
     #[derive(Default)]
     struct CapturingClient {
         last_seen: Mutex<Option<ReasoningConfig>>,
+        hosted: bool,
     }
 
     impl CapturingClient {
         fn last(&self) -> Option<ReasoningConfig> {
             *self.last_seen.lock().unwrap()
+        }
+
+        /// A double that supports hosted tool search. `default()` gives one
+        /// that does not.
+        fn hosted() -> Self {
+            Self {
+                hosted: true,
+                ..Default::default()
+            }
         }
     }
 
@@ -174,10 +189,8 @@ mod tests {
             })
         }
 
-        /// `true`, not the trait default. A wrapper that fails to forward
-        /// this answer reports `false`, so the difference is visible.
         fn supports_hosted_tool_search(&self) -> bool {
-            true
+            self.hosted
         }
     }
 
@@ -283,8 +296,31 @@ mod tests {
     fn forwards_capability_flags_to_inner() {
         let inner = CapturingClient::default();
         let wrapped = FixedReasoningLlmClient::new(inner, ReasoningConfig::default());
-        assert!(wrapped.supports_hosted_tool_search());
         assert_eq!(wrapped.get_default_model(), Some("captured"));
         assert_eq!(wrapped.max_context_tokens(), Some(8_000));
+    }
+
+    /// This wrapper sits between the retry wrapper and the routing client on
+    /// the interactive chain the daemon builds, so a wrong answer here
+    /// reaches every turn, including turns that carry no model override at
+    /// all. Both directions are asserted: dropping the forward answers the
+    /// trait default `false`, and hardcoding `true` invents a capability the
+    /// inner client does not have. Only the second reinstates the defect
+    /// this module's sibling tests exist for.
+    #[test]
+    fn fixed_reasoning_client_answers_hosted_tool_search_from_inner() {
+        let wrapped =
+            FixedReasoningLlmClient::new(CapturingClient::hosted(), ReasoningConfig::default());
+        assert!(
+            wrapped.supports_hosted_tool_search(),
+            "must forward the inner capability"
+        );
+
+        let wrapped =
+            FixedReasoningLlmClient::new(CapturingClient::default(), ReasoningConfig::default());
+        assert!(
+            !wrapped.supports_hosted_tool_search(),
+            "must not invent a capability the inner client does not have"
+        );
     }
 }
