@@ -90,10 +90,10 @@ here and must not share a name:
 
 Hosted tool search is the worked example. `Connector::type_offers_hosted_tool_search`
 answers the type question and feeds the connector-defaults view; the `LlmClient`
-trait's `supports_hosted_tool_search` answers the instance question and is what a
-turn obeys. The names now say which is which, because they once did not: both
-were called `supports_hosted_tool_search`, and a reader had to open the doc
-comments to learn that clients were told one and turns obeyed the other.
+trait's `hosted_tool_search` answers the instance question and is what a turn
+obeys. The names say which is which, because they once did not: both were
+called `supports_hosted_tool_search`, and a reader had to open the doc comments
+to learn that clients were told one and turns obeyed the other.
 
 Keep both questions. Name each for the axis it answers, and make the pair-keyed
 answer carry the instance one.
@@ -182,6 +182,91 @@ first candidate: it branches on the connector-type string today, which is why a
 model that advertises reasoning support can have its reasoning budget silently
 dropped by the connector that serves it.
 
+## An instance answer that cannot lie
+
+The instance question above has a second requirement the type question does not:
+the answer and the behaviour it promises must be the same fact. A capability
+answered by a separate boolean is a claim about the code beside it, and a claim
+can be wrong.
+
+Hosted tool search showed the cost. The `LlmClient` trait carried a
+`supports_hosted_tool_search` boolean and a `stream_completion_with_namespaces`
+method whose default body flattened every namespace into one ordinary tool list.
+A connector could report the capability and inherit that body. The turn was then
+worse than one that claimed nothing, because the service layer strips
+`builtin_tool_search` as soon as hosted search is active: the model received the
+whole tool fleet inline *and* no way to discover tools. Azure was one edit from
+this. A runtime sweep in the daemon narrowed the gap and could not close it,
+because it can only probe a connector whose transport it knows how to drive.
+
+### The candidates
+
+Three shapes were compared. The deciding hazard is stated after them, because it
+is what separates the two that otherwise look close.
+
+**A. Remove the default body.** Every implementor writes the method; the
+flattening becomes a named helper a connector calls on purpose. Cost is about
+forty-five one-line delegations, most of them in test doubles.
+
+**B. An extension trait.** `LlmClient` gains
+`hosted_tool_search() -> Option<&dyn HostedToolSearch>`, which returns `Some`
+only where the extension is implemented. The capability answer and the
+implementation become the same object, and the boolean disappears rather than
+being policed. A client with no hosted search leaves the method at its `None`
+default and costs nothing.
+
+**C. A wrapper applied at construction.** The registry wraps a hosted-search
+connector in a `HostedSearchClient<C>` when it wires one, and only that wrapper
+carries the namespaced path.
+
+### The hazard
+
+Six decorators wrap an LLM client: retry, profiling, the profiling-or-not
+wrapper, error classification, reasoning substitution, and per-turn routing.
+Each must stay in the call path for a namespaced turn, exactly as it does for an
+ordinary one. A decorator that answers the capability by handing back its
+**inner** client's dispatch object is bypassed for that turn - so the turns
+carrying the most tools are the ones that lose retry and per-turn routing, and
+nothing else in the workspace notices.
+
+### The choice
+
+**B, with each decorator implementing the extension for itself.** A decorator
+answers `Some(self)` when, and only when, its inner client has hosted search,
+and its implementation decorates and then hands down to its inner client. The
+chain stays whole. One named test per decorator observes that decorator's own
+effect on a namespaced turn, so a bypass fails a test that names the decorator.
+
+Scored against the requirement - a claim that cannot be wrong:
+
+- **A fails it.** Writing the method is not the same as pairing it with the
+  claim. A connector can still report the capability and write a flattening
+  body, which is the exact defect, only louder. A cost of forty-five edits buys
+  a nudge, not an invariant.
+- **C fails it for the same reason the runtime sweep does.** Enforcement sits at
+  the wiring site, so a connector built by any other path escapes it, and the
+  wrapper adds a layer to a decorator chain that is already six deep.
+- **B holds it in the type system.** Returning `Some(self)` requires
+  `Self: HostedToolSearch`, and implementing that trait means writing the
+  request. Reporting the capability without the implementation does not compile.
+
+B's naive form fails the hazard, and the work to fix it - one small
+implementation per decorator - is what its file-count advantage pays for. It is
+still far below A's cost, because a test double that does not care implements
+nothing at all.
+
+### What the type system still does not cover
+
+Flattening stays representable, deliberately: a connector may implement
+`HostedToolSearch` with a body that flattens, and that is a reviewable choice
+rather than an inherited default. The compiler requires a body, not a correct
+request. So the daemon's cross-connector sweep is kept, with a narrower job:
+what a hosted implementation puts on the wire, whether the registry arm still
+wires the capability on, and whether a claim quietly disappeared. What it
+stopped proving is that a claim has an implementation at all, and that a
+decorator forwarding a claim also forwards the dispatch. Neither is
+representable now.
+
 ## Non-goals
 
 - **A universal API-surface type in `core`.** Only Bedrock has several surfaces
@@ -201,4 +286,4 @@ dropped by the connector that serves it.
 - `docs/connectors/cloud-connector-abstraction.md` - the uniform connector
   contract
 - `crates/core/src/ports/llm.rs` - `ModelCapabilities`, `ModelKind`,
-  `LlmClient`
+  `LlmClient`, `HostedToolSearch`, `dispatch_namespaced`

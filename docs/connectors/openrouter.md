@@ -86,8 +86,9 @@ maximize cache hits - map it to the conversation id in a later iteration.
 
 ## Hosted tool search
 
-Off in v1. Namespaces flatten into the standard `tools` array via the trait's
-default. `supports_hosted_tool_search()` -> `false`.
+Off in v1. The client does not implement `HostedToolSearch`, so
+`hosted_tool_search()` answers `None` and namespaces flatten into the standard
+`tools` array at the call site.
 
 ## Reasoning
 

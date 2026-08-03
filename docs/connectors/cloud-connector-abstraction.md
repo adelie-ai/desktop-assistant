@@ -33,7 +33,7 @@ A connector must implement:
   endpoint via `merge_curated_with_live`, behind a TTL cache (see "Shared model
   cache")
 - `max_context_tokens()` via `apply_context_cap(context_cap, curated_or_live)`
-- Optionally `supports_hosted_tool_search()` + `stream_completion_with_namespaces()`
+- Optionally `HostedToolSearch`, handed back from `hosted_tool_search()`
 - Optionally `EmbeddingClient` when the provider serves embeddings
 
 The builder shape is fixed by the factory in `crates/daemon/src/registry.rs`
@@ -198,13 +198,19 @@ compat module as a plain helper.
 
 ### 5. Dynamic / hosted tool search
 
-Already a trait seam: `supports_hosted_tool_search()` +
-`stream_completion_with_namespaces()`. None of the three enable it in v1 -
+Already a trait seam: the `HostedToolSearch` trait, handed back from
+`LlmClient::hosted_tool_search()`. None of the three enable it in v1 -
 OpenRouter's routed API does not expose it uniformly, Azure Chat Completions does
-not, and Gemini uses function declarations. All three inherit the trait's default
-`stream_completion_with_namespaces` (flatten namespaces into `stream_completion`).
-The seam is kept so a later version (e.g. Azure on the Responses surface) can opt
-in without a core change.
+not, and Gemini uses function declarations. All three leave
+`hosted_tool_search()` at its `None` default, so a namespaced turn flattens at
+the call site (`dispatch_namespaced`). The seam is kept so a later version (e.g.
+Azure on the Responses surface) can opt in without a core change.
+
+The claim and the implementation are one fact, so there is no way to report the
+capability and inherit a flattening body: a connector that answers `Some` must
+implement `HostedToolSearch`, and the compiler enforces it. A connector that
+wants the capability builds a real hosted request; one that does not, does
+nothing.
 
 ### 6. Reasoning / extended thinking
 
