@@ -171,6 +171,18 @@ with different support. The connector composes that answer from three inputs:
 
 - **Model capabilities.** What the model was trained for: vision, reasoning,
   tools, and its kind. This is the existing `ModelCapabilities`.
+
+  `reasoning` answers "can this connector configure reasoning for this model",
+  not "does this model reason". The two differ, and the difference is
+  load-bearing: DeepSeek R1 reasons on every request and returns the trace, and
+  Bedrock's Converse contract for it carries no reasoning field, so an effort
+  set against it changes nothing. Only Anthropic Claude 3.7 and the 4.x line
+  and later take a thinking budget, through
+  `additionalModelRequestFields.thinking`. The capability record and the
+  request builder read one function, so a client cannot be shown a control the
+  request path will discard. A budget that arrives for a model that takes none
+  is reported at `warn!` with the model and the budget, and the request goes
+  out without it.
 - **Backend API capabilities.** What one API surface supports for that model:
   streaming, cache control, tool search, reasoning configuration. This type is
   Bedrock-local. `docs/design/connector-capabilities.md` records why it stays

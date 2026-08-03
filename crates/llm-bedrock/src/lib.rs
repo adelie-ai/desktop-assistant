@@ -961,15 +961,11 @@ fn infer_capabilities_from_id(
         || lc.contains("cohere.command")
         || lc.contains("deepseek");
 
-    let reasoning = lc.contains("anthropic.claude-sonnet-4")
-        || lc.contains("anthropic.claude-opus-4")
-        || lc.contains("anthropic.claude-haiku-4")
-        || lc.contains("anthropic.claude-3-7")
-        || lc.contains("deepseek.r1")
-        || lc.contains("deepseek-r1");
-
     ModelCapabilities {
-        reasoning,
+        // One source of truth with the request builder: the flag says the
+        // connector can act on a reasoning effort for this model, so a client
+        // that offers the control is offering something that takes effect.
+        reasoning: supports_configurable_reasoning(&lc),
         vision,
         tools: tools && !is_embedding,
         // `is_embedding` is computed from the provider's real output-modality
@@ -983,6 +979,53 @@ fn infer_capabilities_from_id(
             ModelKind::Generative
         },
     }
+}
+
+/// Whether this connector can configure reasoning for a Bedrock model, i.e.
+/// whether a requested thinking budget reaches the model instead of being
+/// dropped.
+///
+/// `base_id` must be the region-prefix-stripped foundation model id, the same
+/// contract [`supports_prompt_caching`] and [`supports_streaming_with_tools`]
+/// use. Case-insensitive.
+///
+/// This is the single source of truth for the reasoning axis. Both the
+/// capability record ([`infer_capabilities_from_id`]) and the request builder
+/// ([`build_additional_model_request_fields`]) read it, so the picker cannot
+/// advertise a control the request path will not honour (#1022).
+///
+/// Only Anthropic Claude takes a reasoning configuration through Bedrock's
+/// Converse API, as `additionalModelRequestFields.thinking`: Claude 3.7 and
+/// the 4.x line and later. Claude 3.5 and Claude 3 predate extended thinking.
+///
+/// "Reasons" and "takes a reasoning configuration" are different questions,
+/// and the second one is what this answers. DeepSeek R1 is the case that
+/// makes the difference visible: it reasons on every request and returns its
+/// trace in `reasoningContent`, and AWS documents its whole Converse request
+/// body as `system` / `messages` / `inferenceConfig` / `guardrailConfig` -
+/// there is no reasoning field to set, and the reasoning documentation says
+/// plainly that not all models let you configure the tokens spent on it. A
+/// model whose reasoning is always on and never adjustable answers `false`
+/// here: nothing this connector sends changes what it does.
+fn supports_configurable_reasoning(base_id: &str) -> bool {
+    let lc = base_id.to_ascii_lowercase();
+    let Some(claude) = lc.strip_prefix("anthropic.claude-") else {
+        return false;
+    };
+
+    // Claude 3.x ids spell the minor version into the name
+    // (`3-5-sonnet-...`, `3-7-sonnet-...`); only 3.7 has extended thinking.
+    if let Some(three) = claude.strip_prefix("3-") {
+        return three.starts_with("7-");
+    }
+
+    // Claude 4 and later put the family first (`sonnet-4-5-...`,
+    // `opus-4-1-...`, `haiku-4-5-...`). Match the family, not the version, so
+    // a later minor release needs no edit here - the same forward-compatible
+    // shape `supports_prompt_caching` uses.
+    ["sonnet-", "opus-", "haiku-"]
+        .iter()
+        .any(|family| claude.starts_with(family))
 }
 
 /// Strip a cross-region inference-profile prefix (`us.`, `eu.`, `apac.`) to
@@ -1936,42 +1979,42 @@ fn streaming_tools_unsupported_detail(
     }
 }
 
-/// Recognize Claude-family Bedrock model ids. Only Claude models accept
-/// the `thinking` extended-thinking block via `additionalModelRequestFields`.
+/// What a turn's reasoning hint amounts to for the model that will serve it.
 ///
-/// Matches both the legacy `anthropic.claude-*` names and the cross-region
-/// inference profile aliases (`us.anthropic.claude-*`, `eu.anthropic.claude-*`,
-/// `apac.anthropic.claude-*`).
-fn is_claude_bedrock_model(model: &str) -> bool {
-    let m = model.to_ascii_lowercase();
-    m.contains("anthropic.claude")
+/// Three outcomes, and they stay distinct on purpose (#1022). "Nobody asked"
+/// and "somebody asked and this model cannot honour it" are different facts,
+/// and collapsing the second into the first is what let a paid-for reasoning
+/// effort disappear with nothing above `debug!` to say so.
+#[derive(Debug)]
+enum ReasoningRequest {
+    /// No reasoning was requested for this turn.
+    NotRequested,
+    /// Reasoning was requested and the model takes it. Carries the
+    /// `additionalModelRequestFields` document to send.
+    Configured(Document),
+    /// Reasoning was requested and this model takes no reasoning
+    /// configuration on Bedrock, so the effort has no effect on the request.
+    Unconfigurable { budget: u32 },
 }
 
-/// Build the `additionalModelRequestFields` Document for a Bedrock
-/// Converse request, translating the per-turn reasoning hint into the
-/// per-vendor shape.
+/// Resolve the per-turn reasoning hint against the model that will serve it.
 ///
-/// - Claude-family: `{"thinking": {"type": "enabled", "budget_tokens": N}}`
-/// - Others: `None` (unrecognized field would cause a 400).
+/// `model` may carry a cross-region inference-profile prefix; it is stripped
+/// here, so callers pass the id they dispatch with.
 ///
-/// Returns `None` when no reasoning is requested or when the model is
-/// not known to support extended thinking.
-fn build_additional_model_request_fields(
-    model: &str,
-    reasoning: ReasoningConfig,
-) -> Option<Document> {
+/// The emitted shape for a model that takes it is Anthropic's native one,
+/// `{"thinking": {"type": "enabled", "budget_tokens": N}}`, which Bedrock
+/// forwards verbatim. Which models those are is
+/// [`supports_configurable_reasoning`], shared with the capability record so
+/// the two cannot drift.
+fn resolve_reasoning_request(model: &str, reasoning: ReasoningConfig) -> ReasoningRequest {
     use std::collections::HashMap;
     let budget = match reasoning.thinking_budget_tokens {
         Some(n) if n > 0 => n,
-        _ => return None,
+        _ => return ReasoningRequest::NotRequested,
     };
-    if !is_claude_bedrock_model(model) {
-        tracing::debug!(
-            model,
-            budget,
-            "Bedrock reasoning requested but model is not Claude-family; dropping thinking field"
-        );
-        return None;
+    if !supports_configurable_reasoning(strip_region_prefix(model)) {
+        return ReasoningRequest::Unconfigurable { budget };
     }
     let mut thinking: HashMap<String, Document> = HashMap::new();
     thinking.insert("type".to_string(), Document::String("enabled".to_string()));
@@ -1981,7 +2024,33 @@ fn build_additional_model_request_fields(
     );
     let mut root: HashMap<String, Document> = HashMap::new();
     root.insert("thinking".to_string(), Document::Object(thinking));
-    Some(Document::Object(root))
+    ReasoningRequest::Configured(Document::Object(root))
+}
+
+/// Build the `additionalModelRequestFields` document for a Bedrock Converse
+/// request, and report a reasoning effort the model cannot act on.
+///
+/// Returns `None` when no reasoning was requested, and when the model takes
+/// no reasoning configuration - the second case is stated at `warn!` with the
+/// model and the budget, because the person who set that effort is paying for
+/// a control that did nothing.
+fn build_additional_model_request_fields(
+    model: &str,
+    reasoning: ReasoningConfig,
+) -> Option<Document> {
+    match resolve_reasoning_request(model, reasoning) {
+        ReasoningRequest::NotRequested => None,
+        ReasoningRequest::Configured(fields) => Some(fields),
+        ReasoningRequest::Unconfigurable { budget } => {
+            tracing::warn!(
+                model,
+                budget,
+                "reasoning effort ignored: this Bedrock model takes no reasoning \
+                 configuration, so the request goes out without one"
+            );
+            None
+        }
+    }
 }
 
 /// Map each tool call's (Bedrock-sanitized) name back to the original tool
@@ -2274,12 +2343,50 @@ mod tests {
     // --- Extended-thinking (reasoning) wiring ----------------------------
 
     #[test]
-    fn claude_bedrock_model_detection() {
-        assert!(is_claude_bedrock_model("anthropic.claude-opus-4-1"));
-        assert!(is_claude_bedrock_model("us.anthropic.claude-sonnet-4-6"));
-        assert!(is_claude_bedrock_model("eu.anthropic.claude-haiku-4-5"));
-        assert!(!is_claude_bedrock_model("amazon.titan-text-express-v1"));
-        assert!(!is_claude_bedrock_model("meta.llama3-70b"));
+    fn configurable_reasoning_reads_the_stripped_base_id() {
+        // The caller strips the region prefix, as it does for
+        // `supports_prompt_caching` and `supports_streaming_with_tools`.
+        assert!(supports_configurable_reasoning(strip_region_prefix(
+            "us.anthropic.claude-opus-4-1"
+        )));
+        assert!(supports_configurable_reasoning(strip_region_prefix(
+            "eu.anthropic.claude-3-7-sonnet-20250219-v1:0"
+        )));
+        assert!(!supports_configurable_reasoning(strip_region_prefix(
+            "apac.anthropic.claude-3-5-sonnet-20241022-v2:0"
+        )));
+        assert!(!supports_configurable_reasoning(
+            "amazon.titan-text-express-v1"
+        ));
+        // Unknown models default to "no configuration": an unrecognized
+        // reasoning field fails the whole request.
+        assert!(!supports_configurable_reasoning("future.unknown-model"));
+    }
+
+    #[test]
+    fn an_unconfigurable_reasoning_request_is_reported_not_dropped() {
+        // Three outcomes, and they must stay distinguishable. "Nobody asked"
+        // is not the same answer as "somebody asked and this model cannot
+        // honour it" - collapsing the second into the first is the silent
+        // drop this fix removes.
+        assert!(matches!(
+            resolve_reasoning_request("us.deepseek.r1-v1:0", ReasoningConfig::default()),
+            ReasoningRequest::NotRequested
+        ));
+        assert!(matches!(
+            resolve_reasoning_request(
+                "us.deepseek.r1-v1:0",
+                ReasoningConfig::with_thinking_budget(8_000)
+            ),
+            ReasoningRequest::Unconfigurable { budget: 8_000 }
+        ));
+        assert!(matches!(
+            resolve_reasoning_request(
+                "us.anthropic.claude-sonnet-4-6",
+                ReasoningConfig::with_thinking_budget(8_000)
+            ),
+            ReasoningRequest::Configured(_)
+        ));
     }
 
     /// Model ids paired with whether this connector can configure reasoning
