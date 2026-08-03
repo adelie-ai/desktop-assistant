@@ -675,6 +675,16 @@ impl ConnectionsService for DaemonConnectionsService {
                 );
             }
 
+            // Same hazard, different field. The payload has no `cache_policy`,
+            // so a client editing any other field of a Bedrock connection would
+            // otherwise delete a configured policy and quietly put the cache
+            // writes back on the bill (#1027). Carry it forward.
+            if let (ConnectionConfig::Bedrock(stored), ConnectionConfig::Bedrock(replacement)) =
+                (existing, &mut new_conn)
+            {
+                replacement.cache_policy = stored.cache_policy;
+            }
+
             cfg.connections
                 .insert(id_valid.as_str().to_string(), new_conn);
             Ok(())
@@ -2066,6 +2076,10 @@ fn payload_to_connection(payload: ConnectionConfigPayload) -> ConnectionConfig {
             connect_timeout_secs,
             stream_timeout_secs,
             max_context_tokens,
+            // The payload cannot express a cache policy, so this conversion
+            // cannot either. `update_connection` carries the stored one
+            // forward, the same way it re-attaches the secret coordinate.
+            cache_policy: None,
         }),
         ConnectionConfigPayload::Ollama {
             base_url,
@@ -3031,6 +3045,46 @@ mod tests {
                 Some("eu-west-1"),
                 "the requested edit should still apply"
             ),
+            other => panic!("expected a bedrock connection, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn update_connection_preserves_a_configured_bedrock_cache_policy() {
+        // `cache_policy` is a daemon.toml setting with no field on the wire
+        // payload, so an edit from a client rebuilds the connection without it.
+        // Losing it silently puts the cache writes back on the bill (#1027).
+        let stored = ConnectionConfig::Bedrock(crate::connections::BedrockConnection {
+            aws_profile: Some("work".into()),
+            region: Some("us-west-2".into()),
+            cache_policy: Some(desktop_assistant_llm_bedrock::CachePolicy::None),
+            ..Default::default()
+        });
+        let handle = make_handle_with(config_with_connections(&[("aws", stored)]));
+        let svc = DaemonConnectionsService::new(handle.clone());
+
+        svc.update_connection("aws".to_string(), bedrock_payload("eu-west-1"))
+            .await
+            .expect("updating an existing connection should succeed");
+
+        let cfg = handle.snapshot_config();
+        match cfg
+            .connections
+            .get("aws")
+            .expect("connection should still exist after update")
+        {
+            ConnectionConfig::Bedrock(c) => {
+                assert_eq!(
+                    c.cache_policy,
+                    Some(desktop_assistant_llm_bedrock::CachePolicy::None),
+                    "editing an unrelated field must not turn caching back on"
+                );
+                assert_eq!(
+                    c.region.as_deref(),
+                    Some("eu-west-1"),
+                    "the requested edit should still apply"
+                );
+            }
             other => panic!("expected a bedrock connection, got {other:?}"),
         }
     }

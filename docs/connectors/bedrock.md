@@ -280,22 +280,34 @@ therefore invalidate the system cache on every turn the tool list moves, and
 cost more than it saves. The Anthropic connector marks the system prefix only,
 for this same reason.
 
-`CachePolicy` is designed and not built. There is no `CachePolicy` type and no
-`cache_policy` configuration field today, and nothing turns caching off: the
-Converse path always behaves as `SystemPromptOnly` on a model that accepts a
-checkpoint. The intended shape is:
+**The policy.** `cache_policy` on a Bedrock connection selects how much of the
+request is marked:
 
 ```rust
-enum CachePolicy {
-    /// Emit no cache checkpoints.
+pub enum CachePolicy {
+    /// Emit no cache checkpoints, whatever the model supports.
     None,
     /// One checkpoint after the stable system prefix. The default.
     SystemPromptOnly,
-    /// System prefix and tool list. Sound only where the tool list is fixed
-    /// for the whole conversation.
-    SystemPromptAndTools,
 }
 ```
+
+The default keeps the behaviour every connection had before the setting
+existed. `none` exists because caching is not free: Bedrock bills a cache
+**write** above the uncached input rate, and the write pays back only when a
+later turn reads the same prefix. A conversation of several turns reads it
+every turn and comes out ahead. A workload of many short one-turn
+conversations pays the premium every turn and reads it rarely, and `none` is
+how that workload stops paying. `none` is also the way to rule caching out of
+a misbehaving turn without a code change.
+
+There is no "system prefix and tool list" value. It would be sound only where
+the tool list is fixed for a whole conversation, and this daemon's is not: tool
+search activates and deactivates namespaces inside a conversation. Bedrock
+evaluates checkpoints in the order `tools` -> `system` -> `messages`, so a
+checkpoint on `tools` would invalidate the system cache on every turn the list
+moves, and would cost more than it saves. Adding the value would ship a setting
+that quietly bills more.
 
 The connector decides where checkpoints go. The backend writes them in its own
 API's spelling. A backend serving a model without caching support ignores the
@@ -366,7 +378,13 @@ profile = "production"
 default_model = "us.anthropic.claude-opus-4-1"
 connect_timeout_secs = 30
 event_timeout_secs = 120
+# "system_prompt_only" (the default) or "none". See "Prompt caching".
+cache_policy = "system_prompt_only"
 ```
+
+`cache_policy` is a file setting. The connection commands on the API carry no
+field for it, so a client cannot read or write it, and an edit made through a
+client leaves the configured value in place rather than clearing it.
 
 ## IAM
 

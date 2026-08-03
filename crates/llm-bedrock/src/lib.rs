@@ -73,6 +73,51 @@ const MAX_NOTICE_DETAIL_CHARS: usize = 600;
 /// through daemon logs.
 const LIST_INFERENCE_PROFILES_PERMISSION: &str = "bedrock:ListInferenceProfiles";
 
+/// How much of a Converse request this connector marks for prompt caching.
+///
+/// Caching is not free. Bedrock bills a cache **write** above the uncached
+/// input rate, and the write pays back only when a later turn reads the same
+/// prefix. A conversation that runs for several turns reads it every turn and
+/// comes out ahead; a workload of short one-turn conversations pays the
+/// premium every turn and reads it rarely. So the policy is a setting, not a
+/// constant.
+///
+/// It is also a diagnostic. `none` rules caching out of a misbehaving turn
+/// without a code change.
+///
+/// Only the two shipped values exist. A third, "system prefix and tool list",
+/// is deliberately absent: Bedrock evaluates checkpoints in the order `tools`
+/// -> `system` -> `messages`, and a change in an earlier section invalidates
+/// the cache for every later one. Tool search moves the tool list inside a
+/// conversation, so a checkpoint on `tools` would invalidate the system cache
+/// on every turn the list moves, and would cost more than it saves. See
+/// `docs/connectors/bedrock.md`, "Prompt caching".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CachePolicy {
+    /// Emit no cache checkpoints, whatever the model supports.
+    None,
+    /// One checkpoint after the stable system prefix. The default, and the
+    /// behaviour every Bedrock connection had before this setting existed.
+    #[default]
+    SystemPromptOnly,
+}
+
+/// Whether a request for `model_id` carries a cache checkpoint.
+///
+/// Two independent conditions, and both must hold: the operator's policy
+/// allows a checkpoint, and the model accepts one. `model_id` may carry a
+/// cross-region inference-profile prefix; it is stripped here.
+///
+/// A model the connector has learned to reject checkpoints at runtime is
+/// handled by the caller, which does not call this for such a model.
+fn wants_cache_checkpoint(policy: CachePolicy, model_id: &str) -> bool {
+    match policy {
+        CachePolicy::None => false,
+        CachePolicy::SystemPromptOnly => supports_prompt_caching(strip_region_prefix(model_id)),
+    }
+}
+
 #[derive(Default)]
 struct ModelCache {
     /// Why the whole report and not just the models: a cache hit that
@@ -124,6 +169,9 @@ pub struct BedrockClient {
     /// Per-connection context-window hard cap, in tokens. `None` = "max
     /// available". Folded with the curated table in `max_context_tokens`.
     context_cap: Option<u64>,
+    /// How much of the request is marked for prompt caching. Defaults to
+    /// [`CachePolicy::SystemPromptOnly`].
+    cache_policy: CachePolicy,
     /// Test-only override for the Bedrock control-plane endpoint, so the
     /// model-listing tests can drive `ListFoundationModels` /
     /// `ListInferenceProfiles` against a local mock. Always `None` in
@@ -164,9 +212,20 @@ impl BedrockClient {
             event_timeout: STREAM_EVENT_TIMEOUT,
             non_streaming_timeout: NON_STREAMING_REQUEST_TIMEOUT,
             context_cap: None,
+            cache_policy: CachePolicy::default(),
             control_endpoint_override: None,
             runtime_endpoint_override: None,
         }
+    }
+
+    /// Set how much of the request is marked for prompt caching. `None` keeps
+    /// the [`CachePolicy::SystemPromptOnly`] default, so an unset connection
+    /// field behaves exactly as it did before the setting existed.
+    pub fn with_cache_policy(mut self, policy: Option<CachePolicy>) -> Self {
+        if let Some(policy) = policy {
+            self.cache_policy = policy;
+        }
+        self
     }
 
     /// Set the per-connection context-window hard cap, in tokens. `None`/
@@ -513,8 +572,10 @@ fn static_credentials_from_api_key(api_key: &str) -> Option<Credentials> {
 /// # Cache checkpoints
 ///
 /// Exactly one `cachePoint` block is emitted, directly after the *leading*
-/// system block, and only when `model_id` names a model that supports prompt
-/// caching. Two reasons, and either alone is sufficient:
+/// system block, and only when `cache_checkpoint` is set. The caller decides
+/// that with [`wants_cache_checkpoint`], which folds the operator's
+/// [`CachePolicy`] together with what the model accepts. Two reasons for one
+/// checkpoint in that position, and either alone is sufficient:
 ///
 /// - **Correctness.** Caching is a prefix match, so a checkpoint pays off only
 ///   when everything in front of it is byte-identical on the next turn. The
@@ -533,13 +594,10 @@ fn static_credentials_from_api_key(api_key: &str) -> Option<Credentials> {
 /// tool list inside a conversation, so a checkpoint on `tools` would invalidate
 /// the system cache on every turn the list moves. See
 /// `docs/connectors/bedrock.md`, "Prompt caching".
-///
-/// `model_id` may carry a cross-region inference-profile prefix; the support
-/// check strips it.
 fn convert_messages(
     messages: &[Message],
     tool_names: &ToolNameMap,
-    model_id: &str,
+    cache_checkpoint: bool,
 ) -> Result<(Vec<SystemContentBlock>, Vec<BedrockMessage>), CoreError> {
     let mut system = Vec::new();
     let mut api_messages = Vec::new();
@@ -682,7 +740,7 @@ fn convert_messages(
     // The one checkpoint: immediately behind the stable prefix. Volatile
     // per-turn blocks follow it unmarked, so a change in one of them leaves
     // the cached prefix intact.
-    if !system.is_empty() && supports_prompt_caching(strip_region_prefix(model_id)) {
+    if !system.is_empty() && cache_checkpoint {
         system.insert(1, SystemContentBlock::CachePoint(default_cache_point()?));
     }
 
@@ -1671,7 +1729,8 @@ impl LlmClient for BedrockClient {
         // system prompt carries a cache checkpoint.
         let model = current_model_override().unwrap_or_else(|| self.model.clone());
 
-        let (system, api_messages) = convert_messages(&messages, &tool_names, &model)?;
+        let cache_checkpoint = wants_cache_checkpoint(self.cache_policy, &model);
+        let (system, api_messages) = convert_messages(&messages, &tool_names, cache_checkpoint)?;
         let tool_config = convert_tools(tools, &tool_names)?;
 
         let msg_count = api_messages.len();
@@ -4398,8 +4457,12 @@ mod tests {
         ];
         // Map built from the CURRENT tool set (which still offers the tool).
         let map = ToolNameMap::from_names(["weather.lookup"]);
-        let (_system, messages) =
-            convert_messages(&history, &map, checkpoint_for("us.anthropic.claude-sonnet-4-6")).expect("convert ok");
+        let (_system, messages) = convert_messages(
+            &history,
+            &map,
+            checkpoint_for("us.anthropic.claude-sonnet-4-6"),
+        )
+        .expect("convert ok");
 
         let names = tool_use_names(&messages);
         assert_eq!(names.len(), 1, "expected one toolUse in history");
@@ -4427,8 +4490,12 @@ mod tests {
         )])];
         // Empty map: the tool isn't offered this turn.
         let map = ToolNameMap::from_names(Vec::<&str>::new());
-        let (_system, messages) =
-            convert_messages(&history, &map, checkpoint_for("us.anthropic.claude-sonnet-4-6")).expect("convert ok");
+        let (_system, messages) = convert_messages(
+            &history,
+            &map,
+            checkpoint_for("us.anthropic.claude-sonnet-4-6"),
+        )
+        .expect("convert ok");
         let names = tool_use_names(&messages);
         assert_eq!(names.len(), 1);
         assert!(
@@ -4459,8 +4526,12 @@ mod tests {
         let history = vec![Message::assistant_with_tool_calls(vec![ToolCall::new(
             "c1", tool, "{}",
         )])];
-        let (_s, messages) =
-            convert_messages(&history, &map, checkpoint_for("us.anthropic.claude-sonnet-4-6")).expect("ok");
+        let (_s, messages) = convert_messages(
+            &history,
+            &map,
+            checkpoint_for("us.anthropic.claude-sonnet-4-6"),
+        )
+        .expect("ok");
         let hist_name = tool_use_names(&messages).into_iter().next().expect("one");
 
         assert_eq!(
@@ -4534,9 +4605,12 @@ mod tests {
     #[test]
     fn cache_point_emitted_for_anthropic_model() {
         let map = ToolNameMap::from_names(Vec::<&str>::new());
-        let (system, _messages) =
-            convert_messages(&caching_history(), &map, checkpoint_for("us.anthropic.claude-sonnet-4-6"))
-                .expect("convert ok");
+        let (system, _messages) = convert_messages(
+            &caching_history(),
+            &map,
+            checkpoint_for("us.anthropic.claude-sonnet-4-6"),
+        )
+        .expect("convert ok");
 
         assert_eq!(
             cache_point_indices(&system),
@@ -4561,9 +4635,12 @@ mod tests {
     #[test]
     fn cache_point_emitted_for_amazon_nova_model() {
         let map = ToolNameMap::from_names(Vec::<&str>::new());
-        let (system, _messages) =
-            convert_messages(&caching_history(), &map, checkpoint_for("us.amazon.nova-pro-v1:0"))
-                .expect("convert ok");
+        let (system, _messages) = convert_messages(
+            &caching_history(),
+            &map,
+            checkpoint_for("us.amazon.nova-pro-v1:0"),
+        )
+        .expect("convert ok");
         assert_eq!(cache_point_indices(&system), vec![1], "{system:?}");
     }
 
@@ -4599,7 +4676,8 @@ mod tests {
             "us.anthropic.claude-3-haiku-20240307-v1:0",
         ] {
             let (system, _messages) =
-                convert_messages(&caching_history(), &map, checkpoint_for(profile_id)).expect("convert ok");
+                convert_messages(&caching_history(), &map, checkpoint_for(profile_id))
+                    .expect("convert ok");
             assert!(
                 cache_point_indices(&system).is_empty(),
                 "{profile_id} must get no checkpoint: {system:?}"

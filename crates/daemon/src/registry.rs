@@ -275,18 +275,27 @@ pub fn build_llm_client(resolved: ResolvedLlmConfig) -> Arc<dyn LlmClient> {
             }
             Arc::new(client)
         }
-        Connector::Bedrock => Arc::new(
-            desktop_assistant_llm_bedrock::BedrockClient::new(resolved.api_key)
-                .with_model(resolved.model)
-                .with_base_url(resolved.base_url)
-                .with_temperature(resolved.temperature)
-                .with_top_p(resolved.top_p)
-                .with_max_tokens(resolved.max_tokens)
-                .with_aws_profile(resolved.aws_profile)
-                .with_connect_timeout(resolved.connect_timeout_secs)
-                .with_event_timeout(resolved.stream_timeout_secs)
-                .with_max_context_tokens(resolved.max_context_tokens),
-        ),
+        Connector::Bedrock => {
+            // `None` here means "no `cache_policy` in the connection", which
+            // keeps the connector default rather than turning caching off.
+            let cache_policy = match resolved.extras {
+                ConnectorExtras::Bedrock { cache_policy } => cache_policy,
+                _ => None,
+            };
+            Arc::new(
+                desktop_assistant_llm_bedrock::BedrockClient::new(resolved.api_key)
+                    .with_model(resolved.model)
+                    .with_base_url(resolved.base_url)
+                    .with_temperature(resolved.temperature)
+                    .with_top_p(resolved.top_p)
+                    .with_max_tokens(resolved.max_tokens)
+                    .with_aws_profile(resolved.aws_profile)
+                    .with_connect_timeout(resolved.connect_timeout_secs)
+                    .with_event_timeout(resolved.stream_timeout_secs)
+                    .with_max_context_tokens(resolved.max_context_tokens)
+                    .with_cache_policy(cache_policy),
+            )
+        }
         Connector::OpenAi => {
             if resolved.api_key.is_empty() {
                 tracing::warn!(

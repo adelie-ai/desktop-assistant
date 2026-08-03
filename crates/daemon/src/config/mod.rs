@@ -757,10 +757,15 @@ impl Default for SecretConfig {
 /// `Option<..>` fields that only one connector ever reads.
 #[derive(Debug, Clone, Default)]
 pub enum ConnectorExtras {
-    /// No provider-specific config (Ollama, Anthropic, Bedrock, OpenAI,
-    /// OpenRouter).
+    /// No provider-specific config (Ollama, Anthropic, OpenAI, OpenRouter).
     #[default]
     None,
+    /// Bedrock prompt-caching policy. `None` keeps the connector default
+    /// (`system_prompt_only`), which is what an unset connection field means.
+    Bedrock {
+        /// How much of the request is marked for prompt caching.
+        cache_policy: Option<desktop_assistant_llm_bedrock::CachePolicy>,
+    },
     /// Azure OpenAI surface/auth/version knobs. Strings are the raw config
     /// values; the factory parses them into the connector's typed enums
     /// (`ApiSurface`, `AuthMode`) so an invalid value fails loudly there.

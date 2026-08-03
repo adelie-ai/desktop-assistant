@@ -851,6 +851,13 @@ pub struct BedrockConnection {
     /// available". See [`AnthropicConnection::max_context_tokens`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_context_tokens: Option<u64>,
+    /// How much of a request this connection marks for prompt caching:
+    /// `system_prompt_only` (the default) or `none`. `None` keeps the
+    /// connector default. Bedrock bills a cache write above the uncached input
+    /// rate, so a workload of short one-turn conversations is cheaper with
+    /// `none`; `none` also rules caching out while diagnosing a bad turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_policy: Option<desktop_assistant_llm_bedrock::CachePolicy>,
 }
 
 /// Ollama (local or self-hosted) connection fields.

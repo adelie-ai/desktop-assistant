@@ -809,6 +809,9 @@ pub fn resolve_connection_llm_config(
             auth_mode: c.auth_mode.clone(),
             api_version: c.api_version.clone(),
         },
+        ConnectionConfig::Bedrock(c) => ConnectorExtras::Bedrock {
+            cache_policy: c.cache_policy,
+        },
         ConnectionConfig::Google(c) => ConnectorExtras::Google {
             project: field_or_env(
                 c.project.as_deref(),
