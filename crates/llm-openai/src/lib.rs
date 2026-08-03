@@ -15,6 +15,8 @@ use desktop_assistant_llm_http::{
 use eventsource_stream::Eventsource;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 
 /// Connection-handshake / per-event stall budgets shared with the other
 /// connectors (#214/#220/#302). Kept as local aliases so the streaming loop
@@ -72,6 +74,55 @@ pub struct OpenAiClient {
     /// Per-connection context-window hard cap, in tokens. `None` = "max
     /// available". Folded with the curated table in `max_context_tokens`.
     context_cap: Option<u64>,
+    /// Per-model memo of endpoints that refuse the hosted tool-search request
+    /// shape. A model recorded here skips the hosted attempt and goes straight
+    /// to the flattened tool list on the next namespaced turn.
+    ///
+    /// `base_url` is configurable, so this client also serves endpoints that
+    /// speak the Responses API without being OpenAI. Such an endpoint may
+    /// serve `/responses` and still reject the `tool_search` tool type.
+    /// Populated at runtime from that rejection; the guard is never held
+    /// across an `.await`.
+    no_hosted_search_models: Arc<Mutex<HashSet<String>>>,
+}
+
+/// Failure of the HTTP exchange, read from the response status before the body
+/// is consumed.
+///
+/// Exists so a caller can tell "this endpoint will not accept a request shaped
+/// like this" from every other failure, and retry with a different shape.
+enum SendError {
+    /// The endpoint refused the request itself: a client error that is not
+    /// authentication, throttling, quota, or a context overflow. A
+    /// differently-shaped request could still succeed.
+    Rejected(String),
+    /// Everything else, already classified.
+    Failed(CoreError),
+}
+
+impl SendError {
+    /// Collapse to the port's error type, for a caller with no second shape to
+    /// try. A refused request is a plain LLM error, worded exactly as it was
+    /// before this distinction existed.
+    fn into_core(self) -> CoreError {
+        match self {
+            Self::Rejected(detail) => CoreError::Llm(detail),
+            Self::Failed(e) => e,
+        }
+    }
+}
+
+/// Whether `status` says the endpoint refused the shape of the request, rather
+/// than refusing the caller or the moment.
+///
+/// Excluded on purpose, each because retrying with a different shape is the
+/// wrong answer: 401/403 (the credential, not the request), 408 (a timeout,
+/// which is transient), and 429 (throttling, already classified before this is
+/// reached, and a larger retry would make it worse). A context overflow is
+/// also classified earlier, because flattening deferred tools into the prompt
+/// answers an overflow with a bigger request.
+fn is_request_shape_rejection(status: reqwest::StatusCode) -> bool {
+    status.is_client_error() && !matches!(status.as_u16(), 401 | 403 | 408 | 429)
 }
 
 impl OpenAiClient {
@@ -100,6 +151,7 @@ impl OpenAiClient {
             connect_timeout: OPENAI_CONNECT_TIMEOUT,
             event_timeout: OPENAI_EVENT_TIMEOUT,
             context_cap: None,
+            no_hosted_search_models: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -499,13 +551,33 @@ fn convert_messages(messages: &[Message]) -> (Vec<InputItem>, Option<String>) {
 // ---------------------------------------------------------------------------
 
 impl OpenAiClient {
-    /// Send a Responses API request and parse the SSE stream into an LlmResponse.
+    /// Send a Responses API request and parse the SSE stream into an
+    /// LlmResponse, collapsing a refused request shape into a plain error.
+    ///
+    /// A caller with a second shape to try calls [`Self::send_request`] and
+    /// [`Self::consume_stream`] itself.
     async fn send_and_stream(
         &self,
         request_json: &str,
         request_body: &impl Serialize,
-        mut on_chunk: ChunkCallback,
+        on_chunk: ChunkCallback,
     ) -> Result<LlmResponse, CoreError> {
+        match self.send_request(request_json, request_body).await {
+            Ok(response) => self.consume_stream(response, on_chunk).await,
+            Err(e) => Err(e.into_core()),
+        }
+    }
+
+    /// Perform the HTTP exchange and classify a non-success status.
+    ///
+    /// Split from [`Self::consume_stream`] so a refused request shape is
+    /// visible before the response body is touched, which is what lets the
+    /// namespaced path retry with a different shape and the same callback.
+    async fn send_request(
+        &self,
+        request_json: &str,
+        request_body: &impl Serialize,
+    ) -> Result<reqwest::Response, SendError> {
         let request_bytes = request_json.len();
         tracing::info!(
             request_bytes,
@@ -522,7 +594,7 @@ impl OpenAiClient {
         let cancellation =
             desktop_assistant_core::ports::llm::current_cancellation_token().unwrap_or_default();
         if cancellation.is_cancelled() {
-            return Err(CoreError::Cancelled);
+            return Err(SendError::Failed(CoreError::Cancelled));
         }
 
         let send_fut = self
@@ -535,15 +607,19 @@ impl OpenAiClient {
         // Bound the connection handshake so a stalled connect fails the turn
         // instead of hanging forever (#220).
         let response = tokio::select! {
-            _ = cancellation.cancelled() => return Err(CoreError::Cancelled),
+            _ = cancellation.cancelled() => return Err(SendError::Failed(CoreError::Cancelled)),
             _ = tokio::time::sleep(self.connect_timeout) => {
                 tracing::error!(
                     timeout_s = self.connect_timeout.as_secs(),
                     "OpenAI request send() timed out (no response headers)"
                 );
-                return Err(CoreError::Llm("OpenAI stream stalled".into()));
+                return Err(SendError::Failed(CoreError::Llm(
+                    "OpenAI stream stalled".into(),
+                )));
             }
-            r = send_fut => r.map_err(|e| CoreError::Llm(format!("HTTP request failed: {e}")))?,
+            r = send_fut => r.map_err(|e| {
+                SendError::Failed(CoreError::Llm(format!("HTTP request failed: {e}")))
+            })?,
         };
 
         if !response.status().is_success() {
@@ -565,11 +641,11 @@ impl OpenAiClient {
                     max_tokens = ?max_tokens,
                     "OpenAI rejected request for context overflow"
                 );
-                return Err(CoreError::ContextOverflow {
+                return Err(SendError::Failed(CoreError::ContextOverflow {
                     prompt_tokens,
                     max_tokens,
                     detail: format!("OpenAI API error (HTTP {status}): {body}"),
-                });
+                }));
             }
             // HTTP 429 is overloaded between two semantically distinct
             // signals on OpenAI: throttling (transient, retryable) and
@@ -578,27 +654,44 @@ impl OpenAiClient {
             // classifiers don't have to.
             if status.as_u16() == 429 {
                 if detect_openai_insufficient_quota(&body) {
-                    return Err(CoreError::QuotaExceeded {
+                    return Err(SendError::Failed(CoreError::QuotaExceeded {
                         detail: format!("OpenAI API error (HTTP {status}): {body}"),
-                    });
+                    }));
                 }
-                return Err(CoreError::RateLimited {
+                return Err(SendError::Failed(CoreError::RateLimited {
                     retry_after,
                     detail: format!("OpenAI API error (HTTP {status}): {body}"),
-                });
+                }));
             }
             // 503 Service Unavailable is OpenAI's "server overloaded"
             // signal; retry-with-backoff recovers the same as 429.
             if status.as_u16() == 503 {
-                return Err(CoreError::RateLimited {
+                return Err(SendError::Failed(CoreError::RateLimited {
                     retry_after,
                     detail: format!("OpenAI API error (HTTP {status}): {body}"),
-                });
+                }));
             }
-            return Err(CoreError::Llm(format!(
-                "OpenAI API error (HTTP {status}): {body}"
-            )));
+            let detail = format!("OpenAI API error (HTTP {status}): {body}");
+            if is_request_shape_rejection(status) {
+                return Err(SendError::Rejected(detail));
+            }
+            return Err(SendError::Failed(CoreError::Llm(detail)));
         }
+
+        Ok(response)
+    }
+
+    /// Consume the SSE stream into an [`LlmResponse`].
+    async fn consume_stream(
+        &self,
+        response: reqwest::Response,
+        mut on_chunk: ChunkCallback,
+    ) -> Result<LlmResponse, CoreError> {
+        // Re-read rather than thread it through: the token is a task-local, so
+        // this is the same token `send_request` observed, and the streaming
+        // loop is the half that has to keep watching it.
+        let cancellation =
+            desktop_assistant_core::ports::llm::current_cancellation_token().unwrap_or_default();
 
         let mut events = response.bytes_stream().eventsource();
 
@@ -1010,6 +1103,28 @@ impl LlmClient for OpenAiClient {
         reasoning: ReasoningConfig,
         on_chunk: ChunkCallback,
     ) -> Result<LlmResponse, CoreError> {
+        // Per-turn model override (issue #34); see `stream_completion`.
+        let model = current_model_override().unwrap_or_else(|| self.model.clone());
+
+        // An endpoint already known to refuse the tool-search shape skips the
+        // doomed attempt. The guard is dropped before any `.await`.
+        let skip_hosted = {
+            let memo = self
+                .no_hosted_search_models
+                .lock()
+                .expect("no_hosted_search_models mutex poisoned");
+            memo.contains(&model)
+        };
+        if skip_hosted {
+            tracing::debug!(
+                model = %model,
+                "skipping hosted tool search: endpoint memoized as refusing it"
+            );
+            return self
+                .stream_flattened(messages, core_tools, namespaces, reasoning, on_chunk)
+                .await;
+        }
+
         let (input, instructions) = convert_messages(&messages);
 
         let mut tool_entries: Vec<ToolEntry> = core_tools
@@ -1025,13 +1140,10 @@ impl LlmClient for OpenAiClient {
             r#type: "tool_search".to_string(),
         }));
 
-        // Per-turn model override (issue #34); see `stream_completion`.
-        let model = current_model_override().unwrap_or_else(|| self.model.clone());
-
         let reasoning_block = reasoning_for(&model, reasoning);
 
         let request = ResponsesRequest {
-            model,
+            model: model.clone(),
             input,
             instructions,
             stream: true,
@@ -1051,7 +1163,61 @@ impl LlmClient for OpenAiClient {
             "using hosted tool search with namespaces"
         );
 
-        self.send_and_stream(&request_json, &request, on_chunk)
+        match self.send_request(&request_json, &request).await {
+            Ok(response) => self.consume_stream(response, on_chunk).await,
+            Err(SendError::Rejected(detail)) => {
+                // The tool-search sentinel and the namespace entries are the
+                // only things this request carries that a plain one does not,
+                // so a refused shape means the endpoint does not serve hosted
+                // tool search. Degrade to the flattened tool list rather than
+                // fail the turn, and remember the endpoint so later turns pay
+                // for one request instead of two.
+                tracing::warn!(
+                    model = %model,
+                    detail,
+                    "endpoint refused the hosted tool-search request; sending the \
+                     tools inline instead and memoizing the model"
+                );
+                {
+                    let mut memo = self
+                        .no_hosted_search_models
+                        .lock()
+                        .expect("no_hosted_search_models mutex poisoned");
+                    memo.insert(model);
+                }
+                self.stream_flattened(messages, core_tools, namespaces, reasoning, on_chunk)
+                    .await
+            }
+            Err(e) => Err(e.into_core()),
+        }
+    }
+}
+
+impl OpenAiClient {
+    /// Send every namespace tool inline, as the trait's own default
+    /// `stream_completion_with_namespaces` does.
+    ///
+    /// This is the degraded path, and it has to carry the deferred tools: the
+    /// daemon removes `builtin_tool_search` from the core tools whenever
+    /// hosted search is active, so a fallback that dropped the namespaces
+    /// would leave the model with no way to reach them at all.
+    async fn stream_flattened(
+        &self,
+        messages: Vec<Message>,
+        core_tools: &[ToolDefinition],
+        namespaces: &[ToolNamespace],
+        reasoning: ReasoningConfig,
+        on_chunk: ChunkCallback,
+    ) -> Result<LlmResponse, CoreError> {
+        let mut all: Vec<ToolDefinition> = core_tools.to_vec();
+        for ns in namespaces {
+            all.extend(ns.tools.iter().cloned());
+        }
+        tracing::info!(
+            tool_count = all.len(),
+            "sending every tool inline (hosted tool search unavailable)"
+        );
+        self.stream_completion(messages, &all, reasoning, on_chunk)
             .await
     }
 }
