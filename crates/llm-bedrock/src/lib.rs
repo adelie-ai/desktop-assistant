@@ -3891,11 +3891,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_profile_prefix_this_build_does_not_know_still_carries_the_base_model() {
-        // The prefix allowlist can only ever be as current as the last time
-        // somebody read the AWS docs. When AWS issues a new geography, the
-        // listing still says which foundation model the profile routes to, so
-        // that answer is used rather than an id that matches nothing.
+    async fn a_profile_id_the_prefix_list_does_not_cover_reports_what_dispatch_will_do() {
+        // An id this connector cannot reduce to a foundation model - a
+        // geography newer than the prefix list, or an APPLICATION profile,
+        // whose id is a generated identifier with no prefix at all - is a
+        // capability the connector genuinely does not have. The listing could
+        // recover the base model from the profile's ARN, and must not: the
+        // dispatch path has only the id, so an answer taken from the ARN would
+        // put a control in front of a person that the request path then
+        // discards. That is the #1022 defect, rebuilt.
+        //
+        // So the record withholds, and it withholds in step with dispatch.
+        // Doing better means carrying the resolved mapping to the dispatch
+        // gates as well - see the note on `fallback_modalities_from_id`.
         let server = httpmock::MockServer::start();
         mock_drifting_control_plane(&server);
 
@@ -3904,17 +3912,25 @@ mod tests {
             .await
             .expect("healthy listing");
 
-        let profile = find_model(&report, "xx.anthropic.claude-sonnet-4-5-20250929-v1:0");
-        assert!(
-            profile.capabilities.reasoning,
-            "Sonnet 4.5 takes a thinking budget whatever geography serves it"
+        let id = "xx.anthropic.claude-sonnet-4-5-20250929-v1:0";
+        let profile = find_model(&report, id);
+
+        let dispatch_would_send = matches!(
+            resolve_reasoning_request(id, ReasoningConfig::with_thinking_budget(8_000)),
+            ReasoningRequest::Configured(_)
         );
-        assert!(profile.capabilities.vision);
-        assert!(profile.capabilities.tools);
+        assert_eq!(
+            profile.capabilities.reasoning, dispatch_would_send,
+            "the record and the request path must answer the same, whichever way they answer"
+        );
+        assert!(
+            !profile.capabilities.reasoning,
+            "an id that reduces to nothing cannot be promised a thinking budget"
+        );
         assert_eq!(
             profile.context_limit,
-            Some(200_000),
-            "the context window comes from the base model, not the prefix"
+            context_limit_for_model(id),
+            "the picker's window must be the one the daemon budgets against"
         );
     }
 
