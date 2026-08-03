@@ -1,5 +1,5 @@
 //! Per-turn dispatch client used by [`crate::api_surface::RoutingConversationHandler`]
-//! to swap the underlying [`AnyLlmClient`] based on the resolved
+//! to swap the underlying `AnyLlmClient` based on the resolved
 //! `(connection_id, model_id, effort)` triple for each `send_prompt`.
 //!
 //! Rationale: the core `ConversationHandler` owns a single `llm: L` field
