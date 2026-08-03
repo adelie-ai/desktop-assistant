@@ -1662,6 +1662,96 @@ mod tests {
         assert_eq!(max, None);
     }
 
+    /// vLLM's rejection shape: flat, no `error` key at all, numeric `code`.
+    const VLLM_OVERFLOW_BODY: &str = r#"{"object":"error","message":"This model's maximum context length is 4096 tokens. However, you requested 5000 tokens.","type":"BadRequestError","code":400}"#;
+
+    /// LiteLLM's rejection shape: the envelope parses, but the code is its own.
+    const LITELLM_OVERFLOW_BODY: &str = r#"{"error":{"message":"litellm.ContextWindowExceededError: This model's maximum context length is 8192 tokens. However, you requested 9001 tokens.","type":"context_window_exceeded","code":"400"}}"#;
+
+    /// `base_url` is configurable, so this client also serves endpoints that
+    /// speak the Responses API without being OpenAI. Their overflow wording is
+    /// not OpenAI's, and misreading it costs the whole recovery: the core's
+    /// truncate-and-retry ladder runs on `CoreError::ContextOverflow` and on
+    /// nothing else.
+    #[test]
+    fn detect_context_overflow_reads_vllm_wording() {
+        let (prompt, max) =
+            detect_openai_context_overflow(VLLM_OVERFLOW_BODY).expect("vLLM overflow detected");
+        assert_eq!(max, Some(4096));
+        assert_eq!(prompt, Some(5000));
+    }
+
+    #[test]
+    fn detect_context_overflow_reads_litellm_wording() {
+        let (prompt, max) = detect_openai_context_overflow(LITELLM_OVERFLOW_BODY)
+            .expect("LiteLLM overflow detected");
+        assert_eq!(max, Some(8192));
+        assert_eq!(prompt, Some(9001));
+    }
+
+    /// The structured code is authoritative wherever there is one. A body that
+    /// parses as the envelope and names some other code is not an overflow,
+    /// however its message reads - misclassifying is destructive, because
+    /// `recover_from_overflow` rewrites the largest tool result's content in
+    /// place, up to `MAX_OVERFLOW_RETRIES` times.
+    #[test]
+    fn detect_context_overflow_trusts_the_structured_code_over_the_message() {
+        // A quota refusal that happens to discuss the context window.
+        let body = r#"{"error":{"code":"insufficient_quota","type":"insufficient_quota","message":"Your plan's maximum context length is 8192 tokens; upgrade for more."}}"#;
+        assert!(
+            detect_openai_context_overflow(body).is_none(),
+            "an envelope with its own code must not be reclassified from its message"
+        );
+    }
+
+    #[test]
+    fn detect_context_overflow_still_ignores_unrelated_rejections() {
+        let schema_rejection = r#"{"error":{"code":"invalid_function_parameters","type":"invalid_request_error","message":"Invalid schema for function 'terminal__run'."}}"#;
+        assert!(detect_openai_context_overflow(schema_rejection).is_none());
+        assert!(
+            detect_openai_context_overflow(
+                r#"{"object":"error","message":"bad request","type":"BadRequestError","code":400}"#
+            )
+            .is_none(),
+            "a flat body with no context wording is not an overflow"
+        );
+        assert!(detect_openai_context_overflow("not json").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_vllm_shaped_overflow_surfaces_as_context_overflow() {
+        let server = httpmock::MockServer::start();
+        let _m = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/responses");
+            then.status(400)
+                .header("content-type", "application/json")
+                .body(VLLM_OVERFLOW_BODY);
+        });
+
+        let client = OpenAiClient::new("key".into()).with_base_url(server.url(""));
+        let err = client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await
+            .expect_err("must fail");
+
+        match err {
+            CoreError::ContextOverflow {
+                prompt_tokens,
+                max_tokens,
+                ..
+            } => {
+                assert_eq!(prompt_tokens, Some(5000));
+                assert_eq!(max_tokens, Some(4096));
+            }
+            other => panic!("expected ContextOverflow, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn http_400_context_length_exceeded_emits_context_overflow() {
         let server = httpmock::MockServer::start();
