@@ -79,10 +79,15 @@ here and must not share a name:
   after configuration. This is what a turn actually obeys, and what the model
   listing must carry.
 
-Today both are called `supports_hosted_tool_search` - one on the `Connector`
-enum, one on the `LlmClient` trait - and clients are told the first while turns
-obey the second. They can disagree. Keep both questions, give them names that
-say which they answer, and make the pair-keyed answer carry the instance one.
+Hosted tool search is the worked example. `Connector::type_offers_hosted_tool_search`
+answers the type question and feeds the connector-defaults view; the `LlmClient`
+trait's `supports_hosted_tool_search` answers the instance question and is what a
+turn obeys. The names now say which is which, because they once did not: both
+were called `supports_hosted_tool_search`, and a reader had to open the doc
+comments to learn that clients were told one and turns obeyed the other.
+
+Keep both questions. Name each for the axis it answers, and make the pair-keyed
+answer carry the instance one.
 
 ## Composition
 
