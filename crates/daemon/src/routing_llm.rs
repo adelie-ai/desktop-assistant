@@ -31,8 +31,8 @@ use std::sync::Arc;
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Message, ToolDefinition, ToolNamespace};
 use desktop_assistant_core::ports::llm::{
-    ChunkCallback, LlmClient, LlmResponse, ModelInfo, ModelListingReport, ReasoningConfig,
-    with_model_override,
+    ChunkCallback, HostedToolSearch, LlmClient, LlmResponse, ModelInfo, ModelListingReport,
+    ReasoningConfig, dispatch_namespaced, with_model_override,
 };
 
 use crate::api_surface::RegistryHandle;
@@ -435,6 +435,37 @@ impl LlmClient for RoutingLlmClient {
         }
     }
 
+    /// Hands back `self`, never the resolved client's object, so the router
+    /// stays in the call path for a namespaced turn. Handing back the
+    /// resolved client's object would also freeze the resolution at the
+    /// moment of the capability read, while dispatch must resolve again at
+    /// the moment it sends. See [`LlmClient::hosted_tool_search`].
+    fn hosted_tool_search(&self) -> Option<&dyn HostedToolSearch> {
+        let resolved_has = match &self.fallback {
+            FallbackMode::PerTurn { .. } => self.resolve_per_turn().hosted_tool_search().is_some(),
+            FallbackMode::Pinned { client, .. } => client.hosted_tool_search().is_some(),
+            FallbackMode::DynamicPurpose { .. } => false,
+        };
+        resolved_has.then_some(self as &dyn HostedToolSearch)
+    }
+
+    async fn stream_completion_with_namespaces(
+        &self,
+        messages: Vec<Message>,
+        core_tools: &[ToolDefinition],
+        namespaces: &[ToolNamespace],
+        reasoning: ReasoningConfig,
+        on_chunk: ChunkCallback,
+    ) -> Result<LlmResponse, CoreError> {
+        HostedToolSearch::stream_completion_with_namespaces(
+            self, messages, core_tools, namespaces, reasoning, on_chunk,
+        )
+        .await
+    }
+}
+
+#[async_trait::async_trait]
+impl HostedToolSearch for RoutingLlmClient {
     async fn stream_completion_with_namespaces(
         &self,
         messages: Vec<Message>,
@@ -446,34 +477,32 @@ impl LlmClient for RoutingLlmClient {
         match &self.fallback {
             FallbackMode::PerTurn { .. } => {
                 let client = self.resolve_per_turn();
-                client
-                    .stream_completion_with_namespaces(
-                        messages, core_tools, namespaces, reasoning, on_chunk,
-                    )
-                    .await
+                dispatch_namespaced(
+                    &client, messages, core_tools, namespaces, reasoning, on_chunk,
+                )
+                .await
             }
             FallbackMode::Pinned { .. } => {
                 self.dispatch_pinned(|client| async move {
-                    client
-                        .stream_completion_with_namespaces(
-                            messages, core_tools, namespaces, reasoning, on_chunk,
-                        )
-                        .await
+                    dispatch_namespaced(
+                        &client, messages, core_tools, namespaces, reasoning, on_chunk,
+                    )
+                    .await
                 })
                 .await
             }
             FallbackMode::DynamicPurpose { .. } => {
                 let _ = reasoning;
                 self.dispatch_dynamic(|client, resolved_reasoning| async move {
-                    client
-                        .stream_completion_with_namespaces(
-                            messages,
-                            core_tools,
-                            namespaces,
-                            resolved_reasoning,
-                            on_chunk,
-                        )
-                        .await
+                    dispatch_namespaced(
+                        &client,
+                        messages,
+                        core_tools,
+                        namespaces,
+                        resolved_reasoning,
+                        on_chunk,
+                    )
+                    .await
                 })
                 .await
             }

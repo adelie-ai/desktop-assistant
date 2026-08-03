@@ -1449,6 +1449,33 @@ impl<L: LlmClient> LlmClient for RetryingLlmClient<L> {
         self.inner.supports_hosted_tool_search()
     }
 
+    /// Hands back `self`, never the inner client's object, so this
+    /// decorator stays in the call path for a namespaced turn. See
+    /// [`LlmClient::hosted_tool_search`].
+    fn hosted_tool_search(&self) -> Option<&dyn HostedToolSearch> {
+        self.inner
+            .hosted_tool_search()
+            .is_some()
+            .then_some(self as &dyn HostedToolSearch)
+    }
+
+    async fn stream_completion_with_namespaces(
+        &self,
+        messages: Vec<Message>,
+        core_tools: &[ToolDefinition],
+        namespaces: &[ToolNamespace],
+        reasoning: ReasoningConfig,
+        on_chunk: ChunkCallback,
+    ) -> Result<LlmResponse, CoreError> {
+        HostedToolSearch::stream_completion_with_namespaces(
+            self, messages, core_tools, namespaces, reasoning, on_chunk,
+        )
+        .await
+    }
+}
+
+#[async_trait::async_trait]
+impl<L: LlmClient> HostedToolSearch for RetryingLlmClient<L> {
     async fn stream_completion_with_namespaces(
         &self,
         messages: Vec<Message>,
@@ -1461,15 +1488,15 @@ impl<L: LlmClient> LlmClient for RetryingLlmClient<L> {
         let forwarded = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         (|| async {
-            self.inner
-                .stream_completion_with_namespaces(
-                    messages.clone(),
-                    core_tools,
-                    namespaces,
-                    reasoning,
-                    proxy_callback(&shared_cb, &forwarded),
-                )
-                .await
+            dispatch_namespaced(
+                &self.inner,
+                messages.clone(),
+                core_tools,
+                namespaces,
+                reasoning,
+                proxy_callback(&shared_cb, &forwarded),
+            )
+            .await
         })
         .retry(self.backoff())
         .when(retry_unless_stream_started(&forwarded))

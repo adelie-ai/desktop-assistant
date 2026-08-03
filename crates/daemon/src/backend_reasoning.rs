@@ -27,7 +27,8 @@
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Message, ToolDefinition, ToolNamespace};
 use desktop_assistant_core::ports::llm::{
-    ChunkCallback, LlmClient, LlmResponse, ModelInfo, ModelListingReport, ReasoningConfig,
+    ChunkCallback, HostedToolSearch, LlmClient, LlmResponse, ModelInfo, ModelListingReport,
+    ReasoningConfig, dispatch_namespaced,
 };
 
 /// Wraps an [`LlmClient`] and substitutes a fixed [`ReasoningConfig`]
@@ -96,6 +97,38 @@ impl<L: LlmClient> LlmClient for FixedReasoningLlmClient<L> {
         self.inner.supports_hosted_tool_search()
     }
 
+    /// Hands back `self`, never the inner client's object, so this
+    /// decorator stays in the call path for a namespaced turn. See
+    /// [`LlmClient::hosted_tool_search`].
+    fn hosted_tool_search(&self) -> Option<&dyn HostedToolSearch> {
+        self.inner
+            .hosted_tool_search()
+            .is_some()
+            .then_some(self as &dyn HostedToolSearch)
+    }
+
+    async fn stream_completion_with_namespaces(
+        &self,
+        messages: Vec<Message>,
+        core_tools: &[ToolDefinition],
+        namespaces: &[ToolNamespace],
+        caller_reasoning: ReasoningConfig,
+        on_chunk: ChunkCallback,
+    ) -> Result<LlmResponse, CoreError> {
+        HostedToolSearch::stream_completion_with_namespaces(
+            self,
+            messages,
+            core_tools,
+            namespaces,
+            caller_reasoning,
+            on_chunk,
+        )
+        .await
+    }
+}
+
+#[async_trait::async_trait]
+impl<L: LlmClient> HostedToolSearch for FixedReasoningLlmClient<L> {
     async fn stream_completion_with_namespaces(
         &self,
         messages: Vec<Message>,
@@ -109,11 +142,15 @@ impl<L: LlmClient> LlmClient for FixedReasoningLlmClient<L> {
         } else {
             self.reasoning
         };
-        self.inner
-            .stream_completion_with_namespaces(
-                messages, core_tools, namespaces, effective, on_chunk,
-            )
-            .await
+        dispatch_namespaced(
+            &self.inner,
+            messages,
+            core_tools,
+            namespaces,
+            effective,
+            on_chunk,
+        )
+        .await
     }
 }
 
@@ -268,26 +305,25 @@ mod tests {
     #[tokio::test]
     async fn substitutes_for_with_namespaces_path_too() {
         // The handler's tool-routing dispatch goes through
-        // `stream_completion_with_namespaces`. Backend tasks don't
-        // currently use namespaces, but the trait surface must stay
-        // consistent: the wrapper has to pin reasoning on both methods.
+        // `dispatch_namespaced`. Backend tasks don't currently use
+        // namespaces, but the wrapper has to pin reasoning on both paths.
         let inner = CapturingClient::default();
         let configured = ReasoningConfig::with_reasoning_effort(ReasoningLevel::Medium);
         let wrapped = FixedReasoningLlmClient::new(inner, configured);
 
-        // Default `stream_completion_with_namespaces` from the trait
-        // delegates to `stream_completion` for clients that haven't
-        // overridden it, so the same captured value applies.
-        wrapped
-            .stream_completion_with_namespaces(
-                user_msg("hi"),
-                &[],
-                &[],
-                ReasoningConfig::default(),
-                Box::new(|_| true),
-            )
-            .await
-            .expect("inner client returns Ok");
+        // The inner client has no hosted tool search, so the namespaced turn
+        // flattens into `stream_completion` and the same captured value
+        // applies.
+        dispatch_namespaced(
+            &wrapped,
+            user_msg("hi"),
+            &[],
+            &[],
+            ReasoningConfig::default(),
+            Box::new(|_| true),
+        )
+        .await
+        .expect("inner client returns Ok");
 
         assert_eq!(wrapped.inner.last(), Some(configured));
     }

@@ -6,8 +6,8 @@ use serde::Serialize;
 use crate::CoreError;
 use crate::domain::{Message, Role, ToolDefinition, ToolNamespace};
 use crate::ports::llm::{
-    ChunkCallback, LlmClient, LlmResponse, ModelInfo, ModelListingReport, ReasoningConfig,
-    TokenUsage,
+    ChunkCallback, HostedToolSearch, LlmClient, LlmResponse, ModelInfo, ModelListingReport,
+    ReasoningConfig, TokenUsage, dispatch_namespaced,
 };
 
 /// JSONL profiling entry written for each LLM call.
@@ -254,6 +254,33 @@ impl<L: LlmClient> LlmClient for ProfilingLlmClient<L> {
         self.inner.supports_hosted_tool_search()
     }
 
+    /// Hands back `self`, never the inner client's object, so this
+    /// decorator stays in the call path for a namespaced turn. See
+    /// [`LlmClient::hosted_tool_search`].
+    fn hosted_tool_search(&self) -> Option<&dyn HostedToolSearch> {
+        self.inner
+            .hosted_tool_search()
+            .is_some()
+            .then_some(self as &dyn HostedToolSearch)
+    }
+
+    async fn stream_completion_with_namespaces(
+        &self,
+        messages: Vec<Message>,
+        core_tools: &[ToolDefinition],
+        namespaces: &[ToolNamespace],
+        reasoning: ReasoningConfig,
+        on_chunk: ChunkCallback,
+    ) -> Result<LlmResponse, CoreError> {
+        HostedToolSearch::stream_completion_with_namespaces(
+            self, messages, core_tools, namespaces, reasoning, on_chunk,
+        )
+        .await
+    }
+}
+
+#[async_trait::async_trait]
+impl<L: LlmClient> HostedToolSearch for ProfilingLlmClient<L> {
     async fn stream_completion_with_namespaces(
         &self,
         messages: Vec<Message>,
@@ -273,12 +300,15 @@ impl<L: LlmClient> LlmClient for ProfilingLlmClient<L> {
         let profile_messages = self.profile_messages(&messages);
 
         let start = Instant::now();
-        let result = self
-            .inner
-            .stream_completion_with_namespaces(
-                messages, core_tools, namespaces, reasoning, on_chunk,
-            )
-            .await;
+        let result = dispatch_namespaced(
+            &self.inner,
+            messages,
+            core_tools,
+            namespaces,
+            reasoning,
+            on_chunk,
+        )
+        .await;
         let duration_ms = start.elapsed().as_millis();
 
         self.log_result(
@@ -448,6 +478,34 @@ impl<L: LlmClient> LlmClient for MaybeProfiled<L> {
         }
     }
 
+    /// Hands back `self`, never the inner client's object, so this
+    /// decorator stays in the call path for a namespaced turn. See
+    /// [`LlmClient::hosted_tool_search`].
+    fn hosted_tool_search(&self) -> Option<&dyn HostedToolSearch> {
+        let inner_has = match self {
+            Self::Plain(l) => l.hosted_tool_search().is_some(),
+            Self::Profiled(l) => l.hosted_tool_search().is_some(),
+        };
+        inner_has.then_some(self as &dyn HostedToolSearch)
+    }
+
+    async fn stream_completion_with_namespaces(
+        &self,
+        messages: Vec<Message>,
+        core_tools: &[ToolDefinition],
+        namespaces: &[ToolNamespace],
+        reasoning: ReasoningConfig,
+        on_chunk: ChunkCallback,
+    ) -> Result<LlmResponse, CoreError> {
+        HostedToolSearch::stream_completion_with_namespaces(
+            self, messages, core_tools, namespaces, reasoning, on_chunk,
+        )
+        .await
+    }
+}
+
+#[async_trait::async_trait]
+impl<L: LlmClient> HostedToolSearch for MaybeProfiled<L> {
     async fn stream_completion_with_namespaces(
         &self,
         messages: Vec<Message>,
@@ -458,16 +516,10 @@ impl<L: LlmClient> LlmClient for MaybeProfiled<L> {
     ) -> Result<LlmResponse, CoreError> {
         match self {
             Self::Plain(l) => {
-                l.stream_completion_with_namespaces(
-                    messages, core_tools, namespaces, reasoning, on_chunk,
-                )
-                .await
+                dispatch_namespaced(l, messages, core_tools, namespaces, reasoning, on_chunk).await
             }
             Self::Profiled(l) => {
-                l.stream_completion_with_namespaces(
-                    messages, core_tools, namespaces, reasoning, on_chunk,
-                )
-                .await
+                dispatch_namespaced(l, messages, core_tools, namespaces, reasoning, on_chunk).await
             }
         }
     }

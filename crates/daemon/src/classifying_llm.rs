@@ -37,9 +37,9 @@ use desktop_assistant_core::error_classify::{
     derive_input_ceiling, extract_overflow_fields,
 };
 use desktop_assistant_core::ports::llm::{
-    ChunkCallback, LlmClient, LlmResponse, ModelInfo, ModelListingReport, ReasoningConfig,
-    current_context_budget, current_model_override, is_classification_in_progress,
-    with_classification_in_progress,
+    ChunkCallback, HostedToolSearch, LlmClient, LlmResponse, ModelInfo, ModelListingReport,
+    ReasoningConfig, current_context_budget, current_model_override, dispatch_namespaced,
+    is_classification_in_progress, with_classification_in_progress,
 };
 use desktop_assistant_core::ports::store::{ErrorClassificationStore, LearnedWindowStore};
 use desktop_assistant_core::sanitize::redact_secrets;
@@ -520,6 +520,16 @@ impl<L: LlmClient> LlmClient for ClassifyingLlmClient<L> {
         self.inner.supports_hosted_tool_search()
     }
 
+    /// Hands back `self`, never the inner client's object, so this
+    /// decorator stays in the call path for a namespaced turn. See
+    /// [`LlmClient::hosted_tool_search`].
+    fn hosted_tool_search(&self) -> Option<&dyn HostedToolSearch> {
+        self.inner
+            .hosted_tool_search()
+            .is_some()
+            .then_some(self as &dyn HostedToolSearch)
+    }
+
     async fn list_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
         self.inner.list_models().await
     }
@@ -562,12 +572,32 @@ impl<L: LlmClient> LlmClient for ClassifyingLlmClient<L> {
         reasoning: ReasoningConfig,
         on_chunk: ChunkCallback,
     ) -> Result<LlmResponse, CoreError> {
-        let result = self
-            .inner
-            .stream_completion_with_namespaces(
-                messages, core_tools, namespaces, reasoning, on_chunk,
-            )
-            .await;
+        HostedToolSearch::stream_completion_with_namespaces(
+            self, messages, core_tools, namespaces, reasoning, on_chunk,
+        )
+        .await
+    }
+}
+
+#[async_trait::async_trait]
+impl<L: LlmClient> HostedToolSearch for ClassifyingLlmClient<L> {
+    async fn stream_completion_with_namespaces(
+        &self,
+        messages: Vec<Message>,
+        core_tools: &[ToolDefinition],
+        namespaces: &[ToolNamespace],
+        reasoning: ReasoningConfig,
+        on_chunk: ChunkCallback,
+    ) -> Result<LlmResponse, CoreError> {
+        let result = dispatch_namespaced(
+            &self.inner,
+            messages,
+            core_tools,
+            namespaces,
+            reasoning,
+            on_chunk,
+        )
+        .await;
         self.reclassify(result).await
     }
 }
