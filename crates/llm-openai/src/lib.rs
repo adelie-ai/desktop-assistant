@@ -125,6 +125,11 @@ fn is_request_shape_rejection(status: reqwest::StatusCode) -> bool {
     status.is_client_error() && !matches!(status.as_u16(), 401 | 403 | 408 | 429)
 }
 
+/// Placeholder so the new tests compile against the intended signature.
+fn refuses_hosted_tool_search(status: reqwest::StatusCode, _body: &str) -> bool {
+    is_request_shape_rejection(status)
+}
+
 impl OpenAiClient {
     pub fn get_default_model() -> Option<&'static str> {
         Some("gpt-5.4")
@@ -2106,8 +2111,22 @@ mod tests {
     // type. Because hosted tool search is on by default, that refusal must
     // degrade to the flattened tool list rather than fail the turn.
 
-    /// An endpoint refusing the tool-search request shape.
+    /// An endpoint refusing the tool-search request shape. The refusal names
+    /// the construct it refused, which is what makes it evidence.
     const TOOL_SEARCH_REJECTED_BODY: &str = r#"{"error":{"code":"invalid_value","type":"invalid_request_error","message":"Invalid value: 'tool_search'. Supported values are: 'function'."}}"#;
+
+    /// A 400 that has nothing to do with hosted tool search: one MCP tool
+    /// shipping a JSON Schema the provider will not accept. This repo has
+    /// already lived this failure one connector over (#336, terminal-mcp's
+    /// top-level `oneOf` rejected on every Bedrock turn).
+    const UNRELATED_SCHEMA_REJECTION_BODY: &str = r#"{"error":{"code":"invalid_function_parameters","type":"invalid_request_error","message":"Invalid schema for function 'terminal__run': keyword 'oneOf' is not permitted at the top level."}}"#;
+
+    /// vLLM's rejection shape: flat, no `error` key at all, numeric `code`.
+    const VLLM_OVERFLOW_BODY: &str = r#"{"object":"error","message":"This model's maximum context length is 4096 tokens. However, you requested 5000 tokens.","type":"BadRequestError","code":400}"#;
+
+    /// LiteLLM's rejection shape: the envelope parses, but the code is its
+    /// own.
+    const LITELLM_OVERFLOW_BODY: &str = r#"{"error":{"message":"litellm.ContextWindowExceededError: This model's maximum context length is 8192 tokens. However, you requested 9001 tokens.","type":"context_window_exceeded","code":"400"}}"#;
 
     fn probe_namespace() -> ToolNamespace {
         ToolNamespace::new(
@@ -2296,6 +2315,215 @@ mod tests {
         );
         hosted.assert_calls(1);
         flattened.assert_calls(1);
+    }
+
+    // --- The classifier itself ---------------------------------------------
+    //
+    // The integration tests above cannot reach most of these: an overflow
+    // returns at the detector, a 429 returns at the 429 branch, and a 503
+    // returns before the classifier is consulted at all. So the classifier is
+    // held directly, or widening it would go unnoticed.
+
+    /// Only a refusal that names something the hosted request carries counts
+    /// as evidence that the endpoint refuses hosted tool search.
+    #[test]
+    fn classifier_requires_the_body_to_name_a_hosted_search_construct() {
+        let s = |c: u16| reqwest::StatusCode::from_u16(c).expect("valid status");
+
+        assert!(
+            refuses_hosted_tool_search(s(400), TOOL_SEARCH_REJECTED_BODY),
+            "a refusal naming the tool-search sentinel is the case this exists for"
+        );
+        assert!(
+            refuses_hosted_tool_search(
+                s(400),
+                r#"{"error":{"message":"unknown field 'defer_loading'"}}"#
+            ),
+            "the deferred-loading flag is ours too"
+        );
+        assert!(
+            !refuses_hosted_tool_search(s(400), UNRELATED_SCHEMA_REJECTION_BODY),
+            "a rejected tool schema says nothing about hosted tool search; \
+             concluding otherwise turns the capability off until restart"
+        );
+        assert!(
+            !refuses_hosted_tool_search(s(404), r#"{"error":{"message":"Not Found"}}"#),
+            "a base_url typo is not a statement about tool search"
+        );
+        assert!(
+            !refuses_hosted_tool_search(s(400), "not json at all"),
+            "an unparseable body is not evidence"
+        );
+    }
+
+    /// Statuses that are never a statement about the request's shape, and the
+    /// one where the larger fallback body guarantees a second failure.
+    #[test]
+    fn classifier_refuses_statuses_that_say_nothing_about_the_shape() {
+        let s = |c: u16| reqwest::StatusCode::from_u16(c).expect("valid status");
+
+        // Each carries a body that *does* name the construct, so only the
+        // status can be what turns the answer down.
+        for (code, why) in [
+            (401u16, "a rejected credential"),
+            (402, "a billing refusal"),
+            (403, "a forbidden caller"),
+            (408, "a timeout, which is transient"),
+            (409, "a conflict"),
+            (
+                413,
+                "a body limit - the fallback body is larger, so it fails again",
+            ),
+            (429, "throttling"),
+        ] {
+            assert!(
+                !refuses_hosted_tool_search(s(code), TOOL_SEARCH_REJECTED_BODY),
+                "HTTP {code} is {why}, so it must not degrade"
+            );
+        }
+
+        assert!(
+            !refuses_hosted_tool_search(s(500), TOOL_SEARCH_REJECTED_BODY),
+            "a server error is not a refusal of the request shape"
+        );
+        assert!(
+            !refuses_hosted_tool_search(s(200), TOOL_SEARCH_REJECTED_BODY),
+            "a success is not a refusal"
+        );
+    }
+
+    /// A context overflow must never degrade, in any endpoint's wording. The
+    /// fallback sends every deferred tool inline, so degrading answers an
+    /// overflow with a larger request - and the core's truncate-and-retry
+    /// ladder only runs on `CoreError::ContextOverflow`.
+    #[test]
+    fn classifier_refuses_a_context_overflow_in_every_wording() {
+        let s = |c: u16| reqwest::StatusCode::from_u16(c).expect("valid status");
+        for (name, body) in [
+            (
+                "openai",
+                r#"{"error":{"code":"context_length_exceeded","type":"invalid_request_error","message":"This model's maximum context length is 128000 tokens. However, your messages resulted in 153827 tokens."}}"#,
+            ),
+            ("vllm", VLLM_OVERFLOW_BODY),
+            ("litellm", LITELLM_OVERFLOW_BODY),
+        ] {
+            assert!(
+                !refuses_hosted_tool_search(s(400), body),
+                "{name}'s overflow wording must not be read as a tool-search refusal"
+            );
+        }
+    }
+
+    /// A quota refusal outside the 429 branch must not degrade either - the
+    /// doc on `SendError::Rejected` says quota is excluded, and a 402 or a
+    /// 400-shaped quota error has to honour that.
+    #[test]
+    fn classifier_refuses_a_quota_error_at_any_status() {
+        let s = |c: u16| reqwest::StatusCode::from_u16(c).expect("valid status");
+        let body = r#"{"error":{"code":"insufficient_quota","type":"insufficient_quota","message":"You exceeded your current quota; tool_search unavailable."}}"#;
+        assert!(!refuses_hosted_tool_search(s(400), body));
+        assert!(!refuses_hosted_tool_search(s(402), body));
+    }
+
+    // --- Overflow detection across compatible endpoints ---------------------
+
+    /// The fallback exists for endpoints that are not first-party OpenAI, so
+    /// overflow detection has to read their wording too. Otherwise the one
+    /// exclusion that matters most is the one that does not apply to the
+    /// population it was written for.
+    #[test]
+    fn detect_context_overflow_reads_vllm_wording() {
+        let (prompt, max) =
+            detect_openai_context_overflow(VLLM_OVERFLOW_BODY).expect("vLLM overflow detected");
+        assert_eq!(max, Some(4096));
+        assert_eq!(prompt, Some(5000));
+    }
+
+    #[test]
+    fn detect_context_overflow_reads_litellm_wording() {
+        let (prompt, max) = detect_openai_context_overflow(LITELLM_OVERFLOW_BODY)
+            .expect("LiteLLM overflow detected");
+        assert_eq!(max, Some(8192));
+        assert_eq!(prompt, Some(9001));
+    }
+
+    #[test]
+    fn detect_context_overflow_still_ignores_unrelated_rejections() {
+        assert!(detect_openai_context_overflow(UNRELATED_SCHEMA_REJECTION_BODY).is_none());
+        assert!(
+            detect_openai_context_overflow(
+                r#"{"object":"error","message":"bad request","type":"BadRequestError","code":400}"#
+            )
+            .is_none()
+        );
+    }
+
+    // --- The memo is a conclusion, so it waits for evidence -----------------
+
+    #[tokio::test]
+    async fn an_unrelated_rejection_does_not_degrade_or_memoize() {
+        // The #336 shape: one tool's schema is refused, twice in a row. The
+        // turn must fail with that error rather than silently switching the
+        // connection to sending the whole fleet inline forever.
+        let server = httpmock::MockServer::start();
+        let hosted = hosted_attempt(&server, 400, UNRELATED_SCHEMA_REJECTION_BODY);
+        let flattened = flattened_attempt(&server);
+        let client = OpenAiClient::new("key".into()).with_base_url(server.url(""));
+
+        for _ in 0..2 {
+            let err = namespaced_turn(&client)
+                .await
+                .expect_err("an unrelated 400 must surface");
+            assert!(matches!(err, CoreError::Llm(_)), "got {err:?}");
+        }
+
+        hosted.assert_calls(2);
+        flattened.assert_calls(0);
+    }
+
+    #[tokio::test]
+    async fn a_failing_fallback_is_not_memoized() {
+        // The fallback failing means nothing was learned about hosted tool
+        // search, so the next turn tries it again rather than paying the
+        // inline cost forever on the strength of one bad minute.
+        let server = httpmock::MockServer::start();
+        let hosted = hosted_attempt(&server, 400, TOOL_SEARCH_REJECTED_BODY);
+        let flattened = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/responses")
+                .body_excludes(r#""type":"tool_search""#);
+            then.status(503)
+                .header("content-type", "application/json")
+                .body(r#"{"error":{"message":"overloaded"}}"#);
+        });
+        let client = OpenAiClient::new("key".into()).with_base_url(server.url(""));
+
+        for _ in 0..2 {
+            namespaced_turn(&client)
+                .await
+                .expect_err("the fallback's own failure surfaces");
+        }
+
+        hosted.assert_calls(2);
+        flattened.assert_calls(2);
+    }
+
+    #[tokio::test]
+    async fn a_vllm_shaped_overflow_surfaces_as_context_overflow() {
+        // Not a generic error: the core's overflow ladder only runs on this
+        // variant, and this endpoint is exactly who the fallback is for.
+        let server = httpmock::MockServer::start();
+        let hosted = hosted_attempt(&server, 400, VLLM_OVERFLOW_BODY);
+        let flattened = flattened_attempt(&server);
+        let client = OpenAiClient::new("key".into()).with_base_url(server.url(""));
+
+        let err = namespaced_turn(&client).await.expect_err("must fail");
+        assert!(
+            matches!(err, CoreError::ContextOverflow { .. }),
+            "expected ContextOverflow, got {err:?}"
+        );
+        hosted.assert_calls(1);
+        flattened.assert_calls(0);
     }
 
     #[tokio::test]

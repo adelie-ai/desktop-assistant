@@ -1431,10 +1431,8 @@ mystery_key = "x"
                 "probe-model",
             )
             .supports_hosted_tool_search(),
-            Connector::Anthropic => {
-                desktop_assistant_llm_anthropic::AnthropicClient::new(key)
-                    .supports_hosted_tool_search()
-            }
+            Connector::Anthropic => desktop_assistant_llm_anthropic::AnthropicClient::new(key)
+                .supports_hosted_tool_search(),
             Connector::Bedrock => {
                 desktop_assistant_llm_bedrock::BedrockClient::new(key).supports_hosted_tool_search()
             }
