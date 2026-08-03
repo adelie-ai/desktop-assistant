@@ -1914,9 +1914,9 @@ mod tests {
         );
 
         // Constructor default, pinned because the two connectors differ.
-        assert_eq!(
-            OpenAiClient::new("k".into()).supports_hosted_tool_search(),
-            false
+        assert!(
+            !OpenAiClient::new("k".into()).supports_hosted_tool_search(),
+            "the constructor default is off, and the two connectors differ"
         );
     }
 }

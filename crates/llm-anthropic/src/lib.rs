@@ -2426,9 +2426,9 @@ mod tests {
         );
 
         // Constructor default, pinned because the two connectors differ.
-        assert_eq!(
+        assert!(
             AnthropicClient::new("k".into()).supports_hosted_tool_search(),
-            true
+            "the constructor default is on, and the two connectors differ"
         );
     }
 }
