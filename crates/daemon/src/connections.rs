@@ -235,8 +235,13 @@ impl ConnectionConfig {
     /// credential write would let an operator's very first save of a
     /// malicious `base_url` through. Ollama is the only connector with no
     /// credential concept at all.
+    ///
+    /// Answered by [`Connector::carries_credential`], which is an exhaustive
+    /// match. A `!matches!` here would read the same and would silently admit
+    /// a new connector to the stricter rule, or exclude it from it, depending
+    /// on which way the negation ran.
     pub fn carries_credential(&self) -> bool {
-        !matches!(self, Self::Ollama(_))
+        self.connector().carries_credential()
     }
 
     /// Set (or clear, with `None`) this connection's secret-store coordinate.
@@ -318,6 +323,24 @@ macro_rules! declare_connectors {
                 expect(dead_code, reason = "read by the per-connector test sweeps")
             )]
             pub const ALL: &'static [Self] = &[ $( Self::$variant ),+ ];
+
+            /// Every string [`Self::parse`] accepts for this connector: the
+            /// canonical name first, then the declared aliases.
+            ///
+            /// Emitted from the same token list as the variants, so an alias
+            /// that exists is in this list. A sweep that must reach the legacy
+            /// spellings (`aws-bedrock`) iterates this instead of repeating
+            /// them.
+            // Only the sweeps read this today, for the same reason `ALL` gives.
+            #[cfg_attr(
+                not(test),
+                expect(dead_code, reason = "read by the per-connector test sweeps")
+            )]
+            pub fn names(self) -> &'static [&'static str] {
+                match self {
+                    $( Self::$variant => &[ $canonical $(, $alias )* ], )+
+                }
+            }
 
             /// Canonical short name. Matches the `type =` tag in
             /// `[connections.<id>]` and the legacy `[llm].connector` value.
@@ -542,6 +565,66 @@ impl Connector {
         match self {
             Self::OpenAi | Self::Anthropic => true,
             Self::Ollama | Self::Bedrock | Self::OpenRouter | Self::Azure | Self::Google => false,
+        }
+    }
+
+    /// Whether a connection of this type authenticates its requests, and so
+    /// carries a `secret` coordinate to hold the credential.
+    ///
+    /// One property, three questions that all read it:
+    ///
+    /// - Which connections may store a credential. [`ConnectionConfig::secret`]
+    ///   and [`ConnectionConfig::set_secret`] follow this answer.
+    /// - Which requests a hijacked `base_url` could expose, which decides the
+    ///   URL policy - see [`ConnectionConfig::carries_credential`].
+    /// - Which embedding backends must warn when nothing resolved, in
+    ///   [`crate::embedding_client`].
+    ///
+    /// Ollama is the only connector with no credential concept: it talks to a
+    /// local or self-hosted endpoint. Bedrock is included even though it names
+    /// no `api_key_env` - see [`Self::carries_api_key_env`] - because it signs
+    /// every request through the AWS credential chain.
+    ///
+    /// Connector-typed, not "has a key been configured yet": a connector that
+    /// is meant to carry one gets the stricter treatment from its first save,
+    /// because waiting for the first credential write would let an operator's
+    /// very first malicious `base_url` through.
+    ///
+    /// Exhaustive with no catch-all, like [`Self::supports_embeddings`]: a new
+    /// connector states its answer rather than inheriting one in silence.
+    pub fn carries_credential(self) -> bool {
+        match self {
+            Self::Anthropic
+            | Self::OpenAi
+            | Self::OpenRouter
+            | Self::Azure
+            | Self::Google
+            | Self::Bedrock => true,
+            Self::Ollama => false,
+        }
+    }
+
+    /// Whether a connection of this type reads its credential from a named
+    /// environment variable, and so carries an `api_key_env` field.
+    ///
+    /// Narrower than [`Self::carries_credential`]: Bedrock authenticates
+    /// through the AWS credential chain rather than one variable, and Ollama
+    /// needs no credential at all, so neither carries the field.
+    /// [`ConnectionConfig::api_key_env`] and
+    /// [`ConnectionConfig::set_api_key_env`] follow this answer, as does the
+    /// `api_key_env` allowlist the API surface enforces.
+    ///
+    /// Exhaustive with no catch-all.
+    // The wire-payload sweeps in `api_surface` are the readers today; a
+    // connector's own arms answer the same question by field access.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by the per-connector test sweeps")
+    )]
+    pub fn carries_api_key_env(self) -> bool {
+        match self {
+            Self::Anthropic | Self::OpenAi | Self::OpenRouter | Self::Azure | Self::Google => true,
+            Self::Bedrock | Self::Ollama => false,
         }
     }
 }
@@ -1414,6 +1497,119 @@ mystery_key = "x"
         assert!(!Connector::OpenRouter.type_offers_hosted_tool_search());
         assert!(!Connector::Azure.type_offers_hosted_tool_search());
         assert!(!Connector::Google.type_offers_hosted_tool_search());
+    }
+
+    /// A default connection of each connector type. Exhaustive with no
+    /// catch-all, so a new connector must supply one before this compiles.
+    fn default_connection(connector: Connector) -> ConnectionConfig {
+        match connector {
+            Connector::Ollama => ConnectionConfig::Ollama(OllamaConnection::default()),
+            Connector::Anthropic => ConnectionConfig::Anthropic(AnthropicConnection::default()),
+            Connector::Bedrock => ConnectionConfig::Bedrock(BedrockConnection::default()),
+            Connector::OpenAi => ConnectionConfig::OpenAi(OpenAiConnection::default()),
+            Connector::OpenRouter => ConnectionConfig::OpenRouter(OpenRouterConnection::default()),
+            Connector::Azure => ConnectionConfig::Azure(AzureConnection::default()),
+            Connector::Google => ConnectionConfig::Google(GoogleConnection::default()),
+        }
+    }
+
+    /// [`Connector::names`] holds every spelling [`Connector::parse`] accepts,
+    /// so a sweep can iterate it instead of repeating the legacy aliases.
+    #[test]
+    fn connector_names_all_parse_back_to_the_connector() {
+        for &c in Connector::ALL {
+            let names = c.names();
+            assert_eq!(
+                names.first().copied(),
+                Some(c.as_str()),
+                "{c} must list its canonical name first"
+            );
+            for name in names {
+                assert_eq!(
+                    Connector::parse(name),
+                    Some(c),
+                    "{c} lists {name:?}, which does not parse back to it"
+                );
+            }
+        }
+        // The one declared alias, named so a sweep that silently stopped
+        // covering it is visible here.
+        assert!(
+            Connector::Bedrock.names().contains(&"aws-bedrock"),
+            "the legacy bedrock alias must stay in the swept set"
+        );
+    }
+
+    /// [`Connector::carries_credential`] must agree with what a connection of
+    /// that type actually accepts. `set_secret` refuses a credential on a
+    /// connector that has no `secret` field, so the two answers are the same
+    /// question asked twice.
+    ///
+    /// Fails in both directions: a connector that claims a credential and
+    /// refuses one fails, and so does a connector that refuses the claim and
+    /// accepts one.
+    #[test]
+    fn connector_credential_claim_agrees_with_the_secret_setter() {
+        for &c in Connector::ALL {
+            let mut conn = default_connection(c);
+            let accepted = conn.set_secret(Some(SecretConfig::default())).is_ok();
+            assert_eq!(
+                accepted,
+                c.carries_credential(),
+                "{c} accepts a stored secret = {accepted}, but \
+                 carries_credential() says {}",
+                c.carries_credential(),
+            );
+            assert_eq!(
+                conn.secret().is_some(),
+                c.carries_credential(),
+                "{c} must keep the secret it accepted, and store none it refused"
+            );
+            assert_eq!(
+                conn.carries_credential(),
+                c.carries_credential(),
+                "{c}'s connection and its connector must answer alike"
+            );
+        }
+    }
+
+    /// [`Connector::carries_api_key_env`] must agree with what a connection of
+    /// that type actually accepts. `set_api_key_env` refuses a variable name on
+    /// a connector that has no `api_key_env` field.
+    ///
+    /// Fails in both directions, for the same reason as the secret sweep.
+    #[test]
+    fn connector_api_key_env_claim_agrees_with_the_config_setter() {
+        for &c in Connector::ALL {
+            let mut conn = default_connection(c);
+            let accepted = conn
+                .set_api_key_env(Some("PROBE_API_KEY".to_string()))
+                .is_ok();
+            assert_eq!(
+                accepted,
+                c.carries_api_key_env(),
+                "{c} accepts an api_key_env = {accepted}, but \
+                 carries_api_key_env() says {}",
+                c.carries_api_key_env(),
+            );
+            assert_eq!(
+                conn.api_key_env(),
+                c.carries_api_key_env().then_some("PROBE_API_KEY"),
+                "{c} must store the name it accepted, and none it refused"
+            );
+        }
+    }
+
+    /// Naming a credential and reading it from an environment variable are two
+    /// different claims, and the narrower one must stay inside the wider one.
+    #[test]
+    fn connector_api_key_env_claim_implies_a_credential_claim() {
+        for &c in Connector::ALL {
+            assert!(
+                !c.carries_api_key_env() || c.carries_credential(),
+                "{c} reads a key from an environment variable but claims no credential"
+            );
+        }
     }
 
     #[test]

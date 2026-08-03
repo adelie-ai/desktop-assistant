@@ -2215,7 +2215,7 @@ fn purposes_referencing(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connections::{BedrockConnection, ConnectionConfig, OllamaConnection};
+    use crate::connections::{BedrockConnection, ConnectionConfig, Connector, OllamaConnection};
     use desktop_assistant_core::prompts::PersonalityLevel;
 
     use std::sync::Mutex;
@@ -2911,99 +2911,99 @@ mod tests {
         }
     }
 
-    /// Every connector carrying a `secret` coordinate, paired with an update
-    /// payload of the same connector type. Exhaustive on purpose: a newly
-    /// added credential-bearing connector should fail this test rather than
-    /// silently skip the carry-forward.
-    fn credential_connectors() -> Vec<(&'static str, ConnectionConfig, ConnectionConfigPayload)> {
-        use crate::connections::{
-            AnthropicConnection, AzureConnection, GoogleConnection, OpenAiConnection,
-            OpenRouterConnection,
-        };
-        vec![
-            (
-                "anthropic",
-                ConnectionConfig::Anthropic(AnthropicConnection {
-                    secret: secret_coordinate(),
-                    ..Default::default()
-                }),
-                ConnectionConfigPayload::Anthropic {
-                    base_url: Some("https://anthropic.example.invalid".into()),
-                    api_key_env: None,
-                    connect_timeout_secs: None,
-                    stream_timeout_secs: None,
-                    max_context_tokens: None,
-                },
-            ),
-            (
-                "openai",
-                ConnectionConfig::OpenAi(OpenAiConnection {
-                    secret: secret_coordinate(),
-                    ..Default::default()
-                }),
-                ConnectionConfigPayload::OpenAi {
-                    base_url: Some("https://openai.example.invalid".into()),
-                    api_key_env: None,
-                    connect_timeout_secs: None,
-                    stream_timeout_secs: None,
-                    max_context_tokens: None,
-                },
-            ),
-            (
-                "openrouter",
-                ConnectionConfig::OpenRouter(OpenRouterConnection {
-                    secret: secret_coordinate(),
-                    ..Default::default()
-                }),
-                ConnectionConfigPayload::OpenRouter {
-                    base_url: Some("https://openrouter.example.invalid".into()),
-                    api_key_env: None,
-                    connect_timeout_secs: None,
-                    stream_timeout_secs: None,
-                    max_context_tokens: None,
-                },
-            ),
-            (
-                "azure",
-                ConnectionConfig::Azure(AzureConnection {
-                    secret: secret_coordinate(),
-                    ..Default::default()
-                }),
-                ConnectionConfigPayload::Azure {
-                    base_url: Some("https://azure.example.invalid".into()),
-                    api_key_env: None,
-                    api_surface: None,
-                    auth_mode: None,
-                    api_version: None,
-                    connect_timeout_secs: None,
-                    stream_timeout_secs: None,
-                    max_context_tokens: None,
-                },
-            ),
-            (
-                "google",
-                ConnectionConfig::Google(GoogleConnection {
-                    secret: secret_coordinate(),
-                    ..Default::default()
-                }),
-                ConnectionConfigPayload::Google {
-                    base_url: Some("https://google.example.invalid".into()),
-                    api_key_env: None,
-                    project: Some("proj".into()),
-                    location: None,
-                    auth_mode: None,
-                    credentials_path: None,
-                    connect_timeout_secs: None,
-                    stream_timeout_secs: None,
-                    max_context_tokens: None,
-                },
-            ),
-            (
-                "bedrock",
-                bedrock_with_secret(),
-                bedrock_payload("eu-west-1"),
-            ),
-        ]
+    /// A default stored connection of each connector type. Exhaustive with no
+    /// catch-all, so a new connector must supply one before this compiles.
+    fn stored_connection(connector: Connector) -> ConnectionConfig {
+        match connector {
+            Connector::Anthropic => ConnectionConfig::Anthropic(AnthropicConnection::default()),
+            Connector::OpenAi => ConnectionConfig::OpenAi(OpenAiConnection::default()),
+            Connector::OpenRouter => ConnectionConfig::OpenRouter(OpenRouterConnection::default()),
+            Connector::Azure => ConnectionConfig::Azure(AzureConnection::default()),
+            Connector::Google => ConnectionConfig::Google(GoogleConnection::default()),
+            Connector::Bedrock => bedrock_work(),
+            Connector::Ollama => ollama_local(),
+        }
+    }
+
+    /// An update payload of each connector type, carrying one edit so a
+    /// carry-forward test can see the update land. Exhaustive with no
+    /// catch-all.
+    fn update_payload(connector: Connector) -> ConnectionConfigPayload {
+        match connector {
+            Connector::Anthropic => ConnectionConfigPayload::Anthropic {
+                base_url: Some("https://anthropic.example.invalid".into()),
+                api_key_env: None,
+                connect_timeout_secs: None,
+                stream_timeout_secs: None,
+                max_context_tokens: None,
+            },
+            Connector::OpenAi => ConnectionConfigPayload::OpenAi {
+                base_url: Some("https://openai.example.invalid".into()),
+                api_key_env: None,
+                connect_timeout_secs: None,
+                stream_timeout_secs: None,
+                max_context_tokens: None,
+            },
+            Connector::OpenRouter => ConnectionConfigPayload::OpenRouter {
+                base_url: Some("https://openrouter.example.invalid".into()),
+                api_key_env: None,
+                connect_timeout_secs: None,
+                stream_timeout_secs: None,
+                max_context_tokens: None,
+            },
+            Connector::Azure => ConnectionConfigPayload::Azure {
+                base_url: Some("https://azure.example.invalid".into()),
+                api_key_env: None,
+                api_surface: None,
+                auth_mode: None,
+                api_version: None,
+                connect_timeout_secs: None,
+                stream_timeout_secs: None,
+                max_context_tokens: None,
+            },
+            Connector::Google => ConnectionConfigPayload::Google {
+                base_url: Some("https://google.example.invalid".into()),
+                api_key_env: None,
+                project: Some("proj".into()),
+                location: None,
+                auth_mode: None,
+                credentials_path: None,
+                connect_timeout_secs: None,
+                stream_timeout_secs: None,
+                max_context_tokens: None,
+            },
+            Connector::Bedrock => bedrock_payload("eu-west-1"),
+            Connector::Ollama => ConnectionConfigPayload::Ollama {
+                base_url: Some("http://ollama.example.invalid".into()),
+                connect_timeout_secs: None,
+                stream_timeout_secs: None,
+                keep_warm: None,
+                max_context_tokens: None,
+            },
+        }
+    }
+
+    /// Every connector carrying a `secret` coordinate, paired with a stored
+    /// connection that holds one and an update payload of the same connector
+    /// type.
+    ///
+    /// Derived from [`Connector::ALL`] and [`Connector::carries_credential`],
+    /// so a new credential-bearing connector joins the sweep the moment it is
+    /// declared. `set_secret` refuses a connector with no `secret` field, so
+    /// the filter and the stored connection cannot disagree in silence.
+    fn credential_connectors() -> Vec<(Connector, ConnectionConfig, ConnectionConfigPayload)> {
+        Connector::ALL
+            .iter()
+            .copied()
+            .filter(|c| c.carries_credential())
+            .map(|c| {
+                let mut stored = stored_connection(c);
+                stored.set_secret(secret_coordinate()).unwrap_or_else(|e| {
+                    panic!("{c} claims a credential but refused a secret coordinate: {e}")
+                });
+                (c, stored, update_payload(c))
+            })
+            .collect()
     }
 
     #[tokio::test]
@@ -3056,13 +3056,19 @@ mod tests {
 
     #[tokio::test]
     async fn update_connection_preserves_secret_across_all_credential_connectors() {
-        for (name, stored, payload) in credential_connectors() {
+        let sweep = credential_connectors();
+        assert!(
+            !sweep.is_empty(),
+            "the credential class is empty, so this sweep asserts nothing"
+        );
+
+        for (connector, stored, payload) in sweep {
             let handle = make_handle_with(config_with_connections(&[("conn", stored)]));
             let svc = DaemonConnectionsService::new(handle.clone());
 
             svc.update_connection("conn".to_string(), payload)
                 .await
-                .unwrap_or_else(|e| panic!("update should succeed for {name}: {e}"));
+                .unwrap_or_else(|e| panic!("update should succeed for {connector}: {e}"));
 
             let cfg = handle.snapshot_config();
             assert_eq!(
@@ -3073,9 +3079,37 @@ mod tests {
                 )
                 .as_deref(),
                 Some(SECRET_ACCOUNT),
-                "{name} lost its credential reference on update"
+                "{connector} lost its credential reference on update"
             );
         }
+    }
+
+    /// The carry-forward sweep must reach every connector that stores a
+    /// credential, and no connector that does not.
+    ///
+    /// Fails in both directions: a connector wrongly excluded goes untested by
+    /// the sweep above, and a connector wrongly included would be asked to hold
+    /// a credential it has nowhere to put.
+    #[tokio::test]
+    async fn credential_connectors_covers_the_credential_bearing_connectors_only() {
+        let swept: Vec<Connector> = credential_connectors()
+            .into_iter()
+            .map(|(c, _, _)| c)
+            .collect();
+
+        for &c in Connector::ALL {
+            assert_eq!(
+                swept.contains(&c),
+                c.carries_credential(),
+                "{c} is swept = {}, but carries_credential() says {}",
+                swept.contains(&c),
+                c.carries_credential(),
+            );
+        }
+        assert!(
+            !swept.is_empty(),
+            "the credential class is empty, so the sweep asserts nothing"
+        );
     }
 
     #[tokio::test]
@@ -3144,40 +3178,53 @@ mod tests {
 
     // --- api_key_env may not name an arbitrary process env var (#736) -------
 
-    /// Connector tags whose wire payload carries an `api_key_env` field.
-    const API_KEY_ENV_CONNECTORS: [&str; 5] =
-        ["anthropic", "openai", "openrouter", "azure", "google"];
+    /// Every connector whose wire payload carries an `api_key_env` field.
+    ///
+    /// Derived from [`Connector::ALL`] and [`Connector::carries_api_key_env`],
+    /// so a new connector that reads a key from an environment variable joins
+    /// the sweeps the moment it is declared.
+    fn api_key_env_connectors() -> Vec<Connector> {
+        Connector::ALL
+            .iter()
+            .copied()
+            .filter(|c| c.carries_api_key_env())
+            .collect()
+    }
 
     /// A payload for `connector` carrying `api_key_env` and connector defaults
-    /// for everything else. Panics for connectors with no such field.
+    /// for everything else. `None` for a connector with no such field.
+    ///
+    /// Exhaustive with no catch-all, so a new connector must answer here, and
+    /// `payload_with_api_key_env_agrees_with_the_connector_claim` holds that
+    /// answer to [`Connector::carries_api_key_env`].
     fn payload_with_api_key_env(
-        connector: &str,
+        connector: Connector,
         api_key_env: Option<&str>,
-    ) -> ConnectionConfigPayload {
+    ) -> Option<ConnectionConfigPayload> {
         let api_key_env = api_key_env.map(str::to_string);
-        match connector {
-            "anthropic" => ConnectionConfigPayload::Anthropic {
+        Some(match connector {
+            Connector::Anthropic => ConnectionConfigPayload::Anthropic {
                 base_url: None,
                 api_key_env,
                 connect_timeout_secs: None,
                 stream_timeout_secs: None,
                 max_context_tokens: None,
             },
-            "openai" => ConnectionConfigPayload::OpenAi {
+            Connector::OpenAi => ConnectionConfigPayload::OpenAi {
                 base_url: None,
                 api_key_env,
                 connect_timeout_secs: None,
                 stream_timeout_secs: None,
                 max_context_tokens: None,
             },
-            "openrouter" => ConnectionConfigPayload::OpenRouter {
+            Connector::OpenRouter => ConnectionConfigPayload::OpenRouter {
                 base_url: None,
                 api_key_env,
                 connect_timeout_secs: None,
                 stream_timeout_secs: None,
                 max_context_tokens: None,
             },
-            "azure" => ConnectionConfigPayload::Azure {
+            Connector::Azure => ConnectionConfigPayload::Azure {
                 base_url: None,
                 api_key_env,
                 api_surface: None,
@@ -3187,7 +3234,7 @@ mod tests {
                 stream_timeout_secs: None,
                 max_context_tokens: None,
             },
-            "google" => ConnectionConfigPayload::Google {
+            Connector::Google => ConnectionConfigPayload::Google {
                 base_url: None,
                 api_key_env,
                 project: Some("proj".into()),
@@ -3198,8 +3245,38 @@ mod tests {
                 stream_timeout_secs: None,
                 max_context_tokens: None,
             },
-            other => panic!("connector {other:?} carries no api_key_env field"),
+            Connector::Bedrock | Connector::Ollama => return None,
+        })
+    }
+
+    /// The payload builder and the connector claim answer the same question,
+    /// so they must agree for every variant.
+    ///
+    /// Fails in both directions: a connector that claims the field and has no
+    /// payload for it fails, and so does a connector with a payload that
+    /// claims no field.
+    #[test]
+    fn payload_with_api_key_env_agrees_with_the_connector_claim() {
+        for &c in Connector::ALL {
+            assert_eq!(
+                payload_with_api_key_env(c, Some("PROBE_API_KEY")).is_some(),
+                c.carries_api_key_env(),
+                "{c} builds an api_key_env payload = {}, but \
+                 carries_api_key_env() says {}",
+                payload_with_api_key_env(c, Some("PROBE_API_KEY")).is_some(),
+                c.carries_api_key_env(),
+            );
         }
+    }
+
+    /// A payload for a connector that carries the field. Panics otherwise, so
+    /// a caller naming the wrong connector says so instead of skipping.
+    fn api_key_env_payload(
+        connector: Connector,
+        api_key_env: Option<&str>,
+    ) -> ConnectionConfigPayload {
+        payload_with_api_key_env(connector, api_key_env)
+            .unwrap_or_else(|| panic!("{connector} carries no api_key_env field"))
     }
 
     /// The `api_key_env` stored on a connection, whatever its connector.
@@ -3253,7 +3330,7 @@ mod tests {
             let err = svc
                 .create_connection(
                     "exfil".to_string(),
-                    payload_with_api_key_env("openai", Some(name)),
+                    api_key_env_payload(Connector::OpenAi, Some(name)),
                 )
                 .await
                 .unwrap_err();
@@ -3284,7 +3361,7 @@ mod tests {
         for name in ["openai_api_key", "OpenAi_Api_Key", "OPENAI_API_key"] {
             svc.create_connection(
                 "exfil".to_string(),
-                payload_with_api_key_env("openai", Some(name)),
+                api_key_env_payload(Connector::OpenAi, Some(name)),
             )
             .await
             .unwrap_err();
@@ -3309,7 +3386,7 @@ mod tests {
         ] {
             svc.create_connection(
                 "exfil".to_string(),
-                payload_with_api_key_env("openai", Some(name)),
+                api_key_env_payload(Connector::OpenAi, Some(name)),
             )
             .await
             .unwrap_err();
@@ -3329,15 +3406,15 @@ mod tests {
         // Pointing one connector at another's key sends that key to a host
         // the payload also chooses.
         for (connector, name) in [
-            ("anthropic", "OPENAI_API_KEY"),
-            ("openai", "ANTHROPIC_API_KEY"),
-            ("google", "AZURE_OPENAI_API_KEY"),
-            ("openrouter", "GOOGLE_API_KEY"),
+            (Connector::Anthropic, "OPENAI_API_KEY"),
+            (Connector::OpenAi, "ANTHROPIC_API_KEY"),
+            (Connector::Google, "AZURE_OPENAI_API_KEY"),
+            (Connector::OpenRouter, "GOOGLE_API_KEY"),
         ] {
             let err = svc
                 .create_connection(
                     "exfil".to_string(),
-                    payload_with_api_key_env(connector, Some(name)),
+                    api_key_env_payload(connector, Some(name)),
                 )
                 .await
                 .unwrap_err();
@@ -3356,19 +3433,19 @@ mod tests {
     #[tokio::test]
     async fn create_connection_accepts_the_documented_api_key_env_for_each_connector() {
         for (connector, name) in [
-            ("anthropic", "ANTHROPIC_API_KEY"),
-            ("openai", "OPENAI_API_KEY"),
-            ("openrouter", "OPENROUTER_API_KEY"),
-            ("azure", "AZURE_OPENAI_API_KEY"),
-            ("azure", "AZURE_API_KEY"),
-            ("google", "GOOGLE_API_KEY"),
+            (Connector::Anthropic, "ANTHROPIC_API_KEY"),
+            (Connector::OpenAi, "OPENAI_API_KEY"),
+            (Connector::OpenRouter, "OPENROUTER_API_KEY"),
+            (Connector::Azure, "AZURE_OPENAI_API_KEY"),
+            (Connector::Azure, "AZURE_API_KEY"),
+            (Connector::Google, "GOOGLE_API_KEY"),
         ] {
             let handle = make_handle_with(DaemonConfig::default());
             let svc = DaemonConnectionsService::new(handle.clone());
 
             svc.create_connection(
                 "conn".to_string(),
-                payload_with_api_key_env(connector, Some(name)),
+                api_key_env_payload(connector, Some(name)),
             )
             .await
             .unwrap_or_else(|e| panic!("{connector} should accept {name}: {e}"));
@@ -3385,14 +3462,14 @@ mod tests {
     async fn create_connection_accepts_each_connectors_derived_default_api_key_env() {
         // Pins the allowlist to the `<CONNECTOR>_API_KEY` derivation so the
         // two cannot drift apart.
-        for connector in API_KEY_ENV_CONNECTORS {
-            let derived = crate::config::default_api_key_env(connector);
+        for connector in api_key_env_connectors() {
+            let derived = crate::config::default_api_key_env(connector.as_str());
             let handle = make_handle_with(DaemonConfig::default());
             let svc = DaemonConnectionsService::new(handle.clone());
 
             svc.create_connection(
                 "conn".to_string(),
-                payload_with_api_key_env(connector, Some(&derived)),
+                api_key_env_payload(connector, Some(&derived)),
             )
             .await
             .unwrap_or_else(|e| panic!("{connector} should accept its derived {derived}: {e}"));
@@ -3413,7 +3490,7 @@ mod tests {
 
             svc.create_connection(
                 "conn".to_string(),
-                payload_with_api_key_env("openai", Some(blank)),
+                api_key_env_payload(Connector::OpenAi, Some(blank)),
             )
             .await
             .unwrap_or_else(|e| panic!("a blank api_key_env should mean unset: {e}"));
@@ -3433,7 +3510,7 @@ mod tests {
 
         svc.create_connection(
             "conn".to_string(),
-            payload_with_api_key_env("openai", Some("  OPENAI_API_KEY\n")),
+            api_key_env_payload(Connector::OpenAi, Some("  OPENAI_API_KEY\n")),
         )
         .await
         .expect("surrounding whitespace should not defeat the allowlist");
@@ -3504,7 +3581,7 @@ mod tests {
 
         svc.update_connection(
             "work".to_string(),
-            payload_with_api_key_env("openai", Some("OPENAI_WORK_KEY")),
+            api_key_env_payload(Connector::OpenAi, Some("OPENAI_WORK_KEY")),
         )
         .await
         .expect("re-sending the stored api_key_env must not be rejected");
@@ -3529,7 +3606,7 @@ mod tests {
         let err = svc
             .update_connection(
                 "personal".to_string(),
-                payload_with_api_key_env("openai", Some("OPENAI_WORK_KEY")),
+                api_key_env_payload(Connector::OpenAi, Some("OPENAI_WORK_KEY")),
             )
             .await
             .unwrap_err();

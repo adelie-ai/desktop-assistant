@@ -13,22 +13,27 @@ use std::sync::Arc;
 use desktop_assistant_core::ports::embedding::EmbeddingClient;
 
 use crate::config::EmbeddingsSettingsView;
+use crate::connections::Connector;
 
-/// Whether a connector needs a credential to work at all.
+/// The connector `view` names, resolved the way `build_llm_client` resolves
+/// one: an unrecognised name is an OpenAI-compatible endpoint.
+///
+/// Going through [`Connector::parse`] also accepts the legacy `aws-bedrock`
+/// spelling and any casing, which a bare string match did not.
+fn connector_of(view: &EmbeddingsSettingsView) -> Connector {
+    Connector::parse(&view.connector).unwrap_or(Connector::OpenAi)
+}
+
+/// Whether `view` names a connector that needs a credential and has none.
 ///
 /// Ollama is local and unauthenticated. Every other connector talks to a
 /// provider that will refuse an anonymous caller - or worse will not even try,
 /// because its SDK goes hunting for ambient credentials first and then reports
 /// that timeout instead of the missing configuration.
-fn requires_credential(connector: &str) -> bool {
-    !matches!(connector, "ollama")
-}
-
-/// Whether `view` names a connector that needs a credential and has none.
 ///
 /// Separated from the logging so the decision can be asserted directly.
 fn credential_missing(view: &EmbeddingsSettingsView) -> bool {
-    requires_credential(&view.connector)
+    connector_of(view).carries_credential()
         && view.api_key.trim().is_empty()
         && view.aws_profile.is_none()
 }
@@ -56,19 +61,22 @@ pub fn build_embedding_client(view: &EmbeddingsSettingsView) -> Option<Arc<dyn E
         );
     }
 
-    Some(match view.connector.as_str() {
-        "ollama" => {
+    // Exhaustive with no catch-all, so a new connector must choose its
+    // embedding client here rather than inherit the OpenAI-compatible one in
+    // silence.
+    Some(match connector_of(view) {
+        Connector::Ollama => {
             tracing::info!("using Ollama embedding backend");
             Arc::new(desktop_assistant_llm_ollama::OllamaClient::new(
                 view.base_url.clone(),
                 view.model.clone(),
             ))
         }
-        "bedrock" | "aws-bedrock" => {
+        Connector::Bedrock => {
             tracing::info!("using Bedrock embedding backend");
             Arc::new(build_bedrock(view))
         }
-        "azure" => {
+        Connector::Azure => {
             // Azure serves embeddings on `/openai/v1/embeddings` (or the
             // classic deployments path). The legacy `[embeddings]` block
             // carries no surface/auth extras, so this uses the connector's
@@ -80,7 +88,7 @@ pub fn build_embedding_client(view: &EmbeddingsSettingsView) -> Option<Arc<dyn E
                     .with_base_url(view.base_url.clone()),
             )
         }
-        "google" => {
+        Connector::Google => {
             // Google embeddings target Vertex `:predict` or the Gemini API
             // `:embedContent`. The legacy `[embeddings]` block carries no
             // project/location/auth extras, so this uses the connector's
@@ -94,7 +102,12 @@ pub fn build_embedding_client(view: &EmbeddingsSettingsView) -> Option<Arc<dyn E
             }
             Arc::new(client)
         }
-        _ => {
+        // Anthropic and OpenRouter serve no embeddings
+        // (`supports_embeddings()` is `false` for both), so the availability
+        // gate turns them away before this point. They share the arm rather
+        // than take one of their own, because an unrecognised connector name
+        // resolves here too and this is the OpenAI-shaped client it needs.
+        Connector::OpenAi | Connector::Anthropic | Connector::OpenRouter => {
             tracing::info!("using OpenAI-compatible embedding backend");
             // `view.api_key` is resolved by `resolve_embeddings_config` itself
             // (purpose path uses the purpose's connection's secret/env; legacy
@@ -203,22 +216,70 @@ mod tests {
         assert!(!credential_missing(&view));
     }
 
-    /// Every credential-taking connector must reach its client with the key the
-    /// view resolved. Pins the class rather than the one branch that had it
-    /// wrong, so a future branch cannot quietly omit it.
+    /// Every credential-taking embedding connector must reach its client with
+    /// the key the view resolved. Pins the class rather than the one branch
+    /// that had it wrong.
+    ///
+    /// The class is derived from [`Connector::ALL`] - every connector that
+    /// serves embeddings and authenticates - so a new connector joins it the
+    /// moment it is declared, and each connector is swept under every spelling
+    /// [`Connector::parse`] accepts, including the legacy `aws-bedrock`.
     #[test]
     fn every_credential_requiring_connector_is_built_with_the_resolved_key() {
-        for connector in ["bedrock", "aws-bedrock", "azure", "google", "openai"] {
-            let mut view = bedrock_view();
-            view.connector = connector.to_string();
-            assert!(
-                !credential_missing(&view),
-                "{connector} resolved a key, so it must not be flagged as missing one"
-            );
-            assert!(
-                build_embedding_client(&view).is_some(),
-                "{connector} must build a client when it is available"
-            );
+        let class: Vec<Connector> = Connector::ALL
+            .iter()
+            .copied()
+            .filter(|c| c.supports_embeddings() && c.carries_credential())
+            .collect();
+        assert!(
+            !class.is_empty(),
+            "the class is empty, so this sweep asserts nothing"
+        );
+
+        for connector in class {
+            for name in connector.names() {
+                let mut view = bedrock_view();
+                view.connector = (*name).to_string();
+                assert!(
+                    !credential_missing(&view),
+                    "{name} resolved a key, so it must not be flagged as missing one"
+                );
+                assert!(
+                    build_embedding_client(&view).is_some(),
+                    "{name} must build a client when it is available"
+                );
+            }
+        }
+    }
+
+    /// A connector that needs no credential must not be flagged, whatever it
+    /// resolved. The counterpart of the sweep above: together they fail both
+    /// when a connector is wrongly told it needs a key and when one that needs
+    /// a key is let through without one.
+    #[test]
+    fn no_credential_free_connector_is_flagged_for_a_missing_key() {
+        let class: Vec<Connector> = Connector::ALL
+            .iter()
+            .copied()
+            .filter(|c| !c.carries_credential())
+            .collect();
+        assert!(
+            !class.is_empty(),
+            "the class is empty, so this sweep asserts nothing"
+        );
+
+        for connector in class {
+            for name in connector.names() {
+                let mut view = bedrock_view();
+                view.connector = (*name).to_string();
+                view.api_key = String::new();
+                view.has_api_key = false;
+                view.aws_profile = None;
+                assert!(
+                    !credential_missing(&view),
+                    "{name} needs no credential, so a missing one must not be flagged"
+                );
+            }
         }
     }
 }
