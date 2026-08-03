@@ -1280,9 +1280,9 @@ fn supports_streaming_with_tools(base_id: &str) -> bool {
 ///
 /// Every marker names the feature itself, in one of the spellings the service
 /// uses: `cachePoint` for Converse, `cache_control` for the Anthropic shape
-/// Bedrock forwards, and the prose forms - "cache point", "cache checkpoint",
-/// and the bare "caching", which also covers "prompt caching". Nothing here is
-/// a status code, a generic "unsupported", or a schema path, because none of those is
+/// Bedrock forwards, and the prose forms "cache point", "cache checkpoint" and
+/// "prompt caching". Nothing here is a status code, a generic "unsupported", or
+/// a schema path, because none of those is
 /// evidence about the checkpoint: a validation failure arrives just as easily
 /// from a tool schema (#336), an over-long prompt, or a bad model id, and
 /// reading one of those as a cache refusal would disable caching on a model
@@ -1303,7 +1303,7 @@ fn names_the_cache_field(message: &str) -> bool {
         "cache point",
         "cache_control",
         "cache checkpoint",
-        "caching",
+        "prompt caching",
     ]
     .iter()
     .any(|marker| lc.contains(marker))
@@ -5809,11 +5809,9 @@ mod tests {
             "Invalid value at 'system[1].cachePoint'",
             "cache_control is not supported for this model",
             "This model does not support prompt caching.",
-            // Space-separated prose, and the bare gerund. Both name the
-            // feature and nothing else; a miss here is the failure this
+            // Space-separated prose. A miss here is the failure this
             // recovery exists to remove.
             "The cache point block is not supported by this model.",
-            "Caching is not available for this model.",
         ] {
             assert!(
                 names_the_cache_field(names_it),
@@ -5826,6 +5824,14 @@ mod tests {
             "Input is too long for requested model.",
             "The provided model identifier is invalid.",
             "Malformed input request: #/system/1: subject must not be valid against schema",
+            // The bare gerund is deliberately not a marker. Matching is a
+            // substring test over the whole message, and Bedrock quotes the
+            // offending schema path, so a tool whose input schema has a
+            // property named `caching` - an HTTP fetch tool with a cache
+            // toggle, a build tool with `caching: bool` - would turn its own
+            // schema fault into a wasted call, a `warn!` pointing an operator
+            // at prompt caching, and a model memoised as cache-refusing.
+            "The json schema for tool fetch is invalid: properties.caching is not supported.",
             "",
         ] {
             assert!(

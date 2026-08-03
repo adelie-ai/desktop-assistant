@@ -325,9 +325,12 @@ and the provider's message.
 Three limits, each deliberate:
 
 - The error must name the cache feature: `cachePoint`, `cache_control`, or the
-  prose forms "cache point", "cache checkpoint" and "caching". A validation
-  failure that names anything else is returned to the caller unchanged. A
-  status code is not evidence.
+  prose forms "cache point", "cache checkpoint" and "prompt caching". A
+  validation failure that names anything else is returned to the caller
+  unchanged. A status code is not evidence. The bare word "caching" is
+  deliberately not a marker: matching is a substring test over the whole
+  message, and Bedrock quotes the offending schema path, so a tool whose input
+  schema has a property named `caching` would be read as a cache refusal.
 - The retry is classified only when the request that failed actually carried a
   checkpoint. The retry does not, so the retry can never be read as a second
   refusal, and the memo can never be written on evidence the fallback itself
