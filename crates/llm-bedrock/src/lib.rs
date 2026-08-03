@@ -45,6 +45,20 @@ impl ModelClock for SystemClock {
     }
 }
 
+/// Whole-request budget for the non-streaming (`Converse`) path.
+///
+/// `Converse` answers once, after generation is complete, so this bounds a
+/// whole generation rather than a stall. Ten minutes is chosen to be longer
+/// than any one-shot completion a Bedrock chat model produces in practice -
+/// the path is mandatory for Llama 3 and 4 with tools, whose answers can run
+/// for minutes - so the bound catches a hung request and nothing else.
+///
+/// Deliberately not [`STREAM_EVENT_TIMEOUT`] or a sum of the stream budgets:
+/// those bound the gap between events, and one name must not answer two
+/// questions. A user who cancels does not wait this out - the dispatch races
+/// the cancellation token as well.
+const NON_STREAMING_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// Upper bound on the characters of provider text relayed in a listing
 /// notice's `detail`.
 ///
@@ -94,6 +108,19 @@ pub struct BedrockClient {
     connect_timeout: Duration,
     /// Per-chunk stall budget; defaults to [`STREAM_EVENT_TIMEOUT`].
     event_timeout: Duration,
+    /// Whole-request budget for the non-streaming (`Converse`) path; defaults
+    /// to [`NON_STREAMING_REQUEST_TIMEOUT`].
+    ///
+    /// Its own setting, not a function of the two stream budgets: those bound
+    /// a connection and the gap between events, and this bounds a whole
+    /// generation. One name answering both questions would make a change to
+    /// stall detection move a generation deadline with it.
+    ///
+    /// It does cap total generation time on this path, which the streaming
+    /// path does not cap. That is the trade, and it is why the default is
+    /// generous: an unbounded request hangs the turn until the AWS SDK's own
+    /// defaults give up, and ignores a stop.
+    non_streaming_timeout: Duration,
     /// Per-connection context-window hard cap, in tokens. `None` = "max
     /// available". Folded with the curated table in `max_context_tokens`.
     context_cap: Option<u64>,
@@ -135,6 +162,7 @@ impl BedrockClient {
             non_streaming_tools_models: Arc::new(Mutex::new(HashSet::new())),
             connect_timeout: STREAM_CONNECT_TIMEOUT,
             event_timeout: STREAM_EVENT_TIMEOUT,
+            non_streaming_timeout: NON_STREAMING_REQUEST_TIMEOUT,
             context_cap: None,
             control_endpoint_override: None,
             runtime_endpoint_override: None,
@@ -164,6 +192,21 @@ impl BedrockClient {
     pub fn with_event_timeout(mut self, secs: Option<u64>) -> Self {
         if let Some(s) = secs.filter(|s| *s > 0) {
             self.event_timeout = Duration::from_secs(s);
+        }
+        self
+    }
+
+    /// Override the whole-request budget for the non-streaming (`Converse`)
+    /// path. `None`/`Some(0)` keeps the [`NON_STREAMING_REQUEST_TIMEOUT`]
+    /// default. Seconds.
+    ///
+    /// Raise this for a model that answers in one shot and legitimately takes
+    /// longer than the default to finish. It has no effect on the streaming
+    /// path, whose two budgets bound the connection and the gap between
+    /// events.
+    pub fn with_non_streaming_timeout(mut self, secs: Option<u64>) -> Self {
+        if let Some(s) = secs.filter(|s| *s > 0) {
+            self.non_streaming_timeout = Duration::from_secs(s);
         }
         self
     }
@@ -1755,23 +1798,6 @@ struct BedrockRequestInputs {
 }
 
 impl BedrockClient {
-    /// Whole-request budget for the non-streaming (`Converse`) path.
-    ///
-    /// Why the two stream budgets added together: `Converse` returns one
-    /// response, after generation is complete, so there is no separate
-    /// connect phase to bound. The equivalent allowance is what the streaming
-    /// path grants a turn that produces a single event - the connect budget
-    /// plus one event budget. Both come from the same per-connection settings
-    /// an operator already controls, so a model that needs longer is a
-    /// configuration change and not a code change.
-    ///
-    /// This does cap total generation time on this path, which the streaming
-    /// path does not cap. That is the trade: an unbounded request hangs the
-    /// turn until the AWS SDK's own defaults give up, and ignores a stop.
-    fn non_streaming_timeout(&self) -> Duration {
-        self.connect_timeout.saturating_add(self.event_timeout)
-    }
-
     fn build_inference_config(
         &self,
     ) -> Option<aws_sdk_bedrockruntime::types::InferenceConfiguration> {
@@ -1968,7 +1994,7 @@ impl BedrockClient {
         // `Converse` answers once, when generation is complete, so one bound
         // covers the whole call. Race it against cancellation as well, so a
         // stop drops the in-flight request instead of waiting the request out.
-        let request_timeout = self.non_streaming_timeout();
+        let request_timeout = self.non_streaming_timeout;
         let send_fut = request.send();
         let response = tokio::select! {
             _ = cancellation.cancelled() => {
@@ -4764,19 +4790,18 @@ mod tests {
         }
     }
 
-    /// A client that dispatches `Converse` at `endpoint`, with `secs` for
-    /// both stall budgets.
+    /// A client that dispatches `Converse` at `url`, with `secs` as the
+    /// whole-request budget for that path.
     ///
     /// The model is a Llama 4 profile id: Llama 4 is on the
     /// non-streaming-with-tools deny list, so a turn that carries tools takes
     /// `dispatch_non_streaming` without a streaming attempt first.
-    fn stalled_non_streaming_client(endpoint: &StalledEndpoint, secs: u64) -> BedrockClient {
+    fn non_streaming_client(url: &str, secs: u64) -> BedrockClient {
         BedrockClient::new(format!("AKIAIOSFODNN7EXAMPLE:{TEST_SECRET_ACCESS_KEY}"))
             .with_base_url("us-east-1")
-            .__with_runtime_endpoint_for_test(&endpoint.url)
+            .__with_runtime_endpoint_for_test(url)
             .with_model("us.meta.llama4-maverick-17b-instruct-v1:0")
-            .with_connect_timeout(Some(secs))
-            .with_event_timeout(Some(secs))
+            .with_non_streaming_timeout(Some(secs))
     }
 
     /// One tool, which is what puts the turn on the non-streaming path.
@@ -4798,7 +4823,7 @@ mod tests {
         // today starts failing.
         let client = BedrockClient::new(String::new());
         assert_eq!(
-            client.non_streaming_timeout(),
+            client.non_streaming_timeout,
             Duration::from_secs(600),
             "the default must leave room for a full one-shot generation"
         );
@@ -4807,16 +4832,34 @@ mod tests {
             .with_connect_timeout(Some(1))
             .with_event_timeout(Some(1));
         assert_eq!(
-            tightened.non_streaming_timeout(),
+            tightened.non_streaming_timeout,
             Duration::from_secs(600),
             "tightening the streaming budgets must not move the generation deadline"
         );
+
+        // The override is per-connection, and rejects the two no-op values the
+        // sibling budgets also reject.
+        assert_eq!(
+            BedrockClient::new(String::new())
+                .with_non_streaming_timeout(Some(30))
+                .non_streaming_timeout,
+            Duration::from_secs(30)
+        );
+        for no_op in [None, Some(0)] {
+            assert_eq!(
+                BedrockClient::new(String::new())
+                    .with_non_streaming_timeout(no_op)
+                    .non_streaming_timeout,
+                Duration::from_secs(600),
+                "{no_op:?} means \"keep the default\""
+            );
+        }
     }
 
     #[tokio::test]
     async fn non_streaming_dispatch_that_exceeds_the_timeout_returns_a_timeout_error() {
         let endpoint = stalled_endpoint().await;
-        let client = stalled_non_streaming_client(&endpoint, 1);
+        let client = non_streaming_client(&endpoint.url, 1);
 
         // The outer bound only stops a hang from becoming a suite-wide stall.
         // The assertion is that the connector's own budget ended the call.
@@ -4839,15 +4882,74 @@ mod tests {
         );
     }
 
+    /// One complete `Converse` response, as the API returns it.
+    const CONVERSE_RESPONSE_BODY: &str = r#"{
+      "output": {
+        "message": {
+          "role": "assistant",
+          "content": [{"text": "the whole answer, in one piece"}]
+        }
+      },
+      "stopReason": "end_turn",
+      "usage": {"inputTokens": 12, "outputTokens": 7, "totalTokens": 19},
+      "metrics": {"latencyMs": 250}
+    }"#;
+
+    #[tokio::test]
+    async fn non_streaming_dispatch_inside_the_budget_returns_the_answer() {
+        // The bound must end a hung request and nothing else. A turn that
+        // takes real time and finishes inside its budget has to come back
+        // whole - text, usage, and one callback - or the timeout has turned
+        // into a cap on working turns.
+        let server = httpmock::MockServer::start();
+        let converse = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path_matches(r"/converse$");
+            then.status(200)
+                .header("content-type", "application/json")
+                .delay(Duration::from_millis(400))
+                .body(CONVERSE_RESPONSE_BODY);
+        });
+
+        let client = non_streaming_client(&server.url(""), 2);
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = seen.clone();
+
+        let response = client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &one_tool(),
+                ReasoningConfig::default(),
+                Box::new(move |chunk| {
+                    sink.lock().expect("chunk sink").push(chunk);
+                    true
+                }),
+            )
+            .await
+            .expect("a turn that answers inside its budget must succeed");
+
+        converse.assert();
+        assert_eq!(response.text, "the whole answer, in one piece");
+        assert_eq!(
+            response.usage.as_ref().and_then(|u| u.output_tokens),
+            Some(7)
+        );
+        assert_eq!(
+            seen.lock().expect("chunk sink").as_slice(),
+            ["the whole answer, in one piece"],
+            "the callback fires once with the full text"
+        );
+    }
+
     #[tokio::test]
     async fn cancelling_during_a_non_streaming_dispatch_returns_promptly() {
         use desktop_assistant_core::ports::llm::with_cancellation_token;
         use tokio_util::sync::CancellationToken;
 
         let endpoint = stalled_endpoint().await;
-        // Budgets far longer than the test: the timeout must not be what ends
+        // A budget far longer than the test: the timeout must not be what ends
         // this call, or the test would pass without any cancellation support.
-        let client = stalled_non_streaming_client(&endpoint, 600);
+        let client = non_streaming_client(&endpoint.url, 600);
 
         let token = CancellationToken::new();
         let trip = token.clone();

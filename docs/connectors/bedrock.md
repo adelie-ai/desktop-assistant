@@ -302,17 +302,34 @@ multiply the attempts.
 **Timeouts** are connector-level, because they are network concerns rather than
 API concerns:
 
-- `connect_timeout` - the time to establish the connection.
-- `event_timeout` - the time between streaming events before the stream counts
-  as stalled.
+- `connect_timeout` (30s) - the time to establish the connection.
+- `event_timeout` (60s) - the time between streaming events before the stream
+  counts as stalled.
+- `non_streaming_timeout` (600s) - the whole-request budget for the
+  non-streaming path.
 
-Both apply to every backend. On the streaming path they bound the two phases
-separately: the connect race, then each gap between events. The non-streaming
-path answers once, when generation is complete, so it takes the sum of the two
-as a single whole-request budget - 90 seconds on the defaults. A model that
-needs longer than that to answer in one shot raises both values on its
-connection. Each path also races its request against the cancellation token, so
-a stop ends the turn rather than waiting the request out.
+Three settings, because there are three questions. The first two bound the
+streaming path's two phases: the connect race, then each gap between events.
+Neither bounds a whole turn - a stream that keeps producing runs as long as it
+likes.
+
+The non-streaming path has no intermediate events to time. `Converse` answers
+once, after generation is complete, so its bound is necessarily a bound on the
+generation, and it gets its own setting rather than borrowing `event_timeout`.
+Reusing that one would give a single name two meanings, and a change to stall
+detection would move a generation deadline with it. The default is deliberately
+generous: this path is mandatory for Llama 3 and 4 with tools, whose one-shot
+answers can run for minutes, so the bound is there to catch a hung request and
+nothing else. Raise it per connection for a model that legitimately takes
+longer.
+
+Each path also races its request against the cancellation token, so a stop ends
+the turn rather than waiting the budget out.
+
+`non_streaming_timeout` is a connector setting today, not yet a connection key:
+the client accepts it, and nothing in the daemon's configuration sets it, so
+every connection runs the default. Issue #1042 carries it through the wire
+shape and the resolver to join the other two.
 
 **Tool-schema sanitisation** runs above the backend boundary, in the shared
 request conversion. Top-level `oneOf`, `anyOf` and `allOf` are removed and a
