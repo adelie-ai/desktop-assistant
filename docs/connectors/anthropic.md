@@ -27,9 +27,12 @@ which sends namespace tools as deferred and adds the
 `tool_search_tool_regex_20251119` sentinel), so an unconfigured connection gets
 it. OpenAI defaults the same way.
 
-Set `hosted_tool_search = false` on the connection to turn it off.
-`docs/connectors/cloud-connector-abstraction.md`, section 5, records the decision
-and what an operator sees on each setting.
+Set `hosted_tool_search = false` on the connection to turn it off. Do this for
+an endpoint that speaks the Messages API without serving the tool-search beta:
+unlike `llm-openai`, this client does not yet re-send the turn with the tools
+inline when the endpoint refuses the request, so the turn fails instead.
+`docs/connectors/cloud-connector-abstraction.md`, section 5, records the
+decision and both fallbacks.
 
 ## Prompt Caching
 

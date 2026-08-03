@@ -235,11 +235,31 @@ runs one tool-categorization call on the backend model (cached by tool-set hash)
 With no namespaces - an empty tool fleet - nothing changes: `send_prompt` takes
 the namespaced path only when the namespace list is non-empty.
 
-**When to turn it off.** Set `hosted_tool_search = false` on the connection for a
-third-party endpoint that speaks the connector's API but rejects its tool-search
-request shape. The daemon's own demotion path (a text-only first response falls
-back to `builtin_tool_search`) does not cover a transport error, so such an
-endpoint fails the turn rather than degrading.
+**What happens on an endpoint that does not serve it.** `base_url` is
+configurable, so a connector also serves endpoints that speak its API without
+being the first-party provider. Such an endpoint may refuse the tool-search
+request shape. There are two independent fallbacks, and they cover different
+failures:
+
+- *The model answered, but used no deferred tool.* The daemon demotes to
+  `builtin_tool_search` and nudges the model to call it (`core/src/service.rs`).
+  This fires on a text-only first response, inside the turn.
+- *The endpoint refused the request.* The connector re-sends the same turn with
+  every tool inline - what the trait's own default
+  `stream_completion_with_namespaces` does - and memoizes the model, so later
+  turns send one request instead of two. `llm-openai` implements this;
+  `llm-anthropic` does not yet.
+
+The connector-level fallback is deliberately narrow. It answers a client error
+that is not authentication, a timeout, throttling, quota, or a context overflow.
+The first two say nothing about the request shape, and a context overflow must
+not be answered with a larger request - flattening deferred tools makes the
+prompt bigger, and the core service already truncates and retries that variant.
+
+**When to turn it off.** Setting `hosted_tool_search = false` on the connection
+is still the cheaper answer for an endpoint known never to serve it: it skips
+the first refused request on the very first turn, which the memo can only skip
+from the second turn onward.
 
 ### 6. Reasoning / extended thinking
 

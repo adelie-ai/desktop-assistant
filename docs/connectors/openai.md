@@ -26,10 +26,16 @@ On by default. `OpenAiClient` implements hosted tool search
 which adds a `{"type": "tool_search"}` sentinel to the `tools` array), so an
 unconfigured connection gets it. Anthropic defaults the same way.
 
-Set `hosted_tool_search = false` on the connection to turn it off - for example
-for a third-party endpoint that serves the Responses API but rejects the
-tool-search tool type. `docs/connectors/cloud-connector-abstraction.md`, section
-5, records the decision and what an operator sees on each setting.
+An endpoint that serves the Responses API but rejects the `tool_search` tool
+type does not fail the turn. The client re-sends the same turn with every tool
+inline and memoizes the model, so later turns send one request instead of two.
+The retry is narrow: it answers a client error that is not authentication, a
+timeout, throttling, quota, or a context overflow.
+
+Setting `hosted_tool_search = false` on the connection is still the cheaper
+answer for an endpoint known never to serve it, because it also skips the first
+refused request. `docs/connectors/cloud-connector-abstraction.md`, section 5,
+records the decision and both fallbacks.
 
 ## Prompt Caching
 
