@@ -733,25 +733,72 @@ struct OpenAiErrorBody {
     error_type: Option<String>,
 }
 
-/// Detect an OpenAI context-overflow rejection in an HTTP error body.
+/// A rejection body with no `error` envelope, as vLLM and several other
+/// OpenAI-compatible servers emit: `{"object":"error","message":"...",
+/// "type":"BadRequestError","code":400}`. `code` is a number here rather than
+/// a string, so it is not read.
+#[derive(Deserialize, Default)]
+struct FlatErrorBody {
+    #[serde(default)]
+    message: String,
+}
+
+/// Whether an error code or type names a context-window rejection.
+///
+/// `context_length_exceeded` is OpenAI's. `context_window_exceeded` is
+/// LiteLLM's for the same condition, and it arrives on `type` rather than
+/// `code`.
+fn is_context_overflow_code(code: Option<&str>) -> bool {
+    matches!(
+        code,
+        Some("context_length_exceeded") | Some("context_window_exceeded")
+    )
+}
+
+/// Detect a context-overflow rejection in an HTTP error body.
 ///
 /// Returns `Some((prompt_tokens, max_tokens))` (each may itself be `None`
-/// when the wording doesn't carry numbers) when the body parses as the
-/// OpenAI error envelope and `error.code == "context_length_exceeded"`.
-/// Returns `None` for any other shape so the caller can fall through to
-/// a generic `CoreError::Llm`.
+/// when the wording doesn't carry numbers), or `None` for any other shape so
+/// the caller can fall through to a generic `CoreError::Llm`.
 ///
-/// Why: pattern-matching on error message strings is normally banned
-/// (see `AGENTS.md`), but at the connector boundary this is the only
-/// signal OpenAI provides for context-window rejections — converting
-/// it into structured `CoreError::ContextOverflow` here is exactly what
-/// the rule carves out, since downstream code never has to.
+/// Reads two families, because `base_url` is configurable and this client
+/// therefore also serves endpoints that speak the Responses API without being
+/// OpenAI:
+///
+/// - **A structured envelope.** OpenAI's `code = "context_length_exceeded"`
+///   and LiteLLM's `type = "context_window_exceeded"`. Where a code field
+///   exists it is authoritative, and a body naming some other code is not an
+///   overflow however its message reads. Getting that wrong is destructive:
+///   the core's `recover_from_overflow` rewrites the largest tool result's
+///   content in place, up to `MAX_OVERFLOW_RETRIES` times.
+/// - **A flat body with no `error` key**, as vLLM emits. There is no code to
+///   trust here, so the message is the only signal there is.
+///
+/// Reading only OpenAI's would leave every compatible endpoint's overflow
+/// misclassified as a generic error, and the truncate-and-retry ladder runs on
+/// `CoreError::ContextOverflow` and on nothing else.
+///
+/// Why match on a message at all: pattern-matching on error message strings is
+/// normally banned (see `AGENTS.md`), but at the connector boundary this is
+/// the only signal these servers provide - converting it into a structured
+/// `CoreError::ContextOverflow` here is exactly what the rule carves out,
+/// since downstream code never has to.
 fn detect_openai_context_overflow(body: &str) -> Option<(Option<u64>, Option<u64>)> {
-    let envelope: OpenAiErrorEnvelope = serde_json::from_str(body).ok()?;
-    if envelope.error.code.as_deref() != Some("context_length_exceeded") {
+    if let Ok(envelope) = serde_json::from_str::<OpenAiErrorEnvelope>(body) {
+        let error = envelope.error;
+        if is_context_overflow_code(error.code.as_deref())
+            || is_context_overflow_code(error.error_type.as_deref())
+        {
+            return Some(parse_openai_context_length_message(&error.message));
+        }
         return None;
     }
-    Some(parse_openai_context_length_message(&envelope.error.message))
+    let flat = serde_json::from_str::<FlatErrorBody>(body).ok()?;
+    let lowered = flat.message.to_ascii_lowercase();
+    if lowered.contains("maximum context length") || lowered.contains("context window") {
+        return Some(parse_openai_context_length_message(&flat.message));
+    }
+    None
 }
 
 /// Detect OpenAI's `insufficient_quota` billing error in an HTTP error

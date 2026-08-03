@@ -4,7 +4,8 @@ Crate: `desktop-assistant-llm-openai`
 
 ## API Details
 
-- Endpoint: `{base_url}/chat/completions` (POST, streaming SSE)
+- Endpoint: `{base_url}/responses` (Responses API; POST, streaming SSE)
+- Embeddings endpoint: `{base_url}/embeddings`
 - Auth: `Authorization: Bearer {api_key}`
 - Default model: `gpt-5.4`
 - Default base URL: `https://api.openai.com/v1`
@@ -17,6 +18,23 @@ Crate: `desktop-assistant-llm-openai`
 | Environment | `OPENAI_MODEL` | No |
 | Environment | `OPENAI_BASE_URL` | No |
 | Config file | `daemon.toml` [openai] section | No |
+
+## Context-Overflow Detection
+
+`base_url` is configurable, so this client also serves endpoints that speak the
+Responses API without being OpenAI. Their context-window rejections are read
+too, because the daemon's truncate-and-retry recovery runs on
+`CoreError::ContextOverflow` and on nothing else:
+
+| Endpoint | Signal |
+|----------|--------|
+| OpenAI | `error.code = "context_length_exceeded"` |
+| LiteLLM | `error.type = "context_window_exceeded"` |
+| vLLM | no `error` key at all; the limit is stated only in `message` |
+
+Where a structured code exists it is authoritative - a body naming some other
+code is not an overflow however its message reads. The message is consulted
+only for the flat shape, which has no code to trust.
 
 ## Prompt Caching
 
