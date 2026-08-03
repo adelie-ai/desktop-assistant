@@ -30,6 +30,13 @@ tracing-subscriber.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml = { workspace = true, features = ["preserve_order"] }
+# Names the keys serde discarded while deserializing daemon.toml. `DaemonConfig`
+# cannot carry `deny_unknown_fields` - see `unknown_config_keys` for why a stale
+# key must not stop the daemon - so without this the whole of a misspelled table
+# is thrown away in silence, which is how `[connection.name]` (singular) reached
+# a shipped doc. The alternative is a hand-listed set of known keys, which is
+# the same drift this guard exists to catch.
+serde_ignored = "0.1.14"
 thiserror.workspace = true
 indexmap = { version = "2", features = ["serde"] }
 # Non-poisoning RwLock for RegistryHandle (DT-9 / #276): a panic while a

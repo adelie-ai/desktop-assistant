@@ -401,16 +401,27 @@ Credentials come from the static key above, or from the standard AWS provider
 chain: environment, profile, SSO, instance role.
 
 ```toml
-[connection.my-bedrock]
+[connections.my-bedrock]
 type = "bedrock"
 region = "us-east-1"
-profile = "production"
-default_model = "us.anthropic.claude-opus-4-1"
+aws_profile = "production"
 connect_timeout_secs = 30
-event_timeout_secs = 120
+stream_timeout_secs = 120
 # "system_prompt_only" (the default) or "none". See "Prompt caching".
 cache_policy = "system_prompt_only"
+
+# A connection is an endpoint and a credential. The model is chosen per
+# purpose, so the same connection can serve a large interactive model and a
+# small one for background work.
+[purposes.interactive]
+connection = "my-bedrock"
+model = "us.anthropic.claude-opus-4-1"
 ```
+
+The table is `[connections.<name>]`, plural. A misspelled table name configures
+nothing: `DaemonConfig` accepts unknown keys, so the whole block is discarded.
+The daemon names every discarded key at `warn!` on load, which is the only
+signal that a block did nothing.
 
 `cache_policy` is a file setting. The connection commands on the API carry no
 field for it, so a client cannot read or write it, and an edit made through a

@@ -142,13 +142,18 @@ Simple env-var providers:
 Azure and Vertex carry multi-field config that env vars alone cannot express, so
 configure them as named connections in `daemon.toml`. Minimal examples:
 
+A connection is an endpoint and a credential. It carries no model: the model is
+chosen per purpose, in `[purposes.*]`, so one connection can serve a large
+interactive model and a small one for background work. A `model` key inside
+`[connections.*]` is rejected at load - every connection type refuses unknown
+fields.
+
 ```toml
-# Azure OpenAI (v1 GA API). `model` is your deployment name; `base_url` is the
-# resource endpoint. Set AZURE_OPENAI_API_KEY (or use auth_mode = "entra").
+# Azure OpenAI (v1 GA API). `base_url` is the resource endpoint. Set
+# AZURE_OPENAI_API_KEY (or use auth_mode = "entra").
 [connections.azure-prod]
 type = "azure"
 base_url = "https://YOUR-RESOURCE.openai.azure.com"
-model = "my-gpt5-deployment"   # the deployment you created in the portal
 # api_surface = "v1"           # default; "classic" for the legacy deployment-in-URL API
 # auth_mode = "api_key"        # default; "entra" for Entra ID / managed identity
 
@@ -157,12 +162,19 @@ model = "my-gpt5-deployment"   # the deployment you created in the portal
 type = "google"
 project = "my-gcp-project"
 location = "us-central1"
-model = "gemini-2.5-pro"
 # auth_mode = "vertex"         # default; "api_key" uses the Gemini API + GOOGLE_API_KEY
 
 # OpenRouter (also works purely from OPENROUTER_API_KEY).
 [connections.openrouter]
 type = "openrouter"
+
+# The model goes here. On Azure it is your deployment name.
+[purposes.interactive]
+connection = "azure-prod"
+model = "my-gpt5-deployment"
+
+[purposes.dreaming]
+connection = "openrouter"
 model = "anthropic/claude-sonnet-4-6"
 ```
 
