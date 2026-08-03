@@ -37,7 +37,7 @@ pub enum Role {
 
 /// A single chat message within a conversation.
 ///
-/// `id` is a monotonic UUIDv7 ([`new_message_id`]) assigned at creation — the
+/// `id` is a monotonic UUIDv7 (`new_message_id`) assigned at creation — the
 /// message's stable identity, ordering key, and resume cursor for live
 /// multi-client sync. It is deliberately NOT part of `PartialEq`/`Eq`: equality
 /// compares message *content* (role/content/tool calls), so existing

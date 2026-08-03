@@ -1704,7 +1704,7 @@ pub struct ServiceAccountView {
 }
 
 /// Wire form of the database settings (#314). Mirrors the core
-/// [`desktop_assistant_core::ports::inbound::DatabaseSettingsView`] but lives
+/// `desktop_assistant_core::ports::inbound::DatabaseSettingsView` but lives
 /// here (serializable) so it can travel over the socket transports.
 ///
 /// SECURITY: `url` never carries a password. The application layer redacts it
@@ -1721,7 +1721,7 @@ pub struct DatabaseSettingsView {
 }
 
 /// Wire form of the backend-tasks settings (#314). Mirrors the core
-/// [`desktop_assistant_core::ports::inbound::BackendTasksSettingsView`].
+/// `desktop_assistant_core::ports::inbound::BackendTasksSettingsView`.
 /// Carries no secret — `llm_base_url` is an endpoint, not a credential.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BackendTasksSettingsView {
@@ -1743,7 +1743,7 @@ pub struct BackendTasksSettingsView {
 }
 
 /// Wire form of the WebSocket auth settings (#314). Mirrors the core
-/// [`desktop_assistant_core::ports::inbound::WsAuthSettingsView`].
+/// `desktop_assistant_core::ports::inbound::WsAuthSettingsView`.
 ///
 /// SECURITY: this carries only the enabled auth `methods` and the
 /// non-sensitive OIDC discovery fields. The JWT HS256 signing key lives in

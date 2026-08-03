@@ -8,11 +8,13 @@
 //! own their auth headers, base-URL shaping, and model addressing. What they
 //! share -- and what lives here -- is the wire dialect itself:
 //!
-//! - [`to_chat_messages`] / [`ChatMessage`]: domain [`Message`]s ->
+//! - [`to_chat_messages`] / [`ChatMessage`]: domain
+//!   [`Message`](desktop_assistant_core::domain::Message)s ->
 //!   `messages[]` in the `chat/completions` shape (`system` / `user` /
 //!   `assistant` with optional `tool_calls` / `tool` results keyed by
 //!   `tool_call_id`).
-//! - [`to_chat_tools`] / [`ChatTool`]: domain [`ToolDefinition`]s ->
+//! - [`to_chat_tools`] / [`ChatTool`]: domain
+//!   [`ToolDefinition`](desktop_assistant_core::domain::ToolDefinition)s ->
 //!   `tools[{type:"function", function:{name,description,parameters}}]`, with
 //!   the parameter schema passed through [`sanitize_tool_schema`].
 //! - [`sanitize_tool_schema`] / [`sanitize_tool_arguments`]: the two
@@ -22,7 +24,8 @@
 //! - [`consume_chat_stream`] / [`parse_chat_chunk`] / [`ChatChunk`]: SSE
 //!   `choices[].delta` parsing with indexed `tool_calls` accumulation and a
 //!   final `usage` read, terminating on `[DONE]`.
-//! - [`parse_usage`]: `usage` -> [`TokenUsage`], including the cache-activity
+//! - [`parse_usage`]: `usage` -> [`TokenUsage`](desktop_assistant_core::ports::llm::TokenUsage),
+//!   including the cache-activity
 //!   fields (`prompt_tokens_details.cached_tokens` / `.cache_write_tokens`).
 //! - [`mark_system_cache_breakpoint`]: add a `cache_control` marker to the last
 //!   system message via the multi-part content-array form.

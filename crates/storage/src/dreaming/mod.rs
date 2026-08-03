@@ -15,7 +15,7 @@
 //!    its own slower cadence by [`run_consolidation_scan`].
 //! 4. **Trash sweep** (frequent, cheap, no LLM) — frees soft-deleted entries
 //!    past their retention window. Deliberately independent of the passes
-//!    above: see [`trash`] and [`sweep_expired_trash`].
+//!    above: see `trash` and [`sweep_expired_trash`].
 
 mod archival;
 mod common;

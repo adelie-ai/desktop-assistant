@@ -11,7 +11,8 @@
 //! ## Why a task-local
 //!
 //! The codebase already threads per-turn LLM configuration the same way
-//! (see [`crate::ports::llm::CONTEXT_BUDGET`] and [`MODEL_OVERRIDE`]).
+//! (see the `CONTEXT_BUDGET` and `MODEL_OVERRIDE` task-locals in
+//! [`crate::ports::llm`]).
 //! User identity is the same shape of value: scoped to a single request,
 //! crossing many `await` points and many layers, read by code that
 //! doesn't otherwise know about the auth pipeline. Threading it through
@@ -48,7 +49,7 @@ tokio::task_local! {
 /// identity. All [`current_user_id`] calls inside the future (and any
 /// sub-tasks that inherit the scope) observe `user_id`.
 ///
-/// The transport handler ([`crates/ws-interface`] and friends) calls
+/// The transport handler (`crates/ws-interface` and friends) calls
 /// this exactly once per request, immediately after extracting the
 /// identity from the JWT. Nested calls override the outer scope for the
 /// duration of the inner future — this is how dreaming workers and

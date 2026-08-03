@@ -288,7 +288,7 @@ pub fn current_reasoning_config() -> ReasoningConfig {
 /// Run `fut` with `refinement` installed as the current request's
 /// system-prompt refinement. The context assembler reads it via
 /// [`current_system_refinement`] and appends it to the system message for
-/// the turn. See [`SYSTEM_REFINEMENT`].
+/// the turn. See `SYSTEM_REFINEMENT`.
 pub async fn with_system_refinement<F, T>(refinement: String, fut: F) -> T
 where
     F: std::future::Future<Output = T>,
@@ -308,7 +308,7 @@ pub fn current_system_refinement() -> String {
 
 /// Run `fut` with `personality` installed as the active personality for this
 /// turn. The context assembler reads it via [`current_personality`] and injects
-/// the rendered disposition blurb into the system message. See [`PERSONALITY`].
+/// the rendered disposition blurb into the system message. See `PERSONALITY`.
 pub async fn with_personality<F, T>(personality: crate::prompts::Personality, fut: F) -> T
 where
     F: std::future::Future<Output = T>,
@@ -328,7 +328,7 @@ pub fn current_personality() -> crate::prompts::Personality {
 /// Run `fut` with `now_line` installed as this turn's ambient "now" context.
 /// The context assembler reads it via [`current_now_context`] and surfaces it
 /// as a `[Now]` system message for the turn. Pass the rendered output of
-/// [`crate::clock::NowSnapshot::ambient_line`]. See [`NOW_CONTEXT`].
+/// [`crate::clock::NowSnapshot::ambient_line`]. See `NOW_CONTEXT`.
 pub async fn with_now_context<F, T>(now_line: String, fut: F) -> T
 where
     F: std::future::Future<Output = T>,
@@ -345,7 +345,7 @@ pub fn current_now_context() -> String {
 
 /// Run `fut` with `key` installed as the current foreground send's client
 /// idempotency key. `send_prompt` reads it via [`current_idempotency_key`] and
-/// stamps it onto the USER message row it persists. See [`IDEMPOTENCY_KEY`].
+/// stamps it onto the USER message row it persists. See `IDEMPOTENCY_KEY`.
 ///
 /// The application layer wraps ONLY the foreground dispatch with this; agent
 /// runs deliberately do not, so their user rows persist `None`.
@@ -367,7 +367,7 @@ pub fn current_idempotency_key() -> Option<String> {
 /// Run `fut` with `disabled` installed as the current turn's tool-provenance
 /// gate override. `ConversationHandler::send_prompt` reads it via
 /// [`current_tool_gate_disabled`] when constructing `TurnProvenance`. See
-/// [`TOOL_GATE_DISABLED`].
+/// `TOOL_GATE_DISABLED`.
 pub async fn with_tool_gate_disabled<F, T>(disabled: bool, fut: F) -> T
 where
     F: std::future::Future<Output = T>,
@@ -386,7 +386,7 @@ pub fn current_tool_gate_disabled() -> bool {
 
 /// Run `fut` with `model` installed as the current turn's model override.
 /// Connectors read it via [`current_model_override`] in `stream_completion`
-/// and use it in place of `self.model`. See [`MODEL_OVERRIDE`].
+/// and use it in place of `self.model`. See `MODEL_OVERRIDE`.
 pub async fn with_model_override<F, T>(model: String, fut: F) -> T
 where
     F: std::future::Future<Output = T>,
@@ -442,7 +442,7 @@ pub enum BudgetSource {
 /// reads this via [`current_context_budget`] to drive token-pressure
 /// compaction.
 ///
-/// Why a task-local: see the doc on [`CONTEXT_BUDGET`].
+/// Why a task-local: see the doc on `CONTEXT_BUDGET`.
 pub async fn with_context_budget<F, T>(budget: ContextBudget, fut: F) -> T
 where
     F: std::future::Future<Output = T>,
@@ -487,7 +487,7 @@ pub fn emit_context_usage(usage: ContextUsage) {
 /// (it's an `Arc<…>` internally), so the dispatch wrapper hands a clone
 /// to the inner future and keeps a clone for its own monitoring.
 ///
-/// Why a task-local: see the doc on [`CANCELLATION_TOKEN`].
+/// Why a task-local: see the doc on `CANCELLATION_TOKEN`.
 pub async fn with_cancellation_token<F, T>(token: CancellationToken, fut: F) -> T
 where
     F: std::future::Future<Output = T>,
@@ -509,7 +509,7 @@ pub fn current_cancellation_token() -> Option<CancellationToken> {
 /// `spawn_subagent` builtin tool (#112) so the spawned task body can
 /// restrict the LLM's tool surface for the duration of that run.
 ///
-/// See [`TOOL_ALLOWLIST`] for the read side and the semantic contract.
+/// See `TOOL_ALLOWLIST` for the read side and the semantic contract.
 pub async fn with_tool_allowlist<F, T>(tools: Vec<String>, fut: F) -> T
 where
     F: std::future::Future<Output = T>,
@@ -531,7 +531,7 @@ pub fn current_tool_allowlist() -> Option<Vec<String>> {
 }
 
 /// Run `fut` with the classification reentrancy guard installed. See
-/// [`CLASSIFICATION_IN_PROGRESS`]. Used by the classifier's LLM tier to wrap
+/// `CLASSIFICATION_IN_PROGRESS`. Used by the classifier's LLM tier to wrap
 /// its own LLM call so the result can't be recursively classified.
 pub async fn with_classification_in_progress<F, T>(fut: F) -> T
 where
@@ -1115,7 +1115,7 @@ pub trait LlmClient: Send + Sync {
 
     /// Optional one-shot warmup hook called once after registry construction.
     /// Default no-op; Ollama uses it to populate the GGUF context-length
-    /// cache so [`max_context_tokens`] returns a real value on first use.
+    /// cache so [`LlmClient::max_context_tokens`] returns a real value on first use.
     /// Errors are intentionally swallowed by the registry — warmup is
     /// best-effort and a failure just falls back to the universal default.
     async fn warmup(&self) {}

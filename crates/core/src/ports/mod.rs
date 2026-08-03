@@ -28,63 +28,27 @@ pub mod scratchpad;
 /// Tool registry store port — outbound trait for tool definition persistence and search.
 pub mod tool_registry;
 
-/// Skill index store port — outbound trait for the disk-sourced skill catalog.
-pub mod skill_index;
-
 /// Database query port — closure type for read-only SQL queries.
 pub mod database;
-
-/// Desktop-notification port — capability-gated closure for posting a desktop
-/// notification (freedesktop `org.freedesktop.Notifications`).
-pub mod notify;
 
 /// Conversation search port — outbound trait for full-text search over past messages.
 pub mod conversation_search;
 
-/// Request-scoped auth context — task-local `UserId` for SQL scoping (#105).
+// The modules below document themselves with a `//!` header. A summary here as
+// well would merge with it and make every unqualified intra-doc link in that
+// header resolve against THIS module instead of its own, which silently breaks
+// the links.
 pub mod auth;
-
-/// Request-scoped login-session identity — task-local [`session::SessionId`],
-/// unique per client connection, so per-connection state (client-local tool
-/// registration) doesn't bleed between two windows of the same user (#261).
-pub mod session;
-
-/// Request-scoped transport context — task-local [`crate::domain::TransportKind`]
-/// so the turn loop can infer tool co-location (UDS/D-Bus ⇒ same machine,
-/// WebSocket ⇒ possibly remote) when tagging tools with locality (#243).
-pub mod transport;
-
-/// Request-scoped conversation context — task-local `ConversationId` so tool
-/// executors can scope per-conversation side state (e.g. the scratchpad).
-pub mod conversation_ctx;
-
-/// Per-subagent-turn scratchpad scope task-locals (#287): the session-pad
-/// redirect, `owner_todo` namespace, spawn snapshot cut, and ancestor chain.
-pub mod scratchpad_scope;
-
-/// Bundle of the request-scoped task-locals that must cross a `tokio::spawn`
-/// boundary ([`request_scope::RequestScope`]) — captured before the spawn and
-/// re-installed in one call inside the spawned turn body, so a new
-/// spawn-crossing local can never be silently dropped at a re-install site
-/// (the #261 leak class, issue #305 item 4).
-pub mod request_scope;
-
-/// Client-side tool execution port — outbound trait the turn loop uses to
-/// consult the current user's registered client-local tools and suspend the
-/// turn on a client-tool call (#107 / #234).
 pub mod client_tools;
-
-/// Request-scoped tool-activity observer — task-local sink the turn loop
-/// notifies of each tool/MCP call and its outcome, so a caller can surface a
-/// live activity feed (e.g. the background-task panel) without threading a
-/// sink through the `send_prompt` trait surface.
+pub mod conversation_ctx;
+pub mod notify;
+pub mod request_scope;
+pub mod scratchpad_scope;
+pub mod session;
+pub mod skill_index;
 pub mod tool_observer;
 pub mod tool_usage;
-
-/// Request-scoped turn interactivity: task-local
-/// [`turn_interactivity::TurnInteractivity`] saying whether a person is
-/// watching this turn while it runs, so narration can be tuned for a live
-/// audience or for the record (#942).
+pub mod transport;
 pub mod turn_capability;
 pub mod turn_interactivity;
 

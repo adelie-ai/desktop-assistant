@@ -9,7 +9,7 @@
 //! degrade to a smaller (possibly empty) context rather than an error.
 //!
 //! Raw environment / syscall reads live in thin wrappers; the [`ClientContext`]
-//! is assembled by the pure [`assemble_client_context`], which is unit-tested by
+//! is assembled by the pure `assemble_client_context`, which is unit-tested by
 //! feeding it resolved strings so tests never depend on the host's real
 //! `$USER` / timezone / passwd entry.
 
@@ -24,7 +24,7 @@ use desktop_assistant_api_model::ClientContext;
 /// - `real_name`: the current user's GECOS full name (`getpwuid(getuid())`).
 /// - `username`: `$USER`, else `$LOGNAME`.
 /// - `home_dir`: `$HOME`.
-/// - `hostname`: the kernel hostname (see [`local_hostname`]).
+/// - `hostname`: the kernel hostname (see `local_hostname`).
 /// - `timezone`: the IANA zone name via `iana-time-zone`.
 /// - `os`: the Linux distro `PRETTY_NAME`, else the OS family.
 pub fn resolve_client_context() -> ClientContext {

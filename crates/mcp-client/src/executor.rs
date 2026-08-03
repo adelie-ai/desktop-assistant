@@ -260,7 +260,7 @@ pub struct McpServerConfig {
     ///
     /// Now a *supplement* rather than a substitute: it is indexed alongside
     /// anything the server declares for itself, rather than only when the server
-    /// is silent. See [`resolve_provider_description`] for why every source is
+    /// is silent. See `resolve_provider_description` for why every source is
     /// combined. Optional for TOML back-compat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -1360,7 +1360,7 @@ impl McpControlHandle {
     /// the daemon when a persistent tool index exists. `OnceLock::set` succeeds
     /// only the first time; a second call is silently ignored, which is fine -
     /// the closure is startup-immutable. Left unwired (headless / no-Postgres),
-    /// [`Self::fire_tool_reindex`] is a no-op and toggling behaves exactly as
+    /// `Self::fire_tool_reindex` is a no-op and toggling behaves exactly as
     /// before this change.
     pub fn set_tool_reindex(&self, reindex: ToolReindexFn) {
         let _ = self.state.tool_reindex.set(reindex);

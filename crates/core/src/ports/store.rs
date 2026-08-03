@@ -438,7 +438,7 @@ pub trait ConversationStore: Send + Sync {
     /// archived flag, and a SQL-computed `message_count` — and never loads
     /// message bodies. A Postgres adapter MUST satisfy this with a single
     /// aggregate query (one `LEFT JOIN ... GROUP BY` over `messages`), not a
-    /// per-conversation fetch. Callers that need full bodies use [`get`].
+    /// per-conversation fetch. Callers that need full bodies use [`Self::get`].
     fn list(
         &self,
     ) -> impl std::future::Future<Output = Result<Vec<ConversationSummary>, CoreError>> + Send;

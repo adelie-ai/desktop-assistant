@@ -264,7 +264,7 @@ impl ListChangeFlags {
 }
 
 /// Client for a single MCP server, speaking JSON-RPC over a pluggable
-/// [`Transport`] — either a spawned stdio child process or a remote
+/// `Transport` — either a spawned stdio child process or a remote
 /// streamable-HTTP endpoint.
 pub struct McpClient {
     transport: Transport,
@@ -520,7 +520,7 @@ impl McpClient {
 
     /// The MCP protocol revision this session negotiated, as reported by the
     /// server's `initialize` result — which may be older than
-    /// [`REQUESTED_PROTOCOL_VERSION`]. `None` only before the handshake has
+    /// `REQUESTED_PROTOCOL_VERSION`. `None` only before the handshake has
     /// run; a connected client always has one.
     pub fn protocol_version(&self) -> Option<&str> {
         self.protocol_version.as_deref()

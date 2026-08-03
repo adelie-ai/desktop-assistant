@@ -287,7 +287,7 @@ impl AzureClient {
     /// Set the per-connection context-window hard cap, in tokens. `None`/
     /// `Some(0)` = "max available". Folded with the resolved window in
     /// [`LlmClient::max_context_tokens`] via
-    /// [`apply_context_cap`](desktop_assistant_llm_http::apply_context_cap).
+    /// [`desktop_assistant_llm_http::apply_context_cap`].
     pub fn with_max_context_tokens(mut self, max: Option<u64>) -> Self {
         self.context_cap = max.filter(|m| *m > 0);
         self

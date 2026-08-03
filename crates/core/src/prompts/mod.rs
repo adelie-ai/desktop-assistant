@@ -74,7 +74,7 @@ const ADAPTATION_CLAUSE: &str = "Treat this as a starting point, not a script. \
 ///
 /// The blurb is a single disposition sentence — one clause per trait whose
 /// level is not [`PersonalityLevel::Never`], phrased by level — followed by the
-/// fixed [`ADAPTATION_CLAUSE`]. A `Never` trait contributes no clause. When
+/// fixed `ADAPTATION_CLAUSE`. A `Never` trait contributes no clause. When
 /// every trait is `Never`, only the adaptation clause is emitted.
 ///
 /// A free function (not an inherent method) because [`Personality`] now lives
@@ -113,7 +113,7 @@ const CLIENT_CONTEXT_HEADER: &str = "== About the user & their device ==";
 /// Render a [`ClientContext`] (issue #549) into an "about the user & their
 /// device" system-prompt section, or `None` when no field is present.
 ///
-/// Each value is sanitized ([`crate::sanitize::sanitize_client_field`]) before
+/// Each value is sanitized (`crate::sanitize::sanitize_client_field`) before
 /// it is templated — the context is untrusted, self-reported display data — and
 /// any field that sanitizes to empty is treated as absent. One clause is emitted
 /// per present field; the timezone clause (the highest-value field) tells the

@@ -142,7 +142,7 @@ pub fn capability_for_local_peer(peer_uid: u32, daemon_uid: u32) -> Capability {
 
 /// The capability a command requires.
 ///
-/// Delegates to [`classify`], the single exhaustive match.
+/// Delegates to `classify`, the single exhaustive match.
 ///
 /// The split is *write* versus *read*, not command-name prefix:
 ///

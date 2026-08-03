@@ -188,7 +188,7 @@ impl OpenRouterClient {
     }
 
     /// Override the first-response (connect) stall budget. `None`/`Some(0)`
-    /// keeps the [`OPENROUTER_CONNECT_TIMEOUT`] default. Seconds.
+    /// keeps the `OPENROUTER_CONNECT_TIMEOUT` default. Seconds.
     pub fn with_connect_timeout(mut self, secs: Option<u64>) -> Self {
         if let Some(s) = secs.filter(|s| *s > 0) {
             self.connect_timeout = Duration::from_secs(s);
@@ -197,7 +197,7 @@ impl OpenRouterClient {
     }
 
     /// Override the per-chunk stall budget. `None`/`Some(0)` keeps the
-    /// [`OPENROUTER_EVENT_TIMEOUT`] default. Seconds.
+    /// `OPENROUTER_EVENT_TIMEOUT` default. Seconds.
     pub fn with_event_timeout(mut self, secs: Option<u64>) -> Self {
         if let Some(s) = secs.filter(|s| *s > 0) {
             self.event_timeout = Duration::from_secs(s);

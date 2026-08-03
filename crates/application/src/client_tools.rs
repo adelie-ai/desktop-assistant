@@ -231,7 +231,7 @@ impl ClientToolCoordinator {
 
     /// Test/diagnostic helper: true iff `name` is registered in **any**
     /// `(user, session)` bucket. Production code must use
-    /// [`is_client_registered`], which is correctly scoped to the calling
+    /// [`Self::is_client_registered`], which is correctly scoped to the calling
     /// connection's session (#261). This exists for out-of-band callers
     /// (integration tests, diagnostics) that need to assert a registration
     /// landed without knowing the server-minted `session_id` of the

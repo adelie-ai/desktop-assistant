@@ -57,6 +57,8 @@ The bar is high and the soundness argument must be written down in a `// SAFETY:
 - Include rationale (`Why:` lines) for non-obvious choices, not just descriptions of behavior.
 - For shared trait-locks / task-locals, document the contract in the module-level doc.
 - Don't narrate PR / issue history in code comments. Reference issues only when the comment captures a non-obvious WHY tied to that issue.
+- Intra-doc links are checked by the gate (`just doc`), so a bracketed link must resolve to something a reader of the public docs can follow. When the target is deliberately private, write a plain code span instead of a link - never make an item public, and never add an `#[allow(rustdoc::...)]`, to satisfy a link.
+- A module documented with its own `//!` header takes no `///` summary on its `mod` declaration. The two merge, and the merged text resolves its links against the PARENT module, which silently breaks every unqualified link in the header.
 
 ## Storage & migrations
 
@@ -81,13 +83,16 @@ The workspace is held to:
 - a working-tree secret scan (`scripts/secret-scan.sh`) - see "Secret scanning" below
 - `cargo fmt`
 - `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo doc --workspace --no-deps` (`scripts/doc.sh`) - see "Documentation lints" below
 - `cargo test --workspace`
-- the same `clippy` and `test` runs for `crates/storage-sqlite` with its
-  `--features sqlite` on (`just lint-sqlite`, `just test-sqlite`)
-- the same `clippy` and `test` runs for `crates/client-common` with its
-  `--features mcp-host` on (`just lint-mcp-host`, `just test-mcp-host`)
+- the same `clippy`, `doc` and `test` runs for `crates/storage-sqlite` with its
+  `--features sqlite` on (`just lint-sqlite`, `just doc-sqlite`,
+  `just test-sqlite`)
+- the same `clippy`, `doc` and `test` runs for `crates/client-common` with its
+  `--features mcp-host` on (`just lint-mcp-host`, `just doc-mcp-host`,
+  `just test-mcp-host`)
 
-Neither extra pair is redundant, for the same reason. `storage-sqlite` is
+Neither extra set is redundant, for the same reason. `storage-sqlite` is
 entirely behind an off-by-default `sqlite` feature - the feature exists so the
 daemon build never links the sqlite C library. `client-common`'s
 `mcp_host` module (the client-side MCP host: the spawn path a real desktop
@@ -101,12 +106,13 @@ and a shell suite holds the gate to having one:
 
 `just check` runs all of those, each workspace step followed by its
 `storage-sqlite` and `mcp-host` counterparts (`lint` then `lint-sqlite` then
-`lint-mcp-host`, `test` then `test-sqlite` then `test-mcp-host`), with `build`
-in between and `just test-scripts` last (the named tests for the gate's own
-shell steps, under `scripts/tests/`). The advisory scan and the secret scan
-both come first, before either `lint` or `build` - build scripts execute at
-first compile, under `clippy` as much as under `build`, and enabling `sqlite`
-adds `libsqlite3-sys`, which compiles C.
+`lint-mcp-host`, `doc` then `doc-sqlite` then `doc-mcp-host`, `test` then
+`test-sqlite` then `test-mcp-host`), with `build` in between and
+`just test-scripts` last (the named tests for the gate's own shell steps, under
+`scripts/tests/`). The advisory scan and the secret scan both come first,
+before `lint`, `doc` or `build` - build scripts execute at first compile, under
+`clippy` and `doc` as much as under `build`, and enabling `sqlite` adds
+`libsqlite3-sys`, which compiles C.
 
 What `just check` does **not** cover:
 
@@ -126,6 +132,35 @@ set is bundled in the binary, not fetched per run. That goes for `git push`
 too: the pre-push hook runs the same `just check`.
 
 New code keeps it there. Warnings-as-errors is enforced **mechanically**, not by reviewer vigilance: the root `Cargo.toml` sets `[workspace.lints] rust.warnings = "deny"` and `clippy.all = "deny"`, and every member inherits via `[lints] workspace = true`, so a plain `cargo build`/`test`/`clippy` hard-fails on any warning. Base rule 2.1 states the posture.
+
+## Documentation lints
+
+`just doc` (`scripts/doc.sh`) runs `cargo doc --no-deps` over the workspace, plus
+the two feature-gated repeats. It is the only step in the gate that evaluates
+rustdoc lints: `cargo clippy -- -D warnings` reaches compiler lints only, so
+without this step a doc link to a renamed, privatised or deleted item passes
+everything else. Those lints become errors the same mechanical way the compiler
+ones do - `[workspace.lints] rust.warnings = "deny"` reaches rustdoc too.
+
+Like the two scans, the step is unable to pass by accident:
+
+- **A rustdoc error** - hard failure, with rustdoc's own output. Fix the doc
+  comment, and read the prose beside it: a link to an item that no longer exists
+  usually means the sentence around it is stale too.
+- **A rustdoc *warning*** - hard failure. A warning where every other crate gets
+  an error means that crate is not inheriting `[lints] workspace = true`, so its
+  documentation would rot behind a green gate.
+- **A run that produced no documentation** - hard failure. `cargo doc` that
+  selects nothing exits 0 and prints almost nothing, which reads in the log like
+  "the docs are fine", so the step checks each selected crate's `index.html` on
+  disk instead of trusting the exit status.
+
+`scripts/tests/doc-gate.test.sh` holds the gate to having the step, and proves
+the detection against throwaway fixture workspaces.
+
+Do not silence a finding with `#[allow(rustdoc::...)]`, and do not widen an
+item's visibility to satisfy a link. Where the target is genuinely private,
+the link becomes a plain `code span`.
 
 ## Dependency safety
 

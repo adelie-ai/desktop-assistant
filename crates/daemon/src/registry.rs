@@ -1,7 +1,7 @@
 //! Per-connection LLM client registry.
 //!
 //! Issue #9. Builds one `Arc<dyn LlmClient>` per entry in
-//! [`ConnectionsMap`] (from #8) and tracks availability so a single
+//! [`crate::connections::ConnectionsMap`] (from #8) and tracks availability so a single
 //! misconfigured connection does not prevent daemon startup.
 //!
 //! Downstream:
@@ -153,7 +153,7 @@ impl ConnectionRegistry {
     ///    start but requests will be rejected with a clear error).
     ///
     /// This is recorded once at build time so the choice is stable after
-    /// construction; if config reloads change the order, [`rebuild_from`]
+    /// construction; if config reloads change the order, [`Self::rebuild_from`]
     /// recomputes it.
     pub fn active_connection(&self) -> Option<&ConnectionId> {
         self.active.as_ref()

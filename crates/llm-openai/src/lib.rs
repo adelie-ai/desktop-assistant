@@ -109,7 +109,7 @@ impl OpenAiClient {
     }
 
     /// Override the first-response (connect) stall budget. `None`/`Some(0)`
-    /// keeps the [`OPENAI_CONNECT_TIMEOUT`] default. Seconds.
+    /// keeps the `OPENAI_CONNECT_TIMEOUT` default. Seconds.
     pub fn with_connect_timeout(mut self, secs: Option<u64>) -> Self {
         if let Some(s) = secs.filter(|s| *s > 0) {
             self.connect_timeout = std::time::Duration::from_secs(s);
@@ -118,7 +118,7 @@ impl OpenAiClient {
     }
 
     /// Override the per-chunk stall budget. `None`/`Some(0)` keeps the
-    /// [`OPENAI_EVENT_TIMEOUT`] default. Seconds.
+    /// `OPENAI_EVENT_TIMEOUT` default. Seconds.
     pub fn with_event_timeout(mut self, secs: Option<u64>) -> Self {
         if let Some(s) = secs.filter(|s| *s > 0) {
             self.event_timeout = std::time::Duration::from_secs(s);

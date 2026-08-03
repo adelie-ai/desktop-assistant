@@ -164,7 +164,7 @@ impl GoogleClient {
         Some(DEFAULT_BACKEND_MODEL)
     }
 
-    /// Composed default base URL (Vertex at [`DEFAULT_LOCATION`]).
+    /// Composed default base URL (Vertex at `DEFAULT_LOCATION`).
     pub fn get_default_base_url() -> Option<&'static str> {
         Some(DEFAULT_BASE_URL)
     }
