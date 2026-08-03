@@ -2506,11 +2506,17 @@ async fn main() -> Result<()> {
     //      that resolves the connection/model/effort from the live config
     //      on every call. Control-panel edits take effect on the next
     //      backend dispatch with no daemon restart.
-    //   2. `[backend_tasks.llm]` legacy block — install a static client
-    //      only if it differs from the primary, so unmigrated installs
-    //      that haven't authored a `[purposes]` table still work. The
-    //      legacy path stays static; authors are expected to move to
+    //   2. `[backend_tasks.llm]` legacy block - install a client pinned to
+    //      the connector and model named there, only if they differ from
+    //      the primary, so unmigrated installs that haven't authored a
+    //      `[purposes]` table still work. The legacy path resolves once at
+    //      startup instead of per call; authors are expected to move to
     //      `[purposes.titling]`.
+    //
+    // Both backend paths ignore the turn's `ACTIVE_CLIENT` and install their
+    // own model override. Titling and context summary run inside the caller's
+    // `send_prompt` scope, so a slot that read either task-local would bill
+    // every title to the interactive connection and model.
     let resolved_primary = config::resolve_llm_config(daemon_config.as_ref());
     let titling_configured = daemon_config
         .as_ref()
@@ -2547,9 +2553,14 @@ async fn main() -> Result<()> {
                 resolved_bt.connector,
                 resolved_bt.model
             );
-            let bt_llm = build_llm_client(resolved_bt);
-            let bt_fallback = Arc::new(bt_llm);
-            let bt_llm = routing_llm::RoutingLlmClient::new(bt_fallback);
+            let bt_model = resolved_bt.model.clone();
+            let bt_client = build_llm_client(resolved_bt);
+            // Pin both the client and the model. This branch is entered
+            // only when the backend connector or model differs from the
+            // primary, so the turn's `ACTIVE_CLIENT` and `MODEL_OVERRIDE`
+            // both name a different target. Titling runs inside the turn's
+            // scope, so both are in force when it dispatches.
+            let bt_llm = routing_llm::RoutingLlmClient::new_pinned(bt_client, bt_model);
             let bt_llm =
                 backend_reasoning::FixedReasoningLlmClient::new(bt_llm, ReasoningConfig::default());
             let bt_llm = RetryingLlmClient::new(bt_llm, 3);
