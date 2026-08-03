@@ -264,6 +264,50 @@ has nowhere to put them. Adding a provider therefore MUST also:
 A checklist that stops at the config enums leaves Azure/Vertex with no way to
 receive their core config.
 
+## The variant list is generated
+
+`Connector` is declared through the `declare_connectors!` macro in
+`daemon/src/connections.rs`. One invocation carries the variant, its canonical
+name, and its aliases; the macro emits the enum, `as_str`, `parse`, and
+`Connector::ALL`. Every sweep iterates `ALL`.
+
+Why a generated list at all: a list a person keeps beside the enum can be
+appended to incorrectly and still compile, and the connector it forgets is then
+simply never tested. An array, an index table, and a count constant all have
+that property. So does a chain of "what comes after this one" arms, and less
+visibly: the `match` is exhaustive, so a new variant does force an arm, but the
+natural minimal arm, `Foo => None`, ends the walk instead of extending it, and
+the sweep stops one connector short with nothing to show for it.
+
+Three shapes were compared:
+
+- **A `macro_rules!` that declares the enum and the list together** (chosen).
+  The list is a consequence of the declaration rather than a second thing to
+  keep in step, so no edit can produce a variant that exists and is not in
+  `ALL`. It costs no dependency, and it absorbs two more per-variant tables
+  (`as_str` and `parse`) into the same declaration.
+- **A `strum::EnumIter` derive.** Adds a proc-macro dependency for iteration
+  alone. `as_str` and `parse` would stay hand-written, or would move to
+  `AsRefStr`/`EnumString` attributes that cannot express this enum's parse
+  contract without changing it: `parse` trims, lowercases, accepts the legacy
+  `aws-bedrock` alias, and deliberately refuses `gemini`. The deliberate
+  refusal would become an absent attribute, which reads as an oversight.
+- **A hand-written `pub const ALL` / `all() -> [Self; N]`**, matching
+  `PurposeKind` in `crates/protocol/src/lib.rs`. Simplest, and it has prior art
+  here, but it is the shape the problem is about: a person writes the list, so a
+  forgotten append is silent, and the test that pins it is an assertion someone
+  has to keep sharp.
+
+Per-connector *behaviour* is not generated. Those arms call into different
+provider crates and have nothing in common but their shape, and an exhaustive
+`match` with no catch-all already forces a new variant to be handled. It was
+only the list that had no such force.
+
+What remains outside the guarantee: a `match` on `Connector` that grows a
+catch-all arm, or a `matches!` used in place of an exhaustive `match`, drops
+back to silent defaulting. Neither is a minimal edit, and both are visible in a
+diff, but neither is prevented by the compiler.
+
 ## Wiring surface (per new first-class provider)
 
 There is no single `ProviderKind` enum; identity is spread across four parallel
@@ -277,10 +321,17 @@ Compile-forced (a new variant breaks the build until every arm exists):
 - `ConnectionConfigPayload` + `connector_type()` (`core/src/ports/inbound.rs`)
 - `ConnectionConfigView` + `connector_type()` (`api-model/src/lib.rs`)
 - `ConnectionConfig` (`connector()` + `set_secret()`) and the `Connector` enum
-  (`as_str/parse/default_base_url/default_chat_model/default_backend_chat_model/
-  default_embedding_model/default_http_base_url`, plus review of
-  `supports_embeddings/type_offers_hosted_tool_search`), plus a `<Provider>Connection`
-  struct (`daemon/src/connections.rs`)
+  (`default_base_url/default_chat_model/default_backend_chat_model/
+  default_embedding_model/default_http_base_url/supports_embeddings/
+  type_offers_hosted_tool_search`), plus a `<Provider>Connection` struct
+  (`daemon/src/connections.rs`). The variant's canonical name and its aliases
+  go on the `declare_connectors!` line itself, which also emits `as_str`,
+  `parse` and `Connector::ALL` - see "The variant list is generated" below.
+- Every sweep that walks `Connector::ALL`: the hosted-tool-search invariant
+  sweep and `probe_target` (`registry.rs`), the model-kind sweep
+  (`model_defaults.rs`), and the connector tests in `connections.rs`. A new
+  variant joins each of them as soon as it is declared, and the arms with no
+  catch-all then refuse to compile until it is classified.
 - The two resolution matches (`daemon/src/config/resolution.rs`)
 - Four mappers (`application/src/lib.rs` x2, `daemon/src/api_surface.rs` x2)
 - `model_defaults.rs` `DefaultsFile` field + `defaults_for` arm
@@ -299,19 +350,12 @@ Silent if omitted (compiles, misbehaves - each MUST be added):
   OpenRouter needs an explicit `false`).
 - `map_effort_to_reasoning_config` (`api_surface.rs`): the `_` arm drops reasoning
   silently.
-- `Connector::parse` (`connections.rs`): its `_ => None` coerces an unknown
-  declared type to `Connector::OpenAi` defaults; landing all enum arms + `parse`
-  atomically avoids a declared `type` silently masquerading as OpenAI.
 - `connection_from_legacy_llm` (`connections.rs`): legacy `[llm]` path.
-- `next_in_declaration_order` (`registry.rs`, test module): the chain the
-  hosted-tool-search invariant sweep walks to reach every connector. The `match`
-  is exhaustive, so a new variant does force an arm - but an arm that returns
-  `None` instead of linking the variant compiles and drops it from the sweep,
-  which is the silent half (#1034 tracks generating the variant list, which
-  removes this entry). Link the new variant into the chain, and give it an arm
-  in `probe_target` beside it: either a client built with hosted tool search
-  forced on plus the marker its namespaced request carries, or the recorded
-  reason it does not claim the capability.
+- The hand-kept connector subsets in the test modules. Each names a class
+  narrower than `Connector::ALL`, so a new connector in that class must be added
+  to it by hand or its behaviour goes untested: the credential-taking list in
+  `credential_missing` / `build_embedding_client` (`embedding_client.rs`), and
+  `credential_connectors` and `API_KEY_ENV_CONNECTORS` (`api_surface.rs`).
 
 Better: where practical, route the factory / sanity / embeddings / reasoning
 dispatch through the typed `Connector` enum (issue #47's direction) so a new

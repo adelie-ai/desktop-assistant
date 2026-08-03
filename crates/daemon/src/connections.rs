@@ -261,63 +261,118 @@ impl ConnectionConfig {
     }
 }
 
-/// Typed connector identity. The wire/config layer continues to round-trip
-/// through `&str` (TOML, env vars, the legacy `[llm].connector` field) but
-/// internally every per-connector default — base URL, default chat model,
-/// embedding model, hosted-tool-search availability, etc. — is a method on
-/// this enum so adding a new connector or fixing an alias is a single
-/// match-arm change instead of a 5-table edit (#47).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Connector {
-    Ollama,
-    Anthropic,
-    Bedrock,
-    OpenAi,
-    OpenRouter,
-    Azure,
-    Google,
+/// Declare the [`Connector`] enum together with everything that has to list
+/// its variants: the canonical name, the accepted aliases, and
+/// [`Connector::ALL`].
+///
+/// One invocation is the single hand-maintained definition of the variant set.
+/// Adding a connector is one line here, and the list every sweep walks follows
+/// from it. A separate list - an array, an index table, a count constant, a
+/// chain of "what comes next" arms - can be appended to incorrectly and still
+/// compile, which drops the new connector from the sweeps that read it (#1034).
+///
+/// Per-connector *behaviour* stays a hand-written `match` on the enum below.
+/// Those arms differ per connector (each calls into its own provider crate),
+/// and an exhaustive `match` with no catch-all already forces a new variant to
+/// be handled. It was only the list that had no such force.
+///
+/// Write every canonical name and alias in lowercase. [`Connector::parse`]
+/// lowercases its input before matching, so a literal with a capital in it can
+/// never be reached; `connector_as_str_round_trips_through_parse` catches one.
+macro_rules! declare_connectors {
+    (
+        $(#[$enum_meta:meta])*
+        $vis:vis enum $name:ident {
+            $(
+                $(#[$variant_meta:meta])*
+                $variant:ident => $canonical:literal $(| $alias:literal)*,
+            )+
+        }
+    ) => {
+        $(#[$enum_meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        $vis enum $name {
+            $(
+                $(#[$variant_meta])*
+                $variant,
+            )+
+        }
+
+        impl $name {
+            /// Every connector, in declaration order.
+            ///
+            /// Emitted from the same token list that declares the variants, so
+            /// it cannot fall behind them. Sweeps iterate this rather than a
+            /// list of their own.
+            ///
+            /// A slice, not the workspace's usual `all() -> [Self; N]` (see
+            /// `PurposeKind` in `crates/protocol/src/lib.rs`): the length here
+            /// is generated, and a hand-written `N` would be one more number to
+            /// keep in step.
+            // Only the sweeps read this today; the daemon's own run path never
+            // enumerates connectors, and `pub` exempts nothing in a binary
+            // crate. `expect` rather than `allow`, so the first production
+            // caller is told to delete the attribute.
+            #[cfg_attr(
+                not(test),
+                expect(dead_code, reason = "read by the per-connector test sweeps")
+            )]
+            pub const ALL: &'static [Self] = &[ $( Self::$variant ),+ ];
+
+            /// Canonical short name. Matches the `type =` tag in
+            /// `[connections.<id>]` and the legacy `[llm].connector` value.
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    $( Self::$variant => $canonical, )+
+                }
+            }
+
+            /// Parse a connector identifier with alias support.
+            ///
+            /// Accepts:
+            /// - canonical names (`ollama`, `anthropic`, `bedrock`, `openai`, ...)
+            /// - the aliases declared beside each variant, such as the legacy
+            ///   `aws-bedrock` for [`Self::Bedrock`]
+            /// - leading/trailing whitespace and any case
+            ///
+            /// Returns `None` for unrecognised values; callers that need a
+            /// default for unknown input should chain
+            /// `.unwrap_or(Connector::OpenAi)` (or whichever default is right
+            /// for their context).
+            pub fn parse(raw: &str) -> Option<Self> {
+                match raw.trim().to_ascii_lowercase().as_str() {
+                    $( $canonical $( | $alias )* => Some(Self::$variant), )+
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
+declare_connectors! {
+    /// Typed connector identity. The wire/config layer continues to round-trip
+    /// through `&str` (TOML, env vars, the legacy `[llm].connector` field) but
+    /// internally every per-connector default - base URL, default chat model,
+    /// embedding model, hosted-tool-search availability - is a method on
+    /// this enum so adding a new connector or fixing an alias is a single
+    /// match-arm change instead of a 5-table edit (#47).
+    ///
+    /// Declared through [`declare_connectors!`], which emits [`Self::ALL`] from
+    /// the same list. Add a variant here and every sweep picks it up.
+    pub enum Connector {
+        Ollama => "ollama",
+        Anthropic => "anthropic",
+        Bedrock => "bedrock" | "aws-bedrock",
+        OpenAi => "openai",
+        OpenRouter => "openrouter",
+        Azure => "azure",
+        // Deliberately no "gemini" alias: an unknown `type = "gemini"` must
+        // stay unrecognised so the negative config test keeps rejecting it.
+        Google => "google",
+    }
 }
 
 impl Connector {
-    /// Canonical short name. Matches the `type =` tag in
-    /// `[connections.<id>]` and the legacy `[llm].connector` value.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Ollama => "ollama",
-            Self::Anthropic => "anthropic",
-            Self::Bedrock => "bedrock",
-            Self::OpenAi => "openai",
-            Self::OpenRouter => "openrouter",
-            Self::Azure => "azure",
-            Self::Google => "google",
-        }
-    }
-
-    /// Parse a connector identifier with alias support.
-    ///
-    /// Accepts:
-    /// - canonical names (`ollama`, `anthropic`, `bedrock`, `openai`)
-    /// - the legacy `aws-bedrock` alias for [`Self::Bedrock`]
-    /// - leading/trailing whitespace and any case
-    ///
-    /// Returns `None` for unrecognised values; callers that need a
-    /// default for unknown input should chain `.unwrap_or(Connector::OpenAi)`
-    /// (or whichever default is right for their context).
-    pub fn parse(raw: &str) -> Option<Self> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "ollama" => Some(Self::Ollama),
-            "anthropic" => Some(Self::Anthropic),
-            "bedrock" | "aws-bedrock" => Some(Self::Bedrock),
-            "openai" => Some(Self::OpenAi),
-            "openrouter" => Some(Self::OpenRouter),
-            "azure" => Some(Self::Azure),
-            // Deliberately no "gemini" alias: an unknown `type = "gemini"` must
-            // stay unrecognised so the negative config test keeps rejecting it.
-            "google" => Some(Self::Google),
-            _ => None,
-        }
-    }
-
     /// Default base URL for this connector. Empty string for connectors
     /// that don't ship a default (so `.to_string()` and `format!` callers
     /// don't have to special-case `Option`).
@@ -480,8 +535,14 @@ impl Connector {
     /// This one is the wider claim. A connector named here still has to
     /// implement the capability in its client, and its client still has to
     /// override `stream_completion_with_namespaces` to honour it.
+    ///
+    /// Exhaustive with no catch-all, like [`Self::supports_embeddings`]: a new
+    /// connector states its answer rather than inheriting `false` in silence.
     pub fn type_offers_hosted_tool_search(self) -> bool {
-        matches!(self, Self::OpenAi | Self::Anthropic)
+        match self {
+            Self::OpenAi | Self::Anthropic => true,
+            Self::Ollama | Self::Bedrock | Self::OpenRouter | Self::Azure | Self::Google => false,
+        }
     }
 }
 
