@@ -2282,6 +2282,52 @@ mod tests {
         assert!(!is_claude_bedrock_model("meta.llama3-70b"));
     }
 
+    /// Model ids paired with whether this connector can configure reasoning
+    /// for them, spanning both answers so neither direction can pass
+    /// vacuously.
+    ///
+    /// Claude 3.7 and the 4.x line take an extended-thinking budget. Claude
+    /// 3.5 and Claude 3 predate the feature. DeepSeek R1 reasons on its own
+    /// and Bedrock exposes no knob for it. Nothing else on Bedrock takes a
+    /// thinking budget through the Converse API.
+    const REASONING_CONFIGURABLE_BY_ID: &[(&str, bool)] = &[
+        ("anthropic.claude-sonnet-4-6", true),
+        ("us.anthropic.claude-opus-4-1", true),
+        ("eu.anthropic.claude-haiku-4-5-20251001-v1:0", true),
+        ("apac.anthropic.claude-3-7-sonnet-20250219-v1:0", true),
+        ("anthropic.claude-3-5-sonnet-20241022-v2:0", false),
+        ("anthropic.claude-3-haiku-20240307-v1:0", false),
+        ("us.deepseek.r1-v1:0", false),
+        ("us.meta.llama4-maverick-17b-instruct-v1:0", false),
+        ("amazon.nova-premier-v1:0", false),
+        ("openai.gpt-oss-120b-1:0", false),
+        ("amazon.titan-embed-text-v2:0", false),
+    ];
+
+    #[test]
+    fn reasoning_capability_and_the_emitted_thinking_field_agree_for_every_model() {
+        // The capability record and the request builder must not be able to
+        // disagree: a model that advertises reasoning has its budget sent,
+        // and a model that does not advertise it is never sent one.
+        for (id, configurable) in REASONING_CONFIGURABLE_BY_ID {
+            let advertised =
+                infer_capabilities_from_id(strip_region_prefix(id), false, false).reasoning;
+            let emitted = build_additional_model_request_fields(
+                id,
+                ReasoningConfig::with_thinking_budget(8_000),
+            )
+            .is_some();
+            assert_eq!(
+                advertised, *configurable,
+                "{id}: capability record disagrees with what Bedrock accepts"
+            );
+            assert_eq!(
+                emitted, *configurable,
+                "{id}: emitted request fields disagree with what Bedrock accepts"
+            );
+        }
+    }
+
     #[test]
     fn additional_model_request_fields_none_when_no_budget() {
         assert!(
@@ -3018,7 +3064,15 @@ mod tests {
         );
         let info = inference_profile_to_model_info(&profile).expect("kept");
         assert_eq!(info.id, "us.deepseek.r1-v1:0");
-        assert!(info.capabilities.reasoning, "R1 is a reasoning model");
+        // R1 reasons, and it reasons whether or not anybody asks: Bedrock's
+        // Converse contract for DeepSeek carries no reasoning configuration
+        // at all, so this connector cannot act on a reasoning effort for it.
+        // Reporting `true` put a reasoning badge and an effort control in
+        // front of a person, and dropped the budget on the way out.
+        assert!(
+            !info.capabilities.reasoning,
+            "R1 takes no reasoning configuration on Bedrock"
+        );
         assert!(info.capabilities.tools);
         assert!(!info.capabilities.vision);
     }
