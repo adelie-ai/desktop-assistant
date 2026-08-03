@@ -705,6 +705,7 @@ mod tests {
         OpenAiConnection,
     };
     use indexmap::IndexMap;
+    use std::sync::Mutex;
 
     /// Build a bare [`ResolvedLlmConfig`] with only the identity/credential
     /// fields set — the rest default to `None`/`false`. Keeps the new-connector
@@ -1266,27 +1267,55 @@ mod tests {
     // The trait ships a default for the second that flattens every namespace
     // into one ordinary tool list, so a connector that claims the capability
     // without overriding it sends the whole tool fleet in a single request and
-    // no tool-search entry at all — the service layer has already stripped
-    // `builtin_tool_search` by then. The test below drives every production
-    // client and refuses that combination.
+    // no tool-search entry at all - the service layer has already stripped
+    // `builtin_tool_search` by then. The sweep below drives every production
+    // client, by both construction paths, and refuses that combination.
 
-    /// Every [`Connector`] variant. [`claiming_client`] matches on all of them
-    /// with no catch-all arm, so a new variant fails to compile there until it
-    /// is given a constructor here too.
-    const ALL_CONNECTORS: [Connector; 7] = [
-        Connector::Ollama,
-        Connector::Anthropic,
-        Connector::Bedrock,
-        Connector::OpenAi,
-        Connector::OpenRouter,
-        Connector::Azure,
-        Connector::Google,
-    ];
+    /// The connector that follows `connector` in declaration order, or `None`
+    /// for the last one.
+    ///
+    /// The sweep walks this chain instead of reading a hand-kept array,
+    /// because the `match` has no catch-all: a new `Connector` variant fails to
+    /// compile here until someone links it in. An array keeps compiling
+    /// untouched, and the connector it forgets is simply never tested.
+    ///
+    /// One gap is left, and it is not compile-forced: an arm that returns
+    /// `None` orphans its variant rather than linking it, which ends the walk
+    /// early. `docs/connectors/cloud-connector-abstraction.md` lists this chain
+    /// among the sites a new connector must update by hand.
+    fn next_in_declaration_order(connector: Connector) -> Option<Connector> {
+        match connector {
+            Connector::Ollama => Some(Connector::Anthropic),
+            Connector::Anthropic => Some(Connector::Bedrock),
+            Connector::Bedrock => Some(Connector::OpenAi),
+            Connector::OpenAi => Some(Connector::OpenRouter),
+            Connector::OpenRouter => Some(Connector::Azure),
+            Connector::Azure => Some(Connector::Google),
+            Connector::Google => None,
+        }
+    }
+
+    /// Every connector, walked from the head of the chain above.
+    fn every_connector() -> Vec<Connector> {
+        let mut out = Vec::new();
+        let mut cursor = Some(Connector::Ollama);
+        while let Some(connector) = cursor {
+            out.push(connector);
+            cursor = next_in_declaration_order(connector);
+        }
+        out
+    }
 
     /// Name of the single tool the probe turn carries. It appears in both the
     /// namespaced and the flattened request body, which is how a captured body
     /// is told apart from any other traffic a client emits.
     const PROBE_TOOL: &str = "hosted_search_probe_tool";
+
+    /// The connectors the sweep expects to reach the request probe. Pinned so
+    /// the probe cannot quietly shrink to nothing: if every connector stopped
+    /// claiming the capability, an unpinned sweep would run zero probes and
+    /// still report a pass, which reads exactly like a deleted test.
+    const EXPECTED_CLAIMANTS: [&str; 2] = ["anthropic", "openai"];
 
     fn probe_tool() -> desktop_assistant_core::domain::ToolDefinition {
         desktop_assistant_core::domain::ToolDefinition::new(
@@ -1304,78 +1333,192 @@ mod tests {
         )
     }
 
-    /// Build one client per connector with hosted tool search forced on
-    /// wherever the builder accepts the flag, so the assertion covers what a
-    /// connector *can* claim rather than what today's config happens to set.
-    fn claiming_client(connector: Connector, base_url: &str) -> Arc<dyn LlmClient> {
+    /// One connector's entry in the sweep.
+    struct ProbeTarget {
+        /// The client built straight from the connector's own builder, with
+        /// hosted tool search forced on where the builder accepts a preference.
+        direct: Arc<dyn LlmClient>,
+        /// `None` when the builder takes a hosted-tool-search preference.
+        /// `Some(reason)` when it has none: the opt-in cannot be forced here,
+        /// so the reason is recorded and the client must still report `false`.
+        no_opt_in: Option<&'static str>,
+    }
+
+    /// Classify and build every connector. Exhaustive with no catch-all arm, so
+    /// a new variant must be classified before this compiles, and a connector
+    /// the sweep cannot force on is a recorded decision rather than a silence.
+    fn probe_target(connector: Connector, base_url: &str) -> ProbeTarget {
         match connector {
-            Connector::Ollama => Arc::new(desktop_assistant_llm_ollama::OllamaClient::new(
-                base_url,
-                "probe-model",
-            )),
-            Connector::Anthropic => Arc::new(
-                desktop_assistant_llm_anthropic::AnthropicClient::new("probe-key".to_string())
+            Connector::Ollama => ProbeTarget {
+                direct: Arc::new(desktop_assistant_llm_ollama::OllamaClient::new(
+                    base_url,
+                    "probe-model",
+                )),
+                no_opt_in: Some("the Ollama builder has no `with_hosted_tool_search`"),
+            },
+            Connector::Anthropic => ProbeTarget {
+                direct: Arc::new(
+                    desktop_assistant_llm_anthropic::AnthropicClient::new("probe-key".to_string())
+                        .with_model("probe-model")
+                        .with_base_url(base_url)
+                        .with_hosted_tool_search(true),
+                ),
+                no_opt_in: None,
+            },
+            Connector::Bedrock => ProbeTarget {
+                direct: Arc::new(
+                    desktop_assistant_llm_bedrock::BedrockClient::new("probe-key".to_string())
+                        .with_model("probe-model")
+                        .with_base_url(base_url),
+                ),
+                no_opt_in: Some("the Bedrock builder has no `with_hosted_tool_search`"),
+            },
+            Connector::OpenAi => ProbeTarget {
+                direct: Arc::new(
+                    desktop_assistant_llm_openai::OpenAiClient::new("probe-key".to_string())
+                        .with_model("probe-model")
+                        .with_base_url(base_url)
+                        .with_hosted_tool_search(true),
+                ),
+                no_opt_in: None,
+            },
+            Connector::OpenRouter => ProbeTarget {
+                direct: Arc::new(
+                    desktop_assistant_llm_openrouter::OpenRouterClient::new(
+                        "probe-key".to_string(),
+                    )
                     .with_model("probe-model")
                     .with_base_url(base_url)
                     .with_hosted_tool_search(true),
-            ),
-            Connector::Bedrock => Arc::new(
-                desktop_assistant_llm_bedrock::BedrockClient::new("probe-key".to_string())
-                    .with_model("probe-model")
-                    .with_base_url(base_url),
-            ),
-            Connector::OpenAi => Arc::new(
-                desktop_assistant_llm_openai::OpenAiClient::new("probe-key".to_string())
-                    .with_model("probe-model")
-                    .with_base_url(base_url)
-                    .with_hosted_tool_search(true),
-            ),
-            Connector::OpenRouter => Arc::new(
-                desktop_assistant_llm_openrouter::OpenRouterClient::new("probe-key".to_string())
-                    .with_model("probe-model")
-                    .with_base_url(base_url)
-                    .with_hosted_tool_search(true),
-            ),
-            Connector::Azure => Arc::new(
-                desktop_assistant_llm_azure::AzureClient::new("probe-key".to_string())
-                    .with_model("probe-model")
-                    .with_base_url(base_url)
-                    .with_hosted_tool_search(true),
-            ),
-            Connector::Google => Arc::new(
-                desktop_assistant_llm_google::GoogleClient::new("probe-key".to_string())
-                    .with_model("probe-model")
-                    .with_base_url(base_url),
-            ),
+                ),
+                no_opt_in: None,
+            },
+            Connector::Azure => ProbeTarget {
+                direct: Arc::new(
+                    desktop_assistant_llm_azure::AzureClient::new("probe-key".to_string())
+                        .with_model("probe-model")
+                        .with_base_url(base_url)
+                        .with_hosted_tool_search(true),
+                ),
+                no_opt_in: None,
+            },
+            Connector::Google => ProbeTarget {
+                direct: Arc::new(
+                    desktop_assistant_llm_google::GoogleClient::new("probe-key".to_string())
+                        .with_model("probe-model")
+                        .with_base_url(base_url),
+                ),
+                no_opt_in: Some("the Google builder has no `with_hosted_tool_search`"),
+            },
         }
     }
 
-    /// First captured body that carries the probe tool, ignoring any other
-    /// request a client makes on the way (model listings, warmups).
-    fn probe_body(bodies: &Arc<std::sync::Mutex<Vec<String>>>) -> Option<String> {
-        bodies
-            .lock()
-            .expect("probe body sink poisoned")
-            .iter()
-            .find(|body| body.contains(PROBE_TOOL))
-            .cloned()
+    /// The same connector built through the production factory with the config
+    /// asking for hosted tool search.
+    ///
+    /// This is the second construction path, and it covers what the first
+    /// cannot: a connector whose builder gains a setter later is reached here
+    /// the moment its `build_llm_client` arm wires that setter, without anyone
+    /// having to remember to update [`probe_target`].
+    fn factory_client(connector: Connector, base_url: &str) -> Arc<dyn LlmClient> {
+        build_llm_client(ResolvedLlmConfig {
+            hosted_tool_search: Some(true),
+            ..resolved(
+                connector.as_str(),
+                "probe-model",
+                base_url,
+                "probe-key",
+                ConnectorExtras::None,
+            )
+        })
     }
 
-    fn clear_bodies(bodies: &Arc<std::sync::Mutex<Vec<String>>>) {
+    /// What one probe turn observed at the mock server.
+    enum ProbeOutcome {
+        /// The request body carrying [`PROBE_TOOL`].
+        Body(String),
+        /// The server recorded nothing at all for this turn.
+        NoRequest,
+        /// The server recorded requests, but none carried [`PROBE_TOOL`].
+        NoProbeRequest(usize),
+    }
+
+    /// Run one turn and report what reached the mock server. `namespaced`
+    /// selects `stream_completion_with_namespaces` over `stream_completion`;
+    /// both carry the same single probe tool, so a client that inherits the
+    /// trait's flattening default produces the same bytes twice.
+    async fn probe_turn(
+        client: &Arc<dyn LlmClient>,
+        bodies: &Arc<Mutex<Vec<String>>>,
+        namespaced: bool,
+    ) -> ProbeOutcome {
         bodies.lock().expect("probe body sink poisoned").clear();
+
+        let messages = vec![desktop_assistant_core::domain::Message::new(
+            desktop_assistant_core::domain::Role::User,
+            "probe",
+        )];
+        let reasoning = desktop_assistant_core::ports::llm::ReasoningConfig::default();
+        let _ = if namespaced {
+            client
+                .stream_completion_with_namespaces(
+                    messages,
+                    &[],
+                    &[probe_namespace()],
+                    reasoning,
+                    Box::new(|_| true),
+                )
+                .await
+        } else {
+            client
+                .stream_completion(messages, &[probe_tool()], reasoning, Box::new(|_| true))
+                .await
+        };
+
+        let seen = bodies.lock().expect("probe body sink poisoned").clone();
+        match seen.iter().find(|body| body.contains(PROBE_TOOL)) {
+            Some(body) => ProbeOutcome::Body(body.clone()),
+            None if seen.is_empty() => ProbeOutcome::NoRequest,
+            None => ProbeOutcome::NoProbeRequest(seen.len()),
+        }
+    }
+
+    /// Unwrap a probe turn, naming the cause the two empty cases have. They are
+    /// different faults: one says the connector was never driven, the other
+    /// says the capture stopped working.
+    fn expect_probe_body(
+        outcome: ProbeOutcome,
+        connector: Connector,
+        path: &str,
+        turn: &str,
+    ) -> String {
+        match outcome {
+            ProbeOutcome::Body(body) => body,
+            ProbeOutcome::NoRequest => panic!(
+                "{connector} (built by {path}) claims hosted tool search, but the probe \
+                 server recorded no request at all for its {turn} turn. Either the client \
+                 never sent one - teach the probe how to drive this connector - or the \
+                 capture matcher stopped recording."
+            ),
+            ProbeOutcome::NoProbeRequest(count) => panic!(
+                "{connector} (built by {path}) claims hosted tool search, and the probe \
+                 server recorded {count} request(s) for its {turn} turn, but none carried \
+                 `{PROBE_TOOL}`. Teach the probe how to drive this connector before letting \
+                 it claim the capability."
+            ),
+        }
     }
 
     #[tokio::test]
     async fn connector_claiming_hosted_tool_search_must_override_namespace_dispatch() {
         let server = httpmock::MockServer::start_async().await;
-        let bodies: Arc<std::sync::Mutex<Vec<String>>> =
-            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let bodies: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
 
         // Match every request, record its body, then fail it so the client
         // returns instead of waiting on a stream that never arrives. Only the
         // outgoing request matters here.
         let sink = Arc::clone(&bodies);
-        server
+        let _capture = server
             .mock_async(move |when, then| {
                 when.is_true(move |req: &httpmock::HttpMockRequest| {
                     sink.lock()
@@ -1388,56 +1531,64 @@ mod tests {
             .await;
 
         let base_url = server.base_url();
-        let messages = vec![desktop_assistant_core::domain::Message::new(
-            desktop_assistant_core::domain::Role::User,
-            "probe",
-        )];
+        let mut claimants: Vec<&'static str> = Vec::new();
 
-        for connector in ALL_CONNECTORS {
-            let client = claiming_client(connector, &base_url);
-            if !client.supports_hosted_tool_search() {
-                continue;
+        for connector in every_connector() {
+            let target = probe_target(connector, &base_url);
+            let factory = factory_client(connector, &base_url);
+
+            if let Some(reason) = target.no_opt_in {
+                assert!(
+                    !target.direct.supports_hosted_tool_search(),
+                    "{connector} is recorded as unable to opt in ({reason}), yet the \
+                     client its own builder produces claims hosted tool search. Give it a \
+                     probe arm that forces the flag on, so the claim is checked rather than \
+                     skipped."
+                );
             }
 
-            clear_bodies(&bodies);
-            let _ = client
-                .stream_completion_with_namespaces(
-                    messages.clone(),
-                    &[],
-                    &[probe_namespace()],
-                    desktop_assistant_core::ports::llm::ReasoningConfig::default(),
-                    Box::new(|_| true),
-                )
-                .await;
-            let namespaced = probe_body(&bodies).unwrap_or_else(|| {
-                panic!(
-                    "{connector} claims hosted tool search but the probe captured no request \
-                     carrying `{PROBE_TOOL}`; teach the probe how to drive this connector \
-                     before letting it claim the capability"
-                )
-            });
+            for (path, client) in [
+                ("its own builder", &target.direct),
+                ("the registry factory", &factory),
+            ] {
+                if !client.supports_hosted_tool_search() {
+                    continue;
+                }
+                if !claimants.contains(&connector.as_str()) {
+                    claimants.push(connector.as_str());
+                }
 
-            clear_bodies(&bodies);
-            let _ = client
-                .stream_completion(
-                    messages.clone(),
-                    &[probe_tool()],
-                    desktop_assistant_core::ports::llm::ReasoningConfig::default(),
-                    Box::new(|_| true),
-                )
-                .await;
-            let flattened = probe_body(&bodies).unwrap_or_else(|| {
-                panic!("{connector} sent no plain-tools request carrying `{PROBE_TOOL}`")
-            });
+                let namespaced = expect_probe_body(
+                    probe_turn(client, &bodies, true).await,
+                    connector,
+                    path,
+                    "namespaced",
+                );
+                let flattened = expect_probe_body(
+                    probe_turn(client, &bodies, false).await,
+                    connector,
+                    path,
+                    "plain-tools",
+                );
 
-            assert_ne!(
-                namespaced, flattened,
-                "{connector} reports supports_hosted_tool_search() == true, but its namespaced \
-                 request is byte-identical to a plain request with the namespace tools flattened \
-                 in: it inherits the trait's flattening default instead of overriding \
-                 stream_completion_with_namespaces, so a turn would send the whole tool fleet \
-                 with no tool-search entry"
-            );
+                assert_ne!(
+                    namespaced, flattened,
+                    "{connector} (built by {path}) reports supports_hosted_tool_search() == \
+                     true, but its namespaced request is byte-identical to a plain request with \
+                     the namespace tools flattened in: it inherits the trait's flattening \
+                     default instead of overriding stream_completion_with_namespaces, so a turn \
+                     would send the whole tool fleet with no tool-search entry"
+                );
+            }
         }
+
+        assert_eq!(
+            claimants,
+            EXPECTED_CLAIMANTS.to_vec(),
+            "the set of connectors that reached the request probe changed. A connector added \
+             here must implement stream_completion_with_namespaces; a connector dropped from \
+             here leaves the probe with less to prove, and a probe that asserts nothing passes \
+             for the same reason a deleted one does."
+        );
     }
 }
