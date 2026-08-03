@@ -307,9 +307,11 @@ Silent if omitted (compiles, misbehaves - each MUST be added):
   hosted-tool-search invariant sweep walks to reach every connector. The `match`
   is exhaustive, so a new variant does force an arm - but an arm that returns
   `None` instead of linking the variant compiles and drops it from the sweep,
-  which is the silent half. Link the new variant into the chain, and give it an
-  arm in `probe_target` beside it: either a client built with hosted tool search
-  forced on, or the recorded reason its builder cannot be forced.
+  which is the silent half (#1034 tracks generating the variant list, which
+  removes this entry). Link the new variant into the chain, and give it an arm
+  in `probe_target` beside it: either a client built with hosted tool search
+  forced on plus the marker its namespaced request carries, or the recorded
+  reason it does not claim the capability.
 
 Better: where practical, route the factory / sanity / embeddings / reasoning
 dispatch through the typed `Connector` enum (issue #47's direction) so a new

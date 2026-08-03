@@ -1894,4 +1894,29 @@ mod tests {
             "stream should abort promptly on cancellation; took {elapsed:?}"
         );
     }
+    // --- capability claims -----------------------------------------------
+
+    #[test]
+    fn openai_reports_hosted_tool_search_when_enabled() {
+        // OpenAi is one of only two connectors that implement hosted tool
+        // search, and this client's override of
+        // `stream_completion_with_namespaces` is what makes the claim honest.
+        // Pinned here as well as in the daemon's cross-connector sweep, so
+        // hardening this crate cannot quietly turn the capability off with the
+        // sweep's expectation as the only thing left to edit.
+        let on = OpenAiClient::new("k".into()).with_hosted_tool_search(true);
+        assert!(on.supports_hosted_tool_search());
+
+        let off = OpenAiClient::new("k".into()).with_hosted_tool_search(false);
+        assert!(
+            !off.supports_hosted_tool_search(),
+            "the configured preference must drive the claim, not a constant"
+        );
+
+        // Constructor default, pinned because the two connectors differ.
+        assert_eq!(
+            OpenAiClient::new("k".into()).supports_hosted_tool_search(),
+            false
+        );
+    }
 }

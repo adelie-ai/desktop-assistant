@@ -2406,4 +2406,29 @@ mod tests {
             "the key field should be present but redacted: {rendered}"
         );
     }
+    // --- capability claims -----------------------------------------------
+
+    #[test]
+    fn anthropic_reports_hosted_tool_search_when_enabled() {
+        // Anthropic is one of only two connectors that implement hosted tool
+        // search, and this client's override of
+        // `stream_completion_with_namespaces` is what makes the claim honest.
+        // Pinned here as well as in the daemon's cross-connector sweep, so
+        // hardening this crate cannot quietly turn the capability off with the
+        // sweep's expectation as the only thing left to edit.
+        let on = AnthropicClient::new("k".into()).with_hosted_tool_search(true);
+        assert!(on.supports_hosted_tool_search());
+
+        let off = AnthropicClient::new("k".into()).with_hosted_tool_search(false);
+        assert!(
+            !off.supports_hosted_tool_search(),
+            "the configured preference must drive the claim, not a constant"
+        );
+
+        // Constructor default, pinned because the two connectors differ.
+        assert_eq!(
+            AnthropicClient::new("k".into()).supports_hosted_tool_search(),
+            true
+        );
+    }
 }
