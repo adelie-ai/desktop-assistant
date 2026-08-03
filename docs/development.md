@@ -5,7 +5,7 @@ The assistant persona is named **Adele**, in reference to the **Adélie penguin*
 ## Day-to-day Commands
 
 ```bash
-# the whole gate: dependency scan, secret scan, format, lints, build, tests
+# the whole gate: dependency scan, secret scan, format, lints, docs, build, tests
 just check
 
 # individual steps
@@ -14,13 +14,21 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 just audit                  # RustSec advisory scan of Cargo.lock
 just secret-scan            # gitleaks over the working tree, not git history
+just doc                    # cargo doc --no-deps; the only step that lints rustdoc
 just lint-sqlite            # clippy the SQLite adapter with --features sqlite
+just doc-sqlite             # rustdoc it with --features sqlite, for the same reason
 just test-sqlite            # its own suite, which --workspace runs none of
 ```
 
-The two `-sqlite` steps exist because `crates/storage-sqlite` is entirely behind
-an off-by-default `sqlite` feature, so the `--workspace` commands above compile
-it as an empty crate and run zero of its tests.
+The three `-sqlite` steps exist because `crates/storage-sqlite` is entirely
+behind an off-by-default `sqlite` feature, so the `--workspace` commands above
+compile it as an empty crate and run zero of its tests. `just doc-mcp-host` is
+the same idea for `crates/client-common`.
+
+`just doc` is separate from the lints because `cargo clippy -- -D warnings`
+reaches compiler lints only. Rustdoc lints - a link to an item that was
+renamed, made private, or deleted - are evaluated by `cargo doc` and by
+nothing else. See AGENTS.md, "Documentation lints".
 
 `just check` needs `cargo-audit` (`cargo install cargo-audit --locked`) and
 network access for the advisory database; it fails loudly without either rather
