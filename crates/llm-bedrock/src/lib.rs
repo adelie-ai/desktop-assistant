@@ -4788,6 +4788,31 @@ mod tests {
         )]
     }
 
+    #[test]
+    fn the_non_streaming_budget_is_its_own_setting_with_its_own_default() {
+        // `event_timeout` bounds the gap between streamed events. Reusing it
+        // to bound a whole generation would give one name two meanings, and
+        // would make a stall-detection change silently move a generation
+        // deadline. The non-streaming path answers once, after generation, so
+        // it carries its own budget - long enough that no turn that works
+        // today starts failing.
+        let client = BedrockClient::new(String::new());
+        assert_eq!(
+            client.non_streaming_timeout(),
+            Duration::from_secs(600),
+            "the default must leave room for a full one-shot generation"
+        );
+
+        let tightened = BedrockClient::new(String::new())
+            .with_connect_timeout(Some(1))
+            .with_event_timeout(Some(1));
+        assert_eq!(
+            tightened.non_streaming_timeout(),
+            Duration::from_secs(600),
+            "tightening the streaming budgets must not move the generation deadline"
+        );
+    }
+
     #[tokio::test]
     async fn non_streaming_dispatch_that_exceeds_the_timeout_returns_a_timeout_error() {
         let endpoint = stalled_endpoint().await;
