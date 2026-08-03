@@ -2506,11 +2506,17 @@ async fn main() -> Result<()> {
     //      that resolves the connection/model/effort from the live config
     //      on every call. Control-panel edits take effect on the next
     //      backend dispatch with no daemon restart.
-    //   2. `[backend_tasks.llm]` legacy block — install a static client
-    //      only if it differs from the primary, so unmigrated installs
-    //      that haven't authored a `[purposes]` table still work. The
-    //      legacy path stays static; authors are expected to move to
+    //   2. `[backend_tasks.llm]` legacy block - install a client pinned to
+    //      the connector and model named there, only if they differ from
+    //      the primary, so unmigrated installs that haven't authored a
+    //      `[purposes]` table still work. The legacy path resolves once at
+    //      startup instead of per call; authors are expected to move to
     //      `[purposes.titling]`.
+    //
+    // Both backend paths ignore the turn's `ACTIVE_CLIENT` and install their
+    // own model override. Titling and context summary run inside the caller's
+    // `send_prompt` scope, so a slot that read either task-local would bill
+    // every title to the interactive connection and model.
     let resolved_primary = config::resolve_llm_config(daemon_config.as_ref());
     let titling_configured = daemon_config
         .as_ref()

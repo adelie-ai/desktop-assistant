@@ -71,10 +71,11 @@ pub(crate) fn active_client_is_set() -> bool {
 /// installed.
 #[derive(Clone)]
 pub enum FallbackMode {
-    /// Static client captured at construction. Used by the primary
-    /// (interactive) slot — dispatch reads `ACTIVE_CLIENT` first, then
-    /// falls back to this client for legacy callers without an override.
-    Static { client: Arc<dyn LlmClient> },
+    /// Follows the turn. Dispatch reads `ACTIVE_CLIENT` first, then falls
+    /// back to this client, which is captured at construction, for callers
+    /// that installed no per-turn override. Used by the primary
+    /// (interactive) slot, and the only mode that reads the task-local.
+    PerTurn { client: Arc<dyn LlmClient> },
     /// Resolve the target client from a [`RegistryHandle`] on every
     /// dispatch by re-reading the named purpose's config. Used by the
     /// backend-tasks slot so titling/dreaming pick up control-panel
@@ -100,19 +101,19 @@ pub enum FallbackMode {
     /// Both halves are load-bearing. Reading `ACTIVE_CLIENT` bills the
     /// title to the interactive connection. Leaving `MODEL_OVERRIDE` in
     /// place asks the backend connection for a model it does not serve.
-    PinnedClient {
+    Pinned {
         client: Arc<dyn LlmClient>,
         model: String,
     },
 }
 
 /// The handler's LLM facade. Delegates to the per-turn active client when
-/// one is installed (Static mode only), or to the configured fallback
+/// one is installed (PerTurn mode only), or to the configured fallback
 /// otherwise.
 ///
-/// Only [`FallbackMode::Static`] follows the turn. The two backend-task
+/// Only [`FallbackMode::PerTurn`] follows the turn. The two backend-task
 /// modes, [`FallbackMode::DynamicPurpose`] and
-/// [`FallbackMode::PinnedClient`], never read `ACTIVE_CLIENT` and always
+/// [`FallbackMode::Pinned`], never read `ACTIVE_CLIENT` and always
 /// install their own model override, so a title or a summary goes to the
 /// configured backend model whether or not it started inside a
 /// `send_prompt` scope.
@@ -127,10 +128,10 @@ pub enum FallbackMode {
 /// `Option<&str>` tied to `self`, which no task-local lookup can satisfy,
 /// so they report the statically configured value. The DynamicPurpose mode
 /// has no single captured client and answers `None`/`false`/empty for all
-/// of them. The PinnedClient mode answers from its captured client, and
+/// of them. The Pinned mode answers from its captured client, and
 /// reports its pinned model as the default model.
 ///
-/// One gap in the PinnedClient mode, and it is deliberate: the sync
+/// One gap in the Pinned mode, and it is deliberate: the sync
 /// accessors cannot install a model override, because `with_model_override`
 /// is async. So a connector whose `max_context_tokens` consults
 /// `current_model_override` answers for the turn's model there. Nothing
@@ -149,11 +150,11 @@ pub struct RoutingLlmClient {
 }
 
 impl RoutingLlmClient {
-    /// Static-fallback constructor. Used by the primary (interactive)
-    /// slot.
+    /// Per-turn constructor. Used by the primary (interactive) slot. The
+    /// argument serves any call made outside a turn scope.
     pub fn new(fallback: Arc<dyn LlmClient>) -> Self {
         Self {
-            fallback: FallbackMode::Static { client: fallback },
+            fallback: FallbackMode::PerTurn { client: fallback },
         }
     }
 
@@ -171,33 +172,32 @@ impl RoutingLlmClient {
     /// Pinned-client constructor. Used by the legacy `[backend_tasks.llm]`
     /// slot. `client` serves every dispatch and `model` is installed as the
     /// model override for its duration, so neither half of the caller's turn
-    /// reaches the backend task. See [`FallbackMode::PinnedClient`].
+    /// reaches the backend task. See [`FallbackMode::Pinned`].
     pub fn new_pinned(client: Arc<dyn LlmClient>, model: String) -> Self {
         Self {
-            fallback: FallbackMode::PinnedClient { client, model },
+            fallback: FallbackMode::Pinned { client, model },
         }
     }
 
-    /// Snapshot of the static fallback client for accessor delegation
+    /// The client captured at construction, for accessor delegation
     /// (`list_models`, `max_context_tokens`, etc.). Returns `None` for
     /// dynamic-purpose wrappers, which intentionally have no single
     /// captured client to delegate to.
-    fn static_fallback(&self) -> Option<&Arc<dyn LlmClient>> {
+    fn captured_client(&self) -> Option<&Arc<dyn LlmClient>> {
         match &self.fallback {
-            FallbackMode::Static { client, .. } => Some(client),
-            FallbackMode::PinnedClient { client, .. } => Some(client),
+            FallbackMode::PerTurn { client, .. } => Some(client),
+            FallbackMode::Pinned { client, .. } => Some(client),
             FallbackMode::DynamicPurpose { .. } => None,
         }
     }
 
-    /// Resolve the current turn's active client for Static mode. Returns
-    /// the task-local override if set, or the static fallback otherwise.
-    /// Only meaningful for Static mode — DynamicPurpose dispatches via
-    /// [`Self::dispatch_dynamic`] and PinnedClient via
-    /// [`Self::dispatch_pinned`].
-    fn resolve_static(&self) -> Arc<dyn LlmClient> {
-        let FallbackMode::Static { client, .. } = &self.fallback else {
-            unreachable!("resolve_static called on a backend-task mode");
+    /// Resolve the current turn's active client for PerTurn mode. Returns
+    /// the task-local override if set, or the captured client otherwise.
+    /// Only meaningful for PerTurn mode. DynamicPurpose dispatches via
+    /// [`Self::dispatch_dynamic`] and Pinned via [`Self::dispatch_pinned`].
+    fn resolve_per_turn(&self) -> Arc<dyn LlmClient> {
+        let FallbackMode::PerTurn { client, .. } = &self.fallback else {
+            unreachable!("resolve_per_turn called on a backend-task mode");
         };
         ACTIVE_CLIENT
             .try_with(Arc::clone)
@@ -218,7 +218,7 @@ impl RoutingLlmClient {
         Fut: std::future::Future<Output = Result<T, CoreError>>,
     {
         let FallbackMode::DynamicPurpose { registry, purpose } = &self.fallback else {
-            unreachable!("dispatch_dynamic called on Static mode");
+            unreachable!("dispatch_dynamic called on a non-purpose mode");
         };
         let config = registry.snapshot_config();
         // Resolve the purpose to a concrete `ResolvedPurpose` carrying
@@ -268,7 +268,7 @@ impl RoutingLlmClient {
         with_model_override(resolved.model_id, op(client, reasoning)).await
     }
 
-    /// Dispatch path for [`FallbackMode::PinnedClient`]. Runs `op` against
+    /// Dispatch path for [`FallbackMode::Pinned`]. Runs `op` against
     /// the captured client with the captured model installed as the model
     /// override, so the connector reads the configured backend model and
     /// not the turn's. `ACTIVE_CLIENT` is never consulted.
@@ -277,7 +277,7 @@ impl RoutingLlmClient {
         F: FnOnce(Arc<dyn LlmClient>) -> Fut,
         Fut: std::future::Future<Output = Result<T, CoreError>>,
     {
-        let FallbackMode::PinnedClient { client, model } = &self.fallback else {
+        let FallbackMode::Pinned { client, model } = &self.fallback else {
             unreachable!("dispatch_pinned called on a non-pinned mode");
         };
         with_model_override(model.clone(), op(Arc::clone(client))).await
@@ -289,7 +289,7 @@ impl LlmClient for RoutingLlmClient {
     fn get_default_model(&self) -> Option<&str> {
         // `Option<&str>` borrows from `self`; we can't delegate through the
         // task-local (which returns an Arc) or a dynamic registry lookup.
-        // Static mode delegates to the captured fallback; dynamic-purpose
+        // PerTurn mode delegates to the captured client; dynamic-purpose
         // mode has no single captured client so reports `None`. This
         // accessor reports the statically configured default and is not
         // meaningfully per-turn or per-purpose.
@@ -297,13 +297,13 @@ impl LlmClient for RoutingLlmClient {
         // Pinned mode answers with the model it pins, which is the model
         // every one of its dispatches carries.
         match &self.fallback {
-            FallbackMode::PinnedClient { model, .. } => Some(model.as_str()),
-            _ => self.static_fallback().and_then(|c| c.get_default_model()),
+            FallbackMode::Pinned { model, .. } => Some(model.as_str()),
+            _ => self.captured_client().and_then(|c| c.get_default_model()),
         }
     }
 
     fn get_default_base_url(&self) -> Option<&str> {
-        self.static_fallback()
+        self.captured_client()
             .and_then(|c| c.get_default_base_url())
     }
 
@@ -311,14 +311,14 @@ impl LlmClient for RoutingLlmClient {
         // The dispatch loop reads token-pressure budgets from the
         // `CONTEXT_BUDGET` task-local installed by the daemon's wrapper,
         // not from this trait method, so the resolution chain no longer
-        // lives here. Static-mode delegates to the resolved client;
+        // lives here. PerTurn mode delegates to the resolved client;
         // dynamic-purpose mode has no single client to ask without a
         // config snapshot, and callers (capability probes, debug paths)
         // tolerate `None`. Pinned mode asks its captured client, never the
         // turn's.
         match &self.fallback {
-            FallbackMode::Static { .. } => self.resolve_static().max_context_tokens(),
-            FallbackMode::PinnedClient { client, .. } => client.max_context_tokens(),
+            FallbackMode::PerTurn { .. } => self.resolve_per_turn().max_context_tokens(),
+            FallbackMode::Pinned { client, .. } => client.max_context_tokens(),
             FallbackMode::DynamicPurpose { .. } => None,
         }
     }
@@ -328,37 +328,37 @@ impl LlmClient for RoutingLlmClient {
         // API, which resolves clients directly from the registry — not
         // through the routing wrapper. Keep this consistent with
         // connector-level behaviour and delegate to whichever client is
-        // currently active (task-local or static fallback). The
+        // currently active (task-local or captured client). The
         // dynamic-purpose wrapper isn't used by listing paths, so report
         // an empty list there. Pinned mode asks its captured client, never
         // the turn's.
         match &self.fallback {
-            FallbackMode::Static { .. } => self.resolve_static().list_models().await,
-            FallbackMode::PinnedClient { client, .. } => client.list_models().await,
+            FallbackMode::PerTurn { .. } => self.resolve_per_turn().list_models().await,
+            FallbackMode::Pinned { client, .. } => client.list_models().await,
             FallbackMode::DynamicPurpose { .. } => Ok(Vec::new()),
         }
     }
 
     async fn refresh_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
         match &self.fallback {
-            FallbackMode::Static { .. } => self.resolve_static().refresh_models().await,
-            FallbackMode::PinnedClient { client, .. } => client.refresh_models().await,
+            FallbackMode::PerTurn { .. } => self.resolve_per_turn().refresh_models().await,
+            FallbackMode::Pinned { client, .. } => client.refresh_models().await,
             FallbackMode::DynamicPurpose { .. } => Ok(Vec::new()),
         }
     }
 
     async fn list_models_detailed(&self) -> Result<ModelListingReport, CoreError> {
         match &self.fallback {
-            FallbackMode::Static { .. } => self.resolve_static().list_models_detailed().await,
-            FallbackMode::PinnedClient { client, .. } => client.list_models_detailed().await,
+            FallbackMode::PerTurn { .. } => self.resolve_per_turn().list_models_detailed().await,
+            FallbackMode::Pinned { client, .. } => client.list_models_detailed().await,
             FallbackMode::DynamicPurpose { .. } => Ok(ModelListingReport::default()),
         }
     }
 
     async fn refresh_models_detailed(&self) -> Result<ModelListingReport, CoreError> {
         match &self.fallback {
-            FallbackMode::Static { .. } => self.resolve_static().refresh_models_detailed().await,
-            FallbackMode::PinnedClient { client, .. } => client.refresh_models_detailed().await,
+            FallbackMode::PerTurn { .. } => self.resolve_per_turn().refresh_models_detailed().await,
+            FallbackMode::Pinned { client, .. } => client.refresh_models_detailed().await,
             FallbackMode::DynamicPurpose { .. } => Ok(ModelListingReport::default()),
         }
     }
@@ -371,13 +371,13 @@ impl LlmClient for RoutingLlmClient {
         on_chunk: ChunkCallback,
     ) -> Result<LlmResponse, CoreError> {
         match &self.fallback {
-            FallbackMode::Static { .. } => {
-                let client = self.resolve_static();
+            FallbackMode::PerTurn { .. } => {
+                let client = self.resolve_per_turn();
                 client
                     .stream_completion(messages, tools, reasoning, on_chunk)
                     .await
             }
-            FallbackMode::PinnedClient { .. } => {
+            FallbackMode::Pinned { .. } => {
                 // The legacy `[backend_tasks.llm]` block carries no effort,
                 // so the caller's reasoning stands. Only the client and the
                 // model are pinned.
@@ -405,13 +405,13 @@ impl LlmClient for RoutingLlmClient {
 
     fn supports_hosted_tool_search(&self) -> bool {
         // This answer must describe the client the turn will actually
-        // dispatch to, so Static mode resolves the same way
+        // dispatch to, so PerTurn mode resolves the same way
         // `stream_completion_with_namespaces` does. `ConversationHandler`
         // reads the flag near the start of `send_prompt`, inside the scope
         // the daemon's dispatch wrapper installs, so the task-local is
         // already set for a turn that carries a per-turn model override.
         //
-        // Answering from the static fallback instead let the two disagree:
+        // Answering from the captured client instead let the two disagree:
         // a fallback with hosted search would strip `builtin_tool_search`
         // from the tool list, then send the request to a connection without
         // hosted search, whose default `stream_completion_with_namespaces`
@@ -429,8 +429,8 @@ impl LlmClient for RoutingLlmClient {
         // Pinned mode holds the same invariant, and does have a client to
         // ask, so it answers from the one it dispatches to.
         match &self.fallback {
-            FallbackMode::Static { .. } => self.resolve_static().supports_hosted_tool_search(),
-            FallbackMode::PinnedClient { client, .. } => client.supports_hosted_tool_search(),
+            FallbackMode::PerTurn { .. } => self.resolve_per_turn().supports_hosted_tool_search(),
+            FallbackMode::Pinned { client, .. } => client.supports_hosted_tool_search(),
             FallbackMode::DynamicPurpose { .. } => false,
         }
     }
@@ -444,15 +444,15 @@ impl LlmClient for RoutingLlmClient {
         on_chunk: ChunkCallback,
     ) -> Result<LlmResponse, CoreError> {
         match &self.fallback {
-            FallbackMode::Static { .. } => {
-                let client = self.resolve_static();
+            FallbackMode::PerTurn { .. } => {
+                let client = self.resolve_per_turn();
                 client
                     .stream_completion_with_namespaces(
                         messages, core_tools, namespaces, reasoning, on_chunk,
                     )
                     .await
             }
-            FallbackMode::PinnedClient { .. } => {
+            FallbackMode::Pinned { .. } => {
                 self.dispatch_pinned(|client| async move {
                     client
                         .stream_completion_with_namespaces(
@@ -530,7 +530,7 @@ mod tests {
         let client = RoutingLlmClient::new(Arc::clone(&fallback));
         // Without a task-local override, `resolve()` must equal the
         // fallback pointer.
-        let resolved = client.resolve_static();
+        let resolved = client.resolve_per_turn();
         assert!(
             Arc::ptr_eq(&resolved, &fallback),
             "resolve() should return fallback when task-local is unset"
@@ -551,7 +551,7 @@ mod tests {
 
         let override_clone = Arc::clone(&override_client);
         let resolved =
-            with_active_client(override_client, async move { client.resolve_static() }).await;
+            with_active_client(override_client, async move { client.resolve_per_turn() }).await;
         assert!(
             Arc::ptr_eq(&resolved, &override_clone),
             "resolve() must return the task-local override when set"
