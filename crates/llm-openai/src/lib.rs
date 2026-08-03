@@ -733,25 +733,72 @@ struct OpenAiErrorBody {
     error_type: Option<String>,
 }
 
-/// Detect an OpenAI context-overflow rejection in an HTTP error body.
+/// A rejection body with no `error` envelope, as vLLM and several other
+/// OpenAI-compatible servers emit: `{"object":"error","message":"...",
+/// "type":"BadRequestError","code":400}`. `code` is a number here rather than
+/// a string, so it is not read.
+#[derive(Deserialize, Default)]
+struct FlatErrorBody {
+    #[serde(default)]
+    message: String,
+}
+
+/// Whether an error code or type names a context-window rejection.
+///
+/// `context_length_exceeded` is OpenAI's. `context_window_exceeded` is
+/// LiteLLM's for the same condition, and it arrives on `type` rather than
+/// `code`.
+fn is_context_overflow_code(code: Option<&str>) -> bool {
+    matches!(
+        code,
+        Some("context_length_exceeded") | Some("context_window_exceeded")
+    )
+}
+
+/// Detect a context-overflow rejection in an HTTP error body.
 ///
 /// Returns `Some((prompt_tokens, max_tokens))` (each may itself be `None`
-/// when the wording doesn't carry numbers) when the body parses as the
-/// OpenAI error envelope and `error.code == "context_length_exceeded"`.
-/// Returns `None` for any other shape so the caller can fall through to
-/// a generic `CoreError::Llm`.
+/// when the wording doesn't carry numbers), or `None` for any other shape so
+/// the caller can fall through to a generic `CoreError::Llm`.
 ///
-/// Why: pattern-matching on error message strings is normally banned
-/// (see `AGENTS.md`), but at the connector boundary this is the only
-/// signal OpenAI provides for context-window rejections — converting
-/// it into structured `CoreError::ContextOverflow` here is exactly what
-/// the rule carves out, since downstream code never has to.
+/// Reads two families, because `base_url` is configurable and this client
+/// therefore also serves endpoints that speak the Responses API without being
+/// OpenAI:
+///
+/// - **A structured envelope.** OpenAI's `code = "context_length_exceeded"`
+///   and LiteLLM's `type = "context_window_exceeded"`. Where a code field
+///   exists it is authoritative, and a body naming some other code is not an
+///   overflow however its message reads. Getting that wrong is destructive:
+///   the core's `recover_from_overflow` rewrites the largest tool result's
+///   content in place, up to `MAX_OVERFLOW_RETRIES` times.
+/// - **A flat body with no `error` key**, as vLLM emits. There is no code to
+///   trust here, so the message is the only signal there is.
+///
+/// Reading only OpenAI's would leave every compatible endpoint's overflow
+/// misclassified as a generic error, and the truncate-and-retry ladder runs on
+/// `CoreError::ContextOverflow` and on nothing else.
+///
+/// Why match on a message at all: pattern-matching on error message strings is
+/// normally banned (see `AGENTS.md`), but at the connector boundary this is
+/// the only signal these servers provide - converting it into a structured
+/// `CoreError::ContextOverflow` here is exactly what the rule carves out,
+/// since downstream code never has to.
 fn detect_openai_context_overflow(body: &str) -> Option<(Option<u64>, Option<u64>)> {
-    let envelope: OpenAiErrorEnvelope = serde_json::from_str(body).ok()?;
-    if envelope.error.code.as_deref() != Some("context_length_exceeded") {
+    if let Ok(envelope) = serde_json::from_str::<OpenAiErrorEnvelope>(body) {
+        let error = envelope.error;
+        if is_context_overflow_code(error.code.as_deref())
+            || is_context_overflow_code(error.error_type.as_deref())
+        {
+            return Some(parse_openai_context_length_message(&error.message));
+        }
         return None;
     }
-    Some(parse_openai_context_length_message(&envelope.error.message))
+    let flat = serde_json::from_str::<FlatErrorBody>(body).ok()?;
+    let lowered = flat.message.to_ascii_lowercase();
+    if lowered.contains("maximum context length") || lowered.contains("context window") {
+        return Some(parse_openai_context_length_message(&flat.message));
+    }
+    None
 }
 
 /// Detect OpenAI's `insufficient_quota` billing error in an HTTP error
@@ -1660,6 +1707,96 @@ mod tests {
             detect_openai_context_overflow(body).expect("should still trigger overflow");
         assert_eq!(prompt, None);
         assert_eq!(max, None);
+    }
+
+    /// vLLM's rejection shape: flat, no `error` key at all, numeric `code`.
+    const VLLM_OVERFLOW_BODY: &str = r#"{"object":"error","message":"This model's maximum context length is 4096 tokens. However, you requested 5000 tokens.","type":"BadRequestError","code":400}"#;
+
+    /// LiteLLM's rejection shape: the envelope parses, but the code is its own.
+    const LITELLM_OVERFLOW_BODY: &str = r#"{"error":{"message":"litellm.ContextWindowExceededError: This model's maximum context length is 8192 tokens. However, you requested 9001 tokens.","type":"context_window_exceeded","code":"400"}}"#;
+
+    /// `base_url` is configurable, so this client also serves endpoints that
+    /// speak the Responses API without being OpenAI. Their overflow wording is
+    /// not OpenAI's, and misreading it costs the whole recovery: the core's
+    /// truncate-and-retry ladder runs on `CoreError::ContextOverflow` and on
+    /// nothing else.
+    #[test]
+    fn detect_context_overflow_reads_vllm_wording() {
+        let (prompt, max) =
+            detect_openai_context_overflow(VLLM_OVERFLOW_BODY).expect("vLLM overflow detected");
+        assert_eq!(max, Some(4096));
+        assert_eq!(prompt, Some(5000));
+    }
+
+    #[test]
+    fn detect_context_overflow_reads_litellm_wording() {
+        let (prompt, max) = detect_openai_context_overflow(LITELLM_OVERFLOW_BODY)
+            .expect("LiteLLM overflow detected");
+        assert_eq!(max, Some(8192));
+        assert_eq!(prompt, Some(9001));
+    }
+
+    /// The structured code is authoritative wherever there is one. A body that
+    /// parses as the envelope and names some other code is not an overflow,
+    /// however its message reads - misclassifying is destructive, because
+    /// `recover_from_overflow` rewrites the largest tool result's content in
+    /// place, up to `MAX_OVERFLOW_RETRIES` times.
+    #[test]
+    fn detect_context_overflow_trusts_the_structured_code_over_the_message() {
+        // A quota refusal that happens to discuss the context window.
+        let body = r#"{"error":{"code":"insufficient_quota","type":"insufficient_quota","message":"Your plan's maximum context length is 8192 tokens; upgrade for more."}}"#;
+        assert!(
+            detect_openai_context_overflow(body).is_none(),
+            "an envelope with its own code must not be reclassified from its message"
+        );
+    }
+
+    #[test]
+    fn detect_context_overflow_still_ignores_unrelated_rejections() {
+        let schema_rejection = r#"{"error":{"code":"invalid_function_parameters","type":"invalid_request_error","message":"Invalid schema for function 'terminal__run'."}}"#;
+        assert!(detect_openai_context_overflow(schema_rejection).is_none());
+        assert!(
+            detect_openai_context_overflow(
+                r#"{"object":"error","message":"bad request","type":"BadRequestError","code":400}"#
+            )
+            .is_none(),
+            "a flat body with no context wording is not an overflow"
+        );
+        assert!(detect_openai_context_overflow("not json").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_vllm_shaped_overflow_surfaces_as_context_overflow() {
+        let server = httpmock::MockServer::start();
+        let _m = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/responses");
+            then.status(400)
+                .header("content-type", "application/json")
+                .body(VLLM_OVERFLOW_BODY);
+        });
+
+        let client = OpenAiClient::new("key".into()).with_base_url(server.url(""));
+        let err = client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await
+            .expect_err("must fail");
+
+        match err {
+            CoreError::ContextOverflow {
+                prompt_tokens,
+                max_tokens,
+                ..
+            } => {
+                assert_eq!(prompt_tokens, Some(5000));
+                assert_eq!(max_tokens, Some(4096));
+            }
+            other => panic!("expected ContextOverflow, got {other:?}"),
+        }
     }
 
     #[tokio::test]
