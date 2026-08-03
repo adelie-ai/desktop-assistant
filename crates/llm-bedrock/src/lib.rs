@@ -2433,6 +2433,75 @@ mod tests {
 
     // --- Extended-thinking (reasoning) wiring ----------------------------
 
+    // --- Inference-profile prefixes -------------------------------------
+    //
+    // Every capability gate in this connector takes the region-prefix-stripped
+    // base id. A prefix the stripper does not know is therefore not a cosmetic
+    // miss: the base id never appears, so extended thinking, prompt caching
+    // and the streaming-with-tools deny list all answer for a model id that
+    // matches nothing. AWS documents each of these on the model detail pages
+    // (Claude Sonnet 4.5 lists us / eu / au / jp Geo ids and a global id).
+
+    /// Every profile prefix AWS is known to issue, paired with a model id
+    /// that has to keep answering the same way through it.
+    const PROFILE_PREFIXES: &[&str] = &[
+        "us.", "eu.", "apac.", "ap.", "au.", "jp.", "global.", "us-gov.",
+    ];
+
+    #[test]
+    fn every_inference_profile_prefix_recovers_the_base_model_id() {
+        for prefix in PROFILE_PREFIXES {
+            let id = format!("{prefix}anthropic.claude-sonnet-4-5-20250929-v1:0");
+            assert_eq!(
+                strip_region_prefix(&id),
+                "anthropic.claude-sonnet-4-5-20250929-v1:0",
+                "{prefix} is an AWS inference-profile prefix and must be stripped"
+            );
+        }
+        // A bare foundation id is untouched, and an invented prefix is not
+        // stripped - the set is an allowlist, not a "drop the first segment"
+        // rule, because model ids can carry dots of their own
+        // (`openai.gpt-5.6`).
+        assert_eq!(
+            strip_region_prefix("anthropic.claude-sonnet-4-5-20250929-v1:0"),
+            "anthropic.claude-sonnet-4-5-20250929-v1:0"
+        );
+        assert_eq!(
+            strip_region_prefix("xx.anthropic.claude-sonnet-4-5-20250929-v1:0"),
+            "xx.anthropic.claude-sonnet-4-5-20250929-v1:0"
+        );
+    }
+
+    #[test]
+    fn every_capability_gate_answers_the_same_through_every_prefix() {
+        // Both directions: a capability that must stay on through the prefix,
+        // and a deny-list entry that must stay off through it. A prefix the
+        // stripper misses silently flips both.
+        for prefix in PROFILE_PREFIXES {
+            let claude = format!("{prefix}anthropic.claude-sonnet-4-5-20250929-v1:0");
+            let base = strip_region_prefix(&claude);
+            assert!(
+                supports_configurable_reasoning(base),
+                "{prefix}: extended thinking must survive the prefix"
+            );
+            assert!(
+                supports_prompt_caching(base),
+                "{prefix}: prompt caching must survive the prefix"
+            );
+            assert_eq!(
+                context_limit_for_model(&claude),
+                Some(200_000),
+                "{prefix}: the context window must survive the prefix"
+            );
+
+            let llama = format!("{prefix}meta.llama4-maverick-17b-instruct-v1:0");
+            assert!(
+                !supports_streaming_with_tools(strip_region_prefix(&llama)),
+                "{prefix}: the non-streaming-with-tools deny list must survive the prefix"
+            );
+        }
+    }
+
     #[test]
     fn configurable_reasoning_reads_the_stripped_base_id() {
         // The caller strips the region prefix, as it does for
@@ -3580,6 +3649,16 @@ mod tests {
           "modelLifecycle": {"status": "ACTIVE"}
         },
         {
+          "modelArn": "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-sonnet-4-5-20250929-v1:0",
+          "modelId": "anthropic.claude-sonnet-4-5-20250929-v1:0",
+          "modelName": "Claude Sonnet 4.5",
+          "providerName": "Anthropic",
+          "inputModalities": ["TEXT", "IMAGE"],
+          "outputModalities": ["TEXT"],
+          "inferenceTypesSupported": ["INFERENCE_PROFILE"],
+          "modelLifecycle": {"status": "ACTIVE"}
+        },
+        {
           "modelArn": "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3-haiku-20240307-v1:0",
           "modelId": "anthropic.claude-3-haiku-20240307-v1:0",
           "modelName": "Claude 3 Haiku",
@@ -3632,6 +3711,16 @@ mod tests {
           "inferenceProfileId": "us.anthropic.claude-sonnet-4-6",
           "models": [
             {"modelArn": "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-sonnet-4-6"}
+          ],
+          "status": "ACTIVE",
+          "type": "SYSTEM_DEFINED"
+        },
+        {
+          "inferenceProfileName": "Claude Sonnet 4.5 on a geography this build has never heard of",
+          "inferenceProfileArn": "arn:aws:bedrock:us-east-1:111122223333:inference-profile/xx.anthropic.claude-sonnet-4-5-20250929-v1:0",
+          "inferenceProfileId": "xx.anthropic.claude-sonnet-4-5-20250929-v1:0",
+          "models": [
+            {"modelArn": "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-sonnet-4-5-20250929-v1:0"}
           ],
           "status": "ACTIVE",
           "type": "SYSTEM_DEFINED"
@@ -3718,6 +3807,34 @@ mod tests {
         assert!(
             !profile.capabilities.tools,
             "an embedding model calls no tools"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_profile_prefix_this_build_does_not_know_still_carries_the_base_model() {
+        // The prefix allowlist can only ever be as current as the last time
+        // somebody read the AWS docs. When AWS issues a new geography, the
+        // listing still says which foundation model the profile routes to, so
+        // that answer is used rather than an id that matches nothing.
+        let server = httpmock::MockServer::start();
+        mock_drifting_control_plane(&server);
+
+        let report = control_plane_client(&server)
+            .list_models_detailed()
+            .await
+            .expect("healthy listing");
+
+        let profile = find_model(&report, "xx.anthropic.claude-sonnet-4-5-20250929-v1:0");
+        assert!(
+            profile.capabilities.reasoning,
+            "Sonnet 4.5 takes a thinking budget whatever geography serves it"
+        );
+        assert!(profile.capabilities.vision);
+        assert!(profile.capabilities.tools);
+        assert_eq!(
+            profile.context_limit,
+            Some(200_000),
+            "the context window comes from the base model, not the prefix"
         );
     }
 
