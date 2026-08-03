@@ -5,8 +5,8 @@ use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::ToolCall;
 use desktop_assistant_core::domain::{Message, Role, ToolDefinition, ToolNamespace};
 use desktop_assistant_core::ports::llm::{
-    ChunkCallback, LlmClient, LlmResponse, ModelCapabilities, ModelInfo, ModelKind,
-    ReasoningConfig, TokenUsage, current_model_override,
+    ChunkCallback, HostedToolSearch, LlmClient, LlmResponse, ModelCapabilities, ModelInfo,
+    ModelKind, ReasoningConfig, TokenUsage, current_model_override,
 };
 use desktop_assistant_llm_http::{
     STREAM_CONNECT_TIMEOUT, STREAM_EVENT_TIMEOUT, StreamStep, build_response, next_step,
@@ -882,6 +882,28 @@ impl LlmClient for AnthropicClient {
         self.hosted_tool_search
     }
 
+    fn hosted_tool_search(&self) -> Option<&dyn HostedToolSearch> {
+        self.hosted_tool_search
+            .then_some(self as &dyn HostedToolSearch)
+    }
+
+    async fn stream_completion_with_namespaces(
+        &self,
+        messages: Vec<Message>,
+        core_tools: &[ToolDefinition],
+        namespaces: &[ToolNamespace],
+        reasoning: ReasoningConfig,
+        on_chunk: ChunkCallback,
+    ) -> Result<LlmResponse, CoreError> {
+        HostedToolSearch::stream_completion_with_namespaces(
+            self, messages, core_tools, namespaces, reasoning, on_chunk,
+        )
+        .await
+    }
+}
+
+#[async_trait::async_trait]
+impl HostedToolSearch for AnthropicClient {
     async fn stream_completion_with_namespaces(
         &self,
         messages: Vec<Message>,
