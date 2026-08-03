@@ -349,7 +349,7 @@ pub fn get_connector_defaults(connector: &str) -> ConnectorDefaultsView {
         embeddings_model: embeddings_connector.default_embedding_model().to_string(),
         embeddings_base_url: embeddings_connector.default_base_url().to_string(),
         embeddings_available,
-        hosted_tool_search_available: typed.hosted_tool_search_available(),
+        hosted_tool_search_available: typed.type_offers_hosted_tool_search(),
     }
 }
 

@@ -462,18 +462,25 @@ impl Connector {
         }
     }
 
-    /// Whether a connector of *this type* can ever do server-side hosted tool
-    /// search. It answers a question about the connector kind, not about any
-    /// one configured connection, because `get_connector_defaults` is given a
-    /// connector name and has no connection to inspect. The model-defaults view
-    /// uses it to gate the toggle in the KCM.
+    /// Whether a connector of this *type* offers server-side hosted tool
+    /// search.
     ///
-    /// The per-client answer is
-    /// [`LlmClient::supports_hosted_tool_search`](desktop_assistant_core::ports::llm::LlmClient::supports_hosted_tool_search),
-    /// which a turn obeys. The two must agree for a live connection; this one
-    /// is the wider claim, so a connector listed here still has to implement
-    /// the capability in its client.
-    pub fn hosted_tool_search_available(self) -> bool {
+    /// Two questions share this subject, and the axis between them is connector
+    /// *type* against configured *instance*:
+    ///
+    /// - This method answers the type question: can any connection of this kind
+    ///   ever do it? It is answerable before a connection exists, which is what
+    ///   `get_connector_defaults` needs - it is given a connector name, not a
+    ///   connection id, so it has no instance to inspect. The model-defaults
+    ///   view uses the answer to gate the toggle in the KCM.
+    /// - [`LlmClient::supports_hosted_tool_search`](desktop_assistant_core::ports::llm::LlmClient::supports_hosted_tool_search)
+    ///   answers the instance question: does this configured client do it? That
+    ///   is the one a turn obeys.
+    ///
+    /// This one is the wider claim. A connector named here still has to
+    /// implement the capability in its client, and its client still has to
+    /// override `stream_completion_with_namespaces` to honour it.
+    pub fn type_offers_hosted_tool_search(self) -> bool {
         matches!(self, Self::OpenAi | Self::Anthropic)
     }
 }
@@ -1294,14 +1301,14 @@ mystery_key = "x"
         assert!(Connector::Azure.supports_embeddings());
         assert!(Connector::Google.supports_embeddings());
 
-        assert!(!Connector::Ollama.hosted_tool_search_available());
-        assert!(!Connector::Bedrock.hosted_tool_search_available());
-        assert!(Connector::OpenAi.hosted_tool_search_available());
-        assert!(Connector::Anthropic.hosted_tool_search_available());
+        assert!(!Connector::Ollama.type_offers_hosted_tool_search());
+        assert!(!Connector::Bedrock.type_offers_hosted_tool_search());
+        assert!(Connector::OpenAi.type_offers_hosted_tool_search());
+        assert!(Connector::Anthropic.type_offers_hosted_tool_search());
         // None of the new connectors expose hosted tool search in v1.
-        assert!(!Connector::OpenRouter.hosted_tool_search_available());
-        assert!(!Connector::Azure.hosted_tool_search_available());
-        assert!(!Connector::Google.hosted_tool_search_available());
+        assert!(!Connector::OpenRouter.type_offers_hosted_tool_search());
+        assert!(!Connector::Azure.type_offers_hosted_tool_search());
+        assert!(!Connector::Google.type_offers_hosted_tool_search());
     }
 
     #[test]
