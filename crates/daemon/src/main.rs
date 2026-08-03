@@ -2547,9 +2547,14 @@ async fn main() -> Result<()> {
                 resolved_bt.connector,
                 resolved_bt.model
             );
-            let bt_llm = build_llm_client(resolved_bt);
-            let bt_fallback = Arc::new(bt_llm);
-            let bt_llm = routing_llm::RoutingLlmClient::new(bt_fallback);
+            let bt_model = resolved_bt.model.clone();
+            let bt_client = build_llm_client(resolved_bt);
+            // Pin both the client and the model. This branch is entered
+            // only when the backend connector or model differs from the
+            // primary, so the turn's `ACTIVE_CLIENT` and `MODEL_OVERRIDE`
+            // both name a different target. Titling runs inside the turn's
+            // scope, so both are in force when it dispatches.
+            let bt_llm = routing_llm::RoutingLlmClient::new_pinned(bt_client, bt_model);
             let bt_llm =
                 backend_reasoning::FixedReasoningLlmClient::new(bt_llm, ReasoningConfig::default());
             let bt_llm = RetryingLlmClient::new(bt_llm, 3);
