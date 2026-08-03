@@ -968,11 +968,11 @@ fn infer_capabilities_from_id(
         reasoning: supports_configurable_reasoning(&lc),
         vision,
         tools: tools && !is_embedding,
-        // `is_embedding` is computed from the provider's real output-modality
-        // metadata for foundation models (see `summary_to_model_info`); the
-        // inference-profile path passes `false` because profiles only ever
-        // cover chat models. Either way the kind follows the modality, not the
-        // id (#647).
+        // `vision` and `is_embedding` are the provider's real modality
+        // metadata on both paths: read from the summary for a foundation
+        // model, and read from the base model's summary for an inference
+        // profile (see `ModalityIndex`). The kind follows the modality, not
+        // the id (#647).
         kind: if is_embedding {
             ModelKind::Embedding
         } else {
@@ -1145,6 +1145,81 @@ fn document_to_json_string(doc: &Document) -> String {
     serde_json::to_string(&doc_to_value(doc)).unwrap_or_else(|_| "{}".to_string())
 }
 
+/// The modality facts `ListFoundationModels` reports for one model, reduced
+/// to the two questions the capability record asks of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ModelModalities {
+    /// The model takes image input.
+    vision: bool,
+    /// The model returns vectors rather than text.
+    is_embedding: bool,
+}
+
+impl ModelModalities {
+    fn from_summary(summary: &aws_sdk_bedrock::types::FoundationModelSummary) -> Self {
+        use aws_sdk_bedrock::types::ModelModality;
+        Self {
+            vision: summary.input_modalities().contains(&ModelModality::Image),
+            is_embedding: summary
+                .output_modalities()
+                .contains(&ModelModality::Embedding),
+        }
+    }
+}
+
+/// Modality metadata for every foundation model the account lists, keyed by
+/// foundation model id.
+///
+/// Why it exists: `ListInferenceProfiles` reports no modalities, so the
+/// profile path used to carry a second, hardcoded vision id list. That list is
+/// the one that runs in practice - the on-demand filter removes nearly every
+/// modern chat model from the foundation catalogue, leaving the profile entry
+/// as the thing a person picks - and it drifts from what AWS reports for the
+/// same model. Both listings arrive in one call, so a profile reuses the real
+/// metadata of the model it routes to (#1023).
+///
+/// Built from every summary, before any filter: a model the catalogue drops
+/// for having no on-demand throughput is exactly the model a profile serves.
+#[derive(Debug, Default)]
+struct ModalityIndex(std::collections::HashMap<String, ModelModalities>);
+
+impl ModalityIndex {
+    fn from_summaries(summaries: &[aws_sdk_bedrock::types::FoundationModelSummary]) -> Self {
+        Self(
+            summaries
+                .iter()
+                .map(|s| (s.model_id().to_string(), ModelModalities::from_summary(s)))
+                .collect(),
+        )
+    }
+
+    /// The modalities of the foundation model a profile routes to, or `None`
+    /// when this account's listing does not describe that model.
+    ///
+    /// Two ways to name the base model, tried in order. The profile's `models`
+    /// carry the foundation-model ARN, which is AWS's own statement of what
+    /// the profile routes to. Where no ARN names a foundation model - an
+    /// application profile pointing at another profile, or a field AWS did not
+    /// populate - the profile id minus its region prefix is the same id by
+    /// construction (`us.anthropic.claude-...`).
+    fn resolve_profile(
+        &self,
+        profile: &aws_sdk_bedrock::types::InferenceProfileSummary,
+    ) -> Option<ModelModalities> {
+        profile
+            .models()
+            .iter()
+            .filter_map(|model| model.model_arn())
+            .filter_map(|arn| arn.split_once("foundation-model/"))
+            .find_map(|(_, base_id)| self.0.get(base_id).copied())
+            .or_else(|| {
+                self.0
+                    .get(strip_region_prefix(profile.inference_profile_id()))
+                    .copied()
+            })
+    }
+}
+
 /// Convert a `FoundationModelSummary` into a `ModelInfo`, returning `None`
 /// if the model should be filtered out (not ACTIVE, not text/embedding, or
 /// not invocable via on-demand throughput).
@@ -1176,19 +1251,15 @@ fn summary_to_model_info(
     // Filter: output modality must include TEXT or EMBEDDING.
     // (We skip pure IMAGE/VIDEO generation models — they're not usable as
     // chat/embedding backends in this connector.)
-    let output_modalities = summary.output_modalities();
-    let is_text = output_modalities.contains(&ModelModality::Text);
-    let is_embedding = output_modalities.contains(&ModelModality::Embedding);
-    if !(is_text || is_embedding) {
+    let modalities = ModelModalities::from_summary(summary);
+    let is_text = summary.output_modalities().contains(&ModelModality::Text);
+    if !(is_text || modalities.is_embedding) {
         return None;
     }
 
-    let input_modalities = summary.input_modalities();
-    let vision = input_modalities.contains(&ModelModality::Image);
-
     let id = summary.model_id();
     let model_name = summary.model_name().unwrap_or(id).to_string();
-    let capabilities = infer_capabilities_from_id(id, vision, is_embedding);
+    let capabilities = infer_capabilities_from_id(id, modalities.vision, modalities.is_embedding);
 
     Some(ModelInfo {
         id: id.to_string(),
@@ -1202,14 +1273,13 @@ fn summary_to_model_info(
 /// for non-active profiles or profiles whose underlying foundation model
 /// can't be recovered.
 ///
-/// Capabilities are derived from the underlying foundation model id (after
-/// stripping the region prefix) since the profile API doesn't expose them.
-/// Vision support is conservatively inferred from the model id family rather
-/// than from a real modality field — Bedrock doesn't surface modalities on
-/// profiles, but the profile's underlying model has the same modalities as
-/// its foundation counterpart.
+/// A profile is a route to a foundation model, so its capabilities are that
+/// model's capabilities. `modalities` carries what `ListFoundationModels`
+/// reported in the same call, and the profile reuses it. Only where the base
+/// model is not in that listing does the id-family fallback below decide.
 fn inference_profile_to_model_info(
     profile: &aws_sdk_bedrock::types::InferenceProfileSummary,
+    modalities: &ModalityIndex,
 ) -> Option<ModelInfo> {
     use aws_sdk_bedrock::types::InferenceProfileStatus;
 
@@ -1223,25 +1293,14 @@ fn inference_profile_to_model_info(
     }
 
     let base_id = strip_region_prefix(profile_id);
-    let lc = base_id.to_ascii_lowercase();
-
-    // Vision: known multimodal Bedrock model families. Profile API gives us
-    // no modality info, so this list is best-effort and conservative.
-    let vision = lc.contains("anthropic.claude-3")
-        || lc.contains("anthropic.claude-sonnet-4")
-        || lc.contains("anthropic.claude-opus-4")
-        || lc.contains("anthropic.claude-haiku-4")
-        || lc.contains("amazon.nova-pro")
-        || lc.contains("amazon.nova-lite")
-        || lc.contains("amazon.nova-premier")
-        || lc.contains("meta.llama3-2-11b-vision")
-        || lc.contains("meta.llama3-2-90b-vision")
-        || lc.contains("meta.llama4");
-
-    // Inference profiles cover chat models; embeddings stay on their bare
-    // ids (which support OnDemand and pass through the foundation-model
-    // path).
-    let is_embedding = false;
+    let resolved = modalities.resolve_profile(profile).unwrap_or_else(|| {
+        tracing::debug!(
+            profile_id,
+            "inference profile has no foundation-model entry in this listing; \
+             falling back to the model-id family for its modalities"
+        );
+        fallback_modalities_from_id(base_id)
+    });
 
     let display_name = if profile.inference_profile_name.is_empty() {
         profile_id.to_string()
@@ -1254,8 +1313,39 @@ fn inference_profile_to_model_info(
         display_name,
         // context_limit_for_model already strips the region prefix internally.
         context_limit: context_limit_for_model(profile_id),
-        capabilities: infer_capabilities_from_id(base_id, vision, is_embedding),
+        capabilities: infer_capabilities_from_id(base_id, resolved.vision, resolved.is_embedding),
     })
+}
+
+/// Modalities guessed from a model id, for the one case that has no better
+/// answer: a profile whose base model this account's `ListFoundationModels`
+/// did not return, so there is no provider metadata to reuse.
+///
+/// A documented fallback, not a second rule. Everything else reads AWS's own
+/// modality fields through [`ModalityIndex`]. The families listed are the
+/// multimodal ones Bedrock serves through profiles; anything unrecognized is
+/// reported as text-only, which costs a picker badge rather than sending an
+/// image to a model that cannot read one.
+///
+/// `is_embedding` is `false` here because an embedding model is reachable by
+/// its bare on-demand id and appears on the foundation path, so a profile for
+/// one is resolvable through the index or does not exist.
+fn fallback_modalities_from_id(base_id: &str) -> ModelModalities {
+    let lc = base_id.to_ascii_lowercase();
+    let vision = lc.contains("anthropic.claude-3")
+        || lc.contains("anthropic.claude-sonnet-4")
+        || lc.contains("anthropic.claude-opus-4")
+        || lc.contains("anthropic.claude-haiku-4")
+        || lc.contains("amazon.nova-pro")
+        || lc.contains("amazon.nova-lite")
+        || lc.contains("amazon.nova-premier")
+        || lc.contains("meta.llama3-2-11b-vision")
+        || lc.contains("meta.llama3-2-90b-vision")
+        || lc.contains("meta.llama4");
+    ModelModalities {
+        vision,
+        is_embedding: false,
+    }
 }
 
 /// Build the degradation notice for a failed `ListInferenceProfiles` call.
@@ -1355,17 +1445,18 @@ impl BedrockClient {
         let foundation = foundation_res
             .map_err(|e| CoreError::Llm(format!("Bedrock ListFoundationModels failed: {e:#}")))?;
 
-        let mut models: Vec<ModelInfo> = foundation
-            .model_summaries()
-            .iter()
-            .filter_map(summary_to_model_info)
-            .collect();
+        let summaries = foundation.model_summaries();
+        // Built before the on-demand filter: the models it drops are exactly
+        // the ones the profiles below route to.
+        let modalities = ModalityIndex::from_summaries(summaries);
+        let mut models: Vec<ModelInfo> =
+            summaries.iter().filter_map(summary_to_model_info).collect();
         let mut notices = Vec::new();
 
         match profiles_res {
             Ok(profile_resp) => {
                 for profile in profile_resp.inference_profile_summaries() {
-                    if let Some(info) = inference_profile_to_model_info(profile) {
+                    if let Some(info) = inference_profile_to_model_info(profile, &modalities) {
                         models.push(info);
                     }
                 }
@@ -2923,7 +3014,8 @@ mod tests {
             "Claude Haiku 4.5 (US)",
             InferenceProfileStatus::Active,
         );
-        let profile_info = inference_profile_to_model_info(&profile).expect("kept");
+        let profile_info =
+            inference_profile_to_model_info(&profile, &ModalityIndex::default()).expect("kept");
         assert_eq!(profile_info.capabilities.kind, ModelKind::Generative);
     }
 
@@ -3093,9 +3185,11 @@ mod tests {
         status: InferenceProfileStatus,
     ) -> InferenceProfileSummary {
         // The builder requires `models` to be set (the underlying foundation
-        // models the profile routes to). The conversion code doesn't read
-        // them — we infer capabilities from the profile id — so a single
-        // stub entry is enough for the test.
+        // models the profile routes to). A stub ARN that matches no listed
+        // model is enough here: paired with an empty `ModalityIndex` it puts
+        // these tests on the id-family fallback, which is what they cover.
+        // The metadata path is covered end to end against a mocked control
+        // plane, further down.
         let model_stub = InferenceProfileModel::builder()
             .model_arn("arn:aws:bedrock:us-east-1::foundation-model/test")
             .build();
@@ -3127,7 +3221,7 @@ mod tests {
             InferenceProfileStatus::Active,
         );
         // sanity: the active path keeps it
-        assert!(inference_profile_to_model_info(&profile).is_some());
+        assert!(inference_profile_to_model_info(&profile, &ModalityIndex::default()).is_some());
     }
 
     #[test]
@@ -3137,7 +3231,8 @@ mod tests {
             "Claude Haiku 4.5 (US)",
             InferenceProfileStatus::Active,
         );
-        let info = inference_profile_to_model_info(&profile).expect("kept");
+        let info =
+            inference_profile_to_model_info(&profile, &ModalityIndex::default()).expect("kept");
         assert_eq!(info.id, "us.anthropic.claude-haiku-4-5-20251001-v1:0");
         assert_eq!(info.display_name, "Claude Haiku 4.5 (US)");
         assert_eq!(info.context_limit, Some(200_000));
@@ -3154,7 +3249,8 @@ mod tests {
             "Nova Premier (US)",
             InferenceProfileStatus::Active,
         );
-        let info = inference_profile_to_model_info(&profile).expect("kept");
+        let info =
+            inference_profile_to_model_info(&profile, &ModalityIndex::default()).expect("kept");
         assert_eq!(info.id, "us.amazon.nova-premier-v1:0");
         assert!(info.capabilities.tools, "Nova supports tool use");
         assert!(info.capabilities.vision, "Nova Premier is multimodal");
@@ -3169,7 +3265,8 @@ mod tests {
             "DeepSeek R1 (US)",
             InferenceProfileStatus::Active,
         );
-        let info = inference_profile_to_model_info(&profile).expect("kept");
+        let info =
+            inference_profile_to_model_info(&profile, &ModalityIndex::default()).expect("kept");
         assert_eq!(info.id, "us.deepseek.r1-v1:0");
         // R1 reasons, and it reasons whether or not anybody asks: Bedrock's
         // Converse contract for DeepSeek carries no reasoning configuration
@@ -3191,7 +3288,8 @@ mod tests {
             "",
             InferenceProfileStatus::Active,
         );
-        let info = inference_profile_to_model_info(&profile).expect("kept");
+        let info =
+            inference_profile_to_model_info(&profile, &ModalityIndex::default()).expect("kept");
         assert_eq!(info.display_name, "us.anthropic.claude-sonnet-4-6");
     }
 

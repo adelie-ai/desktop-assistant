@@ -137,6 +137,19 @@ modern chat model, because those models are reachable only through an inference
 profile. Every backend that lists foundation models applies the same filter. A
 backend that skips it advertises models that cannot be called.
 
+**A profile carries its base model's capabilities.** `ListInferenceProfiles`
+reports no modalities, and a profile is only a route to a foundation model, so
+the profile entry reuses the modality metadata `ListFoundationModels` returned
+in the same call. The base model is named by the foundation-model ARN in the
+profile's `models`, and failing that by the profile id minus its region prefix.
+Only a profile whose base model this account did not list falls back to a
+family guess from the id, which reports vision from the family and treats the
+model as generative - an embedding model is reachable by its bare on-demand id,
+so a profile for one resolves through the listing or does not exist. Deriving
+vision from a curated id list on this path is what made a new vision-capable
+model report `vision: false` until somebody edited the list, while the same
+model's foundation entry reported it correctly.
+
 Notices are cached with the models, so a cache hit inside the one-hour TTL still
 reports the degradation. An explicit refresh re-issues the calls and always
 returns a report, so a client can tell a reload that found nothing new from a
