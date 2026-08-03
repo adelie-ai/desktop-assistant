@@ -894,7 +894,7 @@ impl LlmResponse {
 /// client offers hosted tool search exactly when
 /// [`LlmClient::hosted_tool_search`] hands back one of these, and it can only
 /// hand one back if it implements this trait. There is no way to claim the
-/// capability and inherit a flattening body by omission — that combination
+/// capability and inherit a flattening body by omission - that combination
 /// produced a turn carrying the whole tool fleet inline *and* no discovery
 /// tool, because the service layer strips `builtin_tool_search` whenever
 /// hosted search is active (#1033).
@@ -909,7 +909,7 @@ pub trait HostedToolSearch: Send + Sync {
     /// provider's deferred-loading shape and append the provider's
     /// tool-search entry. An implementation that simply flattens the
     /// namespaces into an ordinary tool list is a deliberate, reviewable
-    /// choice — see [`flatten_namespaces`] — not something a connector can
+    /// choice - see [`flatten_namespaces`] - not something a connector can
     /// fall into by not writing the method.
     async fn stream_completion_with_namespaces(
         &self,
@@ -1038,7 +1038,7 @@ pub trait LlmClient: Send + Sync {
     ///
     /// **Decorators return `Some(self)`, never their inner client's object.**
     /// Handing back the inner object drops the decorator from the call path
-    /// for exactly the turns that carry the most tools — losing retry,
+    /// for exactly the turns that carry the most tools - losing retry,
     /// profiling, classification, reasoning substitution or per-turn routing.
     /// The shape to copy:
     ///
@@ -2423,8 +2423,8 @@ mod tests {
 
 /// Test doubles and tests for the hosted-tool-search seam (#1033).
 ///
-/// The headline property of that seam — a client cannot report hosted tool
-/// search without implementing the dispatch — is a compile-time property and
+/// The headline property of that seam - a client cannot report hosted tool
+/// search without implementing the dispatch - is a compile-time property and
 /// has no runtime test. What is tested here is the runtime half: that
 /// [`dispatch_namespaced`] picks the right path, and that every decorator
 /// stays in the call path for a namespaced turn.
