@@ -6,7 +6,7 @@
 //!
 //! - [`DaemonConnectionsService`] wraps a shared [`ConnectionRegistry`]
 //!   (plus the on-disk config) and implements the
-//!   [`ConnectionsService`](desktop_assistant_core::ports::inbound::ConnectionsService)
+//!   [`desktop_assistant_core::ports::inbound::ConnectionsService`]
 //!   inbound port. Writes mutate the on-disk config and rebuild the
 //!   registry; reads snapshot registry state.
 //!
@@ -498,7 +498,7 @@ impl RegistryHandle {
     /// startup (database, embeddings, TLS, …) are reported as
     /// "restart required" rather than silently dropped.
     ///
-    /// Returns the [`ReloadPlan`] describing what was applied (and what still
+    /// Returns the [`crate::config::ReloadPlan`] describing what was applied (and what still
     /// needs a restart) on success.
     pub fn apply_reload(&self) -> anyhow::Result<crate::config::ReloadPlan> {
         // 1. Parse + validate the candidate from disk. `load_daemon_config`

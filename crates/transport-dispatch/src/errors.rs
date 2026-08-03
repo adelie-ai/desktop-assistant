@@ -18,7 +18,7 @@
 //!
 //! ## What is not classified yet
 //!
-//! [`api_error_frame`] classifies the structural [`ApiError`] variants. It
+//! `api_error_frame` classifies the structural [`ApiError`] variants. It
 //! leaves [`ApiError::Core`] unclassified, because that variant carries a
 //! `CoreError` already flattened to a string, and matching on an error's
 //! `Display` output is exactly what this project forbids. Classifying those

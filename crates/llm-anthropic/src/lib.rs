@@ -120,7 +120,7 @@ impl AnthropicClient {
     }
 
     /// Override the first-response (connect) stall budget. `None`/`Some(0)`
-    /// keeps the [`ANTHROPIC_CONNECT_TIMEOUT`] default. Seconds.
+    /// keeps the `ANTHROPIC_CONNECT_TIMEOUT` default. Seconds.
     pub fn with_connect_timeout(mut self, secs: Option<u64>) -> Self {
         if let Some(s) = secs.filter(|s| *s > 0) {
             self.connect_timeout = std::time::Duration::from_secs(s);
@@ -129,7 +129,7 @@ impl AnthropicClient {
     }
 
     /// Override the per-chunk stall budget. `None`/`Some(0)` keeps the
-    /// [`ANTHROPIC_EVENT_TIMEOUT`] default. Seconds.
+    /// `ANTHROPIC_EVENT_TIMEOUT` default. Seconds.
     pub fn with_event_timeout(mut self, secs: Option<u64>) -> Self {
         if let Some(s) = secs.filter(|s| *s > 0) {
             self.event_timeout = std::time::Duration::from_secs(s);
@@ -177,7 +177,7 @@ impl AnthropicClient {
     /// Create from environment variables.
     /// Reads `ANTHROPIC_API_KEY` for the API key.
     /// Optionally reads `ANTHROPIC_MODEL` (defaults to claude-sonnet-4-6-20260227)
-    /// and `ANTHROPIC_BASE_URL` (defaults to https://api.anthropic.com).
+    /// and `ANTHROPIC_BASE_URL` (defaults to <https://api.anthropic.com>).
     pub fn from_env() -> Result<Self, CoreError> {
         let api_key = std::env::var("ANTHROPIC_API_KEY")
             .map_err(|_| CoreError::Llm("ANTHROPIC_API_KEY environment variable not set".into()))?;

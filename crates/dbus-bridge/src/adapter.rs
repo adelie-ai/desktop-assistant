@@ -1,12 +1,12 @@
-//! D-Bus adapters that translate session-bus calls into [`api::Command`]
-//! dispatches over a [`BridgeTransport`].
+//! D-Bus adapters that translate session-bus calls into
+//! [`desktop_assistant_api_model::Command`] dispatches over a
+//! [`crate::transport::BridgeTransport`].
 //!
 //! Each adapter mirrors the corresponding in-process adapter in
 //! `crates/dbus-interface/src/*.rs` **method-for-method**: same
 //! interface name, same method names, same signatures, same return
 //! shapes. The wire-format compatibility is enforced by the
-//! [`introspection`](crate::adapter::introspection) golden tests in
-//! `tests/`.
+//! golden introspection tests in `tests/`.
 //!
 //! The big difference from the in-process adapters: there is no
 //! `AssistantService`/`ConversationService`/`SettingsService` trait

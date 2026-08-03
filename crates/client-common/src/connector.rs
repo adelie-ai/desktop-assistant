@@ -1,6 +1,6 @@
 //! A single high-level handle over any transport.
 //!
-//! [`Connector`] wraps [`connect_transport`](crate::transport::connect_transport):
+//! [`Connector`] wraps [`connect_transport`]:
 //! it owns the chosen [`TransportClient`] *and* the daemon's signal stream,
 //! fanning every [`SignalEvent`] out to any number of
 //! [`subscribe`](Connector::subscribe)rs. A client issues commands and reads
@@ -603,7 +603,7 @@ impl Connector {
     }
 
     /// Deliver the outcome of a
-    /// [`SignalEvent::ClientToolCall`](crate::SignalEvent::ClientToolCall) back
+    /// [`SignalEvent::ClientToolCall`] back
     /// to the daemon so the suspended turn can resume (#107/#231). Pass the
     /// `task_id` and `tool_call_id` from the event and exactly one of
     /// `result` / `error` (encoded as `Ok` / `Err`).

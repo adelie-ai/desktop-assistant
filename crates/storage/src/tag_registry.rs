@@ -59,7 +59,8 @@ pub enum CreateTagOutcome {
 /// The tag registry is per-user (#102 moved the PK to `(user_id, name)`)
 /// so the scope reads the task-local user identity. Dreaming, which is
 /// the primary consumer, runs per conversation and inherits each
-/// conversation's `user_id` via [`with_user_id`] — see #105 for the
+/// conversation's `user_id` via
+/// [`desktop_assistant_core::ports::auth::with_user_id`] — see #105 for the
 /// threading contract.
 pub async fn list_active_tags(pool: &PgPool) -> Result<Vec<TagRecord>, CoreError> {
     let user_id = current_user_id();

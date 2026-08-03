@@ -74,7 +74,7 @@ tokio::task_local! {
 
 /// Returns the id of the task currently executing, when the call site
 /// is inside a [`BackgroundTaskRegistry::spawn`] body. Returns `None`
-/// outside any registered task body — see [`CURRENT_TASK_ID`].
+/// outside any registered task body — see `CURRENT_TASK_ID`.
 pub fn current_task_id() -> Option<api::TaskId> {
     CURRENT_TASK_ID.try_with(|id| id.clone()).ok()
 }

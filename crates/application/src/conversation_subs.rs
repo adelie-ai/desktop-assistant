@@ -238,7 +238,7 @@ fn turn_event_conversation_id(event: &api::Event) -> Option<&str> {
 /// chokepoint every transport's turn funnels through — means a turn driven over
 /// ANY transport (a voice turn over D-Bus, a tui/gtk send over UDS/WS) fans to
 /// viewers, without each transport re-implementing it. The fan-out is
-/// best-effort and non-blocking (see [`FanoutTargetSink`]-style targets), so a
+/// best-effort and non-blocking (see `FanoutTargetSink`-style targets), so a
 /// slow viewer never backpressures the origin's reliable delivery.
 pub struct FanOutSink {
     inner: Arc<dyn EventSink>,

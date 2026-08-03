@@ -9,7 +9,7 @@ use crate::domain::ToolDefinition;
 /// Stores tool definitions with embeddings for hybrid search.
 pub trait ToolRegistryStore: Send + Sync {
     /// Register (upsert) tool definitions from a source (e.g. an MCP server name or "builtin").
-    /// Embeddings are chunk arrays (one Vec<f32> per chunk) to match the vector[] column.
+    /// Embeddings are chunk arrays (one `Vec<f32>` per chunk) to match the `vector[]` column.
     ///
     /// `provider` is the batch-constant provider identity (an MCP server's
     /// namespace/name, or a builtin group) written to every row in the batch —

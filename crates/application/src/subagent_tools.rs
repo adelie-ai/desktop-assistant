@@ -1,7 +1,7 @@
 //! Builtin tools for spawning and inspecting subagents (#112).
 //!
 //! This module defines two LLM-facing tools that compose on top of the
-//! `BackgroundTaskRegistry` (#111) and the [`spawn_agent_conversation`]
+//! `BackgroundTaskRegistry` (#111) and the `spawn_agent_conversation`
 //! helper extracted by #113. Each one is a small wrapper:
 //!
 //! - [`TOOL_SPAWN_SUBAGENT`] — the parent LLM calls this to create a
@@ -25,7 +25,7 @@
 //!    errors instead of silently producing orphan tasks.
 //! 3. Creates a fresh `Conversation` via `ConversationService` so the
 //!    child has its own id and message history.
-//! 4. Delegates the registry-spawn + run to [`spawn_agent_conversation`]
+//! 4. Delegates the registry-spawn + run to `spawn_agent_conversation`
 //!    with a `TaskKind::Subagent` kind factory. The helper threads the
 //!    user identity, cancellation token, and (when provided) the tool
 //!    allowlist through the run automatically.

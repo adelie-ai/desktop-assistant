@@ -3,18 +3,18 @@
 //! This module groups three related concerns that conspire to keep the
 //! prompt under the model's input-token budget:
 //!
-//! - **Assembly** ([`assemble_turn_within_budget`], [`assemble_turn`]):
+//! - **Assembly** (`assemble_turn_within_budget`, `assemble_turn`):
 //!   Builds the per-turn `Vec<Message>` from conversation history,
 //!   summaries, tool definitions, and the active-task anchor — applying
 //!   pre-flight token-budget checks and shrinking the window when the
 //!   estimated cost exceeds the threshold.
-//! - **Recovery** ([`recover_from_overflow`]): When the provider rejects a
+//! - **Recovery** (`recover_from_overflow`): When the provider rejects a
 //!   turn with [`crate::CoreError::ContextOverflow`], runs a structured
 //!   recovery ladder (truncate the largest tool result → compact the oldest
 //!   tool results → summarise-and-shrink) before the dispatch loop retries.
 //!   Every rung rewrites message content; none removes a message, because the
 //!   list it works on is the one the turn persists.
-//! - **Summarisation** ([`generate_context_summary`]): Asks the LLM for a
+//! - **Summarisation** (`generate_context_summary`): Asks the LLM for a
 //!   bullet-point summary of dropped messages and merges it with any
 //!   existing rolling summary, so windowed-out history is not lost.
 //!

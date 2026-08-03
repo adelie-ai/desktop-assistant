@@ -112,7 +112,7 @@ const PERSONAL_DATA_TABLES: &[&str] = &[
     "idempotency_keys",
 ];
 
-/// The canonical set of personal-data tables (see [`PERSONAL_DATA_TABLES`]).
+/// The canonical set of personal-data tables (see `PERSONAL_DATA_TABLES`).
 ///
 /// Exposed so the static audit in `tests/audit_user_id_scoping.rs` can
 /// consume the same list instead of maintaining a second copy that drifts

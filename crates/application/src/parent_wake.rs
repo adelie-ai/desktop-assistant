@@ -19,7 +19,7 @@
 //!   two children finishing together never launch two overlapping turns on the
 //!   same conversation (which would corrupt its transcript order).
 //!
-//! Bounding autonomy, two skips in [`ParentWakeCoordinator::on_completion`]:
+//! Bounding autonomy, two skips in `ParentWakeCoordinator::on_completion`:
 //!
 //! - **Detached children only.** A completion whose `notify_parent` is `false`
 //!   came from a blocking `spawn_subagent { wait: true }` — the default — whose

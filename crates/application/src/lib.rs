@@ -3028,7 +3028,7 @@ where
     /// Hand the dispatcher (or any transport-level forwarder) a
     /// `broadcast::Receiver` so it can fan `Event::Task*` frames out
     /// to a single connection. Reads the per-request user id from the
-    /// task-local installed by [`handle_command_for`] (#105).
+    /// task-local installed by [`AssistantApiHandler::handle_command_for`] (#105).
     async fn subscribe_user_events(&self) -> Option<tokio::sync::broadcast::Receiver<api::Event>> {
         let registry = self.registry.as_ref()?;
         let user_id = desktop_assistant_core::ports::auth::current_user_id();

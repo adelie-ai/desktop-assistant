@@ -434,7 +434,7 @@ fn spawn_background_task_subscription(connector: &Arc<Connector>) {
 /// seam `run` uses internally, exposed so integration tests can drive the emit
 /// path over a p2p connection without standing up a full Connector.
 ///
-/// `destination` mirrors [`emit`]: `None` broadcasts, `Some(unique_name)`
+/// `destination` mirrors `emit`: `None` broadcasts, `Some(unique_name)`
 /// unicasts to one D-Bus sender (the per-sender session path).
 pub async fn forward_one(connection: &Connection, destination: Option<&str>, event: SignalEvent) {
     emit(connection, destination, translate(event)).await;

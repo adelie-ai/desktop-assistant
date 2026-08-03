@@ -115,7 +115,7 @@ pub struct DaemonConfig {
     pub database: DatabaseConfig,
     /// Backend-tasks (dreaming / titling) overrides. The legacy `llm` field
     /// is reshaped into `[purposes]` during migration; see
-    /// [`maybe_migrate_legacy_purposes`]. Consumers that still read
+    /// `maybe_migrate_legacy_purposes`. Consumers that still read
     /// `backend_tasks.llm` see `None` after migration and fall back to
     /// the primary LLM.
     #[serde(default)]

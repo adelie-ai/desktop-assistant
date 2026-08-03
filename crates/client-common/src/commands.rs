@@ -268,7 +268,7 @@ pub trait AssistantCommands: Send + Sync {
     /// and does not affect later turns. This is how a voice client attaches
     /// instructions like "respond briefly, by voice" to a turn dictated into
     /// an existing chat without polluting the visible transcript. An empty
-    /// `system_refinement` is equivalent to [`send_prompt`].
+    /// `system_refinement` is equivalent to [`Self::send_prompt`].
     async fn send_prompt_with_system_refinement(
         &self,
         conversation_id: &str,
@@ -309,7 +309,7 @@ pub trait AssistantCommands: Send + Sync {
     /// de-duplicated by the daemon — re-attached to the still-running turn, or
     /// (if it already finished) the committed reply replayed — instead of
     /// re-running the turn and re-processing an action. `None` is identical to
-    /// [`send_prompt_full`]. Every `send_prompt*` method routes through here so
+    /// [`Self::send_prompt_full`]. Every `send_prompt*` method routes through here so
     /// the ack-handling and wire shape live in one place.
     async fn send_prompt_idempotent(
         &self,

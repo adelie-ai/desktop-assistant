@@ -241,7 +241,7 @@ pub const DEFAULT_OLLAMA_NUM_CTX: u64 = 8_192;
 /// Ollama hosts arbitrary GGUF models, so we don't curate context windows.
 /// The model's *architecture* context length (the ceiling) is read from the
 /// per-model `POST /api/show` response and cached per-model in
-/// [`OllamaClient::context_length_cache`] (populated by
+/// `OllamaClient::context_length_cache` (populated by
 /// [`OllamaClient::warm_context_length`], fire-and-forget at startup).
 ///
 /// The *runtime* window is Ollama's `num_ctx`, which defaults to a measly
@@ -382,7 +382,7 @@ impl OllamaClient {
 
     /// Set the per-connection context-window **hard cap**, in tokens. `None`
     /// (or `Some(0)`) means "max available" — no extra ceiling. A positive
-    /// value clamps [`Self::effective_num_ctx`] (and therefore the reported
+    /// value clamps `Self::effective_num_ctx` (and therefore the reported
     /// window and the `num_ctx` sent on the wire) down to at most this many
     /// tokens, e.g. when the model's full window won't fit in RAM on this box.
     pub fn with_max_context_tokens(mut self, max: Option<u64>) -> Self {
@@ -391,7 +391,7 @@ impl OllamaClient {
     }
 
     /// Override the PRESENCE-phase budget (`/api/tags`). `None`/`Some(0)`
-    /// keeps the [`OLLAMA_PRESENCE_TIMEOUT`] default. Seconds (#560).
+    /// keeps the `OLLAMA_PRESENCE_TIMEOUT` default. Seconds (#560).
     pub fn with_presence_timeout(mut self, secs: Option<u64>) -> Self {
         if let Some(s) = secs.filter(|s| *s > 0) {
             self.presence_timeout = Duration::from_secs(s);
@@ -400,7 +400,7 @@ impl OllamaClient {
     }
 
     /// Override the PULL-phase per-chunk stall budget (streamed `/api/pull`).
-    /// `None`/`Some(0)` keeps the generous [`OLLAMA_PULL_TIMEOUT`] default.
+    /// `None`/`Some(0)` keeps the generous `OLLAMA_PULL_TIMEOUT` default.
     /// Seconds (#560).
     pub fn with_pull_timeout(mut self, secs: Option<u64>) -> Self {
         if let Some(s) = secs.filter(|s| *s > 0) {
@@ -410,7 +410,7 @@ impl OllamaClient {
     }
 
     /// Override the LOAD-phase budget (`/api/generate` warm-up). `None`/`Some(0)`
-    /// keeps the minute-scale [`OLLAMA_LOAD_TIMEOUT`] default. Seconds (#560).
+    /// keeps the minute-scale `OLLAMA_LOAD_TIMEOUT` default. Seconds (#560).
     pub fn with_load_timeout(mut self, secs: Option<u64>) -> Self {
         if let Some(s) = secs.filter(|s| *s > 0) {
             self.load_timeout = Duration::from_secs(s);
@@ -419,7 +419,7 @@ impl OllamaClient {
     }
 
     /// Override the GENERATE first-response (connect) stall budget.
-    /// `None`/`Some(0)` keeps the [`OLLAMA_CONNECT_TIMEOUT`] default. Seconds.
+    /// `None`/`Some(0)` keeps the `OLLAMA_CONNECT_TIMEOUT` default. Seconds.
     pub fn with_connect_timeout(mut self, secs: Option<u64>) -> Self {
         if let Some(s) = secs.filter(|s| *s > 0) {
             self.connect_timeout = std::time::Duration::from_secs(s);
@@ -428,7 +428,7 @@ impl OllamaClient {
     }
 
     /// Override the per-chunk stall budget. `None`/`Some(0)` keeps the
-    /// [`OLLAMA_EVENT_TIMEOUT`] default. Seconds.
+    /// `OLLAMA_EVENT_TIMEOUT` default. Seconds.
     pub fn with_event_timeout(mut self, secs: Option<u64>) -> Self {
         if let Some(s) = secs.filter(|s| *s > 0) {
             self.event_timeout = std::time::Duration::from_secs(s);
@@ -609,7 +609,7 @@ impl OllamaClient {
 
     /// LOAD phase: make `model` resident in memory via an empty-prompt
     /// `POST /api/generate` with a [`OLLAMA_KEEP_ALIVE`] window, bounded by the
-    /// minute-scale [`Self::load_timeout`].
+    /// minute-scale `Self::load_timeout`.
     ///
     /// Called explicitly BEFORE the chat stream (#560) so a cold GGUF load —
     /// which can run tens of seconds to minutes — is never charged to the 30s

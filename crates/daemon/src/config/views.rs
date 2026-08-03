@@ -1,5 +1,5 @@
 //! Settings views — the `get_*` / `set_*` pairs that the inbound API
-//! handler dispatches into when clients edit settings (the [llm] block,
+//! handler dispatches into when clients edit settings (the `[llm]` block,
 //! embeddings, persistence, database, backend tasks, WS auth).
 //!
 //! Extracted from `config.rs` (#41). Each pair is a thin wrapper over

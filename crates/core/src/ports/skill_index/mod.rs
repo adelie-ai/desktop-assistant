@@ -67,7 +67,7 @@ pub type SkillGetFn = Arc<
 /// what to keep; these methods just do as they are told.
 ///
 /// The contract every implementation owes is executable, not prose:
-/// [`conformance`] runs it against any store, and each adapter's test suite
+/// the `conformance` module runs it against any store, and each adapter's test suite
 /// invokes it.
 #[async_trait::async_trait]
 pub trait SkillIndexStore: Send + Sync {

@@ -10,15 +10,15 @@
 //!
 //! Only the **relational** (non-vector, non-FTS) stores:
 //!
-//! - [`SqliteConversationStore`] — [`desktop_assistant_core::ports::store::ConversationStore`]
-//! - [`SqliteTurnStateStore`] — [`desktop_assistant_core::ports::store::TurnStateStore`]
-//! - [`SqliteBackgroundTaskStore`] — [`desktop_assistant_core::ports::store::BackgroundTaskStore`]
-//! - [`SqliteErrorClassificationStore`] — [`desktop_assistant_core::ports::store::ErrorClassificationStore`]
-//! - [`SqliteLearnedWindowStore`] — [`desktop_assistant_core::ports::store::LearnedWindowStore`]
-//! - [`SqliteIdempotencyKeyStore`] — [`desktop_assistant_core::ports::store::IdempotencyKeyStore`]
+//! - `SqliteConversationStore` — [`desktop_assistant_core::ports::store::ConversationStore`]
+//! - `SqliteTurnStateStore` — [`desktop_assistant_core::ports::store::TurnStateStore`]
+//! - `SqliteBackgroundTaskStore` — [`desktop_assistant_core::ports::store::BackgroundTaskStore`]
+//! - `SqliteErrorClassificationStore` — [`desktop_assistant_core::ports::store::ErrorClassificationStore`]
+//! - `SqliteLearnedWindowStore` — [`desktop_assistant_core::ports::store::LearnedWindowStore`]
+//! - `SqliteIdempotencyKeyStore` — [`desktop_assistant_core::ports::store::IdempotencyKeyStore`]
 //!
 //! Vector search (sqlite-vec), dreaming, `db_query`, and daemon wiring are
-//! deferred to later increments (see `DESIGN.md`). The [`SqliteSkillIndexStore`]
+//! deferred to later increments (see `DESIGN.md`). The `SqliteSkillIndexStore`
 //! (#594) is the first FTS5 store here — full-text only, since the vector half
 //! still awaits sqlite-vec; the KB / scratchpad / conversation FTS stores remain
 //! deferred.

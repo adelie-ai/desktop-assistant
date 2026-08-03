@@ -115,7 +115,7 @@ impl<'de> Deserialize<'de> for ConnectionId {
 /// Serialized as a tagged enum under `type = "..."`. Each variant owns only the
 /// fields relevant to its connector type. The connection id (map key) and any
 /// purpose-level model/parameter overrides are intentionally *not* stored here
-/// — those live on the [`RootConnectionsConfig`] wrapper and on purpose configs
+/// — those live on the [`ConnectionsMap`] wrapper and on purpose configs
 /// (#10) respectively.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
@@ -647,15 +647,13 @@ pub struct AnthropicConnection {
     pub secret: Option<SecretConfig>,
     /// Seconds to wait for the first streaming response (headers/first event)
     /// before treating the request as stalled. Overrides the connector-shared
-    /// [`STREAM_CONNECT_TIMEOUT`](desktop_assistant_llm_http::STREAM_CONNECT_TIMEOUT)
-    /// default (30s). Useful for slow local models (e.g. a large GGUF doing a
-    /// long prompt-eval on CPU).
+    /// `STREAM_CONNECT_TIMEOUT` default (30s). Useful for slow local models
+    /// (e.g. a large GGUF doing a long prompt-eval on CPU).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connect_timeout_secs: Option<u64>,
     /// Seconds to wait between streaming chunks before treating the stream as
     /// stalled. Overrides the connector-shared
-    /// [`STREAM_EVENT_TIMEOUT`](desktop_assistant_llm_http::STREAM_EVENT_TIMEOUT)
-    /// default (60s).
+    /// `STREAM_EVENT_TIMEOUT` default (60s).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_timeout_secs: Option<u64>,
     /// Hard ceiling on the effective context window, in tokens. `None` = "max

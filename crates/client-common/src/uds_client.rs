@@ -16,9 +16,9 @@
 //! ## Reconnect (#246)
 //!
 //! The live socket (the writer's `outbound_tx`) lives behind a swappable
-//! [`ConnState`] cell, while the request-correlation map, the signal stream the
+//! `ConnState` cell, while the request-correlation map, the signal stream the
 //! [`Connector`](crate::Connector) reads, and the drop-notification channel all
-//! **persist across reconnects**. [`UdsClient::reconnect`] re-runs the handshake
+//! **persist across reconnects**. `UdsClient::reconnect` re-runs the handshake
 //! and spawns fresh reader/writer tasks wired to those same persistent
 //! channels, then swaps the cell — so the connection comes back transparently
 //! under a stable `&TransportClient` without the Connector having to re-subscribe

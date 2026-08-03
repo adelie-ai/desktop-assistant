@@ -12,18 +12,18 @@
 //! turn body (moved in as plain data, re-installed inside the spawned body —
 //! never read across a `tokio::spawn`):
 //!
-//! - [`SCRATCHPAD_SCOPE`] — the conversation whose pad the scratchpad tools
+//! - `SCRATCHPAD_SCOPE` — the conversation whose pad the scratchpad tools
 //!   operate on (the SESSION/root conversation), distinct from the
 //!   [`crate::ports::conversation_ctx`] `ConversationId`, which stays the child
 //!   conversation (history / LLM / KB provenance).
-//! - [`SCRATCHPAD_OWNER_TODO`] — the materialized-path namespace the running
+//! - `SCRATCHPAD_OWNER_TODO` — the materialized-path namespace the running
 //!   agent writes under and is confined to. Root sentinel `""` / unset =
 //!   top-level.
-//! - [`SCRATCHPAD_VISIBLE_BEFORE`] — the spawn snapshot cut: a canonical
+//! - `SCRATCHPAD_VISIBLE_BEFORE` — the spawn snapshot cut: a canonical
 //!   lowercase-hyphenated UUIDv7 string (the child's `spawn_marker`). Bound as
 //!   TEXT because `scratchpads.id` is TEXT and UUIDv7 canonical strings are
 //!   time-ordered. Its presence gates whether the snapshot predicate applies.
-//! - [`SCRATCHPAD_ANCESTORS`] — the frozen ancestor-namespace chain (each
+//! - `SCRATCHPAD_ANCESTORS` — the frozen ancestor-namespace chain (each
 //!   ancestor *agent*'s `owner_todo`, e.g. `["", "1.1"]` for a child under
 //!   subagent `1.1`). The snapshot read admits pre-marker rows ONLY from these
 //!   namespaces, so a concurrent sibling/cousin's in-flight notes are never
@@ -133,7 +133,7 @@ tokio::task_local! {
 }
 
 /// Run `fut` (a `spawn_subagent` tool execution) with `scope` installed as the
-/// scope its child should adopt. See [`PENDING_CHILD_SCOPE`].
+/// scope its child should adopt. See `PENDING_CHILD_SCOPE`.
 pub async fn with_pending_child_scope<F, T>(scope: SubagentScope, fut: F) -> T
 where
     F: std::future::Future<Output = T>,

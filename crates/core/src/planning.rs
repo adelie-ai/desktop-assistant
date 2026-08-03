@@ -10,16 +10,16 @@
 //!
 //! This module is the pure mechanism behind that behaviour:
 //!
-//! - [`StepStack`] — a per-turn stack of [`StepFrame`]s. `begin` pushes a
+//! - `StepStack` — a per-turn stack of `StepFrame`s. `begin` pushes a
 //!   frame and auto-assigns a dotted path from stack depth + a per-frame child
 //!   counter (step 1 → 1.1, 1.2, …; 1.2 → 1.2.1 … 1.2.6). `complete` pops it.
-//! - [`evict_tool_results`] — replaces the content of sizeable `Role::Tool`
+//! - `evict_tool_results` — replaces the content of sizeable `Role::Tool`
 //!   messages in a scope with a pointer to the scratchpad note that distilled
 //!   them, **preserving role + `tool_call_id`** so provider ToolUse↔ToolResult
 //!   pairing stays valid (Bedrock/Ollama). Idempotent and structure-preserving.
-//! - [`render_plan`] — renders the open todos as a compact indented tree for
+//! - `render_plan` — renders the open todos as a compact indented tree for
 //!   per-round surfacing.
-//! - [`begin_step_tool`] / [`complete_step_tool`] — the tool definitions the
+//! - `begin_step_tool` / `complete_step_tool` — the tool definitions the
 //!   dispatch loop advertises and intercepts (they are core-loop tools, not
 //!   MCP/builtin-executor tools, because only the loop owns `conv.messages`).
 //!

@@ -22,8 +22,8 @@
 //!
 //! ## Modules
 //!
-//! - [`transport`]: the [`BridgeTransport`](transport::BridgeTransport) trait the
-//!   adapters dispatch through, and [`ConnectorBridgeTransport`](transport::ConnectorBridgeTransport),
+//! - [`transport`]: the [`BridgeTransport`] trait the
+//!   adapters dispatch through, and [`ConnectorBridgeTransport`],
 //!   a thin forwarder over the shared client-common `Connector` (which owns the
 //!   authenticated UDS connection, reconnect, and JWT minting — #316).
 //! - [`adapter`]: D-Bus adapter structs (one per object path) that
