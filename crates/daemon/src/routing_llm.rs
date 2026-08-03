@@ -944,6 +944,17 @@ mod tests {
         use crate::purposes::{ConnectionRef, ModelRef, PurposeConfig, Purposes};
         let id = ConnectionId::new("cloud").unwrap();
         let mut purposes = Purposes::default();
+        // `resolve_purpose` refuses every purpose while `[purposes.interactive]`
+        // is absent, so a fixture without it proves nothing about the answer.
+        purposes.set(
+            PurposeKind::Interactive,
+            Some(PurposeConfig {
+                connection: ConnectionRef::Named(id.clone()),
+                model: ModelRef::Named("cloud-model".to_string()),
+                effort: None,
+                max_context_tokens: None,
+            }),
+        );
         purposes.set(
             PurposeKind::Titling,
             Some(PurposeConfig {
@@ -987,6 +998,24 @@ mod tests {
     #[tokio::test]
     async fn dynamic_purpose_answers_no_even_when_the_purpose_offers_hosted_search() {
         let handle = build_handle_with_hosted_search_purpose();
+
+        // Establish the premise, so the assertion below cannot pass because
+        // the fixture resolves to nothing.
+        let config = handle.snapshot_config();
+        let connections = config
+            .validated_connections()
+            .expect("the fixture's `[connections]` table is valid");
+        let resolved =
+            crate::purposes::resolve_purpose(PurposeKind::Titling, &config.purposes, &connections)
+                .expect("the fixture's titling purpose resolves");
+        let resolved_client = handle
+            .client_for(&resolved.connection_id)
+            .expect("the resolved connection is in the registry");
+        assert!(
+            resolved_client.hosted_tool_search().is_some(),
+            "the fixture's resolved client must offer hosted tool search"
+        );
+
         let client = RoutingLlmClient::new_dynamic_purpose(handle, PurposeKind::Titling);
         assert!(
             client.hosted_tool_search().is_none(),
