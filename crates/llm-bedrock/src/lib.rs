@@ -197,8 +197,7 @@ impl BedrockClient {
     }
 
     /// Override the whole-request budget for the non-streaming (`Converse`)
-    /// path. `None`/`Some(0)` keeps the [`NON_STREAMING_REQUEST_TIMEOUT`]
-    /// default. Seconds.
+    /// path. `None`/`Some(0)` keeps the ten-minute default. Seconds.
     ///
     /// It has no effect on the streaming path, whose two budgets bound the
     /// connection and the gap between events.
@@ -1110,10 +1109,12 @@ const INFERENCE_PROFILE_PREFIXES: &[&str] = &[
 /// foundation model id. Returns the input unchanged when no known prefix
 /// matches.
 ///
-/// The listing path does better than this where it can: a profile carries the
-/// ARN of the model it routes to, so [`base_model_id_from_arns`] recovers the
-/// base id even for a prefix this build has never seen. This function is what
-/// the dispatch path has, where the model id string is all there is.
+/// This is the only way this connector names the model behind a profile, and
+/// that is deliberate. A turn arrives carrying a model id and nothing else, so
+/// this is all the dispatch path has; the listing resolves the same way rather
+/// than reading the richer answer in the profile's ARN, because a capability
+/// the listing can see and dispatch cannot is one the picker offers and the
+/// request builder discards. Issue #1044 covers resolving it for both sides.
 fn strip_region_prefix(id: &str) -> &str {
     INFERENCE_PROFILE_PREFIXES
         .iter()
