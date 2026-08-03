@@ -1259,6 +1259,13 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         }
 
         // Dynamic tool discovery: start with core tools, activate more via tool_search.
+        //
+        // This answer decides the whole turn's tool list, and the dispatch
+        // below must go to the same client that answered it. The read happens
+        // inside whatever scope the caller installed, so a routing `llm` sees
+        // the per-turn client here exactly as it does at dispatch. Keep any
+        // work that could move this read outside that scope out of the path
+        // above it.
         let use_hosted_search = self.llm.supports_hosted_tool_search();
         let namespaces: Vec<ToolNamespace> = if use_hosted_search {
             let raw_namespaces = self.tools.tool_namespaces().await;

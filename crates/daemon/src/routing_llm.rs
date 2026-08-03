@@ -84,10 +84,17 @@ pub enum FallbackMode {
 /// one is installed (Static mode only), or to the configured fallback
 /// otherwise.
 ///
-/// Note that `list_models`, capability flags, and default-model accessors
-/// always delegate to the Static fallback — they describe the handler's
-/// configured interactive model and are not meaningfully per-turn. The
-/// DynamicPurpose mode is only useful for `stream_completion` paths.
+/// Two groups of accessors resolve differently, and the split is
+/// deliberate. Anything that changes what a request contains or where it
+/// goes — `stream_completion`, `stream_completion_with_namespaces`,
+/// `supports_hosted_tool_search`, `max_context_tokens`, the model-listing
+/// calls — resolves through the per-turn active client, so the answer
+/// always describes the client the turn dispatches to. The borrowing
+/// accessors `get_default_model` and `get_default_base_url` return
+/// `Option<&str>` tied to `self`, which no task-local lookup can satisfy,
+/// so they report the statically configured value. The DynamicPurpose mode
+/// has no single captured client and answers `None`/`false`/empty for all
+/// of them.
 #[derive(Clone)]
 pub struct RoutingLlmClient {
     fallback: FallbackMode,
@@ -298,15 +305,31 @@ impl LlmClient for RoutingLlmClient {
     }
 
     fn supports_hosted_tool_search(&self) -> bool {
-        // The flag gates how `ConversationHandler` assembles the tool
-        // list at the start of a turn, before any task-local is
-        // consulted. Static mode reports the fallback's capability;
-        // dynamic-purpose mode is only used for backend tasks
-        // (title/summary), which don't traverse the hosted-search path,
-        // so reporting `false` is safe and matches the connector-default.
-        self.static_fallback()
-            .map(|c| c.supports_hosted_tool_search())
-            .unwrap_or(false)
+        // This answer must describe the client the turn will actually
+        // dispatch to, so Static mode resolves the same way
+        // `stream_completion_with_namespaces` does. `ConversationHandler`
+        // reads the flag near the start of `send_prompt`, inside the scope
+        // the daemon's dispatch wrapper installs, so the task-local is
+        // already set for a turn that carries a per-turn model override.
+        //
+        // Answering from the static fallback instead let the two disagree:
+        // a fallback with hosted search would strip `builtin_tool_search`
+        // from the tool list, then send the request to a connection without
+        // hosted search, whose default `stream_completion_with_namespaces`
+        // flattens every namespace tool into one call. The turn then paid
+        // for the whole fleet in one request and had no way to discover
+        // tools either.
+        //
+        // Dynamic-purpose mode is only used for backend tasks
+        // (title/summary), which don't traverse the hosted-search path, so
+        // reporting `false` is safe and matches the connector default. It
+        // must also ignore the task-local, for the same reason its dispatch
+        // path does: a backend task must not inherit the user's per-turn
+        // model override.
+        match &self.fallback {
+            FallbackMode::Static { .. } => self.resolve_static().supports_hosted_tool_search(),
+            FallbackMode::DynamicPurpose { .. } => false,
+        }
     }
 
     async fn stream_completion_with_namespaces(
@@ -741,8 +764,10 @@ mod tests {
         // Fallback supports hosted search; the turn's override does not.
         let router = RoutingLlmClient::new(Arc::new(CapabilityLlm::new(true)));
         let without_search: Arc<dyn LlmClient> = Arc::new(CapabilityLlm::new(false));
-        let answer =
-            with_active_client(without_search, async { router.supports_hosted_tool_search() }).await;
+        let answer = with_active_client(without_search, async {
+            router.supports_hosted_tool_search()
+        })
+        .await;
         assert!(
             !answer,
             "capability must come from the active client, which has no hosted search"
@@ -933,8 +958,7 @@ mod tests {
         let hosted_fallback = Arc::new(CapabilityLlm::new(true));
         let overridden = Arc::new(CapabilityLlm::new(false));
 
-        let router =
-            RoutingLlmClient::new(Arc::clone(&hosted_fallback) as Arc<dyn LlmClient>);
+        let router = RoutingLlmClient::new(Arc::clone(&hosted_fallback) as Arc<dyn LlmClient>);
         let handler = ConversationHandler::with_tools(
             MemStore::default(),
             router,
@@ -972,10 +996,7 @@ mod tests {
             "a connection without hosted search keeps builtin_tool_search; got {first:?}"
         );
         assert!(
-            !offered
-                .iter()
-                .flatten()
-                .any(|n| n.starts_with("fleet_")),
+            !offered.iter().flatten().any(|n| n.starts_with("fleet_")),
             "the namespaced fleet must not be flattened into a request; got {offered:?}"
         );
     }

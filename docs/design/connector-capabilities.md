@@ -117,8 +117,12 @@ not determined the answer.
 The same caution applies to the decorators. Every wrapper around `LlmClient` -
 routing, classifying, profiling, retrying - forwards trait methods by hand. A
 decorator that forgets to forward a capability method answers for the wrong
-client. One already does: the routing decorator reports the static fallback's
-hosted-tool-search support rather than the selected connection's.
+client. The routing decorator did exactly that for hosted tool search: it
+reported the static fallback's support rather than the selected connection's,
+so a per-turn model override assembled the tool list for one client and sent
+it to another. It now resolves the capability through the same per-turn lookup
+its dispatch path uses. Every capability method added later must resolve the
+same way.
 
 ## Reaching the client
 
