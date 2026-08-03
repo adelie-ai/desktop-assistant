@@ -1247,6 +1247,22 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         let mut overflow_retries: u32 = 0;
 
         // Run compaction if enough messages have been dropped by windowing.
+        //
+        // This block, and everything else from here to the
+        // `supports_hosted_tool_search` read below, must run in THIS task.
+        // Do not move any of it into `tokio::spawn`, `spawn_blocking`, or a
+        // `JoinSet`, however tempting the latency win looks — the summary
+        // below is a whole LLM round-trip and reads as an obvious candidate.
+        //
+        // Why: the daemon passes this turn's LLM client, its model override,
+        // its context budget and its reasoning config through
+        // `tokio::task_local!` slots, which a spawned task does not inherit.
+        // A spawn here would silently drop them. The summary would go to the
+        // wrong model, and the capability read below would answer for the
+        // wrong client, which decides the entire turn's tool list. Nothing
+        // fails loudly; the turn just gets more expensive and less capable.
+        // Run such work inside the current task, or carry the task-locals
+        // across the boundary by hand.
         if let Some((from, to)) = compaction_range(&conv, target_window) {
             let summary = generate_context_summary(
                 &conv.context_summary,
@@ -1261,11 +1277,10 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         // Dynamic tool discovery: start with core tools, activate more via tool_search.
         //
         // This answer decides the whole turn's tool list, and the dispatch
-        // below must go to the same client that answered it. The read happens
-        // inside whatever scope the caller installed, so a routing `llm` sees
-        // the per-turn client here exactly as it does at dispatch. Keep any
-        // work that could move this read outside that scope out of the path
-        // above it.
+        // below must go to the same client that answered it. It holds because
+        // the read runs in the task the caller scoped, so a routing `llm`
+        // resolves the same per-turn client here as it does at dispatch. See
+        // the task-local warning above the compaction block.
         let use_hosted_search = self.llm.supports_hosted_tool_search();
         let namespaces: Vec<ToolNamespace> = if use_hosted_search {
             let raw_namespaces = self.tools.tool_namespaces().await;

@@ -1709,12 +1709,24 @@ where
             .resolve_turn(user_driven_selection.as_ref(), effective_selection.as_ref())
             .await?;
 
+        // `hosted_tool_search` records which tool-discovery mode this turn
+        // takes, beside the connection and model that decide it. `true` means
+        // the provider searches the tool set server-side and the turn drops
+        // `builtin_tool_search`; `false` means the turn keeps
+        // `builtin_tool_search` and sends only the core tools. `None` means
+        // no per-turn client was resolved, so the statically configured
+        // primary answers and this line cannot see which. Without this field
+        // the mode is invisible in the logs, and a turn that picks the wrong
+        // one just looks expensive.
         tracing::info!(
             purpose = ?if routed_via_voice { PurposeKind::Voice } else { PurposeKind::Interactive },
             connection = ?chosen.as_ref().map(|(c, _)| c.as_str()),
             model = ?chosen.as_ref().map(|(_, m)| m.as_str()),
             source = ?budget.source,
             max_input_tokens = budget.max_input_tokens,
+            hosted_tool_search = ?active_client
+                .as_ref()
+                .map(|c| c.supports_hosted_tool_search()),
             "context budget resolved"
         );
 

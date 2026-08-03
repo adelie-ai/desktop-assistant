@@ -120,9 +120,13 @@ decorator that forgets to forward a capability method answers for the wrong
 client. The routing decorator did exactly that for hosted tool search: it
 reported the static fallback's support rather than the selected connection's,
 so a per-turn model override assembled the tool list for one client and sent
-it to another. It now resolves the capability through the same per-turn lookup
-its dispatch path uses. Every capability method added later must resolve the
-same way.
+it to another. In its static-fallback mode it now resolves the capability
+through the same per-turn lookup its dispatch path uses. Its dynamic-purpose
+mode still answers a fixed `false` while its dispatch path resolves a real
+client, which is safe only because backend tasks do not reach the
+hosted-search path at all - a fixed answer, not a resolved one. Every
+capability method added later must resolve against the client that will serve
+the request, and that second mode is where the resolution is still missing.
 
 ## Reaching the client
 
