@@ -279,7 +279,7 @@ Compile-forced (a new variant breaks the build until every arm exists):
 - `ConnectionConfig` (`connector()` + `set_secret()`) and the `Connector` enum
   (`as_str/parse/default_base_url/default_chat_model/default_backend_chat_model/
   default_embedding_model/default_http_base_url`, plus review of
-  `supports_embeddings/supports_hosted_tool_search`), plus a `<Provider>Connection`
+  `supports_embeddings/type_offers_hosted_tool_search`), plus a `<Provider>Connection`
   struct (`daemon/src/connections.rs`)
 - The two resolution matches (`daemon/src/config/resolution.rs`)
 - Four mappers (`application/src/lib.rs` x2, `daemon/src/api_surface.rs` x2)
@@ -328,7 +328,7 @@ A new connector's key variables also belong on `allowed_api_key_envs`
 (`config/mod.rs`): that list is what an API client may name in `api_key_env`,
 and the derived `<CONNECTOR>_API_KEY` is on it automatically. Add an entry only
 for a documented exception, as Azure has. Leave it alone and the connector still
-works from `daemon.toml`, a stored secret, or its derived variable — only a
+works from `daemon.toml`, a stored secret, or its derived variable - only a
 client-supplied custom name is refused.
 
 Docs: `docs/connectors/<provider>.md`, an entry in `docs/architecture.md`, and an
