@@ -4,7 +4,8 @@ Crate: `desktop-assistant-llm-openai`
 
 ## API Details
 
-- Endpoint: `{base_url}/chat/completions` (POST, streaming SSE)
+- Endpoint: `{base_url}/responses` (Responses API; POST, streaming SSE)
+- Embeddings endpoint: `{base_url}/embeddings`
 - Auth: `Authorization: Bearer {api_key}`
 - Default model: `gpt-5.4`
 - Default base URL: `https://api.openai.com/v1`
