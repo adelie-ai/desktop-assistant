@@ -1257,4 +1257,190 @@ mod tests {
         ))
         .expect("Azure Entra without an api key should pass preflight");
     }
+
+    // --- hosted tool search: a claim must be backed by an implementation ---
+    //
+    // Two independent things have to agree for hosted tool search to work:
+    // `LlmClient::supports_hosted_tool_search` says the connector does it, and
+    // `LlmClient::stream_completion_with_namespaces` is what actually does it.
+    // The trait ships a default for the second that flattens every namespace
+    // into one ordinary tool list, so a connector that claims the capability
+    // without overriding it sends the whole tool fleet in a single request and
+    // no tool-search entry at all — the service layer has already stripped
+    // `builtin_tool_search` by then. The test below drives every production
+    // client and refuses that combination.
+
+    /// Every [`Connector`] variant. [`claiming_client`] matches on all of them
+    /// with no catch-all arm, so a new variant fails to compile there until it
+    /// is given a constructor here too.
+    const ALL_CONNECTORS: [Connector; 7] = [
+        Connector::Ollama,
+        Connector::Anthropic,
+        Connector::Bedrock,
+        Connector::OpenAi,
+        Connector::OpenRouter,
+        Connector::Azure,
+        Connector::Google,
+    ];
+
+    /// Name of the single tool the probe turn carries. It appears in both the
+    /// namespaced and the flattened request body, which is how a captured body
+    /// is told apart from any other traffic a client emits.
+    const PROBE_TOOL: &str = "hosted_search_probe_tool";
+
+    fn probe_tool() -> desktop_assistant_core::domain::ToolDefinition {
+        desktop_assistant_core::domain::ToolDefinition::new(
+            PROBE_TOOL,
+            "probe tool",
+            serde_json::json!({"type": "object", "properties": {}}),
+        )
+    }
+
+    fn probe_namespace() -> desktop_assistant_core::domain::ToolNamespace {
+        desktop_assistant_core::domain::ToolNamespace::new(
+            "hosted_search_probe_ns",
+            "probe namespace",
+            vec![probe_tool()],
+        )
+    }
+
+    /// Build one client per connector with hosted tool search forced on
+    /// wherever the builder accepts the flag, so the assertion covers what a
+    /// connector *can* claim rather than what today's config happens to set.
+    fn claiming_client(connector: Connector, base_url: &str) -> Arc<dyn LlmClient> {
+        match connector {
+            Connector::Ollama => Arc::new(desktop_assistant_llm_ollama::OllamaClient::new(
+                base_url,
+                "probe-model",
+            )),
+            Connector::Anthropic => Arc::new(
+                desktop_assistant_llm_anthropic::AnthropicClient::new("probe-key".to_string())
+                    .with_model("probe-model")
+                    .with_base_url(base_url)
+                    .with_hosted_tool_search(true),
+            ),
+            Connector::Bedrock => Arc::new(
+                desktop_assistant_llm_bedrock::BedrockClient::new("probe-key".to_string())
+                    .with_model("probe-model")
+                    .with_base_url(base_url),
+            ),
+            Connector::OpenAi => Arc::new(
+                desktop_assistant_llm_openai::OpenAiClient::new("probe-key".to_string())
+                    .with_model("probe-model")
+                    .with_base_url(base_url)
+                    .with_hosted_tool_search(true),
+            ),
+            Connector::OpenRouter => Arc::new(
+                desktop_assistant_llm_openrouter::OpenRouterClient::new("probe-key".to_string())
+                    .with_model("probe-model")
+                    .with_base_url(base_url)
+                    .with_hosted_tool_search(true),
+            ),
+            Connector::Azure => Arc::new(
+                desktop_assistant_llm_azure::AzureClient::new("probe-key".to_string())
+                    .with_model("probe-model")
+                    .with_base_url(base_url)
+                    .with_hosted_tool_search(true),
+            ),
+            Connector::Google => Arc::new(
+                desktop_assistant_llm_google::GoogleClient::new("probe-key".to_string())
+                    .with_model("probe-model")
+                    .with_base_url(base_url),
+            ),
+        }
+    }
+
+    /// First captured body that carries the probe tool, ignoring any other
+    /// request a client makes on the way (model listings, warmups).
+    fn probe_body(bodies: &Arc<std::sync::Mutex<Vec<String>>>) -> Option<String> {
+        bodies
+            .lock()
+            .expect("probe body sink poisoned")
+            .iter()
+            .find(|body| body.contains(PROBE_TOOL))
+            .cloned()
+    }
+
+    fn clear_bodies(bodies: &Arc<std::sync::Mutex<Vec<String>>>) {
+        bodies
+            .lock()
+            .expect("probe body sink poisoned")
+            .clear();
+    }
+
+    #[tokio::test]
+    async fn connector_claiming_hosted_tool_search_must_override_namespace_dispatch() {
+        let server = httpmock::MockServer::start_async().await;
+        let bodies: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        // Match every request, record its body, then fail it so the client
+        // returns instead of waiting on a stream that never arrives. Only the
+        // outgoing request matters here.
+        let sink = Arc::clone(&bodies);
+        server
+            .mock_async(move |when, then| {
+                when.is_true(move |req: &httpmock::HttpMockRequest| {
+                    sink.lock()
+                        .expect("probe body sink poisoned")
+                        .push(req.body_string());
+                    true
+                });
+                then.status(500).body("probe: no completion served");
+            })
+            .await;
+
+        let base_url = server.base_url();
+        let messages = vec![desktop_assistant_core::domain::Message::new(
+            desktop_assistant_core::domain::Role::User,
+            "probe",
+        )];
+
+        for connector in ALL_CONNECTORS {
+            let client = claiming_client(connector, &base_url);
+            if !client.supports_hosted_tool_search() {
+                continue;
+            }
+
+            clear_bodies(&bodies);
+            let _ = client
+                .stream_completion_with_namespaces(
+                    messages.clone(),
+                    &[],
+                    &[probe_namespace()],
+                    desktop_assistant_core::ports::llm::ReasoningConfig::default(),
+                    Box::new(|_| true),
+                )
+                .await;
+            let namespaced = probe_body(&bodies).unwrap_or_else(|| {
+                panic!(
+                    "{connector} claims hosted tool search but the probe captured no request \
+                     carrying `{PROBE_TOOL}`; teach the probe how to drive this connector \
+                     before letting it claim the capability"
+                )
+            });
+
+            clear_bodies(&bodies);
+            let _ = client
+                .stream_completion(
+                    messages.clone(),
+                    &[probe_tool()],
+                    desktop_assistant_core::ports::llm::ReasoningConfig::default(),
+                    Box::new(|_| true),
+                )
+                .await;
+            let flattened = probe_body(&bodies).unwrap_or_else(|| {
+                panic!("{connector} sent no plain-tools request carrying `{PROBE_TOOL}`")
+            });
+
+            assert_ne!(
+                namespaced, flattened,
+                "{connector} reports supports_hosted_tool_search() == true, but its namespaced \
+                 request is byte-identical to a plain request with the namespace tools flattened \
+                 in: it inherits the trait's flattening default instead of overriding \
+                 stream_completion_with_namespaces, so a turn would send the whole tool fleet \
+                 with no tool-search entry"
+            );
+        }
+    }
 }

@@ -2185,4 +2185,27 @@ mod tests {
             "cancellation must abort the non-streaming retry promptly; took {elapsed:?}"
         );
     }
+
+    // --- capability claims -----------------------------------------------
+
+    #[test]
+    fn azure_never_reports_hosted_tool_search() {
+        // Azure Chat Completions has no hosted-search request shape, and this
+        // client does not override `stream_completion_with_namespaces`, so a
+        // `true` here would send the whole tool fleet in one flattened request
+        // with no tool-search entry. The builder still accepts the flag for
+        // factory-shape parity; the trait must ignore it.
+        let plain = AzureClient::new("k".into());
+        assert!(!plain.supports_hosted_tool_search());
+
+        let opted_in = AzureClient::new("k".into()).with_hosted_tool_search(true);
+        assert!(
+            opted_in.hosted_tool_search,
+            "the builder still records the preference"
+        );
+        assert!(
+            !opted_in.supports_hosted_tool_search(),
+            "Azure must never advertise a capability it does not implement"
+        );
+    }
 }
