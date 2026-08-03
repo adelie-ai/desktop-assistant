@@ -186,9 +186,11 @@ mod tests {
         use crate::connections::Connector;
         use desktop_assistant_core::ports::llm::{LlmClient, ModelKind};
 
-        // Exhaustive over every connector: the `match` has no wildcard, so a new
-        // `Connector` variant cannot compile until it is handled here, forcing
-        // the author to decide how it classifies models (#647).
+        // Exhaustive over every connector: the loop walks `Connector::ALL`,
+        // which is emitted from the enum's own declaration, and the `match` has
+        // no wildcard - so a new `Connector` variant joins this sweep the
+        // moment it is declared and cannot compile until it is handled here,
+        // forcing the author to decide how it classifies models (#647).
         //
         // The catalog is fetched the cheapest offline way per connector: the
         // two curated-only HTTP connectors list from their in-memory table;
@@ -196,15 +198,7 @@ mod tests {
         // live AWS output-modality metadata, which cannot be reached offline --
         // that path is proven by `bedrock_derives_kind_from_output_modalities`
         // in `llm-bedrock`, so its arm has no offline catalog to assert.
-        for connector in [
-            Connector::Ollama,
-            Connector::Anthropic,
-            Connector::Bedrock,
-            Connector::OpenAi,
-            Connector::OpenRouter,
-            Connector::Azure,
-            Connector::Google,
-        ] {
+        for &connector in Connector::ALL {
             let catalog: Vec<ModelInfo> = match connector {
                 Connector::OpenAi => desktop_assistant_llm_openai::OpenAiClient::new("k".into())
                     .list_models()

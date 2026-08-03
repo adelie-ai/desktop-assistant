@@ -1271,45 +1271,14 @@ mod tests {
     // `builtin_tool_search` by then. The sweep below drives every production
     // client, by both construction paths, and refuses that combination.
     //
+    // "Every" is `Connector::ALL`, which `declare_connectors!` emits from the
+    // same token list that declares the variants. So the sweep reaches a new
+    // connector as soon as it exists, and `probe_target` - exhaustive, no
+    // catch-all - refuses to compile until it is classified.
+    //
     // The sweep is a guard, not the fix. Removing the trait's default body
     // would make the invariant unrepresentable rather than merely tested, and
     // #1033 tracks that.
-
-    /// The connector that follows `connector` in declaration order, or `None`
-    /// for the last one.
-    ///
-    /// The sweep walks this chain instead of reading a hand-kept array,
-    /// because the `match` has no catch-all: a new `Connector` variant fails to
-    /// compile here until someone links it in. An array keeps compiling
-    /// untouched, and the connector it forgets is simply never tested.
-    ///
-    /// One gap is left, and it is not compile-forced: an arm that returns
-    /// `None` orphans its variant rather than linking it, which ends the walk
-    /// early. #1034 tracks generating the variant list, which closes that gap;
-    /// until then `docs/connectors/cloud-connector-abstraction.md` lists this
-    /// chain among the sites a new connector must update by hand.
-    fn next_in_declaration_order(connector: Connector) -> Option<Connector> {
-        match connector {
-            Connector::Ollama => Some(Connector::Anthropic),
-            Connector::Anthropic => Some(Connector::Bedrock),
-            Connector::Bedrock => Some(Connector::OpenAi),
-            Connector::OpenAi => Some(Connector::OpenRouter),
-            Connector::OpenRouter => Some(Connector::Azure),
-            Connector::Azure => Some(Connector::Google),
-            Connector::Google => None,
-        }
-    }
-
-    /// Every connector, walked from the head of the chain above.
-    fn every_connector() -> Vec<Connector> {
-        let mut out = Vec::new();
-        let mut cursor = Some(Connector::Ollama);
-        while let Some(connector) = cursor {
-            out.push(connector);
-            cursor = next_in_declaration_order(connector);
-        }
-        out
-    }
 
     /// Name of the single tool the probe turn carries. It appears in both the
     /// namespaced and the flattened request body, which is how a captured body
@@ -1353,6 +1322,10 @@ mod tests {
 
     /// Classify and build every connector. Exhaustive with no catch-all arm, so
     /// a new variant must be classified before this compiles.
+    ///
+    /// Classification is all this arm decides. Whether the connector is swept
+    /// at all is settled by [`Connector::ALL`], so no answer here - not even
+    /// "this one claims nothing" - can take a connector out of the sweep.
     fn probe_target(connector: Connector, base_url: &str) -> ProbeTarget {
         match connector {
             Connector::Ollama => ProbeTarget {
@@ -1550,6 +1523,53 @@ mod tests {
         }
     }
 
+    /// A new `Connector` variant cannot be omitted from the hosted-tool-search
+    /// sweep.
+    ///
+    /// The guarantee is structural, and it has two halves. The sweep iterates
+    /// [`Connector::ALL`], which the `declare_connectors!` macro emits from the
+    /// same token list that declares the variants, so a variant that exists is
+    /// swept. And [`probe_target`] has no catch-all arm, so a variant that is
+    /// swept fails to compile until it is classified. Neither half is a list
+    /// anyone maintains by hand.
+    ///
+    /// This test pins what the halves rest on: the list is not empty, it holds
+    /// no connector twice, and every classification in it is well formed.
+    #[test]
+    fn hosted_tool_search_sweep_reaches_every_connector() {
+        assert!(
+            !Connector::ALL.is_empty(),
+            "the sweep would pass vacuously over an empty connector list"
+        );
+
+        let mut names: Vec<&str> = Connector::ALL.iter().map(|c| c.as_str()).collect();
+        let declared = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            declared,
+            "a connector appears twice in the sweep: {names:?}"
+        );
+
+        // A classification says either "claims the capability, and here is the
+        // marker its namespaced request carries" or "does not claim it, and
+        // here is why". Half a classification reaches the sweep as a runtime
+        // panic on the connector's first probe turn; caught here it names the
+        // arm instead. The base URL is never dialled - only the client is
+        // constructed - so an unroutable address is enough.
+        for &connector in Connector::ALL {
+            let target = probe_target(connector, "http://127.0.0.1:1");
+            assert_eq!(
+                target.no_claim_reason.is_none(),
+                target.hosted_search_marker.is_some(),
+                "{connector}'s `probe_target` arm is half classified: it must either \
+                 record why it does not claim hosted tool search, or record the marker \
+                 its namespaced request carries, and never both or neither"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn connector_claiming_hosted_tool_search_must_override_namespace_dispatch() {
         let server = httpmock::MockServer::start_async().await;
@@ -1573,7 +1593,7 @@ mod tests {
 
         let base_url = server.base_url();
 
-        for connector in every_connector() {
+        for &connector in Connector::ALL {
             let target = probe_target(connector, &base_url);
             let factory = factory_client(connector, &base_url);
 
