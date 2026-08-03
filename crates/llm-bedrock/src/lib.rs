@@ -1425,7 +1425,14 @@ impl LlmClient for BedrockClient {
 
         let msg_count = api_messages.len();
         let tool_count = tools.len();
-        let system_chars: usize = system.iter().map(|b| format!("{b:?}").len()).sum();
+        // Count prompt content only. A cache checkpoint is a control marker
+        // with no prompt text, so counting its `Debug` form would inflate the
+        // reported prompt size on exactly the models that cache.
+        let system_chars: usize = system
+            .iter()
+            .filter(|b| !matches!(b, SystemContentBlock::CachePoint(_)))
+            .map(|b| format!("{b:?}").len())
+            .sum();
         let msg_chars: usize = api_messages.iter().map(|m| format!("{m:?}").len()).sum();
         tracing::info!(
             msg_chars,
@@ -3841,29 +3848,37 @@ mod tests {
         );
     }
 
-    #[test]
-    fn usage_maps_cache_read_and_write_tokens() {
-        use aws_sdk_bedrockruntime::types::{
-            ConverseStreamMetadataEvent, ConverseStreamOutput, TokenUsage as SdkTokenUsage,
-        };
-
-        let sdk_usage = SdkTokenUsage::builder()
+    /// Converse usage carrying both cache counters.
+    fn sdk_usage_with_cache_counters() -> aws_sdk_bedrockruntime::types::TokenUsage {
+        aws_sdk_bedrockruntime::types::TokenUsage::builder()
             .input_tokens(120)
             .output_tokens(30)
             .total_tokens(150)
             .cache_read_input_tokens(4096)
             .cache_write_input_tokens(2048)
             .build()
-            .expect("usage builds");
+            .expect("usage builds")
+    }
 
-        // Non-streaming path (`dispatch_non_streaming`) maps through here.
-        let mapped = map_token_usage(&sdk_usage);
+    #[test]
+    fn usage_maps_cache_read_and_write_tokens_on_the_non_streaming_path() {
+        // `dispatch_non_streaming` maps `response.usage` through here. The AWS
+        // SDK is not mockable at the HTTP level the way `httpmock` stubs the
+        // other connectors, so the mapper is exercised directly; it is the
+        // whole of that path's usage mapping.
+        let mapped = map_token_usage(&sdk_usage_with_cache_counters());
         assert_eq!(mapped.input_tokens, Some(120));
         assert_eq!(mapped.output_tokens, Some(30));
         assert_eq!(mapped.cache_read_input_tokens, Some(4096));
         assert_eq!(mapped.cache_creation_input_tokens, Some(2048));
+    }
 
-        // Streaming path (`dispatch_streaming`) maps through `apply_stream_event`.
+    #[test]
+    fn usage_maps_cache_read_and_write_tokens_on_the_streaming_path() {
+        use aws_sdk_bedrockruntime::types::{ConverseStreamMetadataEvent, ConverseStreamOutput};
+
+        // `dispatch_streaming` reads usage from the metadata event, through
+        // the real `apply_stream_event`.
         let mut text = String::new();
         let mut tool_acc = ToolCallAccumulator::default();
         let mut on_chunk: ChunkCallback = Box::new(|_| true);
@@ -3871,7 +3886,7 @@ mod tests {
         apply_stream_event(
             ConverseStreamOutput::Metadata(
                 ConverseStreamMetadataEvent::builder()
-                    .usage(sdk_usage)
+                    .usage(sdk_usage_with_cache_counters())
                     .build(),
             ),
             &mut text,
