@@ -8581,6 +8581,13 @@ mod tests {
         /// turn. This is what the turn's provider is shown, so it is what an
         /// allowlist has to constrain.
         observed_namespaces: Mutex<Vec<ToolNamespace>>,
+        /// Flat tool names offered on the *first* non-categorization call.
+        ///
+        /// First, not last: `send_prompt` also titles the conversation through
+        /// the task LLM once the turn is done, and that call carries no tools.
+        /// Recording the last would capture the title call and report an empty
+        /// tool list for every turn.
+        observed_tools: Mutex<Option<Vec<String>>>,
     }
 
     impl CategorizingLlm {
@@ -8590,7 +8597,20 @@ mod tests {
                 category_payload: Mutex::new(category_payload),
                 categorization_delay: std::time::Duration::ZERO,
                 observed_namespaces: Mutex::new(Vec::new()),
+                observed_tools: Mutex::new(None),
             }
+        }
+
+        /// Flat tool names the turn was offered, sorted.
+        fn observed_tools(&self) -> Vec<String> {
+            let mut names = self
+                .observed_tools
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("the turn must have reached the LLM at least once");
+            names.sort();
+            names
         }
 
         /// Every tool name the last turn's namespaces carried, sorted.
@@ -8638,7 +8658,7 @@ mod tests {
         async fn stream_completion(
             &self,
             messages: Vec<Message>,
-            _tools: &[ToolDefinition],
+            tools: &[ToolDefinition],
             _reasoning: ReasoningConfig,
             mut on_chunk: ChunkCallback,
         ) -> Result<LlmResponse, CoreError> {
@@ -8653,6 +8673,10 @@ mod tests {
                 let payload = self.category_payload.lock().unwrap().clone();
                 return Ok(LlmResponse::text(payload));
             }
+            self.observed_tools
+                .lock()
+                .unwrap()
+                .get_or_insert_with(|| tools.iter().map(|t| t.name.clone()).collect());
             let text = "ok".to_string();
             on_chunk(text.clone());
             Ok(LlmResponse::text(text))
@@ -8682,12 +8706,27 @@ mod tests {
     /// can edit names/descriptions between `send_prompt` calls.
     struct NamespacedToolExecutor {
         namespaces: Mutex<Vec<ToolNamespace>>,
+        core: Vec<ToolDefinition>,
     }
 
     impl NamespacedToolExecutor {
         fn new(namespaces: Vec<ToolNamespace>) -> Self {
             Self {
                 namespaces: Mutex::new(namespaces),
+                core: Vec::new(),
+            }
+        }
+
+        /// Same, but also offering the local tool-discovery tool, so a test
+        /// can watch whether the hosted path takes it away.
+        fn with_builtin_search(namespaces: Vec<ToolNamespace>) -> Self {
+            Self {
+                namespaces: Mutex::new(namespaces),
+                core: vec![ToolDefinition::new(
+                    "builtin_tool_search",
+                    "Search for tools",
+                    serde_json::json!({"type": "object"}),
+                )],
             }
         }
 
@@ -8699,7 +8738,7 @@ mod tests {
 
     impl ToolExecutor for NamespacedToolExecutor {
         async fn core_tools(&self) -> Vec<ToolDefinition> {
-            Vec::new()
+            self.core.clone()
         }
 
         async fn search_tools(&self, _query: &str) -> Result<Vec<ToolDefinition>, CoreError> {
@@ -8883,6 +8922,39 @@ mod tests {
             answers, 1,
             "the caller must receive one answer; {answers} means the demotion \
              fired for a turn that never used hosted tool search"
+        );
+    }
+
+    /// `builtin_tool_search` comes out of the core tools only when the turn
+    /// really is deferring tools to the provider. A restricted turn whose
+    /// allowlist leaves no namespaced tool is not, so taking its local
+    /// discovery tool away would leave it with no way to find anything -
+    /// while the allowlist explicitly permits that tool.
+    #[tokio::test]
+    async fn a_restricted_turn_keeps_builtin_tool_search_when_nothing_is_deferred() {
+        let count = 12;
+        let executor =
+            NamespacedToolExecutor::with_builtin_search(vec![make_oversized_namespace(count)]);
+        let llm = CategorizingLlm::new(make_categorization_payload(count));
+        let handler = build_categorization_handler(executor, llm);
+
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+
+        with_tool_allowlist(vec!["builtin_tool_search".into()], async {
+            handler
+                .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
+                .await
+                .expect("invariant: send_prompt with a valid conv must succeed");
+        })
+        .await;
+
+        assert_eq!(
+            handler.llm.observed_tools(),
+            vec!["builtin_tool_search".to_string()],
+            "nothing was deferred, so local discovery must stay on offer"
         );
     }
 
