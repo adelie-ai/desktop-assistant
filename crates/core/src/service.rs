@@ -1549,10 +1549,43 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 });
             }
 
-            let deferred_ns: &[ToolNamespace] = if !hosted_search_demoted {
-                &namespaces
-            } else {
+            // The allowlist above filters `tool_defs`, but hosted tool search
+            // sends its tools through `namespaces`, which never passed that
+            // filter. A restricted subagent's provider-side tool search could
+            // therefore still surface, describe and schema-dump the whole
+            // fleet, and on an endpoint that refuses hosted search the
+            // connector's flattened retry sends every one of them as a
+            // callable definition. Dispatch still refuses execution, so this
+            // is disclosure rather than unauthorized use - but the comment
+            // above has to be true on every path, not only where hosted search
+            // is off.
+            //
+            // A namespace left with no allowed tools is dropped whole: a name
+            // and a description with nothing behind them is disclosure with no
+            // use.
+            let allowed_ns: Vec<ToolNamespace>;
+            let deferred_ns: &[ToolNamespace] = if hosted_search_demoted {
                 &[]
+            } else if let Some(allowed) = current_tool_allowlist() {
+                allowed_ns = namespaces
+                    .iter()
+                    .filter_map(|ns| {
+                        let tools: Vec<ToolDefinition> = ns
+                            .tools
+                            .iter()
+                            .filter(|t| allowed.iter().any(|a| a == &t.name))
+                            .cloned()
+                            .collect();
+                        (!tools.is_empty()).then(|| ToolNamespace {
+                            name: ns.name.clone(),
+                            description: ns.description.clone(),
+                            tools,
+                        })
+                    })
+                    .collect();
+                &allowed_ns
+            } else {
+                &namespaces
             };
             // `tool_rounds_since_anchor` doubles as "how many tool rounds
             // have we executed in this turn". Each completed round increments
@@ -1663,12 +1696,18 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
             // keep the stall alive on their own; this covers the pre-first-token
             // window. Mirrors the tool-exec keepalive (#584). Cancellation is
             // unaffected: the call still resolves and breaks the loop.
+            // `deferred_ns`, not `namespaces`: it is the demotion-aware and
+            // allowlist-filtered set, and it is what the budget above was
+            // estimated from. Dispatching the unfiltered list sent the model a
+            // set the budget never accounted for, and one the allowlist never
+            // reached. Empty here also means there is nothing to defer, so the
+            // plain path is the right one.
             let mut llm_call =
-                if use_hosted_search && !namespaces.is_empty() && !hosted_search_demoted {
+                if use_hosted_search && !deferred_ns.is_empty() && !hosted_search_demoted {
                     self.llm.stream_completion_with_namespaces(
                         llm_messages,
                         &tool_defs,
-                        &namespaces,
+                        deferred_ns,
                         reasoning,
                         filtered_chunk_callback,
                     )
