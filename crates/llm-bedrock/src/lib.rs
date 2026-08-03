@@ -200,10 +200,14 @@ impl BedrockClient {
     /// path. `None`/`Some(0)` keeps the [`NON_STREAMING_REQUEST_TIMEOUT`]
     /// default. Seconds.
     ///
-    /// Raise this for a model that answers in one shot and legitimately takes
-    /// longer than the default to finish. It has no effect on the streaming
-    /// path, whose two budgets bound the connection and the gap between
-    /// events.
+    /// It has no effect on the streaming path, whose two budgets bound the
+    /// connection and the gap between events.
+    ///
+    /// **No connection configuration reaches this yet.** The daemon builds
+    /// its Bedrock clients without calling it, so every connection runs the
+    /// default; issue #1042 carries a `non_streaming_timeout_secs` through the
+    /// wire shape and the resolver to join the other two budgets. Until then
+    /// this is settable only by a caller constructing the client directly.
     pub fn with_non_streaming_timeout(mut self, secs: Option<u64>) -> Self {
         if let Some(s) = secs.filter(|s| *s > 0) {
             self.non_streaming_timeout = Duration::from_secs(s);
@@ -1071,7 +1075,14 @@ fn supports_configurable_reasoning(base_id: &str) -> bool {
         .any(|family| claude.starts_with(family))
 }
 
-/// Every inference-profile prefix AWS is known to issue, longest-lived first.
+/// Every inference-profile prefix AWS is known to issue.
+///
+/// **Every entry ends in `.`, and that is what keeps the list order-free.** A
+/// prefix that included the separator's absence - `"ap"` rather than `"ap."` -
+/// would match `apac.anthropic...` and leave `ac.anthropic...`, and which
+/// entry won would depend on where a maintainer inserted it.
+/// `inference_profile_prefixes_all_end_in_a_separator` holds the invariant so
+/// the next entry cannot be added without it.
 ///
 /// A profile id is the foundation model id behind one of these prefixes, so
 /// this list is what lets every capability gate in this connector see the base
@@ -1272,23 +1283,6 @@ impl ModalityIndex {
     }
 }
 
-/// The foundation model id a profile routes to, taken from the ARNs in its
-/// `models`. `None` when no entry names a foundation model - an application
-/// profile pointing at another profile, or a field AWS did not populate.
-///
-/// This is AWS's own statement of what the profile serves, so it beats
-/// [`strip_region_prefix`]: it holds for a geography prefix that postdates
-/// this build.
-fn base_model_id_from_arns(
-    profile: &aws_sdk_bedrock::types::InferenceProfileSummary,
-) -> Option<&str> {
-    profile
-        .models()
-        .iter()
-        .filter_map(|model| model.model_arn())
-        .find_map(|arn| arn.split_once("foundation-model/").map(|(_, id)| id))
-}
-
 /// Convert a `FoundationModelSummary` into a `ModelInfo`, returning `None`
 /// if the model should be filtered out (not ACTIVE, not text/embedding, or
 /// not invocable via on-demand throughput).
@@ -1344,8 +1338,13 @@ fn summary_to_model_info(
 ///
 /// A profile is a route to a foundation model, so its capabilities are that
 /// model's capabilities. `modalities` carries what `ListFoundationModels`
-/// reported in the same call, and the profile reuses it. Only where the base
-/// model is not in that listing does the id-family fallback below decide.
+/// reported in the same call, keyed by model id, and the profile reuses it.
+/// Only where the base model is not in that listing does the id-family
+/// fallback below decide.
+///
+/// The base model is named by the profile id minus its geography prefix, and
+/// by nothing else. [`fallback_modalities_from_id`] records why the ARN in the
+/// profile's `models` is not read here, and what reading it would require.
 fn inference_profile_to_model_info(
     profile: &aws_sdk_bedrock::types::InferenceProfileSummary,
     modalities: &ModalityIndex,
@@ -1361,28 +1360,15 @@ fn inference_profile_to_model_info(
         return None;
     }
 
-    // Which foundation model this profile serves. The ARN is AWS's own
-    // answer, so it wins; the stripped id is the fallback for a profile that
-    // names no foundation model. Where the two disagree, the prefix is one
-    // `INFERENCE_PROFILE_PREFIXES` does not know - say so once, loudly enough
-    // to be found, and carry on with the ARN's answer.
-    let stripped = strip_region_prefix(profile_id);
-    let base_id = match base_model_id_from_arns(profile) {
-        Some(from_arn) => {
-            if from_arn != stripped {
-                tracing::warn!(
-                    profile_id,
-                    base_model_id = from_arn,
-                    "inference-profile id does not reduce to the model it serves; \
-                     its prefix is not one this build knows. Capabilities come from \
-                     the listing, but a turn dispatched against this id resolves them \
-                     from the id alone and will under-report them"
-                );
-            }
-            from_arn
-        }
-        None => stripped,
-    };
+    // The profile id minus its geography prefix, and nothing else. The
+    // profile's `models` carry the ARN of the foundation model it serves,
+    // which would resolve more ids than this does - and it is deliberately
+    // not read here. The dispatch path has only the model id, so every gate
+    // it consults resolves through `strip_region_prefix`; a capability taken
+    // from an input dispatch does not share is a capability the picker can
+    // offer and the request builder will discard. See the note on
+    // `fallback_modalities_from_id` for what resolving it properly needs.
+    let base_id = strip_region_prefix(profile_id);
 
     let resolved = modalities.get(base_id).unwrap_or_else(|| {
         tracing::debug!(
@@ -1403,9 +1389,10 @@ fn inference_profile_to_model_info(
     Some(ModelInfo {
         id: profile_id.to_string(),
         display_name,
-        // Read against the resolved base id, so a profile whose prefix this
-        // build does not know still reports its model's real window.
-        context_limit: context_limit_for_model(base_id),
+        // `context_limit_for_model` strips the prefix itself, so the picker's
+        // window is the one `max_context_tokens` will budget against for the
+        // same id.
+        context_limit: context_limit_for_model(profile_id),
         capabilities: infer_capabilities_from_id(base_id, resolved.vision, resolved.is_embedding),
     })
 }
@@ -1423,6 +1410,16 @@ fn inference_profile_to_model_info(
 /// `is_embedding` is `false` here because an embedding model is reachable by
 /// its bare on-demand id and appears on the foundation path, so a profile for
 /// one is resolvable through the index or does not exist.
+///
+/// This is also where an id that does not reduce to a foundation model lands:
+/// an `APPLICATION` profile, whose id is a generated identifier, or a
+/// geography newer than [`INFERENCE_PROFILE_PREFIXES`]. The profile summary
+/// does carry the base model's ARN, and it is deliberately not read - the
+/// dispatch path has only the model id, so a capability recovered here and not
+/// there is one the picker offers and the request builder discards. Resolving
+/// it for both sides is issue #1044: the mapping has to reach the dispatch
+/// gates, with a defined answer for a turn against a model that was never
+/// listed.
 fn fallback_modalities_from_id(base_id: &str) -> ModelModalities {
     let lc = base_id.to_ascii_lowercase();
     let vision = lc.contains("anthropic.claude-3")
@@ -2546,6 +2543,28 @@ mod tests {
             strip_region_prefix("xx.anthropic.claude-sonnet-4-5-20250929-v1:0"),
             "xx.anthropic.claude-sonnet-4-5-20250929-v1:0"
         );
+    }
+
+    #[test]
+    fn inference_profile_prefixes_all_end_in_a_separator() {
+        // The list is matched entry by entry, so nothing may be a prefix of
+        // anything else. Ending every entry at the separator guarantees that
+        // whatever order they sit in. `"ap"` without the dot would match
+        // `apac.anthropic...` and leave `ac.anthropic...` behind.
+        for prefix in INFERENCE_PROFILE_PREFIXES {
+            assert!(
+                prefix.ends_with('.'),
+                "{prefix} must end at the separator, or it can swallow another prefix"
+            );
+        }
+        for (i, outer) in INFERENCE_PROFILE_PREFIXES.iter().enumerate() {
+            for (j, inner) in INFERENCE_PROFILE_PREFIXES.iter().enumerate() {
+                assert!(
+                    i == j || !outer.starts_with(inner),
+                    "{inner} is a prefix of {outer}, so the match depends on list order"
+                );
+            }
+        }
     }
 
     #[test]
