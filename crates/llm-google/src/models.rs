@@ -142,7 +142,10 @@ mod tests {
     fn curated_2_5_models_flagged_reasoning_and_tools() {
         let models = curated_gemini_models();
         let pro = models.iter().find(|m| m.id == "gemini-2.5-pro").unwrap();
-        assert!(pro.capabilities.reasoning, "2.5 pro is a reasoning model");
+        assert!(
+            pro.capabilities.reasoning,
+            "2.5 pro takes a thinking budget, which is what the flag reports"
+        );
         assert!(pro.capabilities.tools);
         assert!(pro.capabilities.vision);
         assert_eq!(pro.capabilities.kind, ModelKind::Generative);

@@ -64,6 +64,15 @@ input most in need of better data. Several connectors infer it from substrings
 of the model id today. Where a provider publishes real capability metadata, read
 that instead.
 
+One of those flags does not mean what its name suggests, and the exception is
+load-bearing. `reasoning` answers "can this connector configure reasoning for
+this model", not "does this model reason". Every consumer already treats it that
+way - a client offers a reasoning control, a connector decides whether to send
+the field - and a model that reasons but accepts no configuration has to report
+`false`, or the control is shown and the budget is dropped. DeepSeek R1 on
+Bedrock is exactly that model. So the flag is populated from the same function
+the request path reads, never from a second list that can disagree with it.
+
 **The API surface.** What the API serving this model supports. Only a connector
 that speaks more than one API needs this input, and only Bedrock does. Azure's
 two surfaces differ in URL shape and carry identical capabilities; Google's two
