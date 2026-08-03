@@ -1028,13 +1028,42 @@ fn supports_configurable_reasoning(base_id: &str) -> bool {
         .any(|family| claude.starts_with(family))
 }
 
-/// Strip a cross-region inference-profile prefix (`us.`, `eu.`, `apac.`) to
-/// recover the underlying foundation model id. Returns the input unchanged
-/// when no known prefix matches.
+/// Every inference-profile prefix AWS is known to issue, longest-lived first.
+///
+/// A profile id is the foundation model id behind one of these prefixes, so
+/// this list is what lets every capability gate in this connector see the base
+/// id. A missing entry is not cosmetic: the gates take the stripped id, so an
+/// unstripped prefix makes extended thinking, prompt caching, the context
+/// window and the streaming-with-tools deny list all answer for an id that
+/// matches nothing - silently withholding a capability the model has.
+///
+/// Sources, all AWS documentation:
+/// - Geographic cross-Region inference names `us`, `eu`, `apac` as geography
+///   prefixes, and `ap` appears on the newer APAC profiles.
+/// - The Claude Sonnet 4.5 model card lists Geo ids for `us.`, `eu.`, `au.`
+///   and `jp.`, and the Global id `global.anthropic.claude-sonnet-4-5-...`.
+/// - GovCloud sources route through the US geo id, and `us-gov.` is carried
+///   here as well because it costs nothing and an unstripped prefix is the
+///   expensive direction.
+///
+/// An allowlist rather than "drop the first dotted segment", because model ids
+/// carry dots of their own - `openai.gpt-5.6` would lose its provider.
+const INFERENCE_PROFILE_PREFIXES: &[&str] = &[
+    "global.", "us-gov.", "us.", "eu.", "apac.", "ap.", "au.", "jp.",
+];
+
+/// Strip a cross-region inference-profile prefix to recover the underlying
+/// foundation model id. Returns the input unchanged when no known prefix
+/// matches.
+///
+/// The listing path does better than this where it can: a profile carries the
+/// ARN of the model it routes to, so [`base_model_id_from_arns`] recovers the
+/// base id even for a prefix this build has never seen. This function is what
+/// the dispatch path has, where the model id string is all there is.
 fn strip_region_prefix(id: &str) -> &str {
-    id.strip_prefix("us.")
-        .or_else(|| id.strip_prefix("eu."))
-        .or_else(|| id.strip_prefix("apac."))
+    INFERENCE_PROFILE_PREFIXES
+        .iter()
+        .find_map(|prefix| id.strip_prefix(prefix))
         .unwrap_or(id)
 }
 
@@ -1193,31 +1222,28 @@ impl ModalityIndex {
         )
     }
 
-    /// The modalities of the foundation model a profile routes to, or `None`
-    /// when this account's listing does not describe that model.
-    ///
-    /// Two ways to name the base model, tried in order. The profile's `models`
-    /// carry the foundation-model ARN, which is AWS's own statement of what
-    /// the profile routes to. Where no ARN names a foundation model - an
-    /// application profile pointing at another profile, or a field AWS did not
-    /// populate - the profile id minus its region prefix is the same id by
-    /// construction (`us.anthropic.claude-...`).
-    fn resolve_profile(
-        &self,
-        profile: &aws_sdk_bedrock::types::InferenceProfileSummary,
-    ) -> Option<ModelModalities> {
-        profile
-            .models()
-            .iter()
-            .filter_map(|model| model.model_arn())
-            .filter_map(|arn| arn.split_once("foundation-model/"))
-            .find_map(|(_, base_id)| self.0.get(base_id).copied())
-            .or_else(|| {
-                self.0
-                    .get(strip_region_prefix(profile.inference_profile_id()))
-                    .copied()
-            })
+    /// The modalities this listing reported for `base_id`, or `None` when it
+    /// did not describe that model.
+    fn get(&self, base_id: &str) -> Option<ModelModalities> {
+        self.0.get(base_id).copied()
     }
+}
+
+/// The foundation model id a profile routes to, taken from the ARNs in its
+/// `models`. `None` when no entry names a foundation model - an application
+/// profile pointing at another profile, or a field AWS did not populate.
+///
+/// This is AWS's own statement of what the profile serves, so it beats
+/// [`strip_region_prefix`]: it holds for a geography prefix that postdates
+/// this build.
+fn base_model_id_from_arns(
+    profile: &aws_sdk_bedrock::types::InferenceProfileSummary,
+) -> Option<&str> {
+    profile
+        .models()
+        .iter()
+        .filter_map(|model| model.model_arn())
+        .find_map(|arn| arn.split_once("foundation-model/").map(|(_, id)| id))
 }
 
 /// Convert a `FoundationModelSummary` into a `ModelInfo`, returning `None`
@@ -1292,10 +1318,33 @@ fn inference_profile_to_model_info(
         return None;
     }
 
-    let base_id = strip_region_prefix(profile_id);
-    let resolved = modalities.resolve_profile(profile).unwrap_or_else(|| {
+    // Which foundation model this profile serves. The ARN is AWS's own
+    // answer, so it wins; the stripped id is the fallback for a profile that
+    // names no foundation model. Where the two disagree, the prefix is one
+    // `INFERENCE_PROFILE_PREFIXES` does not know - say so once, loudly enough
+    // to be found, and carry on with the ARN's answer.
+    let stripped = strip_region_prefix(profile_id);
+    let base_id = match base_model_id_from_arns(profile) {
+        Some(from_arn) => {
+            if from_arn != stripped {
+                tracing::warn!(
+                    profile_id,
+                    base_model_id = from_arn,
+                    "inference-profile id does not reduce to the model it serves; \
+                     its prefix is not one this build knows. Capabilities come from \
+                     the listing, but a turn dispatched against this id resolves them \
+                     from the id alone and will under-report them"
+                );
+            }
+            from_arn
+        }
+        None => stripped,
+    };
+
+    let resolved = modalities.get(base_id).unwrap_or_else(|| {
         tracing::debug!(
             profile_id,
+            base_id,
             "inference profile has no foundation-model entry in this listing; \
              falling back to the model-id family for its modalities"
         );
@@ -1311,8 +1360,9 @@ fn inference_profile_to_model_info(
     Some(ModelInfo {
         id: profile_id.to_string(),
         display_name,
-        // context_limit_for_model already strips the region prefix internally.
-        context_limit: context_limit_for_model(profile_id),
+        // Read against the resolved base id, so a profile whose prefix this
+        // build does not know still reports its model's real window.
+        context_limit: context_limit_for_model(base_id),
         capabilities: infer_capabilities_from_id(base_id, resolved.vision, resolved.is_embedding),
     })
 }
@@ -3253,14 +3303,18 @@ mod tests {
         name: &str,
         status: InferenceProfileStatus,
     ) -> InferenceProfileSummary {
-        // The builder requires `models` to be set (the underlying foundation
-        // models the profile routes to). A stub ARN that matches no listed
-        // model is enough here: paired with an empty `ModalityIndex` it puts
-        // these tests on the id-family fallback, which is what they cover.
-        // The metadata path is covered end to end against a mocked control
-        // plane, further down.
+        // `models` carries the foundation model the profile routes to, and a
+        // real profile's ARN names the same model its id reduces to - so the
+        // stub is built from the id, not from a placeholder. Paired with an
+        // empty `ModalityIndex`, these tests then exercise the id-family
+        // fallback, which is what they cover. The metadata path and the
+        // disagreeing-ARN path are covered end to end against a mocked
+        // control plane, further down.
         let model_stub = InferenceProfileModel::builder()
-            .model_arn("arn:aws:bedrock:us-east-1::foundation-model/test")
+            .model_arn(format!(
+                "arn:aws:bedrock:us-east-1::foundation-model/{}",
+                strip_region_prefix(id)
+            ))
             .build();
         InferenceProfileSummary::builder()
             .inference_profile_arn(format!(

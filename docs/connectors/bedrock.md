@@ -141,7 +141,19 @@ backend that skips it advertises models that cannot be called.
 reports no modalities, and a profile is only a route to a foundation model, so
 the profile entry reuses the modality metadata `ListFoundationModels` returned
 in the same call. The base model is named by the foundation-model ARN in the
-profile's `models`, and failing that by the profile id minus its region prefix.
+profile's `models`, and failing that by the profile id minus its geography
+prefix.
+
+**The base id is what every capability gate reads.** Extended thinking, prompt
+caching, the streaming-with-tools deny list and the context window all take the
+prefix-stripped id, so a prefix the connector does not recognise withholds all
+four at once, silently. The recognised set is `global.`, `us.`, `eu.`, `apac.`,
+`ap.`, `au.`, `jp.` and `us-gov.`, held in one list and pinned by a test. It is
+an allowlist rather than "drop the first dotted segment", because model ids
+carry dots of their own - `openai.gpt-5.6` would lose its provider. On the
+listing path the profile's own ARN outranks the list, so a geography AWS adds
+later still resolves; where the two disagree the connector says so at `warn!`,
+because a turn dispatched against that id has only the id to work from.
 Only a profile whose base model this account did not list falls back to a
 family guess from the id, which reports vision from the family and treats the
 model as generative - an embedding model is reachable by its bare on-demand id,
