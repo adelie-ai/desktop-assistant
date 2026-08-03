@@ -2424,11 +2424,19 @@ mod tests {
             !off.supports_hosted_tool_search(),
             "the configured preference must drive the claim, not a constant"
         );
+    }
 
-        // Constructor default, pinned because the two connectors differ.
+    #[test]
+    fn anthropic_defaults_hosted_tool_search_on() {
+        // `[llm].hosted_tool_search` is `Option<bool>` and documents `None` as
+        // "the connector's built-in capability", so an unconfigured connection
+        // is answered by this constructor alone - the daemon only calls
+        // `with_hosted_tool_search` for `Some`. This client implements the
+        // capability, so the built-in answer is yes, the same as OpenAI's.
         assert!(
             AnthropicClient::new("k".into()).supports_hosted_tool_search(),
-            "the constructor default is on, and the two connectors differ"
+            "an unconfigured Anthropic connection must get the capability this \
+             client implements"
         );
     }
 }

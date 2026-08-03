@@ -1416,6 +1416,71 @@ mystery_key = "x"
         assert!(!Connector::Google.type_offers_hosted_tool_search());
     }
 
+    /// What a client built from `connector`'s own constructor answers about
+    /// hosted tool search, with no `.with_hosted_tool_search(...)` call.
+    ///
+    /// Exhaustive with no catch-all, so a new connector must be built here
+    /// before this compiles.
+    fn default_client_offers_hosted_tool_search(connector: Connector) -> bool {
+        use desktop_assistant_core::ports::llm::LlmClient;
+
+        let key = "probe-key".to_string();
+        match connector {
+            Connector::Ollama => desktop_assistant_llm_ollama::OllamaClient::new(
+                "http://localhost:11434",
+                "probe-model",
+            )
+            .supports_hosted_tool_search(),
+            Connector::Anthropic => {
+                desktop_assistant_llm_anthropic::AnthropicClient::new(key)
+                    .supports_hosted_tool_search()
+            }
+            Connector::Bedrock => {
+                desktop_assistant_llm_bedrock::BedrockClient::new(key).supports_hosted_tool_search()
+            }
+            Connector::OpenAi => {
+                desktop_assistant_llm_openai::OpenAiClient::new(key).supports_hosted_tool_search()
+            }
+            Connector::OpenRouter => desktop_assistant_llm_openrouter::OpenRouterClient::new(key)
+                .supports_hosted_tool_search(),
+            Connector::Azure => {
+                desktop_assistant_llm_azure::AzureClient::new(key).supports_hosted_tool_search()
+            }
+            Connector::Google => {
+                desktop_assistant_llm_google::GoogleClient::new(key).supports_hosted_tool_search()
+            }
+        }
+    }
+
+    /// A connector whose *type* offers hosted tool search must build a client
+    /// that claims it without being asked, and a connector whose type does not
+    /// must not.
+    ///
+    /// `[llm].hosted_tool_search` is `Option<bool>` and documents `None` as
+    /// "the connector's built-in capability", so an operator who configures
+    /// nothing is answered by the client constructor alone -
+    /// `build_llm_client` calls `.with_hosted_tool_search(...)` only for
+    /// `Some`. Two connectors used to disagree about what the absent setting
+    /// means (#1035); this holds the type claim and the constructor default to
+    /// one answer.
+    ///
+    /// Driven from [`Connector::ALL`], and it fails in both directions: a
+    /// client that withholds what its type claims fails, and so does a client
+    /// that claims what its type denies.
+    #[test]
+    fn connector_clients_default_hosted_tool_search_to_the_type_claim() {
+        for &c in Connector::ALL {
+            assert_eq!(
+                default_client_offers_hosted_tool_search(c),
+                c.type_offers_hosted_tool_search(),
+                "{c} builds an unconfigured client claiming hosted tool search \
+                 = {}, but type_offers_hosted_tool_search() says {}",
+                default_client_offers_hosted_tool_search(c),
+                c.type_offers_hosted_tool_search(),
+            );
+        }
+    }
+
     #[test]
     fn connection_config_connector_method_matches_type_tag() {
         let cases: [(ConnectionConfig, Connector); 7] = [
