@@ -3497,7 +3497,8 @@ mod tests {
         ];
         // Map built from the CURRENT tool set (which still offers the tool).
         let map = ToolNameMap::from_names(["weather.lookup"]);
-        let (_system, messages) = convert_messages(&history, &map).expect("convert ok");
+        let (_system, messages) =
+            convert_messages(&history, &map, "us.anthropic.claude-sonnet-4-6").expect("convert ok");
 
         let names = tool_use_names(&messages);
         assert_eq!(names.len(), 1, "expected one toolUse in history");
@@ -3525,7 +3526,8 @@ mod tests {
         )])];
         // Empty map: the tool isn't offered this turn.
         let map = ToolNameMap::from_names(Vec::<&str>::new());
-        let (_system, messages) = convert_messages(&history, &map).expect("convert ok");
+        let (_system, messages) =
+            convert_messages(&history, &map, "us.anthropic.claude-sonnet-4-6").expect("convert ok");
         let names = tool_use_names(&messages);
         assert_eq!(names.len(), 1);
         assert!(
@@ -3556,7 +3558,8 @@ mod tests {
         let history = vec![Message::assistant_with_tool_calls(vec![ToolCall::new(
             "c1", tool, "{}",
         )])];
-        let (_s, messages) = convert_messages(&history, &map).expect("ok");
+        let (_s, messages) =
+            convert_messages(&history, &map, "us.anthropic.claude-sonnet-4-6").expect("ok");
         let hist_name = tool_use_names(&messages).into_iter().next().expect("one");
 
         assert_eq!(
@@ -3586,6 +3589,235 @@ mod tests {
         // ids and arguments survive untouched.
         assert_eq!(restored[0].id, "id1");
         assert_eq!(restored[0].arguments, r#"{"p":1}"#);
+    }
+
+    // --- Prompt caching (#462) -------------------------------------------
+    //
+    // Bedrock's Converse API caches a prompt prefix when the request carries a
+    // `cachePoint` block. Support is per model, not per API: a model that does
+    // not support it rejects the request. So the connector emits the block only
+    // where the model accepts it, and reads the two cache counters back out of
+    // the response usage.
+
+    /// The system blocks the daemon actually sends: one stable assembler
+    /// instruction, then a volatile per-turn block.
+    ///
+    /// The checkpoint belongs between the two. Caching is a prefix match, so a
+    /// checkpoint after the volatile block is written every turn and read
+    /// never.
+    fn caching_history() -> Vec<Message> {
+        vec![
+            Message::new(Role::System, "stable assembler instruction"),
+            Message::new(Role::System, "[Scratchpad] volatile per-turn state"),
+            Message::new(Role::User, "hi"),
+        ]
+    }
+
+    /// Indices of the cache checkpoints in a system block list.
+    fn cache_point_indices(system: &[SystemContentBlock]) -> Vec<usize> {
+        system
+            .iter()
+            .enumerate()
+            .filter(|(_, block)| matches!(block, SystemContentBlock::CachePoint(_)))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    #[test]
+    fn cache_point_emitted_for_anthropic_model() {
+        let map = ToolNameMap::from_names(Vec::<&str>::new());
+        let (system, _messages) =
+            convert_messages(&caching_history(), &map, "us.anthropic.claude-sonnet-4-6")
+                .expect("convert ok");
+
+        assert_eq!(
+            cache_point_indices(&system),
+            vec![1],
+            "exactly one checkpoint, directly after the stable system prefix: {system:?}"
+        );
+        // The prefix itself must survive unchanged in front of the checkpoint.
+        assert!(
+            matches!(&system[0], SystemContentBlock::Text(t) if t == "stable assembler instruction"),
+            "leading block must stay the stable prefix: {:?}",
+            system[0]
+        );
+        // The volatile block follows the checkpoint, so a change in it does
+        // not invalidate the cached prefix.
+        assert!(
+            matches!(&system[2], SystemContentBlock::Text(t) if t.starts_with("[Scratchpad]")),
+            "volatile block must follow the checkpoint: {:?}",
+            system[2]
+        );
+    }
+
+    #[test]
+    fn cache_point_emitted_for_amazon_nova_model() {
+        let map = ToolNameMap::from_names(Vec::<&str>::new());
+        let (system, _messages) =
+            convert_messages(&caching_history(), &map, "us.amazon.nova-pro-v1:0")
+                .expect("convert ok");
+        assert_eq!(cache_point_indices(&system), vec![1], "{system:?}");
+    }
+
+    #[test]
+    fn cache_point_omitted_for_meta_llama() {
+        let map = ToolNameMap::from_names(Vec::<&str>::new());
+        // Bedrock rejects a checkpoint on a Meta model, so the request must go
+        // out without one - and it must still be built successfully.
+        let (system, messages) = convert_messages(
+            &caching_history(),
+            &map,
+            "us.meta.llama4-maverick-17b-instruct-v1:0",
+        )
+        .expect("a model without caching support still converts");
+
+        assert!(
+            cache_point_indices(&system).is_empty(),
+            "no checkpoint for Meta: {system:?}"
+        );
+        assert_eq!(system.len(), 2, "both system blocks survive: {system:?}");
+        assert_eq!(messages.len(), 1, "the user turn survives: {messages:?}");
+    }
+
+    #[test]
+    fn cache_point_omitted_for_inference_profile_whose_base_model_lacks_support() {
+        let map = ToolNameMap::from_names(Vec::<&str>::new());
+        // The region prefix must not hide the base model from the check.
+        for profile_id in [
+            "us.deepseek.r1-v1:0",
+            "eu.mistral.mistral-large-2407-v1:0",
+            "apac.cohere.command-r-plus-v1:0",
+            // Claude 3 (not 3.5) predates prompt caching on Bedrock.
+            "us.anthropic.claude-3-haiku-20240307-v1:0",
+        ] {
+            let (system, _messages) =
+                convert_messages(&caching_history(), &map, profile_id).expect("convert ok");
+            assert!(
+                cache_point_indices(&system).is_empty(),
+                "{profile_id} must get no checkpoint: {system:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cache_point_never_emitted_on_tool_list() {
+        // Bedrock evaluates checkpoints `tools` -> `system` -> `messages`, and
+        // a change in an earlier section invalidates every later one. Tool
+        // search moves the tool list inside a conversation, so a checkpoint on
+        // `tools` would invalidate the system cache on every such turn.
+        let cfg = convert_tools(
+            &[ToolDefinition::new("weather", "d", serde_json::json!({}))],
+            &ToolNameMap::from_names(["weather"]),
+        )
+        .expect("convert ok")
+        .expect("one tool config");
+
+        assert!(
+            !cfg.tools()
+                .iter()
+                .any(|tool| matches!(tool, Tool::CachePoint(_))),
+            "the tool list must carry no checkpoint: {:?}",
+            cfg.tools()
+        );
+    }
+
+    #[test]
+    fn usage_maps_cache_read_and_write_tokens() {
+        use aws_sdk_bedrockruntime::types::{
+            ConverseStreamMetadataEvent, ConverseStreamOutput, TokenUsage as SdkTokenUsage,
+        };
+
+        let sdk_usage = SdkTokenUsage::builder()
+            .input_tokens(120)
+            .output_tokens(30)
+            .total_tokens(150)
+            .cache_read_input_tokens(4096)
+            .cache_write_input_tokens(2048)
+            .build()
+            .expect("usage builds");
+
+        // Non-streaming path (`dispatch_non_streaming`) maps through here.
+        let mapped = map_token_usage(&sdk_usage);
+        assert_eq!(mapped.input_tokens, Some(120));
+        assert_eq!(mapped.output_tokens, Some(30));
+        assert_eq!(mapped.cache_read_input_tokens, Some(4096));
+        assert_eq!(mapped.cache_creation_input_tokens, Some(2048));
+
+        // Streaming path (`dispatch_streaming`) maps through `apply_stream_event`.
+        let mut text = String::new();
+        let mut tool_acc = ToolCallAccumulator::default();
+        let mut on_chunk: ChunkCallback = Box::new(|_| true);
+        let mut token_usage = None;
+        apply_stream_event(
+            ConverseStreamOutput::Metadata(
+                ConverseStreamMetadataEvent::builder()
+                    .usage(sdk_usage)
+                    .build(),
+            ),
+            &mut text,
+            &mut tool_acc,
+            &mut on_chunk,
+            &mut token_usage,
+        );
+        let streamed = token_usage.expect("metadata event yields usage");
+        assert_eq!(streamed.input_tokens, Some(120));
+        assert_eq!(streamed.output_tokens, Some(30));
+        assert_eq!(streamed.cache_read_input_tokens, Some(4096));
+        assert_eq!(streamed.cache_creation_input_tokens, Some(2048));
+    }
+
+    #[test]
+    fn usage_omits_cache_counters_when_the_response_has_none() {
+        use aws_sdk_bedrockruntime::types::TokenUsage as SdkTokenUsage;
+
+        // A model without caching returns no cache fields. `Some(0)` would
+        // read to a caller as "caching ran and saved nothing", which is a
+        // different claim from "caching did not run".
+        let sdk_usage = SdkTokenUsage::builder()
+            .input_tokens(10)
+            .output_tokens(5)
+            .total_tokens(15)
+            .build()
+            .expect("usage builds");
+
+        let mapped = map_token_usage(&sdk_usage);
+        assert_eq!(mapped.cache_read_input_tokens, None);
+        assert_eq!(mapped.cache_creation_input_tokens, None);
+    }
+
+    #[test]
+    fn supports_prompt_caching_reads_the_stripped_base_id() {
+        // The caller strips the region prefix, as it does for
+        // `supports_streaming_with_tools`.
+        assert!(supports_prompt_caching(strip_region_prefix(
+            "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+        )));
+        assert!(supports_prompt_caching(strip_region_prefix(
+            "eu.anthropic.claude-3-7-sonnet-20250219-v1:0"
+        )));
+        assert!(supports_prompt_caching(strip_region_prefix(
+            "apac.amazon.nova-lite-v1:0"
+        )));
+        assert!(!supports_prompt_caching(strip_region_prefix(
+            "us.meta.llama4-maverick-17b-instruct-v1:0"
+        )));
+        // Unknown models default to "no checkpoint": an unwanted checkpoint
+        // fails the whole request, a missing one only costs tokens.
+        assert!(!supports_prompt_caching("future.unknown-model"));
+    }
+
+    #[test]
+    fn cache_point_omitted_when_there_is_no_system_prompt() {
+        // A checkpoint on an empty `system` list has nothing to cache and
+        // would be the only element of the list.
+        let map = ToolNameMap::from_names(Vec::<&str>::new());
+        let (system, _messages) = convert_messages(
+            &[Message::new(Role::User, "hi")],
+            &map,
+            "us.anthropic.claude-sonnet-4-6",
+        )
+        .expect("convert ok");
+        assert!(system.is_empty(), "no system blocks, no checkpoint");
     }
 
     // --- Cancellation (issue #109) ---------------------------------------
