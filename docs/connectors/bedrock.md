@@ -2,276 +2,283 @@
 
 Crate: `desktop-assistant-llm-bedrock`
 
-## Overview
+## Purpose and scope
 
-The Bedrock connector provides unified access to AWS Bedrock with support for multiple backend APIs. It aggregates models across backend APIs while presenting a coherent capability model to clients.
+One connector reaches every model AWS Bedrock offers. Bedrock serves those
+models through several different APIs, and no single API reaches all of them.
+The connector speaks each API it needs and hides that choice from the user. A
+person configures one Bedrock connection and picks a model. They never pick an
+API.
+
+The connector owns model discovery, backend selection, request translation, and
+the cross-cutting concerns of timeout and cache policy. It does not own
+provider-independent behaviour that belongs to the daemon: purpose binding,
+context budgeting, retry, and tool dispatch.
+
+## Why several backends
+
+Each Bedrock API surface reaches models the others cannot. That is the reason
+for the split. Capability differences between the APIs are real, but they are
+secondary: they decide which backend serves a request, not whether the backend
+exists at all.
+
+| Backend | SDK operation | Endpoint | Reaches |
+|---|---|---|---|
+| Converse | `Converse`, `ConverseStream` | `bedrock-runtime` | Text chat, broadly: Anthropic, Amazon Nova, Meta, Mistral, Cohere, DeepSeek, GLM. Mostly through cross-region inference profiles. |
+| Responses | Responses API | `bedrock-mantle` | The `openai.gpt-5.6` family. No other API reaches these models. |
+| Invoke | `InvokeModel`, `InvokeModelWithResponseStream` | `bedrock-runtime` | Everything Converse refuses: embeddings, image and video generation, reranking, and any model that rejects a Converse request. |
+
+Converse is a text-and-chat API only. Embedding models, image generation models
+and rerankers are not addressable through it. The connector already calls
+`InvokeModel` for embeddings, so the Invoke path exists today. The backend work
+generalises that path; it does not introduce it.
+
+Responses runs on a different endpoint from the other two. It needs its own SDK
+client, not a second serialization over the shared one.
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                     BedrockConnector                          │
-│  - Unified external interface                                 │
-│  - High-level concerns: retry, timeouts, cache policy         │
-│  - Model aggregation across backends                          │
-│  - Capability composition                                      │
-└──────────────────────────────────────────────────────────────┘
-                              │
-        ┌─────────────────────┼─────────────────────┐
-        │                     │                     │
-        ▼                     ▼                     ▼
-┌───────────────┐   ┌───────────────┐   ┌───────────────┐
-│    Converse   │   │    Invoke     │   │   Responses   │
-│    Backend    │   │    Backend    │   │   Backend     │
-│               │   │               │   │  (GPT-5.x)    │
-└───────────────┘   └───────────────┘   └───────────────┘
-        │                     │                     │
-        └─────────────────────┴─────────────────────┘
-                              │
-                              ▼
-                  AWS SDK (bedrock-runtime-client)
+                    BedrockConnector  (implements LlmClient)
+                    - model aggregation and de-duplication
+                    - backend selection
+                    - capability composition
+                    - cache policy
+                             |
+        +--------------------+--------------------+
+        |                    |                    |
+   ConverseBackend      InvokeBackend      ResponsesBackend
+        |                    |                    |
+   bedrock-runtime      bedrock-runtime      bedrock-mantle
 ```
 
-## Backend APIs
-
-### Converse Backend (Primary)
-
-**Surface:** `Converse` / `ConverseStream` SDK calls
-
-**Use when:** General-purpose model access across Bedrock providers
-
-**Capabilities:**
-- Streaming: ✓
-- Tool calling: ✓
-- Vision: ✓ (model-dependent)
-- Tool search: ✗
-- Prompt caching: ✗
-- Cache control: ✗
-
-**Models:** Most Bedrock models accessible through this API (Anthropic, Amazon Nova, Cohere, etc.)
-
-The Converse API is Bedrock's provider-agnostic abstraction. It normalizes request/response formats across different model providers, which simplifies the connector but loses provider-specific features.
-
-### Invoke Backend (Anthropic Features)
-
-**Surface:** `InvokeModel` / `InvokeModelWithResponseStream` SDK calls
-
-**Use when:** Anthropic-specific features are required
-
-**Capabilities:**
-- Streaming: ✓
-- Tool calling: ✓
-- Vision: ✓
-- Tool search: ✓ (Anthropic-style)
-- Prompt caching: ✓ (Anthropic-style)
-- Cache control: ✓
-
-**Models:** Anthropic models (`anthropic.claude-*`, `us.anthropic.claude-*`)
-
-The Invoke backend sends raw Anthropic-compatible JSON to Bedrock, enabling features that Converse doesn't expose. This duplicates some logic with the direct `llm-anthropic` crate, but the alternative (using that crate directly) would require a different HTTP transport layer.
-
-### Responses Backend (Future)
-
-**Surface:** TBD — AWS Bedrock integration for OpenAI-style Responses API
-
-**Use when:** GPT-5.x models on Bedrock that require the Responses surface
-
-**Capabilities:** (projected)
-- Streaming: ✓
-- Tool calling: ✓
-- Vision: ✓
-- Tool search: ✓ (OpenAI-style)
-- Reasoning config: ✓ (reasoning_effort)
-
-**Models:** OpenAI models provisioned on Bedrock (if/when AWS launches this)
-
-*Status: Not yet implemented. Placeholder for future Bedrock/Responses integration.*
-
----
-
-## Backend Trait
+## The backend trait
 
 ```rust
-/// Common interface for Bedrock backend APIs.
-/// 
-/// Each backend (Converse, Invoke, Responses) implements this trait,
-/// providing model discovery and completion streaming specific to that API.
+/// One Bedrock API surface.
+///
+/// An implementor translates the connector's request into its own API shape
+/// and translates the response back. It does not retry, and it does not
+/// decide which models the user sees.
 #[async_trait]
 pub trait BedrockBackend: Send + Sync {
-    /// Human-readable API name for logging and diagnostics.
+    /// Short API name, for logs, notices and model annotation.
     fn api_name(&self) -> &'static str;
-    
-    /// List models accessible through this backend.
-    async fn list_models(&self) -> Result<Vec<ModelInfo>, CoreError>;
-    
-    /// Stream a completion through this backend.
+
+    /// Whether this backend can serve the model at all.
+    ///
+    /// This is the routing primitive. A backend that cannot serve a model
+    /// never receives a request for it, and never contributes it to the
+    /// catalogue.
+    fn can_serve(&self, model_id: &str) -> bool;
+
+    /// The models this backend reaches, with any listing notices.
+    async fn list_models(&self) -> Result<ModelListingReport, CoreError>;
+
+    /// What this API surface supports for one model.
+    ///
+    /// Why the model id: support varies per model inside a single API.
+    /// Converse accepts `cachePoint` for Anthropic and Nova models, and
+    /// rejects it for Meta, Mistral and Cohere models.
+    fn capabilities(&self, model_id: &str) -> BackendApiCapabilities;
+
+    /// Stream a completion.
     async fn stream_completion(
         &self,
-        model_id: &str,
-        messages: Vec<Message>,
-        tools: &[ToolDefinition],
-        reasoning: ReasoningConfig,
-        cache_control: Option<CacheControl>,
+        request: BedrockRequest,
         on_chunk: ChunkCallback,
     ) -> Result<LlmResponse, CoreError>;
-    
-    /// Capabilities of this backend API.
-    fn capabilities(&self) -> BackendApiCapabilities;
-    
-    /// Whether this backend can serve the given model.
-    fn can_serve(&self, model_id: &str) -> bool;
 }
 ```
 
-### Supertrait Relationship
+The trait uses `#[async_trait]`. It does not use `-> impl Future` in return
+position, because `BedrockConnector` holds `Vec<Arc<dyn BedrockBackend>>` and
+return-position `impl Trait` is not dyn-compatible.
 
-`BedrockBackend` does **not** extend `LlmClient`. Instead:
+`BedrockBackend` does not extend `LlmClient`. `BedrockConnector` implements
+`LlmClient`, and the backends sit behind it. This keeps `core` unaware of
+Bedrock internals, and keeps each backend responsible for one API.
 
-- `BedrockConnector` (the top-level struct) implements `LlmClient`
-- `BedrockConnector` holds `Vec<Arc<dyn BedrockBackend>>`
-- The connector delegates to the appropriate backend based on model ID
+## Model aggregation
 
-This separation ensures:
-1. Backends focus on API-specific concerns
-2. The connector handles cross-cutting concerns (retry, caching, model selection)
-3. The `LlmClient` trait остается in `core` and doesn't know about Bedrock internals
+The connector queries every backend and merges the results into one catalogue.
 
----
+**A model appears once.** The user picks a model, not a model-and-API pair. When
+several backends serve the same model id, the entry is de-duplicated, and it
+records the full set of backends that serve it. It does not keep only the
+richest one. The discarded backends carry capabilities that the kept one does
+not, and dropping them would hide capabilities the product has.
 
-## Connector Responsibilities
+**A failing backend degrades the catalogue. It does not empty it.** Each backend
+returns a `ModelListingReport`, which carries `notices` beside `models`. The
+connector concatenates both. A backend that fails contributes a notice that
+names what is missing, and the models from the other backends still reach the
+picker. The daemon puts those notices on every `ListAvailableModels` row for the
+connection, so a client can explain a partial catalogue instead of showing an
+empty one.
 
-### Model Aggregation
+Inside the Converse backend, discovery makes two control-plane calls in
+parallel:
 
-The connector queries all backends for models and merges them:
+| Call | IAM action | Contributes |
+|---|---|---|
+| `ListFoundationModels` | `bedrock:ListFoundationModels` | Foundation models with on-demand throughput |
+| `ListInferenceProfiles` | `bedrock:ListInferenceProfiles` | Cross-region inference profiles (`us.anthropic.claude-...`) |
 
-```rust
-async fn list_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
-    let mut all_models = Vec::new();
-    
-    for backend in &self.backends {
-        let models = backend.list_models().await?;
-        all_models.extend(models.into_iter().map(|m| ModelInfo {
-            id: m.id,
-            display_name: m.display_name,
-            context_limit: m.context_limit,
-            capabilities: m.capabilities,
-            // Annotate with backend info for diagnostics
-            backend: Some(backend.api_name().to_string()),
-        }));
-    }
-    
-    Ok(all_models)
-}
-```
+A failure of `ListFoundationModels` fails that backend's listing. A failure of
+`ListInferenceProfiles` does not: the listing degrades to on-demand foundation
+models and adds a partial-catalogue notice that names
+`bedrock:ListInferenceProfiles`. Many IAM policies grant only the first call.
 
-Duplicate model IDs (e.g., `anthropic.claude-sonnet-4-6` available via both Converse and Invoke) are resolved by preferring the backend with richer capabilities (Invoke > Converse).
+**Foundation models without on-demand support are filtered out.** Their bare ids
+are not callable. Selecting one fails at invocation time with a
+`ValidationException`. In a current AWS account that filter removes nearly every
+modern chat model, because those models are reachable only through an inference
+profile. Every backend that lists foundation models applies the same filter. A
+backend that skips it advertises models that cannot be called.
 
-### Backend Selection
+Notices are cached with the models, so a cache hit inside the one-hour TTL still
+reports the degradation. An explicit refresh re-issues the calls and always
+returns a report, so a client can tell a reload that found nothing new from a
+reload that failed.
 
-When a completion request arrives:
+## Backend selection
 
-```rust
-async fn stream_completion(&self, messages: Vec<Message>, ...) -> Result<LlmResponse, CoreError> {
-    let model_id = current_model_override()
-        .unwrap_or_else(|| self.default_model.as_str());
-    
-    // Select backend based on model ID and feature requirements
-    let backend = self.select_backend(model_id, /* cache_control, tool_search */);
-    
-    backend.stream_completion(model_id, messages, ...).await
-}
-```
+Selection runs in two steps, in this order.
 
-Backend selection logic:
-1. Check if model ID prefix indicates backend (`invoke/`, `converse/`)
-2. Check if request requires features only available on specific backends
-3. Default to Invoke for Anthropic models, Converse for others
+1. **Reach.** Keep the backends whose `can_serve` accepts the model. If none
+   does, the model is not in the catalogue, and no request for it can arrive.
+2. **Requested features.** Among those, choose a backend whose
+   `BackendApiCapabilities` satisfy what the request asks for: cache control
+   when the cache policy is on, vision when the messages carry images, and so
+   on.
 
-### Capability Composition
+When more than one backend qualifies, prefer the backend that already served
+this conversation, then the first one listed. Stability is worth more than a
+small capability gain, because a change of backend inside a conversation
+invalidates the prompt cache.
 
-The connector computes effective capabilities for the model picker:
+When no single backend satisfies every requested feature, the connector fails
+and names the conflict: the model, the features asked for, and the backend that
+provides each one. It does not drop a feature and continue. A partial capability
+is the user's decision, not the connector's.
 
-```rust
-fn effective_capabilities(&self, model_id: &str) -> EffectiveCapabilities {
-    let backend = self.select_backend(model_id);
-    let model_caps = self.model_capabilities(model_id);
-    let backend_caps = backend.capabilities();
-    let connector_caps = self.connector_capabilities();
-    
-    EffectiveCapabilities {
-        can_use_tools: model_caps.tools && backend_caps.supports_tools && connector_caps.supports_tools,
-        can_use_vision: model_caps.vision && backend_caps.supports_vision && connector_caps.supports_vision,
-        can_use_tool_search: model_caps.tools && backend_caps.supports_tool_search,
-        can_use_prompt_caching: backend_caps.supports_cache_control,
-        // ... other capabilities
-    }
-}
-```
+## Capability composition
 
----
+A capability answer belongs to a **(connection, model)** pair. The same model
+behaves differently on different connections, and one connection serves models
+with different support. The connector composes that answer from three inputs:
 
-## High-Level Cross-Cutting Concerns
+- **Model capabilities.** What the model was trained for: vision, reasoning,
+  tools, and its kind. This is the existing `ModelCapabilities`.
+- **Backend API capabilities.** What one API surface supports for that model:
+  streaming, cache control, tool search, reasoning configuration. This type is
+  Bedrock-local. `docs/design/connector-capabilities.md` records why it stays
+  out of `core`.
+- **Connector capabilities.** What this connector supports at all, whatever the
+  model or the API.
 
-Implemented once in `BedrockConnector`, not per-backend:
+For a model that one backend serves, the composed answer is the intersection.
+Any input can block a capability. No input can grant a capability that another
+denies.
 
-### Retry Policy
+For a model that several backends serve, the composed answer is the **union
+across the qualifying backends**, and each capability records which backends
+provide it. A capability that only Invoke delivers is genuinely available on
+that model. Reporting it as unavailable because Converse lacks it would
+under-report what the product can do.
 
-```rust
-// In BedrockConnector::stream_completion
-let response = Retryable::new(
-    || backend.stream_completion(...),
-    |e: &CoreError| matches!(e, CoreError::RateLimited { .. }),
-)
-.with(backon::ExponentialBuilder::default())
-.await?;
-```
+The union carries one obligation. Two capabilities can each be available while
+no single backend provides both. The composed answer therefore keeps the
+per-capability backend set, so selection can detect an unsatisfiable combination
+by name before the request goes out, instead of meeting it as a
+`ValidationException` in the middle of a turn.
 
-Retry is configured at the connector level because:
-- Retry parameters (max attempts, backoff) are user-facing settings
-- All backends share the same transient error patterns (throttling, 5xx)
+Each unavailable capability carries a reason, so a client can show a control as
+disabled with an explanation instead of letting a person try and fail.
+`docs/design/connector-capabilities.md` defines the states and the reasons.
 
-### Timeouts
+## Prompt caching
 
-- `connect_timeout`: Time to establish connection to Bedrock
-- `event_timeout`: Time between streaming events before declaring stall
-- `request_timeout`: Overall request timeout (optional, for debugging)
+Bedrock supports prompt caching. The connector reaches it through whichever
+backend serves the request.
 
-These are connector-level because they're AWS/network-level concerns, not API-level.
+**Converse** accepts `cachePoint` blocks in the `system`, `messages` and `tools`
+fields, up to four checkpoints per request for Anthropic models, with a
+five-minute or one-hour TTL. The response carries `cacheReadInputTokens` and
+`cacheWriteInputTokens`. These map onto `TokenUsage`'s
+`cache_read_input_tokens` and `cache_creation_input_tokens`.
 
-### Cache Policy
+**Invoke** accepts Anthropic's native `cache_control` markers for Anthropic
+models, and `cachePoint` for Nova models.
 
-The connector decides *where* cache breakpoints go; the backend applies them:
+**Responses** accepts `prompt_cache_breakpoint` on content blocks for the
+GPT-5.6 family, and caches automatically for earlier OpenAI models.
+
+Support is per model, not per API. Anthropic and Nova models honour cache
+checkpoints. Meta, Mistral and Cohere models do not. The connector detects
+support per model and emits no checkpoint where support is absent, rather than
+sending a marker that the service ignores or rejects.
+
+**Where the checkpoint goes.** One checkpoint, after the stable system prefix.
+Not on the tool list. Bedrock evaluates checkpoints in the order `tools`, then
+`system`, then `messages`, and a change in an earlier section invalidates the
+cache for every later section. Our tool list changes inside a conversation as
+tool search activates and deactivates namespaces. A checkpoint on `tools` would
+therefore invalidate the system cache on every turn the tool list moves, and
+cost more than it saves. The Anthropic connector marks the system prefix only,
+for this same reason.
+
+`CachePolicy` selects the behaviour:
 
 ```rust
 enum CachePolicy {
-    /// No caching (Converse backend)
+    /// Emit no cache checkpoints.
     None,
-    
-    /// System prompt only (safe default for Invoke)
+    /// One checkpoint after the stable system prefix. The default.
     SystemPromptOnly,
-    
-    /// System + selected tools (risky: tool list can change)
+    /// System prefix and tool list. Sound only where the tool list is fixed
+    /// for the whole conversation.
     SystemPromptAndTools,
 }
 ```
 
-The connector's `cache_policy` field (from config) drives what `CacheControl` object gets passed to backends. Backends that don't support caching ignore it.
+The connector decides where checkpoints go. The backend writes them in its own
+API's spelling. A backend serving a model without caching support ignores the
+policy.
 
----
+## Cross-cutting concerns
+
+**Retry** is not implemented here. `RetryingLlmClient` in `core` wraps any
+`LlmClient` from outside and already applies exponential backoff to retryable
+errors. A second retry loop inside the connector would nest the backoffs and
+multiply the attempts.
+
+**Timeouts** are connector-level, because they are network concerns rather than
+API concerns:
+
+- `connect_timeout` - the time to establish the connection.
+- `event_timeout` - the time between streaming events before the stream counts
+  as stalled.
+
+Both apply to every backend, and to the streaming and the non-streaming path.
+
+**Tool-schema sanitisation** runs above the backend boundary, in the shared
+request conversion. Top-level `oneOf`, `anyOf` and `allOf` are removed and a
+`type` is added; empty-string keys are dropped from recorded tool inputs; tool
+names pass through a per-request bijection and back. Every backend consumes the
+sanitised result, so the rules are written once.
 
 ## Configuration
 
-### Environment Variables
-
 | Variable | Purpose | Default |
-|----------|---------|---------|
-| `AWS_BEDROCK_API_KEY` | Static credentials (ACCESS_KEY:SECRET[:SESSION_TOKEN]) | — |
-| `AWS_PROFILE` | Named AWS profile | — |
+|---|---|---|
+| `AWS_BEDROCK_API_KEY` | Static credentials, `ACCESS_KEY_ID:SECRET_ACCESS_KEY[:SESSION_TOKEN]` | Falls back to the AWS credential chain |
+| `AWS_PROFILE` | Named AWS profile | - |
 | `AWS_REGION` | AWS region | `us-east-1` |
-| `BEDROCK_DEFAULT_MODEL` | Default model ID | `us.anthropic.claude-sonnet-4-6` |
-| `BEDROCK_CACHE_POLICY` | Cache breakpoint policy | `system_prompt_only` |
 
-### daemon.toml
+Credentials come from the static key above, or from the standard AWS provider
+chain: environment, profile, SSO, instance role.
 
 ```toml
 [connection.my-bedrock]
@@ -284,113 +291,16 @@ connect_timeout_secs = 30
 event_timeout_secs = 120
 ```
 
----
-
-## Model Listing
-
-### Current: Two Parallel Calls
-
-| Call | IAM Action | Contributes |
-|------|-----------|-------------|
-| `ListFoundationModels` | `bedrock:ListFoundationModels` | Foundation models (on-demand) |
-| `ListInferenceProfiles` | `bedrock:ListInferenceProfiles` | Cross-region profiles |
-
-Matches are filtered and merged into a single list.
-
-### extension: Backend-Specific Listings
-
-Each backend contributes its own model list:
-
-```rust
-impl BedrockBackend for ConverseBackend {
-    async fn list_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
-        // Call ListFoundationModels + ListInferenceProfiles
-        // Filter to models supported by Converse
-        // Annotate with Converse capabilities
-    }
-}
-
-impl BedrockBackend for InvokeBackend {
-    async fn list_models(&self) -> Result<Vec<ModelInfo>, CoreError> {
-        // Call ListFoundationModels for Anthropic models only
-        // Annotate with Invoke capabilities (caching, tool search)
-    }
-}
-```
-
-The connector merges and deduplicates.
-
----
-
-## Capability Examples
-
-### Example 1: Claude Sonnet with Tool Search
-
-Request: Use tool search with `claude-sonnet-4-6`
-
-| Layer | Check | Result |
-|-------|-------|--------|
-| Model | `tools: true` | ✓ |
-| Backend (Converse) | `supports_tool_search: false` | ✗ |
-| Backend (Invoke) | `supports_tool_search: true` | ✓ |
-| **Decision** | Use Invoke backend | Tool search enabled |
-
-### Example 2: Nova Premier with Vision
-
-Request: Use vision with `amazon.nova-premier`
-
-| Layer | Check | Result |
-|-------|-------|--------|
-| Model | `vision: true` | ✓ (Nova Premier trained for vision) |
-| Backend (Converse) | `supports_vision: true` | ✓ |
-| Backend (Invoke) | N/A | Invoke cannot serve Nova |
-| **Decision** | Use Converse backend | Vision enabled |
-
-### Example 3: Embedding Model for Chat
-
-Request: Use chat with `amazon.titan-embed-text-v1`
-
-| Layer | Check | Result |
-|-------|-------|--------|
-| Model | `kind: Embedding` | Embedding model |
-| Backend | — | Cannot serve |
-| **Decision** | Reject with ToolsUnsupported | Embedding models don't chat |
-
----
-
-## Migration Path
-
-### Phase 1: Refactor Existing Code
-
-1. Extract Converse-specific code into `ConverseBackend` struct
-2. Extract Invoke-specific code into `InvokeBackend` struct (currently stubbed)
-3. Keep `BedrockConnector` as the `LlmClient` impl
-4. Add `BackendApiCapabilities` to each backend
-
-### Phase 2: Enable Backend Selection
-
-1. Add backend selection logic to connector
-2. Default to Converse, use Invoke when features require it
-3. Expose backend name in model metadata
-
-### Phase 3: Capability Integration
-
-1. Implement `EffectiveCapabilities` composition
-2. Update daemon to query composed capabilities
-3. Update clients (GTK, TUI, web) to display capability diagnostics
-
----
-
-## IAM Requirements
+## IAM
 
 | Permission | Purpose |
-|-----------|---------|
-| `bedrock:InvokeModel` | Stream completions |
-| `bedrock:InvokeModelWithResponseStream` | Stream completions |
+|---|---|
+| `bedrock:InvokeModel` | Completions, embeddings, non-chat modalities |
+| `bedrock:InvokeModelWithResponseStream` | Streaming completions |
 | `bedrock:ListFoundationModels` | Model listing |
 | `bedrock:ListInferenceProfiles` | Cross-region model listing |
 
-Minimum viable policy for chat-only usage:
+Chat only, minimum viable:
 
 ```json
 {
@@ -404,7 +314,7 @@ Minimum viable policy for chat-only usage:
 }
 ```
 
-For model listing, add:
+Add, for model listing:
 
 ```json
 {
@@ -418,11 +328,47 @@ For model listing, add:
 }
 ```
 
----
+A policy that grants only `ListFoundationModels` is supported. The catalogue
+degrades as "Model aggregation" describes.
+
+## Alternatives considered
+
+**One connector per Bedrock API.** Rejected. The API that serves a model is an
+implementation detail of Bedrock, not a choice a user should make. Separate
+connectors would make a person learn which API serves which model, configure the
+same credentials several times, and choose a new model whenever a model moved
+between APIs.
+
+**Invoke to obtain Anthropic prompt caching.** Rejected. Converse supports
+prompt caching directly through `cachePoint`. Routing Anthropic models to Invoke
+for caching would gain nothing and would add a second serialization path to
+maintain. Invoke earns its place through the modalities Converse cannot address.
+
+**A new Anthropic serialization inside this crate.** Rejected. Where a backend
+needs the native Anthropic request shape, reuse `llm-anthropic`'s serialization
+behind a thin transport adapter that sends the serialized body through
+`InvokeModelWithResponseStream`. A second copy of the request builder and the
+event parser would leave two implementations to keep in step with one vendor's
+API.
+
+## Migration path
+
+1. Extract the existing Converse code into `ConverseBackend` behind the trait.
+   Keep the listing contract, the on-demand filter and the notices. No
+   behaviour change.
+2. Add backend selection and the de-duplicating aggregation, with one backend
+   registered. Still no behaviour change.
+3. Add `ResponsesBackend` for the GPT-5.6 family on `bedrock-mantle`.
+4. Generalise the existing embeddings `InvokeModel` call into `InvokeBackend`,
+   then extend it to the other modalities Converse refuses.
+
+Each step lands on its own and leaves the connector working.
 
 ## References
 
-- `docs/design/connector-capabilities.md` — Three-layer capability system
-- `docs/connectors/cloud-connector-abstraction.md` — Connector uniformity requirements
-- `crates/core/src/ports/llm.rs` — `ModelCapabilities`, `LlmClient` trait
-- [AWS Bedrock Converse API](https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference.html)
+- `docs/design/connector-capabilities.md` - the capability model and its states
+- `docs/connectors/cloud-connector-abstraction.md` - connector uniformity
+- `crates/core/src/ports/llm.rs` - `ModelCapabilities`, `ModelListingReport`,
+  `LlmClient`
+- [Bedrock Converse API](https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference.html)
+- [Bedrock prompt caching](https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html)
