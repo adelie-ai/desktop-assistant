@@ -890,14 +890,25 @@ impl LlmResponse {
 /// pull individual tools in, instead of putting every tool in the request.
 ///
 /// This is a separate trait, not a pair of methods on [`LlmClient`], because
-/// the capability answer and the implementation must be the same fact. A
+/// the capability answer and the implementation have to travel together. A
 /// client offers hosted tool search exactly when
-/// [`LlmClient::hosted_tool_search`] hands back one of these, and it can only
-/// hand one back if it implements this trait. There is no way to claim the
-/// capability and inherit a flattening body by omission - that combination
-/// produced a turn carrying the whole tool fleet inline *and* no discovery
-/// tool, because the service layer strips `builtin_tool_search` whenever
-/// hosted search is active (#1033).
+/// [`LlmClient::hosted_tool_search`] hands back one of these, so the answer
+/// cannot be a claim about code sitting beside it.
+///
+/// What that buys, precisely: a connector's only candidate object is `self`,
+/// and `Some(self)` does not compile without `impl HostedToolSearch for Self`.
+/// So a connector cannot report the capability and inherit a flattening body
+/// by omission - the combination that produced a turn carrying the whole tool
+/// fleet inline *and* no discovery tool, because the service layer strips
+/// `builtin_tool_search` whenever hosted search is active (#1033).
+///
+/// What it does not buy: the return type is `Option<&dyn HostedToolSearch>`,
+/// so any reference reachable from `&self` type-checks, including some other
+/// object that only flattens. That latitude is load-bearing - a decorator
+/// needs it - and it makes pointing elsewhere a deliberate act someone has to
+/// write and a reviewer can see, rather than a default nobody chose. What the
+/// object then puts on the wire is checked by the cross-connector sweep in
+/// the daemon's `registry.rs`, which the type system cannot reach.
 ///
 /// Decorators implement this trait for themselves rather than handing back
 /// their inner client's object; see [`LlmClient::hosted_tool_search`].
@@ -1029,18 +1040,20 @@ pub trait LlmClient: Send + Sync {
 
     /// This client's server-side hosted tool search, if it has one.
     ///
-    /// `Some` is both the capability answer and the dispatch object, so the
-    /// two cannot disagree: returning `Some(self)` requires `Self` to
-    /// implement [`HostedToolSearch`], and implementing that trait means
-    /// writing the namespaced request. A client with no hosted search answers
-    /// `None` by leaving this method alone, and its namespaced turns flatten
-    /// (see [`dispatch_namespaced`]).
+    /// `Some` is both the capability answer and the dispatch object, so a
+    /// connector cannot answer one way and behave another: `Some(self)`
+    /// requires `Self` to implement [`HostedToolSearch`], and implementing
+    /// that trait means writing the namespaced request. A client with no
+    /// hosted search answers `None` by leaving this method alone, and its
+    /// namespaced turns flatten (see [`dispatch_namespaced`]).
     ///
-    /// **Decorators return `Some(self)`, never their inner client's object.**
+    /// **A decorator returns `Some(self)`, never its inner client's object.**
     /// Handing back the inner object drops the decorator from the call path
     /// for exactly the turns that carry the most tools - losing retry,
     /// profiling, classification, reasoning substitution or per-turn routing.
-    /// The shape to copy:
+    /// Nothing in the type system stops that, which is why each decorator has
+    /// a named test asserting its own effect on a namespaced turn. The shape
+    /// to copy:
     ///
     /// ```ignore
     /// fn hosted_tool_search(&self) -> Option<&dyn HostedToolSearch> {
@@ -1050,6 +1063,12 @@ pub trait LlmClient: Send + Sync {
     ///
     /// with a [`HostedToolSearch`] implementation that decorates and then
     /// calls [`dispatch_namespaced`] on `self.inner`.
+    ///
+    /// A *transparent forwarder* is the exception and hands back its inner
+    /// object directly, because it has no per-call work to lose: the `Arc<T>`
+    /// blanket impl below and
+    /// [`MaybeProfiled`](crate::ports::llm_profiling::MaybeProfiled), which
+    /// only selects an arm. Adding a hop there could only be neutral.
     fn hosted_tool_search(&self) -> Option<&dyn HostedToolSearch> {
         None
     }
@@ -2423,11 +2442,12 @@ mod tests {
 
 /// Test doubles and tests for the hosted-tool-search seam (#1033).
 ///
-/// The headline property of that seam - a client cannot report hosted tool
-/// search without implementing the dispatch - is a compile-time property and
-/// has no runtime test. What is tested here is the runtime half: that
-/// [`dispatch_namespaced`] picks the right path, and that every decorator
-/// stays in the call path for a namespaced turn.
+/// The headline property of that seam - a connector cannot report hosted
+/// tool search without implementing the dispatch, because `Some(self)` needs
+/// the impl - is a compile-time property and has no runtime test. What is
+/// tested here is the runtime half: that [`dispatch_namespaced`] picks the
+/// right path, and that every decorator with per-call work of its own stays
+/// in the call path for a namespaced turn.
 #[cfg(test)]
 pub(crate) mod hosted_search_test_support {
     use super::*;
