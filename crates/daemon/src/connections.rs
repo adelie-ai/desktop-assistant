@@ -264,6 +264,48 @@ impl ConnectionConfig {
         }
         Ok(())
     }
+
+    /// Copy `stored`'s **file-only** fields onto this connection: the settings
+    /// a [`crate::api_surface`] connection payload has no field for, and which
+    /// rebuilding a connection from a payload would therefore delete.
+    ///
+    /// Why it exists: an edit from a client sends the whole connection, so the
+    /// daemon replaces the stored one with a connection built from the payload.
+    /// A setting the payload cannot carry is gone from that moment - not
+    /// refused, not warned about, just absent on the next load. The stored
+    /// credential coordinate has the same shape, and
+    /// [`crate::api_surface`]'s update path re-attaches it the same way.
+    ///
+    /// Nothing is carried across a connector switch. A connection that changed
+    /// type is a different connection, and its old type's settings are not
+    /// meaningful on the new one.
+    ///
+    /// Exhaustive with no catch-all, like [`Self::set_secret`]: a new connector
+    /// states what it keeps in the file rather than inheriting silence.
+    /// [`Connector::has_file_only_fields`] carries the same answer for callers
+    /// that need to ask without a connection in hand, and a test sweep holds
+    /// the two together.
+    ///
+    /// A new *field* is caught one step earlier, by the compiler: the payload
+    /// conversion in [`crate::api_surface`] builds each connection struct with
+    /// an explicit field list, so adding a field there fails to build until
+    /// somebody decides whether the payload can express it. If it cannot, it
+    /// belongs here.
+    pub fn carry_forward_file_only_fields(&mut self, stored: &Self) {
+        match self {
+            Self::Bedrock(replacement) => {
+                if let Self::Bedrock(stored) = stored {
+                    replacement.cache_policy = stored.cache_policy;
+                }
+            }
+            Self::Anthropic(_)
+            | Self::OpenAi(_)
+            | Self::OpenRouter(_)
+            | Self::Azure(_)
+            | Self::Google(_)
+            | Self::Ollama(_) => {}
+        }
+    }
 }
 
 /// Declare the [`Connector`] enum together with everything that has to list
@@ -625,6 +667,38 @@ impl Connector {
         match self {
             Self::Anthropic | Self::OpenAi | Self::OpenRouter | Self::Azure | Self::Google => true,
             Self::Bedrock | Self::Ollama => false,
+        }
+    }
+
+    /// Whether a connection of this type carries settings that the connection
+    /// payload has no field for, and which an edit from a client would
+    /// therefore delete unless they are carried forward.
+    ///
+    /// Bedrock keeps `cache_policy` in the file only. Putting it on the wire is
+    /// source-breaking for every client that constructs the payload variant, so
+    /// it waits for its own change (#1053).
+    ///
+    /// [`ConnectionConfig::carry_forward_file_only_fields`] does the carrying;
+    /// this answers the same question for a caller with no connection in hand.
+    /// A test sweep pins the two against each other in both directions, so
+    /// neither can become a stale claim.
+    ///
+    /// Exhaustive with no catch-all.
+    // The test sweeps in `api_surface` are the readers today; the carry itself
+    // answers the same question by matching on the connection.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by the per-connector test sweeps")
+    )]
+    pub fn has_file_only_fields(self) -> bool {
+        match self {
+            Self::Bedrock => true,
+            Self::Anthropic
+            | Self::OpenAi
+            | Self::OpenRouter
+            | Self::Azure
+            | Self::Google
+            | Self::Ollama => false,
         }
     }
 }

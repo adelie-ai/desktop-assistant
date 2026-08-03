@@ -675,15 +675,13 @@ impl ConnectionsService for DaemonConnectionsService {
                 );
             }
 
-            // Same hazard, different field. The payload has no `cache_policy`,
-            // so a client editing any other field of a Bedrock connection would
-            // otherwise delete a configured policy and quietly put the cache
-            // writes back on the bill (#1027). Carry it forward.
-            if let (ConnectionConfig::Bedrock(stored), ConnectionConfig::Bedrock(replacement)) =
-                (existing, &mut new_conn)
-            {
-                replacement.cache_policy = stored.cache_policy;
-            }
+            // Same hazard, wider than one field. Every setting the payload has
+            // no field for is absent from `new_conn`, so a client editing any
+            // other field would delete it - for Bedrock's `cache_policy`, that
+            // quietly puts the cache writes back on the bill (#1027). The
+            // connection type states what it keeps in the file; a test sweep
+            // holds every connector to its answer.
+            new_conn.carry_forward_file_only_fields(existing);
 
             cfg.connections
                 .insert(id_valid.as_str().to_string(), new_conn);
@@ -2988,7 +2986,10 @@ mod tests {
             },
             Connector::Bedrock => bedrock_payload("eu-west-1"),
             Connector::Ollama => ConnectionConfigPayload::Ollama {
-                base_url: Some("http://ollama.example.invalid".into()),
+                // Loopback: Ollama is the one connector the URL policy lets
+                // reach a plain-http endpoint, and only on a network the
+                // operator already controls.
+                base_url: Some("http://127.0.0.1:11434".into()),
                 connect_timeout_secs: None,
                 stream_timeout_secs: None,
                 keep_warm: None,
@@ -3046,6 +3047,114 @@ mod tests {
                 "the requested edit should still apply"
             ),
             other => panic!("expected a bedrock connection, got {other:?}"),
+        }
+    }
+
+    /// A stored connection of each connector type whose **file-only** fields -
+    /// the ones no `ConnectionConfigPayload` can express - are set to a value
+    /// that is not the default, and which carries no secret, so a payload
+    /// round-trip differs from it in those fields and nothing else.
+    ///
+    /// Exhaustive with no catch-all, like [`stored_connection`]: a new
+    /// connector must state what it keeps in the file before this compiles.
+    fn stored_with_file_only_fields(connector: Connector) -> ConnectionConfig {
+        match connector {
+            Connector::Bedrock => ConnectionConfig::Bedrock(BedrockConnection {
+                aws_profile: Some("work".into()),
+                region: Some("us-west-2".into()),
+                cache_policy: Some(desktop_assistant_llm_bedrock::CachePolicy::None),
+                ..Default::default()
+            }),
+            Connector::Anthropic => ConnectionConfig::Anthropic(AnthropicConnection::default()),
+            Connector::OpenAi => ConnectionConfig::OpenAi(OpenAiConnection::default()),
+            Connector::OpenRouter => ConnectionConfig::OpenRouter(OpenRouterConnection::default()),
+            Connector::Azure => ConnectionConfig::Azure(AzureConnection::default()),
+            Connector::Google => ConnectionConfig::Google(GoogleConnection::default()),
+            Connector::Ollama => ConnectionConfig::Ollama(OllamaConnection::default()),
+        }
+    }
+
+    #[test]
+    fn a_payload_round_trip_loses_exactly_what_a_connector_declares_file_only() {
+        // `Connector::has_file_only_fields` is the claim; this is the check of
+        // it, in both directions, without naming a single field. A connector
+        // that claims none must survive the round trip whole, and one that
+        // claims some must not - so the claim cannot rot into a comment.
+        for &connector in Connector::ALL {
+            let stored = stored_with_file_only_fields(connector);
+            let round_tripped = payload_to_connection(connection_to_payload(&stored));
+            if connector.has_file_only_fields() {
+                assert_ne!(
+                    round_tripped, stored,
+                    "{connector} claims a file-only field, but a payload round trip \
+                     loses nothing - either the claim is stale or the payload gained a field"
+                );
+            } else {
+                assert_eq!(
+                    round_tripped, stored,
+                    "{connector} claims no file-only field, but a payload round trip \
+                     lost something - declare it, or an edit from a client deletes it"
+                );
+            }
+        }
+    }
+
+    /// Store `stored` as connection `c`, apply `connector`'s update payload,
+    /// and return the connection that resulted.
+    async fn update_and_read_back(
+        connector: Connector,
+        stored: ConnectionConfig,
+    ) -> ConnectionConfig {
+        let handle = make_handle_with(config_with_connections(&[("c", stored)]));
+        let svc = DaemonConnectionsService::new(handle.clone());
+        svc.update_connection("c".to_string(), update_payload(connector))
+            .await
+            .unwrap_or_else(|e| panic!("{connector}: updating an existing connection: {e}"));
+        handle
+            .snapshot_config()
+            .connections
+            .get("c")
+            .expect("connection still exists")
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn update_connection_preserves_file_only_fields_across_all_connectors() {
+        // The behavioural half. An edit through the API rebuilds the connection
+        // from a payload that cannot carry these fields, so `update_connection`
+        // must put them back - the same obligation, and the same sweep, as the
+        // stored credential coordinate.
+        //
+        // Read by running the same edit over two stored connections that differ
+        // only in their file-only fields. Deliberately not by rebuilding the
+        // expected connection with the carry-forward itself, which would move
+        // both sides of the assertion together and pass whatever the carry did.
+        for &connector in Connector::ALL {
+            let from_distinctive =
+                update_and_read_back(connector, stored_with_file_only_fields(connector)).await;
+            let from_default = update_and_read_back(connector, stored_connection(connector)).await;
+
+            if connector.has_file_only_fields() {
+                assert_ne!(
+                    from_distinctive, from_default,
+                    "{connector} claims a file-only field, but the same edit over two \
+                     different stored values produced the same connection - the stored \
+                     value did not survive"
+                );
+            } else {
+                assert_eq!(
+                    from_distinctive, from_default,
+                    "{connector} claims no file-only field, so nothing outside the payload \
+                     may reach the result"
+                );
+            }
+
+            // And the edit itself landed, whole, for every connector.
+            assert_eq!(
+                connection_to_payload(&from_distinctive),
+                update_payload(connector),
+                "{connector}: the requested edit must apply"
+            );
         }
     }
 
