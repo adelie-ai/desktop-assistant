@@ -3433,6 +3433,215 @@ mod tests {
         foundation.assert_calls(2);
     }
 
+    // --- Profile capabilities come from the base model's metadata (#1023) --
+    //
+    // The profile API returns no modality data, so the profile path used to
+    // carry its own hardcoded vision id list. That list is the path that runs
+    // in practice - the on-demand filter removes nearly every modern chat
+    // model from the foundation listing - and it drifts away from what AWS
+    // reports for the same model. The listings arrive in one call, so a
+    // profile can be resolved to its base model and reuse the real metadata.
+
+    /// `ListFoundationModels` where the interesting models are reachable only
+    /// through a profile, which is the shape of a current AWS account.
+    ///
+    /// The two profile-only entries are chosen so the retired id list would
+    /// answer wrongly in both directions: a vision-capable model it has never
+    /// heard of, and a model it treats as vision-capable by family prefix
+    /// whose real input modalities are text only.
+    const DRIFTING_FOUNDATION_MODELS_BODY: &str = r#"{
+      "modelSummaries": [
+        {
+          "modelArn": "arn:aws:bedrock:us-east-1::foundation-model/amazon.nova-2-omni-v1:0",
+          "modelId": "amazon.nova-2-omni-v1:0",
+          "modelName": "Nova 2 Omni",
+          "providerName": "Amazon",
+          "inputModalities": ["TEXT", "IMAGE"],
+          "outputModalities": ["TEXT"],
+          "inferenceTypesSupported": ["INFERENCE_PROFILE"],
+          "modelLifecycle": {"status": "ACTIVE"}
+        },
+        {
+          "modelArn": "arn:aws:bedrock:us-east-1::foundation-model/meta.llama4-scout-17b-instruct-v1:0",
+          "modelId": "meta.llama4-scout-17b-instruct-v1:0",
+          "modelName": "Llama 4 Scout 17B Instruct",
+          "providerName": "Meta",
+          "inputModalities": ["TEXT"],
+          "outputModalities": ["TEXT"],
+          "inferenceTypesSupported": ["INFERENCE_PROFILE"],
+          "modelLifecycle": {"status": "ACTIVE"}
+        },
+        {
+          "modelArn": "arn:aws:bedrock:us-east-1::foundation-model/amazon.titan-embed-image-v1:0",
+          "modelId": "amazon.titan-embed-image-v1:0",
+          "modelName": "Titan Multimodal Embeddings",
+          "providerName": "Amazon",
+          "inputModalities": ["TEXT", "IMAGE"],
+          "outputModalities": ["EMBEDDING"],
+          "inferenceTypesSupported": ["INFERENCE_PROFILE"],
+          "modelLifecycle": {"status": "ACTIVE"}
+        },
+        {
+          "modelArn": "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3-haiku-20240307-v1:0",
+          "modelId": "anthropic.claude-3-haiku-20240307-v1:0",
+          "modelName": "Claude 3 Haiku",
+          "providerName": "Anthropic",
+          "inputModalities": ["TEXT", "IMAGE"],
+          "outputModalities": ["TEXT"],
+          "inferenceTypesSupported": ["ON_DEMAND"],
+          "modelLifecycle": {"status": "ACTIVE"}
+        }
+      ]
+    }"#;
+
+    /// Profiles for the three profile-only models above, plus one whose base
+    /// model is absent from the foundation listing.
+    const DRIFTING_INFERENCE_PROFILES_BODY: &str = r#"{
+      "inferenceProfileSummaries": [
+        {
+          "inferenceProfileName": "US Nova 2 Omni",
+          "inferenceProfileArn": "arn:aws:bedrock:us-east-1:111122223333:inference-profile/us.amazon.nova-2-omni-v1:0",
+          "inferenceProfileId": "us.amazon.nova-2-omni-v1:0",
+          "models": [
+            {"modelArn": "arn:aws:bedrock:us-east-1::foundation-model/amazon.nova-2-omni-v1:0"}
+          ],
+          "status": "ACTIVE",
+          "type": "SYSTEM_DEFINED"
+        },
+        {
+          "inferenceProfileName": "US Llama 4 Scout",
+          "inferenceProfileArn": "arn:aws:bedrock:us-east-1:111122223333:inference-profile/us.meta.llama4-scout-17b-instruct-v1:0",
+          "inferenceProfileId": "us.meta.llama4-scout-17b-instruct-v1:0",
+          "models": [
+            {"modelArn": "arn:aws:bedrock:us-east-1::foundation-model/meta.llama4-scout-17b-instruct-v1:0"}
+          ],
+          "status": "ACTIVE",
+          "type": "SYSTEM_DEFINED"
+        },
+        {
+          "inferenceProfileName": "US Titan Multimodal Embeddings",
+          "inferenceProfileArn": "arn:aws:bedrock:us-east-1:111122223333:inference-profile/us.amazon.titan-embed-image-v1:0",
+          "inferenceProfileId": "us.amazon.titan-embed-image-v1:0",
+          "models": [
+            {"modelArn": "arn:aws:bedrock:us-east-1::foundation-model/amazon.titan-embed-image-v1:0"}
+          ],
+          "status": "ACTIVE",
+          "type": "SYSTEM_DEFINED"
+        },
+        {
+          "inferenceProfileName": "US Claude Sonnet 4.6",
+          "inferenceProfileArn": "arn:aws:bedrock:us-east-1:111122223333:inference-profile/us.anthropic.claude-sonnet-4-6",
+          "inferenceProfileId": "us.anthropic.claude-sonnet-4-6",
+          "models": [
+            {"modelArn": "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-sonnet-4-6"}
+          ],
+          "status": "ACTIVE",
+          "type": "SYSTEM_DEFINED"
+        }
+      ]
+    }"#;
+
+    /// Both control-plane calls succeed, serving the drifting-catalogue
+    /// bodies above.
+    fn mock_drifting_control_plane(server: &httpmock::MockServer) {
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/foundation-models");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(DRIFTING_FOUNDATION_MODELS_BODY);
+        });
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/inference-profiles");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(DRIFTING_INFERENCE_PROFILES_BODY);
+        });
+    }
+
+    fn find_model<'a>(report: &'a ModelListingReport, id: &str) -> &'a ModelInfo {
+        report
+            .models
+            .iter()
+            .find(|m| m.id == id)
+            .unwrap_or_else(|| {
+                let ids: Vec<&str> = report.models.iter().map(|m| m.id.as_str()).collect();
+                panic!("{id} missing from the listing, got {ids:?}")
+            })
+    }
+
+    #[tokio::test]
+    async fn vision_capable_model_reports_vision_on_both_the_foundation_and_profile_paths() {
+        let server = httpmock::MockServer::start();
+        mock_drifting_control_plane(&server);
+
+        let report = control_plane_client(&server)
+            .list_models_detailed()
+            .await
+            .expect("healthy listing");
+
+        assert!(
+            find_model(&report, "anthropic.claude-3-haiku-20240307-v1:0")
+                .capabilities
+                .vision,
+            "the foundation path reads IMAGE from the real input modalities"
+        );
+        assert!(
+            find_model(&report, "us.amazon.nova-2-omni-v1:0")
+                .capabilities
+                .vision,
+            "the profile path must read the same metadata, not a curated id list"
+        );
+        assert!(
+            !find_model(&report, "us.meta.llama4-scout-17b-instruct-v1:0")
+                .capabilities
+                .vision,
+            "a model AWS reports as text-only must not be advertised as vision-capable"
+        );
+    }
+
+    #[tokio::test]
+    async fn profile_of_an_embedding_base_model_does_not_report_generative() {
+        let server = httpmock::MockServer::start();
+        mock_drifting_control_plane(&server);
+
+        let report = control_plane_client(&server)
+            .list_models_detailed()
+            .await
+            .expect("healthy listing");
+
+        let profile = find_model(&report, "us.amazon.titan-embed-image-v1:0");
+        assert_eq!(
+            profile.capabilities.kind,
+            ModelKind::Embedding,
+            "model kind follows the base model's output modality, it is not assumed"
+        );
+        assert!(
+            !profile.capabilities.tools,
+            "an embedding model calls no tools"
+        );
+    }
+
+    #[tokio::test]
+    async fn profile_with_an_unresolvable_base_model_falls_back_to_the_id_family() {
+        // `anthropic.claude-sonnet-4-6` is not in this account's foundation
+        // listing, so there is no metadata to reuse. The documented fallback
+        // keeps the profile usable rather than reporting nothing.
+        let server = httpmock::MockServer::start();
+        mock_drifting_control_plane(&server);
+
+        let report = control_plane_client(&server)
+            .list_models_detailed()
+            .await
+            .expect("healthy listing");
+
+        let profile = find_model(&report, "us.anthropic.claude-sonnet-4-6");
+        assert!(profile.capabilities.vision);
+        assert!(profile.capabilities.tools);
+        assert_eq!(profile.capabilities.kind, ModelKind::Generative);
+    }
+
     #[tokio::test]
     async fn cached_listing_repeats_the_partial_failure_notice() {
         // A cache hit must not quietly drop the degradation: the picker would
