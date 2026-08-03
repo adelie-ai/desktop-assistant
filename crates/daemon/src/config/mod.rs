@@ -4700,48 +4700,72 @@ admin_subjects = ["operator", "ops-oncall"]
     // have taken effect. The keys are still discarded - the fix is that the
     // operator is told.
 
-    /// Every ```toml block under `docs/` that declares a connection, with the
-    /// path it came from.
+    /// Every fenced `toml` block in the repository's prose that is an example
+    /// of the daemon's own configuration file, with the path it came from.
     ///
-    /// These blocks are the only place an operator is told how to configure a
-    /// connector, and nothing else checks them. `docs/connectors/bedrock.md`
+    /// These blocks are the only place an operator is told how to configure the
+    /// daemon, and nothing else checks them. `docs/connectors/bedrock.md`
     /// documented `[connection.my-bedrock]`, singular, alongside three field
     /// names no connection has - a block that configured nothing, silently, for
-    /// anyone who followed it.
-    fn documented_connection_examples() -> Vec<(String, String)> {
+    /// anyone who followed it. `docs/cloud-providers.md` put `model` inside
+    /// three `[connections.*]` tables, which every connection type refuses, so
+    /// all three of its examples failed at load.
+    ///
+    /// Every block is classified, and nothing is skipped by accident. The
+    /// repository documents three TOML files, and only one of them is this one:
+    /// `mcp_servers.toml` carries `[[servers]]`, and `secrets.toml` carries
+    /// `[secrets]`. Both are read elsewhere, against their own types.
+    fn documented_daemon_config_examples() -> Vec<(String, String)> {
         fn walk(root: &std::path::Path, dir: &std::path::Path, found: &mut Vec<(String, String)>) {
-            let entries = std::fs::read_dir(dir).expect("docs/ must be readable");
+            let entries = std::fs::read_dir(dir).expect("the docs tree must be readable");
             for entry in entries {
                 let path = entry.expect("a readable directory entry").path();
                 if path.is_dir() {
                     walk(root, &path, found);
                 } else if path.extension().is_some_and(|e| e == "md") {
-                    let text = std::fs::read_to_string(&path).expect("a readable doc");
-                    // Reported repo-relative, so a failure names the file to
-                    // edit rather than one machine's checkout.
-                    let name = path
-                        .strip_prefix(root)
-                        .unwrap_or(&path)
-                        .display()
-                        .to_string();
-                    for block in toml_blocks(&text) {
-                        if block.contains("[connections.") || block.contains("[connection.") {
-                            found.push((name.clone(), block));
-                        }
-                    }
+                    collect(root, &path, found);
                 }
             }
         }
 
-        let mut found = Vec::new();
+        fn collect(
+            root: &std::path::Path,
+            path: &std::path::Path,
+            found: &mut Vec<(String, String)>,
+        ) {
+            let text = std::fs::read_to_string(path).expect("a readable doc");
+            // Reported repo-relative, so a failure names the file to edit
+            // rather than one machine's checkout.
+            let name = path
+                .strip_prefix(root)
+                .unwrap_or(path)
+                .display()
+                .to_string();
+            for block in toml_blocks(&text) {
+                if is_daemon_config_example(&block) {
+                    found.push((name.clone(), block));
+                }
+            }
+        }
+
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut found = Vec::new();
         walk(&root, &root.join("docs"), &mut found);
+        collect(&root, &root.join("README.md"), &mut found);
         found.sort();
         assert!(
-            !found.is_empty(),
-            "no documented connection example found - this test has stopped checking anything"
+            found.len() > 5,
+            "too few daemon config examples found ({}) - this test has stopped checking \
+             what it was written to check",
+            found.len()
         );
         found
+    }
+
+    /// Whether a documented TOML block is an example of `daemon.toml` rather
+    /// than one of the other two files the repository documents.
+    fn is_daemon_config_example(block: &str) -> bool {
+        !block.contains("[[servers]]") && !block.contains("[secrets]")
     }
 
     /// The contents of each fenced ```toml block in `doc`.
@@ -4763,11 +4787,11 @@ admin_subjects = ["operator", "ops-oncall"]
     }
 
     #[test]
-    fn every_documented_connection_example_is_configuration_the_daemon_reads() {
+    fn every_documented_daemon_config_example_is_configuration_the_daemon_reads() {
         // A doc that parses to nothing is worse than no doc: it is followed,
         // and it fails in silence. So each example is loaded exactly as
         // written, and every key in it must be a key the daemon understands.
-        for (source, toml_src) in documented_connection_examples() {
+        for (source, toml_src) in documented_daemon_config_examples() {
             let unknown = unknown_config_keys(&toml_src);
             assert!(
                 unknown.is_empty(),
@@ -4784,13 +4808,29 @@ admin_subjects = ["operator", "ops-oncall"]
     }
 
     #[test]
+    fn the_other_documented_toml_files_are_recognised_and_left_alone() {
+        // The classifier decides what the test above checks, so a change that
+        // quietly widened it to "nothing" would leave the guard passing while
+        // checking no daemon config at all - and one that narrowed it would
+        // hand `mcp_servers.toml` examples to the wrong loader.
+        assert!(is_daemon_config_example(
+            "[connections.x]\ntype = \"ollama\"\n"
+        ));
+        assert!(is_daemon_config_example(
+            "[database]\nmax_connections = 5\n"
+        ));
+        assert!(!is_daemon_config_example("[[servers]]\nname = \"web\"\n"));
+        assert!(!is_daemon_config_example("[secrets]\ntoken = \"x\"\n"));
+    }
+
+    #[test]
     fn the_documented_bedrock_example_sets_the_cache_policy() {
         // The setting #1027 adds is reachable only through this block, so the
         // block has to carry it into a real connection.
-        let (source, toml_src) = documented_connection_examples()
+        let (source, toml_src) = documented_daemon_config_examples()
             .into_iter()
             .find(|(source, _)| source.ends_with("connectors/bedrock.md"))
-            .expect("the bedrock connector doc must carry a connection example");
+            .expect("the bedrock connector doc must carry a configuration example");
 
         let dir = tempfile::TempDir::new().expect("tempdir");
         let path = dir.path().join("daemon.toml");
