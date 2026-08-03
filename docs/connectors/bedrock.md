@@ -137,6 +137,40 @@ modern chat model, because those models are reachable only through an inference
 profile. Every backend that lists foundation models applies the same filter. A
 backend that skips it advertises models that cannot be called.
 
+**A profile carries its base model's capabilities.** `ListInferenceProfiles`
+reports no modalities, and a profile is only a route to a foundation model, so
+the profile entry reuses the modality metadata `ListFoundationModels` returned
+in the same call, keyed by model id.
+
+**One id, read one way, by both sides.** The base model is the profile id minus
+its geography prefix, and nothing else. Extended thinking, prompt caching, the
+streaming-with-tools deny list and the context window all read that id, and so
+does the request builder at dispatch time, because a turn arrives carrying a
+model id and nothing else. A capability recovered from an input the dispatch
+path does not have is a capability the picker offers and the request builder
+discards - the defect the reasoning work exists to remove.
+
+The recognised prefixes are `global.`, `us.`, `eu.`, `apac.`, `ap.`, `au.`,
+`jp.` and `us-gov.`, held in one list and pinned by a test. Every entry ends at
+the separator, so no entry can swallow another and the order does not matter.
+It is an allowlist rather than "drop the first dotted segment", because model
+ids carry dots of their own - that rule would strip `openai.gpt-5.6-sol` to
+`gpt-5.6-sol`.
+
+An id that does not reduce that way - an `APPLICATION` profile, whose id is a
+generated identifier, or a geography newer than the list - reports no reasoning,
+no prompt caching and no context window. The profile summary does carry the base
+model's ARN, and reading it would fix the listing while leaving dispatch exactly
+as wrong, so it is deliberately not read. Issue #1044 covers resolving the
+mapping for both sides, with application profiles as the motivating case.
+Only a profile whose base model this account did not list falls back to a
+family guess from the id, which reports vision from the family and treats the
+model as generative - an embedding model is reachable by its bare on-demand id,
+so a profile for one resolves through the listing or does not exist. Deriving
+vision from a curated id list on this path is what made a new vision-capable
+model report `vision: false` until somebody edited the list, while the same
+model's foundation entry reported it correctly.
+
 Notices are cached with the models, so a cache hit inside the one-hour TTL still
 reports the degradation. An explicit refresh re-issues the calls and always
 returns a report, so a client can tell a reload that found nothing new from a
@@ -171,6 +205,18 @@ with different support. The connector composes that answer from three inputs:
 
 - **Model capabilities.** What the model was trained for: vision, reasoning,
   tools, and its kind. This is the existing `ModelCapabilities`.
+
+  `reasoning` answers "can this connector configure reasoning for this model",
+  not "does this model reason". The two differ, and the difference is
+  load-bearing: DeepSeek R1 reasons on every request and returns the trace, and
+  Bedrock's Converse contract for it carries no reasoning field, so an effort
+  set against it changes nothing. Only Anthropic Claude 3.7 and the 4.x line
+  and later take a thinking budget, through
+  `additionalModelRequestFields.thinking`. The capability record and the
+  request builder read one function, so a client cannot be shown a control the
+  request path will discard. A budget that arrives for a model that takes none
+  is reported at `warn!` with the model and the budget, and the request goes
+  out without it.
 - **Backend API capabilities.** What one API surface supports for that model:
   streaming, cache control, tool search, reasoning configuration. This type is
   Bedrock-local. `docs/design/connector-capabilities.md` records why it stays
@@ -265,11 +311,35 @@ multiply the attempts.
 **Timeouts** are connector-level, because they are network concerns rather than
 API concerns:
 
-- `connect_timeout` - the time to establish the connection.
-- `event_timeout` - the time between streaming events before the stream counts
-  as stalled.
+- `connect_timeout` (30s) - the time to establish the connection.
+- `event_timeout` (60s) - the time between streaming events before the stream
+  counts as stalled.
+- `non_streaming_timeout` (600s) - the whole-request budget for the
+  non-streaming path. **Not settable per connection yet**, see below.
 
-Both apply to every backend, and to the streaming and the non-streaming path.
+Three settings, because there are three questions. The first two bound the
+streaming path's two phases: the connect race, then each gap between events.
+Neither bounds a whole turn - a stream that keeps producing runs as long as it
+likes.
+
+The non-streaming path has no intermediate events to time. `Converse` answers
+once, after generation is complete, so its bound is necessarily a bound on the
+generation, and it gets its own setting rather than borrowing `event_timeout`.
+Reusing that one would give a single name two meanings, and a change to stall
+detection would move a generation deadline with it. The default is deliberately
+generous: this path is mandatory for Llama 3 and 4 with tools, whose one-shot
+answers can run for minutes, so the bound is there to catch a hung request and
+nothing else.
+
+Each path also races its request against the cancellation token, so a stop ends
+the turn rather than waiting the budget out.
+
+**`non_streaming_timeout` cannot be configured yet.** The client accepts the
+value, nothing in the daemon sets it, and there is no connection key for it, so
+every Bedrock connection runs the 600-second default and no setting changes
+that. Issue #1042 carries it through the wire shape and the resolver to join
+the other two; until it lands, a model that needs longer than ten minutes for a
+one-shot answer has no remedy short of a code change.
 
 **Tool-schema sanitisation** runs above the backend boundary, in the shared
 request conversion. Top-level `oneOf`, `anyOf` and `allOf` are removed and a

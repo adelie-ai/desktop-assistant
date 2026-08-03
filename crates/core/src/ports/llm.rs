@@ -665,7 +665,23 @@ pub enum ModelKind {
 /// *generative* model, meaningful only when `kind` is [`ModelKind::Generative`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ModelCapabilities {
-    /// Model supports extended-thinking / reasoning traces.
+    /// The connector can configure reasoning for this model: a
+    /// [`ReasoningConfig`] carrying an effort or a budget reaches the provider
+    /// and changes what the model does.
+    ///
+    /// Not "the model reasons". The two questions have different answers, and
+    /// this is the one every consumer acts on - a client offers a reasoning
+    /// control, and a connector decides whether to send the field. DeepSeek R1
+    /// on Bedrock is the case that separates them: it reasons on every request
+    /// and returns the trace, and Bedrock's request contract for it carries no
+    /// reasoning field at all, so it reports `false`. A model that reasons but
+    /// takes no configuration would otherwise show a control that does
+    /// nothing, and a budget the connector drops on the way out.
+    ///
+    /// Populate it from what the request path will honour, and read the same
+    /// answer there - one function, not two. A capability record that can
+    /// disagree with the request builder is the defect this field exists to
+    /// prevent.
     #[serde(default)]
     pub reasoning: bool,
     /// Model accepts image input.

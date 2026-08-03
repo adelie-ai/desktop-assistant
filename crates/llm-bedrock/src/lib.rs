@@ -45,6 +45,20 @@ impl ModelClock for SystemClock {
     }
 }
 
+/// Whole-request budget for the non-streaming (`Converse`) path.
+///
+/// `Converse` answers once, after generation is complete, so this bounds a
+/// whole generation rather than a stall. Ten minutes is chosen to be longer
+/// than any one-shot completion a Bedrock chat model produces in practice -
+/// the path is mandatory for Llama 3 and 4 with tools, whose answers can run
+/// for minutes - so the bound catches a hung request and nothing else.
+///
+/// Deliberately not [`STREAM_EVENT_TIMEOUT`] or a sum of the stream budgets:
+/// those bound the gap between events, and one name must not answer two
+/// questions. A user who cancels does not wait this out - the dispatch races
+/// the cancellation token as well.
+const NON_STREAMING_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// Upper bound on the characters of provider text relayed in a listing
 /// notice's `detail`.
 ///
@@ -94,6 +108,19 @@ pub struct BedrockClient {
     connect_timeout: Duration,
     /// Per-chunk stall budget; defaults to [`STREAM_EVENT_TIMEOUT`].
     event_timeout: Duration,
+    /// Whole-request budget for the non-streaming (`Converse`) path; defaults
+    /// to [`NON_STREAMING_REQUEST_TIMEOUT`].
+    ///
+    /// Its own setting, not a function of the two stream budgets: those bound
+    /// a connection and the gap between events, and this bounds a whole
+    /// generation. One name answering both questions would make a change to
+    /// stall detection move a generation deadline with it.
+    ///
+    /// It does cap total generation time on this path, which the streaming
+    /// path does not cap. That is the trade, and it is why the default is
+    /// generous: an unbounded request hangs the turn until the AWS SDK's own
+    /// defaults give up, and ignores a stop.
+    non_streaming_timeout: Duration,
     /// Per-connection context-window hard cap, in tokens. `None` = "max
     /// available". Folded with the curated table in `max_context_tokens`.
     context_cap: Option<u64>,
@@ -102,6 +129,11 @@ pub struct BedrockClient {
     /// `ListInferenceProfiles` against a local mock. Always `None` in
     /// production, where the endpoint is derived from the region.
     control_endpoint_override: Option<String>,
+    /// Test-only override for the Bedrock runtime endpoint, so the dispatch
+    /// tests can drive `Converse` / `ConverseStream` against a local socket.
+    /// Always `None` in production, where the endpoint is derived from the
+    /// region.
+    runtime_endpoint_override: Option<String>,
 }
 
 impl BedrockClient {
@@ -130,8 +162,10 @@ impl BedrockClient {
             non_streaming_tools_models: Arc::new(Mutex::new(HashSet::new())),
             connect_timeout: STREAM_CONNECT_TIMEOUT,
             event_timeout: STREAM_EVENT_TIMEOUT,
+            non_streaming_timeout: NON_STREAMING_REQUEST_TIMEOUT,
             context_cap: None,
             control_endpoint_override: None,
+            runtime_endpoint_override: None,
         }
     }
 
@@ -158,6 +192,24 @@ impl BedrockClient {
     pub fn with_event_timeout(mut self, secs: Option<u64>) -> Self {
         if let Some(s) = secs.filter(|s| *s > 0) {
             self.event_timeout = Duration::from_secs(s);
+        }
+        self
+    }
+
+    /// Override the whole-request budget for the non-streaming (`Converse`)
+    /// path. `None`/`Some(0)` keeps the ten-minute default. Seconds.
+    ///
+    /// It has no effect on the streaming path, whose two budgets bound the
+    /// connection and the gap between events.
+    ///
+    /// **No connection configuration reaches this yet.** The daemon builds
+    /// its Bedrock clients without calling it, so every connection runs the
+    /// default; issue #1042 carries a `non_streaming_timeout_secs` through the
+    /// wire shape and the resolver to join the other two budgets. Until then
+    /// this is settable only by a caller constructing the client directly.
+    pub fn with_non_streaming_timeout(mut self, secs: Option<u64>) -> Self {
+        if let Some(s) = secs.filter(|s| *s > 0) {
+            self.non_streaming_timeout = Duration::from_secs(s);
         }
         self
     }
@@ -221,6 +273,20 @@ impl BedrockClient {
     pub fn __with_control_endpoint_for_test(mut self, url: impl Into<String>) -> Self {
         self.control_endpoint_override = Some(url.into());
         self.control_client = OnceCell::new();
+        self
+    }
+
+    /// Test-only: point the Bedrock runtime plane (`Converse` /
+    /// `ConverseStream`) at `url` instead of the regional AWS endpoint, so
+    /// the dispatch behaviour can be exercised against a local socket rather
+    /// than a live account.
+    ///
+    /// Only the runtime plane is redirected; the control (model-listing)
+    /// client is untouched.
+    #[doc(hidden)]
+    pub fn __with_runtime_endpoint_for_test(mut self, url: impl Into<String>) -> Self {
+        self.runtime_endpoint_override = Some(url.into());
+        self.client = OnceCell::new();
         self
     }
 
@@ -288,7 +354,13 @@ impl BedrockClient {
         self.client
             .get_or_try_init(|| async {
                 let shared_config = self.load_shared_config().await;
-                Ok(Client::new(&shared_config))
+                let Some(endpoint) = self.runtime_endpoint_override.as_ref() else {
+                    return Ok(Client::new(&shared_config));
+                };
+                let config = aws_sdk_bedrockruntime::config::Builder::from(&shared_config)
+                    .endpoint_url(endpoint)
+                    .build();
+                Ok(Client::from_conf(config))
             })
             .await
     }
@@ -935,22 +1007,18 @@ fn infer_capabilities_from_id(
         || lc.contains("cohere.command")
         || lc.contains("deepseek");
 
-    let reasoning = lc.contains("anthropic.claude-sonnet-4")
-        || lc.contains("anthropic.claude-opus-4")
-        || lc.contains("anthropic.claude-haiku-4")
-        || lc.contains("anthropic.claude-3-7")
-        || lc.contains("deepseek.r1")
-        || lc.contains("deepseek-r1");
-
     ModelCapabilities {
-        reasoning,
+        // One source of truth with the request builder: the flag says the
+        // connector can act on a reasoning effort for this model, so a client
+        // that offers the control is offering something that takes effect.
+        reasoning: supports_configurable_reasoning(&lc),
         vision,
         tools: tools && !is_embedding,
-        // `is_embedding` is computed from the provider's real output-modality
-        // metadata for foundation models (see `summary_to_model_info`); the
-        // inference-profile path passes `false` because profiles only ever
-        // cover chat models. Either way the kind follows the modality, not the
-        // id (#647).
+        // `vision` and `is_embedding` are the provider's real modality
+        // metadata on both paths: read from the summary for a foundation
+        // model, and read from the base model's summary for an inference
+        // profile (see `ModalityIndex`). The kind follows the modality, not
+        // the id (#647).
         kind: if is_embedding {
             ModelKind::Embedding
         } else {
@@ -959,13 +1027,98 @@ fn infer_capabilities_from_id(
     }
 }
 
-/// Strip a cross-region inference-profile prefix (`us.`, `eu.`, `apac.`) to
-/// recover the underlying foundation model id. Returns the input unchanged
-/// when no known prefix matches.
+/// Whether this connector can configure reasoning for a Bedrock model, i.e.
+/// whether a requested thinking budget reaches the model instead of being
+/// dropped.
+///
+/// `base_id` must be the region-prefix-stripped foundation model id, the same
+/// contract [`supports_prompt_caching`] and [`supports_streaming_with_tools`]
+/// use. Case-insensitive.
+///
+/// This is the single source of truth for the reasoning axis. Both the
+/// capability record ([`infer_capabilities_from_id`]) and the request builder
+/// ([`build_additional_model_request_fields`]) read it, so the picker cannot
+/// advertise a control the request path will not honour (#1022).
+///
+/// Only Anthropic Claude takes a reasoning configuration through Bedrock's
+/// Converse API, as `additionalModelRequestFields.thinking`: Claude 3.7 and
+/// the 4.x line and later. Claude 3.5 and Claude 3 predate extended thinking.
+///
+/// "Reasons" and "takes a reasoning configuration" are different questions,
+/// and the second one is what this answers. DeepSeek R1 is the case that
+/// makes the difference visible: it reasons on every request and returns its
+/// trace in `reasoningContent`, and AWS documents its whole Converse request
+/// body as `system` / `messages` / `inferenceConfig` / `guardrailConfig` -
+/// there is no reasoning field to set, and the reasoning documentation says
+/// plainly that not all models let you configure the tokens spent on it. A
+/// model whose reasoning is always on and never adjustable answers `false`
+/// here: nothing this connector sends changes what it does.
+fn supports_configurable_reasoning(base_id: &str) -> bool {
+    let lc = base_id.to_ascii_lowercase();
+    let Some(claude) = lc.strip_prefix("anthropic.claude-") else {
+        return false;
+    };
+
+    // Claude 3.x ids spell the minor version into the name
+    // (`3-5-sonnet-...`, `3-7-sonnet-...`); only 3.7 has extended thinking.
+    if let Some(three) = claude.strip_prefix("3-") {
+        return three.starts_with("7-");
+    }
+
+    // Claude 4 and later put the family first (`sonnet-4-5-...`,
+    // `opus-4-1-...`, `haiku-4-5-...`). Match the family, not the version, so
+    // a later minor release needs no edit here - the same forward-compatible
+    // shape `supports_prompt_caching` uses.
+    ["sonnet-", "opus-", "haiku-"]
+        .iter()
+        .any(|family| claude.starts_with(family))
+}
+
+/// Every inference-profile prefix AWS is known to issue.
+///
+/// **Every entry ends in `.`, and that is what keeps the list order-free.** A
+/// prefix that included the separator's absence - `"ap"` rather than `"ap."` -
+/// would match `apac.anthropic...` and leave `ac.anthropic...`, and which
+/// entry won would depend on where a maintainer inserted it.
+/// `inference_profile_prefixes_all_end_in_a_separator` holds the invariant so
+/// the next entry cannot be added without it.
+///
+/// A profile id is the foundation model id behind one of these prefixes, so
+/// this list is what lets every capability gate in this connector see the base
+/// id. A missing entry is not cosmetic: the gates take the stripped id, so an
+/// unstripped prefix makes extended thinking, prompt caching, the context
+/// window and the streaming-with-tools deny list all answer for an id that
+/// matches nothing - silently withholding a capability the model has.
+///
+/// Sources, all AWS documentation:
+/// - Geographic cross-Region inference names `us`, `eu`, `apac` as geography
+///   prefixes, and `ap` appears on the newer APAC profiles.
+/// - The Claude Sonnet 4.5 model card lists Geo ids for `us.`, `eu.`, `au.`
+///   and `jp.`, and the Global id `global.anthropic.claude-sonnet-4-5-...`.
+/// - GovCloud sources route through the US geo id, and `us-gov.` is carried
+///   here as well because it costs nothing and an unstripped prefix is the
+///   expensive direction.
+///
+/// An allowlist rather than "drop the first dotted segment", because model ids
+/// carry dots of their own - `openai.gpt-5.6` would lose its provider.
+const INFERENCE_PROFILE_PREFIXES: &[&str] = &[
+    "global.", "us-gov.", "us.", "eu.", "apac.", "ap.", "au.", "jp.",
+];
+
+/// Strip a cross-region inference-profile prefix to recover the underlying
+/// foundation model id. Returns the input unchanged when no known prefix
+/// matches.
+///
+/// This is the only way this connector names the model behind a profile, and
+/// that is deliberate. A turn arrives carrying a model id and nothing else, so
+/// this is all the dispatch path has; the listing resolves the same way rather
+/// than reading the richer answer in the profile's ARN, because a capability
+/// the listing can see and dispatch cannot is one the picker offers and the
+/// request builder discards. Issue #1044 covers resolving it for both sides.
 fn strip_region_prefix(id: &str) -> &str {
-    id.strip_prefix("us.")
-        .or_else(|| id.strip_prefix("eu."))
-        .or_else(|| id.strip_prefix("apac."))
+    INFERENCE_PROFILE_PREFIXES
+        .iter()
+        .find_map(|prefix| id.strip_prefix(prefix))
         .unwrap_or(id)
 }
 
@@ -1076,6 +1229,61 @@ fn document_to_json_string(doc: &Document) -> String {
     serde_json::to_string(&doc_to_value(doc)).unwrap_or_else(|_| "{}".to_string())
 }
 
+/// The modality facts `ListFoundationModels` reports for one model, reduced
+/// to the two questions the capability record asks of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ModelModalities {
+    /// The model takes image input.
+    vision: bool,
+    /// The model returns vectors rather than text.
+    is_embedding: bool,
+}
+
+impl ModelModalities {
+    fn from_summary(summary: &aws_sdk_bedrock::types::FoundationModelSummary) -> Self {
+        use aws_sdk_bedrock::types::ModelModality;
+        Self {
+            vision: summary.input_modalities().contains(&ModelModality::Image),
+            is_embedding: summary
+                .output_modalities()
+                .contains(&ModelModality::Embedding),
+        }
+    }
+}
+
+/// Modality metadata for every foundation model the account lists, keyed by
+/// foundation model id.
+///
+/// Why it exists: `ListInferenceProfiles` reports no modalities, so the
+/// profile path used to carry a second, hardcoded vision id list. That list is
+/// the one that runs in practice - the on-demand filter removes nearly every
+/// modern chat model from the foundation catalogue, leaving the profile entry
+/// as the thing a person picks - and it drifts from what AWS reports for the
+/// same model. Both listings arrive in one call, so a profile reuses the real
+/// metadata of the model it routes to (#1023).
+///
+/// Built from every summary, before any filter: a model the catalogue drops
+/// for having no on-demand throughput is exactly the model a profile serves.
+#[derive(Debug, Default)]
+struct ModalityIndex(std::collections::HashMap<String, ModelModalities>);
+
+impl ModalityIndex {
+    fn from_summaries(summaries: &[aws_sdk_bedrock::types::FoundationModelSummary]) -> Self {
+        Self(
+            summaries
+                .iter()
+                .map(|s| (s.model_id().to_string(), ModelModalities::from_summary(s)))
+                .collect(),
+        )
+    }
+
+    /// The modalities this listing reported for `base_id`, or `None` when it
+    /// did not describe that model.
+    fn get(&self, base_id: &str) -> Option<ModelModalities> {
+        self.0.get(base_id).copied()
+    }
+}
+
 /// Convert a `FoundationModelSummary` into a `ModelInfo`, returning `None`
 /// if the model should be filtered out (not ACTIVE, not text/embedding, or
 /// not invocable via on-demand throughput).
@@ -1107,19 +1315,15 @@ fn summary_to_model_info(
     // Filter: output modality must include TEXT or EMBEDDING.
     // (We skip pure IMAGE/VIDEO generation models — they're not usable as
     // chat/embedding backends in this connector.)
-    let output_modalities = summary.output_modalities();
-    let is_text = output_modalities.contains(&ModelModality::Text);
-    let is_embedding = output_modalities.contains(&ModelModality::Embedding);
-    if !(is_text || is_embedding) {
+    let modalities = ModelModalities::from_summary(summary);
+    let is_text = summary.output_modalities().contains(&ModelModality::Text);
+    if !(is_text || modalities.is_embedding) {
         return None;
     }
 
-    let input_modalities = summary.input_modalities();
-    let vision = input_modalities.contains(&ModelModality::Image);
-
     let id = summary.model_id();
     let model_name = summary.model_name().unwrap_or(id).to_string();
-    let capabilities = infer_capabilities_from_id(id, vision, is_embedding);
+    let capabilities = infer_capabilities_from_id(id, modalities.vision, modalities.is_embedding);
 
     Some(ModelInfo {
         id: id.to_string(),
@@ -1133,14 +1337,18 @@ fn summary_to_model_info(
 /// for non-active profiles or profiles whose underlying foundation model
 /// can't be recovered.
 ///
-/// Capabilities are derived from the underlying foundation model id (after
-/// stripping the region prefix) since the profile API doesn't expose them.
-/// Vision support is conservatively inferred from the model id family rather
-/// than from a real modality field — Bedrock doesn't surface modalities on
-/// profiles, but the profile's underlying model has the same modalities as
-/// its foundation counterpart.
+/// A profile is a route to a foundation model, so its capabilities are that
+/// model's capabilities. `modalities` carries what `ListFoundationModels`
+/// reported in the same call, keyed by model id, and the profile reuses it.
+/// Only where the base model is not in that listing does the id-family
+/// fallback below decide.
+///
+/// The base model is named by the profile id minus its geography prefix, and
+/// by nothing else. [`fallback_modalities_from_id`] records why the ARN in the
+/// profile's `models` is not read here, and what reading it would require.
 fn inference_profile_to_model_info(
     profile: &aws_sdk_bedrock::types::InferenceProfileSummary,
+    modalities: &ModalityIndex,
 ) -> Option<ModelInfo> {
     use aws_sdk_bedrock::types::InferenceProfileStatus;
 
@@ -1153,26 +1361,25 @@ fn inference_profile_to_model_info(
         return None;
     }
 
+    // The profile id minus its geography prefix, and nothing else. The
+    // profile's `models` carry the ARN of the foundation model it serves,
+    // which would resolve more ids than this does - and it is deliberately
+    // not read here. The dispatch path has only the model id, so every gate
+    // it consults resolves through `strip_region_prefix`; a capability taken
+    // from an input dispatch does not share is a capability the picker can
+    // offer and the request builder will discard. See the note on
+    // `fallback_modalities_from_id` for what resolving it properly needs.
     let base_id = strip_region_prefix(profile_id);
-    let lc = base_id.to_ascii_lowercase();
 
-    // Vision: known multimodal Bedrock model families. Profile API gives us
-    // no modality info, so this list is best-effort and conservative.
-    let vision = lc.contains("anthropic.claude-3")
-        || lc.contains("anthropic.claude-sonnet-4")
-        || lc.contains("anthropic.claude-opus-4")
-        || lc.contains("anthropic.claude-haiku-4")
-        || lc.contains("amazon.nova-pro")
-        || lc.contains("amazon.nova-lite")
-        || lc.contains("amazon.nova-premier")
-        || lc.contains("meta.llama3-2-11b-vision")
-        || lc.contains("meta.llama3-2-90b-vision")
-        || lc.contains("meta.llama4");
-
-    // Inference profiles cover chat models; embeddings stay on their bare
-    // ids (which support OnDemand and pass through the foundation-model
-    // path).
-    let is_embedding = false;
+    let resolved = modalities.get(base_id).unwrap_or_else(|| {
+        tracing::debug!(
+            profile_id,
+            base_id,
+            "inference profile has no foundation-model entry in this listing; \
+             falling back to the model-id family for its modalities"
+        );
+        fallback_modalities_from_id(base_id)
+    });
 
     let display_name = if profile.inference_profile_name.is_empty() {
         profile_id.to_string()
@@ -1183,10 +1390,53 @@ fn inference_profile_to_model_info(
     Some(ModelInfo {
         id: profile_id.to_string(),
         display_name,
-        // context_limit_for_model already strips the region prefix internally.
+        // `context_limit_for_model` strips the prefix itself, so the picker's
+        // window is the one `max_context_tokens` will budget against for the
+        // same id.
         context_limit: context_limit_for_model(profile_id),
-        capabilities: infer_capabilities_from_id(base_id, vision, is_embedding),
+        capabilities: infer_capabilities_from_id(base_id, resolved.vision, resolved.is_embedding),
     })
+}
+
+/// Modalities guessed from a model id, for the one case that has no better
+/// answer: a profile whose base model this account's `ListFoundationModels`
+/// did not return, so there is no provider metadata to reuse.
+///
+/// A documented fallback, not a second rule. Everything else reads AWS's own
+/// modality fields through [`ModalityIndex`]. The families listed are the
+/// multimodal ones Bedrock serves through profiles; anything unrecognized is
+/// reported as text-only, which costs a picker badge rather than sending an
+/// image to a model that cannot read one.
+///
+/// `is_embedding` is `false` here because an embedding model is reachable by
+/// its bare on-demand id and appears on the foundation path, so a profile for
+/// one is resolvable through the index or does not exist.
+///
+/// This is also where an id that does not reduce to a foundation model lands:
+/// an `APPLICATION` profile, whose id is a generated identifier, or a
+/// geography newer than [`INFERENCE_PROFILE_PREFIXES`]. The profile summary
+/// does carry the base model's ARN, and it is deliberately not read - the
+/// dispatch path has only the model id, so a capability recovered here and not
+/// there is one the picker offers and the request builder discards. Resolving
+/// it for both sides is issue #1044: the mapping has to reach the dispatch
+/// gates, with a defined answer for a turn against a model that was never
+/// listed.
+fn fallback_modalities_from_id(base_id: &str) -> ModelModalities {
+    let lc = base_id.to_ascii_lowercase();
+    let vision = lc.contains("anthropic.claude-3")
+        || lc.contains("anthropic.claude-sonnet-4")
+        || lc.contains("anthropic.claude-opus-4")
+        || lc.contains("anthropic.claude-haiku-4")
+        || lc.contains("amazon.nova-pro")
+        || lc.contains("amazon.nova-lite")
+        || lc.contains("amazon.nova-premier")
+        || lc.contains("meta.llama3-2-11b-vision")
+        || lc.contains("meta.llama3-2-90b-vision")
+        || lc.contains("meta.llama4");
+    ModelModalities {
+        vision,
+        is_embedding: false,
+    }
 }
 
 /// Build the degradation notice for a failed `ListInferenceProfiles` call.
@@ -1286,17 +1536,18 @@ impl BedrockClient {
         let foundation = foundation_res
             .map_err(|e| CoreError::Llm(format!("Bedrock ListFoundationModels failed: {e:#}")))?;
 
-        let mut models: Vec<ModelInfo> = foundation
-            .model_summaries()
-            .iter()
-            .filter_map(summary_to_model_info)
-            .collect();
+        let summaries = foundation.model_summaries();
+        // Built before the on-demand filter: the models it drops are exactly
+        // the ones the profiles below route to.
+        let modalities = ModalityIndex::from_summaries(summaries);
+        let mut models: Vec<ModelInfo> =
+            summaries.iter().filter_map(summary_to_model_info).collect();
         let mut notices = Vec::new();
 
         match profiles_res {
             Ok(profile_resp) => {
                 for profile in profile_resp.inference_profile_summaries() {
-                    if let Some(info) = inference_profile_to_model_info(profile) {
+                    if let Some(info) = inference_profile_to_model_info(profile, &modalities) {
                         models.push(info);
                     }
                 }
@@ -1475,7 +1726,9 @@ impl LlmClient for BedrockClient {
                     "skipping ConverseStream: model on the non-streaming-with-tools deny-list"
                 );
             }
-            return self.dispatch_non_streaming(client, inputs, on_chunk).await;
+            return self
+                .dispatch_non_streaming(client, inputs, on_chunk, &cancellation)
+                .await;
         }
 
         match self
@@ -1494,7 +1747,8 @@ impl LlmClient for BedrockClient {
                     .lock()
                     .await
                     .insert(model.clone());
-                self.dispatch_non_streaming(client, inputs, on_chunk).await
+                self.dispatch_non_streaming(client, inputs, on_chunk, &cancellation)
+                    .await
             }
             Err(StreamingDispatchError::Other(err)) => Err(err),
         }
@@ -1707,11 +1961,16 @@ impl BedrockClient {
     /// single `on_chunk` call with the full text so the upstream
     /// service contract — "the callback fires at least once with the
     /// model's prose output" — is preserved.
+    ///
+    /// The request is bounded by [`Self::non_streaming_timeout`] and raced
+    /// against `cancellation`, so this path fails a stalled turn and answers
+    /// a stop the same way [`Self::dispatch_streaming`] does.
     async fn dispatch_non_streaming(
         &self,
         client: &Client,
         inputs: BedrockRequestInputs,
         mut on_chunk: ChunkCallback,
+        cancellation: &tokio_util::sync::CancellationToken,
     ) -> Result<LlmResponse, CoreError> {
         let mut request = client
             .converse()
@@ -1730,7 +1989,29 @@ impl BedrockClient {
             request = request.additional_model_request_fields(extra);
         }
 
-        let response = request.send().await.map_err(map_converse_error)?;
+        // `Converse` answers once, when generation is complete, so one bound
+        // covers the whole call. Race it against cancellation as well, so a
+        // stop drops the in-flight request instead of waiting the request out.
+        let request_timeout = self.non_streaming_timeout;
+        let send_fut = request.send();
+        let response = tokio::select! {
+            _ = cancellation.cancelled() => {
+                tracing::debug!(model = %inputs.model, "Bedrock converse cancelled by token");
+                return Err(CoreError::Cancelled);
+            }
+            _ = tokio::time::sleep(request_timeout) => {
+                tracing::error!(
+                    model = %inputs.model,
+                    timeout_s = request_timeout.as_secs(),
+                    "Bedrock converse send() timed out (no response)"
+                );
+                return Err(CoreError::Llm(format!(
+                    "Bedrock converse request timed out after {}s",
+                    request_timeout.as_secs()
+                )));
+            }
+            r = send_fut => r.map_err(map_converse_error)?,
+        };
 
         let mut text = String::new();
         let mut tool_calls = Vec::new();
@@ -1863,42 +2144,42 @@ fn streaming_tools_unsupported_detail(
     }
 }
 
-/// Recognize Claude-family Bedrock model ids. Only Claude models accept
-/// the `thinking` extended-thinking block via `additionalModelRequestFields`.
+/// What a turn's reasoning hint amounts to for the model that will serve it.
 ///
-/// Matches both the legacy `anthropic.claude-*` names and the cross-region
-/// inference profile aliases (`us.anthropic.claude-*`, `eu.anthropic.claude-*`,
-/// `apac.anthropic.claude-*`).
-fn is_claude_bedrock_model(model: &str) -> bool {
-    let m = model.to_ascii_lowercase();
-    m.contains("anthropic.claude")
+/// Three outcomes, and they stay distinct on purpose (#1022). "Nobody asked"
+/// and "somebody asked and this model cannot honour it" are different facts,
+/// and collapsing the second into the first is what let a paid-for reasoning
+/// effort disappear with nothing above `debug!` to say so.
+#[derive(Debug)]
+enum ReasoningRequest {
+    /// No reasoning was requested for this turn.
+    NotRequested,
+    /// Reasoning was requested and the model takes it. Carries the
+    /// `additionalModelRequestFields` document to send.
+    Configured(Document),
+    /// Reasoning was requested and this model takes no reasoning
+    /// configuration on Bedrock, so the effort has no effect on the request.
+    Unconfigurable { budget: u32 },
 }
 
-/// Build the `additionalModelRequestFields` Document for a Bedrock
-/// Converse request, translating the per-turn reasoning hint into the
-/// per-vendor shape.
+/// Resolve the per-turn reasoning hint against the model that will serve it.
 ///
-/// - Claude-family: `{"thinking": {"type": "enabled", "budget_tokens": N}}`
-/// - Others: `None` (unrecognized field would cause a 400).
+/// `model` may carry a cross-region inference-profile prefix; it is stripped
+/// here, so callers pass the id they dispatch with.
 ///
-/// Returns `None` when no reasoning is requested or when the model is
-/// not known to support extended thinking.
-fn build_additional_model_request_fields(
-    model: &str,
-    reasoning: ReasoningConfig,
-) -> Option<Document> {
+/// The emitted shape for a model that takes it is Anthropic's native one,
+/// `{"thinking": {"type": "enabled", "budget_tokens": N}}`, which Bedrock
+/// forwards verbatim. Which models those are is
+/// [`supports_configurable_reasoning`], shared with the capability record so
+/// the two cannot drift.
+fn resolve_reasoning_request(model: &str, reasoning: ReasoningConfig) -> ReasoningRequest {
     use std::collections::HashMap;
     let budget = match reasoning.thinking_budget_tokens {
         Some(n) if n > 0 => n,
-        _ => return None,
+        _ => return ReasoningRequest::NotRequested,
     };
-    if !is_claude_bedrock_model(model) {
-        tracing::debug!(
-            model,
-            budget,
-            "Bedrock reasoning requested but model is not Claude-family; dropping thinking field"
-        );
-        return None;
+    if !supports_configurable_reasoning(strip_region_prefix(model)) {
+        return ReasoningRequest::Unconfigurable { budget };
     }
     let mut thinking: HashMap<String, Document> = HashMap::new();
     thinking.insert("type".to_string(), Document::String("enabled".to_string()));
@@ -1908,7 +2189,33 @@ fn build_additional_model_request_fields(
     );
     let mut root: HashMap<String, Document> = HashMap::new();
     root.insert("thinking".to_string(), Document::Object(thinking));
-    Some(Document::Object(root))
+    ReasoningRequest::Configured(Document::Object(root))
+}
+
+/// Build the `additionalModelRequestFields` document for a Bedrock Converse
+/// request, and report a reasoning effort the model cannot act on.
+///
+/// Returns `None` when no reasoning was requested, and when the model takes
+/// no reasoning configuration - the second case is stated at `warn!` with the
+/// model and the budget, because the person who set that effort is paying for
+/// a control that did nothing.
+fn build_additional_model_request_fields(
+    model: &str,
+    reasoning: ReasoningConfig,
+) -> Option<Document> {
+    match resolve_reasoning_request(model, reasoning) {
+        ReasoningRequest::NotRequested => None,
+        ReasoningRequest::Configured(fields) => Some(fields),
+        ReasoningRequest::Unconfigurable { budget } => {
+            tracing::warn!(
+                model,
+                budget,
+                "reasoning effort ignored: this Bedrock model takes no reasoning \
+                 configuration, so the request goes out without one"
+            );
+            None
+        }
+    }
 }
 
 /// Map each tool call's (Bedrock-sanitized) name back to the original tool
@@ -2200,13 +2507,188 @@ mod tests {
 
     // --- Extended-thinking (reasoning) wiring ----------------------------
 
+    // --- Inference-profile prefixes -------------------------------------
+    //
+    // Every capability gate in this connector takes the region-prefix-stripped
+    // base id. A prefix the stripper does not know is therefore not a cosmetic
+    // miss: the base id never appears, so extended thinking, prompt caching
+    // and the streaming-with-tools deny list all answer for a model id that
+    // matches nothing. AWS documents each of these on the model detail pages
+    // (Claude Sonnet 4.5 lists us / eu / au / jp Geo ids and a global id).
+
+    /// Every profile prefix AWS is known to issue, paired with a model id
+    /// that has to keep answering the same way through it.
+    const PROFILE_PREFIXES: &[&str] = &[
+        "us.", "eu.", "apac.", "ap.", "au.", "jp.", "global.", "us-gov.",
+    ];
+
     #[test]
-    fn claude_bedrock_model_detection() {
-        assert!(is_claude_bedrock_model("anthropic.claude-opus-4-1"));
-        assert!(is_claude_bedrock_model("us.anthropic.claude-sonnet-4-6"));
-        assert!(is_claude_bedrock_model("eu.anthropic.claude-haiku-4-5"));
-        assert!(!is_claude_bedrock_model("amazon.titan-text-express-v1"));
-        assert!(!is_claude_bedrock_model("meta.llama3-70b"));
+    fn every_inference_profile_prefix_recovers_the_base_model_id() {
+        for prefix in PROFILE_PREFIXES {
+            let id = format!("{prefix}anthropic.claude-sonnet-4-5-20250929-v1:0");
+            assert_eq!(
+                strip_region_prefix(&id),
+                "anthropic.claude-sonnet-4-5-20250929-v1:0",
+                "{prefix} is an AWS inference-profile prefix and must be stripped"
+            );
+        }
+        // A bare foundation id is untouched, and an invented prefix is not
+        // stripped - the set is an allowlist, not a "drop the first segment"
+        // rule, because model ids can carry dots of their own
+        // (`openai.gpt-5.6`).
+        assert_eq!(
+            strip_region_prefix("anthropic.claude-sonnet-4-5-20250929-v1:0"),
+            "anthropic.claude-sonnet-4-5-20250929-v1:0"
+        );
+        assert_eq!(
+            strip_region_prefix("xx.anthropic.claude-sonnet-4-5-20250929-v1:0"),
+            "xx.anthropic.claude-sonnet-4-5-20250929-v1:0"
+        );
+    }
+
+    #[test]
+    fn inference_profile_prefixes_all_end_in_a_separator() {
+        // The list is matched entry by entry, so nothing may be a prefix of
+        // anything else. Ending every entry at the separator guarantees that
+        // whatever order they sit in. `"ap"` without the dot would match
+        // `apac.anthropic...` and leave `ac.anthropic...` behind.
+        for prefix in INFERENCE_PROFILE_PREFIXES {
+            assert!(
+                prefix.ends_with('.'),
+                "{prefix} must end at the separator, or it can swallow another prefix"
+            );
+        }
+        for (i, outer) in INFERENCE_PROFILE_PREFIXES.iter().enumerate() {
+            for (j, inner) in INFERENCE_PROFILE_PREFIXES.iter().enumerate() {
+                assert!(
+                    i == j || !outer.starts_with(inner),
+                    "{inner} is a prefix of {outer}, so the match depends on list order"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_capability_gate_answers_the_same_through_every_prefix() {
+        // Both directions: a capability that must stay on through the prefix,
+        // and a deny-list entry that must stay off through it. A prefix the
+        // stripper misses silently flips both.
+        for prefix in PROFILE_PREFIXES {
+            let claude = format!("{prefix}anthropic.claude-sonnet-4-5-20250929-v1:0");
+            let base = strip_region_prefix(&claude);
+            assert!(
+                supports_configurable_reasoning(base),
+                "{prefix}: extended thinking must survive the prefix"
+            );
+            assert!(
+                supports_prompt_caching(base),
+                "{prefix}: prompt caching must survive the prefix"
+            );
+            assert_eq!(
+                context_limit_for_model(&claude),
+                Some(200_000),
+                "{prefix}: the context window must survive the prefix"
+            );
+
+            let llama = format!("{prefix}meta.llama4-maverick-17b-instruct-v1:0");
+            assert!(
+                !supports_streaming_with_tools(strip_region_prefix(&llama)),
+                "{prefix}: the non-streaming-with-tools deny list must survive the prefix"
+            );
+        }
+    }
+
+    #[test]
+    fn configurable_reasoning_reads_the_stripped_base_id() {
+        // The caller strips the region prefix, as it does for
+        // `supports_prompt_caching` and `supports_streaming_with_tools`.
+        assert!(supports_configurable_reasoning(strip_region_prefix(
+            "us.anthropic.claude-opus-4-1"
+        )));
+        assert!(supports_configurable_reasoning(strip_region_prefix(
+            "eu.anthropic.claude-3-7-sonnet-20250219-v1:0"
+        )));
+        assert!(!supports_configurable_reasoning(strip_region_prefix(
+            "apac.anthropic.claude-3-5-sonnet-20241022-v2:0"
+        )));
+        assert!(!supports_configurable_reasoning(
+            "amazon.titan-text-express-v1"
+        ));
+        // Unknown models default to "no configuration": an unrecognized
+        // reasoning field fails the whole request.
+        assert!(!supports_configurable_reasoning("future.unknown-model"));
+    }
+
+    #[test]
+    fn an_unconfigurable_reasoning_request_is_reported_not_dropped() {
+        // Three outcomes, and they must stay distinguishable. "Nobody asked"
+        // is not the same answer as "somebody asked and this model cannot
+        // honour it" - collapsing the second into the first is the silent
+        // drop this fix removes.
+        assert!(matches!(
+            resolve_reasoning_request("us.deepseek.r1-v1:0", ReasoningConfig::default()),
+            ReasoningRequest::NotRequested
+        ));
+        assert!(matches!(
+            resolve_reasoning_request(
+                "us.deepseek.r1-v1:0",
+                ReasoningConfig::with_thinking_budget(8_000)
+            ),
+            ReasoningRequest::Unconfigurable { budget: 8_000 }
+        ));
+        assert!(matches!(
+            resolve_reasoning_request(
+                "us.anthropic.claude-sonnet-4-6",
+                ReasoningConfig::with_thinking_budget(8_000)
+            ),
+            ReasoningRequest::Configured(_)
+        ));
+    }
+
+    /// Model ids paired with whether this connector can configure reasoning
+    /// for them, spanning both answers so neither direction can pass
+    /// vacuously.
+    ///
+    /// Claude 3.7 and the 4.x line take an extended-thinking budget. Claude
+    /// 3.5 and Claude 3 predate the feature. DeepSeek R1 reasons on its own
+    /// and Bedrock exposes no knob for it. Nothing else on Bedrock takes a
+    /// thinking budget through the Converse API.
+    const REASONING_CONFIGURABLE_BY_ID: &[(&str, bool)] = &[
+        ("anthropic.claude-sonnet-4-6", true),
+        ("us.anthropic.claude-opus-4-1", true),
+        ("eu.anthropic.claude-haiku-4-5-20251001-v1:0", true),
+        ("apac.anthropic.claude-3-7-sonnet-20250219-v1:0", true),
+        ("anthropic.claude-3-5-sonnet-20241022-v2:0", false),
+        ("anthropic.claude-3-haiku-20240307-v1:0", false),
+        ("us.deepseek.r1-v1:0", false),
+        ("us.meta.llama4-maverick-17b-instruct-v1:0", false),
+        ("amazon.nova-premier-v1:0", false),
+        ("openai.gpt-oss-120b-1:0", false),
+        ("amazon.titan-embed-text-v2:0", false),
+    ];
+
+    #[test]
+    fn reasoning_capability_and_the_emitted_thinking_field_agree_for_every_model() {
+        // The capability record and the request builder must not be able to
+        // disagree: a model that advertises reasoning has its budget sent,
+        // and a model that does not advertise it is never sent one.
+        for (id, configurable) in REASONING_CONFIGURABLE_BY_ID {
+            let advertised =
+                infer_capabilities_from_id(strip_region_prefix(id), false, false).reasoning;
+            let emitted = build_additional_model_request_fields(
+                id,
+                ReasoningConfig::with_thinking_budget(8_000),
+            )
+            .is_some();
+            assert_eq!(
+                advertised, *configurable,
+                "{id}: capability record disagrees with what Bedrock accepts"
+            );
+            assert_eq!(
+                emitted, *configurable,
+                "{id}: emitted request fields disagree with what Bedrock accepts"
+            );
+        }
     }
 
     #[test]
@@ -2697,7 +3179,8 @@ mod tests {
             "Claude Haiku 4.5 (US)",
             InferenceProfileStatus::Active,
         );
-        let profile_info = inference_profile_to_model_info(&profile).expect("kept");
+        let profile_info =
+            inference_profile_to_model_info(&profile, &ModalityIndex::default()).expect("kept");
         assert_eq!(profile_info.capabilities.kind, ModelKind::Generative);
     }
 
@@ -2866,12 +3349,18 @@ mod tests {
         name: &str,
         status: InferenceProfileStatus,
     ) -> InferenceProfileSummary {
-        // The builder requires `models` to be set (the underlying foundation
-        // models the profile routes to). The conversion code doesn't read
-        // them — we infer capabilities from the profile id — so a single
-        // stub entry is enough for the test.
+        // `models` carries the foundation model the profile routes to, and a
+        // real profile's ARN names the same model its id reduces to - so the
+        // stub is built from the id, not from a placeholder. Paired with an
+        // empty `ModalityIndex`, these tests then exercise the id-family
+        // fallback, which is what they cover. The metadata path and the
+        // disagreeing-ARN path are covered end to end against a mocked
+        // control plane, further down.
         let model_stub = InferenceProfileModel::builder()
-            .model_arn("arn:aws:bedrock:us-east-1::foundation-model/test")
+            .model_arn(format!(
+                "arn:aws:bedrock:us-east-1::foundation-model/{}",
+                strip_region_prefix(id)
+            ))
             .build();
         InferenceProfileSummary::builder()
             .inference_profile_arn(format!(
@@ -2901,7 +3390,7 @@ mod tests {
             InferenceProfileStatus::Active,
         );
         // sanity: the active path keeps it
-        assert!(inference_profile_to_model_info(&profile).is_some());
+        assert!(inference_profile_to_model_info(&profile, &ModalityIndex::default()).is_some());
     }
 
     #[test]
@@ -2911,7 +3400,8 @@ mod tests {
             "Claude Haiku 4.5 (US)",
             InferenceProfileStatus::Active,
         );
-        let info = inference_profile_to_model_info(&profile).expect("kept");
+        let info =
+            inference_profile_to_model_info(&profile, &ModalityIndex::default()).expect("kept");
         assert_eq!(info.id, "us.anthropic.claude-haiku-4-5-20251001-v1:0");
         assert_eq!(info.display_name, "Claude Haiku 4.5 (US)");
         assert_eq!(info.context_limit, Some(200_000));
@@ -2928,7 +3418,8 @@ mod tests {
             "Nova Premier (US)",
             InferenceProfileStatus::Active,
         );
-        let info = inference_profile_to_model_info(&profile).expect("kept");
+        let info =
+            inference_profile_to_model_info(&profile, &ModalityIndex::default()).expect("kept");
         assert_eq!(info.id, "us.amazon.nova-premier-v1:0");
         assert!(info.capabilities.tools, "Nova supports tool use");
         assert!(info.capabilities.vision, "Nova Premier is multimodal");
@@ -2943,9 +3434,18 @@ mod tests {
             "DeepSeek R1 (US)",
             InferenceProfileStatus::Active,
         );
-        let info = inference_profile_to_model_info(&profile).expect("kept");
+        let info =
+            inference_profile_to_model_info(&profile, &ModalityIndex::default()).expect("kept");
         assert_eq!(info.id, "us.deepseek.r1-v1:0");
-        assert!(info.capabilities.reasoning, "R1 is a reasoning model");
+        // R1 reasons, and it reasons whether or not anybody asks: Bedrock's
+        // Converse contract for DeepSeek carries no reasoning configuration
+        // at all, so this connector cannot act on a reasoning effort for it.
+        // Reporting `true` put a reasoning badge and an effort control in
+        // front of a person, and dropped the budget on the way out.
+        assert!(
+            !info.capabilities.reasoning,
+            "R1 takes no reasoning configuration on Bedrock"
+        );
         assert!(info.capabilities.tools);
         assert!(!info.capabilities.vision);
     }
@@ -2957,7 +3457,8 @@ mod tests {
             "",
             InferenceProfileStatus::Active,
         );
-        let info = inference_profile_to_model_info(&profile).expect("kept");
+        let info =
+            inference_profile_to_model_info(&profile, &ModalityIndex::default()).expect("kept");
         assert_eq!(info.display_name, "us.anthropic.claude-sonnet-4-6");
     }
 
@@ -3197,6 +3698,279 @@ mod tests {
         );
         assert!(second.notices.is_empty());
         foundation.assert_calls(2);
+    }
+
+    // --- Profile capabilities come from the base model's metadata (#1023) --
+    //
+    // The profile API returns no modality data, so the profile path used to
+    // carry its own hardcoded vision id list. That list is the path that runs
+    // in practice - the on-demand filter removes nearly every modern chat
+    // model from the foundation listing - and it drifts away from what AWS
+    // reports for the same model. The listings arrive in one call, so a
+    // profile can be resolved to its base model and reuse the real metadata.
+
+    /// `ListFoundationModels` where the interesting models are reachable only
+    /// through a profile, which is the shape of a current AWS account.
+    ///
+    /// The two profile-only entries are chosen so the retired id list would
+    /// answer wrongly in both directions: a vision-capable model it has never
+    /// heard of, and a model it treats as vision-capable by family prefix
+    /// whose real input modalities are text only.
+    const DRIFTING_FOUNDATION_MODELS_BODY: &str = r#"{
+      "modelSummaries": [
+        {
+          "modelArn": "arn:aws:bedrock:us-east-1::foundation-model/amazon.nova-2-omni-v1:0",
+          "modelId": "amazon.nova-2-omni-v1:0",
+          "modelName": "Nova 2 Omni",
+          "providerName": "Amazon",
+          "inputModalities": ["TEXT", "IMAGE"],
+          "outputModalities": ["TEXT"],
+          "inferenceTypesSupported": ["INFERENCE_PROFILE"],
+          "modelLifecycle": {"status": "ACTIVE"}
+        },
+        {
+          "modelArn": "arn:aws:bedrock:us-east-1::foundation-model/meta.llama4-scout-17b-instruct-v1:0",
+          "modelId": "meta.llama4-scout-17b-instruct-v1:0",
+          "modelName": "Llama 4 Scout 17B Instruct",
+          "providerName": "Meta",
+          "inputModalities": ["TEXT"],
+          "outputModalities": ["TEXT"],
+          "inferenceTypesSupported": ["INFERENCE_PROFILE"],
+          "modelLifecycle": {"status": "ACTIVE"}
+        },
+        {
+          "modelArn": "arn:aws:bedrock:us-east-1::foundation-model/amazon.titan-embed-image-v1:0",
+          "modelId": "amazon.titan-embed-image-v1:0",
+          "modelName": "Titan Multimodal Embeddings",
+          "providerName": "Amazon",
+          "inputModalities": ["TEXT", "IMAGE"],
+          "outputModalities": ["EMBEDDING"],
+          "inferenceTypesSupported": ["INFERENCE_PROFILE"],
+          "modelLifecycle": {"status": "ACTIVE"}
+        },
+        {
+          "modelArn": "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-sonnet-4-5-20250929-v1:0",
+          "modelId": "anthropic.claude-sonnet-4-5-20250929-v1:0",
+          "modelName": "Claude Sonnet 4.5",
+          "providerName": "Anthropic",
+          "inputModalities": ["TEXT", "IMAGE"],
+          "outputModalities": ["TEXT"],
+          "inferenceTypesSupported": ["INFERENCE_PROFILE"],
+          "modelLifecycle": {"status": "ACTIVE"}
+        },
+        {
+          "modelArn": "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3-haiku-20240307-v1:0",
+          "modelId": "anthropic.claude-3-haiku-20240307-v1:0",
+          "modelName": "Claude 3 Haiku",
+          "providerName": "Anthropic",
+          "inputModalities": ["TEXT", "IMAGE"],
+          "outputModalities": ["TEXT"],
+          "inferenceTypesSupported": ["ON_DEMAND"],
+          "modelLifecycle": {"status": "ACTIVE"}
+        }
+      ]
+    }"#;
+
+    /// Profiles for the three profile-only models above, plus one whose base
+    /// model is absent from the foundation listing.
+    const DRIFTING_INFERENCE_PROFILES_BODY: &str = r#"{
+      "inferenceProfileSummaries": [
+        {
+          "inferenceProfileName": "US Nova 2 Omni",
+          "inferenceProfileArn": "arn:aws:bedrock:us-east-1:111122223333:inference-profile/us.amazon.nova-2-omni-v1:0",
+          "inferenceProfileId": "us.amazon.nova-2-omni-v1:0",
+          "models": [
+            {"modelArn": "arn:aws:bedrock:us-east-1::foundation-model/amazon.nova-2-omni-v1:0"}
+          ],
+          "status": "ACTIVE",
+          "type": "SYSTEM_DEFINED"
+        },
+        {
+          "inferenceProfileName": "US Llama 4 Scout",
+          "inferenceProfileArn": "arn:aws:bedrock:us-east-1:111122223333:inference-profile/us.meta.llama4-scout-17b-instruct-v1:0",
+          "inferenceProfileId": "us.meta.llama4-scout-17b-instruct-v1:0",
+          "models": [
+            {"modelArn": "arn:aws:bedrock:us-east-1::foundation-model/meta.llama4-scout-17b-instruct-v1:0"}
+          ],
+          "status": "ACTIVE",
+          "type": "SYSTEM_DEFINED"
+        },
+        {
+          "inferenceProfileName": "US Titan Multimodal Embeddings",
+          "inferenceProfileArn": "arn:aws:bedrock:us-east-1:111122223333:inference-profile/us.amazon.titan-embed-image-v1:0",
+          "inferenceProfileId": "us.amazon.titan-embed-image-v1:0",
+          "models": [
+            {"modelArn": "arn:aws:bedrock:us-east-1::foundation-model/amazon.titan-embed-image-v1:0"}
+          ],
+          "status": "ACTIVE",
+          "type": "SYSTEM_DEFINED"
+        },
+        {
+          "inferenceProfileName": "US Claude Sonnet 4.6",
+          "inferenceProfileArn": "arn:aws:bedrock:us-east-1:111122223333:inference-profile/us.anthropic.claude-sonnet-4-6",
+          "inferenceProfileId": "us.anthropic.claude-sonnet-4-6",
+          "models": [
+            {"modelArn": "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-sonnet-4-6"}
+          ],
+          "status": "ACTIVE",
+          "type": "SYSTEM_DEFINED"
+        },
+        {
+          "inferenceProfileName": "Claude Sonnet 4.5 on a geography this build has never heard of",
+          "inferenceProfileArn": "arn:aws:bedrock:us-east-1:111122223333:inference-profile/xx.anthropic.claude-sonnet-4-5-20250929-v1:0",
+          "inferenceProfileId": "xx.anthropic.claude-sonnet-4-5-20250929-v1:0",
+          "models": [
+            {"modelArn": "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-sonnet-4-5-20250929-v1:0"}
+          ],
+          "status": "ACTIVE",
+          "type": "SYSTEM_DEFINED"
+        }
+      ]
+    }"#;
+
+    /// Both control-plane calls succeed, serving the drifting-catalogue
+    /// bodies above.
+    fn mock_drifting_control_plane(server: &httpmock::MockServer) {
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/foundation-models");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(DRIFTING_FOUNDATION_MODELS_BODY);
+        });
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/inference-profiles");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(DRIFTING_INFERENCE_PROFILES_BODY);
+        });
+    }
+
+    fn find_model<'a>(report: &'a ModelListingReport, id: &str) -> &'a ModelInfo {
+        report
+            .models
+            .iter()
+            .find(|m| m.id == id)
+            .unwrap_or_else(|| {
+                let ids: Vec<&str> = report.models.iter().map(|m| m.id.as_str()).collect();
+                panic!("{id} missing from the listing, got {ids:?}")
+            })
+    }
+
+    #[tokio::test]
+    async fn vision_capable_model_reports_vision_on_both_the_foundation_and_profile_paths() {
+        let server = httpmock::MockServer::start();
+        mock_drifting_control_plane(&server);
+
+        let report = control_plane_client(&server)
+            .list_models_detailed()
+            .await
+            .expect("healthy listing");
+
+        assert!(
+            find_model(&report, "anthropic.claude-3-haiku-20240307-v1:0")
+                .capabilities
+                .vision,
+            "the foundation path reads IMAGE from the real input modalities"
+        );
+        assert!(
+            find_model(&report, "us.amazon.nova-2-omni-v1:0")
+                .capabilities
+                .vision,
+            "the profile path must read the same metadata, not a curated id list"
+        );
+        assert!(
+            !find_model(&report, "us.meta.llama4-scout-17b-instruct-v1:0")
+                .capabilities
+                .vision,
+            "a model AWS reports as text-only must not be advertised as vision-capable"
+        );
+    }
+
+    #[tokio::test]
+    async fn profile_of_an_embedding_base_model_does_not_report_generative() {
+        let server = httpmock::MockServer::start();
+        mock_drifting_control_plane(&server);
+
+        let report = control_plane_client(&server)
+            .list_models_detailed()
+            .await
+            .expect("healthy listing");
+
+        let profile = find_model(&report, "us.amazon.titan-embed-image-v1:0");
+        assert_eq!(
+            profile.capabilities.kind,
+            ModelKind::Embedding,
+            "model kind follows the base model's output modality, it is not assumed"
+        );
+        assert!(
+            !profile.capabilities.tools,
+            "an embedding model calls no tools"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_profile_id_the_prefix_list_does_not_cover_reports_what_dispatch_will_do() {
+        // An id this connector cannot reduce to a foundation model - a
+        // geography newer than the prefix list, or an APPLICATION profile,
+        // whose id is a generated identifier with no prefix at all - is a
+        // capability the connector genuinely does not have. The listing could
+        // recover the base model from the profile's ARN, and must not: the
+        // dispatch path has only the id, so an answer taken from the ARN would
+        // put a control in front of a person that the request path then
+        // discards. That is the #1022 defect, rebuilt.
+        //
+        // So the record withholds, and it withholds in step with dispatch.
+        // Doing better means carrying the resolved mapping to the dispatch
+        // gates as well - see the note on `fallback_modalities_from_id`.
+        let server = httpmock::MockServer::start();
+        mock_drifting_control_plane(&server);
+
+        let report = control_plane_client(&server)
+            .list_models_detailed()
+            .await
+            .expect("healthy listing");
+
+        let id = "xx.anthropic.claude-sonnet-4-5-20250929-v1:0";
+        let profile = find_model(&report, id);
+
+        let dispatch_would_send = matches!(
+            resolve_reasoning_request(id, ReasoningConfig::with_thinking_budget(8_000)),
+            ReasoningRequest::Configured(_)
+        );
+        assert_eq!(
+            profile.capabilities.reasoning, dispatch_would_send,
+            "the record and the request path must answer the same, whichever way they answer"
+        );
+        assert!(
+            !profile.capabilities.reasoning,
+            "an id that reduces to nothing cannot be promised a thinking budget"
+        );
+        assert_eq!(
+            profile.context_limit,
+            context_limit_for_model(id),
+            "the picker's window must be the one the daemon budgets against"
+        );
+    }
+
+    #[tokio::test]
+    async fn profile_with_an_unresolvable_base_model_falls_back_to_the_id_family() {
+        // `anthropic.claude-sonnet-4-6` is not in this account's foundation
+        // listing, so there is no metadata to reuse. The documented fallback
+        // keeps the profile usable rather than reporting nothing.
+        let server = httpmock::MockServer::start();
+        mock_drifting_control_plane(&server);
+
+        let report = control_plane_client(&server)
+            .list_models_detailed()
+            .await
+            .expect("healthy listing");
+
+        let profile = find_model(&report, "us.anthropic.claude-sonnet-4-6");
+        assert!(profile.capabilities.vision);
+        assert!(profile.capabilities.tools);
+        assert_eq!(profile.capabilities.kind, ModelKind::Generative);
     }
 
     #[tokio::test]
@@ -4006,6 +4780,245 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_secs(1),
             "pre-cancelled token should short-circuit before AWS dispatch; took {elapsed:?}"
+        );
+    }
+
+    // --- Non-streaming dispatch: timeout and cancellation (#1024) --------
+    //
+    // The non-streaming path is not a rare fallback. It is taken for every
+    // model on the `supports_streaming_with_tools` deny list and for every
+    // model the runtime memo has learned rejects tools in streaming mode. A
+    // stalled request on that path must fail the turn on its own budget, and
+    // must answer the cancellation token, exactly as the streaming path does.
+
+    /// A TCP endpoint that completes the connection and then answers nothing.
+    /// This is what a hung Bedrock request looks like from the client side:
+    /// the socket is open, so no layer below the connector reports a failure,
+    /// and the response future never resolves.
+    struct StalledEndpoint {
+        url: String,
+        accept_loop: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for StalledEndpoint {
+        fn drop(&mut self) {
+            self.accept_loop.abort();
+        }
+    }
+
+    async fn stalled_endpoint() -> StalledEndpoint {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback port");
+        let addr = listener.local_addr().expect("read the bound port");
+        let accept_loop = tokio::spawn(async move {
+            // Hold every accepted socket open for the life of the task. A
+            // dropped socket would close the connection and turn the stall
+            // into a transport error, which is a different test.
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        StalledEndpoint {
+            url: format!("http://{addr}"),
+            accept_loop,
+        }
+    }
+
+    /// A client that dispatches `Converse` at `url`, with `secs` as the
+    /// whole-request budget for that path.
+    ///
+    /// The model is a Llama 4 profile id: Llama 4 is on the
+    /// non-streaming-with-tools deny list, so a turn that carries tools takes
+    /// `dispatch_non_streaming` without a streaming attempt first.
+    fn non_streaming_client(url: &str, secs: u64) -> BedrockClient {
+        BedrockClient::new(format!("AKIAIOSFODNN7EXAMPLE:{TEST_SECRET_ACCESS_KEY}"))
+            .with_base_url("us-east-1")
+            .__with_runtime_endpoint_for_test(url)
+            .with_model("us.meta.llama4-maverick-17b-instruct-v1:0")
+            .with_non_streaming_timeout(Some(secs))
+    }
+
+    /// One tool, which is what puts the turn on the non-streaming path.
+    fn one_tool() -> Vec<ToolDefinition> {
+        vec![ToolDefinition::new(
+            "weather",
+            "look up the weather",
+            serde_json::json!({"type": "object"}),
+        )]
+    }
+
+    #[test]
+    fn the_non_streaming_budget_is_its_own_setting_with_its_own_default() {
+        // `event_timeout` bounds the gap between streamed events. Reusing it
+        // to bound a whole generation would give one name two meanings, and
+        // would make a stall-detection change silently move a generation
+        // deadline. The non-streaming path answers once, after generation, so
+        // it carries its own budget - long enough that no turn that works
+        // today starts failing.
+        let client = BedrockClient::new(String::new());
+        assert_eq!(
+            client.non_streaming_timeout,
+            Duration::from_secs(600),
+            "the default must leave room for a full one-shot generation"
+        );
+
+        let tightened = BedrockClient::new(String::new())
+            .with_connect_timeout(Some(1))
+            .with_event_timeout(Some(1));
+        assert_eq!(
+            tightened.non_streaming_timeout,
+            Duration::from_secs(600),
+            "tightening the streaming budgets must not move the generation deadline"
+        );
+
+        // The override is per-connection, and rejects the two no-op values the
+        // sibling budgets also reject.
+        assert_eq!(
+            BedrockClient::new(String::new())
+                .with_non_streaming_timeout(Some(30))
+                .non_streaming_timeout,
+            Duration::from_secs(30)
+        );
+        for no_op in [None, Some(0)] {
+            assert_eq!(
+                BedrockClient::new(String::new())
+                    .with_non_streaming_timeout(no_op)
+                    .non_streaming_timeout,
+                Duration::from_secs(600),
+                "{no_op:?} means \"keep the default\""
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn non_streaming_dispatch_that_exceeds_the_timeout_returns_a_timeout_error() {
+        let endpoint = stalled_endpoint().await;
+        let client = non_streaming_client(&endpoint.url, 1);
+
+        // The outer bound only stops a hang from becoming a suite-wide stall.
+        // The assertion is that the connector's own budget ended the call.
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(20),
+            client.stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &one_tool(),
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            ),
+        )
+        .await
+        .expect("a stalled non-streaming dispatch must end on its own timeout, not hang");
+
+        let error = outcome.expect_err("a stalled request cannot produce a response");
+        assert!(
+            matches!(&error, CoreError::Llm(detail) if detail.contains("timed out")),
+            "the failure must name the timeout so an operator can raise the budget, got {error:?}"
+        );
+    }
+
+    /// One complete `Converse` response, as the API returns it.
+    const CONVERSE_RESPONSE_BODY: &str = r#"{
+      "output": {
+        "message": {
+          "role": "assistant",
+          "content": [{"text": "the whole answer, in one piece"}]
+        }
+      },
+      "stopReason": "end_turn",
+      "usage": {"inputTokens": 12, "outputTokens": 7, "totalTokens": 19},
+      "metrics": {"latencyMs": 250}
+    }"#;
+
+    #[tokio::test]
+    async fn non_streaming_dispatch_inside_the_budget_returns_the_answer() {
+        // The bound must end a hung request and nothing else. A turn that
+        // takes real time and finishes inside its budget has to come back
+        // whole - text, usage, and one callback - or the timeout has turned
+        // into a cap on working turns.
+        let server = httpmock::MockServer::start();
+        let converse = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path_matches(r"/converse$");
+            then.status(200)
+                .header("content-type", "application/json")
+                .delay(Duration::from_millis(400))
+                .body(CONVERSE_RESPONSE_BODY);
+        });
+
+        let client = non_streaming_client(&server.url(""), 2);
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = seen.clone();
+
+        let response = client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &one_tool(),
+                ReasoningConfig::default(),
+                Box::new(move |chunk| {
+                    sink.lock().expect("chunk sink").push(chunk);
+                    true
+                }),
+            )
+            .await
+            .expect("a turn that answers inside its budget must succeed");
+
+        converse.assert();
+        assert_eq!(response.text, "the whole answer, in one piece");
+        assert_eq!(
+            response.usage.as_ref().and_then(|u| u.output_tokens),
+            Some(7)
+        );
+        assert_eq!(
+            seen.lock().expect("chunk sink").as_slice(),
+            ["the whole answer, in one piece"],
+            "the callback fires once with the full text"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_during_a_non_streaming_dispatch_returns_promptly() {
+        use desktop_assistant_core::ports::llm::with_cancellation_token;
+        use tokio_util::sync::CancellationToken;
+
+        let endpoint = stalled_endpoint().await;
+        // A budget far longer than the test: the timeout must not be what ends
+        // this call, or the test would pass without any cancellation support.
+        let client = non_streaming_client(&endpoint.url, 600);
+
+        let token = CancellationToken::new();
+        let trip = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            trip.cancel();
+        });
+
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(20),
+            with_cancellation_token(token, async {
+                client
+                    .stream_completion(
+                        vec![Message::new(Role::User, "hi")],
+                        &one_tool(),
+                        ReasoningConfig::default(),
+                        Box::new(|_| true),
+                    )
+                    .await
+            }),
+        )
+        .await
+        .expect("cancelling must end the dispatch, not leave it running");
+
+        assert!(
+            matches!(outcome, Err(CoreError::Cancelled)),
+            "a cancelled non-streaming dispatch reports Cancelled, got {outcome:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "cancellation must be answered promptly; took {:?}",
+            started.elapsed()
         );
     }
 }
