@@ -1,12 +1,27 @@
-//! AWS Bedrock Converse API connector implementing the core `LlmClient` port.
+//! AWS Bedrock connector implementing the core `LlmClient` port.
+//!
+//! One connector reaches every model AWS Bedrock offers. Bedrock serves those
+//! models through several different APIs, and no single API reaches all of
+//! them, so the connector speaks each API it needs and hides that choice from
+//! the user: a person configures one Bedrock connection and picks a model,
+//! never an API. Each API surface is a backend, behind the `backend` module's
+//! trait.
+//!
+//! The connector owns model discovery and its cache, backend selection, the
+//! cross-cutting timeout and cache policy, and the tool-name bijection every
+//! backend spells names with. It does not own provider-independent behaviour
+//! that belongs to the daemon: purpose binding, context budgeting, retry, and
+//! tool dispatch.
+//!
+//! `docs/connectors/bedrock.md` records the design.
 
+mod backend;
+mod sdk;
 mod tool_names;
 pub use tool_names::ToolNameMap;
 
-use aws_config::{BehaviorVersion, Region};
 use aws_credential_types::Credentials;
 use aws_sdk_bedrock::Client as BedrockControlClient;
-use aws_sdk_bedrockruntime::Client;
 use aws_sdk_bedrockruntime::types::{
     CachePointBlock, CachePointType, ContentBlock, ConversationRole, Message as BedrockMessage,
     SystemContentBlock, Tool, ToolConfiguration, ToolInputSchema, ToolResultBlock,
@@ -20,10 +35,13 @@ use desktop_assistant_core::ports::llm::{
     ModelListingNotice, ModelListingReport, ReasoningConfig, TokenUsage, current_model_override,
 };
 use desktop_assistant_llm_http::{STREAM_CONNECT_TIMEOUT, STREAM_EVENT_TIMEOUT};
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::Mutex;
+
+use backend::converse::ConverseBackend;
+use backend::{BackendTimeouts, BedrockBackend, BedrockRequest, SamplingParams};
+use sdk::SdkClients;
 
 /// Default TTL for the `list_models()` cache. One hour is cheap to refresh
 /// and long enough that UIs don't trigger a round-trip on every open.
@@ -103,19 +121,19 @@ pub enum CachePolicy {
     SystemPromptOnly,
 }
 
-/// Whether a request for `model_id` carries a cache checkpoint.
-///
-/// Two independent conditions, and both must hold: the operator's policy
-/// allows a checkpoint, and the model accepts one. `model_id` may be an
-/// inference-profile id; `base_model_for` reduces it to the foundation model
-/// the profile routes to.
-///
-/// A model the connector has learned to reject checkpoints at runtime is
-/// handled by the caller, which does not call this for such a model.
-fn wants_cache_checkpoint(policy: CachePolicy, model_id: &str) -> bool {
-    match policy {
-        CachePolicy::None => false,
-        CachePolicy::SystemPromptOnly => supports_prompt_caching(&base_model_for(model_id)),
+impl CachePolicy {
+    /// Whether the operator's policy permits a cache checkpoint at all.
+    ///
+    /// This is the connector's whole half of the question. Whether the model
+    /// accepts a checkpoint is the backend's half, because acceptance is a
+    /// property of one API surface and one model together: Converse takes a
+    /// `cachePoint` block, Invoke takes Anthropic's native `cache_control`
+    /// markers, and a model can accept one and refuse the other.
+    fn permits_checkpoint(self) -> bool {
+        match self {
+            CachePolicy::None => false,
+            CachePolicy::SystemPromptOnly => true,
+        }
     }
 }
 
@@ -134,31 +152,21 @@ pub struct BedrockClient {
     base_url: String,
     api_key: String,
     aws_profile: Option<String>,
-    client: OnceCell<Client>,
-    control_client: OnceCell<BedrockControlClient>,
+    /// The AWS SDK clients this connection uses, built once and shared with
+    /// every backend. Behind a cell because the builder methods below can
+    /// change the credentials, the region or a test endpoint after `new`.
+    sdk: OnceLock<Arc<SdkClients>>,
+    /// The API surfaces this connection speaks.
+    ///
+    /// One today. #1018 turns this into the full set, with aggregation across
+    /// their catalogues and selection per request.
+    backend: OnceLock<Arc<ConverseBackend>>,
     temperature: Option<f64>,
     top_p: Option<f64>,
     max_tokens: Option<u32>,
     model_cache: Arc<Mutex<ModelCache>>,
     model_cache_ttl: Duration,
     clock: Arc<dyn ModelClock>,
-    /// Models discovered at runtime to reject `ConverseStream` with
-    /// tools. Populated when the static allowlist
-    /// (`supports_streaming_with_tools`) reports `true` but Bedrock
-    /// returns the specific "doesn't support tool use in streaming
-    /// mode" validation error. Per-instance so each client warms its
-    /// own cache; not shared across `BedrockClient` instances. (#67)
-    non_streaming_tools_models: Arc<Mutex<HashSet<String>>>,
-    /// Models discovered at runtime to reject a `cachePoint` block, although
-    /// [`supports_prompt_caching`] accepts them. That list is read from AWS
-    /// documentation which states it covers only the models absent from
-    /// "Models at a glance", so it is a best reading and not an enumeration;
-    /// this set is how a wrong entry costs one call instead of every turn.
-    ///
-    /// Written only from a refusal that names the cache field, on a request
-    /// that carried a checkpoint. Per-instance, like
-    /// [`Self::non_streaming_tools_models`]. (#1028)
-    cache_unsupported_models: Arc<Mutex<HashSet<String>>>,
     /// First-response (connect) stall budget; defaults to
     /// [`STREAM_CONNECT_TIMEOUT`], overridable per-connection.
     connect_timeout: Duration,
@@ -210,16 +218,14 @@ impl BedrockClient {
             base_url: Self::get_default_base_url().unwrap_or_default().to_string(),
             api_key,
             aws_profile: None,
-            client: OnceCell::new(),
-            control_client: OnceCell::new(),
+            sdk: OnceLock::new(),
+            backend: OnceLock::new(),
             temperature: None,
             top_p: None,
             max_tokens: None,
             model_cache: Arc::new(Mutex::new(ModelCache::default())),
             model_cache_ttl: DEFAULT_MODEL_CACHE_TTL,
             clock: Arc::new(SystemClock),
-            non_streaming_tools_models: Arc::new(Mutex::new(HashSet::new())),
-            cache_unsupported_models: Arc::new(Mutex::new(HashSet::new())),
             connect_timeout: STREAM_CONNECT_TIMEOUT,
             event_timeout: STREAM_EVENT_TIMEOUT,
             non_streaming_timeout: NON_STREAMING_REQUEST_TIMEOUT,
@@ -334,10 +340,9 @@ impl BedrockClient {
     /// cannot produce.
     #[doc(hidden)]
     pub async fn __force_non_streaming_tools_for_test(&self, model: &str) {
-        self.non_streaming_tools_models
-            .lock()
-            .await
-            .insert(model.to_string());
+        self.backend()
+            .__force_non_streaming_tools_for_test(model)
+            .await;
     }
 
     /// Test-only: peek at the cache contents.
@@ -357,7 +362,7 @@ impl BedrockClient {
     #[doc(hidden)]
     pub fn __with_control_endpoint_for_test(mut self, url: impl Into<String>) -> Self {
         self.control_endpoint_override = Some(url.into());
-        self.control_client = OnceCell::new();
+        self.rebuild_on_next_use();
         self
     }
 
@@ -371,7 +376,7 @@ impl BedrockClient {
     #[doc(hidden)]
     pub fn __with_runtime_endpoint_for_test(mut self, url: impl Into<String>) -> Self {
         self.runtime_endpoint_override = Some(url.into());
-        self.client = OnceCell::new();
+        self.rebuild_on_next_use();
         self
     }
 
@@ -382,8 +387,7 @@ impl BedrockClient {
 
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
-        self.client = OnceCell::new();
-        self.control_client = OnceCell::new();
+        self.rebuild_on_next_use();
         self
     }
 
@@ -404,65 +408,50 @@ impl BedrockClient {
 
     pub fn with_aws_profile(mut self, profile: Option<String>) -> Self {
         self.aws_profile = profile.filter(|s| !s.trim().is_empty());
+        self.rebuild_on_next_use();
         self
     }
 
-    async fn load_shared_config(&self) -> aws_config::SdkConfig {
-        let mut loader = aws_config::defaults(BehaviorVersion::latest());
-
-        let effective_profile = self
-            .aws_profile
-            .clone()
-            .or_else(|| aws_profile_exists("adele").then(|| "adele".to_string()));
-
-        if let Some(ref profile) = effective_profile {
-            tracing::info!(aws_profile = %profile, "using AWS profile");
-            loader = loader.profile_name(profile);
-        }
-
-        if let Some(region) = region_from_base_url(&self.base_url) {
-            loader = loader.region(Region::new(region));
-        }
-
-        if let Some(credentials) = static_credentials_from_api_key(&self.api_key) {
-            loader = loader.credentials_provider(credentials);
-        } else if !self.api_key.trim().is_empty() {
-            tracing::debug!(
-                "llm.bedrock.api_key is set but not parseable as static credentials; falling back to AWS credential chain"
-            );
-        }
-
-        loader.load().await
+    /// Drop the built SDK clients and backends, so the next use builds them
+    /// from the configuration as it now stands.
+    ///
+    /// Every builder that feeds either of them calls this. A builder consumes
+    /// `self`, so it cannot run while a `&self` method holds a reference, but
+    /// nothing stops a caller from listing models and *then* changing the
+    /// region - and a client built against the old one would keep serving.
+    fn rebuild_on_next_use(&mut self) {
+        self.sdk = OnceLock::new();
+        self.backend = OnceLock::new();
     }
 
-    async fn client(&self) -> Result<&Client, CoreError> {
-        self.client
-            .get_or_try_init(|| async {
-                let shared_config = self.load_shared_config().await;
-                let Some(endpoint) = self.runtime_endpoint_override.as_ref() else {
-                    return Ok(Client::new(&shared_config));
-                };
-                let config = aws_sdk_bedrockruntime::config::Builder::from(&shared_config)
-                    .endpoint_url(endpoint)
-                    .build();
-                Ok(Client::from_conf(config))
-            })
-            .await
+    /// The AWS SDK clients for this connection, built on first use.
+    fn sdk(&self) -> &Arc<SdkClients> {
+        self.sdk.get_or_init(|| {
+            Arc::new(SdkClients::new(
+                self.api_key.clone(),
+                self.base_url.clone(),
+                self.aws_profile.clone(),
+                self.control_endpoint_override.clone(),
+                self.runtime_endpoint_override.clone(),
+            ))
+        })
     }
 
-    async fn control_client(&self) -> Result<&BedrockControlClient, CoreError> {
-        self.control_client
-            .get_or_try_init(|| async {
-                let shared_config = self.load_shared_config().await;
-                let Some(endpoint) = self.control_endpoint_override.as_ref() else {
-                    return Ok(BedrockControlClient::new(&shared_config));
-                };
-                let config = aws_sdk_bedrock::config::Builder::from(&shared_config)
-                    .endpoint_url(endpoint)
-                    .build();
-                Ok(BedrockControlClient::from_conf(config))
-            })
-            .await
+    /// The Converse backend for this connection, built on first use.
+    ///
+    /// One backend today, so selection is not a choice yet: every request and
+    /// the whole catalogue go to it. #1018 makes this the full set.
+    fn backend(&self) -> &Arc<ConverseBackend> {
+        self.backend.get_or_init(|| {
+            Arc::new(ConverseBackend::new(
+                Arc::clone(self.sdk()),
+                BackendTimeouts {
+                    connect: self.connect_timeout,
+                    event: self.event_timeout,
+                    non_streaming: self.non_streaming_timeout,
+                },
+            ))
+        })
     }
 
     /// Return the model ID as the stable version identifier.
@@ -474,7 +463,10 @@ impl BedrockClient {
     }
 
     pub async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, CoreError> {
-        let client = self.client().await?;
+        // Still the connector's own `InvokeModel` call, not a backend's.
+        // #1017 generalises it into `InvokeBackend`, which is the surface that
+        // reaches embedding models.
+        let client = self.sdk().runtime().await?;
 
         let mut vectors = Vec::with_capacity(texts.len());
         for text in texts {
@@ -1602,7 +1594,7 @@ fn summary_to_model_info(
     // Nova Premier, DeepSeek R1, etc.) are only callable via an inference
     // profile or Provisioned Throughput; surfacing the bare id leads to a
     // ValidationException at invocation time. Inference profiles are merged
-    // separately by `fetch_models_uncached`.
+    // separately by the Converse backend's listing.
     let supports_on_demand = summary
         .inference_types_supported()
         .iter()
@@ -1931,118 +1923,6 @@ fn truncate_chars(text: &str, max: usize) -> String {
 }
 
 impl BedrockClient {
-    /// Call `ListFoundationModels` + `ListInferenceProfiles` and merge into
-    /// a single `ModelInfo` list:
-    ///
-    /// * Foundation models without `OnDemand` support are filtered out —
-    ///   their bare ids are uncallable and surfacing them leads to runtime
-    ///   `ValidationException`s. Users reach those models via inference
-    ///   profiles instead.
-    /// * Inference profiles are merged in with their prefixed ids
-    ///   (`us.anthropic.claude-haiku-4-5-…` etc.) so the model picker
-    ///   exposes the IDs that AWS will actually accept on Converse.
-    ///
-    /// Both calls go in parallel. A `ListInferenceProfiles` failure degrades
-    /// the listing instead of failing it: many existing IAM policies grant
-    /// `bedrock:ListFoundationModels` without
-    /// `bedrock:ListInferenceProfiles`, and a foundation-model-only picker
-    /// beats no picker at all.
-    ///
-    /// The degradation is reported in the returned
-    /// [`ModelListingReport::notices`] as well as logged. Why both: what
-    /// survives the filter in a current AWS account is mostly the embedding
-    /// families, so a caller that only sees the model list cannot tell a
-    /// degraded listing from an account with nothing but embedding models
-    /// (#648).
-    async fn fetch_models_uncached(&self) -> Result<ModelListingReport, CoreError> {
-        use aws_sdk_bedrock::types::InferenceProfileType;
-
-        let client = self.control_client().await?;
-
-        let foundation_fut = client.list_foundation_models().send();
-        let system_fut =
-            list_inference_profiles_of_type(client, InferenceProfileType::SystemDefined);
-        let application_fut =
-            list_inference_profiles_of_type(client, InferenceProfileType::Application);
-
-        let (foundation_res, system_res, application_res) =
-            tokio::join!(foundation_fut, system_fut, application_fut);
-
-        let foundation = foundation_res
-            .map_err(|e| CoreError::Llm(format!("Bedrock ListFoundationModels failed: {e:#}")))?;
-
-        let summaries = foundation.model_summaries();
-        // Built before the on-demand filter: the models it drops are exactly
-        // the ones the profiles below route to.
-        let modalities = ModalityIndex::from_summaries(summaries);
-        let mut models: Vec<ModelInfo> =
-            summaries.iter().filter_map(summary_to_model_info).collect();
-        let mut notices = Vec::new();
-
-        let mut profiles: Vec<aws_sdk_bedrock::types::InferenceProfileSummary> = Vec::new();
-        let mut truncated = false;
-
-        match system_res {
-            Ok(listing) => {
-                truncated |= listing.truncated;
-                profiles.extend(listing.summaries);
-            }
-            Err(error) => {
-                use aws_smithy_types::error::metadata::ProvideErrorMetadata;
-                tracing::warn!(
-                    "Bedrock ListInferenceProfiles failed; model picker will only show \
-                     on-demand foundation models. Grant bedrock:ListInferenceProfiles to \
-                     surface inference-profile ids (Claude 4.x, Nova Premier, etc.). \
-                     Cause: {error:#}"
-                );
-                notices.push(inference_profiles_notice(error.code(), error.message()));
-            }
-        }
-
-        match application_res {
-            Ok(listing) => {
-                truncated |= listing.truncated;
-                profiles.extend(listing.summaries);
-            }
-            Err(error) => {
-                use aws_smithy_types::error::metadata::ProvideErrorMetadata;
-                tracing::warn!(
-                    "Bedrock ListInferenceProfiles for APPLICATION profiles failed. \
-                     Cause: {error:#}"
-                );
-                // Only when the system-defined call worked. When both failed
-                // the notice above already says inference profiles are
-                // missing, and a second one repeats it without adding a fact.
-                if notices.is_empty() {
-                    notices.push(application_profiles_notice(error.code(), error.message()));
-                }
-            }
-        }
-
-        if truncated {
-            notices.push(truncated_profiles_notice());
-        }
-
-        // Register every profile before any of them is turned into a record.
-        // The record reads the register, exactly as the dispatch gates do, so
-        // the two cannot answer differently.
-        for profile in &profiles {
-            register_profile_base_model(profile);
-        }
-        for profile in &profiles {
-            if let Some(info) = inference_profile_to_model_info(profile, &modalities) {
-                models.push(info);
-            }
-        }
-
-        // Stable ordering so UIs don't shuffle between refreshes.
-        // Defensive dedupe — foundation ids and profile ids don't collide
-        // in practice, but keep the merge total just in case.
-        models.sort_by(|a, b| a.id.cmp(&b.id));
-        models.dedup_by(|a, b| a.id == b.id);
-        Ok(ModelListingReport { models, notices })
-    }
-
     /// Return the cached listing, refreshing if the TTL elapsed or the cache
     /// is empty. Notices are cached with the models they describe.
     async fn list_models_cached(&self) -> Result<ModelListingReport, CoreError> {
@@ -2061,7 +1941,7 @@ impl BedrockClient {
     /// Force a refresh: bypass the cache, fetch from Bedrock, and populate
     /// the cache on success.
     async fn refresh_models_internal(&self) -> Result<ModelListingReport, CoreError> {
-        let fresh = self.fetch_models_uncached().await?;
+        let fresh = self.backend().list_models().await?;
         let now = self.clock.now();
         let mut cache = self.model_cache.lock().await;
         cache.entry = Some((now, fresh.clone()));
@@ -2123,7 +2003,7 @@ impl LlmClient for BedrockClient {
     /// the registry spawns beside it. A failure leaves the register empty,
     /// which is the conservative answer the gates already have.
     async fn warmup(&self) {
-        match self.fetch_models_uncached().await {
+        match self.backend().list_models().await {
             Ok(report) if report.notices.is_empty() => {
                 let now = self.clock.now();
                 let mut cache = self.model_cache.lock().await;
@@ -2139,6 +2019,7 @@ impl LlmClient for BedrockClient {
             Ok(report) => {
                 tracing::warn!(
                     notices = report.notices.len(),
+                    surface = self.backend().api_name(),
                     "Bedrock model listing came back degraded at startup; not caching it. \
                      Inference profiles missing from it resolve by their id, so they get \
                      no reasoning, no prompt cache and no context window until a later \
@@ -2162,97 +2043,67 @@ impl LlmClient for BedrockClient {
         reasoning: ReasoningConfig,
         on_chunk: ChunkCallback,
     ) -> Result<LlmResponse, CoreError> {
-        // Cooperative cancellation token (issue #109): pre-check before
-        // building the AWS SDK client / making any network call. Inside
-        // the streaming loop we race the next event against
-        // `token.cancelled()` so the body stream is dropped cleanly
-        // when the user cancels mid-stream.
+        // Cooperative cancellation token (issue #109): pre-check before any
+        // backend builds an AWS SDK client or makes a network call. The token
+        // travels on the request, and every backend races its network waits
+        // against it, so a stop drops an in-flight body rather than waiting a
+        // timeout out.
         let cancellation =
             desktop_assistant_core::ports::llm::current_cancellation_token().unwrap_or_default();
         if cancellation.is_cancelled() {
             return Err(CoreError::Cancelled);
         }
 
-        let client = self.client().await?;
-
         // Bedrock validates every tool name (in the request tool-spec AND in
         // every `toolUse` block carried in the message history) against
-        // `^[a-zA-Z0-9_-]+$` with a 64-char cap — stricter than the Anthropic
-        // API. Build a per-request bijection from the available tools, apply
-        // it consistently to the tool definitions and to historical
-        // `toolUse.name`s, and reverse it when the model echoes a name back so
-        // dispatch still hits the real (possibly `.`/`:`/`/`-containing) tool.
+        // `^[a-zA-Z0-9_-]+$` with a 64-char cap - stricter than the Anthropic
+        // API. Build a per-request bijection from the available tools once
+        // here, so every backend spells a tool the same way in the request and
+        // in the history, and reverses it the same way on the response.
         let tool_names = ToolNameMap::from_names(tools.iter().map(|t| t.name.as_str()));
 
         // Per-turn model override (issue #34): when the daemon-side routing
         // layer has set `MODEL_OVERRIDE`, dispatch the user-chosen model id
-        // instead of the connector's baked-in `self.model`. Used for the
-        // request `model_id`, for the prompt-cache and reasoning support
-        // checks, and for the context-window heuristics below. It is resolved
+        // instead of the connector's baked-in `self.model`. It is resolved
         // before the request is built, because the model decides whether the
         // system prompt carries a cache checkpoint.
         let model = current_model_override().unwrap_or_else(|| self.model.clone());
 
-        // Two independent reasons to withhold the checkpoint: the operator's
-        // policy, and a refusal this connector has already met on this model.
-        let cache_checkpoint = wants_cache_checkpoint(self.cache_policy, &model)
-            && !self.cache_unsupported_models.lock().await.contains(&model);
-
-        let inputs = self.build_request_inputs(
-            &messages,
-            tools,
-            &tool_names,
-            &model,
-            reasoning,
-            cache_checkpoint,
-        )?;
-
-        match self
-            .dispatch_attempt(client, inputs, on_chunk, &cancellation, !tools.is_empty())
-            .await
-        {
-            Ok(response) => Ok(response),
-            Err(AttemptError::CachePointRejected { on_chunk, detail }) => {
-                // The refusal named the cache field, on a request that carried
-                // a checkpoint. That is the evidence, and it is the whole of
-                // it: the memo is written here, from what the service said,
-                // and never from a retry that succeeded - a request without
-                // the field succeeds whatever the real cause was, so treating
-                // that as proof would certify a wrong verdict.
-                tracing::warn!(
-                    model = %model,
-                    detail,
-                    "Bedrock refused the prompt-cache checkpoint; retrying this turn \
-                     without it and omitting it for later turns on this model"
-                );
-                self.cache_unsupported_models
-                    .lock()
-                    .await
-                    .insert(model.clone());
-
-                let retry = self.build_request_inputs(
-                    &messages,
-                    tools,
-                    &tool_names,
-                    &model,
-                    reasoning,
-                    false,
-                )?;
-                self.dispatch_attempt(client, retry, on_chunk, &cancellation, !tools.is_empty())
-                    .await
-                    .map_err(|e| match e {
-                        AttemptError::Other(err) => err,
-                        // Unreachable in practice: the retry carries no
-                        // checkpoint, and a refusal is only classified for a
-                        // request that sent one. Reported rather than retried
-                        // again, so a second attempt is the last one.
-                        AttemptError::CachePointRejected { detail, .. } => {
-                            CoreError::Llm(format!("Bedrock converse request failed: {detail}"))
-                        }
-                    })
-            }
-            Err(AttemptError::Other(err)) => Err(err),
+        // Reach first. A backend that cannot serve the model never receives a
+        // request for it, and the refusal names the model and the surfaces
+        // that were asked - a `ValidationException` from AWS several hundred
+        // milliseconds later says none of that.
+        let backend = self.backend();
+        if !backend.can_serve(&model) {
+            return Err(CoreError::Llm(format!(
+                "no Bedrock API this connection speaks can serve model {model}; \
+                 the {} surface reports it cannot",
+                backend.api_name()
+            )));
         }
+
+        let request = BedrockRequest {
+            // Two halves of one question. The operator's policy permits a
+            // checkpoint, and this API surface accepts one for this model. The
+            // backend adds a third condition of its own - whether the model
+            // has already refused a checkpoint here - because a refusal is per
+            // (surface, model).
+            cache_checkpoint: self.cache_policy.permits_checkpoint()
+                && backend.capabilities(&model).cache_control,
+            model,
+            messages,
+            tools: tools.to_vec(),
+            tool_names,
+            reasoning,
+            sampling: SamplingParams {
+                temperature: self.temperature,
+                top_p: self.top_p,
+                max_tokens: self.max_tokens,
+            },
+            cancellation,
+        };
+
+        backend.stream_completion(request, on_chunk).await
     }
 }
 
@@ -2264,487 +2115,6 @@ impl desktop_assistant_core::ports::embedding::EmbeddingClient for BedrockClient
 
     async fn model_identifier(&self) -> Result<String, CoreError> {
         BedrockClient::model_identifier(self).await
-    }
-}
-
-/// Outcome of a `ConverseStream` dispatch attempt. The "streaming with
-/// tools is unsupported" arm carries the unconsumed callback so the
-/// caller can retry against `Converse` without rebuilding it; a
-/// `ChunkCallback` is `FnOnce`-ish in spirit (boxed dyn FnMut) and
-/// passing it back avoids forcing a `Clone` bound on the trait.
-enum StreamingDispatchError {
-    StreamingToolsUnsupported {
-        on_chunk: ChunkCallback,
-        detail: String,
-    },
-    /// Bedrock refused the `cachePoint` block this request carried. Same
-    /// callback-carrying reason as the arm above. (#1028)
-    CachePointRejected {
-        on_chunk: ChunkCallback,
-        detail: String,
-    },
-    Other(CoreError),
-}
-
-/// Outcome of one complete dispatch attempt, after the streaming ->
-/// non-streaming fallback has been resolved inside
-/// [`BedrockClient::dispatch_attempt`].
-///
-/// Only one failure is actionable at this level, and it is the one the caller
-/// can answer by changing the request: a refused cache checkpoint, which the
-/// caller retries once without it. (#1028)
-enum AttemptError {
-    CachePointRejected {
-        on_chunk: ChunkCallback,
-        detail: String,
-    },
-    Other(CoreError),
-}
-
-/// All the per-call parameters that `ConverseStream` and `Converse`
-/// share. Built once at the top of `stream_completion` and consumed by
-/// whichever dispatch path runs (#67).
-struct BedrockRequestInputs {
-    model: String,
-    api_messages: Vec<BedrockMessage>,
-    system: Vec<SystemContentBlock>,
-    tool_config: Option<ToolConfiguration>,
-    inference_cfg: Option<aws_sdk_bedrockruntime::types::InferenceConfiguration>,
-    additional_request_fields: Option<Document>,
-    /// Sanitized<->original tool-name bijection for this request. Used to map
-    /// the (sanitized) name the model returns in a `toolUse` back to the real
-    /// tool so the upstream dispatch can execute it. (#198)
-    tool_names: ToolNameMap,
-    /// Whether `system` carries a `cachePoint` block. Read off `system` itself
-    /// in [`BedrockClient::build_request_inputs`], not from the policy that
-    /// asked for one, so it cannot claim a checkpoint the request does not
-    /// hold - a turn with no system prompt has no prefix to mark.
-    ///
-    /// This is what makes a refusal attributable. A request that sent no
-    /// checkpoint cannot have had one refused, so the dispatch paths do not
-    /// even ask whether the failure names the cache field. The retry is built
-    /// without one, which is why the retry can never be read as a second
-    /// refusal, and why the memo can never rest on evidence the fallback
-    /// itself produced. (#1028)
-    cache_checkpoint: bool,
-}
-
-impl BedrockClient {
-    fn build_inference_config(
-        &self,
-    ) -> Option<aws_sdk_bedrockruntime::types::InferenceConfiguration> {
-        if self.temperature.is_none() && self.top_p.is_none() && self.max_tokens.is_none() {
-            return None;
-        }
-        let mut inference_cfg = aws_sdk_bedrockruntime::types::InferenceConfiguration::builder();
-        if let Some(t) = self.temperature {
-            inference_cfg = inference_cfg.temperature(t as f32);
-        }
-        if let Some(p) = self.top_p {
-            inference_cfg = inference_cfg.top_p(p as f32);
-        }
-        if let Some(m) = self.max_tokens {
-            inference_cfg = inference_cfg.max_tokens(m as i32);
-        }
-        Some(inference_cfg.build())
-    }
-
-    /// Translate one turn into the Converse request shape.
-    ///
-    /// `want_cache_checkpoint` is what the caller asks for. Whether a
-    /// checkpoint is actually emitted is read back off the built request, so
-    /// `BedrockRequestInputs::cache_checkpoint` describes the bytes that go out
-    /// rather than the intent behind them. The two differ: a turn with no
-    /// system prompt has no prefix to mark, so it sends no checkpoint however
-    /// the policy is set.
-    ///
-    /// Called a second time, with `want_cache_checkpoint` forced to `false`,
-    /// when Bedrock refuses the checkpoint. It is a pure translation of the
-    /// same turn, so the retry differs from the first attempt in that one field
-    /// and nothing else - which is what makes the retry's outcome readable.
-    fn build_request_inputs(
-        &self,
-        messages: &[Message],
-        tools: &[ToolDefinition],
-        tool_names: &ToolNameMap,
-        model: &str,
-        reasoning: ReasoningConfig,
-        want_cache_checkpoint: bool,
-    ) -> Result<BedrockRequestInputs, CoreError> {
-        let (system, api_messages) = convert_messages(messages, tool_names, want_cache_checkpoint)?;
-        let tool_config = convert_tools(tools, tool_names)?;
-
-        // Read from the request, never from the request we meant to build.
-        let cache_checkpoint = system
-            .iter()
-            .any(|block| matches!(block, SystemContentBlock::CachePoint(_)));
-
-        let msg_count = api_messages.len();
-        let tool_count = tools.len();
-        // Count prompt content only. A cache checkpoint is a control marker
-        // with no prompt text, so counting its `Debug` form would inflate the
-        // reported prompt size on exactly the models that cache.
-        let system_chars: usize = system
-            .iter()
-            .filter(|b| !matches!(b, SystemContentBlock::CachePoint(_)))
-            .map(|b| format!("{b:?}").len())
-            .sum();
-        let msg_chars: usize = api_messages.iter().map(|m| format!("{m:?}").len()).sum();
-        tracing::info!(
-            msg_chars,
-            msg_count,
-            tool_count,
-            system_chars,
-            cache_checkpoint,
-            model = %model,
-            "LLM request payload"
-        );
-
-        Ok(BedrockRequestInputs {
-            model: model.to_string(),
-            api_messages,
-            system,
-            tool_config,
-            inference_cfg: self.build_inference_config(),
-            additional_request_fields: build_additional_model_request_fields(model, reasoning),
-            tool_names: tool_names.clone(),
-            cache_checkpoint,
-        })
-    }
-
-    /// Dispatch one request, choosing the path and answering the one
-    /// per-model restriction that path selection cannot predict.
-    ///
-    /// Path selection (#67):
-    /// - No tools: streaming is always safe; use the streaming path.
-    /// - Tools + model on the static deny-list: skip the stream attempt
-    ///   and go straight to non-streaming.
-    /// - Tools + runtime memo says non-streaming: same.
-    /// - Otherwise: try streaming first; on the specific
-    ///   "doesn't support tool use in streaming" validation error,
-    ///   memoize the model and retry via non-streaming.
-    ///
-    /// A refused cache checkpoint is **not** answered here. It changes the
-    /// request rather than the path, so it goes back to the caller, which owns
-    /// the request. (#1028)
-    async fn dispatch_attempt(
-        &self,
-        client: &Client,
-        inputs: BedrockRequestInputs,
-        on_chunk: ChunkCallback,
-        cancellation: &tokio_util::sync::CancellationToken,
-        has_tools: bool,
-    ) -> Result<LlmResponse, AttemptError> {
-        let model = inputs.model.clone();
-        let base_model = base_model_for(&model);
-        let memo_says_non_streaming = has_tools && {
-            let memo = self.non_streaming_tools_models.lock().await;
-            memo.contains(&model)
-        };
-        let allowlist_says_non_streaming = has_tools && !supports_streaming_with_tools(&base_model);
-        if memo_says_non_streaming || allowlist_says_non_streaming {
-            if allowlist_says_non_streaming {
-                tracing::debug!(
-                    model = %model,
-                    "skipping ConverseStream: model on the non-streaming-with-tools deny-list"
-                );
-            }
-            return self
-                .dispatch_non_streaming(client, inputs, on_chunk, cancellation)
-                .await;
-        }
-
-        match self
-            .dispatch_streaming(client, &inputs, on_chunk, cancellation)
-            .await
-        {
-            Ok(response) => Ok(response),
-            Err(StreamingDispatchError::StreamingToolsUnsupported { on_chunk, detail }) => {
-                tracing::warn!(
-                    model = %model,
-                    detail,
-                    "Bedrock rejected ConverseStream with tools; retrying via Converse \
-                     and memoizing the model so future turns skip the stream attempt"
-                );
-                self.non_streaming_tools_models
-                    .lock()
-                    .await
-                    .insert(model.clone());
-                self.dispatch_non_streaming(client, inputs, on_chunk, cancellation)
-                    .await
-            }
-            Err(StreamingDispatchError::CachePointRejected { on_chunk, detail }) => {
-                Err(AttemptError::CachePointRejected { on_chunk, detail })
-            }
-            Err(StreamingDispatchError::Other(err)) => Err(AttemptError::Other(err)),
-        }
-    }
-
-    /// Attempt the streaming dispatch. The success path mirrors the
-    /// pre-#67 implementation; the error path tags the specific
-    /// "tools-in-streaming-mode" validation error so the caller can
-    /// transparently fall back to `Converse`.
-    ///
-    /// `cancellation` is checked between SDK events via `tokio::select!`
-    /// (issue #109) so the body stream is dropped cleanly when the user
-    /// cancels mid-stream.
-    async fn dispatch_streaming(
-        &self,
-        client: &Client,
-        inputs: &BedrockRequestInputs,
-        mut on_chunk: ChunkCallback,
-        cancellation: &tokio_util::sync::CancellationToken,
-    ) -> Result<LlmResponse, StreamingDispatchError> {
-        let mut request = client
-            .converse_stream()
-            .model_id(inputs.model.clone())
-            .set_messages(Some(inputs.api_messages.clone()));
-        if let Some(cfg) = inputs.inference_cfg.clone() {
-            request = request.inference_config(cfg);
-        }
-        if !inputs.system.is_empty() {
-            request = request.set_system(Some(inputs.system.clone()));
-        }
-        if let Some(cfg) = inputs.tool_config.clone() {
-            request = request.tool_config(cfg);
-        }
-        if let Some(extra) = inputs.additional_request_fields.clone() {
-            request = request.additional_model_request_fields(extra);
-        }
-
-        // Bound both the connection handshake and the gap between streamed
-        // events so a stalled Bedrock stream fails the turn gracefully instead
-        // of hanging forever (#214). `stream.recv()` and `send()` have no
-        // built-in timeout; gpt-oss on Bedrock was observed accepting a
-        // tool-history follow-up request and then never emitting an event.
-        // The budgets default to the values shared with the reqwest connectors
-        // (#302) but are overridable per-connection; Bedrock's AWS-SDK stream
-        // can't reuse the `tokio_stream`-typed `next_step`, so it applies the
-        // same `self.connect_timeout` / `self.event_timeout` directly.
-        let connect_timeout = self.connect_timeout;
-        let event_timeout = self.event_timeout;
-
-        // Race connection establishment against cancellation and a timeout. If
-        // the user cancels mid-handshake we drop the in-flight request (the
-        // SDK's HTTP body) before it resolves.
-        let send_fut = request.send();
-        let response = tokio::select! {
-            _ = cancellation.cancelled() => {
-                return Err(StreamingDispatchError::Other(CoreError::Cancelled));
-            }
-            _ = tokio::time::sleep(connect_timeout) => {
-                tracing::error!(
-                    timeout_s = connect_timeout.as_secs(),
-                    "Bedrock converse_stream send() timed out (no response headers)"
-                );
-                return Err(StreamingDispatchError::Other(CoreError::Llm(
-                    "Bedrock converse_stream connection timed out".into(),
-                )));
-            }
-            r = send_fut => match r {
-                Ok(r) => r,
-                Err(e) => {
-                    if let Some(detail) = streaming_tools_unsupported_detail(&e) {
-                        return Err(StreamingDispatchError::StreamingToolsUnsupported {
-                            on_chunk,
-                            detail,
-                        });
-                    }
-                    // Asked only of a request that carried a checkpoint: a
-                    // refusal of a field this request did not send is a
-                    // refusal of something else.
-                    if inputs.cache_checkpoint
-                        && let Some(detail) = cache_point_rejected_detail_stream(&e)
-                    {
-                        return Err(StreamingDispatchError::CachePointRejected {
-                            on_chunk,
-                            detail,
-                        });
-                    }
-                    return Err(StreamingDispatchError::Other(map_converse_stream_error(e)));
-                }
-            },
-        };
-
-        let mut stream = response.stream;
-        let mut text = String::new();
-        let mut tool_acc = ToolCallAccumulator::default();
-        let mut token_usage: Option<TokenUsage> = None;
-        let mut event_count: u64 = 0;
-
-        loop {
-            // Race the next streaming event against cancellation and a
-            // stall timeout. Dropping `stream` closes the underlying HTTP
-            // body the same way the SSE adapters do.
-            let event_result = tokio::select! {
-                _ = cancellation.cancelled() => {
-                    tracing::debug!("Bedrock stream cancelled by token");
-                    drop(stream);
-                    return Err(StreamingDispatchError::Other(CoreError::Cancelled));
-                }
-                _ = tokio::time::sleep(event_timeout) => {
-                    tracing::error!(
-                        timeout_s = event_timeout.as_secs(),
-                        events_so_far = event_count,
-                        "Bedrock converse_stream stalled — no further event"
-                    );
-                    drop(stream);
-                    return Err(StreamingDispatchError::Other(CoreError::Llm(
-                        "Bedrock converse_stream stalled (no events)".into(),
-                    )));
-                }
-                ev = stream.recv() => ev,
-            };
-            event_count += 1;
-            let event = match event_result {
-                Ok(Some(e)) => e,
-                Ok(None) => break,
-                Err(e) => {
-                    return Err(StreamingDispatchError::Other(CoreError::Llm(format!(
-                        "Bedrock stream receive failed: {e}"
-                    ))));
-                }
-            };
-            if !apply_stream_event(
-                event,
-                &mut text,
-                &mut tool_acc,
-                &mut on_chunk,
-                &mut token_usage,
-            ) {
-                break;
-            }
-        }
-
-        // Reverse the sanitization: the model echoed back the Bedrock-safe
-        // tool name, but the upstream dispatch (and the MCP routing table)
-        // keys on the ORIGINAL name. Map each call's name back. The
-        // tool_use_id is left untouched.
-        let tool_calls = restore_tool_call_names(tool_acc.into_tool_calls(), &inputs.tool_names);
-        let mut response = if tool_calls.is_empty() {
-            LlmResponse::text(text)
-        } else {
-            LlmResponse::with_tool_calls(text, tool_calls)
-        };
-        if let Some(usage) = token_usage {
-            response = response.with_usage(usage);
-        }
-        Ok(response)
-    }
-
-    /// Non-streaming dispatch via Bedrock's `Converse` API. Used for
-    /// models that reject tools in streaming mode (#67). Synthesises a
-    /// single `on_chunk` call with the full text so the upstream
-    /// service contract — "the callback fires at least once with the
-    /// model's prose output" — is preserved.
-    ///
-    /// The request is bounded by [`Self::non_streaming_timeout`] and raced
-    /// against `cancellation`, so this path fails a stalled turn and answers
-    /// a stop the same way [`Self::dispatch_streaming`] does.
-    async fn dispatch_non_streaming(
-        &self,
-        client: &Client,
-        inputs: BedrockRequestInputs,
-        mut on_chunk: ChunkCallback,
-        cancellation: &tokio_util::sync::CancellationToken,
-    ) -> Result<LlmResponse, AttemptError> {
-        let cache_checkpoint = inputs.cache_checkpoint;
-        let mut request = client
-            .converse()
-            .model_id(inputs.model.clone())
-            .set_messages(Some(inputs.api_messages));
-        if let Some(cfg) = inputs.inference_cfg {
-            request = request.inference_config(cfg);
-        }
-        if !inputs.system.is_empty() {
-            request = request.set_system(Some(inputs.system));
-        }
-        if let Some(cfg) = inputs.tool_config {
-            request = request.tool_config(cfg);
-        }
-        if let Some(extra) = inputs.additional_request_fields {
-            request = request.additional_model_request_fields(extra);
-        }
-
-        // `Converse` answers once, when generation is complete, so one bound
-        // covers the whole call. Race it against cancellation as well, so a
-        // stop drops the in-flight request instead of waiting the request out.
-        let request_timeout = self.non_streaming_timeout;
-        let send_fut = request.send();
-        let response = tokio::select! {
-            _ = cancellation.cancelled() => {
-                tracing::debug!(model = %inputs.model, "Bedrock converse cancelled by token");
-                return Err(AttemptError::Other(CoreError::Cancelled));
-            }
-            _ = tokio::time::sleep(request_timeout) => {
-                tracing::error!(
-                    model = %inputs.model,
-                    timeout_s = request_timeout.as_secs(),
-                    "Bedrock converse send() timed out (no response)"
-                );
-                return Err(AttemptError::Other(CoreError::Llm(format!(
-                    "Bedrock converse request timed out after {}s",
-                    request_timeout.as_secs()
-                ))));
-            }
-            r = send_fut => match r {
-                Ok(r) => r,
-                Err(e) => {
-                    // Asked only of a request that carried a checkpoint: a
-                    // refusal of a field this request did not send is a
-                    // refusal of something else.
-                    if cache_checkpoint && let Some(detail) = cache_point_rejected_detail(&e) {
-                        return Err(AttemptError::CachePointRejected { on_chunk, detail });
-                    }
-                    return Err(AttemptError::Other(map_converse_error(e)));
-                }
-            },
-        };
-
-        let mut text = String::new();
-        let mut tool_calls = Vec::new();
-        if let Some(aws_sdk_bedrockruntime::types::ConverseOutput::Message(message)) =
-            response.output
-        {
-            for block in message.content() {
-                match block {
-                    ContentBlock::Text(s) => text.push_str(s),
-                    ContentBlock::ToolUse(tool_use) => {
-                        // Reverse the sanitization so upstream dispatch hits
-                        // the real tool; the id is left untouched.
-                        let original_name =
-                            inputs.tool_names.to_original(tool_use.name()).into_owned();
-                        tool_calls.push(ToolCall::new(
-                            tool_use.tool_use_id().to_string(),
-                            original_name,
-                            document_to_json_string(tool_use.input()),
-                        ));
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        // Fire the callback once with the full text so the upstream
-        // service treats this as a (degenerate) stream rather than
-        // skipping its post-completion processing. Bail without erroring
-        // if the callback signals abort — the response is fully built
-        // either way.
-        if !text.is_empty() {
-            let _ = on_chunk(text.clone());
-        }
-
-        let token_usage = response.usage.as_ref().map(map_token_usage);
-
-        let mut llm_response = if tool_calls.is_empty() {
-            LlmResponse::text(text)
-        } else {
-            LlmResponse::with_tool_calls(text, tool_calls)
-        };
-        if let Some(usage) = token_usage {
-            llm_response = llm_response.with_usage(usage);
-        }
-        Ok(llm_response)
     }
 }
 
@@ -3057,6 +2427,19 @@ mod tests {
         ConverseStreamOutput, ToolUseBlockDelta, ToolUseBlockStart,
     };
     use std::sync::{Arc, Mutex};
+
+    /// Whether a turn against `model_id` carries a cache checkpoint, composed
+    /// exactly as `stream_completion` composes it: the operator's policy
+    /// permits one, and the API surface that will serve the turn accepts one
+    /// for this model.
+    ///
+    /// A helper and not a production function, because production has no such
+    /// function to call - the two halves belong to two layers, and asserting
+    /// on either alone would pass while the pair disagreed.
+    fn wants_cache_checkpoint(policy: CachePolicy, model_id: &str) -> bool {
+        let client = BedrockClient::new(String::new());
+        policy.permits_checkpoint() && client.backend().capabilities(model_id).cache_control
+    }
 
     // --- tool input_schema sanitization (top-level oneOf/anyOf/allOf) -----
 
@@ -6776,7 +6159,9 @@ mod tests {
         let backend = client.backend();
 
         assert!(
-            backend.capabilities("anthropic.claude-sonnet-4-6").cache_control,
+            backend
+                .capabilities("anthropic.claude-sonnet-4-6")
+                .cache_control,
             "Converse accepts a cachePoint for Anthropic Claude 3.5 and later"
         );
         assert!(
@@ -6796,7 +6181,9 @@ mod tests {
             backend
                 .capabilities("us.anthropic.claude-sonnet-4-6")
                 .cache_control,
-            backend.capabilities("anthropic.claude-sonnet-4-6").cache_control,
+            backend
+                .capabilities("anthropic.claude-sonnet-4-6")
+                .cache_control,
             "a profile is a route to a foundation model, so it answers for that model"
         );
         assert!(
@@ -6812,7 +6199,10 @@ mod tests {
         let client = backend_client();
         let backend = client.backend();
 
-        for model in ["anthropic.claude-sonnet-4-6", "us.anthropic.claude-opus-4-1"] {
+        for model in [
+            "anthropic.claude-sonnet-4-6",
+            "us.anthropic.claude-opus-4-1",
+        ] {
             assert!(
                 backend.capabilities(model).reasoning,
                 "{model} takes additionalModelRequestFields.thinking"

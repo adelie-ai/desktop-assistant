@@ -99,6 +99,21 @@ return-position `impl Trait` is not dyn-compatible.
 `LlmClient`, and the backends sit behind it. This keeps `core` unaware of
 Bedrock internals, and keeps each backend responsible for one API.
 
+`BedrockRequest` carries domain messages and tool definitions, not one API's
+wire types, because the Responses and Invoke surfaces do not accept Converse
+messages. Each backend translates. Two things stay above the boundary and are
+written once: the connector builds the tool-name bijection, so every backend
+spells a tool the same way in the request and in the message history, and the
+connector races nothing against the cancellation token itself - the token
+travels on the request and each backend races its own network waits.
+
+The cache checkpoint is answered in three parts, by whoever owns each part.
+The connector answers the operator's policy. The backend's `capabilities`
+answers whether the surface accepts a checkpoint for that model. The backend
+also holds what it has learned at run time, because a refusal belongs to one
+(surface, model) pair: a model can accept Anthropic `cache_control` through
+Invoke and reject `cachePoint` through Converse.
+
 ## Model aggregation
 
 The connector queries every backend and merges the results into one catalogue.
@@ -621,9 +636,10 @@ path.
 
 ## Migration path
 
-1. Extract the existing Converse code into `ConverseBackend` behind the trait.
-   Keep the listing contract, the on-demand filter and the notices. No
-   behaviour change.
+1. **Done.** The Converse code sits behind the trait as `ConverseBackend`, with
+   the listing contract, the on-demand filter and the notices unchanged. The
+   connector holds one backend and sends every request and the whole catalogue
+   to it.
 2. Add backend selection and the de-duplicating aggregation, with one backend
    registered. Still no behaviour change.
 3. Add `ResponsesBackend` for the GPT-5.6 family on `bedrock-mantle`.
@@ -631,6 +647,14 @@ path.
    then extend it to the other modalities Converse refuses.
 
 Each step lands on its own and leaves the connector working.
+
+One interlock spans steps 1 and 4, and it is invisible in a diff. The Converse
+listing returns embedding models, because those models are what the daemon's
+embedding path reaches and the catalogue is where a person picks one.
+`ConverseBackend::can_serve` reports - correctly - that Converse cannot serve
+them. So **the aggregation in step 2 must not filter the catalogue by
+`can_serve`** until step 4 lists those models through `InvokeBackend`. Filtering
+early takes every embedding model out of the picker.
 
 ## References
 

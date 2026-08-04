@@ -1,0 +1,198 @@
+//! One Bedrock API surface, behind one trait.
+//!
+//! Bedrock serves its models through several different APIs, and no single API
+//! reaches all of them. A backend is one of those APIs. Backends exist for
+//! **reach**, not for capability: each one reaches models the others cannot,
+//! and the capability differences between them decide which backend serves a
+//! request, not whether the backend exists at all.
+//!
+//! The connector holds the backends and hides the choice from the user. A
+//! person configures one Bedrock connection and picks a model. They never pick
+//! an API. `docs/connectors/bedrock.md` records the design.
+
+use async_trait::async_trait;
+use desktop_assistant_core::CoreError;
+use desktop_assistant_core::domain::{Message, ToolDefinition};
+use desktop_assistant_core::ports::llm::{
+    ChunkCallback, LlmResponse, ModelListingReport, ReasoningConfig,
+};
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
+
+use crate::ToolNameMap;
+
+pub(crate) mod converse;
+
+/// One Bedrock API surface.
+///
+/// An implementor translates the connector's request into its own API shape
+/// and translates the response back.
+///
+/// What a backend does **not** do:
+///
+/// - **It does not retry a failed call.** `RetryingLlmClient` in `core` wraps
+///   the whole connector from outside and already applies exponential backoff
+///   to retryable errors. A second loop inside a backend nests the backoffs
+///   and multiplies the attempts. Changing the *request* and sending it again
+///   is a different thing, and is allowed: see `cache_checkpoint` on
+///   [`BedrockRequest`].
+/// - **It does not decide which models the user sees.** It reports what it
+///   reaches; the connector merges, de-duplicates and caches.
+/// - **It does not read task-locals.** Everything a request depends on arrives
+///   on [`BedrockRequest`], so a backend is testable without a task context.
+///
+/// The trait uses `#[async_trait]` and not `-> impl Future` in return
+/// position, because the connector holds `Vec<Arc<dyn BedrockBackend>>` and
+/// return-position `impl Trait` is not dyn-compatible.
+///
+/// It does not extend `LlmClient`. The connector implements `LlmClient` and
+/// the backends sit behind it, which keeps `core` unaware of Bedrock
+/// internals.
+#[async_trait]
+pub(crate) trait BedrockBackend: Send + Sync {
+    /// Short API name, for logs, notices and model annotation.
+    fn api_name(&self) -> &'static str;
+
+    /// Whether this backend can serve `model_id` at all.
+    ///
+    /// This is the routing primitive. A backend that cannot serve a model
+    /// never receives a request for it.
+    ///
+    /// It answers permissively for a model it knows nothing about. A model no
+    /// listing described is a model the connector has no reason to refuse, and
+    /// refusing it would turn missing metadata into a failed turn.
+    fn can_serve(&self, model_id: &str) -> bool;
+
+    /// The models this backend reaches, with any listing notices.
+    ///
+    /// Returns a [`ModelListingReport`] and not a plain list because a partial
+    /// answer must stay distinguishable from a small account: a failure that
+    /// degrades the catalogue contributes a notice beside the models it could
+    /// still read. Caching the answer is the connector's job.
+    async fn list_models(&self) -> Result<ModelListingReport, CoreError>;
+
+    /// What this API surface supports for one model.
+    ///
+    /// Why the model id: support varies per model *inside* a single API.
+    /// Converse accepts a cache checkpoint for Anthropic and Amazon Nova
+    /// models, and rejects it for Meta, Mistral and Cohere models. A per-API
+    /// constant cannot express that.
+    fn capabilities(&self, model_id: &str) -> BackendApiCapabilities;
+
+    /// Stream a completion.
+    ///
+    /// `on_chunk` fires at least once with the model's prose output, even
+    /// where the underlying API answers in one piece, so the caller's contract
+    /// does not change with the path taken.
+    async fn stream_completion(
+        &self,
+        request: BedrockRequest,
+        on_chunk: ChunkCallback,
+    ) -> Result<LlmResponse, CoreError>;
+}
+
+/// One turn, in terms every backend understands.
+///
+/// It carries domain types rather than one API's wire types. The Converse
+/// request shape is `aws_sdk_bedrockruntime` messages and content blocks,
+/// which the Responses and Invoke surfaces do not accept, so translation
+/// belongs inside each backend and this type stays neutral.
+pub(crate) struct BedrockRequest {
+    /// The id to dispatch against. It may be an inference-profile id, so a
+    /// backend reduces it with `base_model_for` before consulting any
+    /// per-model gate.
+    pub model: String,
+    /// The conversation, oldest first, system messages included.
+    pub messages: Vec<Message>,
+    /// The tools offered this turn, with their schemas as the caller supplied
+    /// them. A backend applies whatever its own API needs.
+    pub tools: Vec<ToolDefinition>,
+    /// The sanitized-to-original tool-name bijection for this turn.
+    ///
+    /// The connector builds it once so every backend spells a tool the same
+    /// way, in the request and in the message history, and reverses it the
+    /// same way on the response.
+    pub tool_names: ToolNameMap,
+    /// The reasoning effort asked for this turn. A backend that cannot act on
+    /// it reports that rather than dropping it silently.
+    pub reasoning: ReasoningConfig,
+    /// Temperature, nucleus sampling and output cap, from the connection.
+    pub sampling: SamplingParams,
+    /// Whether this turn may carry a prompt-cache checkpoint.
+    ///
+    /// The connector answers the operator's half: the cache policy allows one,
+    /// and the model accepts one. A backend answers its own half - whether the
+    /// model has already refused a checkpoint on *this* surface - and may
+    /// withhold the checkpoint on that ground. It may also send the turn
+    /// again without the checkpoint when the service refuses it, because that
+    /// changes the request rather than retrying a transport failure.
+    ///
+    /// The two halves stay apart because a refusal is per (surface, model): a
+    /// model can accept Anthropic `cache_control` through Invoke and reject
+    /// `cachePoint` through Converse.
+    pub cache_checkpoint: bool,
+    /// Cancellation for this turn. A backend races every network wait against
+    /// it, so a stop ends the turn rather than waiting a timeout out.
+    pub cancellation: CancellationToken,
+}
+
+/// The sampling settings a connection carries, in provider-neutral form.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct SamplingParams {
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+    pub max_tokens: Option<u32>,
+}
+
+/// The network budgets a connection applies to every backend.
+///
+/// Timeouts are connector-level because they are network concerns rather than
+/// API concerns, and every backend gets the same three.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BackendTimeouts {
+    /// Time to establish the connection and receive the first response.
+    pub connect: Duration,
+    /// Time between streamed events before the stream counts as stalled.
+    pub event: Duration,
+    /// Whole-request budget for a path that answers once, after generation is
+    /// complete, and so has no intermediate event to time.
+    pub non_streaming: Duration,
+}
+
+/// What one API surface supports for one model.
+///
+/// Bedrock-local, and deliberately so: only Bedrock has several API surfaces
+/// with differing capabilities. Azure's surfaces differ in URL shape with
+/// identical capabilities, and Google's differ in host and credential, so
+/// eight other connectors should not carry a layer that describes one.
+/// `docs/design/connector-capabilities.md` records that boundary.
+///
+/// **No `Default` implementation, deliberately.** Every field is stated at
+/// every construction site, so the compiler stops a new capability from
+/// arriving as a silent `false` on a backend nobody edited - the direction
+/// that invents or erases a capability without anyone reading a diff. A
+/// backend is never uncertain about its own API surface, so the three-state
+/// `Unknown` the shared capability model uses has no meaning at this layer;
+/// uncertainty enters when these answers are composed with the model's and the
+/// connector's into the per-(connection, model) answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BackendApiCapabilities {
+    /// The surface can stream a completion token by token.
+    pub streaming: bool,
+    /// The surface accepts tool definitions and returns tool calls.
+    pub tools: bool,
+    /// The surface can carry image input **as this backend builds a request**,
+    /// which is not the same as what the API documents. A backend reports what
+    /// it actually sends.
+    pub vision: bool,
+    /// The surface accepts a prompt-cache checkpoint for this model.
+    pub cache_control: bool,
+    /// The surface takes a reasoning configuration for this model that changes
+    /// what the model does. A model that always reasons and takes no setting
+    /// answers `false`: nothing the connector sends changes its behaviour.
+    pub reasoning: bool,
+    /// The surface runs tool search on the server.
+    pub hosted_tool_search: bool,
+    /// The surface returns vectors for this model.
+    pub embeddings: bool,
+}
