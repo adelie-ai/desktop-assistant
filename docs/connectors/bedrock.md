@@ -142,27 +142,62 @@ reports no modalities, and a profile is only a route to a foundation model, so
 the profile entry reuses the modality metadata `ListFoundationModels` returned
 in the same call, keyed by model id.
 
-**One id, read one way, by both sides.** The base model is the profile id minus
-its geography prefix, and nothing else. Extended thinking, prompt caching, the
-streaming-with-tools deny list and the context window all read that id, and so
-does the request builder at dispatch time, because a turn arrives carrying a
-model id and nothing else. A capability recovered from an input the dispatch
-path does not have is a capability the picker offers and the request builder
+**One id, read one way, by both sides.** Extended thinking, prompt caching, the
+streaming-with-tools deny list and the context window all read the base model
+id, and so does the request builder at dispatch time, because a turn arrives
+carrying a model id and nothing else. One function answers for every one of
+them, on both paths. A capability recovered from an input the dispatch path
+does not have is a capability the picker offers and the request builder
 discards - the defect the reasoning work exists to remove.
 
-The recognised prefixes are `global.`, `us.`, `eu.`, `apac.`, `ap.`, `au.`,
-`jp.` and `us-gov.`, held in one list and pinned by a test. Every entry ends at
-the separator, so no entry can swallow another and the order does not matter.
-It is an allowlist rather than "drop the first dotted segment", because model
-ids carry dots of their own - that rule would strip `openai.gpt-5.6-sol` to
-`gpt-5.6-sol`.
+That function answers in two steps.
 
-An id that does not reduce that way - an `APPLICATION` profile, whose id is a
-generated identifier, or a geography newer than the list - reports no reasoning,
-no prompt caching and no context window. The profile summary does carry the base
-model's ARN, and reading it would fix the listing while leaving dispatch exactly
-as wrong, so it is deliberately not read. Issue #1044 covers resolving the
-mapping for both sides, with application profiles as the motivating case.
+1. **The register.** A successful `ListInferenceProfiles` records what each
+   profile routes to, taken from the foundation-model ARNs in the profile's
+   `models`. A cross-region profile lists one ARN per region; they name one
+   model, and that model is the answer. No ARNs, an ARN shape the connector
+   cannot read, or two ARNs naming different models all record nothing, because
+   a wrong base model attaches another model's capabilities to the profile.
+2. **The prefix rule.** An id the register does not hold is the profile id
+   minus its geography prefix. The recognised prefixes are `global.`, `us.`,
+   `eu.`, `apac.`, `ap.`, `au.`, `jp.` and `us-gov.`, held in one list and
+   pinned by a test. Every entry ends at the separator, so no entry can swallow
+   another and the order does not matter. It is an allowlist rather than "drop
+   the first dotted segment", because model ids carry dots of their own - that
+   rule would strip `openai.gpt-5.6-sol` to `gpt-5.6-sol`.
+
+An entry is recorded only where the ARN adds something the prefix rule does not
+already get right, so the register holds exactly the ids that need it. Entries
+are never removed: a deleted profile is undispatchable at AWS, so a stale entry
+cannot grant a capability to a live turn, and a profile whose route changes is
+corrected by the next listing.
+
+**The register is process-wide, and that is the load-bearing part.** The two
+sides that must agree do not share a client object: the daemon lists models
+through the registry's per-connection client and dispatches turns through a
+second client built for the interactive purpose. A register held per client
+would let the picker see a capability the request builder cannot. It is keyed
+by profile id alone, which is safe because a system-defined id names the same
+foundation model in every account and an application profile id is a generated
+identifier.
+
+**Two ids this fixes.** An `APPLICATION` profile has a generated id that no rule
+reduces; accounts create them to attribute cost per team or per feature, and
+before the register such an account silently got a lesser product on every turn.
+A geography newer than the prefix list has the same shape. Both are ordinary
+listed profiles, so both are registered.
+
+**One id it does not fix, on purpose.** A turn can dispatch a model the listing
+never returned - a configured `default_model`, a per-turn model override, or a
+keep-warm probe before the first listing. The register has no entry, so the
+prefix rule alone decides, which is the conservative answer: no thinking budget
+(reported at `warn!`, never silently dropped), no cache checkpoint, no context
+window, and the streaming path with its runtime fallback. The connector does
+**not** refresh the listing to answer, because that would put a control-plane
+call, its IAM failure modes and its latency on the turn path. The boundary is
+the miss, not the model: the same id resolves fully as soon as any listing on
+this daemon has returned it.
+
 Only a profile whose base model this account did not list falls back to a
 family guess from the id, which reports vision from the family and treats the
 model as generative - an embedding model is reachable by its bare on-demand id,
@@ -490,6 +525,36 @@ behind a thin transport adapter that sends the serialized body through
 `InvokeModelWithResponseStream`. A second copy of the request builder and the
 event parser would leave two implementations to keep in step with one vendor's
 API.
+
+### Where the profile-to-base-model mapping lives
+
+Four candidates, scored against two requirements: the capability record and the
+dispatch gates must read one answer, and no turn may make a control-plane call.
+
+**A register populated by the listing, read by every gate. Chosen.** Meets both.
+The listing already makes the call, so the mapping is free, and a miss has a
+defined answer that costs nothing - the prefix rule, which is what every gate
+did before. Its cost is a process-wide register, which is what makes the record
+and the dispatch path share one answer across two client objects, and it leaves
+one case unsolved: an id no listing returned stays conservative.
+
+**Resolution when the connection is built.** Rejected. It resolves the
+connection's own model and nothing else, so a per-turn model override or a
+cross-connection send is unresolved, and it puts a control-plane call in the
+constructor - which then decides whether the daemon starts cleanly.
+
+**Carry the resolved base model on the request.** Rejected on scope and on
+reach. `stream_completion` takes a model id because that is the port's shape,
+so this means a change to `core::ports::llm` and to every connector, for one
+provider's problem. It also only moves the question: whatever sets the field
+still has to resolve the id, from the same listing.
+
+**Decline, and document the gap.** Rejected as the whole answer, kept as the
+answer for one case. It is what shipped before, and it costs an account that
+routes through an application profile its reasoning control, its prompt cache,
+its context window and the deny list, on every turn. Where it is still right is
+the never-listed id, where the alternative is a control-plane call on the turn
+path.
 
 ## Migration path
 

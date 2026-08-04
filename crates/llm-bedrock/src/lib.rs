@@ -106,8 +106,9 @@ pub enum CachePolicy {
 /// Whether a request for `model_id` carries a cache checkpoint.
 ///
 /// Two independent conditions, and both must hold: the operator's policy
-/// allows a checkpoint, and the model accepts one. `model_id` may carry a
-/// cross-region inference-profile prefix; it is stripped here.
+/// allows a checkpoint, and the model accepts one. `model_id` may be an
+/// inference-profile id; `base_model_for` reduces it to the foundation model
+/// the profile routes to.
 ///
 /// A model the connector has learned to reject checkpoints at runtime is
 /// handled by the caller, which does not call this for such a model.
@@ -1034,10 +1035,10 @@ fn map_converse_stream_service_error(
 
 /// Return the prompt-token context window for a known Bedrock model ID.
 ///
-/// Accepts cross-region inference-profile prefixes (`us.`, `eu.`, `apac.`).
-/// Returns `None` for models without a known limit; callers should treat
-/// `None` as "disable token-based compaction" and rely on message-count
-/// fallbacks instead.
+/// Accepts an inference-profile id, which `base_model_for` reduces to the
+/// foundation model the profile routes to. Returns `None` for models without
+/// a known limit; callers should treat `None` as "disable token-based
+/// compaction" and rely on message-count fallbacks instead.
 ///
 /// `ListFoundationModels` does not expose context windows, so this table
 /// is the single source of truth for Bedrock models whose windows we know.
@@ -1074,7 +1075,7 @@ pub fn context_limit_for_model(model_id: &str) -> Option<u64> {
 }
 
 /// Heuristic capability inference from a model id. Operates on the *base*
-/// id (region-prefix already stripped) so it works for both bare foundation
+/// id (`base_model_for` already applied) so it works for both bare foundation
 /// model ids and inference-profile ids.
 fn infer_capabilities_from_id(
     base_id: &str,
@@ -1115,9 +1116,9 @@ fn infer_capabilities_from_id(
 /// whether a requested thinking budget reaches the model instead of being
 /// dropped.
 ///
-/// `base_id` must be the region-prefix-stripped foundation model id, the same
-/// contract [`supports_prompt_caching`] and [`supports_streaming_with_tools`]
-/// use. Case-insensitive.
+/// `base_id` must be the foundation model id `base_model_for` returns, the
+/// same contract [`supports_prompt_caching`] and
+/// [`supports_streaming_with_tools`] use. Case-insensitive.
 ///
 /// This is the single source of truth for the reasoning axis. Both the
 /// capability record ([`infer_capabilities_from_id`]) and the request builder
@@ -1167,12 +1168,13 @@ fn supports_configurable_reasoning(base_id: &str) -> bool {
 /// `inference_profile_prefixes_all_end_in_a_separator` holds the invariant so
 /// the next entry cannot be added without it.
 ///
-/// A profile id is the foundation model id behind one of these prefixes, so
-/// this list is what lets every capability gate in this connector see the base
-/// id. A missing entry is not cosmetic: the gates take the stripped id, so an
-/// unstripped prefix makes extended thinking, prompt caching, the context
-/// window and the streaming-with-tools deny list all answer for an id that
-/// matches nothing - silently withholding a capability the model has.
+/// A system-defined profile id is the foundation model id behind one of these
+/// prefixes, so this list is how the capability gates see the base id without
+/// a listing. A missing entry costs extended thinking, prompt caching, the
+/// context window and the streaming-with-tools deny list for any id that never
+/// reached the register - a `default_model` or a `MODEL_OVERRIDE` set before
+/// the first listing, in particular. A profile the account has listed is
+/// covered either way.
 ///
 /// Sources, all AWS documentation:
 /// - Geographic cross-Region inference names `us`, `eu`, `apac` as geography
@@ -1259,12 +1261,101 @@ fn base_model_for(id: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// The foundation model id inside a Bedrock model ARN, or `None` when this
+/// connector cannot read the ARN.
+///
+/// Two resource types answer: `foundation-model/<id>`, which names the model
+/// directly, and `inference-profile/<id>`, which names a system-defined
+/// profile and reduces by [`strip_region_prefix`]. Any other resource type
+/// answers `None` rather than a guess - a provisioned-throughput ARN names a
+/// deployment, not a model, and reading it as one would attach another
+/// model's capabilities to it.
+///
+/// The partition is not matched, so `aws`, `aws-us-gov` and `aws-cn` all
+/// parse. The resource id is taken whole after the first `/`, because model
+/// ids carry `:` and `.` of their own and only the resource separator is
+/// reliable.
+fn base_model_from_model_arn(arn: &str) -> Option<&str> {
+    let (head, resource_id) = arn.strip_prefix("arn:")?.split_once('/')?;
+    let (_, resource_type) = head.rsplit_once(':')?;
+    if !matches!(resource_type, "foundation-model" | "inference-profile") {
+        return None;
+    }
+    if !head.contains(":bedrock:") {
+        return None;
+    }
+    let base = strip_region_prefix(resource_id);
+    (!base.is_empty()).then_some(base)
+}
+
+/// The foundation model an inference-profile summary routes to, taken from
+/// the ARNs in its `models`.
+///
+/// A cross-region profile lists one ARN per region, and they name one model,
+/// so the answer is that model. Anything less certain answers `None`: no
+/// `models` at all, an ARN this connector cannot read, or two ARNs that name
+/// different models. A wrong base model is worse than no base model, because
+/// it attaches another model's capabilities to the profile.
+fn profile_base_model(profile: &aws_sdk_bedrock::types::InferenceProfileSummary) -> Option<&str> {
+    let mut resolved: Option<&str> = None;
+    for model in profile.models() {
+        let base = base_model_from_model_arn(model.model_arn()?)?;
+        match resolved {
+            None => resolved = Some(base),
+            Some(seen) if seen == base => {}
+            Some(_) => return None,
+        }
+    }
+    resolved
+}
+
+/// Record what an inference profile routes to, so every capability gate on
+/// every `BedrockClient` in this process answers for that model.
+///
+/// Only where the ARN adds something. A profile id the prefix rule already
+/// reduces correctly is left out, so the register holds exactly the ids that
+/// need it, and the prefix rule stays the single answer for the ids it can
+/// answer for.
+fn register_profile_base_model(profile: &aws_sdk_bedrock::types::InferenceProfileSummary) {
+    use aws_sdk_bedrock::types::InferenceProfileStatus;
+
+    if profile.status != InferenceProfileStatus::Active {
+        return;
+    }
+    let profile_id = profile.inference_profile_id();
+    if profile_id.is_empty() {
+        return;
+    }
+    let Some(base) = profile_base_model(profile) else {
+        tracing::debug!(
+            profile_id,
+            "inference profile names no single foundation model in its ARNs; \
+             its capabilities fall back to the profile id"
+        );
+        return;
+    };
+    if base == strip_region_prefix(profile_id) {
+        return;
+    }
+    tracing::debug!(
+        profile_id,
+        base,
+        "inference profile registered against its base foundation model"
+    );
+    PROFILE_BASE_MODELS
+        // Poisoning is ignored for the same reason it is ignored on read: a
+        // panic elsewhere must not cost every later turn its capabilities.
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(profile_id.to_string(), base.to_string());
+}
+
 /// Whether a Bedrock model accepts `cachePoint` prompt-cache checkpoints.
 ///
-/// `base_id` must be the region-prefix-stripped foundation model id --
-/// `anthropic.claude-sonnet-4-6`, not `us.anthropic.claude-sonnet-4-6`. The
-/// caller strips it with [`strip_region_prefix`], the same contract
-/// [`supports_streaming_with_tools`] uses.
+/// `base_id` must be the foundation model id -- `anthropic.claude-sonnet-4-6`,
+/// not `us.anthropic.claude-sonnet-4-6`. The caller reduces it with
+/// `base_model_for`, the same contract [`supports_streaming_with_tools`]
+/// uses.
 ///
 /// Why an allow-list, and why it defaults to `false`: support is a property of
 /// the model, not of the Converse API, and Bedrock rejects a request that
@@ -1311,9 +1402,9 @@ fn supports_prompt_caching(base_id: &str) -> bool {
 /// tools via `Converse` *only*, not `ConverseStream`. Llama 3/4 fall in
 /// that bucket; Claude does not. (#67)
 ///
-/// `base_id` should be the region-prefix-stripped foundation model id —
-/// `meta.llama4-…`, not `us.meta.llama4-…`. The caller is responsible
-/// for calling [`strip_region_prefix`] first.
+/// `base_id` should be the foundation model id — `meta.llama4-…`, not
+/// `us.meta.llama4-…`. The caller is responsible for calling
+/// `base_model_for` first.
 ///
 /// Conservative: defaults to `true` for unknown models so we keep the
 /// streaming path when in doubt. The runtime fallback in `stream_completion`
@@ -1515,9 +1606,9 @@ fn summary_to_model_info(
 /// Only where the base model is not in that listing does the id-family
 /// fallback below decide.
 ///
-/// The base model is named by the profile id minus its geography prefix, and
-/// by nothing else. [`fallback_modalities_from_id`] records why the ARN in the
-/// profile's `models` is not read here, and what reading it would require.
+/// The base model comes from `base_model_for`, which the dispatch gates call
+/// as well. The caller registers every profile before the first record is
+/// built, so a record and a request for the same id read one answer.
 fn inference_profile_to_model_info(
     profile: &aws_sdk_bedrock::types::InferenceProfileSummary,
     modalities: &ModalityIndex,
@@ -1533,14 +1624,10 @@ fn inference_profile_to_model_info(
         return None;
     }
 
-    // The profile id minus its geography prefix, and nothing else. The
-    // profile's `models` carry the ARN of the foundation model it serves,
-    // which would resolve more ids than this does - and it is deliberately
-    // not read here. The dispatch path has only the model id, so every gate
-    // it consults resolves through `strip_region_prefix`; a capability taken
-    // from an input dispatch does not share is a capability the picker can
-    // offer and the request builder will discard. See the note on
-    // `fallback_modalities_from_id` for what resolving it properly needs.
+    // The same call every dispatch gate makes, on the same register. A
+    // capability read from an input dispatch does not share is a capability
+    // the picker offers and the request builder discards, so the record is
+    // not allowed a richer source than the request path has.
     let base_id = base_model_for(profile_id);
     let base_id = base_id.as_ref();
 
@@ -1585,15 +1672,13 @@ fn inference_profile_to_model_info(
 /// its bare on-demand id and appears on the foundation path, so a profile for
 /// one is resolvable through the index or does not exist.
 ///
-/// This is also where an id that does not reduce to a foundation model lands:
-/// an `APPLICATION` profile, whose id is a generated identifier, or a
-/// geography newer than [`INFERENCE_PROFILE_PREFIXES`]. The profile summary
-/// does carry the base model's ARN, and it is deliberately not read - the
-/// dispatch path has only the model id, so a capability recovered here and not
-/// there is one the picker offers and the request builder discards. Resolving
-/// it for both sides is issue #1044: the mapping has to reach the dispatch
-/// gates, with a defined answer for a turn against a model that was never
-/// listed.
+/// An id that reduces to no foundation model at all reaches here as well, and
+/// that is now the narrow case it sounds like. An `APPLICATION` profile, whose
+/// id is a generated identifier, and a geography newer than
+/// [`INFERENCE_PROFILE_PREFIXES`] both carry the base model's ARN in the
+/// profile summary; the listing registers it, and `base_model_for` gives the
+/// same answer to the record and to every dispatch gate. What is left is an id
+/// no listing returned, or a profile whose ARNs name no single model.
 fn fallback_modalities_from_id(base_id: &str) -> ModelModalities {
     let lc = base_id.to_ascii_lowercase();
     let vision = lc.contains("anthropic.claude-3")
@@ -1719,6 +1804,12 @@ impl BedrockClient {
 
         match profiles_res {
             Ok(profile_resp) => {
+                // Register every profile before any of them is turned into a
+                // record. The record reads the register, exactly as the
+                // dispatch gates do, so the two cannot answer differently.
+                for profile in profile_resp.inference_profile_summaries() {
+                    register_profile_base_model(profile);
+                }
                 for profile in profile_resp.inference_profile_summaries() {
                     if let Some(info) = inference_profile_to_model_info(profile, &modalities) {
                         models.push(info);
@@ -2534,8 +2625,8 @@ enum ReasoningRequest {
 
 /// Resolve the per-turn reasoning hint against the model that will serve it.
 ///
-/// `model` may carry a cross-region inference-profile prefix; it is stripped
-/// here, so callers pass the id they dispatch with.
+/// `model` may be an inference-profile id; `base_model_for` reduces it here,
+/// so callers pass the id they dispatch with.
 ///
 /// The emitted shape for a model that takes it is Anthropic's native one,
 /// `{"thinking": {"type": "enabled", "budget_tokens": N}}`, which Bedrock
@@ -4541,6 +4632,48 @@ mod tests {
             supports_streaming_with_tools(&base_model_for(NEVER_LISTED)),
             "the streaming deny list is an allow-by-default list with a runtime fallback"
         );
+    }
+
+    #[test]
+    fn a_profile_model_arn_names_the_foundation_model_it_routes_to() {
+        assert_eq!(
+            base_model_from_model_arn(
+                "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-sonnet-4-5-20250929-v1:0"
+            ),
+            Some("anthropic.claude-sonnet-4-5-20250929-v1:0"),
+            "a foundation-model ARN names the model directly"
+        );
+        assert_eq!(
+            base_model_from_model_arn(
+                "arn:aws:bedrock:us-east-1:111122223333:inference-profile/us.meta.llama4-scout-17b-instruct-v1:0"
+            ),
+            Some("meta.llama4-scout-17b-instruct-v1:0"),
+            "a system-defined profile ARN reduces by the prefix rule"
+        );
+        assert_eq!(
+            base_model_from_model_arn(
+                "arn:aws-us-gov:bedrock:us-gov-west-1::foundation-model/anthropic.claude-sonnet-4-5-20250929-v1:0"
+            ),
+            Some("anthropic.claude-sonnet-4-5-20250929-v1:0"),
+            "the GovCloud partition is still an AWS ARN"
+        );
+    }
+
+    #[test]
+    fn a_model_arn_this_connector_cannot_read_names_nothing() {
+        for arn in [
+            "",
+            "anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "arn:aws:s3:::a-bucket/an-object",
+            "arn:aws:bedrock:us-east-1:111122223333:provisioned-model/abcd1234",
+            "arn:aws:bedrock:us-east-1::foundation-model/",
+        ] {
+            assert_eq!(
+                base_model_from_model_arn(arn),
+                None,
+                "{arn} is not a Bedrock model ARN this connector can reduce"
+            );
+        }
     }
 
     #[tokio::test]
