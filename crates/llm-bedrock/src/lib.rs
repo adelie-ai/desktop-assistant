@@ -1225,23 +1225,27 @@ fn strip_region_prefix(id: &str) -> &str {
 /// cannot, which is the defect this connector already paid for once. A
 /// register held per process cannot.
 ///
-/// Keyed by profile id alone, and it cannot be keyed more narrowly. A daemon
-/// can hold Bedrock connections to several accounts, so an account-scoped key
-/// would be the safer one - and the read side cannot build it. A turn arrives
-/// with a model id and a credential, never an account id, so scoping the key
-/// by account would mean an STS call on the turn path: the cost this whole
-/// design exists to avoid. What is left is a residual risk with no
-/// demonstrated failure: a system-defined id (`us.anthropic....`) names the
-/// same foundation model in every account, and an application profile id is an
-/// AWS-generated identifier, so a collision needs two accounts in one daemon
-/// to be issued the same id for profiles routing to different models. The
-/// stored value is a foundation model id, which is global as well.
+/// Keyed by profile id, and narrowing that key was a choice rather than an
+/// impossibility. A daemon can hold Bedrock connections to several accounts,
+/// and a connection-identity key - base url, aws profile, credential, all of
+/// which both clients share because both are built from one resolved
+/// connection - needs no network call. It is not used because it would make
+/// `base_model_for` a method and change a public signature to close a
+/// collision nobody can demonstrate: an application profile id is a
+/// twelve-character service-generated identifier, so a collision needs two
+/// accounts in one daemon to be issued the same one for profiles routing to
+/// different models, and a system-defined id names the same foundation model
+/// in every account. An account-scoped key is the one that is genuinely
+/// unavailable, because a turn arrives with a model id and a credential and
+/// never an account id.
 ///
 /// Entries are written by a successful `ListInferenceProfiles` and are never
-/// removed. A deleted profile makes its id undispatchable at AWS, so a stale
-/// entry cannot grant a capability to a live turn; a profile whose route
-/// changes is corrected by the next listing, which overwrites the entry.
-/// Growth is bounded by the account's inference-profile quota.
+/// removed, so the bound is every profile id any connection in this process
+/// has ever listed - not the account's current quota. A deleted profile makes
+/// its id undispatchable at AWS, so a stale entry cannot grant a capability to
+/// a live turn; a profile whose route changes is corrected by the next
+/// listing, which overwrites the entry. Ids are not reused, and an entry is
+/// two short strings, so the growth is not a leak worth reclaiming.
 ///
 /// A `BTreeMap` rather than a `HashMap` because its constructor is `const`,
 /// so the register needs no lazy initialization.
@@ -1351,20 +1355,29 @@ fn register_profile_base_model(profile: &aws_sdk_bedrock::types::InferenceProfil
         );
         return;
     };
-    if base == strip_region_prefix(profile_id) {
-        return;
-    }
-    tracing::debug!(
-        profile_id,
-        base,
-        "inference profile registered against its base foundation model"
-    );
-    PROFILE_BASE_MODELS
+    // Both forms AWS accepts as a `modelId`, because a turn can carry either
+    // and the gates see only what it carried. The bare id is skipped where the
+    // prefix rule already reduces it correctly, so the register holds only ids
+    // that need it; the ARN is always registered, because no rule reduces an
+    // ARN and AWS documents the ARN as an accepted `modelId` for a profile.
+    let mut register = PROFILE_BASE_MODELS
         // Poisoning is ignored for the same reason it is ignored on read: a
         // panic elsewhere must not cost every later turn its capabilities.
         .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(profile_id.to_string(), base.to_string());
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let profile_arn = profile.inference_profile_arn();
+    if !profile_arn.is_empty() {
+        register.insert(profile_arn.to_string(), base.to_string());
+    }
+    if base != strip_region_prefix(profile_id) {
+        tracing::debug!(
+            profile_id,
+            base,
+            "inference profile registered against its base foundation model"
+        );
+        register.insert(profile_id.to_string(), base.to_string());
+    }
 }
 
 /// Whether a Bedrock model accepts `cachePoint` prompt-cache checkpoints.
@@ -1714,6 +1727,135 @@ fn fallback_modalities_from_id(base_id: &str) -> ModelModalities {
     }
 }
 
+/// Upper bound on the `ListInferenceProfiles` pages this connector follows,
+/// per profile type.
+///
+/// A stop, not an expectation. The service pages at 100 summaries by default
+/// and 1000 at most, so this covers far more profiles than an account can
+/// hold, and it exists so a repeating or malformed `nextToken` cannot spin the
+/// listing forever. Hitting it truncates the catalogue, which is reported as a
+/// notice rather than passed off as a complete listing.
+const MAX_INFERENCE_PROFILE_PAGES: usize = 50;
+
+/// Every inference profile of one type, and whether the page cap cut the
+/// answer short.
+struct InferenceProfileListing {
+    summaries: Vec<aws_sdk_bedrock::types::InferenceProfileSummary>,
+    truncated: bool,
+}
+
+/// Call `ListInferenceProfiles` for one profile type, following `nextToken`
+/// to the end.
+///
+/// **The type filter is mandatory, not a refinement.** An unfiltered
+/// `ListInferenceProfiles` returns `SYSTEM_DEFINED` profiles and nothing else.
+/// That is the service's behaviour and not the API reference's wording, so it
+/// is stated here: verified against a live account on 2026-08-03, where the
+/// unfiltered call and `typeEquals=SYSTEM_DEFINED` returned the same 63
+/// profiles and `typeEquals=APPLICATION` was the only way to ask for the
+/// others. Dropping the filter silently loses every application profile, which
+/// is the whole population this resolution exists for.
+///
+/// Pagination is followed rather than ignored for the same reason it matters
+/// now and did not before: a profile that lands on page two used to cost the
+/// picker one row, and now costs that model its reasoning, its prompt cache,
+/// its context window and its streaming path. An account that creates a
+/// profile per team is exactly the account whose profiles run past one page.
+async fn list_inference_profiles_of_type(
+    client: &BedrockControlClient,
+    profile_type: aws_sdk_bedrock::types::InferenceProfileType,
+) -> Result<
+    InferenceProfileListing,
+    aws_sdk_bedrock::error::SdkError<
+        aws_sdk_bedrock::operation::list_inference_profiles::ListInferenceProfilesError,
+    >,
+> {
+    let mut summaries = Vec::new();
+    let mut next_token: Option<String> = None;
+    let mut pages = 0usize;
+    let truncated = loop {
+        let mut request = client
+            .list_inference_profiles()
+            .type_equals(profile_type.clone());
+        if let Some(token) = next_token.take() {
+            request = request.next_token(token);
+        }
+        let response = request.send().await?;
+        summaries.extend(response.inference_profile_summaries().iter().cloned());
+        pages += 1;
+
+        match response.next_token {
+            Some(token) if !token.is_empty() => next_token = Some(token),
+            _ => break false,
+        }
+        if pages >= MAX_INFERENCE_PROFILE_PAGES {
+            tracing::warn!(
+                profile_type = %profile_type,
+                pages,
+                "stopped following ListInferenceProfiles pages at the cap; the model \
+                 listing is incomplete"
+            );
+            break true;
+        }
+    };
+    Ok(InferenceProfileListing {
+        summaries,
+        truncated,
+    })
+}
+
+/// Build the degradation notice for a failed `ListInferenceProfiles` call for
+/// `APPLICATION` profiles, when the system-defined call worked.
+///
+/// Its own notice, because what is missing is different. The system-defined
+/// failure hides the models nobody can reach any other way; this one hides the
+/// profiles an account created for itself, so the text names those rather than
+/// Claude 4.x and Nova.
+fn application_profiles_notice(code: Option<&str>, message: Option<&str>) -> ModelListingNotice {
+    let denied = code.is_some_and(|c| c.to_ascii_lowercase().starts_with("accessdenied"));
+    let cause = match (code, message) {
+        (Some(code), Some(message)) => format!("{code}: {message}"),
+        (Some(code), None) => code.to_string(),
+        (None, Some(message)) => message.to_string(),
+        (None, None) => "no error details were returned".to_string(),
+    };
+    let notice = ModelListingNotice::partial_catalog(
+        "Bedrock application inference profiles unavailable",
+        truncate_chars(
+            &format!(
+                "ListInferenceProfiles refused the APPLICATION filter, so any inference \
+                 profile this account created for its own cost attribution is missing from \
+                 the list, and a request against one gets no reasoning, no prompt cache and \
+                 no context window. AWS said - {}",
+                truncate_chars(&cause, MAX_NOTICE_DETAIL_CHARS / 2)
+            ),
+            MAX_NOTICE_DETAIL_CHARS,
+        ),
+    );
+    if denied {
+        notice.with_required_permission(LIST_INFERENCE_PROFILES_PERMISSION)
+    } else {
+        notice
+    }
+}
+
+/// Build the notice for a listing that stopped at
+/// [`MAX_INFERENCE_PROFILE_PAGES`].
+///
+/// Reported rather than swallowed: a truncated listing looks exactly like a
+/// small account, and the profiles it drops lose their capabilities silently.
+fn truncated_profiles_notice() -> ModelListingNotice {
+    ModelListingNotice::partial_catalog(
+        "Bedrock inference-profile listing was truncated",
+        format!(
+            "This connection stopped after {MAX_INFERENCE_PROFILE_PAGES} pages of \
+             ListInferenceProfiles, so some inference profiles are missing from the list. \
+             A request against a missing profile gets no reasoning, no prompt cache and no \
+             context window."
+        ),
+    )
+}
+
 /// Build the degradation notice for a failed `ListInferenceProfiles` call.
 ///
 /// `code` / `message` are the service error metadata (both optional: a
@@ -1801,12 +1943,18 @@ impl BedrockClient {
     /// degraded listing from an account with nothing but embedding models
     /// (#648).
     async fn fetch_models_uncached(&self) -> Result<ModelListingReport, CoreError> {
+        use aws_sdk_bedrock::types::InferenceProfileType;
+
         let client = self.control_client().await?;
 
         let foundation_fut = client.list_foundation_models().send();
-        let profiles_fut = client.list_inference_profiles().send();
+        let system_fut =
+            list_inference_profiles_of_type(client, InferenceProfileType::SystemDefined);
+        let application_fut =
+            list_inference_profiles_of_type(client, InferenceProfileType::Application);
 
-        let (foundation_res, profiles_res) = tokio::join!(foundation_fut, profiles_fut);
+        let (foundation_res, system_res, application_res) =
+            tokio::join!(foundation_fut, system_fut, application_fut);
 
         let foundation = foundation_res
             .map_err(|e| CoreError::Llm(format!("Bedrock ListFoundationModels failed: {e:#}")))?;
@@ -1819,19 +1967,13 @@ impl BedrockClient {
             summaries.iter().filter_map(summary_to_model_info).collect();
         let mut notices = Vec::new();
 
-        match profiles_res {
-            Ok(profile_resp) => {
-                // Register every profile before any of them is turned into a
-                // record. The record reads the register, exactly as the
-                // dispatch gates do, so the two cannot answer differently.
-                for profile in profile_resp.inference_profile_summaries() {
-                    register_profile_base_model(profile);
-                }
-                for profile in profile_resp.inference_profile_summaries() {
-                    if let Some(info) = inference_profile_to_model_info(profile, &modalities) {
-                        models.push(info);
-                    }
-                }
+        let mut profiles: Vec<aws_sdk_bedrock::types::InferenceProfileSummary> = Vec::new();
+        let mut truncated = false;
+
+        match system_res {
+            Ok(listing) => {
+                truncated |= listing.truncated;
+                profiles.extend(listing.summaries);
             }
             Err(error) => {
                 use aws_smithy_types::error::metadata::ProvideErrorMetadata;
@@ -1842,6 +1984,42 @@ impl BedrockClient {
                      Cause: {error:#}"
                 );
                 notices.push(inference_profiles_notice(error.code(), error.message()));
+            }
+        }
+
+        match application_res {
+            Ok(listing) => {
+                truncated |= listing.truncated;
+                profiles.extend(listing.summaries);
+            }
+            Err(error) => {
+                use aws_smithy_types::error::metadata::ProvideErrorMetadata;
+                tracing::warn!(
+                    "Bedrock ListInferenceProfiles for APPLICATION profiles failed. \
+                     Cause: {error:#}"
+                );
+                // Only when the system-defined call worked. When both failed
+                // the notice above already says inference profiles are
+                // missing, and a second one repeats it without adding a fact.
+                if notices.is_empty() {
+                    notices.push(application_profiles_notice(error.code(), error.message()));
+                }
+            }
+        }
+
+        if truncated {
+            notices.push(truncated_profiles_notice());
+        }
+
+        // Register every profile before any of them is turned into a record.
+        // The record reads the register, exactly as the dispatch gates do, so
+        // the two cannot answer differently.
+        for profile in &profiles {
+            register_profile_base_model(profile);
+        }
+        for profile in &profiles {
+            if let Some(info) = inference_profile_to_model_info(profile, &modalities) {
+                models.push(info);
             }
         }
 
@@ -1933,12 +2111,35 @@ impl LlmClient for BedrockClient {
     /// the registry spawns beside it. A failure leaves the register empty,
     /// which is the conservative answer the gates already have.
     async fn warmup(&self) {
-        if let Err(error) = self.list_models_cached().await {
-            tracing::debug!(
-                %error,
-                "Bedrock model listing failed at startup; inference profiles resolve \
-                 by their id until a later listing succeeds"
-            );
+        match self.fetch_models_uncached().await {
+            Ok(report) if report.notices.is_empty() => {
+                let now = self.clock.now();
+                let mut cache = self.model_cache.lock().await;
+                cache.entry = Some((now, report));
+            }
+            // A degraded listing is deliberately NOT cached here. Caching one
+            // would hold a partial catalogue for the whole TTL, decided at the
+            // moment a transient failure is likeliest - several connections
+            // firing control-plane calls at boot, or a session credential not
+            // yet refreshed - and with nobody watching. Whatever the call did
+            // register is kept; the next listing is a real call again, made
+            // when somebody is present to see the notice and press refresh.
+            Ok(report) => {
+                tracing::warn!(
+                    notices = report.notices.len(),
+                    "Bedrock model listing came back degraded at startup; not caching it. \
+                     Inference profiles missing from it resolve by their id, so they get \
+                     no reasoning, no prompt cache and no context window until a later \
+                     listing succeeds"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "Bedrock model listing failed at startup; every inference profile on \
+                     this connection resolves by its id until a later listing succeeds"
+                );
+            }
         }
     }
 
@@ -4072,15 +4273,14 @@ mod tests {
 
     /// Both control-plane calls succeed.
     fn mock_healthy_control_plane(server: &httpmock::MockServer) -> httpmock::Mock<'_> {
-        server.mock(|when, then| {
-            when.method(httpmock::Method::GET)
-                .path("/inference-profiles");
-            then.status(200)
-                .header("content-type", "application/json")
-                .body(INFERENCE_PROFILES_BODY);
-        });
+        mock_inference_profiles_by_type(server, "SYSTEM_DEFINED", INFERENCE_PROFILES_BODY);
+        mock_inference_profiles_by_type(server, "APPLICATION", EMPTY_PROFILES_BODY);
         mock_foundation_models(server)
     }
+
+    /// A `ListInferenceProfiles` page with nothing on it. What an account with
+    /// no application profiles returns for `typeEquals=APPLICATION`.
+    const EMPTY_PROFILES_BODY: &str = r#"{"inferenceProfileSummaries": []}"#;
 
     #[tokio::test]
     async fn list_models_reports_partial_failure_when_profiles_call_fails() {
@@ -4330,7 +4530,20 @@ mod tests {
           ],
           "status": "ACTIVE",
           "type": "SYSTEM_DEFINED"
-        },
+        }
+      ]
+    }"#;
+
+    /// `ListInferenceProfiles` with `typeEquals=APPLICATION`, the only request
+    /// that returns these.
+    ///
+    /// The `models` shape is the one a live account returns: one `modelArn`
+    /// per region the profile routes to, all naming the same foundation model.
+    /// Captured from `aws bedrock list-inference-profiles` on 2026-08-03 and
+    /// scrubbed - the ids and the account number are invented, the shape is
+    /// not.
+    const DRIFTING_APPLICATION_PROFILES_BODY: &str = r#"{
+      "inferenceProfileSummaries": [
         {
           "inferenceProfileName": "platform-team-claude",
           "inferenceProfileArn": "arn:aws:bedrock:us-east-1:111122223333:application-inference-profile/y1c2q8m4t6bk",
@@ -4374,13 +4587,37 @@ mod tests {
                 .header("content-type", "application/json")
                 .body(DRIFTING_FOUNDATION_MODELS_BODY);
         });
+        mock_inference_profiles_by_type(server, "SYSTEM_DEFINED", DRIFTING_INFERENCE_PROFILES_BODY);
+        mock_inference_profiles_by_type(server, "APPLICATION", DRIFTING_APPLICATION_PROFILES_BODY);
+    }
+
+    /// Mock `ListInferenceProfiles` **for one `typeEquals` value only**.
+    ///
+    /// The query matcher is the point of this helper, not an incidental
+    /// detail. An unfiltered `ListInferenceProfiles` returns `SYSTEM_DEFINED`
+    /// profiles and nothing else - verified against a live account on
+    /// 2026-08-03, where the unfiltered call and `typeEquals=SYSTEM_DEFINED`
+    /// both returned the same 63 profiles. A mock that answered an unfiltered
+    /// request with `APPLICATION` entries would certify a contract the service
+    /// does not implement, so a request without the filter matches nothing
+    /// here and fails.
+    fn mock_inference_profiles_by_type<'a>(
+        server: &'a httpmock::MockServer,
+        profile_type: &str,
+        body: &str,
+    ) -> httpmock::Mock<'a> {
         server.mock(|when, then| {
             when.method(httpmock::Method::GET)
-                .path("/inference-profiles");
+                .path("/inference-profiles")
+                // `type`, not `typeEquals`: the SDK member is `typeEquals`
+                // and the wire query key it serializes to is `type`. Matching
+                // the member name would match nothing, and every request
+                // would 404 instead of being filtered.
+                .query_param("type", profile_type);
             then.status(200)
                 .header("content-type", "application/json")
-                .body(DRIFTING_INFERENCE_PROFILES_BODY);
-        });
+                .body(body);
+        })
     }
 
     fn find_model<'a>(report: &'a ModelListingReport, id: &str) -> &'a ModelInfo {
@@ -4638,8 +4875,9 @@ mod tests {
         );
     }
 
-    /// `ListInferenceProfiles` with one `APPLICATION` profile whose id no
-    /// other test lists, so "before the listing" is a meaningful state.
+    /// `ListInferenceProfiles` with `typeEquals=APPLICATION`, carrying one
+    /// profile whose id no other test lists, so "before the listing" is a
+    /// meaningful state.
     const WARMUP_PROFILES_BODY: &str = r#"{
       "inferenceProfileSummaries": [
         {
@@ -4664,13 +4902,8 @@ mod tests {
         const ID: &str = "w7f3j5s8v2qd";
         let server = httpmock::MockServer::start();
         mock_foundation_models(&server);
-        server.mock(|when, then| {
-            when.method(httpmock::Method::GET)
-                .path("/inference-profiles");
-            then.status(200)
-                .header("content-type", "application/json")
-                .body(WARMUP_PROFILES_BODY);
-        });
+        mock_inference_profiles_by_type(&server, "SYSTEM_DEFINED", EMPTY_PROFILES_BODY);
+        mock_inference_profiles_by_type(&server, "APPLICATION", WARMUP_PROFILES_BODY);
 
         assert_eq!(
             base_model_for(ID),
@@ -4684,6 +4917,118 @@ mod tests {
             base_model_for(ID),
             APP_PROFILE_CLAUDE_BASE,
             "startup listing must leave the register ready for the first turn"
+        );
+    }
+
+    /// `ListInferenceProfiles` with no `type` filter returns `SYSTEM_DEFINED`
+    /// profiles and nothing else, so the `APPLICATION` call has to be made on
+    /// purpose. Verified against a live account on 2026-08-03: the unfiltered
+    /// call and `type=SYSTEM_DEFINED` returned the same 63 profiles, and only
+    /// `type=APPLICATION` can return the rest.
+    #[tokio::test]
+    async fn the_listing_asks_for_application_profiles_by_name() {
+        let server = httpmock::MockServer::start();
+        mock_foundation_models(&server);
+        mock_inference_profiles_by_type(&server, "SYSTEM_DEFINED", EMPTY_PROFILES_BODY);
+        let application =
+            mock_inference_profiles_by_type(&server, "APPLICATION", EMPTY_PROFILES_BODY);
+
+        control_plane_client(&server)
+            .list_models_detailed()
+            .await
+            .expect("healthy listing");
+
+        application.assert_calls(1);
+    }
+
+    /// An account that creates a profile per team is the account #1044 exists
+    /// for, and it is also the account whose profiles run past one page. A
+    /// profile the listing never reached is a profile whose capabilities are
+    /// lost, so `nextToken` is followed rather than dropped.
+    #[tokio::test]
+    async fn a_profile_on_the_second_page_is_registered_like_any_other() {
+        const ID: &str = "q4v8b1n6z3rt";
+        let server = httpmock::MockServer::start();
+        mock_foundation_models(&server);
+        mock_inference_profiles_by_type(&server, "SYSTEM_DEFINED", EMPTY_PROFILES_BODY);
+
+        // Page one carries nothing and a token; the profile is on page two.
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/inference-profiles")
+                .query_param("type", "APPLICATION")
+                .query_param_missing("nextToken");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"inferenceProfileSummaries": [], "nextToken": "PAGE2"}"#);
+        });
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/inference-profiles")
+                .query_param("type", "APPLICATION")
+                .query_param("nextToken", "PAGE2");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(
+                    r#"{"inferenceProfileSummaries": [
+                      {
+                        "inferenceProfileName": "page-two-team",
+                        "inferenceProfileArn": "arn:aws:bedrock:us-east-1:111122223333:application-inference-profile/q4v8b1n6z3rt",
+                        "inferenceProfileId": "q4v8b1n6z3rt",
+                        "models": [
+                          {"modelArn": "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-sonnet-4-5-20250929-v1:0"}
+                        ],
+                        "status": "ACTIVE",
+                        "type": "APPLICATION"
+                      }
+                    ]}"#,
+                );
+        });
+
+        let report = control_plane_client(&server)
+            .list_models_detailed()
+            .await
+            .expect("healthy listing");
+
+        find_model(&report, ID);
+        assert_eq!(
+            base_model_for(ID),
+            APP_PROFILE_CLAUDE_BASE,
+            "a profile past the first page must reach the register like any other"
+        );
+    }
+
+    /// The startup warm runs when a transient control-plane failure is
+    /// likeliest and nobody is watching. Caching a degraded listing there
+    /// would hold a partial catalogue for the whole TTL, so it is not cached.
+    #[tokio::test]
+    async fn the_startup_warm_does_not_cache_a_degraded_listing() {
+        let server = httpmock::MockServer::start();
+        let foundation = mock_foundation_models(&server);
+        let failure = mock_inference_profiles_error(
+            &server,
+            403,
+            "AccessDeniedException",
+            ACCESS_DENIED_BODY,
+        );
+
+        let client = control_plane_client(&server).with_model_cache_ttl(Duration::from_secs(3600));
+        client.warmup().await;
+
+        let report = client
+            .list_models_detailed()
+            .await
+            .expect("degraded listing is still a listing");
+
+        assert!(
+            !report.notices.is_empty(),
+            "the degradation must still be reported to whoever asks"
+        );
+        foundation.assert_calls(2);
+        assert!(
+            failure.calls() >= 2,
+            "a degraded warm must not serve the next caller from the cache, got {} calls",
+            failure.calls()
         );
     }
 

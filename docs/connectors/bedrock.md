@@ -123,12 +123,37 @@ parallel:
 | Call | IAM action | Contributes |
 |---|---|---|
 | `ListFoundationModels` | `bedrock:ListFoundationModels` | Foundation models with on-demand throughput |
-| `ListInferenceProfiles` | `bedrock:ListInferenceProfiles` | Cross-region inference profiles (`us.anthropic.claude-...`) |
+| `ListInferenceProfiles`, `type=SYSTEM_DEFINED` | `bedrock:ListInferenceProfiles` | Cross-region inference profiles (`us.anthropic.claude-...`) |
+| `ListInferenceProfiles`, `type=APPLICATION` | `bedrock:ListInferenceProfiles` | Application inference profiles the account created for its own cost attribution |
+
+**The type filter is mandatory, not a refinement.** An unfiltered
+`ListInferenceProfiles` returns `SYSTEM_DEFINED` profiles and nothing else. The
+API reference does not state that default, which is exactly why it reads as "no
+filter means everything". Verified against a live account on 2026-08-03: the
+unfiltered call and `type=SYSTEM_DEFINED` returned the same 63 profiles, and
+`type=APPLICATION` is the only way to ask for the rest. So the connector makes
+both calls by name. A connector that makes one unfiltered call sees no
+application profile at all, and every model behind one silently loses its
+reasoning, its prompt cache, its context window and its streaming path - which
+is the defect this resolution exists to remove.
+
+**Both calls follow `nextToken`.** A page missed is a profile missed, and a
+profile missed is a model whose capabilities are lost, so the listing is not one
+page deep. A live account already returns 63 system-defined profiles per region
+before it creates any of its own. The connector stops after 50 pages per type,
+which is far more than an account can hold and exists so a repeating token
+cannot spin the listing forever; hitting it adds a notice rather than passing a
+truncated catalogue off as complete.
 
 A failure of `ListFoundationModels` fails that backend's listing. A failure of
 `ListInferenceProfiles` does not: the listing degrades to on-demand foundation
 models and adds a partial-catalogue notice that names
 `bedrock:ListInferenceProfiles`. Many IAM policies grant only the first call.
+The two profile calls are reported apart, because what each one hides is
+different - the system-defined call hides models no other route reaches, and the
+application call hides the profiles an account made for itself. When both fail,
+one notice is emitted, because the second would repeat the first without adding
+a fact.
 
 **Foundation models without on-demand support are filtered out.** Their bare ids
 are not callable. Selecting one fails at invocation time with a
@@ -158,6 +183,13 @@ That function answers in two steps.
    model, and that model is the answer. No ARNs, an ARN shape the connector
    cannot read, or two ARNs naming different models all record nothing, because
    a wrong base model attaches another model's capabilities to the profile.
+   Each profile is recorded under **both** forms AWS accepts as a `modelId` -
+   the bare profile id and the profile ARN - because a turn carries one of them
+   and the gates see only what it carried. Which form a turn carries for an
+   application profile is not settled here: AWS documents that a cross-region
+   profile takes either, and is less explicit for an application profile.
+   Registering both makes the question moot rather than leaving it to be
+   discovered on a turn.
 2. **The prefix rule.** An id the register does not hold is the profile id
    minus its geography prefix. The recognised prefixes are `global.`, `us.`,
    `eu.`, `apac.`, `ap.`, `au.`, `jp.` and `us-gov.`, held in one list and
@@ -166,11 +198,12 @@ That function answers in two steps.
    the first dotted segment", because model ids carry dots of their own - that
    rule would strip `openai.gpt-5.6-sol` to `gpt-5.6-sol`.
 
-An entry is recorded only where the ARN adds something the prefix rule does not
-already get right, so the register holds exactly the ids that need it. Entries
-are never removed: a deleted profile is undispatchable at AWS, so a stale entry
-cannot grant a capability to a live turn, and a profile whose route changes is
-corrected by the next listing.
+A bare id is recorded only where the ARN adds something the prefix rule does not
+already get right; an ARN is always recorded, because no rule reduces one.
+Entries are never removed, so what the register holds is every profile any
+connection in this process has listed - a deleted profile is undispatchable at
+AWS, so a stale entry cannot grant a capability to a live turn, and a profile
+whose route changes is corrected by the next listing.
 
 **The register is process-wide, and that is the load-bearing part.** The two
 sides that must agree do not share a client object: the daemon lists models
@@ -178,15 +211,16 @@ through the registry's per-connection client and dispatches turns through a
 second client built for the interactive purpose. A register held per client
 would let the picker see a capability the request builder cannot.
 
-It is keyed by profile id alone, and it cannot be keyed more narrowly. A daemon
-can hold Bedrock connections to several accounts, so an account-scoped key
-would be the safer one - and the read side cannot build it. A turn arrives with
-a model id and a credential, never an account id, so scoping by account means
-an STS call on the turn path, which is the cost this design exists to avoid.
-The residual risk is accepted and small: a system-defined id names the same
-foundation model in every account, and a collision needs two accounts in one
-daemon to be issued the same generated application-profile id for profiles
-routing to different models.
+It is keyed by profile id, and narrowing that key was a choice. A daemon can hold
+Bedrock connections to several accounts, and a connection-identity key - base
+url, aws profile, credential, all shared by both clients because both are built
+from one resolved connection - needs no network call. It is not used, because it
+would make the resolver a method and change a public signature to close a
+collision nobody can demonstrate: an application profile id is a
+twelve-character service-generated identifier, and a system-defined id names the
+same foundation model in every account. An account-scoped key is the one that is
+genuinely unavailable, since a turn carries a model id and a credential and
+never an account id.
 
 **Two ids this fixes.** An `APPLICATION` profile has a generated id that no rule
 reduces; accounts create them to attribute cost per team or per feature, and
@@ -214,8 +248,18 @@ time.
 Usually, not always: the registry spawns the warm detached and does not wait for
 it, so a turn dispatched during startup can beat it, and a listing that fails
 registers nothing. Both land on the conservative answer above, which is why
-neither is retried - a failed warm is a `debug!` line, so a connection nobody
-uses cannot fail startup.
+neither is retried. A warm that fails, or that comes back degraded, is a `warn!`
+line naming what the connection lost, so a connection nobody uses cannot fail
+startup but a broken one is not silent either.
+
+**A degraded warm is not cached.** `ListInferenceProfiles` can fail while
+`ListFoundationModels` succeeds, and the report is then a real listing with a
+notice on it. Caching that from the boot warm would hold a partial catalogue for
+the whole hour, decided at the moment transient failures are likeliest - several
+connections firing control-plane calls at once, or a session credential not yet
+refreshed - and with nobody watching. Whatever the call did register is kept; the
+cache stays empty, so the next caller makes a real call, sees the notice, and can
+press refresh.
 
 Only a profile whose base model this account did not list falls back to a
 family guess from the id, which reports vision from the family and treats the
