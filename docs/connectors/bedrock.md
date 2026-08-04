@@ -76,9 +76,10 @@ pub trait BedrockBackend: Send + Sync {
 
     /// Whether this backend can serve the model at all.
     ///
-    /// This is the routing primitive. A backend that cannot serve a model
-    /// never receives a request for it, and never contributes it to the
-    /// catalogue.
+    /// This is the routing primitive, and completion is the whole of the
+    /// question. A backend that cannot complete a model never receives a turn
+    /// for it, and still contributes it to the catalogue where a person picks
+    /// it for another purpose.
     fn can_serve(&self, model_id: &str) -> bool;
 
     /// The models this backend reaches, with any listing notices.
@@ -302,8 +303,11 @@ reload that failed.
 
 Selection runs in two steps, in this order.
 
-1. **Reach.** Keep the backends whose `can_serve` accepts the model. If none
-   does, the model is not in the catalogue, and no request for it can arrive.
+1. **Reach.** Keep the backends whose `can_serve` accepts the model for a
+   completion. If none does, the turn is refused by name before the request
+   goes out. The model may still be in the catalogue: an embedding model is
+   listed so it can be picked for embeddings, and reach and the catalogue
+   answer different questions.
 2. **Requested features.** Among those, choose a backend whose
    `BackendApiCapabilities` satisfy what the request asks for: cache control
    when the cache policy is on, vision when the messages carry images, and so

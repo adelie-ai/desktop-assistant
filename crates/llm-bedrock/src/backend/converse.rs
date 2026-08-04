@@ -224,8 +224,23 @@ impl ConverseBackend {
         let found: Vec<String> = summaries
             .iter()
             .filter(|s| {
-                s.output_modalities()
-                    .contains(&aws_sdk_bedrock::types::ModelModality::Embedding)
+                // The same lifecycle and on-demand filters the emitted rows
+                // pass, because this used to read those rows. A model neither
+                // surface can call is not one to record: recorded, it turns a
+                // turn against it into "check the model id", which is not the
+                // fault and not the fix.
+                use aws_sdk_bedrock::types::{
+                    FoundationModelLifecycleStatus, InferenceType, ModelModality,
+                };
+                let active = s
+                    .model_lifecycle
+                    .as_ref()
+                    .is_none_or(|l| l.status() == &FoundationModelLifecycleStatus::Active);
+                let on_demand = s
+                    .inference_types_supported()
+                    .iter()
+                    .any(|t| t == &InferenceType::OnDemand);
+                active && on_demand && s.output_modalities().contains(&ModelModality::Embedding)
             })
             .map(|s| s.model_id().to_string())
             .collect();

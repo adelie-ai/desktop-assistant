@@ -2,9 +2,7 @@
 //!
 //! Bedrock is reached through more than one SDK client: `bedrock-runtime` for
 //! inference, and `bedrock` for the control plane that lists models. Each
-//! backend needs the client its own API surface runs on, and the connector
-//! needs a runtime client of its own for embeddings until `InvokeBackend`
-//! takes them.
+//! backend needs the client its own API surface runs on.
 //!
 //! They all share one value, rather than holding a lazy cell each, because
 //! building a client resolves credentials: a cell per holder loads the AWS

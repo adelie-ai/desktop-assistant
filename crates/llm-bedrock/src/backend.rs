@@ -54,14 +54,23 @@ pub(crate) trait BedrockBackend: Send + Sync {
     /// Short API name, for logs, notices and model annotation.
     fn api_name(&self) -> &'static str;
 
-    /// Whether this backend can serve `model_id` at all.
+    /// Whether this backend can serve a **completion** for `model_id`.
     ///
-    /// This is the routing primitive. A backend that cannot serve a model
-    /// never receives a request for it.
+    /// This is the routing primitive, and completion is the whole of the
+    /// question: backend selection asks it once, about a turn. It is not "does
+    /// this backend list the model", and the two answers come apart. A surface
+    /// serving a modality that cannot hold a conversation answers `false` for
+    /// every model it serves, and still contributes those models to the
+    /// catalogue, because a person picks them for that other purpose.
     ///
-    /// It answers permissively for a model it knows nothing about. A model no
-    /// listing described is a model the connector has no reason to refuse, and
-    /// refusing it would turn missing metadata into a failed turn.
+    /// So a backend that answered `true` here for such a model would take a
+    /// chat turn and fail at the service, and a catalogue filtered by this
+    /// answer would lose those models from the picker.
+    ///
+    /// Answer permissively for a model this backend knows nothing about, where
+    /// it can serve completions at all. A model no listing described is a
+    /// model the connector has no reason to refuse, and refusing it would turn
+    /// missing metadata into a failed turn.
     fn can_serve(&self, model_id: &str) -> bool;
 
     /// The models this backend reaches, with any listing notices.
