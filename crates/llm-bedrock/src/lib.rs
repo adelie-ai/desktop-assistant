@@ -6346,4 +6346,272 @@ mod tests {
         // daemon's embedding path.
         find_model(&report, "amazon.titan-embed-text-v2:0");
     }
+
+    // ---- Aggregation and selection across several backends (#1018) ----
+
+    use crate::backend::{BackendApiCapabilities, BedrockRequest, Feature, required_features};
+
+    /// A backend under the test's control.
+    ///
+    /// Real backends reach AWS, so nothing else can put two of them side by
+    /// side, which is the only shape in which aggregation and selection have
+    /// anything to decide.
+    struct FakeBackend {
+        name: &'static str,
+        serves: Vec<String>,
+        listing: Option<ModelListingReport>,
+        caps: BackendApiCapabilities,
+        calls: Arc<Mutex<usize>>,
+    }
+
+    /// A capability answer with everything off, so a test states only the
+    /// fields it is about.
+    fn no_capabilities() -> BackendApiCapabilities {
+        BackendApiCapabilities {
+            streaming: false,
+            tools: false,
+            vision: false,
+            cache_control: false,
+            reasoning: false,
+            hosted_tool_search: false,
+            embeddings: false,
+        }
+    }
+
+    impl FakeBackend {
+        fn new(name: &'static str, serves: &[&str]) -> Self {
+            Self {
+                name,
+                serves: serves.iter().map(|s| s.to_string()).collect(),
+                listing: Some(ModelListingReport::complete(
+                    serves.iter().map(|id| model_named(id)).collect(),
+                )),
+                caps: no_capabilities(),
+                calls: Arc::new(Mutex::new(0)),
+            }
+        }
+
+        fn that_fails_to_list(mut self) -> Self {
+            self.listing = None;
+            self
+        }
+
+        fn with_capabilities(mut self, caps: BackendApiCapabilities) -> Self {
+            self.caps = caps;
+            self
+        }
+    }
+
+    fn model_named(id: &str) -> ModelInfo {
+        ModelInfo {
+            id: id.to_string(),
+            display_name: id.to_string(),
+            context_limit: None,
+            capabilities: ModelCapabilities::default(),
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BedrockBackend for FakeBackend {
+        fn api_name(&self) -> &'static str {
+            self.name
+        }
+
+        fn can_serve(&self, model_id: &str) -> bool {
+            self.serves.iter().any(|s| s == model_id)
+        }
+
+        async fn list_models(&self) -> Result<ModelListingReport, CoreError> {
+            match &self.listing {
+                Some(report) => Ok(report.clone()),
+                None => Err(CoreError::Llm(format!("{} listing failed", self.name))),
+            }
+        }
+
+        fn capabilities(&self, _model_id: &str) -> BackendApiCapabilities {
+            self.caps
+        }
+
+        async fn stream_completion(
+            &self,
+            _request: BedrockRequest,
+            _on_chunk: ChunkCallback,
+        ) -> Result<LlmResponse, CoreError> {
+            *self.calls.lock().expect("count a dispatch") += 1;
+            Err(CoreError::RateLimited {
+                retry_after: None,
+                detail: "always retryable".into(),
+            })
+        }
+    }
+
+    fn client_with(backends: Vec<Arc<dyn BedrockBackend>>) -> BedrockClient {
+        BedrockClient::new(String::new()).__with_backends_for_test(backends)
+    }
+
+    #[tokio::test]
+    async fn a_failing_backend_degrades_the_catalogue_and_names_itself() {
+        let client = client_with(vec![
+            Arc::new(FakeBackend::new("alpha", &["alpha.model"]).that_fails_to_list()),
+            Arc::new(FakeBackend::new("beta", &["beta.model"])),
+        ]);
+
+        let report = client
+            .list_models_detailed()
+            .await
+            .expect("one backend failing must not empty the catalogue");
+
+        find_model(&report, "beta.model");
+        let notice = report
+            .notices
+            .first()
+            .expect("the failure must reach the caller as data, not only a log line");
+        assert!(
+            notice.detail.contains("alpha"),
+            "the notice must name the backend that failed, got {:?}",
+            notice.detail
+        );
+    }
+
+    #[tokio::test]
+    async fn every_backend_failing_fails_the_listing() {
+        let client = client_with(vec![
+            Arc::new(FakeBackend::new("alpha", &["alpha.model"]).that_fails_to_list()),
+            Arc::new(FakeBackend::new("beta", &["beta.model"]).that_fails_to_list()),
+        ]);
+
+        client.list_models_detailed().await.expect_err(
+            "a catalogue with nothing in it and no surface left to ask is a failure, \
+             not an empty success",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_model_two_backends_serve_appears_once_with_both_recorded() {
+        let client = client_with(vec![
+            Arc::new(FakeBackend::new("alpha", &["shared.model"])),
+            Arc::new(FakeBackend::new("beta", &["shared.model"])),
+        ]);
+
+        let report = client.list_models_detailed().await.expect("both list");
+
+        let hits = report
+            .models
+            .iter()
+            .filter(|m| m.id == "shared.model")
+            .count();
+        assert_eq!(hits, 1, "a person picks a model, not a model-and-API pair");
+        assert_eq!(
+            client.backends_serving("shared.model"),
+            vec!["alpha", "beta"],
+            "the discarded backend carries capabilities the kept one does not, \
+             so the set is kept whole"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_whose_features_no_single_backend_provides_fails_by_name() {
+        let vision_only = BackendApiCapabilities {
+            vision: true,
+            ..no_capabilities()
+        };
+        let cache_only = BackendApiCapabilities {
+            cache_control: true,
+            ..no_capabilities()
+        };
+        let client = client_with(vec![
+            Arc::new(FakeBackend::new("alpha", &["split.model"]).with_capabilities(vision_only)),
+            Arc::new(FakeBackend::new("beta", &["split.model"]).with_capabilities(cache_only)),
+        ]);
+
+        let error = client
+            .__select_backend_for_test("split.model", &[Feature::Vision, Feature::CacheControl])
+            .expect_err("no single backend provides both, so the turn cannot be served");
+
+        let detail = error.to_string();
+        for named in ["split.model", "vision", "cache control", "alpha", "beta"] {
+            assert!(
+                detail.contains(named),
+                "the refusal must name {named}, got {detail}"
+            );
+        }
+    }
+
+    #[test]
+    fn soft_capabilities_never_become_hard_requirements() {
+        // The dangerous edit is promoting a degradation into a refusal. A
+        // missing checkpoint costs input tokens; a reasoning budget the model
+        // cannot take is reported and dropped (#1022). Neither may refuse a
+        // turn, so neither may appear here.
+        let wants_both = BedrockRequest {
+            model: "anthropic.claude-sonnet-4-6".into(),
+            messages: vec![Message::new(Role::User, "hi")],
+            tools: Vec::new(),
+            tool_names: ToolNameMap::from_names(std::iter::empty()),
+            reasoning: ReasoningConfig::with_thinking_budget(4096),
+            sampling: crate::backend::SamplingParams::default(),
+            cache_checkpoint: true,
+            cancellation: Default::default(),
+        };
+
+        let required = required_features(&wants_both);
+        assert!(
+            !required.contains(&Feature::CacheControl),
+            "a missing prompt cache is a degradation, never a wrong answer"
+        );
+        assert!(
+            !required.contains(&Feature::Reasoning),
+            "#1022 reports an unusable reasoning budget and sends the turn without it"
+        );
+        assert!(
+            required.is_empty(),
+            "no domain message can carry an image yet (#1059), so nothing is hard \
+             about this turn; got {required:?}"
+        );
+    }
+
+    #[test]
+    fn backend_selection_is_deterministic() {
+        let both =
+            |name| Arc::new(FakeBackend::new(name, &["shared.model"])) as Arc<dyn BedrockBackend>;
+        let client = client_with(vec![both("alpha"), both("beta")]);
+
+        let first = client
+            .__select_backend_for_test("shared.model", &[])
+            .expect("a served model resolves");
+        for _ in 0..8 {
+            let again = client
+                .__select_backend_for_test("shared.model", &[])
+                .expect("a served model resolves");
+            assert_eq!(
+                first, again,
+                "consecutive turns of one conversation must stay on one surface, \
+                 or every turn pays a cold prompt cache"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_connector_holds_no_retry_loop() {
+        let backend = Arc::new(FakeBackend::new("alpha", &["alpha.model"]));
+        let calls = Arc::clone(&backend.calls);
+        let client = client_with(vec![backend]).with_model("alpha.model");
+
+        client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await
+            .expect_err("the backend always fails");
+
+        assert_eq!(
+            *calls.lock().expect("read the count"),
+            1,
+            "RetryingLlmClient already wraps this connector from outside; a second \
+             loop here nests the backoffs and multiplies the attempts"
+        );
+    }
 }
