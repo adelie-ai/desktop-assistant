@@ -16,7 +16,7 @@ use aws_smithy_types::Document;
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::ToolCall;
 use desktop_assistant_core::ports::llm::{
-    ChunkCallback, LlmResponse, ModelInfo, ModelKind, ModelListingReport, TokenUsage,
+    ChunkCallback, LlmResponse, ModelInfo, ModelListingReport, TokenUsage,
 };
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
@@ -200,24 +200,49 @@ impl ConverseBackend {
         models.sort_by(|a, b| a.id.cmp(&b.id));
         models.dedup_by(|a, b| a.id == b.id);
 
-        self.record_embedding_models(&models);
+        self.record_embedding_models(summaries);
 
         Ok(ModelListingReport { models, notices })
     }
 
-    /// Remember which of the listed models return vectors, so [`Self::can_serve`]
-    /// answers from what AWS reported rather than from an id pattern.
+    /// Remember which models AWS reported as returning vectors, so
+    /// [`Self::can_serve`] answers from the provider's own modality metadata
+    /// rather than from an id pattern.
     ///
     /// Entries accumulate rather than replace. A later listing that degrades -
     /// a throttled control-plane call, a narrowed IAM policy - would otherwise
     /// silently make an embedding model look servable by a chat API again, and
     /// the union is the conservative direction: a model that returns vectors
     /// does not stop returning them.
-    fn record_embedding_models(&self, models: &[ModelInfo]) {
-        let found: Vec<String> = models
+    fn record_embedding_models(
+        &self,
+        summaries: &[aws_sdk_bedrock::types::FoundationModelSummary],
+    ) {
+        // Read from the summaries, not from the rows this listing emits: it
+        // deliberately emits no embedding model, and `can_serve` still has to
+        // know which ids those are.
+        let found: Vec<String> = summaries
             .iter()
-            .filter(|m| m.capabilities.kind == ModelKind::Embedding)
-            .map(|m| m.id.clone())
+            .filter(|s| {
+                // The same lifecycle and on-demand filters the emitted rows
+                // pass, because this used to read those rows. A model neither
+                // surface can call is not one to record: recorded, it turns a
+                // turn against it into "check the model id", which is not the
+                // fault and not the fix.
+                use aws_sdk_bedrock::types::{
+                    FoundationModelLifecycleStatus, InferenceType, ModelModality,
+                };
+                let active = s
+                    .model_lifecycle
+                    .as_ref()
+                    .is_none_or(|l| l.status() == &FoundationModelLifecycleStatus::Active);
+                let on_demand = s
+                    .inference_types_supported()
+                    .iter()
+                    .any(|t| t == &InferenceType::OnDemand);
+                active && on_demand && s.output_modalities().contains(&ModelModality::Embedding)
+            })
+            .map(|s| s.model_id().to_string())
             .collect();
         if found.is_empty() {
             return;

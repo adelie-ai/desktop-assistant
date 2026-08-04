@@ -41,6 +41,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 use backend::converse::ConverseBackend;
+use backend::invoke::InvokeBackend;
 use backend::{
     BackendTimeouts, BedrockBackend, BedrockRequest, Feature, SamplingParams, required_features,
 };
@@ -162,14 +163,18 @@ pub struct BedrockClient {
     /// The API surfaces this connection speaks, in the order selection
     /// considers them.
     ///
-    /// Converse only, until `ResponsesBackend` (#1019) and `InvokeBackend`
-    /// (#1017) join it. Registration order is the selection tie-break, so it
-    /// is a `Vec` and not a set.
+    /// Converse and Invoke, until `ResponsesBackend` (#1019) joins them.
+    /// Registration order is the selection tie-break, so it is a `Vec` and not
+    /// a set.
     backends: OnceLock<Vec<Arc<dyn BedrockBackend>>>,
-    /// The Converse surface as its own type, so the embedding path and the
-    /// test hooks can reach what only it offers. It is the same value the
-    /// registration above holds behind `dyn`.
+    /// The Converse surface as its own type, so the test hooks can reach what
+    /// only it offers. It is the same value the registration above holds
+    /// behind `dyn`.
     converse: OnceLock<Arc<ConverseBackend>>,
+    /// The Invoke surface as its own type, so the embedding path can reach
+    /// what only it offers. The same value the registration above holds
+    /// behind `dyn`.
+    invoke: OnceLock<Arc<InvokeBackend>>,
     /// Whether a test supplied the backends. A builder must not drop those.
     backends_are_injected: bool,
     /// Which surfaces served each model in the last aggregated listing.
@@ -237,6 +242,7 @@ impl BedrockClient {
             sdk: OnceLock::new(),
             backends: OnceLock::new(),
             converse: OnceLock::new(),
+            invoke: OnceLock::new(),
             backends_are_injected: false,
             backends_serving: std::sync::Mutex::new(BTreeMap::new()),
             temperature: None,
@@ -444,6 +450,7 @@ impl BedrockClient {
     fn rebuild_on_next_use(&mut self) {
         self.sdk = OnceLock::new();
         self.converse = OnceLock::new();
+        self.invoke = OnceLock::new();
         // Backends injected by a test are never rebuilt. Dropping them here
         // would silently put a real `ConverseBackend` behind a unit test, which
         // then reaches AWS and presents as a flake somewhere unrelated.
@@ -516,10 +523,25 @@ impl BedrockClient {
         })
     }
 
+    /// The Invoke surface, as its own type.
+    fn invoke(&self) -> &Arc<InvokeBackend> {
+        self.invoke
+            .get_or_init(|| Arc::new(InvokeBackend::new(Arc::clone(self.sdk()))))
+    }
+
     /// The API surfaces this connection speaks, built on first use.
+    ///
+    /// Converse first, so it wins the selection tie-break for every model both
+    /// reach. They reach disjoint sets today, so the order decides nothing
+    /// yet; it is stated rather than incidental because the order is the
+    /// contract selection rests on.
     fn backends(&self) -> &[Arc<dyn BedrockBackend>] {
-        self.backends
-            .get_or_init(|| vec![Arc::clone(self.converse()) as Arc<dyn BedrockBackend>])
+        self.backends.get_or_init(|| {
+            vec![
+                Arc::clone(self.converse()) as Arc<dyn BedrockBackend>,
+                Arc::clone(self.invoke()) as Arc<dyn BedrockBackend>,
+            ]
+        })
     }
 
     /// Merge every backend's catalogue into one.
@@ -547,11 +569,11 @@ impl BedrockClient {
     /// three-state capability model that #1012 introduces. Until then the
     /// surface set here is what records that more than one answer existed.
     ///
-    /// Reach does **not** filter this. `ConverseBackend::can_serve` reports
-    /// that Converse cannot serve an embedding model, and the Converse listing
-    /// is still where the daemon's embedding path finds those models. Removing
-    /// them here takes them out of the picker; `InvokeBackend` (#1017) is what
-    /// makes reach and the catalogue agree.
+    /// Reach does **not** filter this, and must not start. `can_serve` answers
+    /// a completion request, and a surface that completes nothing still lists
+    /// the models a person picks for another purpose - Invoke and its
+    /// embedding models. Filtering here would take every one of them out of
+    /// the picker.
     async fn aggregate_models(&self) -> Result<ModelListingReport, CoreError> {
         let mut models: Vec<ModelInfo> = Vec::new();
         let mut notices = Vec::new();
@@ -727,43 +749,14 @@ impl BedrockClient {
     }
 
     pub async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, CoreError> {
-        // Still the connector's own `InvokeModel` call, not a backend's.
-        // #1017 generalises it into `InvokeBackend`, which is the surface that
-        // reaches embedding models.
-        let client = self.sdk().runtime().await?;
-
-        let mut vectors = Vec::with_capacity(texts.len());
-        for text in texts {
-            let payload = serde_json::json!({
-                "inputText": text,
-            });
-
-            let response = client
-                .invoke_model()
-                .model_id(self.model.clone())
-                .content_type("application/json")
-                .accept("application/json")
-                .body(payload.to_string().into_bytes().into())
-                .send()
-                .await
-                .map_err(|e| CoreError::Llm(format!("Bedrock embeddings request failed: {e}")))?;
-
-            let body = response.body.into_inner();
-            let parsed: BedrockEmbeddingResponse = serde_json::from_slice(&body).map_err(|e| {
-                CoreError::Llm(format!("failed to parse Bedrock embedding response: {e}"))
-            })?;
-
-            vectors.push(parsed.embedding);
-        }
-
-        Ok(vectors)
+        self.invoke().embed(&self.model, texts).await
     }
 }
 
 #[derive(serde::Deserialize)]
-struct BedrockEmbeddingResponse {
+pub(crate) struct BedrockEmbeddingResponse {
     #[serde(default)]
-    embedding: Vec<f32>,
+    pub(crate) embedding: Vec<f32>,
 }
 
 /// Check whether an AWS profile exists in `~/.aws/config` or `~/.aws/credentials`.
@@ -1867,12 +1860,13 @@ fn summary_to_model_info(
         return None;
     }
 
-    // Filter: output modality must include TEXT or EMBEDDING.
-    // (We skip pure IMAGE/VIDEO generation models — they're not usable as
-    // chat/embedding backends in this connector.)
+    // Filter: output modality must include TEXT. An embedding model is not
+    // addressable through Converse at all, so it is not a row this surface
+    // offers - `embedding_model_from_summary` is what emits those, on the
+    // Invoke surface that can serve them. Pure IMAGE/VIDEO generation models
+    // are reached by no surface yet.
     let modalities = ModelModalities::from_summary(summary);
-    let is_text = summary.output_modalities().contains(&ModelModality::Text);
-    if !(is_text || modalities.is_embedding) {
+    if !summary.output_modalities().contains(&ModelModality::Text) {
         return None;
     }
 
@@ -1885,6 +1879,50 @@ fn summary_to_model_info(
         display_name: model_name,
         context_limit: context_limit_for_model(id),
         capabilities,
+    })
+}
+
+/// Convert a `FoundationModelSummary` into a `ModelInfo` for the Invoke
+/// surface, returning `None` for anything that is not a callable embedding
+/// model.
+///
+/// The same lifecycle and on-demand filters `summary_to_model_info` applies,
+/// and a modality filter that selects what Converse leaves behind.
+///
+/// The two filters are not disjoint: a model reporting both TEXT and EMBEDDING
+/// output is emitted by both surfaces. The rows are identical, so the
+/// aggregation's de-duplication collapses them to the one row that existed
+/// before, and the model is recorded as served by both. The de-duplication is
+/// what makes that safe, not the filters.
+pub(crate) fn embedding_model_from_summary(
+    summary: &aws_sdk_bedrock::types::FoundationModelSummary,
+) -> Option<ModelInfo> {
+    use aws_sdk_bedrock::types::{FoundationModelLifecycleStatus, InferenceType};
+
+    if let Some(lifecycle) = summary.model_lifecycle.as_ref()
+        && lifecycle.status() != &FoundationModelLifecycleStatus::Active
+    {
+        return None;
+    }
+    if !summary
+        .inference_types_supported()
+        .iter()
+        .any(|t| t == &InferenceType::OnDemand)
+    {
+        return None;
+    }
+
+    let modalities = ModelModalities::from_summary(summary);
+    if !modalities.is_embedding {
+        return None;
+    }
+
+    let id = summary.model_id();
+    Some(ModelInfo {
+        id: id.to_string(),
+        display_name: summary.model_name().unwrap_or(id).to_string(),
+        context_limit: context_limit_for_model(id),
+        capabilities: infer_capabilities_from_id(id, modalities.vision, true),
     })
 }
 
@@ -3501,7 +3539,11 @@ mod tests {
             ModelModality::Embedding,
             vec![ModelModality::Text],
         );
-        let info = summary_to_model_info(&model).expect("keep embedding model");
+        assert!(
+            summary_to_model_info(&model).is_none(),
+            "Converse cannot serve an embedding model, so it offers no row for one"
+        );
+        let info = embedding_model_from_summary(&model).expect("keep embedding model");
         assert_eq!(info.capabilities.kind, ModelKind::Embedding);
         assert!(!info.capabilities.tools);
         assert!(!info.capabilities.reasoning);
@@ -3519,11 +3561,22 @@ mod tests {
             ModelModality::Embedding,
             vec![ModelModality::Text],
         );
-        let embed_info = summary_to_model_info(&embed).expect("kept");
+        let embed_info = embedding_model_from_summary(&embed).expect("kept");
         assert_eq!(
             embed_info.capabilities.kind,
             ModelKind::Embedding,
             "an EMBEDDING output modality classifies the model as an embedding model"
+        );
+        assert!(
+            embedding_model_from_summary(&make_summary(
+                "anthropic.claude-sonnet-4-6",
+                FoundationModelLifecycleStatus::Active,
+                ModelModality::Text,
+                vec![ModelModality::Text],
+            ))
+            .is_none(),
+            "and the Invoke surface offers no row for a text model, so the two surfaces \
+             emit each model exactly once"
         );
 
         // A TEXT output modality is a generative model.
@@ -3889,6 +3942,14 @@ mod tests {
     /// on a degradation message.
     const TEST_SECRET_ACCESS_KEY: &str = "wJalrXUtnFEMIxK7MDENGxbPxRfiCYEXAMPLEKEY";
 
+    /// How many `ListFoundationModels` calls one aggregated listing makes.
+    ///
+    /// One per surface that reads the foundation catalogue: Converse for the
+    /// text models, Invoke for the embedding models. The call-count assertions
+    /// below are about caching, so they multiply by this rather than hard-code
+    /// a number that a third surface would silently invalidate.
+    const FOUNDATION_CALLS_PER_LISTING: usize = 2;
+
     /// A `BedrockClient` whose control-plane calls are pointed at `server`.
     ///
     /// Static credentials parsed from the api-key keep the AWS credential
@@ -4082,7 +4143,7 @@ mod tests {
              otherwise the client cannot tell it happened"
         );
         assert!(second.notices.is_empty());
-        foundation.assert_calls(2);
+        foundation.assert_calls(2 * FOUNDATION_CALLS_PER_LISTING);
     }
 
     // --- Profile capabilities come from the base model's metadata (#1023) --
@@ -4703,7 +4764,7 @@ mod tests {
             !report.notices.is_empty(),
             "the degradation must still be reported to whoever asks"
         );
-        foundation.assert_calls(2);
+        foundation.assert_calls(2 * FOUNDATION_CALLS_PER_LISTING);
         assert!(
             failure.calls() >= 2,
             "a degraded warm must not serve the next caller from the cache, got {} calls",
@@ -4850,7 +4911,7 @@ mod tests {
             .await
             .expect("second listing served from cache");
 
-        foundation.assert_calls(1);
+        foundation.assert_calls(FOUNDATION_CALLS_PER_LISTING);
         assert!(!second.notices.is_empty(), "cache hit dropped the notice");
         assert_eq!(first.notices, second.notices);
     }
@@ -6606,6 +6667,221 @@ mod tests {
         // early would take every embedding model out of the picker and off the
         // daemon's embedding path.
         find_model(&report, "amazon.titan-embed-text-v2:0");
+    }
+
+    // ---- The Invoke surface (#1017) ----
+
+    const EMBED_MODEL: &str = "amazon.titan-embed-text-v2:0";
+
+    /// A path regex matching `id` as the AWS SDK writes it into a request
+    /// path. Bedrock ids carry `.` and `:`; the dot needs escaping for the
+    /// regex, and the colon is percent-encoded, so both spellings are accepted
+    /// rather than guessing which one this SDK version emits.
+    fn model_in_path(id: &str) -> String {
+        id.chars()
+            .map(|c| match c {
+                '.' => r"\.".to_string(),
+                ':' => "(:|%3A)".to_string(),
+                other => other.to_string(),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn embeddings_go_out_as_an_invoke_model_call_against_the_configured_model() {
+        // The only code this entry moved, and the acceptance criterion is that
+        // it behaves identically. Asserted at the wire, because the body key
+        // and the model id are silent everywhere else: the mock matches the
+        // configured model's own path, so a call against another model, or a
+        // body without `inputText`, does not match and the count is zero.
+        let server = httpmock::MockServer::start();
+        let invoke = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path_matches(format!(r"^/model/{}/invoke$", model_in_path(EMBED_MODEL)))
+                .body_includes(r#""inputText""#)
+                .body_includes("embed me");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"embedding": [0.5, -0.25]}"#);
+        });
+
+        let client = BedrockClient::new(format!("AKIAIOSFODNN7EXAMPLE:{TEST_SECRET_ACCESS_KEY}"))
+            .with_base_url("us-east-1")
+            .__with_runtime_endpoint_for_test(server.url(""))
+            .with_model(EMBED_MODEL);
+
+        let vectors = client
+            .embed(vec!["embed me".to_string()])
+            .await
+            .expect("the mocked InvokeModel call answers");
+
+        assert_eq!(
+            invoke.calls(),
+            1,
+            "one InvokeModel call, against the configured model, carrying inputText"
+        );
+        assert_eq!(
+            vectors,
+            vec![vec![0.5, -0.25]],
+            "the embedding is read out of the response body"
+        );
+    }
+
+    #[test]
+    fn the_invoke_listing_drops_an_embedding_model_that_cannot_be_called() {
+        // Epic #1011 names the on-demand filter as a contract that must
+        // survive the refactor: a bare id without on-demand throughput fails
+        // at invocation time, so offering it offers a model that cannot work.
+        // The lifecycle filter is the same bargain for a retired model.
+        let no_on_demand = make_summary_inference_types(
+            EMBED_MODEL,
+            FoundationModelLifecycleStatus::Active,
+            ModelModality::Embedding,
+            vec![ModelModality::Text],
+            &[InferenceType::Provisioned],
+        );
+        assert!(
+            embedding_model_from_summary(&no_on_demand).is_none(),
+            "a bare id with no on-demand throughput is not callable"
+        );
+
+        let retired = make_summary(
+            EMBED_MODEL,
+            FoundationModelLifecycleStatus::Legacy,
+            ModelModality::Embedding,
+            vec![ModelModality::Text],
+        );
+        assert!(
+            embedding_model_from_summary(&retired).is_none(),
+            "a retired model is not a model to offer"
+        );
+    }
+    const CHAT_MODEL: &str = "anthropic.claude-3-haiku-20240307-v1:0";
+
+    #[tokio::test]
+    async fn the_converse_listing_emits_no_embedding_model() {
+        let server = httpmock::MockServer::start();
+        mock_healthy_control_plane(&server);
+        let client = control_plane_client(&server);
+        client
+            .list_models_detailed()
+            .await
+            .expect("the listing succeeds");
+
+        let converse = client
+            .converse()
+            .list_models()
+            .await
+            .expect("the Converse listing succeeds");
+
+        assert!(
+            !converse.models.iter().any(|m| m.id == EMBED_MODEL),
+            "Converse is a text-and-chat API; a model it cannot serve must not be a row \
+             it offers, or reach and the catalogue disagree"
+        );
+        assert!(
+            converse.models.iter().any(|m| m.id == CHAT_MODEL),
+            "the text models must still be there"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_catalogue_keeps_the_embedding_model_and_attributes_it_to_invoke() {
+        let server = httpmock::MockServer::start();
+        mock_healthy_control_plane(&server);
+        let client = control_plane_client(&server);
+
+        let report = client
+            .list_models_detailed()
+            .await
+            .expect("the listing succeeds");
+
+        // The row a person picks for embeddings must not move or vanish; only
+        // the surface behind it changes.
+        find_model(&report, EMBED_MODEL);
+        assert_eq!(
+            client.backends_serving(EMBED_MODEL),
+            vec!["invoke"],
+            "the surface that can actually serve it is the one recorded"
+        );
+        assert_eq!(
+            client.backends_serving(CHAT_MODEL),
+            vec!["converse"],
+            "a text model stays with Converse"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_conversation_against_an_embedding_model_is_refused_before_dispatch() {
+        let server = httpmock::MockServer::start();
+        mock_healthy_control_plane(&server);
+        let client = control_plane_client(&server).with_model(EMBED_MODEL);
+        client
+            .list_models_detailed()
+            .await
+            .expect("the listing succeeds");
+
+        let error = client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await
+            .expect_err("an embedding model cannot serve a conversation");
+
+        let detail = error.to_string();
+        assert!(
+            detail.contains(EMBED_MODEL),
+            "the refusal must name the model, got {detail}"
+        );
+        assert!(
+            detail.contains("text model"),
+            "the refusal must say what to pick instead, got {detail}"
+        );
+    }
+
+    #[tokio::test]
+    async fn invoke_offers_embeddings_and_nothing_else() {
+        let server = httpmock::MockServer::start();
+        let client = control_plane_client(&server);
+        let caps = client.invoke().capabilities(EMBED_MODEL);
+
+        assert!(
+            caps.embeddings,
+            "this is the surface embedding models run on"
+        );
+        for (name, claimed) in [
+            ("tools", caps.tools),
+            ("streaming", caps.streaming),
+            ("vision", caps.vision),
+            ("cache control", caps.cache_control),
+            ("reasoning", caps.reasoning),
+            ("hosted tool search", caps.hosted_tool_search),
+        ] {
+            assert!(
+                !claimed,
+                "Invoke serves embedding models here and offers no {name}; claiming it \
+                 would invent a capability selection could route a turn to"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn invoke_serves_no_conversation_so_selection_never_routes_one_to_it() {
+        let server = httpmock::MockServer::start();
+        mock_healthy_control_plane(&server);
+        let client = control_plane_client(&server);
+        client
+            .list_models_detailed()
+            .await
+            .expect("the listing succeeds");
+
+        assert!(
+            !client.invoke().can_serve(EMBED_MODEL),
+            "reach answers a completion request, and an embedding model cannot serve one"
+        );
     }
 
     // ---- Aggregation and selection across several backends (#1018) ----

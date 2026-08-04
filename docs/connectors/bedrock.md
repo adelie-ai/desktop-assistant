@@ -26,15 +26,24 @@ exists at all.
 |---|---|---|---|
 | Converse | `Converse`, `ConverseStream` | `bedrock-runtime` | Text chat, broadly: Anthropic, Amazon Nova, Meta, Mistral, Cohere, DeepSeek, GLM. Mostly through cross-region inference profiles. |
 | Responses | Responses API | `bedrock-mantle` | The `openai.gpt-5.6` family. No other API reaches these models. |
-| Invoke | `InvokeModel`, `InvokeModelWithResponseStream` | `bedrock-runtime` | Everything Converse refuses: embeddings, image and video generation, reranking, and any model that rejects a Converse request. |
+| Invoke | `InvokeModel`, `InvokeModelWithResponseStream` | `bedrock-runtime` | Everything Converse refuses. Embedding models today; image and video generation and reranking when `ModelKind` describes them. |
 
 Converse is a text-and-chat API only. Embedding models, image generation models
 and rerankers are not addressable through it. The connector already calls
 `InvokeModel` for embeddings, so the Invoke path exists today. The backend work
 generalises that path; it does not introduce it.
 
-Responses runs on a different endpoint from the other two. It needs its own SDK
-client, not a second serialization over the shared one.
+Responses runs on a different endpoint from the other two, and the AWS Rust SDK
+does not reach it: `aws-sdk-bedrockruntime` exposes no Responses operation and
+there is no `bedrock-mantle` crate. That backend therefore needs a signed HTTP
+client of its own, not a second serialization over the shared one, and it is
+sequenced last for that reason.
+
+**Reach answers a completion request.** That is the only question the selection
+path asks, so a backend that serves a modality which cannot hold a conversation
+answers `false` for every model it serves. Invoke does today. It still
+contributes those models to the catalogue, and it still serves them through
+`EmbeddingClient` - reach and the catalogue answer different questions.
 
 ## Architecture
 
@@ -67,9 +76,10 @@ pub trait BedrockBackend: Send + Sync {
 
     /// Whether this backend can serve the model at all.
     ///
-    /// This is the routing primitive. A backend that cannot serve a model
-    /// never receives a request for it, and never contributes it to the
-    /// catalogue.
+    /// This is the routing primitive, and completion is the whole of the
+    /// question. A backend that cannot complete a model never receives a turn
+    /// for it, and still contributes it to the catalogue where a person picks
+    /// it for another purpose.
     fn can_serve(&self, model_id: &str) -> bool;
 
     /// The models this backend reaches, with any listing notices.
@@ -293,8 +303,11 @@ reload that failed.
 
 Selection runs in two steps, in this order.
 
-1. **Reach.** Keep the backends whose `can_serve` accepts the model. If none
-   does, the model is not in the catalogue, and no request for it can arrive.
+1. **Reach.** Keep the backends whose `can_serve` accepts the model for a
+   completion. If none does, the turn is refused by name before the request
+   goes out. The model may still be in the catalogue: an embedding model is
+   listed so it can be picked for embeddings, and reach and the catalogue
+   answer different questions.
 2. **Requested features.** Among those, choose a backend whose
    `BackendApiCapabilities` satisfy what the request asks for: cache control
    when the cache policy is on, vision when the messages carry images, and so
@@ -663,18 +676,20 @@ path.
    backend registered. Still no behaviour change: one surface reaches
    everything the catalogue holds, so selection has nothing to choose between.
 3. Add `ResponsesBackend` for the GPT-5.6 family on `bedrock-mantle`.
-4. Generalise the existing embeddings `InvokeModel` call into `InvokeBackend`,
-   then extend it to the other modalities Converse refuses.
+4. **Done.** The embeddings `InvokeModel` call is `InvokeBackend`. Extending
+   it to the other modalities Converse refuses - image and video generation,
+   reranking - comes with the `ModelKind` variants that describe them.
 
 Each step lands on its own and leaves the connector working.
 
-One interlock spans steps 1 and 4, and it is invisible in a diff. The Converse
-listing returns embedding models, because those models are what the daemon's
-embedding path reaches and the catalogue is where a person picks one.
-`ConverseBackend::can_serve` reports - correctly - that Converse cannot serve
-them. So **the aggregation in step 2 must not filter the catalogue by
-`can_serve`** until step 4 lists those models through `InvokeBackend`. Filtering
-early takes every embedding model out of the picker.
+Steps 1 to 4 held an interlock that is now closed. The Converse listing used to
+return embedding models, because that is where the daemon's embedding path
+finds them, while `ConverseBackend::can_serve` correctly reported that Converse
+cannot serve them - so the catalogue and reach disagreed on purpose. Converse
+now emits text models only, Invoke emits the embedding models, and the
+aggregate catalogue holds the same ids as before. The aggregation still does
+not filter by `can_serve`, and must not start: reach answers a completion
+request, and an embedding model is a row a person picks for embeddings.
 
 ## References
 
