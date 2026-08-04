@@ -6608,6 +6608,122 @@ mod tests {
         find_model(&report, "amazon.titan-embed-text-v2:0");
     }
 
+    // ---- The Invoke surface (#1017) ----
+
+    const EMBED_MODEL: &str = "amazon.titan-embed-text-v2:0";
+    const CHAT_MODEL: &str = "anthropic.claude-3-haiku-20240307-v1:0";
+
+    #[tokio::test]
+    async fn the_converse_listing_emits_no_embedding_model() {
+        let server = httpmock::MockServer::start();
+        mock_healthy_control_plane(&server);
+        let client = control_plane_client(&server);
+        client.list_models_detailed().await.expect("the listing succeeds");
+
+        let converse = client
+            .converse()
+            .list_models()
+            .await
+            .expect("the Converse listing succeeds");
+
+        assert!(
+            !converse.models.iter().any(|m| m.id == EMBED_MODEL),
+            "Converse is a text-and-chat API; a model it cannot serve must not be a row \
+             it offers, or reach and the catalogue disagree"
+        );
+        assert!(
+            converse.models.iter().any(|m| m.id == CHAT_MODEL),
+            "the text models must still be there"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_catalogue_keeps_the_embedding_model_and_attributes_it_to_invoke() {
+        let server = httpmock::MockServer::start();
+        mock_healthy_control_plane(&server);
+        let client = control_plane_client(&server);
+
+        let report = client.list_models_detailed().await.expect("the listing succeeds");
+
+        // The row a person picks for embeddings must not move or vanish; only
+        // the surface behind it changes.
+        find_model(&report, EMBED_MODEL);
+        assert_eq!(
+            client.backends_serving(EMBED_MODEL),
+            vec!["invoke"],
+            "the surface that can actually serve it is the one recorded"
+        );
+        assert_eq!(
+            client.backends_serving(CHAT_MODEL),
+            vec!["converse"],
+            "a text model stays with Converse"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_conversation_against_an_embedding_model_is_refused_before_dispatch() {
+        let server = httpmock::MockServer::start();
+        mock_healthy_control_plane(&server);
+        let client = control_plane_client(&server).with_model(EMBED_MODEL);
+        client.list_models_detailed().await.expect("the listing succeeds");
+
+        let error = client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await
+            .expect_err("an embedding model cannot serve a conversation");
+
+        let detail = error.to_string();
+        assert!(
+            detail.contains(EMBED_MODEL),
+            "the refusal must name the model, got {detail}"
+        );
+        assert!(
+            detail.contains("text model"),
+            "the refusal must say what to pick instead, got {detail}"
+        );
+    }
+
+    #[tokio::test]
+    async fn invoke_offers_embeddings_and_nothing_else() {
+        let server = httpmock::MockServer::start();
+        let client = control_plane_client(&server);
+        let caps = client.invoke().capabilities(EMBED_MODEL);
+
+        assert!(caps.embeddings, "this is the surface embedding models run on");
+        for (name, claimed) in [
+            ("tools", caps.tools),
+            ("streaming", caps.streaming),
+            ("vision", caps.vision),
+            ("cache control", caps.cache_control),
+            ("reasoning", caps.reasoning),
+            ("hosted tool search", caps.hosted_tool_search),
+        ] {
+            assert!(
+                !claimed,
+                "Invoke serves embedding models here and offers no {name}; claiming it \
+                 would invent a capability selection could route a turn to"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn invoke_serves_no_conversation_so_selection_never_routes_one_to_it() {
+        let server = httpmock::MockServer::start();
+        mock_healthy_control_plane(&server);
+        let client = control_plane_client(&server);
+        client.list_models_detailed().await.expect("the listing succeeds");
+
+        assert!(
+            !client.invoke().can_serve(EMBED_MODEL),
+            "reach answers a completion request, and an embedding model cannot serve one"
+        );
+    }
+
     // ---- Aggregation and selection across several backends (#1018) ----
 
     use crate::backend::{BackendApiCapabilities, BedrockRequest, Feature, required_features};
