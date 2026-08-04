@@ -1040,9 +1040,11 @@ fn map_converse_stream_service_error(
 /// a known limit; callers should treat `None` as "disable token-based
 /// compaction" and rely on message-count fallbacks instead.
 ///
-/// Not a pure function of its argument. A profile id answers `None` until a
-/// listing in this process has registered what it routes to, and the base
-/// model's window afterwards. The table below is fixed; what moves is which
+/// Not a pure function of its argument. An id the prefix rule cannot reduce -
+/// an application profile, or a geography the list does not carry - answers
+/// `None` until a listing in this process has registered what it routes to,
+/// and the base model's window afterwards. Every other id answers the same
+/// with or without a listing. The table below is fixed; what moves is which
 /// row an id reaches.
 ///
 /// `ListFoundationModels` does not expose context windows, so this table
@@ -1258,7 +1260,9 @@ static PROFILE_BASE_MODELS: std::sync::RwLock<std::collections::BTreeMap<String,
 /// the account does not return - reduces by the prefix rule alone. Refreshing
 /// the listing here would put a control-plane call, its IAM failure modes and
 /// its latency on the turn path, so it is not done. `BedrockClient::warmup`
-/// is what keeps a connection's own configured model out of this case.
+/// is what usually keeps a connection's own configured model out of this
+/// case - usually, because the warm is detached and best-effort, so a turn
+/// that arrives before it finishes, or after it failed, still misses.
 fn base_model_for(id: &str) -> std::borrow::Cow<'_, str> {
     let mapped = PROFILE_BASE_MODELS
         // A poisoned register means a panic happened elsewhere while holding
@@ -1915,10 +1919,15 @@ impl LlmClient for BedrockClient {
     ///
     /// A turn never calls the control plane to resolve a model id, so an
     /// inference profile no listing has returned answers from the prefix rule
-    /// alone. Doing the listing here means the configured model of a live
-    /// connection is already registered when the first turn arrives, instead
-    /// of only after whichever client happens to open the model picker. It
-    /// warms the listing cache as well.
+    /// alone. Doing the listing here usually means the configured model of a
+    /// live connection is already registered when the first turn arrives,
+    /// instead of only after whichever client happens to open the model
+    /// picker. It warms the listing cache as well.
+    ///
+    /// Usually, and not always. The registry spawns this detached and does not
+    /// wait for it, so a turn dispatched during startup can still beat it, and
+    /// a listing that fails registers nothing. Both land on the conservative
+    /// answer the gates already have, which is why neither is retried.
     ///
     /// Best-effort and detached, exactly like the Ollama context-length warm
     /// the registry spawns beside it. A failure leaves the register empty,

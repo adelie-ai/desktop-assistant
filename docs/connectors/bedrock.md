@@ -206,11 +206,16 @@ boundary is the miss, not the model: the same id resolves fully as soon as any
 listing in this process has returned it.
 
 **The register is warmed at startup.** The connection's `warmup` lists the
-models once, detached, so a configured model that is an application profile is
-already registered when the first turn arrives - rather than only after
-whichever client first opens the model picker. It warms the listing cache at the
-same time. A failed warm is a `debug!` line and leaves the conservative answer
-in place, so a connection nobody uses cannot fail startup.
+models once, so a configured model that is an application profile is usually
+registered before the first turn arrives - rather than only after whichever
+client first opens the model picker. It warms the listing cache at the same
+time.
+
+Usually, not always: the registry spawns the warm detached and does not wait for
+it, so a turn dispatched during startup can beat it, and a listing that fails
+registers nothing. Both land on the conservative answer above, which is why
+neither is retried - a failed warm is a `debug!` line, so a connection nobody
+uses cannot fail startup.
 
 Only a profile whose base model this account did not list falls back to a
 family guess from the id, which reports vision from the family and treats the
