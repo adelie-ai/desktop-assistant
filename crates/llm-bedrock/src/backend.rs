@@ -136,6 +136,74 @@ pub(crate) struct BedrockRequest {
     pub cancellation: CancellationToken,
 }
 
+/// One thing an API surface either does or does not do for a model.
+///
+/// Named rather than a bare field access, so a refusal can say which
+/// capability was missing in words a person reads.
+/// It carries only what a turn can genuinely demand. A capability whose
+/// absence merely costs money or plainness is not one of these, and adding it
+/// here is how a degraded turn becomes a refused turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Feature {
+    /// The turn carries image input, so a surface that cannot send one cannot
+    /// serve it.
+    Vision,
+}
+
+impl Feature {
+    /// Whether `capabilities` provides this feature.
+    pub(crate) fn provided_by(self, capabilities: &BackendApiCapabilities) -> bool {
+        match self {
+            Feature::Vision => capabilities.vision,
+        }
+    }
+
+    /// The name a refusal uses.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Feature::Vision => "vision",
+        }
+    }
+}
+
+/// Whether this turn carries image input.
+///
+/// Always `false`, and not a placeholder: `Message` is text with tool fields,
+/// so no image can reach a connector at all. #1059 covers giving the Converse
+/// surface an image content block, and this predicate is what turns that into
+/// a routing requirement when it lands.
+fn turn_carries_an_image(_request: &BedrockRequest) -> bool {
+    false
+}
+
+/// What this turn cannot be served without.
+///
+/// **It is empty today, and that is a statement about the request rather than
+/// an omission.** A feature belongs here only when its absence makes the
+/// answer wrong, never when the absence only makes the answer dearer or
+/// plainer. Three candidates, and none qualifies:
+///
+/// - **Vision.** No domain message can carry an image: `Message` is text with
+///   tool fields, and no backend builds an image content block. When that
+///   changes (#1059) this is where the requirement is stated.
+/// - **Cache control.** A withheld checkpoint costs input tokens. The turn is
+///   correct either way.
+/// - **Reasoning.** A budget the model cannot take is reported at `warn!` with
+///   the model and the budget, and the turn goes out without it. Refusing
+///   instead would reverse that decision for every model that reasons without
+///   taking a setting, DeepSeek R1 among them.
+///
+/// The derivation lives in one function so a future hard requirement is added
+/// once, and so a test can hold the soft ones out of it: promoting one turns a
+/// degraded turn into a refused turn across the whole fleet.
+pub(crate) fn required_features(request: &BedrockRequest) -> Vec<Feature> {
+    let mut required = Vec::new();
+    if turn_carries_an_image(request) {
+        required.push(Feature::Vision);
+    }
+    required
+}
+
 /// The sampling settings a connection carries, in provider-neutral form.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct SamplingParams {

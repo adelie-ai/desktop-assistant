@@ -300,10 +300,23 @@ Selection runs in two steps, in this order.
    when the cache policy is on, vision when the messages carry images, and so
    on.
 
-When more than one backend qualifies, prefer the backend that already served
-this conversation, then the first one listed. Stability is worth more than a
-small capability gain, because a change of backend inside a conversation
-invalidates the prompt cache.
+**A requested feature is one the turn cannot do without, and no more.** A
+capability whose absence costs money or plainness is not one: a withheld cache
+checkpoint costs input tokens, and a reasoning budget a model cannot take is
+reported and dropped. Promoting either into the requirement set turns a
+degraded turn into a refused turn for every model that lacks it. The set is
+empty today, because the only capability that could be hard is vision and no
+message can carry an image.
+
+When more than one backend qualifies, the choice is **deterministic**:
+registration order decides. An earlier revision of this design said "prefer the
+backend that already served this conversation", and a connector cannot do that
+- no conversation identity reaches one, and none of the task-locals a connector
+may read names a conversation. The reason behind that wording is real, because
+a change of backend inside a conversation invalidates the prompt cache, and
+determinism delivers it: one model and one requirement set always pick one
+backend, so consecutive turns stay together without anyone tracking a
+conversation.
 
 When no single backend satisfies every requested feature, the connector fails
 and names the conflict: the model, the features asked for, and the backend that
@@ -640,8 +653,9 @@ path.
    the listing contract, the on-demand filter and the notices unchanged. The
    connector holds one backend and sends every request and the whole catalogue
    to it.
-2. Add backend selection and the de-duplicating aggregation, with one backend
-   registered. Still no behaviour change.
+2. **Done.** Backend selection and the de-duplicating aggregation, with one
+   backend registered. Still no behaviour change: one surface reaches
+   everything the catalogue holds, so selection has nothing to choose between.
 3. Add `ResponsesBackend` for the GPT-5.6 family on `bedrock-mantle`.
 4. Generalise the existing embeddings `InvokeModel` call into `InvokeBackend`,
    then extend it to the other modalities Converse refuses.
