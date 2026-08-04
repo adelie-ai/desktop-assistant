@@ -6742,4 +6742,160 @@ mod tests {
             );
         }
     }
+
+    // ---- The backend boundary (#1015) and the Converse backend (#1016) ----
+
+    use crate::backend::BedrockBackend;
+
+    /// A client whose backend needs no network: `can_serve` and `capabilities`
+    /// answer from the model id and from what a listing already recorded, so
+    /// neither reaches AWS.
+    fn backend_client() -> BedrockClient {
+        BedrockClient::new(format!("AKIAIOSFODNN7EXAMPLE:{TEST_SECRET_ACCESS_KEY}"))
+            .with_base_url("us-east-1")
+    }
+
+    #[test]
+    fn bedrock_backends_are_dyn_compatible() {
+        let client = backend_client();
+        // The point of the test. `BedrockConnector` (#1018) holds this exact
+        // type, so a return-position `impl Trait` edit to the trait must fail
+        // here rather than in the entry that tries to build the connector.
+        let backends: Vec<Arc<dyn BedrockBackend>> = vec![client.backend().clone()];
+
+        assert_eq!(
+            backends[0].api_name(),
+            "converse",
+            "a backend names its API surface, for logs, notices and model annotation"
+        );
+    }
+
+    #[test]
+    fn converse_reports_cache_control_for_anthropic_and_not_for_meta() {
+        let client = backend_client();
+        let backend = client.backend();
+
+        assert!(
+            backend.capabilities("anthropic.claude-sonnet-4-6").cache_control,
+            "Converse accepts a cachePoint for Anthropic Claude 3.5 and later"
+        );
+        assert!(
+            !backend
+                .capabilities("meta.llama4-scout-17b-instruct-v1:0")
+                .cache_control,
+            "Meta models reject a cachePoint, and a refused checkpoint fails the whole turn"
+        );
+    }
+
+    #[test]
+    fn converse_reports_cache_control_the_same_through_an_inference_profile_prefix() {
+        let client = backend_client();
+        let backend = client.backend();
+
+        assert_eq!(
+            backend
+                .capabilities("us.anthropic.claude-sonnet-4-6")
+                .cache_control,
+            backend.capabilities("anthropic.claude-sonnet-4-6").cache_control,
+            "a profile is a route to a foundation model, so it answers for that model"
+        );
+        assert!(
+            backend
+                .capabilities("us.anthropic.claude-sonnet-4-6")
+                .cache_control,
+            "the shared answer must be the supporting one, not two matching falses"
+        );
+    }
+
+    #[test]
+    fn converse_reports_reasoning_only_where_the_request_builder_will_send_it() {
+        let client = backend_client();
+        let backend = client.backend();
+
+        for model in ["anthropic.claude-sonnet-4-6", "us.anthropic.claude-opus-4-1"] {
+            assert!(
+                backend.capabilities(model).reasoning,
+                "{model} takes additionalModelRequestFields.thinking"
+            );
+        }
+        assert!(
+            !backend.capabilities("deepseek.r1-v1:0").reasoning,
+            "DeepSeek R1 reasons on every request and takes no reasoning configuration, \
+             so offering the control would offer something the request builder discards"
+        );
+    }
+
+    #[test]
+    fn converse_claims_no_capability_this_backend_does_not_actually_send() {
+        let client = backend_client();
+        let caps = client.backend().capabilities("anthropic.claude-sonnet-4-6");
+
+        assert!(
+            !caps.vision,
+            "Converse carries image content blocks and convert_messages emits text only, \
+             so this backend cannot send one"
+        );
+        assert!(
+            !caps.embeddings,
+            "Converse is a text-and-chat API; embedding models are not addressable through it"
+        );
+        assert!(
+            !caps.hosted_tool_search,
+            "hosted tool search is not a Converse feature"
+        );
+        assert!(caps.streaming, "ConverseStream serves this backend");
+        assert!(caps.tools, "Converse takes a toolConfig");
+    }
+
+    #[tokio::test]
+    async fn converse_cannot_serve_a_model_the_listing_returned_as_an_embedding_model() {
+        let server = httpmock::MockServer::start();
+        mock_healthy_control_plane(&server);
+        let client = control_plane_client(&server);
+
+        client
+            .list_models_detailed()
+            .await
+            .expect("the listing must succeed for the backend to learn any model kind");
+
+        let backend = client.backend();
+        assert!(
+            !backend.can_serve("amazon.titan-embed-text-v2:0"),
+            "Converse cannot serve an embedding model, so no request for one may be routed here"
+        );
+        assert!(
+            backend.can_serve("anthropic.claude-3-haiku-20240307-v1:0"),
+            "a chat model the same listing returned must stay reachable"
+        );
+    }
+
+    #[test]
+    fn converse_can_serve_a_model_no_listing_has_returned() {
+        let client = backend_client();
+        assert!(
+            client
+                .backend()
+                .can_serve("some.model-this-account-never-listed"),
+            "reach defaults permissive: an unlisted id dispatches exactly as it does today, \
+             rather than being refused by a catalogue that never described it"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_catalogue_still_lists_an_embedding_model_converse_cannot_serve() {
+        let server = httpmock::MockServer::start();
+        mock_healthy_control_plane(&server);
+
+        let report = control_plane_client(&server)
+            .list_models_detailed()
+            .await
+            .expect("the listing must succeed");
+
+        // The interlock #1018 carries. `can_serve` says Converse cannot serve
+        // this model, and nothing filters the catalogue by `can_serve` until
+        // `InvokeBackend` (#1017) lists embedding models instead. Filtering
+        // early would take every embedding model out of the picker and off the
+        // daemon's embedding path.
+        find_model(&report, "amazon.titan-embed-text-v2:0");
+    }
 }
