@@ -114,7 +114,7 @@ pub enum CachePolicy {
 fn wants_cache_checkpoint(policy: CachePolicy, model_id: &str) -> bool {
     match policy {
         CachePolicy::None => false,
-        CachePolicy::SystemPromptOnly => supports_prompt_caching(strip_region_prefix(model_id)),
+        CachePolicy::SystemPromptOnly => supports_prompt_caching(&base_model_for(model_id)),
     }
 }
 
@@ -1044,7 +1044,8 @@ fn map_converse_stream_service_error(
 /// The `list_models()` implementation uses it to populate
 /// `ModelInfo::context_limit`.
 pub fn context_limit_for_model(model_id: &str) -> Option<u64> {
-    let base = strip_region_prefix(model_id);
+    let base = base_model_for(model_id);
+    let base = base.as_ref();
 
     // Anthropic Claude on Bedrock: 3.x and 4.x all ship with 200K context.
     if base.starts_with("anthropic.claude-3")
@@ -1192,17 +1193,70 @@ const INFERENCE_PROFILE_PREFIXES: &[&str] = &[
 /// foundation model id. Returns the input unchanged when no known prefix
 /// matches.
 ///
-/// This is the only way this connector names the model behind a profile, and
-/// that is deliberate. A turn arrives carrying a model id and nothing else, so
-/// this is all the dispatch path has; the listing resolves the same way rather
-/// than reading the richer answer in the profile's ARN, because a capability
-/// the listing can see and dispatch cannot is one the picker offers and the
-/// request builder discards. Issue #1044 covers resolving it for both sides.
+/// The rule for a system-defined profile id, and the fallback for every other
+/// id. `base_model_for` is what the capability gates call; it consults the
+/// register first and lands here when the register has no answer.
 fn strip_region_prefix(id: &str) -> &str {
     INFERENCE_PROFILE_PREFIXES
         .iter()
         .find_map(|prefix| id.strip_prefix(prefix))
         .unwrap_or(id)
+}
+
+/// Inference-profile id -> the foundation model id it routes to, for the
+/// profile ids [`strip_region_prefix`] cannot reduce.
+///
+/// **Process-global on purpose, and that is the load-bearing part.** Every
+/// capability gate in this connector answers from the base model id, and the
+/// two sides that must agree do not share a `BedrockClient`: the daemon lists
+/// models through the registry's per-connection client and dispatches turns
+/// through a second client built for the interactive purpose. A register held
+/// per instance would let the picker see a capability the request builder
+/// cannot, which is the defect this connector already paid for once. A
+/// register held per process cannot.
+///
+/// Keyed by profile id alone. A system-defined id (`us.anthropic....`) names
+/// the same foundation model in every account, and an application profile id
+/// is a generated identifier, so two accounts in one daemon do not collide in
+/// practice. The stored value is a foundation model id, which is global as
+/// well.
+///
+/// Entries are written by a successful `ListInferenceProfiles` and are never
+/// removed. A deleted profile makes its id undispatchable at AWS, so a stale
+/// entry cannot grant a capability to a live turn; a profile whose route
+/// changes is corrected by the next listing, which overwrites the entry.
+/// Growth is bounded by the account's inference-profile quota.
+///
+/// A `BTreeMap` rather than a `HashMap` because its constructor is `const`,
+/// so the register needs no lazy initialization.
+static PROFILE_BASE_MODELS: std::sync::RwLock<std::collections::BTreeMap<String, String>> =
+    std::sync::RwLock::new(std::collections::BTreeMap::new());
+
+/// The foundation model `id` names, for every capability gate in this
+/// connector.
+///
+/// The register first, then [`strip_region_prefix`]. Both the capability
+/// record and the request builder call this, so neither can answer for a
+/// model the other cannot see.
+///
+/// A miss is a defined answer, not a lookup: an id no listing returned - a
+/// configured `default_model`, a per-turn `MODEL_OVERRIDE`, a keep-warm probe
+/// before the first listing - reduces by the prefix rule alone. Refreshing
+/// the listing here would put a control-plane call, its IAM failure modes and
+/// its latency on the turn path, so it is not done.
+fn base_model_for(id: &str) -> std::borrow::Cow<'_, str> {
+    let mapped = PROFILE_BASE_MODELS
+        // A poisoned register means a panic happened elsewhere while holding
+        // it. Nothing here panics under the lock, and a capability answer is
+        // not worth failing a turn over, so the map is read regardless.
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(id)
+        .cloned();
+    match mapped {
+        Some(base) => std::borrow::Cow::Owned(base),
+        None => std::borrow::Cow::Borrowed(strip_region_prefix(id)),
+    }
 }
 
 /// Whether a Bedrock model accepts `cachePoint` prompt-cache checkpoints.
@@ -1487,7 +1541,8 @@ fn inference_profile_to_model_info(
     // from an input dispatch does not share is a capability the picker can
     // offer and the request builder will discard. See the note on
     // `fallback_modalities_from_id` for what resolving it properly needs.
-    let base_id = strip_region_prefix(profile_id);
+    let base_id = base_model_for(profile_id);
+    let base_id = base_id.as_ref();
 
     let resolved = modalities.get(base_id).unwrap_or_else(|| {
         tracing::debug!(
@@ -2032,12 +2087,12 @@ impl BedrockClient {
         has_tools: bool,
     ) -> Result<LlmResponse, AttemptError> {
         let model = inputs.model.clone();
-        let base_model = strip_region_prefix(&model);
+        let base_model = base_model_for(&model);
         let memo_says_non_streaming = has_tools && {
             let memo = self.non_streaming_tools_models.lock().await;
             memo.contains(&model)
         };
-        let allowlist_says_non_streaming = has_tools && !supports_streaming_with_tools(base_model);
+        let allowlist_says_non_streaming = has_tools && !supports_streaming_with_tools(&base_model);
         if memo_says_non_streaming || allowlist_says_non_streaming {
             if allowlist_says_non_streaming {
                 tracing::debug!(
@@ -2493,7 +2548,7 @@ fn resolve_reasoning_request(model: &str, reasoning: ReasoningConfig) -> Reasoni
         Some(n) if n > 0 => n,
         _ => return ReasoningRequest::NotRequested,
     };
-    if !supports_configurable_reasoning(strip_region_prefix(model)) {
+    if !supports_configurable_reasoning(&base_model_for(model)) {
         return ReasoningRequest::Unconfigurable { budget };
     }
     let mut thinking: HashMap<String, Document> = HashMap::new();
@@ -4139,9 +4194,39 @@ mod tests {
           ],
           "status": "ACTIVE",
           "type": "SYSTEM_DEFINED"
+        },
+        {
+          "inferenceProfileName": "platform-team-claude",
+          "inferenceProfileArn": "arn:aws:bedrock:us-east-1:111122223333:application-inference-profile/y1c2q8m4t6bk",
+          "inferenceProfileId": "y1c2q8m4t6bk",
+          "models": [
+            {"modelArn": "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-sonnet-4-5-20250929-v1:0"},
+            {"modelArn": "arn:aws:bedrock:us-east-2::foundation-model/anthropic.claude-sonnet-4-5-20250929-v1:0"},
+            {"modelArn": "arn:aws:bedrock:us-west-2::foundation-model/anthropic.claude-sonnet-4-5-20250929-v1:0"}
+          ],
+          "status": "ACTIVE",
+          "type": "APPLICATION"
+        },
+        {
+          "inferenceProfileName": "batch-team-llama",
+          "inferenceProfileArn": "arn:aws:bedrock:us-east-1:111122223333:application-inference-profile/p9r4w2k7d3xh",
+          "inferenceProfileId": "p9r4w2k7d3xh",
+          "models": [
+            {"modelArn": "arn:aws:bedrock:us-east-1:111122223333:inference-profile/us.meta.llama4-scout-17b-instruct-v1:0"}
+          ],
+          "status": "ACTIVE",
+          "type": "APPLICATION"
         }
       ]
     }"#;
+
+    /// The base model each `APPLICATION` profile in
+    /// [`DRIFTING_INFERENCE_PROFILES_BODY`] routes to. Named once so a test
+    /// asks the base model the same question it asks the profile.
+    const APP_PROFILE_CLAUDE: &str = "y1c2q8m4t6bk";
+    const APP_PROFILE_CLAUDE_BASE: &str = "anthropic.claude-sonnet-4-5-20250929-v1:0";
+    const APP_PROFILE_LLAMA: &str = "p9r4w2k7d3xh";
+    const APP_PROFILE_LLAMA_BASE: &str = "meta.llama4-scout-17b-instruct-v1:0";
 
     /// Both control-plane calls succeed, serving the drifting-catalogue
     /// bodies above.
@@ -4227,18 +4312,18 @@ mod tests {
 
     #[tokio::test]
     async fn a_profile_id_the_prefix_list_does_not_cover_reports_what_dispatch_will_do() {
-        // An id this connector cannot reduce to a foundation model - a
-        // geography newer than the prefix list, or an APPLICATION profile,
-        // whose id is a generated identifier with no prefix at all - is a
-        // capability the connector genuinely does not have. The listing could
-        // recover the base model from the profile's ARN, and must not: the
-        // dispatch path has only the id, so an answer taken from the ARN would
-        // put a control in front of a person that the request path then
-        // discards. That is the #1022 defect, rebuilt.
+        // A geography newer than the prefix list is one of the two ids the
+        // prefix rule cannot reduce, the other being an APPLICATION profile.
+        // The listing registers what the profile's own ARN names, and every
+        // dispatch gate reads that same register, so the record and the
+        // request path answer together. They must, whichever way they answer:
+        // a capability recovered for the record alone is a control the picker
+        // offers and the request builder discards, which is #1022 rebuilt.
         //
-        // So the record withholds, and it withholds in step with dispatch.
-        // Doing better means carrying the resolved mapping to the dispatch
-        // gates as well - see the note on `fallback_modalities_from_id`.
+        // An id the register does not hold - one no listing returned - still
+        // reduces by the prefix rule alone, and both sides still agree. That
+        // case has its own test, because it is the one that stays
+        // conservative.
         let server = httpmock::MockServer::start();
         mock_drifting_control_plane(&server);
 
@@ -4259,8 +4344,8 @@ mod tests {
             "the record and the request path must answer the same, whichever way they answer"
         );
         assert!(
-            !profile.capabilities.reasoning,
-            "an id that reduces to nothing cannot be promised a thinking budget"
+            profile.capabilities.reasoning,
+            "the profile routes to Claude Sonnet 4.5, so both sides answer for that model"
         );
         assert_eq!(
             profile.context_limit,
@@ -4286,6 +4371,176 @@ mod tests {
         assert!(profile.capabilities.vision);
         assert!(profile.capabilities.tools);
         assert_eq!(profile.capabilities.kind, ModelKind::Generative);
+    }
+
+    // --- Application inference profiles (#1044) --------------------------
+    //
+    // An `APPLICATION` profile id is a generated identifier. No rule reduces
+    // it to a foundation model, so the profile's own `models[].modelArn` is
+    // the only source. The listing registers that mapping, and every gate on
+    // the dispatch path reads the same register, so the record and the
+    // request path cannot answer differently.
+
+    #[tokio::test]
+    async fn an_application_profile_reports_the_reasoning_answer_dispatch_will_send() {
+        let server = httpmock::MockServer::start();
+        mock_drifting_control_plane(&server);
+
+        let report = control_plane_client(&server)
+            .list_models_detailed()
+            .await
+            .expect("healthy listing");
+
+        let profile = find_model(&report, APP_PROFILE_CLAUDE);
+        let dispatch_would_send = matches!(
+            resolve_reasoning_request(
+                APP_PROFILE_CLAUDE,
+                ReasoningConfig::with_thinking_budget(8_000)
+            ),
+            ReasoningRequest::Configured(_)
+        );
+        assert_eq!(
+            profile.capabilities.reasoning, dispatch_would_send,
+            "the record and the request path must answer the same, whichever way they answer"
+        );
+        assert!(
+            supports_configurable_reasoning(APP_PROFILE_CLAUDE_BASE),
+            "fixture check: the base model must be one that takes a thinking budget"
+        );
+        assert!(
+            dispatch_would_send,
+            "the profile routes to Claude Sonnet 4.5, so the budget must reach the request"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_application_profile_reports_the_prompt_caching_answer_dispatch_will_send() {
+        let server = httpmock::MockServer::start();
+        mock_drifting_control_plane(&server);
+
+        control_plane_client(&server)
+            .list_models_detailed()
+            .await
+            .expect("healthy listing");
+
+        assert_eq!(
+            wants_cache_checkpoint(CachePolicy::SystemPromptOnly, APP_PROFILE_CLAUDE),
+            wants_cache_checkpoint(CachePolicy::SystemPromptOnly, APP_PROFILE_CLAUDE_BASE),
+            "a profile takes the checkpoint decision of the model it routes to"
+        );
+        assert!(
+            wants_cache_checkpoint(CachePolicy::SystemPromptOnly, APP_PROFILE_CLAUDE),
+            "Claude Sonnet 4.5 accepts a checkpoint, so the profile must get one"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_application_profile_reports_the_streaming_deny_list_answer_dispatch_will_use() {
+        let server = httpmock::MockServer::start();
+        mock_drifting_control_plane(&server);
+
+        let report = control_plane_client(&server)
+            .list_models_detailed()
+            .await
+            .expect("healthy listing");
+
+        assert!(
+            find_model(&report, APP_PROFILE_LLAMA).capabilities.tools,
+            "the record offers tools on this profile, so the deny list decides the path"
+        );
+        assert_eq!(
+            supports_streaming_with_tools(&base_model_for(APP_PROFILE_LLAMA)),
+            supports_streaming_with_tools(APP_PROFILE_LLAMA_BASE),
+            "a profile takes the streaming decision of the model it routes to"
+        );
+        assert!(
+            !supports_streaming_with_tools(&base_model_for(APP_PROFILE_LLAMA)),
+            "Llama 4 takes tools on Converse only, and a profile over it is no different"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_application_profile_reports_the_context_window_the_daemon_will_budget_against() {
+        let server = httpmock::MockServer::start();
+        mock_drifting_control_plane(&server);
+
+        let report = control_plane_client(&server)
+            .list_models_detailed()
+            .await
+            .expect("healthy listing");
+
+        let profile = find_model(&report, APP_PROFILE_CLAUDE);
+        assert_eq!(
+            profile.context_limit,
+            context_limit_for_model(APP_PROFILE_CLAUDE),
+            "the picker's window must be the one the daemon budgets against"
+        );
+        assert_eq!(
+            profile.context_limit,
+            Some(200_000),
+            "the window is the base model's, not the universal fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_application_profile_reports_the_base_models_own_modalities() {
+        let server = httpmock::MockServer::start();
+        mock_drifting_control_plane(&server);
+
+        let report = control_plane_client(&server)
+            .list_models_detailed()
+            .await
+            .expect("healthy listing");
+
+        assert!(
+            find_model(&report, APP_PROFILE_CLAUDE).capabilities.vision,
+            "the base model's real input modalities reach the profile entry"
+        );
+        assert!(
+            !find_model(&report, APP_PROFILE_LLAMA).capabilities.vision,
+            "a text-only base model must not be advertised as vision-capable"
+        );
+    }
+
+    /// A turn can dispatch a model the listing never returned: a configured
+    /// `default_model`, a per-turn `MODEL_OVERRIDE`, or a keep-warm probe
+    /// before any listing ran. There is no control-plane call on that path,
+    /// so the gates answer from the prefix rule alone.
+    #[test]
+    fn a_model_that_was_never_listed_answers_conservatively_without_a_control_plane_call() {
+        // No client and no mock server here on purpose: the gates are pure
+        // functions of the id and the mapping already in memory, so a turn
+        // against an unknown id cannot reach the network.
+        const NEVER_LISTED: &str = "n0tl1st3d1044";
+
+        assert_eq!(
+            base_model_for(NEVER_LISTED),
+            NEVER_LISTED,
+            "an unregistered id reduces to itself, the same answer as before"
+        );
+        assert!(
+            matches!(
+                resolve_reasoning_request(
+                    NEVER_LISTED,
+                    ReasoningConfig::with_thinking_budget(8_000)
+                ),
+                ReasoningRequest::Unconfigurable { .. }
+            ),
+            "an effort against an unknown id is reported, not sent and not silently dropped"
+        );
+        assert!(
+            !wants_cache_checkpoint(CachePolicy::SystemPromptOnly, NEVER_LISTED),
+            "a checkpoint the model may refuse costs the whole turn, so withhold it"
+        );
+        assert_eq!(
+            context_limit_for_model(NEVER_LISTED),
+            None,
+            "no window is known, so the daemon uses its own fallback"
+        );
+        assert!(
+            supports_streaming_with_tools(&base_model_for(NEVER_LISTED)),
+            "the streaming deny list is an allow-by-default list with a runtime fallback"
+        );
     }
 
     #[tokio::test]
