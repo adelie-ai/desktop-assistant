@@ -1040,6 +1040,11 @@ fn map_converse_stream_service_error(
 /// a known limit; callers should treat `None` as "disable token-based
 /// compaction" and rely on message-count fallbacks instead.
 ///
+/// Not a pure function of its argument. A profile id answers `None` until a
+/// listing in this process has registered what it routes to, and the base
+/// model's window afterwards. The table below is fixed; what moves is which
+/// row an id reaches.
+///
 /// `ListFoundationModels` does not expose context windows, so this table
 /// is the single source of truth for Bedrock models whose windows we know.
 /// The `list_models()` implementation uses it to populate
@@ -1171,10 +1176,11 @@ fn supports_configurable_reasoning(base_id: &str) -> bool {
 /// A system-defined profile id is the foundation model id behind one of these
 /// prefixes, so this list is how the capability gates see the base id without
 /// a listing. A missing entry costs extended thinking, prompt caching, the
-/// context window and the streaming-with-tools deny list for any id that never
-/// reached the register - a `default_model` or a `MODEL_OVERRIDE` set before
-/// the first listing, in particular. A profile the account has listed is
-/// covered either way.
+/// context window and the streaming-with-tools deny list for any id the
+/// register never received - a profile this account does not list, or one
+/// dispatched before the startup warm has finished. A profile the account
+/// lists is covered either way, so the list is a safety net rather than the
+/// only rule.
 ///
 /// Sources, all AWS documentation:
 /// - Geographic cross-Region inference names `us`, `eu`, `apac` as geography
@@ -1217,11 +1223,17 @@ fn strip_region_prefix(id: &str) -> &str {
 /// cannot, which is the defect this connector already paid for once. A
 /// register held per process cannot.
 ///
-/// Keyed by profile id alone. A system-defined id (`us.anthropic....`) names
-/// the same foundation model in every account, and an application profile id
-/// is a generated identifier, so two accounts in one daemon do not collide in
-/// practice. The stored value is a foundation model id, which is global as
-/// well.
+/// Keyed by profile id alone, and it cannot be keyed more narrowly. A daemon
+/// can hold Bedrock connections to several accounts, so an account-scoped key
+/// would be the safer one - and the read side cannot build it. A turn arrives
+/// with a model id and a credential, never an account id, so scoping the key
+/// by account would mean an STS call on the turn path: the cost this whole
+/// design exists to avoid. What is left is a residual risk with no
+/// demonstrated failure: a system-defined id (`us.anthropic....`) names the
+/// same foundation model in every account, and an application profile id is an
+/// AWS-generated identifier, so a collision needs two accounts in one daemon
+/// to be issued the same id for profiles routing to different models. The
+/// stored value is a foundation model id, which is global as well.
 ///
 /// Entries are written by a successful `ListInferenceProfiles` and are never
 /// removed. A deleted profile makes its id undispatchable at AWS, so a stale
@@ -1242,10 +1254,11 @@ static PROFILE_BASE_MODELS: std::sync::RwLock<std::collections::BTreeMap<String,
 /// model the other cannot see.
 ///
 /// A miss is a defined answer, not a lookup: an id no listing returned - a
-/// configured `default_model`, a per-turn `MODEL_OVERRIDE`, a keep-warm probe
-/// before the first listing - reduces by the prefix rule alone. Refreshing
+/// `MODEL_OVERRIDE` naming a profile this connection does not list, or any id
+/// the account does not return - reduces by the prefix rule alone. Refreshing
 /// the listing here would put a control-plane call, its IAM failure modes and
-/// its latency on the turn path, so it is not done.
+/// its latency on the turn path, so it is not done. `BedrockClient::warmup`
+/// is what keeps a connection's own configured model out of this case.
 fn base_model_for(id: &str) -> std::borrow::Cow<'_, str> {
     let mapped = PROFILE_BASE_MODELS
         // A poisoned register means a panic happened elsewhere while holding
@@ -4665,10 +4678,10 @@ mod tests {
         );
     }
 
-    /// A turn can dispatch a model the listing never returned: a configured
-    /// `default_model`, a per-turn `MODEL_OVERRIDE`, or a keep-warm probe
-    /// before any listing ran. There is no control-plane call on that path,
-    /// so the gates answer from the prefix rule alone.
+    /// A turn can dispatch a model no listing returned: a `MODEL_OVERRIDE`
+    /// naming a profile this connection does not list, or an id the account
+    /// does not return at all. There is no control-plane call on that path, so
+    /// the gates answer from the prefix rule alone.
     #[test]
     fn a_model_that_was_never_listed_answers_conservatively_without_a_control_plane_call() {
         // No client and no mock server here on purpose: the gates are pure

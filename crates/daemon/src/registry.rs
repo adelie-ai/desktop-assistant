@@ -187,12 +187,15 @@ impl ConnectionRegistry {
     }
 
     /// Fire-and-forget [`LlmClient::warmup`] on every live client.
-    /// Spawns one detached task per connection. Today only Ollama
-    /// overrides the default no-op — it populates a GGUF context-length
-    /// cache so [`LlmClient::max_context_tokens`] returns the declared
-    /// window instead of `None`. Failures (server down, model not
-    /// pulled) are silently swallowed by the implementation — the
-    /// daemon's universal fallback applies if the cache stays empty.
+    /// Spawns one detached task per connection. Two connectors override
+    /// the default no-op. Ollama populates a GGUF context-length cache so
+    /// [`LlmClient::max_context_tokens`] returns the declared window
+    /// instead of `None`. Bedrock lists its models once, which registers
+    /// what each inference profile routes to, so a profile id resolves to
+    /// its base model on the first turn rather than after a client opens
+    /// the model picker. Failures (server down, model not pulled, a
+    /// listing permission missing) are silently swallowed by the
+    /// implementation — each connector's own fallback applies.
     ///
     /// Called once at daemon startup after [`build_registry`] returns.
     /// Must be invoked from inside a Tokio runtime.

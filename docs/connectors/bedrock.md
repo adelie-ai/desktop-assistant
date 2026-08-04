@@ -176,10 +176,17 @@ corrected by the next listing.
 sides that must agree do not share a client object: the daemon lists models
 through the registry's per-connection client and dispatches turns through a
 second client built for the interactive purpose. A register held per client
-would let the picker see a capability the request builder cannot. It is keyed
-by profile id alone, which is safe because a system-defined id names the same
-foundation model in every account and an application profile id is a generated
-identifier.
+would let the picker see a capability the request builder cannot.
+
+It is keyed by profile id alone, and it cannot be keyed more narrowly. A daemon
+can hold Bedrock connections to several accounts, so an account-scoped key
+would be the safer one - and the read side cannot build it. A turn arrives with
+a model id and a credential, never an account id, so scoping by account means
+an STS call on the turn path, which is the cost this design exists to avoid.
+The residual risk is accepted and small: a system-defined id names the same
+foundation model in every account, and a collision needs two accounts in one
+daemon to be issued the same generated application-profile id for profiles
+routing to different models.
 
 **Two ids this fixes.** An `APPLICATION` profile has a generated id that no rule
 reduces; accounts create them to attribute cost per team or per feature, and
