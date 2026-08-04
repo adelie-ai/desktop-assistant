@@ -35,12 +35,15 @@ use desktop_assistant_core::ports::llm::{
     ModelListingNotice, ModelListingReport, ReasoningConfig, TokenUsage, current_model_override,
 };
 use desktop_assistant_llm_http::{STREAM_CONNECT_TIMEOUT, STREAM_EVENT_TIMEOUT};
+use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 use backend::converse::ConverseBackend;
-use backend::{BackendTimeouts, BedrockBackend, BedrockRequest, SamplingParams};
+use backend::{
+    BackendTimeouts, BedrockBackend, BedrockRequest, Feature, SamplingParams, required_features,
+};
 use sdk::SdkClients;
 
 /// Default TTL for the `list_models()` cache. One hour is cheap to refresh
@@ -156,11 +159,24 @@ pub struct BedrockClient {
     /// every backend. Behind a cell because the builder methods below can
     /// change the credentials, the region or a test endpoint after `new`.
     sdk: OnceLock<Arc<SdkClients>>,
-    /// The API surfaces this connection speaks.
+    /// The API surfaces this connection speaks, in the order selection
+    /// considers them.
     ///
-    /// One today. #1018 turns this into the full set, with aggregation across
-    /// their catalogues and selection per request.
-    backend: OnceLock<Arc<ConverseBackend>>,
+    /// Converse only, until `ResponsesBackend` (#1019) and `InvokeBackend`
+    /// (#1017) join it. Registration order is the selection tie-break, so it
+    /// is a `Vec` and not a set.
+    backends: OnceLock<Vec<Arc<dyn BedrockBackend>>>,
+    /// The Converse surface as its own type, so the embedding path and the
+    /// test hooks can reach what only it offers. It is the same value the
+    /// registration above holds behind `dyn`.
+    converse: OnceLock<Arc<ConverseBackend>>,
+    /// Whether a test supplied the backends. A builder must not drop those.
+    backends_are_injected: bool,
+    /// Which surfaces served each model in the last aggregated listing.
+    ///
+    /// Kept beside the catalogue rather than on `ModelInfo`, which is a `core`
+    /// type that must not learn what a Bedrock backend is.
+    backends_serving: std::sync::Mutex<BTreeMap<String, Vec<&'static str>>>,
     temperature: Option<f64>,
     top_p: Option<f64>,
     max_tokens: Option<u32>,
@@ -219,7 +235,10 @@ impl BedrockClient {
             api_key,
             aws_profile: None,
             sdk: OnceLock::new(),
-            backend: OnceLock::new(),
+            backends: OnceLock::new(),
+            converse: OnceLock::new(),
+            backends_are_injected: false,
+            backends_serving: std::sync::Mutex::new(BTreeMap::new()),
             temperature: None,
             top_p: None,
             max_tokens: None,
@@ -343,7 +362,7 @@ impl BedrockClient {
     /// cannot produce.
     #[doc(hidden)]
     pub async fn __force_non_streaming_tools_for_test(&self, model: &str) {
-        self.backend()
+        self.converse()
             .__force_non_streaming_tools_for_test(model)
             .await;
     }
@@ -424,7 +443,50 @@ impl BedrockClient {
     /// region - and a client built against the old one would keep serving.
     fn rebuild_on_next_use(&mut self) {
         self.sdk = OnceLock::new();
-        self.backend = OnceLock::new();
+        self.converse = OnceLock::new();
+        // Backends injected by a test are never rebuilt. Dropping them here
+        // would silently put a real `ConverseBackend` behind a unit test, which
+        // then reaches AWS and presents as a flake somewhere unrelated.
+        if !self.backends_are_injected {
+            self.backends = OnceLock::new();
+        }
+    }
+
+    /// Test-only: run this connection against backends the test controls.
+    ///
+    /// Nothing else can put two backends side by side - the real ones reach
+    /// AWS - and one backend leaves aggregation and selection with nothing to
+    /// decide.
+    #[cfg(test)]
+    pub(crate) fn __with_backends_for_test(
+        mut self,
+        backends: Vec<Arc<dyn BedrockBackend>>,
+    ) -> Self {
+        self.backends = OnceLock::new();
+        let _ = self.backends.set(backends);
+        self.backends_are_injected = true;
+        self
+    }
+
+    /// Test-only: which surface selection picks for a model and a requirement
+    /// set, or the refusal it raises.
+    #[cfg(test)]
+    pub(crate) fn __select_backend_for_test(
+        &self,
+        model: &str,
+        required: &[Feature],
+    ) -> Result<&'static str, CoreError> {
+        self.select_backend(model, required).map(|b| b.api_name())
+    }
+
+    /// Which surfaces served `model_id` in the last aggregated listing.
+    pub(crate) fn backends_serving(&self, model_id: &str) -> Vec<&'static str> {
+        self.backends_serving
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(model_id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// The AWS SDK clients for this connection, built on first use.
@@ -440,12 +502,9 @@ impl BedrockClient {
         })
     }
 
-    /// The Converse backend for this connection, built on first use.
-    ///
-    /// One backend today, so selection is not a choice yet: every request and
-    /// the whole catalogue go to it. #1018 makes this the full set.
-    fn backend(&self) -> &Arc<ConverseBackend> {
-        self.backend.get_or_init(|| {
+    /// The Converse surface, as its own type.
+    fn converse(&self) -> &Arc<ConverseBackend> {
+        self.converse.get_or_init(|| {
             Arc::new(ConverseBackend::new(
                 Arc::clone(self.sdk()),
                 BackendTimeouts {
@@ -455,6 +514,208 @@ impl BedrockClient {
                 },
             ))
         })
+    }
+
+    /// The API surfaces this connection speaks, built on first use.
+    fn backends(&self) -> &[Arc<dyn BedrockBackend>] {
+        self.backends
+            .get_or_init(|| vec![Arc::clone(self.converse()) as Arc<dyn BedrockBackend>])
+    }
+
+    /// Merge every backend's catalogue into one.
+    ///
+    /// **A failing backend degrades the catalogue; it does not empty it.** The
+    /// loop deliberately does not use `?`: one surface refusing its listing -
+    /// an IAM policy that grants the control plane on one endpoint and not
+    /// another - would otherwise take every other surface's models down with
+    /// it. The failure becomes a notice that names the surface, beside the
+    /// models the others could still read.
+    ///
+    /// Every backend failing is a different case, and it does fail: there is
+    /// no catalogue and no surface left to ask, so an empty success would tell
+    /// a client the account has no models.
+    ///
+    /// **A model appears once.** A person picks a model, not a model-and-API
+    /// pair. Where several surfaces reach one id, the entry is de-duplicated
+    /// and the full set of surfaces is recorded beside it.
+    ///
+    /// The surviving row is the first-registered surface's, and its
+    /// `ModelCapabilities` and `context_limit` come from that surface alone.
+    /// Where two surfaces describe one model differently, the later one's
+    /// answer is lost. Composing them - the union across surfaces, keeping
+    /// which surface provides each capability - is #1013, and it needs the
+    /// three-state capability model that #1012 introduces. Until then the
+    /// surface set here is what records that more than one answer existed.
+    ///
+    /// Reach does **not** filter this. `ConverseBackend::can_serve` reports
+    /// that Converse cannot serve an embedding model, and the Converse listing
+    /// is still where the daemon's embedding path finds those models. Removing
+    /// them here takes them out of the picker; `InvokeBackend` (#1017) is what
+    /// makes reach and the catalogue agree.
+    async fn aggregate_models(&self) -> Result<ModelListingReport, CoreError> {
+        let mut models: Vec<ModelInfo> = Vec::new();
+        let mut notices = Vec::new();
+        let mut serving: BTreeMap<String, Vec<&'static str>> = BTreeMap::new();
+        let mut first_error: Option<CoreError> = None;
+        let mut any_listed = false;
+
+        for backend in self.backends() {
+            let surface = backend.api_name();
+            match backend.list_models().await {
+                Ok(report) => {
+                    any_listed = true;
+                    for model in report.models {
+                        serving.entry(model.id.clone()).or_default().push(surface);
+                        models.push(model);
+                    }
+                    notices.extend(report.notices);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        surface,
+                        %error,
+                        "a Bedrock API surface could not list its models; the catalogue \
+                         keeps what the other surfaces returned"
+                    );
+                    // The summary names no API. A person configures one Bedrock
+                    // connection and picks a model, never a surface, so a
+                    // partial catalogue is reported as a partial catalogue. The
+                    // surface stays in the log line above, where an operator
+                    // debugging the connection will look for it.
+                    notices.push(ModelListingNotice::partial_catalog(
+                        "Some Bedrock models are missing from the list",
+                        truncate_chars(
+                            &format!(
+                                "Part of this connection's model listing failed, so some \
+                                 models are missing. Refresh to try again. AWS said - {error}"
+                            ),
+                            MAX_NOTICE_DETAIL_CHARS,
+                        ),
+                    ));
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+        }
+
+        if !any_listed {
+            return Err(first_error.unwrap_or_else(|| {
+                CoreError::Llm("this Bedrock connection speaks no API surface".into())
+            }));
+        }
+
+        // Stable ordering so UIs don't shuffle between refreshes, then a
+        // total merge so one id cannot appear twice.
+        models.sort_by(|a, b| a.id.cmp(&b.id));
+        models.dedup_by(|a, b| a.id == b.id);
+
+        *self
+            .backends_serving
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = serving;
+
+        Ok(ModelListingReport { models, notices })
+    }
+
+    /// Choose the surface that will serve `model`.
+    ///
+    /// Two steps, in order.
+    ///
+    /// **Reach.** Keep the surfaces whose `can_serve` accepts the model. None
+    /// accepting is a refusal that names the model and every surface asked,
+    /// rather than a `ValidationException` from AWS part-way into the turn.
+    ///
+    /// **Requested features.** Among those, keep the surfaces whose
+    /// capabilities satisfy everything the turn cannot do without. Where no
+    /// single surface satisfies all of them, the refusal names the model, the
+    /// features and which surface provides each - a partial capability is the
+    /// user's decision, not the connector's. `required_features` is empty
+    /// today, and its doc records why each candidate is a degradation rather
+    /// than a requirement.
+    ///
+    /// **The tie-break is registration order.** A connector has no conversation
+    /// identity, so it cannot prefer the surface that already served this
+    /// conversation. Determinism gives the same result without one: the same
+    /// model and the same requirements always pick the same surface, so
+    /// consecutive turns of one conversation stay together, and the prompt
+    /// cache a change of surface would invalidate stays warm.
+    fn select_backend(
+        &self,
+        model: &str,
+        required: &[Feature],
+    ) -> Result<&Arc<dyn BedrockBackend>, CoreError> {
+        let reaching: Vec<&Arc<dyn BedrockBackend>> = self
+            .backends()
+            .iter()
+            .filter(|backend| backend.can_serve(model))
+            .collect();
+
+        if reaching.is_empty() {
+            // Whether the catalogue holds the model separates the two faults a
+            // person can act on, and they have opposite fixes. An id no
+            // listing returned is a wrong id, a stale picker, or an IAM policy
+            // that hides the model. An id the catalogue does hold is a model
+            // this connection lists but cannot use for a conversation - an
+            // embedding model is the case that reaches this - and the fix is
+            // to pick a different model, not to change a policy.
+            let listed = !self.backends_serving(model).is_empty();
+            let remedy = match listed {
+                true => {
+                    "this connection lists that model but cannot use it for a \
+                         conversation - embedding models are listed so they can be \
+                         selected for embeddings. Pick a text model"
+                }
+                false => {
+                    "no Bedrock listing on this connection returned that model. \
+                          Check the model id, or refresh the model list"
+                }
+            };
+            return Err(CoreError::Llm(format!(
+                "Bedrock cannot serve model {model}: {remedy}."
+            )));
+        }
+
+        if let Some(chosen) = reaching
+            .iter()
+            .find(|backend| {
+                let capabilities = backend.capabilities(model);
+                required
+                    .iter()
+                    .all(|feature| feature.provided_by(&capabilities))
+            })
+            .copied()
+        {
+            return Ok(chosen);
+        }
+
+        let wanted: Vec<&str> = required.iter().map(|f| f.label()).collect();
+        let providers: Vec<String> = required
+            .iter()
+            .map(|feature| {
+                let from: Vec<&str> = reaching
+                    .iter()
+                    .filter(|b| feature.provided_by(&b.capabilities(model)))
+                    .map(|b| b.api_name())
+                    .collect();
+                match from.is_empty() {
+                    true => format!("{}: no surface", feature.label()),
+                    false => format!("{}: {}", feature.label(), from.join(" or ")),
+                }
+            })
+            .collect();
+
+        Err(CoreError::Llm(format!(
+            "model {model} cannot be served with everything this turn needs \
+             ({}); no single Bedrock API surface provides them all - {}",
+            wanted.join(", "),
+            providers.join("; ")
+        )))
+    }
+
+    /// The surfaces this connection speaks, by name, for a diagnostic.
+    fn surface_names(&self) -> Vec<&'static str> {
+        self.backends().iter().map(|b| b.api_name()).collect()
     }
 
     /// Return the model ID as the stable version identifier.
@@ -1944,7 +2205,7 @@ impl BedrockClient {
     /// Force a refresh: bypass the cache, fetch from Bedrock, and populate
     /// the cache on success.
     async fn refresh_models_internal(&self) -> Result<ModelListingReport, CoreError> {
-        let fresh = self.backend().list_models().await?;
+        let fresh = self.aggregate_models().await?;
         let now = self.clock.now();
         let mut cache = self.model_cache.lock().await;
         cache.entry = Some((now, fresh.clone()));
@@ -2006,7 +2267,7 @@ impl LlmClient for BedrockClient {
     /// the registry spawns beside it. A failure leaves the register empty,
     /// which is the conservative answer the gates already have.
     async fn warmup(&self) {
-        match self.backend().list_models().await {
+        match self.aggregate_models().await {
             Ok(report) if report.notices.is_empty() => {
                 let now = self.clock.now();
                 let mut cache = self.model_cache.lock().await;
@@ -2022,7 +2283,7 @@ impl LlmClient for BedrockClient {
             Ok(report) => {
                 tracing::warn!(
                     notices = report.notices.len(),
-                    surface = self.backend().api_name(),
+                    surfaces = self.surface_names().join(", "),
                     "Bedrock model listing came back degraded at startup; not caching it. \
                      Inference profiles missing from it resolve by their id, so they get \
                      no reasoning, no prompt cache and no context window until a later \
@@ -2076,23 +2337,11 @@ impl LlmClient for BedrockClient {
         // request for it, and the refusal names the model and the surfaces
         // that were asked - a `ValidationException` from AWS several hundred
         // milliseconds later says none of that.
-        let backend = self.backend();
-        if !backend.can_serve(&model) {
-            return Err(CoreError::Llm(format!(
-                "no Bedrock API this connection speaks can serve model {model}; \
-                 the {} surface reports it cannot",
-                backend.api_name()
-            )));
-        }
-
-        let request = BedrockRequest {
-            // Two halves of one question. The operator's policy permits a
-            // checkpoint, and this API surface accepts one for this model. The
-            // backend adds a third condition of its own - whether the model
-            // has already refused a checkpoint here - because a refusal is per
-            // (surface, model).
-            cache_checkpoint: self.cache_policy.permits_checkpoint()
-                && backend.capabilities(&model).cache_control,
+        let mut request = BedrockRequest {
+            // Filled in below, once the surface that will serve this turn is
+            // known: whether a checkpoint is accepted is a property of the
+            // surface and the model together, not of the model alone.
+            cache_checkpoint: false,
             model,
             messages,
             tools: tools.to_vec(),
@@ -2105,6 +2354,16 @@ impl LlmClient for BedrockClient {
             },
             cancellation,
         };
+
+        let backend = self.select_backend(&request.model, &required_features(&request))?;
+
+        // Two halves of one question. The operator's policy permits a
+        // checkpoint, and the chosen surface accepts one for this model. The
+        // backend adds a third condition of its own - whether the model has
+        // already refused a checkpoint there - because a refusal is per
+        // (surface, model).
+        request.cache_checkpoint = self.cache_policy.permits_checkpoint()
+            && backend.capabilities(&request.model).cache_control;
 
         backend.stream_completion(request, on_chunk).await
     }
@@ -2441,7 +2700,7 @@ mod tests {
     /// on either alone would pass while the pair disagreed.
     fn wants_cache_checkpoint(policy: CachePolicy, model_id: &str) -> bool {
         let client = BedrockClient::new(String::new());
-        policy.permits_checkpoint() && client.backend().capabilities(model_id).cache_control
+        policy.permits_checkpoint() && client.converse().capabilities(model_id).cache_control
     }
 
     // --- tool input_schema sanitization (top-level oneOf/anyOf/allOf) -----
@@ -6147,7 +6406,7 @@ mod tests {
         // The point of the test. `BedrockConnector` (#1018) holds this exact
         // type, so a return-position `impl Trait` edit to the trait must fail
         // here rather than in the entry that tries to build the connector.
-        let backends: Vec<Arc<dyn BedrockBackend>> = vec![client.backend().clone()];
+        let backends: Vec<Arc<dyn BedrockBackend>> = vec![client.converse().clone()];
 
         assert_eq!(
             backends[0].api_name(),
@@ -6159,7 +6418,7 @@ mod tests {
     #[test]
     fn converse_reports_cache_control_for_anthropic_and_not_for_meta() {
         let client = backend_client();
-        let backend = client.backend();
+        let backend = client.converse();
 
         assert!(
             backend
@@ -6178,7 +6437,7 @@ mod tests {
     #[test]
     fn converse_reports_cache_control_the_same_through_an_inference_profile_prefix() {
         let client = backend_client();
-        let backend = client.backend();
+        let backend = client.converse();
 
         assert_eq!(
             backend
@@ -6200,7 +6459,7 @@ mod tests {
     #[test]
     fn converse_reports_reasoning_only_where_the_request_builder_will_send_it() {
         let client = backend_client();
-        let backend = client.backend();
+        let backend = client.converse();
 
         for model in [
             "anthropic.claude-sonnet-4-6",
@@ -6221,7 +6480,9 @@ mod tests {
     #[test]
     fn converse_claims_no_capability_this_backend_does_not_actually_send() {
         let client = backend_client();
-        let caps = client.backend().capabilities("anthropic.claude-sonnet-4-6");
+        let caps = client
+            .converse()
+            .capabilities("anthropic.claude-sonnet-4-6");
 
         assert!(
             !caps.vision,
@@ -6289,7 +6550,7 @@ mod tests {
         // reduces it before answering, so this one does too.
         assert!(
             !client
-                .backend()
+                .converse()
                 .can_serve("us.amazon.titan-embed-text-v2:0"),
             "a profile routing to an embedding model is that model, and Converse cannot serve it"
         );
@@ -6306,7 +6567,7 @@ mod tests {
             .await
             .expect("the listing must succeed for the backend to learn any model kind");
 
-        let backend = client.backend();
+        let backend = client.converse();
         assert!(
             !backend.can_serve("amazon.titan-embed-text-v2:0"),
             "Converse cannot serve an embedding model, so no request for one may be routed here"
@@ -6322,7 +6583,7 @@ mod tests {
         let client = backend_client();
         assert!(
             client
-                .backend()
+                .converse()
                 .can_serve("some.model-this-account-never-listed"),
             "reach defaults permissive: an unlisted id dispatches exactly as it does today, \
              rather than being refused by a catalogue that never described it"
@@ -6345,5 +6606,432 @@ mod tests {
         // early would take every embedding model out of the picker and off the
         // daemon's embedding path.
         find_model(&report, "amazon.titan-embed-text-v2:0");
+    }
+
+    // ---- Aggregation and selection across several backends (#1018) ----
+
+    use crate::backend::{BackendApiCapabilities, BedrockRequest, Feature, required_features};
+
+    /// A backend under the test's control.
+    ///
+    /// Real backends reach AWS, so nothing else can put two of them side by
+    /// side, which is the only shape in which aggregation and selection have
+    /// anything to decide.
+    struct FakeBackend {
+        name: &'static str,
+        serves: Vec<String>,
+        listing: Option<ModelListingReport>,
+        caps: BackendApiCapabilities,
+        calls: Arc<Mutex<usize>>,
+    }
+
+    /// A capability answer with everything off, so a test states only the
+    /// fields it is about.
+    fn no_capabilities() -> BackendApiCapabilities {
+        BackendApiCapabilities {
+            streaming: false,
+            tools: false,
+            vision: false,
+            cache_control: false,
+            reasoning: false,
+            hosted_tool_search: false,
+            embeddings: false,
+        }
+    }
+
+    impl FakeBackend {
+        fn new(name: &'static str, serves: &[&str]) -> Self {
+            // A distinct context limit per surface, so a test can tell whose
+            // row survived de-duplication. Identical rows would make the loss
+            // invisible.
+            let limit = 1_000 + u64::from(name.bytes().next().unwrap_or(b'a'));
+            Self {
+                name,
+                serves: serves.iter().map(|s| s.to_string()).collect(),
+                listing: Some(ModelListingReport::complete(
+                    serves.iter().map(|id| model_named(id, limit)).collect(),
+                )),
+                caps: no_capabilities(),
+                calls: Arc::new(Mutex::new(0)),
+            }
+        }
+
+        fn that_fails_to_list(mut self) -> Self {
+            self.listing = None;
+            self
+        }
+
+        fn with_capabilities(mut self, caps: BackendApiCapabilities) -> Self {
+            self.caps = caps;
+            self
+        }
+    }
+
+    fn model_named(id: &str, context_limit: u64) -> ModelInfo {
+        ModelInfo {
+            id: id.to_string(),
+            display_name: id.to_string(),
+            context_limit: Some(context_limit),
+            capabilities: ModelCapabilities::default(),
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BedrockBackend for FakeBackend {
+        fn api_name(&self) -> &'static str {
+            self.name
+        }
+
+        fn can_serve(&self, model_id: &str) -> bool {
+            self.serves.iter().any(|s| s == model_id)
+        }
+
+        async fn list_models(&self) -> Result<ModelListingReport, CoreError> {
+            match &self.listing {
+                Some(report) => Ok(report.clone()),
+                None => Err(CoreError::Llm(format!("{} listing failed", self.name))),
+            }
+        }
+
+        fn capabilities(&self, _model_id: &str) -> BackendApiCapabilities {
+            self.caps
+        }
+
+        async fn stream_completion(
+            &self,
+            _request: BedrockRequest,
+            _on_chunk: ChunkCallback,
+        ) -> Result<LlmResponse, CoreError> {
+            *self.calls.lock().expect("count a dispatch") += 1;
+            Err(CoreError::RateLimited {
+                retry_after: None,
+                detail: "always retryable".into(),
+            })
+        }
+    }
+
+    fn client_with(backends: Vec<Arc<dyn BedrockBackend>>) -> BedrockClient {
+        BedrockClient::new(String::new()).__with_backends_for_test(backends)
+    }
+
+    #[tokio::test]
+    async fn a_failing_backend_degrades_the_catalogue_and_names_itself() {
+        let client = client_with(vec![
+            Arc::new(FakeBackend::new("alpha", &["alpha.model"]).that_fails_to_list()),
+            Arc::new(FakeBackend::new("beta", &["beta.model"])),
+        ]);
+
+        let report = client
+            .list_models_detailed()
+            .await
+            .expect("one backend failing must not empty the catalogue");
+
+        find_model(&report, "beta.model");
+        let notice = report
+            .notices
+            .first()
+            .expect("the failure must reach the caller as data, not only a log line");
+        assert!(
+            notice.detail.contains("alpha"),
+            "the notice must name the backend that failed, got {:?}",
+            notice.detail
+        );
+    }
+
+    #[tokio::test]
+    async fn every_backend_failing_fails_the_listing() {
+        let client = client_with(vec![
+            Arc::new(FakeBackend::new("alpha", &["alpha.model"]).that_fails_to_list()),
+            Arc::new(FakeBackend::new("beta", &["beta.model"]).that_fails_to_list()),
+        ]);
+
+        client.list_models_detailed().await.expect_err(
+            "a catalogue with nothing in it and no surface left to ask is a failure, \
+             not an empty success",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_model_two_backends_serve_appears_once_with_both_recorded() {
+        let client = client_with(vec![
+            Arc::new(FakeBackend::new("alpha", &["shared.model"])),
+            Arc::new(FakeBackend::new("beta", &["shared.model"])),
+        ]);
+
+        let report = client.list_models_detailed().await.expect("both list");
+
+        let hits = report
+            .models
+            .iter()
+            .filter(|m| m.id == "shared.model")
+            .count();
+        assert_eq!(hits, 1, "a person picks a model, not a model-and-API pair");
+        assert_eq!(
+            client.backends_serving("shared.model"),
+            vec!["alpha", "beta"],
+            "the discarded backend carries capabilities the kept one does not, \
+             so the set is kept whole"
+        );
+        assert_eq!(
+            find_model(&report, "shared.model").context_limit,
+            Some(1_000 + u64::from(b'a')),
+            "the first registered surface's row survives. Which one survives is a \
+             contract, not an accident: #1013 composes the two answers, and until it \
+             lands a reader has to know whose answer they are looking at"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_needing_a_feature_no_reaching_surface_provides_fails_by_name() {
+        // Both surfaces reach the model and neither can send an image, which
+        // is the shape a turn carrying one would meet. The refusal has to say
+        // what was wanted, not just that something was refused.
+        //
+        // The design's other case - two features split so that each surface
+        // has one and neither has both - cannot be built yet, because `Feature`
+        // has one variant. It becomes constructible with the second requirable
+        // capability, and the message path below is the same one it takes.
+        let client = client_with(vec![
+            Arc::new(FakeBackend::new("alpha", &["split.model"])),
+            Arc::new(FakeBackend::new("beta", &["split.model"])),
+        ]);
+
+        let error = client
+            .__select_backend_for_test("split.model", &[Feature::Vision])
+            .expect_err("no reaching surface provides vision, so the turn cannot be served");
+
+        let detail = error.to_string();
+        for named in ["split.model", "vision", "no surface"] {
+            assert!(
+                detail.contains(named),
+                "the refusal must name {named}, got {detail}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_surface_that_provides_the_feature_is_chosen_over_one_that_does_not() {
+        let with_vision = BackendApiCapabilities {
+            vision: true,
+            ..no_capabilities()
+        };
+        let client = client_with(vec![
+            Arc::new(FakeBackend::new("alpha", &["split.model"])),
+            Arc::new(FakeBackend::new("beta", &["split.model"]).with_capabilities(with_vision)),
+        ]);
+
+        assert_eq!(
+            client
+                .__select_backend_for_test("split.model", &[Feature::Vision])
+                .expect("one surface provides it"),
+            "beta",
+            "reach is the first filter and the requested feature is the second, so the \
+             surface that cannot serve the turn must not win on registration order"
+        );
+    }
+
+    #[test]
+    fn soft_capabilities_never_become_hard_requirements() {
+        // The dangerous edit is promoting a degradation into a refusal. A
+        // missing checkpoint costs input tokens; a reasoning budget the model
+        // cannot take is reported and dropped (#1022). Neither may refuse a
+        // turn, so neither may appear here.
+        let wants_both = BedrockRequest {
+            model: "anthropic.claude-sonnet-4-6".into(),
+            messages: vec![Message::new(Role::User, "hi")],
+            tools: Vec::new(),
+            tool_names: ToolNameMap::from_names(std::iter::empty::<&str>()),
+            reasoning: ReasoningConfig::with_thinking_budget(4096),
+            sampling: crate::backend::SamplingParams::default(),
+            cache_checkpoint: true,
+            cancellation: Default::default(),
+        };
+
+        let required = required_features(&wants_both);
+        // `Feature` deliberately has no `CacheControl` or `Reasoning`
+        // variant to assert against: a capability that can never be required
+        // is not part of the requirement vocabulary. Emptiness is therefore
+        // the whole guarantee, and it fails the moment somebody adds a
+        // variant and pushes it for either of these.
+        assert!(
+            required.is_empty(),
+            "a withheld prompt cache costs tokens and an unusable reasoning budget is \
+             reported and dropped (#1022); neither may refuse a turn. No message can \
+             carry an image yet (#1059). Got {required:?}"
+        );
+    }
+
+    /// A model that streams and does **not** accept a cache checkpoint, so a
+    /// turn against it exercises the capability term of the checkpoint
+    /// decision rather than the policy term.
+    const NON_CACHING_STREAMING_MODEL: &str = "us.deepseek.r1-v1:0";
+
+    #[tokio::test]
+    async fn a_model_whose_surface_refuses_checkpoints_sends_none_under_the_default_policy() {
+        // The policy permits a checkpoint and the surface does not accept one
+        // for this model, so nothing may go on the wire. Asserting this at the
+        // wire and not against a re-derived expression is the point: a test
+        // that recomputes the connector's own condition agrees with the
+        // connector however wrong the connector is.
+        let server = httpmock::MockServer::start();
+        let converse_stream = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path_matches(r"/converse-stream$")
+                .body_excludes(CACHE_POINT_MARKER);
+            then.status(400)
+                .header("x-amzn-errortype", "ValidationException")
+                .header("content-type", "application/json")
+                .body(validation_exception_body("mock endpoint: request observed"));
+        });
+
+        let client = BedrockClient::new(format!("AKIAIOSFODNN7EXAMPLE:{TEST_SECRET_ACCESS_KEY}"))
+            .with_base_url("us-east-1")
+            .__with_runtime_endpoint_for_test(server.url(""))
+            .with_model(NON_CACHING_STREAMING_MODEL);
+
+        let _ = client
+            .stream_completion(
+                caching_history(),
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await;
+
+        assert_eq!(
+            converse_stream.calls(),
+            1,
+            "a checkpoint this model rejects would fail the turn, and recovering from \
+             that costs a wasted call on every turn until the memo catches up"
+        );
+    }
+
+    #[test]
+    fn backend_selection_follows_registration_order_and_repeats_it() {
+        let surface =
+            |name| Arc::new(FakeBackend::new(name, &["shared.model"])) as Arc<dyn BedrockBackend>;
+
+        // Both orders, because "deterministic" alone is unfalsifiable: a `Vec`
+        // walked by `find` cannot vary within a process, so a test that only
+        // repeats one client passes however selection iterates. Registration
+        // order is the actual contract, and reversing the iteration has to
+        // break this.
+        for order in [["alpha", "beta"], ["beta", "alpha"]] {
+            let client = client_with(order.iter().map(|n| surface(n)).collect());
+            let expected = order[0];
+
+            for _ in 0..4 {
+                assert_eq!(
+                    client
+                        .__select_backend_for_test("shared.model", &[])
+                        .expect("a served model resolves"),
+                    expected,
+                    "the first registered surface that reaches the model wins, and wins \
+                     again next turn - or every turn pays a cold prompt cache"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_turn_against_a_model_no_surface_reaches_is_refused_before_dispatch() {
+        let backend = Arc::new(FakeBackend::new("alpha", &["alpha.model"]));
+        let calls = Arc::clone(&backend.calls);
+        let client = client_with(vec![backend]).with_model("unreachable.model");
+
+        let error = client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await
+            .expect_err("no surface reaches this model, so the turn cannot be served");
+
+        assert_eq!(
+            *calls.lock().expect("read the count"),
+            0,
+            "the refusal must come before the request goes out; reaching AWS to be told \
+             the same thing costs the turn a round trip and returns an opaque \
+             ValidationException"
+        );
+        let detail = error.to_string();
+        assert!(
+            detail.contains("unreachable.model"),
+            "the refusal must name the model, got {detail}"
+        );
+        assert!(
+            detail.contains("refresh") || detail.contains("model id"),
+            "the refusal must say what to do next, got {detail}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turn_offering_tools_is_refused_by_a_surface_that_carries_none() {
+        // The shape #1017 introduces: `InvokeBackend` reaches the models
+        // Converse refuses, and for an embedding or image model it carries no
+        // tools. Dropping the tool list silently would answer a different
+        // question from the one the caller asked.
+        let backend = Arc::new(FakeBackend::new("alpha", &["alpha.model"]));
+        let calls = Arc::clone(&backend.calls);
+        let client = client_with(vec![backend]).with_model("alpha.model");
+
+        let error = client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &[ToolDefinition::new(
+                    "weather",
+                    "look up the weather",
+                    serde_json::json!({"type": "object"}),
+                )],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await
+            .expect_err("the surface carries no tools, so it cannot serve a turn with one");
+
+        assert_eq!(
+            *calls.lock().expect("read the count"),
+            0,
+            "refused before dispatch"
+        );
+        assert!(
+            error.to_string().contains("tools"),
+            "the refusal must name the missing capability, got {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turn_offering_no_tools_does_not_demand_them() {
+        let client = client_with(vec![Arc::new(FakeBackend::new("alpha", &["alpha.model"]))]);
+
+        client
+            .__select_backend_for_test("alpha.model", &[])
+            .expect("a turn with no tools must not require a surface that carries them");
+    }
+
+    #[tokio::test]
+    async fn the_connector_holds_no_retry_loop() {
+        let backend = Arc::new(FakeBackend::new("alpha", &["alpha.model"]));
+        let calls = Arc::clone(&backend.calls);
+        let client = client_with(vec![backend]).with_model("alpha.model");
+
+        client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .await
+            .expect_err("the backend always fails");
+
+        assert_eq!(
+            *calls.lock().expect("read the count"),
+            1,
+            "RetryingLlmClient already wraps this connector from outside; a second \
+             loop here nests the backoffs and multiplies the attempts"
+        );
     }
 }
