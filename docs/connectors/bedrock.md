@@ -188,15 +188,22 @@ A geography newer than the prefix list has the same shape. Both are ordinary
 listed profiles, so both are registered.
 
 **One id it does not fix, on purpose.** A turn can dispatch a model the listing
-never returned - a configured `default_model`, a per-turn model override, or a
-keep-warm probe before the first listing. The register has no entry, so the
-prefix rule alone decides, which is the conservative answer: no thinking budget
-(reported at `warn!`, never silently dropped), no cache checkpoint, no context
-window, and the streaming path with its runtime fallback. The connector does
-**not** refresh the listing to answer, because that would put a control-plane
-call, its IAM failure modes and its latency on the turn path. The boundary is
-the miss, not the model: the same id resolves fully as soon as any listing on
-this daemon has returned it.
+never returned - a per-turn model override for a profile this connection does
+not list, or any id the account does not return. The register has no entry, so
+the prefix rule alone decides, which is the conservative answer: no thinking
+budget (reported at `warn!`, never silently dropped), no cache checkpoint, no
+context window, and the streaming path with its runtime fallback. The connector
+does **not** refresh the listing to answer, because that would put a
+control-plane call, its IAM failure modes and its latency on the turn path. The
+boundary is the miss, not the model: the same id resolves fully as soon as any
+listing in this process has returned it.
+
+**The register is warmed at startup.** The connection's `warmup` lists the
+models once, detached, so a configured model that is an application profile is
+already registered when the first turn arrives - rather than only after
+whichever client first opens the model picker. It warms the listing cache at the
+same time. A failed warm is a `debug!` line and leaves the conservative answer
+in place, so a connection nobody uses cannot fail startup.
 
 Only a profile whose base model this account did not list falls back to a
 family guess from the id, which reports vision from the family and treats the

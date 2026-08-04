@@ -1897,6 +1897,29 @@ impl LlmClient for BedrockClient {
         self.refresh_models_internal().await
     }
 
+    /// List the models once at startup, so the profile-to-base-model register
+    /// is populated before the first turn.
+    ///
+    /// A turn never calls the control plane to resolve a model id, so an
+    /// inference profile no listing has returned answers from the prefix rule
+    /// alone. Doing the listing here means the configured model of a live
+    /// connection is already registered when the first turn arrives, instead
+    /// of only after whichever client happens to open the model picker. It
+    /// warms the listing cache as well.
+    ///
+    /// Best-effort and detached, exactly like the Ollama context-length warm
+    /// the registry spawns beside it. A failure leaves the register empty,
+    /// which is the conservative answer the gates already have.
+    async fn warmup(&self) {
+        if let Err(error) = self.list_models_cached().await {
+            tracing::debug!(
+                %error,
+                "Bedrock model listing failed at startup; inference profiles resolve \
+                 by their id until a later listing succeeds"
+            );
+        }
+    }
+
     async fn stream_completion(
         &self,
         messages: Vec<Message>,
@@ -4590,6 +4613,55 @@ mod tests {
         assert!(
             !find_model(&report, APP_PROFILE_LLAMA).capabilities.vision,
             "a text-only base model must not be advertised as vision-capable"
+        );
+    }
+
+    /// `ListInferenceProfiles` with one `APPLICATION` profile whose id no
+    /// other test lists, so "before the listing" is a meaningful state.
+    const WARMUP_PROFILES_BODY: &str = r#"{
+      "inferenceProfileSummaries": [
+        {
+          "inferenceProfileName": "startup-team-claude",
+          "inferenceProfileArn": "arn:aws:bedrock:us-east-1:111122223333:application-inference-profile/w7f3j5s8v2qd",
+          "inferenceProfileId": "w7f3j5s8v2qd",
+          "models": [
+            {"modelArn": "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-sonnet-4-5-20250929-v1:0"}
+          ],
+          "status": "ACTIVE",
+          "type": "APPLICATION"
+        }
+      ]
+    }"#;
+
+    #[tokio::test]
+    async fn warmup_registers_profile_base_models_before_the_first_turn() {
+        // The register is populated by a listing, and a turn will not make
+        // one. Startup does, so a configured application profile answers for
+        // its base model on the very first turn rather than after whichever
+        // client happens to open the picker.
+        const ID: &str = "w7f3j5s8v2qd";
+        let server = httpmock::MockServer::start();
+        mock_foundation_models(&server);
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/inference-profiles");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(WARMUP_PROFILES_BODY);
+        });
+
+        assert_eq!(
+            base_model_for(ID),
+            ID,
+            "fixture check: nothing may have registered this id yet"
+        );
+
+        control_plane_client(&server).warmup().await;
+
+        assert_eq!(
+            base_model_for(ID),
+            APP_PROFILE_CLAUDE_BASE,
+            "startup listing must leave the register ready for the first turn"
         );
     }
 
