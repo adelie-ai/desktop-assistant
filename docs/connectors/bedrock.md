@@ -39,7 +39,7 @@ client, not a second serialization over the shared one.
 ## Architecture
 
 ```
-                    BedrockConnector  (implements LlmClient)
+                    BedrockClient  (implements LlmClient)
                     - model aggregation and de-duplication
                     - backend selection
                     - capability composition
@@ -92,10 +92,10 @@ pub trait BedrockBackend: Send + Sync {
 ```
 
 The trait uses `#[async_trait]`. It does not use `-> impl Future` in return
-position, because `BedrockConnector` holds `Vec<Arc<dyn BedrockBackend>>` and
+position, because `BedrockClient` holds `Vec<Arc<dyn BedrockBackend>>` and
 return-position `impl Trait` is not dyn-compatible.
 
-`BedrockBackend` does not extend `LlmClient`. `BedrockConnector` implements
+`BedrockBackend` does not extend `LlmClient`. `BedrockClient` implements
 `LlmClient`, and the backends sit behind it. This keeps `core` unaware of
 Bedrock internals, and keeps each backend responsible for one API.
 
@@ -300,23 +300,29 @@ Selection runs in two steps, in this order.
    when the cache policy is on, vision when the messages carry images, and so
    on.
 
-**A requested feature is one the turn cannot do without, and no more.** A
-capability whose absence costs money or plainness is not one: a withheld cache
-checkpoint costs input tokens, and a reasoning budget a model cannot take is
-reported and dropped. Promoting either into the requirement set turns a
-degraded turn into a refused turn for every model that lacks it. The set is
-empty today, because the only capability that could be hard is vision and no
-message can carry an image.
+**A requested feature is one the turn cannot do without, and no more.** The
+test is whether the absence makes the answer wrong, not whether it makes the
+answer dearer or plainer. Every capability is weighed against it:
 
-When more than one backend qualifies, the choice is **deterministic**:
-registration order decides. An earlier revision of this design said "prefer the
-backend that already served this conversation", and a connector cannot do that
-- no conversation identity reaches one, and none of the task-locals a connector
-may read names a conversation. The reason behind that wording is real, because
-a change of backend inside a conversation invalidates the prompt cache, and
-determinism delivers it: one model and one requirement set always pick one
-backend, so consecutive turns stay together without anyone tracking a
-conversation.
+| Capability | Hard? | Why |
+|---|---|---|
+| Tools | Yes | A backend that drops the tool list answers a different question from the one the caller asked, and the turn cannot recover. |
+| Vision | Yes, but not yet demandable | No message can carry an image, so no turn can need one. |
+| Cache control | No | A withheld checkpoint costs input tokens and nothing else. |
+| Reasoning | No | A budget the model cannot take is reported and dropped. Demanding it would refuse every model that reasons without taking a setting. |
+| Streaming | No | The backend trait guarantees the chunk callback fires at least once whatever path a backend takes. |
+| Embeddings, hosted tool search | No | Neither is a property a completion turn asks for. Reach answers the first. |
+
+Promoting a soft capability into the set turns a degraded turn into a refused
+turn for every model that lacks it, across the whole fleet.
+
+When more than one backend qualifies, **registration order decides**. A
+connector has no conversation identity - none of the task-locals it may read
+names a conversation - so it cannot prefer the backend that already served
+this one. Determinism gives the same result without it: one model and one
+requirement set always pick one backend, so consecutive turns of a
+conversation stay together, and the prompt cache that a change of backend
+would invalidate stays warm.
 
 When no single backend satisfies every requested feature, the connector fails
 and names the conflict: the model, the features asked for, and the backend that

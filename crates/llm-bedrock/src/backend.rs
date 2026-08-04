@@ -145,6 +145,11 @@ pub(crate) struct BedrockRequest {
 /// here is how a degraded turn becomes a refused turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Feature {
+    /// The turn offers tools, so a surface that cannot carry them cannot serve
+    /// it. A surface that drops them answers a different question from the one
+    /// the caller asked, which is why `CoreError::ToolsUnsupported` exists and
+    /// says a caller must switch model or disable tools rather than retry.
+    Tools,
     /// The turn carries image input, so a surface that cannot send one cannot
     /// serve it.
     Vision,
@@ -154,6 +159,7 @@ impl Feature {
     /// Whether `capabilities` provides this feature.
     pub(crate) fn provided_by(self, capabilities: &BackendApiCapabilities) -> bool {
         match self {
+            Feature::Tools => capabilities.tools,
             Feature::Vision => capabilities.vision,
         }
     }
@@ -161,6 +167,7 @@ impl Feature {
     /// The name a refusal uses.
     pub(crate) fn label(self) -> &'static str {
         match self {
+            Feature::Tools => "tools",
             Feature::Vision => "vision",
         }
     }
@@ -178,26 +185,38 @@ fn turn_carries_an_image(_request: &BedrockRequest) -> bool {
 
 /// What this turn cannot be served without.
 ///
-/// **It is empty today, and that is a statement about the request rather than
-/// an omission.** A feature belongs here only when its absence makes the
-/// answer wrong, never when the absence only makes the answer dearer or
-/// plainer. Three candidates, and none qualifies:
+/// The test is whether the absence makes the answer **wrong**, not whether it
+/// makes the answer dearer or plainer. Every field of
+/// [`BackendApiCapabilities`] is weighed against it:
 ///
-/// - **Vision.** No domain message can carry an image: `Message` is text with
-///   tool fields, and no backend builds an image content block. When that
-///   changes (#1059) this is where the requirement is stated.
-/// - **Cache control.** A withheld checkpoint costs input tokens. The turn is
-///   correct either way.
-/// - **Reasoning.** A budget the model cannot take is reported at `warn!` with
-///   the model and the budget, and the turn goes out without it. Refusing
-///   instead would reverse that decision for every model that reasons without
-///   taking a setting, DeepSeek R1 among them.
+/// - **Tools** - hard, and demanded here. A surface that drops the tool list
+///   answers a different question from the one the caller asked, and the turn
+///   cannot recover: `CoreError::ToolsUnsupported` states exactly that, and
+///   says the caller must switch model or disable tools.
+/// - **Vision** - hard, and not yet demandable. No domain message can carry an
+///   image, so no turn can need one. #1059 makes it real, and
+///   `turn_carries_an_image` is where it enters.
+/// - **Cache control** - soft. A withheld checkpoint costs input tokens and
+///   nothing else.
+/// - **Reasoning** - soft, and deliberately so. A budget the model cannot take
+///   is reported at `warn!` with the model and the budget, and the turn goes
+///   out without it. Demanding it here would refuse every model that reasons
+///   without taking a setting, DeepSeek R1 among them.
+/// - **Streaming** - soft. The trait guarantees `on_chunk` fires at least once
+///   whatever path a surface takes, so a surface that cannot stream still
+///   honours the contract.
+/// - **Embeddings** and **hosted tool search** - neither is a property a
+///   completion turn can ask for. Reach answers the first, and nothing in this
+///   connector offers the second.
 ///
-/// The derivation lives in one function so a future hard requirement is added
-/// once, and so a test can hold the soft ones out of it: promoting one turns a
+/// The derivation lives in one function so a future requirement is added once,
+/// and so a test can hold the soft ones out of it: promoting one turns a
 /// degraded turn into a refused turn across the whole fleet.
 pub(crate) fn required_features(request: &BedrockRequest) -> Vec<Feature> {
     let mut required = Vec::new();
+    if !request.tools.is_empty() {
+        required.push(Feature::Tools);
+    }
     if turn_carries_an_image(request) {
         required.push(Feature::Vision);
     }
