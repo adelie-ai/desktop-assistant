@@ -1360,22 +1360,28 @@ fn register_profile_base_model(profile: &aws_sdk_bedrock::types::InferenceProfil
     // prefix rule already reduces it correctly, so the register holds only ids
     // that need it; the ARN is always registered, because no rule reduces an
     // ARN and AWS documents the ARN as an accepted `modelId` for a profile.
-    let mut register = PROFILE_BASE_MODELS
-        // Poisoning is ignored for the same reason it is ignored on read: a
-        // panic elsewhere must not cost every later turn its capabilities.
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
     let profile_arn = profile.inference_profile_arn();
-    if !profile_arn.is_empty() {
-        register.insert(profile_arn.to_string(), base.to_string());
-    }
-    if base != strip_region_prefix(profile_id) {
+    let id_needs_the_register = base != strip_region_prefix(profile_id);
+    if id_needs_the_register {
         tracing::debug!(
             profile_id,
             base,
             "inference profile registered against its base foundation model"
         );
+    }
+
+    // Everything above is decided before the lock, so the write section is
+    // two inserts and no formatting: a `debug!` under the guard would put a
+    // subscriber's work between every profile and the next.
+    let mut register = PROFILE_BASE_MODELS
+        // Poisoning is ignored for the same reason it is ignored on read: a
+        // panic elsewhere must not cost every later turn its capabilities.
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !profile_arn.is_empty() {
+        register.insert(profile_arn.to_string(), base.to_string());
+    }
+    if id_needs_the_register {
         register.insert(profile_id.to_string(), base.to_string());
     }
 }
@@ -1856,7 +1862,13 @@ fn truncated_profiles_notice() -> ModelListingNotice {
     )
 }
 
-/// Build the degradation notice for a failed `ListInferenceProfiles` call.
+/// Build the degradation notice for a failed `ListInferenceProfiles` call for
+/// `SYSTEM_DEFINED` profiles.
+///
+/// It names that half and no more. The two calls are independent, so this one
+/// can fail on a throttle while the `APPLICATION` call succeeds and puts real
+/// models in the list; a notice that said "showing on-demand models only"
+/// would then describe a listing the operator is not looking at.
 ///
 /// `code` / `message` are the service error metadata (both optional: a
 /// transport or timeout failure carries neither). An authorization denial is
@@ -1880,23 +1892,23 @@ fn inference_profiles_notice(code: Option<&str>, message: Option<&str>) -> Model
 
     let detail = if denied {
         format!(
-            "AWS refused ListInferenceProfiles for this connection. Grant \
-             {LIST_INFERENCE_PROFILES_PERMISSION} to surface inference-profile models \
+            "AWS refused ListInferenceProfiles for cross-Region profiles on this \
+             connection. Grant {LIST_INFERENCE_PROFILES_PERMISSION} to surface them \
              (Claude 4.x, Nova Premier, DeepSeek R1 and similar), which are not callable \
              by their bare foundation-model id. AWS said - {}",
             truncate_chars(&cause, MAX_NOTICE_DETAIL_CHARS / 2)
         )
     } else {
         format!(
-            "ListInferenceProfiles failed, so inference-profile models (Claude 4.x, \
-             Nova Premier, DeepSeek R1 and similar) are missing from the list. Refresh \
-             to try again. AWS said - {}",
+            "ListInferenceProfiles failed for cross-Region profiles, so those models \
+             (Claude 4.x, Nova Premier, DeepSeek R1 and similar) are missing from the \
+             list. Refresh to try again. AWS said - {}",
             truncate_chars(&cause, MAX_NOTICE_DETAIL_CHARS / 2)
         )
     };
 
     let notice = ModelListingNotice::partial_catalog(
-        "Bedrock inference profiles unavailable - showing on-demand models only",
+        "Bedrock cross-Region inference profiles unavailable",
         truncate_chars(&detail, MAX_NOTICE_DETAIL_CHARS),
     );
     if denied {
@@ -4254,7 +4266,9 @@ mod tests {
         })
     }
 
-    /// Mock `ListInferenceProfiles` failing with `status` / `error_type`.
+    /// Mock `ListInferenceProfiles` failing with `status` / `error_type`, for
+    /// every profile type. The connector makes one call per type, so this
+    /// intercepts both.
     fn mock_inference_profiles_error<'a>(
         server: &'a httpmock::MockServer,
         status: u16,
@@ -4264,6 +4278,26 @@ mod tests {
         server.mock(|when, then| {
             when.method(httpmock::Method::GET)
                 .path("/inference-profiles");
+            then.status(status)
+                .header("content-type", "application/json")
+                .header("x-amzn-errortype", error_type)
+                .body(body);
+        })
+    }
+
+    /// Mock `ListInferenceProfiles` failing for **one** profile type, so a
+    /// test can pair one type's failure with the other type's success.
+    fn mock_inference_profiles_error_for_type<'a>(
+        server: &'a httpmock::MockServer,
+        profile_type: &str,
+        status: u16,
+        error_type: &str,
+        body: &str,
+    ) -> httpmock::Mock<'a> {
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/inference-profiles")
+                .query_param("type", profile_type);
             then.status(status)
                 .header("content-type", "application/json")
                 .header("x-amzn-errortype", error_type)
@@ -5029,6 +5063,47 @@ mod tests {
             failure.calls() >= 2,
             "a degraded warm must not serve the next caller from the cache, got {} calls",
             failure.calls()
+        );
+    }
+
+    /// The two profile calls are independent, so one can fail on a throttle
+    /// while the other succeeds. The notice must then describe the listing the
+    /// operator is actually looking at, which still has application-profile
+    /// models in it.
+    #[tokio::test]
+    async fn a_system_defined_failure_does_not_claim_every_profile_is_gone() {
+        let server = httpmock::MockServer::start();
+        mock_foundation_models(&server);
+        mock_inference_profiles_error_for_type(
+            &server,
+            "SYSTEM_DEFINED",
+            429,
+            "ThrottlingException",
+            r#"{"message":"Rate exceeded"}"#,
+        );
+        mock_inference_profiles_by_type(&server, "APPLICATION", DRIFTING_APPLICATION_PROFILES_BODY);
+
+        let report = control_plane_client(&server)
+            .list_models_detailed()
+            .await
+            .expect("one failed profile call degrades the listing, it does not fail it");
+
+        find_model(&report, APP_PROFILE_CLAUDE);
+        assert_eq!(
+            base_model_for(APP_PROFILE_CLAUDE),
+            APP_PROFILE_CLAUDE_BASE,
+            "the call that worked still registers what it found"
+        );
+        assert_eq!(report.notices.len(), 1, "one call failed, so one notice");
+        let notice = &report.notices[0];
+        assert!(
+            !notice.summary.contains("on-demand models only")
+                && !notice.detail.contains("on-demand models only"),
+            "the list does contain profile models, so the notice must not deny it: {notice:?}"
+        );
+        assert!(
+            notice.required_permission.is_none(),
+            "a throttle is not a policy problem, so do not send the operator to IAM"
         );
     }
 
