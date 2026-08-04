@@ -22,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 use crate::ToolNameMap;
 
 pub(crate) mod converse;
+pub(crate) mod invoke;
 
 /// One Bedrock API surface.
 ///
