@@ -33,6 +33,14 @@ pub(crate) struct SdkClients {
     control_endpoint_override: Option<String>,
     /// Test-only runtime endpoint. `None` in production.
     runtime_endpoint_override: Option<String>,
+    /// The resolved credentials and region, built once and read by every
+    /// client below.
+    ///
+    /// Its own cell, and not a step inside each client's cell, because
+    /// resolving it is the expensive half: the AWS credential chain reads a
+    /// profile file, and on an instance role or an SSO source it makes a
+    /// network call. A cell per client pays that once per client.
+    shared_config: OnceCell<aws_config::SdkConfig>,
     runtime: OnceCell<Client>,
     control: OnceCell<BedrockControlClient>,
 }
@@ -51,6 +59,7 @@ impl SdkClients {
             aws_profile,
             control_endpoint_override,
             runtime_endpoint_override,
+            shared_config: OnceCell::new(),
             runtime: OnceCell::new(),
             control: OnceCell::new(),
         }
@@ -60,11 +69,11 @@ impl SdkClients {
     pub(crate) async fn runtime(&self) -> Result<&Client, CoreError> {
         self.runtime
             .get_or_try_init(|| async {
-                let shared_config = self.load_shared_config().await;
+                let shared_config = self.shared_config().await;
                 let Some(endpoint) = self.runtime_endpoint_override.as_ref() else {
-                    return Ok(Client::new(&shared_config));
+                    return Ok(Client::new(shared_config));
                 };
-                let config = aws_sdk_bedrockruntime::config::Builder::from(&shared_config)
+                let config = aws_sdk_bedrockruntime::config::Builder::from(shared_config)
                     .endpoint_url(endpoint)
                     .build();
                 Ok(Client::from_conf(config))
@@ -76,15 +85,22 @@ impl SdkClients {
     pub(crate) async fn control(&self) -> Result<&BedrockControlClient, CoreError> {
         self.control
             .get_or_try_init(|| async {
-                let shared_config = self.load_shared_config().await;
+                let shared_config = self.shared_config().await;
                 let Some(endpoint) = self.control_endpoint_override.as_ref() else {
-                    return Ok(BedrockControlClient::new(&shared_config));
+                    return Ok(BedrockControlClient::new(shared_config));
                 };
-                let config = aws_sdk_bedrock::config::Builder::from(&shared_config)
+                let config = aws_sdk_bedrock::config::Builder::from(shared_config)
                     .endpoint_url(endpoint)
                     .build();
                 Ok(BedrockControlClient::from_conf(config))
             })
+            .await
+    }
+
+    /// The resolved credentials and region, resolved on first use.
+    async fn shared_config(&self) -> &aws_config::SdkConfig {
+        self.shared_config
+            .get_or_init(|| self.load_shared_config())
             .await
     }
 

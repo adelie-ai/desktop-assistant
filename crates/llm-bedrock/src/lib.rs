@@ -146,7 +146,7 @@ struct ModelCache {
     entry: Option<(Instant, ModelListingReport)>,
 }
 
-/// Amazon Bedrock client using the Converse API.
+/// One Amazon Bedrock connection, across every API surface it speaks.
 pub struct BedrockClient {
     model: String,
     base_url: String,
@@ -261,6 +261,7 @@ impl BedrockClient {
         if let Some(s) = secs.filter(|s| *s > 0) {
             self.connect_timeout = Duration::from_secs(s);
         }
+        self.rebuild_on_next_use();
         self
     }
 
@@ -270,6 +271,7 @@ impl BedrockClient {
         if let Some(s) = secs.filter(|s| *s > 0) {
             self.event_timeout = Duration::from_secs(s);
         }
+        self.rebuild_on_next_use();
         self
     }
 
@@ -288,6 +290,7 @@ impl BedrockClient {
         if let Some(s) = secs.filter(|s| *s > 0) {
             self.non_streaming_timeout = Duration::from_secs(s);
         }
+        self.rebuild_on_next_use();
         self
     }
 
@@ -6235,6 +6238,61 @@ mod tests {
         );
         assert!(caps.streaming, "ConverseStream serves this backend");
         assert!(caps.tools, "Converse takes a toolConfig");
+    }
+
+    #[tokio::test]
+    async fn a_timeout_set_after_the_backend_is_built_still_reaches_the_dispatch() {
+        let endpoint = stalled_endpoint().await;
+        // Force the backend into existence first, so the budgets it snapshots
+        // are the defaults. A builder that ran after this and did not drop the
+        // built backend would leave the ten-minute default in force while the
+        // caller believes it set one second - visible only as a turn that
+        // hangs for ten minutes.
+        let client = non_streaming_client(&endpoint.url, 600);
+        client
+            .__force_non_streaming_tools_for_test("us.meta.llama4-maverick-17b-instruct-v1:0")
+            .await;
+        let client = client.with_non_streaming_timeout(Some(1));
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(20),
+            client.stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &one_tool(),
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            ),
+        )
+        .await
+        .expect("the one-second budget must end the call, not the ten-minute default");
+
+        let error = outcome.expect_err("a stalled request cannot produce a response");
+        assert!(
+            matches!(&error, CoreError::Llm(detail) if detail.contains("timed out")),
+            "expected the connector's own timeout, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn converse_cannot_serve_an_inference_profile_whose_base_model_is_an_embedding_model() {
+        let server = httpmock::MockServer::start();
+        mock_healthy_control_plane(&server);
+        let client = control_plane_client(&server);
+
+        client
+            .list_models_detailed()
+            .await
+            .expect("the listing must succeed for the backend to learn any model kind");
+
+        // The listing returned the bare id. A turn can carry the profile form
+        // of the same model, and every other per-model gate in this backend
+        // reduces it before answering, so this one does too.
+        assert!(
+            !client
+                .backend()
+                .can_serve("us.amazon.titan-embed-text-v2:0"),
+            "a profile routing to an embedding model is that model, and Converse cannot serve it"
+        );
     }
 
     #[tokio::test]

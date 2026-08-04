@@ -674,11 +674,17 @@ impl BedrockBackend for ConverseBackend {
         // direction on purpose: a turn carrying an unlisted id dispatches
         // exactly as it does today, rather than being refused by a catalogue
         // that never described it.
-        !self
+        //
+        // Both the id as it arrived and the foundation model it reduces to,
+        // the same contract every other per-model gate here follows. An
+        // inference profile routing to an embedding model is that model, and
+        // the listing records whichever form it returned - so asking only one
+        // form would refuse a bare id and accept its own profile.
+        let known = self
             .embedding_models
             .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains(model_id)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        !known.contains(model_id) && !known.contains(base_model_for(model_id).as_ref())
     }
 
     async fn list_models(&self) -> Result<ModelListingReport, CoreError> {
