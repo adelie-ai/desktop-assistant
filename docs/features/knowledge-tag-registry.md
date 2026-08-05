@@ -95,10 +95,14 @@ the built-in tools already apply. A hung backend therefore costs one timeout,
 not one per tag: the timeout is a failure, and the first failure stops the
 vocabulary being consulted for the rest of that write.
 
-One write call may spend 15 seconds in total consulting the vocabulary, counted
-across every entry in the call. A backend that answers slowly raises no error,
-so nothing else would stop it, and the caller chooses how many tags one write
-carries. When the budget runs out the remaining tags are stored as written.
+The vocabulary may be consulted up to 15 seconds into one write call, counted
+across every entry. A backend that answers slowly raises no error, so nothing
+else would stop it, and the caller chooses how many tags one write carries. Once
+the budget is spent the remaining tags are stored as written.
+
+The budget gates the start of a consultation, not its end, so one already in
+flight finishes. The wait is therefore the budget plus at most one embedding
+timeout - about 20 seconds - not 15 exactly.
 
 
 ## What it does not do

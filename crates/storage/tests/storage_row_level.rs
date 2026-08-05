@@ -826,7 +826,9 @@ async fn kb_write_resolves_a_tag_a_concurrent_write_registered_first() {
     //
     // MUTATION: dropping the post-INSERT re-read makes the resolver return the
     // primary-key error, which the write path degrades into "store the tag as
-    // written" - so the returned name check goes RED.
+    // written" - so the returned name check goes RED. Looking the tag back up
+    // under the raw proposed name instead of the normalized one also goes RED,
+    // which is why the proposal below is deliberately not already normalized.
     with_fixture(
         "kb_write_resolves_a_tag_a_concurrent_write_registered_first",
         |fx| async move {
@@ -857,7 +859,9 @@ async fn kb_write_resolves_a_tag_a_concurrent_write_registered_first() {
                     &racing_embed,
                     "test-model",
                     &ProposedTag {
-                        name: "topic:weather".into(),
+                        // Not already normalized, so the read-back has to
+                        // normalize as the insert did to find the row.
+                        name: "Topic: Weather".into(),
                         description: Some("Forecasts, rain, and temperature".into()),
                     },
                 )

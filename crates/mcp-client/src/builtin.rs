@@ -30,15 +30,19 @@ use desktop_assistant_core::ports::transport::{
 
 use crate::executor::McpControlHandle;
 
-/// How long one `builtin_knowledge_base_write` call may spend consulting the
-/// tag vocabulary, counted across every entry in the call.
+/// How far into one `builtin_knowledge_base_write` call the tag vocabulary may
+/// still be consulted, counted across every entry in the call.
 ///
 /// Why a budget at all: the caller chooses how many tags one write carries, and
 /// each tag the vocabulary has not seen before costs an embedding. Without a
 /// ceiling the wait a person sits through grows with the tag count, inside a
-/// live turn. When the budget runs out the remaining tags are stored as
-/// written, which is the same fallback every other absent-vocabulary state
-/// uses.
+/// live turn. Once it is spent the remaining tags are stored as written, which
+/// is the same fallback every other absent-vocabulary state uses.
+///
+/// It gates the start of a consultation, not its end, so one call already in
+/// flight when the budget runs out still finishes. The wait is therefore this
+/// plus at most one embedding timeout, not this exactly. Cutting a consultation
+/// off mid-flight would spend the embedding and then throw the answer away.
 const TAG_RESOLVE_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// The tag vocabulary's share of one `builtin_knowledge_base_write` call.
@@ -1214,14 +1218,30 @@ impl BuiltinToolService {
         let mut saved_out = Vec::with_capacity(specs.len());
         // One budget for the whole call, so a batch cannot spend it per entry.
         let mut tag_budget = TagGateBudget::new();
+        // A spec that fails ends the call, but the budget still reports what it
+        // did first: an entry that failed for its own reason is exactly when an
+        // operator wants to know the vocabulary had already stopped answering.
+        let mut failure: Option<CoreError> = None;
         for spec in &specs {
-            let entry = self.build_write_entry(spec, &mut tag_budget).await?;
+            let entry = match self.build_write_entry(spec, &mut tag_budget).await {
+                Ok(entry) => entry,
+                Err(e) => {
+                    failure = Some(e);
+                    break;
+                }
+            };
             // Embedding generation is decoupled from the write: the entry lands
             // immediately (NULL embedding on create, stale embedding left in
             // place on update) and the background embedding-backfill task
             // generates the vector within its next pass. The row is
             // keyword-searchable (FTS) right away; semantic recall follows.
-            let saved = write_fn(entry).await?;
+            let saved = match write_fn(entry).await {
+                Ok(saved) => saved,
+                Err(e) => {
+                    failure = Some(e);
+                    break;
+                }
+            };
             saved_out.push(serde_json::json!({
                 "id": saved.id,
                 // The tags actually stored, which the vocabulary check may have
@@ -1234,6 +1254,9 @@ impl BuiltinToolService {
             }));
         }
         tag_budget.report();
+        if let Some(e) = failure {
+            return Err(e);
+        }
 
         Ok(serde_json::json!({
             "ok": true,
