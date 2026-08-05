@@ -294,6 +294,7 @@ impl KnowledgeService for UnconfiguredKnowledgeService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use desktop_assistant_core::ports::knowledge::{KnowledgeSearchPage, ScopeSize};
     use std::sync::Mutex;
 
     #[derive(Default)]
@@ -318,8 +319,12 @@ mod tests {
             _tags: Option<Vec<String>>,
             _exclude_tags: Option<Vec<String>>,
             _limit: usize,
-        ) -> Result<Vec<KnowledgeEntry>, CoreError> {
-            Ok(Vec::new())
+        ) -> Result<KnowledgeSearchPage, CoreError> {
+            Ok(KnowledgeSearchPage {
+                entries: Vec::new(),
+                scope_size: ScopeSize::None,
+                available_tags: Vec::new(),
+            })
         }
 
         async fn search_text(

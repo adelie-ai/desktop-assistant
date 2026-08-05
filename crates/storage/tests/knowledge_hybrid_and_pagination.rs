@@ -204,7 +204,8 @@ async fn knowledge_hybrid_search_is_user_scoped() {
                 .await
         })
         .await
-        .expect("bob search");
+        .expect("bob search")
+        .entries;
         assert!(
             !bob_hits.iter().any(|e| e.id == "kb-alice-vec"),
             "bob's hybrid search must NOT surface alice's embedded doc via the \
@@ -220,7 +221,8 @@ async fn knowledge_hybrid_search_is_user_scoped() {
                 .await
         })
         .await
-        .expect("alice search");
+        .expect("alice search")
+        .entries;
         assert!(
             alice_hits.iter().any(|e| e.id == "kb-alice-vec"),
             "alice's own embedded doc must be reachable through the vector \
@@ -283,7 +285,8 @@ async fn knowledge_hybrid_search_excludes_tags() {
                 .await
         })
         .await
-        .expect("search");
+        .expect("search")
+        .entries;
         let ids: Vec<_> = hits.iter().map(|e| e.id.clone()).collect();
         assert!(
             !ids.iter().any(|id| id == "kb-secret"),
@@ -354,7 +357,8 @@ async fn knowledge_hybrid_search_rrf_orders_by_fused_rank() {
                     .await
             })
             .await
-            .expect("search");
+            .expect("search")
+            .entries;
             let ids: Vec<_> = hits.iter().map(|e| e.id.clone()).collect();
             assert_eq!(
                 ids.first().map(String::as_str),
@@ -817,7 +821,8 @@ async fn knowledge_read_filters_are_case_insensitive_and_symmetric() {
                     .await
             })
             .await
-            .expect("search exclude");
+            .expect("search exclude")
+            .entries;
             let kept_ids: Vec<&str> = kept.iter().map(|e| e.id.as_str()).collect();
             assert!(
                 kept_ids.contains(&"kb-other") && !kept_ids.contains(&"kb-instr"),
@@ -841,7 +846,8 @@ async fn knowledge_read_filters_are_case_insensitive_and_symmetric() {
                     .await
             })
             .await
-            .expect("vector search include");
+            .expect("vector search include")
+            .entries;
             let vec_ids: Vec<&str> = vec_hits.iter().map(|e| e.id.as_str()).collect();
             assert!(
                 vec_ids.contains(&"kb-instr") && !vec_ids.contains(&"kb-other"),

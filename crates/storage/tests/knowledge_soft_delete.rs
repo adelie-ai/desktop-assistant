@@ -137,7 +137,8 @@ async fn semantic_search_excludes_soft_deleted() {
             .await
     })
     .await
-    .expect("search");
+    .expect("search")
+    .entries;
 
     let ids: Vec<&str> = hits.iter().map(|e| e.id.as_str()).collect();
     assert!(
@@ -201,7 +202,8 @@ async fn hybrid_search_excludes_soft_deleted_matched_by_both_branches() {
             .await
     })
     .await
-    .expect("search");
+    .expect("search")
+    .entries;
 
     let ids: Vec<&str> = hits.iter().map(|e| e.id.as_str()).collect();
     assert!(
@@ -230,7 +232,8 @@ async fn soft_deleting_the_only_match_yields_empty_results() {
             .await
     })
     .await
-    .expect("search should succeed with no matches");
+    .expect("search should succeed with no matches")
+    .entries;
     assert!(hits.is_empty(), "expected no hits, got {hits:?}");
     fx.cleanup().await;
 }
@@ -254,7 +257,8 @@ async fn restored_entry_becomes_searchable_again() {
             .await
     })
     .await
-    .expect("search");
+    .expect("search")
+    .entries;
     assert!(
         hits.iter().any(|e| e.id == "row"),
         "clearing deleted_at must re-expose the row; got {hits:?}"
