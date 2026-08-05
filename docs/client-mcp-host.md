@@ -123,3 +123,11 @@ disable/enable change takes effect on the client's next launch.
 The daemon's `mcp_servers.toml` configures tools that run **with the daemon**
 (in the pod, for a cluster deployment). `client-mcp.toml` configures tools that
 run **on the edge**. Same schema, opposite locality.
+
+The assistant is told that difference directly. Its system prompt carries a
+`Where things run` section naming both machines and what each one's tools reach,
+so it uses a client-side tool for the user's own files rather than reaching for a
+daemon-side one that cannot see them. When the daemon runs in a pod and no
+client-side tools are registered, it says plainly that it can act only on the
+daemon's machine. The daemon side of that is described in
+[k8s-deployment.md](k8s-deployment.md#what-the-assistant-says-about-where-its-tools-run).

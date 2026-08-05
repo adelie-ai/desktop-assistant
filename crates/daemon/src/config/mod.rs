@@ -166,6 +166,38 @@ pub struct DaemonConfig {
     /// desktop never learns this section exists.
     #[serde(default, skip_serializing_if = "AuthzConfig::is_default")]
     pub authz: AuthzConfig,
+    /// `[deployment]` — where this daemon runs. Absent section => detect it.
+    #[serde(default, skip_serializing_if = "DeploymentConfig::is_default")]
+    pub deployment: DeploymentConfig,
+}
+
+/// `[deployment]` configuration: what kind of machine this daemon runs on.
+///
+/// The assistant tells the model where its daemon-side terminal and file tools
+/// act. On a person's own workstation they act on that person's files; in a
+/// container or on a server they act on a machine the user is not sitting at,
+/// and saying otherwise makes the assistant claim access it does not have.
+///
+/// The daemon detects containerization by itself, so this section exists for
+/// the cases detection cannot reach: a virtual machine, a bare-metal server, or
+/// a container an operator genuinely treats as the user's own workstation.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct DeploymentConfig {
+    /// Whether this daemon runs on the user's own workstation.
+    ///
+    /// `None` (the default) means the operator stated nothing, so the daemon
+    /// decides from container detection. A value stated here wins over that
+    /// detection, and `DESKTOP_ASSISTANT_ON_WORKSTATION` wins over both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_workstation: Option<bool>,
+}
+
+impl DeploymentConfig {
+    /// Whether this equals the default section, so an unconfigured daemon never
+    /// writes a `[deployment]` table into `daemon.toml`.
+    fn is_default(&self) -> bool {
+        self.on_workstation.is_none()
+    }
 }
 
 /// `[authz]` configuration: the operator's remote-administrator allowlist.
@@ -1589,6 +1621,40 @@ model = "llama3"
         // A config with no `[transports]` section deserializes to all defaults.
         let cfg: DaemonConfig = toml::from_str("").unwrap();
         assert_eq!(cfg.transports, TransportsConfig::default());
+    }
+
+    #[test]
+    fn deployment_config_absent_table_states_nothing() {
+        // Absent section means the operator stated nothing, so the daemon
+        // decides from container detection rather than from a default answer.
+        let cfg: DaemonConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.deployment, DeploymentConfig::default());
+        assert_eq!(cfg.deployment.on_workstation, None);
+    }
+
+    #[test]
+    fn deployment_config_roundtrips_on_workstation() {
+        for (src, expected) in [
+            ("[deployment]\non_workstation = false\n", Some(false)),
+            ("[deployment]\non_workstation = true\n", Some(true)),
+        ] {
+            let cfg: DaemonConfig = toml::from_str(src).expect("deployment section must parse");
+            assert_eq!(cfg.deployment.on_workstation, expected);
+            let serialized = toml::to_string(&cfg).expect("config must serialize");
+            let reparsed: DaemonConfig =
+                toml::from_str(&serialized).expect("serialized config must reparse");
+            assert_eq!(reparsed.deployment, cfg.deployment);
+        }
+    }
+
+    #[test]
+    fn deployment_config_default_is_skipped_on_serialize() {
+        let cfg = DaemonConfig::default();
+        let serialized = toml::to_string(&cfg).expect("config must serialize");
+        assert!(
+            !serialized.contains("[deployment]"),
+            "an unconfigured daemon must not write a [deployment] table: {serialized}"
+        );
     }
 
     #[test]
