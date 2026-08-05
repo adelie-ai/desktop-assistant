@@ -218,9 +218,11 @@ impl ConverseBackend {
         &self,
         summaries: &[aws_sdk_bedrock::types::FoundationModelSummary],
     ) {
-        // Read from the summaries, not from the rows this listing emits: it
-        // deliberately emits no embedding model, and `can_serve` still has to
-        // know which ids those are.
+        // Read from the summaries, not from the rows this listing emits. The
+        // foundation rows carry text models only, and the profile rows can
+        // carry an embedding model whose base id has no on-demand form, so the
+        // emitted set is neither all of the embedding ids nor none of them.
+        // `can_serve` has to know every one of them.
         let found: Vec<String> = summaries
             .iter()
             .filter(|s| {

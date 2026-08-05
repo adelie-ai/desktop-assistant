@@ -194,11 +194,21 @@ in the same call, keyed by model id.
 
 **A model that returns neither text nor vectors is in no catalogue.** Image
 generation, video generation and reranking answer no purpose this connector
-binds, so listing one puts a model in the picker that every surface refuses.
-Both listing paths apply the rule, against the same resolved base model: a
-model is kept or dropped for the same reason whichever listing carried it.
-Bedrock exposes the Stability image models through inference profiles only,
-which is the case a rule on the foundation path alone does not reach.
+binds today, so listing one puts a model in the picker that every surface
+refuses. Bedrock exposes the Stability image models through inference profiles
+only, which is the case a rule on the foundation path alone does not reach.
+
+Both listing paths reach that disposition, through different code. The
+foundation path splits by surface: `summary_to_model_info` keeps text for
+Converse, and `embedding_model_from_summary` keeps vectors for Invoke. The
+profile path has one check to make, so it makes it once, against the resolved
+base model. The outcome is shared; the code is not.
+
+The exclusion is tied to the `ModelKind` variants that exist. When Invoke grows
+to serve image and video generation - migration path step 4 below - the
+variants that describe those models arrive with it, and this rule widens in the
+same change. Until then a model this connector cannot serve is a model it does
+not offer.
 
 The rule is written as positive evidence - the model returns text, or it
 returns vectors. It is deliberately not a list of the modalities to reject. The

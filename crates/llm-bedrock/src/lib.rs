@@ -1787,9 +1787,11 @@ struct ModelModalities {
     is_embedding: bool,
     /// The model returns text.
     ///
-    /// Read from the output modalities rather than assumed, because it is
-    /// what separates a model this connector can serve from an
+    /// `from_summary` reads this from AWS's own output modalities, because it
+    /// is what separates a model this connector can serve from an
     /// image-generation or video-generation model it cannot.
+    /// `fallback_modalities_from_id` assumes it instead, for the one case that
+    /// has no metadata to read.
     outputs_text: bool,
 }
 
@@ -1805,18 +1807,22 @@ impl ModelModalities {
         }
     }
 
-    /// Whether this connector can serve the model at all.
+    /// Whether the model returns something a purpose can bind.
     ///
     /// It answers a conversation with text, or an embedding request with
     /// vectors. A model that returns neither - image generation, video
     /// generation, reranking - has no purpose to bind to here, so it belongs
     /// in no catalogue this connector produces.
     ///
+    /// Distinct from `can_serve`, which asks whether one backend routes an id
+    /// it already knows. This asks whether the model belongs in a catalogue at
+    /// all, from its modalities alone.
+    ///
     /// Stated as positive evidence, and deliberately not as a list of rejected
     /// modalities. `ModelModality` models only TEXT, IMAGE and EMBEDDING, so
     /// every modality AWS adds later arrives as the SDK's `Unknown` variant. A
     /// rejection list would let each new one through.
-    fn serves_a_purpose(self) -> bool {
+    fn produces_text_or_vectors(self) -> bool {
         self.outputs_text || self.is_embedding
     }
 }
@@ -1993,12 +1999,15 @@ fn inference_profile_to_model_info(
         fallback_modalities_from_id(base_id)
     });
 
-    // The same rule the foundation path applies, so a model is kept or dropped
-    // for the same reason whichever listing carried it. Without it an
-    // image-generation or video-generation model that Bedrock exposes only
-    // through a profile reaches the picker as a chat model, and fails at AWS
-    // when a turn goes out against it.
-    if !resolved.serves_a_purpose() {
+    // The foundation path reaches the same disposition through its own checks:
+    // `summary_to_model_info` keeps text, and `embedding_model_from_summary`
+    // keeps vectors on the Invoke surface. The two paths share the outcome, not
+    // the code, because this one has a single check to make where that side has
+    // two surfaces to split between. Without this check an image-generation or
+    // video-generation model that Bedrock exposes only through a profile
+    // reaches the picker as a chat model, and fails at AWS when a turn goes out
+    // against it.
+    if !resolved.produces_text_or_vectors() {
         tracing::debug!(
             profile_id,
             base_id,
@@ -2061,9 +2070,10 @@ fn fallback_modalities_from_id(base_id: &str) -> ModelModalities {
     ModelModalities {
         vision,
         is_embedding: false,
-        // No metadata is not evidence against the model. A profile whose base
-        // model this listing did not describe is kept, so a gap in provider
-        // data costs a picker badge rather than a model the account can use.
+        // Missing metadata is not evidence against the model. A profile whose
+        // base model this listing did not describe is kept, so a gap in
+        // provider data costs a picker badge rather than a model the account
+        // can use.
         outputs_text: true,
     }
 }
@@ -5184,6 +5194,100 @@ mod tests {
             .expect("healthy listing");
         let detailed_ids: Vec<String> = models.into_iter().map(|m| m.id).collect();
         assert!(detailed_ids.contains(&"us.anthropic.claude-sonnet-4-6".to_string()));
+    }
+
+    /// Two models an account reaches only through an inference profile: one
+    /// that generates images, one that returns vectors. Neither carries
+    /// `ON_DEMAND`, so the foundation path drops both and the profile path is
+    /// the only route either could take into the catalogue.
+    ///
+    /// Drawn from what a real account lists. Bedrock offers the Stability
+    /// image models and `twelvelabs.marengo-embed-2-7-v1:0` on exactly these
+    /// terms.
+    const PROFILE_ONLY_FOUNDATION_BODY: &str = r#"{
+      "modelSummaries": [
+        {
+          "modelArn": "arn:aws:bedrock:us-east-1::foundation-model/stability.stable-image-inpaint-v1:0",
+          "modelId": "stability.stable-image-inpaint-v1:0",
+          "modelName": "Stable Image Inpaint",
+          "providerName": "Stability AI",
+          "inputModalities": ["TEXT", "IMAGE"],
+          "outputModalities": ["IMAGE"],
+          "inferenceTypesSupported": ["INFERENCE_PROFILE"],
+          "modelLifecycle": {"status": "ACTIVE"}
+        },
+        {
+          "modelArn": "arn:aws:bedrock:us-east-1::foundation-model/twelvelabs.marengo-embed-2-7-v1:0",
+          "modelId": "twelvelabs.marengo-embed-2-7-v1:0",
+          "modelName": "Marengo Embed 2.7",
+          "providerName": "TwelveLabs",
+          "inputModalities": ["TEXT", "IMAGE"],
+          "outputModalities": ["EMBEDDING"],
+          "inferenceTypesSupported": ["INFERENCE_PROFILE"],
+          "modelLifecycle": {"status": "ACTIVE"}
+        }
+      ]
+    }"#;
+
+    /// An active profile for each model in [`PROFILE_ONLY_FOUNDATION_BODY`].
+    const PROFILE_ONLY_PROFILES_BODY: &str = r#"{
+      "inferenceProfileSummaries": [
+        {
+          "inferenceProfileName": "US Stable Image Inpaint",
+          "inferenceProfileArn": "arn:aws:bedrock:us-east-1:111122223333:inference-profile/us.stability.stable-image-inpaint-v1:0",
+          "inferenceProfileId": "us.stability.stable-image-inpaint-v1:0",
+          "models": [
+            {"modelArn": "arn:aws:bedrock:us-east-1::foundation-model/stability.stable-image-inpaint-v1:0"}
+          ],
+          "status": "ACTIVE",
+          "type": "SYSTEM_DEFINED"
+        },
+        {
+          "inferenceProfileName": "US Marengo Embed 2.7",
+          "inferenceProfileArn": "arn:aws:bedrock:us-east-1:111122223333:inference-profile/us.twelvelabs.marengo-embed-2-7-v1:0",
+          "inferenceProfileId": "us.twelvelabs.marengo-embed-2-7-v1:0",
+          "models": [
+            {"modelArn": "arn:aws:bedrock:us-east-1::foundation-model/twelvelabs.marengo-embed-2-7-v1:0"}
+          ],
+          "status": "ACTIVE",
+          "type": "SYSTEM_DEFINED"
+        }
+      ]
+    }"#;
+
+    #[tokio::test]
+    async fn a_whole_listing_drops_the_image_profile_and_keeps_the_embedding_profile() {
+        // Both models take the same route into the catalogue, so nothing but
+        // the modality rule separates them. Asserting the pair together is
+        // what stops a later tightening - "profiles carry text only" - from
+        // removing an embedding model that has no other way in.
+        let server = httpmock::MockServer::start();
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/foundation-models");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(PROFILE_ONLY_FOUNDATION_BODY);
+        });
+        mock_inference_profiles_by_type(&server, "SYSTEM_DEFINED", PROFILE_ONLY_PROFILES_BODY);
+        mock_inference_profiles_by_type(&server, "APPLICATION", EMPTY_PROFILES_BODY);
+
+        let report = control_plane_client(&server)
+            .list_models_detailed()
+            .await
+            .expect("healthy listing");
+        let ids: Vec<&str> = report.models.iter().map(|m| m.id.as_str()).collect();
+
+        assert!(
+            !ids.contains(&"us.stability.stable-image-inpaint-v1:0"),
+            "an image-generation model must reach no catalogue, got {ids:?}"
+        );
+        let embedding = report
+            .models
+            .iter()
+            .find(|m| m.id == "us.twelvelabs.marengo-embed-2-7-v1:0")
+            .expect("an embedding model with no on-demand id keeps its profile row");
+        assert_eq!(embedding.capabilities.kind, ModelKind::Embedding);
     }
 
     #[test]
