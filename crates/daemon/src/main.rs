@@ -49,8 +49,8 @@ use settings_service::DaemonSettingsService;
 use store::PersistentConversationStore;
 use transports::{
     OidcAwareAuth, PeerCredUdsAuth, WsAuthDiscoveryProvider, WsBasicLogin, WsLoginMode,
-    WsSettingsAuth, daemon_host_label, env_bool, is_container_environment, resolve_uds_socket_path,
-    resolve_ws_login_mode,
+    WsSettingsAuth, daemon_host_label, env_bool, is_container_environment, parse_env_opt_bool,
+    resolve_on_workstation, resolve_uds_socket_path, resolve_ws_login_mode,
 };
 
 async fn shutdown_signal() {
@@ -2426,6 +2426,24 @@ async fn main() -> Result<()> {
     // conversation -> handler -> executor cycle non-owning so nothing leaks.
     let conversation_slot: desktop_assistant_application::subagent_executor::ConversationSlot =
         Arc::new(std::sync::OnceLock::new());
+    // Where this daemon runs (#534), resolved once at startup: the environment
+    // variable, else `[deployment] on_workstation`, else container detection.
+    let on_workstation = resolve_on_workstation(
+        parse_env_opt_bool(
+            std::env::var("DESKTOP_ASSISTANT_ON_WORKSTATION")
+                .ok()
+                .as_deref(),
+        ),
+        daemon_config
+            .as_ref()
+            .and_then(|c| c.deployment.on_workstation),
+        is_container_environment(),
+    );
+    tracing::info!(
+        on_workstation,
+        "daemon deployment topology resolved; the assistant describes its \
+         daemon-side tools accordingly"
+    );
     let mut handler = ConversationHandler::with_tools(
         conversation_store.clone(),
         llm,
@@ -2441,7 +2459,11 @@ async fn main() -> Result<()> {
     // identity (the hostname — a human-readable display label for the tool
     // note). Co-location itself is decided by the per-machine system-id
     // handshake (#248, wired into the WS/UDS frontends below), not this label.
-    .with_host(daemon_host_label());
+    .with_host(daemon_host_label())
+    // Where this daemon runs (#534). The model is told whether its daemon-side
+    // terminal and file tools reach the user's own files or a machine the user
+    // is not sitting at. An operator statement wins over container detection.
+    .with_on_workstation(on_workstation);
 
     // Build the shared registry handle (#11): wraps the in-memory
     // `ConnectionRegistry` plus the loaded `DaemonConfig` behind a single

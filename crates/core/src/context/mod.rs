@@ -409,6 +409,10 @@ pub(crate) struct ToolLocalityContext {
     /// The daemon's self-identity label used for `Server { host }` (the
     /// hostname).
     pub host: String,
+    /// Whether the daemon runs on a person's own workstation, rather than in a
+    /// container or on a server (#534). Decides whether the topology section
+    /// may describe daemon-side tools as acting on the user's own machine.
+    pub daemon_on_workstation: bool,
     /// Label shown for a client tool's machine in the remote tool note (e.g.
     /// `your device`, or a hostname the client reported in the handshake, #248).
     pub client_label: String,
@@ -438,6 +442,18 @@ impl ToolLocalityContext {
 
     fn is_client(&self, name: &str) -> bool {
         self.client_tool_names.iter().any(|n| n == name)
+    }
+
+    /// The topology this turn's connection describes (#534), for the
+    /// "where things run" prompt section.
+    fn topology(&self) -> crate::prompts::Topology {
+        crate::prompts::Topology {
+            daemon_host: self.host.clone(),
+            daemon_on_workstation: self.daemon_on_workstation,
+            client_label: self.client_label.clone(),
+            same_machine: self.is_co_located(),
+            client_has_tools: !self.client_tool_names.is_empty(),
+        }
     }
 }
 
@@ -696,7 +712,11 @@ fn build_demoted_tool_note(
 /// identical to the pre-refinement prompt. When present, it is appended
 /// last — after every static section and the tool note — so it can refine or
 /// override the standing guidance for this turn only.
-fn assemble_system_instruction(tool_note: String, ambient: &AmbientContext) -> String {
+fn assemble_system_instruction(
+    tool_note: String,
+    topology: Option<String>,
+    ambient: &AmbientContext,
+) -> String {
     use crate::prompts::{self, PromptSection, PromptSectionKind};
     let mut sections = prompts::static_sections();
 
@@ -728,6 +748,16 @@ fn assemble_system_instruction(tool_note: String, ambient: &AmbientContext) -> S
             PromptSectionKind::ClientContext,
             section,
         ));
+    }
+
+    // Topology (#534): which machines exist, and what each one's tools reach.
+    // Injected immediately before the tool listing, so the model reads the
+    // machines before it reads the tools that are labelled by machine. A
+    // DYNAMIC section — the answer changes with the connection — so it never
+    // perturbs the golden static-prompt snapshot. Absent for callers that
+    // thread no locality context, which leaves their prompt unchanged.
+    if let Some(section) = topology {
+        sections.push(PromptSection::new(PromptSectionKind::Topology, section));
     }
 
     sections.push(PromptSection::new(
@@ -806,7 +836,13 @@ fn system_block(
 ) -> String {
     let tool_note =
         build_full_tool_note(tools.tool_defs, tools.deferred_namespaces, tools.locality);
-    let system_instruction = assemble_system_instruction(tool_note, ambient);
+    // Rendered once and reused by both the full and the demoted assembly: the
+    // topology is a fact about the connection, not about the tool listing, so
+    // demoting the listing must not change it.
+    let topology = tools
+        .locality
+        .map(|ctx| crate::prompts::render_topology(&ctx.topology()));
+    let system_instruction = assemble_system_instruction(tool_note, topology.clone(), ambient);
 
     // Without a budget there's nothing to measure against — emit as-is.
     let Some(b) = budget else {
@@ -826,7 +862,7 @@ fn system_block(
     }
 
     let demoted_note = build_demoted_tool_note(tools.tool_defs, tools.deferred_namespaces);
-    let demoted_system = assemble_system_instruction(demoted_note, ambient);
+    let demoted_system = assemble_system_instruction(demoted_note, topology, ambient);
     let system_tokens_after = estimate(&demoted_system);
     tracing::warn!(
         original_tokens = system_tokens_before,
@@ -1386,11 +1422,100 @@ mod tests {
         (s.chars().count() as u64).div_ceil(4)
     }
 
+    // --- Topology in the system block (#534) -------------------------------
+
+    /// Assemble a system block for a turn whose connection has the given
+    /// locality, at the given budget. `None` budget means no demotion check.
+    fn system_block_for(
+        locality: Option<&ToolLocalityContext>,
+        budget: Option<ContextBudget>,
+    ) -> String {
+        let tool_defs: Vec<ToolDefinition> = (0..40)
+            .map(|i| {
+                ToolDefinition::new(
+                    format!("tool_{i}"),
+                    "a tool with a description long enough to cost real tokens",
+                    serde_json::json!({}),
+                )
+            })
+            .collect();
+        system_block(
+            &ToolContext {
+                tool_defs: &tool_defs,
+                deferred_namespaces: &[],
+                locality,
+            },
+            &AmbientContext::default(),
+            budget,
+            &default_estimate,
+        )
+    }
+
+    #[test]
+    fn the_system_block_states_where_things_run() {
+        let ctx = locality_ctx(
+            TransportKind::WebSocket,
+            "daemon-host",
+            &["terminal"],
+            &["device_terminal"],
+        );
+        let block = system_block_for(Some(&ctx), None);
+        assert!(
+            block.contains("== Where things run =="),
+            "the assembled block must carry the topology section: {block}"
+        );
+        assert!(
+            block.contains("Two different machines"),
+            "and describe a remote connection as two machines: {block}"
+        );
+    }
+
+    #[test]
+    fn the_demoted_block_still_states_where_things_run() {
+        // Demotion collapses the tool listing, which is where the per-tool
+        // location labels live. The topology is a fact about the connection,
+        // not about the listing, so it must survive.
+        let ctx = locality_ctx(
+            TransportKind::WebSocket,
+            "daemon-host",
+            &["terminal"],
+            &["device_terminal"],
+        );
+        let block = system_block_for(
+            Some(&ctx),
+            Some(ContextBudget {
+                max_input_tokens: 1_000,
+                source: crate::ports::llm::BudgetSource::UniversalFallback,
+            }),
+        );
+        assert!(
+            block.contains("Use builtin_tool_search to discover a tool"),
+            "this budget must actually demote the listing: {block}"
+        );
+        assert!(
+            block.contains("== Where things run =="),
+            "and the topology must survive the demotion: {block}"
+        );
+    }
+
+    #[test]
+    fn a_block_without_locality_carries_no_topology() {
+        // Callers that thread no locality context (background jobs, tests) keep
+        // the prompt they had before the section existed.
+        let block = system_block_for(None, None);
+        assert!(
+            !block.contains("== Where things run =="),
+            "no locality context means no topology claim: {block}"
+        );
+    }
+
     #[test]
     fn assemble_system_instruction_appends_refinement_last() {
-        let base = assemble_system_instruction("TOOLNOTE".to_string(), &AmbientContext::default());
+        let base =
+            assemble_system_instruction("TOOLNOTE".to_string(), None, &AmbientContext::default());
         let refined = assemble_system_instruction(
             "TOOLNOTE".to_string(),
+            None,
             &AmbientContext {
                 system_refinement: "Respond briefly, by voice.".to_string(),
                 ..Default::default()
@@ -1402,6 +1527,7 @@ mod tests {
             base,
             assemble_system_instruction(
                 "TOOLNOTE".to_string(),
+                None,
                 &AmbientContext {
                     system_refinement: "   ".to_string(),
                     ..Default::default()
@@ -1438,6 +1564,7 @@ mod tests {
         };
         let assembled = assemble_system_instruction(
             "TOOLNOTE".to_string(),
+            None,
             &AmbientContext {
                 personality,
                 system_refinement: "REFINEMENT".to_string(),
@@ -1465,7 +1592,7 @@ mod tests {
         // A default `AmbientContext` still injects the default disposition
         // (the global personality applies to every turn).
         let assembled =
-            assemble_system_instruction("TOOLNOTE".to_string(), &AmbientContext::default());
+            assemble_system_instruction("TOOLNOTE".to_string(), None, &AmbientContext::default());
         let default_blurb = crate::prompts::render_blurb(&crate::prompts::Personality::default());
         assert!(
             assembled.contains(&default_blurb),
@@ -1492,6 +1619,7 @@ mod tests {
         // user" block inside the cached system instruction, before the tool note.
         let assembled = assemble_system_instruction(
             "TOOLNOTE".to_string(),
+            None,
             &AmbientContext {
                 client_context: Some(full_client_context()),
                 ..Default::default()
@@ -1519,6 +1647,7 @@ mod tests {
         };
         let assembled = assemble_system_instruction(
             "TOOLNOTE".to_string(),
+            None,
             &AmbientContext {
                 client_context: Some(ctx),
                 ..Default::default()
@@ -1534,9 +1663,10 @@ mod tests {
         // Acceptance (c): an all-absent context emits no header at all, and the
         // output is byte-identical to having no client context installed.
         let baseline =
-            assemble_system_instruction("TOOLNOTE".to_string(), &AmbientContext::default());
+            assemble_system_instruction("TOOLNOTE".to_string(), None, &AmbientContext::default());
         let all_absent = assemble_system_instruction(
             "TOOLNOTE".to_string(),
+            None,
             &AmbientContext {
                 client_context: Some(crate::prompts::ClientContext::default()),
                 ..Default::default()
@@ -1557,6 +1687,7 @@ mod tests {
         // ambient env (never set it) and assert it does not appear.
         let assembled = assemble_system_instruction(
             "TOOLNOTE".to_string(),
+            None,
             &AmbientContext {
                 client_context: Some(crate::prompts::ClientContext::default()),
                 ..Default::default()
@@ -3753,6 +3884,7 @@ mod tests {
             co_located: None,
             transport,
             host: host.to_string(),
+            daemon_on_workstation: true,
             client_label: "your device".to_string(),
             server_tool_names: server_names.iter().map(|s| s.to_string()).collect(),
             client_tool_names: client_names.iter().map(|s| s.to_string()).collect(),
@@ -3774,6 +3906,7 @@ mod tests {
             co_located: Some(co_located),
             transport,
             host: host.to_string(),
+            daemon_on_workstation: true,
             client_label: "your device".to_string(),
             server_tool_names: server_names.iter().map(|s| s.to_string()).collect(),
             client_tool_names: client_names.iter().map(|s| s.to_string()).collect(),

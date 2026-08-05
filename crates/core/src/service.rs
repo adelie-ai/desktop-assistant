@@ -497,6 +497,14 @@ pub struct ConversationHandler<S, L, T = NoopToolExecutor> {
     /// [`DEFAULT_HOST_LABEL`] so callers that don't set it (tests, background
     /// jobs) still produce a coherent note.
     host: String,
+    /// Whether the daemon runs on a person's own workstation, rather than in a
+    /// container or on a server (#534). Decides whether the "where things run"
+    /// prompt section may describe daemon-side tools as acting on the user's own
+    /// machine. The daemon resolves it once at startup and sets it via
+    /// [`Self::with_on_workstation`]; the default is `true`, which keeps the
+    /// native desktop install and every test on the wording they had before the
+    /// flag existed.
+    on_workstation: bool,
     /// Per-conversation turn serialization (#282). Maps a conversation id to a
     /// `Weak`-referenced async mutex; a turn upgrades-or-inserts the entry, holds
     /// the `Arc<Mutex<()>>` guard across its whole body, then drops it. Entries
@@ -531,6 +539,7 @@ impl<S, L> ConversationHandler<S, L, NoopToolExecutor> {
             descendant_task_probe: None,
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             host: DEFAULT_HOST_LABEL.to_string(),
+            on_workstation: true,
             turn_locks: std::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -594,6 +603,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             descendant_task_probe: None,
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             host: DEFAULT_HOST_LABEL.to_string(),
+            on_workstation: true,
             turn_locks: std::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -603,6 +613,20 @@ impl<S, L, T> ConversationHandler<S, L, T> {
     /// hostname here; the follow-up phase replaces it with a stable machine-id.
     pub fn with_host(mut self, host: impl Into<String>) -> Self {
         self.host = host.into();
+        self
+    }
+
+    /// State whether the daemon runs on a person's own workstation (issue
+    /// #534).
+    ///
+    /// Why: the "where things run" prompt section tells the model what its
+    /// daemon-side terminal and file tools actually reach. On a workstation they
+    /// reach the user's own files. In a container or on a server they do not,
+    /// and a model told otherwise claims to have read files it never saw. The
+    /// daemon resolves this once at startup from its configuration and from
+    /// container detection.
+    pub fn with_on_workstation(mut self, on_workstation: bool) -> Self {
+        self.on_workstation = on_workstation;
         self
     }
 
@@ -1514,6 +1538,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
             co_located: current_co_location(),
             transport: current_transport_kind(),
             host: self.host.clone(),
+            daemon_on_workstation: self.on_workstation,
             client_label,
             server_tool_names,
             client_tool_names: client_tool_defs.iter().map(|d| d.name.clone()).collect(),

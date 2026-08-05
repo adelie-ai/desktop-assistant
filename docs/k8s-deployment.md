@@ -252,6 +252,38 @@ behind an ingress or a tailnet that already terminates TLS, as in
 `[tls] enabled = false` (or `DESKTOP_ASSISTANT_WS_TLS=false`) instead of
 leaving a broken TLS configuration in place.
 
+## What the assistant says about where its tools run
+
+The daemon's own tools - the MCP servers it spawns, its built-ins - act on the
+daemon's filesystem. In a pod that is the container, not the user's computer. So
+the assistant is told which machines exist before it is told which tools it has,
+in a `Where things run` section of its system prompt.
+
+The daemon works this out for itself. It reports a container when any of these
+is true: `KUBERNETES_SERVICE_HOST` is set, `/.dockerenv` exists,
+`/run/.containerenv` exists, or the generic `container` variable is set. Every
+pod sets the first, so a normal deployment needs no configuration.
+
+State it yourself where detection cannot help - a virtual machine, a bare-metal
+server, or a container you genuinely treat as the user's own workstation:
+
+```toml
+# daemon.toml, in your overlay
+[deployment]
+on_workstation = false
+```
+
+`DESKTOP_ASSISTANT_ON_WORKSTATION` sets the same value and wins over the file.
+Absent both, container detection decides, and a daemon that is not in a
+container reports a workstation.
+
+What changes for the person using it: with a split like this, the assistant no
+longer offers to read files it cannot reach. It names the two machines, uses a
+client-side tool for the user's own files when the client registered one, and
+says plainly that it can act only on the pod when the client registered none.
+Client-side tools are configured in
+[client-mcp-host.md](client-mcp-host.md).
+
 ## Who may administer the instance
 
 The daemon separates a **tenant** from an **administrator**. A tenant owns their

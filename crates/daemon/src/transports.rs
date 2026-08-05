@@ -409,14 +409,69 @@ pub(crate) fn parse_env_opt_bool(value: Option<&str>) -> Option<bool> {
     }
 }
 
+/// Evidence that the daemon runs inside a container, read from the process
+/// environment. Split from [`is_container_environment`] so the decision is
+/// unit-testable without touching the real environment or the real filesystem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ContainerEvidence<'a> {
+    /// The generic `container` variable, set by systemd-nspawn, podman and LXC.
+    pub container_var: Option<&'a str>,
+    /// `/.dockerenv` exists (Docker).
+    pub dockerenv: bool,
+    /// `/run/.containerenv` exists (podman).
+    pub containerenv: bool,
+    /// `KUBERNETES_SERVICE_HOST` is set. Kubernetes injects it into every pod,
+    /// and a pod on containerd has none of the three markers above, so without
+    /// this a k8s daemon reads as a workstation.
+    pub kubernetes_service_host: Option<&'a str>,
+}
+
+/// Whether any piece of [`ContainerEvidence`] says the daemon is containerized.
+///
+/// A blank value counts as absent: an operator who exported `container=` said
+/// nothing.
+pub(crate) fn detect_containerized(evidence: ContainerEvidence<'_>) -> bool {
+    let present = |value: Option<&str>| value.is_some_and(|v| !v.trim().is_empty());
+    present(evidence.container_var)
+        || evidence.dockerenv
+        || evidence.containerenv
+        || present(evidence.kubernetes_service_host)
+}
+
 pub(crate) fn is_container_environment() -> bool {
-    std::env::var("container")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .is_some()
-        || std::path::Path::new("/.dockerenv").exists()
-        || std::path::Path::new("/run/.containerenv").exists()
+    let container_var = std::env::var("container").ok();
+    let kubernetes_service_host = std::env::var("KUBERNETES_SERVICE_HOST").ok();
+    detect_containerized(ContainerEvidence {
+        container_var: container_var.as_deref(),
+        dockerenv: std::path::Path::new("/.dockerenv").exists(),
+        containerenv: std::path::Path::new("/run/.containerenv").exists(),
+        kubernetes_service_host: kubernetes_service_host.as_deref(),
+    })
+}
+
+/// Whether the daemon runs on a person's own workstation, rather than on a
+/// server or in a container.
+///
+/// The answer changes what the assistant may truthfully claim about its
+/// daemon-side terminal and file tools: on a workstation they act on the user's
+/// own files, and anywhere else they act on a machine the user is not sitting
+/// at. Three inputs, in order of authority:
+///
+/// 1. `DESKTOP_ASSISTANT_ON_WORKSTATION`, for an operator who knows better than
+///    any detection.
+/// 2. `[deployment] on_workstation` in `daemon.toml`, the same statement in the
+///    configuration file.
+/// 3. Container detection ([`detect_containerized`]). A containerized daemon is
+///    not on a workstation.
+///
+/// With no statement and no container, the answer is `true`, so a native desktop
+/// install behaves exactly as it did before this flag existed.
+pub(crate) fn resolve_on_workstation(
+    env_override: Option<bool>,
+    configured: Option<bool>,
+    containerized: bool,
+) -> bool {
+    env_override.or(configured).unwrap_or(!containerized)
 }
 
 /// Decide what `POST /login` validates against, if anything.
@@ -558,8 +613,83 @@ pub(crate) fn resolve_ws_door_plan(
 
 #[cfg(test)]
 mod tests {
-    use super::{WsLoginMode, parse_env_bool, resolve_ws_login_mode_decision};
+    use super::{
+        ContainerEvidence, WsLoginMode, detect_containerized, parse_env_bool,
+        resolve_on_workstation, resolve_ws_login_mode_decision,
+    };
     use crate::config::TransportsConfig;
+
+    /// No evidence of a container: the plain workstation case.
+    const NO_CONTAINER: ContainerEvidence<'static> = ContainerEvidence {
+        container_var: None,
+        dockerenv: false,
+        containerenv: false,
+        kubernetes_service_host: None,
+    };
+
+    #[test]
+    fn detect_containerized_kubernetes() {
+        // A pod on containerd has no `container` variable and neither marker
+        // file. Kubernetes injects the service host into every pod, and it is
+        // the only signal such a pod carries.
+        assert!(detect_containerized(ContainerEvidence {
+            kubernetes_service_host: Some("10.96.0.1"),
+            ..NO_CONTAINER
+        }));
+    }
+
+    #[test]
+    fn detect_containerized_docker() {
+        assert!(detect_containerized(ContainerEvidence {
+            dockerenv: true,
+            ..NO_CONTAINER
+        }));
+    }
+
+    #[test]
+    fn detect_containerized_podman() {
+        assert!(detect_containerized(ContainerEvidence {
+            containerenv: true,
+            ..NO_CONTAINER
+        }));
+        // podman and systemd-nspawn also export the generic variable.
+        assert!(detect_containerized(ContainerEvidence {
+            container_var: Some("podman"),
+            ..NO_CONTAINER
+        }));
+    }
+
+    #[test]
+    fn detect_not_containerized() {
+        assert!(!detect_containerized(NO_CONTAINER));
+        // A blank value is a statement of nothing, not a container.
+        assert!(!detect_containerized(ContainerEvidence {
+            container_var: Some("  "),
+            kubernetes_service_host: Some(""),
+            ..NO_CONTAINER
+        }));
+    }
+
+    #[test]
+    fn resolve_workstation_override_wins() {
+        // The environment beats the configuration file, and both beat detection.
+        assert!(resolve_on_workstation(Some(true), Some(false), true));
+        assert!(!resolve_on_workstation(Some(false), Some(true), false));
+        assert!(resolve_on_workstation(None, Some(true), true));
+        assert!(!resolve_on_workstation(None, Some(false), false));
+    }
+
+    #[test]
+    fn resolve_workstation_defaults_to_local() {
+        // Nothing stated and no container: the native desktop install, which
+        // must behave exactly as it did before this flag existed.
+        assert!(resolve_on_workstation(None, None, false));
+    }
+
+    #[test]
+    fn resolve_workstation_container_defaults_to_remote() {
+        assert!(!resolve_on_workstation(None, None, true));
+    }
 
     #[test]
     fn parse_env_bool_recognizes_truthy_and_falsy() {
