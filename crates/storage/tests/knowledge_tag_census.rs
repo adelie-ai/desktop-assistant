@@ -256,7 +256,9 @@ async fn tag_census_sample_ordering_is_total() {
 
         let census = |store: PgKnowledgeBaseStore| async move {
             with_user_id(UserId::new("alice"), async move {
-                store.search("tied", Vec::new(), MODEL, None, None, 10).await
+                store
+                    .search("tied", Vec::new(), MODEL, None, None, 10)
+                    .await
             })
             .await
             .expect("search")

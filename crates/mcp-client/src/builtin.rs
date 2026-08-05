@@ -348,12 +348,15 @@ impl BuiltinToolService {
                      `truncated` and a `message` when the page filled up. `scope_size` is NONE \
                      (no entry passes the filters you supplied - retry without them, the store \
                      may still hold plenty), FEW (the scope is no larger than this page, so a \
-                     `builtin_knowledge_base_list` sweep would show all of it), or MANY (the \
-                     scope holds more than this page could show). FEW does not mean you have \
-                     seen everything: the page holds what matched the query, the scope is what \
-                     passed the filters, so a query that matched nothing still reports FEW when \
-                     the scope is small. `available_tags` lists tag names most frequent first, \
-                     without counts. Both describe the SCOPE - the entries that pass the `tags` \
+                     `builtin_knowledge_base_list` sweep would show all of it), MANY (the \
+                     scope holds more than this page could show), or UNKNOWN (the scope could \
+                     not be measured this time - treat it as NO INFORMATION about the store, \
+                     never as an empty one, and judge the page on `results` alone). FEW does \
+                     not mean you have seen everything: the page holds what matched the query, \
+                     the scope is what passed the filters, so a query that matched nothing \
+                     still reports FEW when the scope is small. `available_tags` lists tag \
+                     names most frequent first, without counts, and is empty under UNKNOWN. \
+                     Both describe the SCOPE - the entries that pass the `tags` \
                      and `exclude_tags` filters - and never the number of entries that matched \
                      the query, which this search cannot count. `available_tags` reports at most \
                      {AVAILABLE_TAGS_LIMIT} tags, counted over at most the \
@@ -1186,6 +1189,10 @@ impl BuiltinToolService {
         // filled up under `Few` holds the whole scope. Claiming truncation
         // there sends the caller narrowing a search that already returned
         // everything there was.
+        //
+        // Only `Few` earns that. `Unknown` says the scope was never measured,
+        // so it proves nothing about what the page holds and must leave the
+        // truncation claim standing.
         let truncated = items.len() >= limit && scope_size != ScopeSize::Few;
         let mut response = serde_json::json!({
             "ok": true,
@@ -3658,9 +3665,10 @@ mod tests {
 
     #[tokio::test]
     async fn kb_search_reports_scope_size_none_for_an_empty_scope() {
-        // An empty page alone cannot tell the model whether its tag filter
-        // found nothing or the store holds nothing. NONE says the scope itself
-        // is empty, so no other filter would have done better.
+        // An empty page alone cannot tell the model whether its query matched
+        // nothing or its tag filter selected nothing. NONE says the scope
+        // itself is empty, so a different query cannot help - only dropping
+        // the filters can, because the store as a whole may hold plenty.
         let (service, _probe) = kb_service_reporting(KnowledgeSearchPage {
             entries: Vec::new(),
             scope_size: ScopeSize::None,
@@ -3677,8 +3685,10 @@ mod tests {
 
     #[tokio::test]
     async fn kb_search_reports_scope_size_few_when_every_entry_fits_the_page() {
-        // FEW means narrowing gains nothing: the whole scope is already on the
-        // page, so a tag filter can only remove entries the model can see.
+        // FEW means the scope is no larger than the page, so a narrower tag
+        // filter can only remove entries, never reveal one. It does not mean
+        // the model has seen everything: the page holds what matched the
+        // query, and an unmatched entry can still be sitting in that scope.
         let (service, _probe) = kb_service_reporting(KnowledgeSearchPage {
             entries: vec![kb_entry("kb-1", &["preference"])],
             scope_size: ScopeSize::Few,
@@ -3904,7 +3914,8 @@ mod tests {
             available_tags: Vec::new(),
         });
 
-        let json = kb_search_response(&service, serde_json::json!({"query": "x", "limit": 0})).await;
+        let json =
+            kb_search_response(&service, serde_json::json!({"query": "x", "limit": 0})).await;
 
         assert_eq!(
             probe.lock().unwrap().limit,

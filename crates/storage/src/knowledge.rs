@@ -107,7 +107,23 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
             .await?
         };
 
-        let (scope_size, available_tags) = self.tag_census(&tags, &exclude_tags, limit).await?;
+        // The census is a decoration on a result the caller already has, so it
+        // is best-effort. A connection reset, a pool timeout, or a slow scan
+        // under load must cost the measurement and not the entries: the system
+        // prompt makes this search mandatory before the assistant asks the user
+        // anything, so raising here would spend a whole turn on the decoration.
+        //
+        // The scope is then reported as `Unknown`, never `None`. `None` is the
+        // positive claim that no entry passes the caller's filters, which is an
+        // actively harmful falsehood when the truth is that nobody measured.
+        let (scope_size, available_tags) = match self.tag_census(&tags, &exclude_tags, limit).await
+        {
+            Ok(census) => census,
+            Err(e) => {
+                tracing::warn!(error = %e, "knowledge base tag census failed; reporting an unmeasured scope");
+                (ScopeSize::Unknown, Vec::new())
+            }
+        };
 
         Ok(KnowledgeSearchPage {
             entries,
@@ -207,18 +223,29 @@ impl PgKnowledgeBaseStore {
     /// the set that matched the query. One aggregate answers both questions, so
     /// a search costs one extra round trip rather than two.
     ///
-    /// Why the sample is ordered by `created_at DESC` rather than merely
-    /// capped, and why the cap exists at all:
+    /// Why the sample is ordered by `created_at DESC, id DESC` rather than
+    /// merely capped, and what the cap does and does not bound:
     ///
     /// - The order rides `knowledge_base_user_id_created_at_idx` (migration
-    ///   016), so the read stops after [`KNOWLEDGE_TAG_CENSUS_SAMPLE`] rows
-    ///   instead of scanning the table.
-    /// - It also makes the sample stable. A bare `LIMIT` takes rows in heap
-    ///   order, which moves after any `VACUUM` or update, so two identical
-    ///   searches would report different tags.
+    ///   016), so the rows arrive newest first without a sort.
+    /// - `created_at` alone is not a total order. Rows that share one timestamp
+    ///   are then cut apart by their physical position, which moves after any
+    ///   `VACUUM` or update, so two identical searches would report different
+    ///   tags. `id` is unique, so adding it makes the order total. Postgres
+    ///   keeps the index early-stop and sorts each timestamp group
+    ///   incrementally.
+    /// - The cap bounds how many rows reach the aggregate, not how many rows
+    ///   the read touches. `LIMIT` stops after
+    ///   [`KNOWLEDGE_TAG_CENSUS_SAMPLE`] rows *pass the filters*, so the read is
+    ///   bounded by how many in-scope entries the user holds. A selective
+    ///   `exclude_tags` that removes most recent entries therefore reads
+    ///   further back, up to the whole of that user's index. Measured against a
+    ///   200k-row table, such a filter read to the end in about 70 ms warm.
     /// - The cap is a tail guardrail for a large multi-tenant store, not an
     ///   optimisation of the common path. A personal knowledge base never
-    ///   reaches it.
+    ///   reaches it. `KnowledgeBaseStore::search` treats this whole statement
+    ///   as best-effort, so a census that does turn slow and fails costs the
+    ///   measurement and not the search.
     ///
     /// Both tag filters must already be normalized (`normalize_tag_filter`), or
     /// a differently-cased filter measures a different scope from the one the
@@ -245,7 +272,7 @@ impl PgKnowledgeBaseStore {
                    AND deleted_at IS NULL
                    AND ($2::text[] IS NULL OR tags && $2)
                    AND ($3::text[] IS NULL OR NOT (tags && $3))
-                 ORDER BY created_at DESC
+                 ORDER BY created_at DESC, id DESC
                  LIMIT $4
              ),
              census AS (
@@ -270,7 +297,7 @@ impl PgKnowledgeBaseStore {
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;
 
-        let sampled = row.scope_count.max(0) as usize;
+        let sampled = row.scope_count as usize;
         let scope_size = ScopeSize::classify(sampled, KNOWLEDGE_TAG_CENSUS_SAMPLE, page_limit);
         Ok((scope_size, row.available_tags))
     }
