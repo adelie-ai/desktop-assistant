@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use desktop_assistant_core::CoreError;
-use desktop_assistant_core::domain::{ToolDefinition, ToolNamespace};
+use desktop_assistant_core::domain::{ToolDefinition, ToolNamespace, ToolRunner};
 use desktop_assistant_core::ports::tool_registry::{ReindexProvider, ToolReindexFn};
 use desktop_assistant_core::ports::tools::ToolExecutor;
 use tokio::sync::{Mutex, MutexGuard, RwLock};
@@ -989,6 +989,63 @@ pub struct McpControlHandle {
 }
 
 impl McpControlHandle {
+    /// Classify each named tool by what it acts on (issue #1082).
+    ///
+    /// A name that routes to a spawned stdio server is [`ToolRunner::Daemon`]:
+    /// the subprocess runs beside the daemon, so it acts on the daemon's own
+    /// filesystem. A name that routes to a server reached over HTTP is
+    /// [`ToolRunner::RemoteService`]: the call leaves this machine, so it acts
+    /// on a third-party service and on no local files at all.
+    ///
+    /// A name this executor does not route is **absent from the result**, not
+    /// defaulted. The caller decides what an unrouted name means, because only
+    /// the caller knows whether it is a built-in (which does run on the daemon)
+    /// or a client-registered tool (which does not).
+    ///
+    /// Read live rather than from a snapshot, so a server added or removed
+    /// since startup classifies correctly. Locks are taken in the order this
+    /// struct documents: `configs` before `tool_routing`.
+    pub async fn tool_runners(&self, names: &[&str]) -> HashMap<String, ToolRunner> {
+        let configs = self.state.configs.read().await;
+        let routing = self.state.tool_routing.lock().await;
+        names
+            .iter()
+            .filter_map(|name| {
+                let (server_idx, _) = routing.get(*name)?;
+                let config = configs.get(*server_idx)?;
+                let runner = if config.http.is_some() {
+                    ToolRunner::RemoteService
+                } else {
+                    ToolRunner::Daemon
+                };
+                Some(((*name).to_string(), runner))
+            })
+            .collect()
+    }
+
+    /// Seed a handle with server configs and a tool-routing table, without
+    /// connecting to anything.
+    ///
+    /// Routing is normally filled in by a real `initialize` handshake, which a
+    /// unit test cannot perform. Test-only, so the classification in
+    /// [`Self::tool_runners`] can be exercised against a configured HTTP server
+    /// and a configured stdio one.
+    #[cfg(test)]
+    pub(crate) fn seeded_for_test(
+        configs: Vec<McpServerConfig>,
+        routing: HashMap<String, (usize, String)>,
+    ) -> Self {
+        let executor = McpToolExecutor::new(configs);
+        let handle = executor.control_handle();
+        handle
+            .state
+            .tool_routing
+            .try_lock()
+            .expect("a fresh state has no other lock holder")
+            .extend(routing);
+        handle
+    }
+
     /// Get status for one or all servers.
     pub async fn status(&self, server: Option<&str>) -> Vec<McpServerStatusInfo> {
         let configs = self.state.configs.read().await;

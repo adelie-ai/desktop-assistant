@@ -15,4 +15,6 @@ pub use skill::{
     AttachmentDigest, IndexedSkill, Locality, ParsedSkill, SkillError, SkillFrontmatter, SkillKind,
     SkillScope, TrustTier,
 };
-pub use tool::{ToolCall, ToolDefinition, ToolLocality, ToolNamespace, ToolResult, TransportKind};
+pub use tool::{
+    ToolCall, ToolDefinition, ToolLocality, ToolNamespace, ToolResult, ToolRunner, TransportKind,
+};
