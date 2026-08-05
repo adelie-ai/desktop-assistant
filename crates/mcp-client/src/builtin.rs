@@ -11,7 +11,7 @@ use desktop_assistant_core::ports::embedding::EmbedFn;
 use desktop_assistant_core::ports::knowledge::{
     AVAILABLE_TAGS_LIMIT, KNOWLEDGE_TAG_CENSUS_SAMPLE, KnowledgeDeleteFn, KnowledgeGetFn,
     KnowledgeListFn, KnowledgeListQuery, KnowledgeSearchFn, KnowledgeWriteFn, ListOrder,
-    ListOrderOpt,
+    ListOrderOpt, ScopeSize,
 };
 use desktop_assistant_core::ports::notify::{NotifyFn, NotifyUrgency};
 use desktop_assistant_core::ports::scratchpad::{
@@ -28,6 +28,14 @@ use crate::executor::McpControlHandle;
 
 const TOOL_KB_WRITE: &str = "builtin_knowledge_base_write";
 const TOOL_KB_SEARCH: &str = "builtin_knowledge_base_search";
+/// Largest `limit` `builtin_knowledge_base_search` will honour, matching the
+/// cap `builtin_knowledge_base_list` already advertises.
+///
+/// Why a cap at all: the storage layer over-fetches with `limit * 2` to feed
+/// the RRF fusion, so an unbounded caller-supplied limit overflows there rather
+/// than merely returning a large page.
+const KB_SEARCH_MAX_LIMIT: u64 = 500;
+
 const TOOL_KB_DELETE: &str = "builtin_knowledge_base_delete";
 const TOOL_KB_LIST: &str = "builtin_knowledge_base_list";
 const TOOL_SEARCH: &str = "builtin_tool_search";
@@ -337,8 +345,14 @@ impl BuiltinToolService {
                     "Search the knowledge base for preferences, memories, and stored context. \
                      Uses hybrid vector + full-text search. Returns `results`, `returned` (how \
                      many entries are in this page), `scope_size`, and `available_tags`; plus \
-                     `truncated` and a `message` when the page filled up. `scope_size` is NONE, \
-                     FEW, or MANY, and `available_tags` lists tag names most frequent first, \
+                     `truncated` and a `message` when the page filled up. `scope_size` is NONE \
+                     (no entry passes the filters you supplied - retry without them, the store \
+                     may still hold plenty), FEW (the scope is no larger than this page, so a \
+                     `builtin_knowledge_base_list` sweep would show all of it), or MANY (the \
+                     scope holds more than this page could show). FEW does not mean you have \
+                     seen everything: the page holds what matched the query, the scope is what \
+                     passed the filters, so a query that matched nothing still reports FEW when \
+                     the scope is small. `available_tags` lists tag names most frequent first, \
                      without counts. Both describe the SCOPE - the entries that pass the `tags` \
                      and `exclude_tags` filters - and never the number of entries that matched \
                      the query, which this search cannot count. `available_tags` reports at most \
@@ -366,6 +380,7 @@ impl BuiltinToolService {
                         "limit": {
                             "type": "integer",
                             "minimum": 1,
+                            "maximum": KB_SEARCH_MAX_LIMIT,
                             "description": "Max results (default 10)"
                         }
                     },
@@ -1108,14 +1123,16 @@ impl BuiltinToolService {
         let query = required_string(&arguments, "query")?;
         let tags = optional_string_array_nonempty(&arguments, "tags");
         let exclude_tags = optional_string_array_nonempty(&arguments, "exclude_tags");
-        // The schema advertises a minimum of 1. Honour it here rather than
-        // trusting it: a limit of 0 would return nothing and then report
-        // `truncated`, because `results.len() >= limit` holds vacuously.
+        // The schema advertises a minimum of 1 and a maximum of
+        // `KB_SEARCH_MAX_LIMIT`. Honour both here rather than trusting them: a
+        // limit of 0 would return nothing and then report `truncated`, because
+        // `results.len() >= limit` holds vacuously, and an unbounded limit
+        // reaches `limit * 2` in the storage layer, which overflows.
         let limit = arguments
             .get("limit")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(10)
-            .max(1) as usize;
+            .clamp(1, KB_SEARCH_MAX_LIMIT) as usize;
 
         tracing::info!(query = %query, ?tags, ?exclude_tags, limit, "knowledge base search");
 
@@ -1163,7 +1180,13 @@ impl BuiltinToolService {
         // A full page is evidence that entries were left behind, so say so and
         // say what to do about it — the same shape `builtin_scratchpad_search`
         // uses. An absent `truncated` is the claim that nothing was dropped.
-        let truncated = items.len() >= limit;
+        //
+        // Why `Few` overrides it: `Few` means the scope is no larger than the
+        // page, and what matched is a subset of the scope, so a page that
+        // filled up under `Few` holds the whole scope. Claiming truncation
+        // there sends the caller narrowing a search that already returned
+        // everything there was.
+        let truncated = items.len() >= limit && scope_size != ScopeSize::Few;
         let mut response = serde_json::json!({
             "ok": true,
             "results": items,

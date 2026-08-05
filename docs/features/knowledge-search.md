@@ -43,9 +43,16 @@ Reporting that as a match count would state a falsehood.
 
 The three values:
 
-- `NONE` - the scope holds no entries. No other filter would have done better.
-- `FEW` - every entry in the scope fit in this page, so narrowing gains nothing.
-- `MANY` - anything else.
+- `NONE` - no entry passes the filters the caller supplied. This says nothing
+  about the store as a whole: dropping the filters may well find plenty.
+- `FEW` - the scope is no larger than this page, so a plain listing would show
+  all of it.
+- `MANY` - the scope holds more entries than this page could show.
+
+`FEW` does not mean the caller has seen everything. The page holds what matched
+the query; the scope is what passed the filters. A query that matched nothing
+still reports `FEW` when the scope is small, and the entry the caller wanted may
+be sitting in that scope unmatched.
 
 It is a bucket rather than a number because the count behind it comes from a
 capped sample (below), and a raw figure invites the reader to trust a number

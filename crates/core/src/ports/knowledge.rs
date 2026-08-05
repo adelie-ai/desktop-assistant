@@ -32,9 +32,15 @@ pub const AVAILABLE_TAGS_LIMIT: usize = 50;
 /// caller to trust a number that is only exact below the cap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScopeSize {
-    /// The scope holds no entries. No filter can find anything here.
+    /// No entry passes the filters the caller supplied. This says nothing
+    /// about the store as a whole: dropping the filters may well find plenty.
     None,
-    /// Every entry in the scope fit in this page, so narrowing gains nothing.
+    /// The scope is no larger than this page, so a plain listing would show
+    /// all of it.
+    ///
+    /// Why this is not "the caller has seen everything": the page holds what
+    /// matched the query, and the scope is what passed the filters. A query
+    /// that matched nothing still reports `Few` when the scope is small.
     Few,
     /// The scope holds more entries than this page could show.
     Many,
