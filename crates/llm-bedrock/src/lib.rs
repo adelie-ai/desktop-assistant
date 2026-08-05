@@ -3828,6 +3828,103 @@ mod tests {
         assert_eq!(info.capabilities.kind, ModelKind::Generative);
     }
 
+    /// A `ModalityIndex` describing one foundation model, so a profile test
+    /// can exercise the metadata path rather than the id-family fallback.
+    fn index_of(base_id: &str, output: ModelModality) -> ModalityIndex {
+        ModalityIndex::from_summaries(&[make_summary_inference_types(
+            base_id,
+            FoundationModelLifecycleStatus::Active,
+            output,
+            vec![ModelModality::Text],
+            &[InferenceType::OnDemand],
+        )])
+    }
+
+    #[test]
+    fn a_profile_for_an_image_only_model_is_not_listed() {
+        // Bedrock exposes the Stability image models through inference
+        // profiles, and the foundation path already drops them for outputting
+        // neither text nor vectors. A catalogue row here would put an
+        // image-generation model in the chat picker.
+        let profile = make_profile(
+            "us.stability.stable-image-inpaint-v1:0",
+            "Stable Image Inpaint (US)",
+            InferenceProfileStatus::Active,
+        );
+        let index = index_of("stability.stable-image-inpaint-v1:0", ModelModality::Image);
+        assert!(
+            inference_profile_to_model_info(&profile, &index).is_none(),
+            "a profile routing to an image-generation model must not be listed"
+        );
+    }
+
+    #[test]
+    fn a_profile_for_a_video_only_model_is_not_listed() {
+        // `ModelModality` models only TEXT, IMAGE and EMBEDDING, so VIDEO
+        // reaches this code as the SDK's `Unknown` variant. The filter must
+        // keep a model on positive evidence - it outputs text or vectors -
+        // rather than by listing the modalities it rejects, or every modality
+        // AWS adds after this SDK version lands in the chat picker.
+        let profile = make_profile(
+            "us.amazon.nova-reel-v1:1",
+            "Nova Reel (US)",
+            InferenceProfileStatus::Active,
+        );
+        let index = index_of("amazon.nova-reel-v1:1", ModelModality::from("VIDEO"));
+        assert!(
+            inference_profile_to_model_info(&profile, &index).is_none(),
+            "a profile routing to a video-generation model must not be listed"
+        );
+    }
+
+    #[test]
+    fn a_profile_for_a_text_model_is_still_listed() {
+        let profile = make_profile(
+            "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+            "Claude Haiku 4.5 (US)",
+            InferenceProfileStatus::Active,
+        );
+        let index = index_of(
+            "anthropic.claude-haiku-4-5-20251001-v1:0",
+            ModelModality::Text,
+        );
+        let info = inference_profile_to_model_info(&profile, &index)
+            .expect("a text model keeps its catalogue row");
+        assert_eq!(info.id, "us.anthropic.claude-haiku-4-5-20251001-v1:0");
+        assert_eq!(info.capabilities.kind, ModelKind::Generative);
+    }
+
+    #[test]
+    fn a_profile_for_an_embedding_model_is_still_listed() {
+        // Embedding models are listed on purpose: they must be selectable for
+        // the embedding purpose. Only text and vectors survive the filter.
+        let profile = make_profile(
+            "us.cohere.embed-v4:0",
+            "Cohere Embed v4 (US)",
+            InferenceProfileStatus::Active,
+        );
+        let index = index_of("cohere.embed-v4:0", ModelModality::Embedding);
+        let info = inference_profile_to_model_info(&profile, &index)
+            .expect("an embedding model keeps its catalogue row");
+        assert_eq!(info.capabilities.kind, ModelKind::Embedding);
+    }
+
+    #[test]
+    fn a_profile_whose_base_model_the_listing_did_not_return_is_still_listed() {
+        // No metadata means no evidence to drop it on. Missing provider data
+        // must not silently shrink the catalogue, which is the same posture
+        // `can_serve` takes for a model it knows nothing about.
+        let profile = make_profile(
+            "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+            "Claude Haiku 4.5 (US)",
+            InferenceProfileStatus::Active,
+        );
+        assert!(
+            inference_profile_to_model_info(&profile, &ModalityIndex::default()).is_some(),
+            "a profile with no foundation-model entry must still be listed"
+        );
+    }
+
     #[test]
     fn profile_amazon_nova_capabilities() {
         let profile = make_profile(
