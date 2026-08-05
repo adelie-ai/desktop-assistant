@@ -584,6 +584,142 @@ async fn resolve_active_name_follows_deprecation_without_cycling() {
     .await;
 }
 
+/// Captured `nomic-embed-text` vectors for the tag-dedup texts, keyed by the
+/// exact string `create_or_match_tag` embeds (`"<name>: <description>"`).
+///
+/// Why captured rather than synthetic: the criterion is whether the 0.10 cosine
+/// threshold still separates two genuinely different facet tags now that the
+/// embedded string carries a colon. A hand-written vector answers a question
+/// about arithmetic; only a real model's vector answers that one.
+fn tag_dedup_fixture_embed_fn() -> BackfillEmbedFn {
+    const FIXTURE: &str = include_str!("fixtures/tag_dedup_embeddings.json");
+    let doc: serde_json::Value =
+        serde_json::from_str(FIXTURE).expect("tag-dedup embedding fixture parses");
+    let vectors: std::collections::HashMap<String, Vec<f32>> = doc["vectors"]
+        .as_object()
+        .expect("fixture has a `vectors` object")
+        .iter()
+        .map(|(text, vec)| {
+            let floats = vec
+                .as_array()
+                .expect("each fixture vector is an array")
+                .iter()
+                .map(|v| v.as_f64().expect("each fixture component is a number") as f32)
+                .collect();
+            (text.clone(), floats)
+        })
+        .collect();
+
+    Box::new(move |texts| {
+        let vectors = vectors.clone();
+        Box::pin(async move {
+            Ok(texts
+                .iter()
+                .map(|t| {
+                    // Loud on a miss: if the embedded-text format changes, this
+                    // test must fail rather than quietly compare the wrong
+                    // strings.
+                    vectors
+                        .get(t)
+                        .unwrap_or_else(|| panic!("no captured embedding for {t:?}"))
+                        .clone()
+                })
+                .collect())
+        })
+    })
+}
+
+#[tokio::test]
+async fn registry_dedup_still_separates_distinct_facet_tags() {
+    // Restoring the facet colon changes the embedded string for every facet
+    // tag, so the `TAG_DEDUP_DISTANCE_THRESHOLD` (0.10 cosine) check has to be
+    // re-proven: `project:adele-gtk` and `project:adele-tui` are different
+    // projects and must stay two tags, while a near-duplicate of the first must
+    // still be redirected onto it.
+    //
+    // MUTATION: widening the threshold to 0.15 collapses gtk and tui into one
+    // tag → RED. Narrowing it to 0.02 stops the near-duplicate redirecting →
+    // also RED.
+    with_fixture(
+        "registry_dedup_still_separates_distinct_facet_tags",
+        |fx| async move {
+            let embed_fn = tag_dedup_fixture_embed_fn();
+
+            with_user_id(UserId::new("alice"), async {
+            let gtk = create_or_match_tag(
+                &fx.pool,
+                &embed_fn,
+                "nomic-embed-text",
+                TagProposal {
+                    name: "project:adele-gtk".into(),
+                    description: "The GTK desktop client for Adele.".into(),
+                    examples: vec![],
+                    distinguish_from: vec![],
+                },
+            )
+            .await
+            .expect("create the gtk project tag");
+            assert!(
+                matches!(gtk, CreateTagOutcome::Created(ref t) if t.name == "project:adele-gtk"),
+                "the registry must store the facet colon verbatim, got {gtk:?}"
+            );
+
+            let tui = create_or_match_tag(
+                &fx.pool,
+                &embed_fn,
+                "nomic-embed-text",
+                TagProposal {
+                    name: "project:adele-tui".into(),
+                    description: "The terminal client for Adele.".into(),
+                    examples: vec![],
+                    distinguish_from: vec![],
+                },
+            )
+            .await
+            .expect("create the tui project tag");
+            assert!(
+                matches!(tui, CreateTagOutcome::Created(ref t) if t.name == "project:adele-tui"),
+                "two different projects must stay two tags, got {tui:?}"
+            );
+
+            // The other direction: the threshold must still fire, or the check
+            // above would pass simply because dedup stopped working.
+            let typo = create_or_match_tag(
+                &fx.pool,
+                &embed_fn,
+                "nomic-embed-text",
+                TagProposal {
+                    name: "project:adelegtk".into(),
+                    description: "The GTK desktop client for Adele.".into(),
+                    examples: vec![],
+                    distinguish_from: vec![],
+                },
+            )
+            .await
+            .expect("propose a near-duplicate of the gtk tag");
+            match typo {
+                CreateTagOutcome::RedirectedTo {
+                    existing, distance, ..
+                } => {
+                    assert_eq!(
+                        existing.name, "project:adele-gtk",
+                        "a near-duplicate facet tag must redirect to the canonical one"
+                    );
+                    assert!(
+                        distance < 0.10,
+                        "the redirect must be inside the threshold, got {distance}"
+                    );
+                }
+                other => panic!("expected RedirectedTo, got {other:?}"),
+            }
+        })
+        .await;
+            fx
+        },
+    )
+    .await;
+}
+
 // -- tool_registry -----------------------------------------------------------
 
 fn tool(name: &str, description: &str) -> ToolDefinition {
