@@ -584,6 +584,265 @@ async fn resolve_active_name_follows_deprecation_without_cycling() {
     .await;
 }
 
+/// Captured `nomic-embed-text` vectors for the tag-dedup texts, keyed by the
+/// exact string `create_or_match_tag` embeds (`"<name>: <description>"`).
+///
+/// Why captured rather than synthetic: the criterion is whether the 0.10 cosine
+/// threshold still separates two genuinely different facet tags now that the
+/// embedded string carries a colon. A hand-written vector answers a question
+/// about arithmetic; only a real model's vector answers that one.
+fn tag_dedup_fixture_embed_fn() -> BackfillEmbedFn {
+    const FIXTURE: &str = include_str!("fixtures/tag_dedup_embeddings.json");
+    let doc: serde_json::Value =
+        serde_json::from_str(FIXTURE).expect("tag-dedup embedding fixture parses");
+    let vectors: std::collections::HashMap<String, Vec<f32>> = doc["vectors"]
+        .as_object()
+        .expect("fixture has a `vectors` object")
+        .iter()
+        .map(|(text, vec)| {
+            let floats = vec
+                .as_array()
+                .expect("each fixture vector is an array")
+                .iter()
+                .map(|v| v.as_f64().expect("each fixture component is a number") as f32)
+                .collect();
+            (text.clone(), floats)
+        })
+        .collect();
+
+    Box::new(move |texts| {
+        let vectors = vectors.clone();
+        Box::pin(async move {
+            Ok(texts
+                .iter()
+                .map(|t| {
+                    // Loud on a miss: if the embedded-text format changes, this
+                    // test must fail rather than quietly compare the wrong
+                    // strings.
+                    vectors
+                        .get(t)
+                        .unwrap_or_else(|| panic!("no captured embedding for {t:?}"))
+                        .clone()
+                })
+                .collect())
+        })
+    })
+}
+
+#[tokio::test]
+async fn registry_dedup_still_separates_distinct_facet_tags() {
+    // Restoring the facet colon changes the embedded string for every facet
+    // tag, so the `TAG_DEDUP_DISTANCE_THRESHOLD` (0.10 cosine) check has to be
+    // re-proven: `project:adele-gtk` and `project:adele-tui` are different
+    // projects and must stay two tags, while a near-duplicate of the first must
+    // still be redirected onto it.
+    //
+    // MUTATION: widening the threshold to 0.15 collapses gtk and tui into one
+    // tag → RED. Narrowing it to 0.02 stops the near-duplicate redirecting →
+    // also RED.
+    with_fixture("registry_dedup_still_separates_distinct_facet_tags", |fx| async move {
+        let embed_fn = tag_dedup_fixture_embed_fn();
+
+        with_user_id(UserId::new("alice"), async {
+            let gtk = create_or_match_tag(
+                &fx.pool,
+                &embed_fn,
+                "nomic-embed-text",
+                TagProposal {
+                    name: "project:adele-gtk".into(),
+                    description: "The GTK desktop client for Adele.".into(),
+                    examples: vec![],
+                    distinguish_from: vec![],
+                },
+            )
+            .await
+            .expect("create the gtk project tag");
+            assert!(
+                matches!(gtk, CreateTagOutcome::Created(ref t) if t.name == "project:adele-gtk"),
+                "the registry must store the facet colon verbatim, got {gtk:?}"
+            );
+
+            let tui = create_or_match_tag(
+                &fx.pool,
+                &embed_fn,
+                "nomic-embed-text",
+                TagProposal {
+                    name: "project:adele-tui".into(),
+                    description: "The terminal client for Adele.".into(),
+                    examples: vec![],
+                    distinguish_from: vec![],
+                },
+            )
+            .await
+            .expect("create the tui project tag");
+            assert!(
+                matches!(tui, CreateTagOutcome::Created(ref t) if t.name == "project:adele-tui"),
+                "two different projects must stay two tags, got {tui:?}"
+            );
+
+            // The other direction: the threshold must still fire, or the check
+            // above would pass simply because dedup stopped working.
+            let typo = create_or_match_tag(
+                &fx.pool,
+                &embed_fn,
+                "nomic-embed-text",
+                TagProposal {
+                    name: "project:adelegtk".into(),
+                    description: "The GTK desktop client for Adele.".into(),
+                    examples: vec![],
+                    distinguish_from: vec![],
+                },
+            )
+            .await
+            .expect("propose a near-duplicate of the gtk tag");
+            match typo {
+                CreateTagOutcome::RedirectedTo {
+                    existing, distance, ..
+                } => {
+                    assert_eq!(
+                        existing.name, "project:adele-gtk",
+                        "a near-duplicate facet tag must redirect to the canonical one"
+                    );
+                    assert!(
+                        distance < 0.10,
+                        "the redirect must be inside the threshold, got {distance}"
+                    );
+                }
+                other => panic!("expected RedirectedTo, got {other:?}"),
+            }
+        })
+        .await;
+        fx
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn migration_repairs_mangled_facet_tag_names() {
+    // Rows written before the facet-preserving normaliser carry a name with the
+    // colon removed (`projectadele-gtk`). Migration 040 restores the colon,
+    // clears the now-stale embedding, drops a mangled row whose facet-correct
+    // twin already exists, and carries every deprecation pointer across.
+    //
+    // MUTATION: dropping the final `deprecated_for_tag` UPDATE strands the
+    // pointer on a name no row holds → RED on the two pointer assertions.
+    const MIGRATION: &str = include_str!("../migrations/040_tag_registry_facet_names.sql");
+
+    with_fixture("migration_repairs_mangled_facet_tag_names", |fx| async move {
+        // Staged as the old normaliser would have written them, plus rows the
+        // repair must leave alone.
+        for (user, name, deprecated_for) in [
+            // Renamed: no facet-correct twin.
+            ("alice", "projectadele-gtk", None),
+            // Collision: both forms present, the correct one wins.
+            ("alice", "project:adele-tui", None),
+            ("alice", "projectadele-tui", None),
+            // Untouched: no facet prefix, and a bare facet word with no value.
+            ("alice", "preference", None),
+            ("alice", "project", None),
+            // Pointers into both a renamed row and a dropped row.
+            ("alice", "old-gtk", Some("projectadele-gtk")),
+            ("alice", "old-tui", Some("projectadele-tui")),
+            // A second tenant's rows are repaired independently.
+            ("bob", "topicdeploy", None),
+        ] {
+            sqlx::query(
+                "INSERT INTO tag_registry \
+                    (user_id, name, description, embedding, embedding_model, deprecated_for_tag) \
+                 VALUES ($1, $2, 'staged', '[1,0,0]'::vector, 'stale-model', $3)",
+            )
+            .bind(user)
+            .bind(name)
+            .bind(deprecated_for)
+            .execute(&fx.pool)
+            .await
+            .expect("stage a pre-repair tag row");
+        }
+
+        sqlx::raw_sql(MIGRATION)
+            .execute(&fx.pool)
+            .await
+            .expect("migration 040 replays cleanly");
+
+        // Sorted in Rust, not by Postgres: `ORDER BY name` would rank `project`
+        // against `project:adele-gtk` by the database's collation, which varies.
+        let mut names: Vec<(String, String)> =
+            sqlx::query_as("SELECT user_id, name FROM tag_registry")
+                .fetch_all(&fx.pool)
+                .await
+                .expect("read back repaired names");
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                ("alice".to_string(), "old-gtk".to_string()),
+                ("alice".to_string(), "old-tui".to_string()),
+                ("alice".to_string(), "preference".to_string()),
+                ("alice".to_string(), "project".to_string()),
+                ("alice".to_string(), "project:adele-gtk".to_string()),
+                ("alice".to_string(), "project:adele-tui".to_string()),
+                ("bob".to_string(), "topic:deploy".to_string()),
+            ],
+            "the mangled duplicate must be dropped and every other row repaired in place"
+        );
+
+        // A renamed row's embedding is stale, so it is cleared (#516 re-embeds
+        // it later). The surviving twin was never renamed and keeps its vector.
+        let cleared: Vec<(String, bool, Option<String>)> = sqlx::query_as(
+            "SELECT name, embedding IS NULL, embedding_model FROM tag_registry \
+             WHERE user_id = 'alice' AND name IN ('project:adele-gtk', 'project:adele-tui') \
+             ORDER BY name",
+        )
+        .fetch_all(&fx.pool)
+        .await
+        .expect("read back embeddings");
+        assert_eq!(
+            cleared,
+            vec![
+                ("project:adele-gtk".to_string(), true, None),
+                (
+                    "project:adele-tui".to_string(),
+                    false,
+                    Some("stale-model".to_string())
+                ),
+            ],
+            "a renamed row loses its embedding; an untouched row keeps its own"
+        );
+
+        let pointers: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT name, deprecated_for_tag FROM tag_registry \
+             WHERE user_id = 'alice' AND name IN ('old-gtk', 'old-tui') ORDER BY name",
+        )
+        .fetch_all(&fx.pool)
+        .await
+        .expect("read back deprecation pointers");
+        assert_eq!(
+            pointers,
+            vec![
+                ("old-gtk".to_string(), Some("project:adele-gtk".to_string())),
+                ("old-tui".to_string(), Some("project:adele-tui".to_string())),
+            ],
+            "a deprecation pointer must follow both a rename and a dropped duplicate"
+        );
+
+        // Replaying is a no-op: a repaired name already carries a colon.
+        sqlx::raw_sql(MIGRATION)
+            .execute(&fx.pool)
+            .await
+            .expect("migration 040 is idempotent");
+        let mut after: Vec<(String, String)> =
+            sqlx::query_as("SELECT user_id, name FROM tag_registry")
+                .fetch_all(&fx.pool)
+                .await
+                .expect("read back names after replay");
+        after.sort();
+        assert_eq!(names, after, "a replay must change nothing");
+
+        fx
+    })
+    .await;
+}
+
 // -- tool_registry -----------------------------------------------------------
 
 fn tool(name: &str, description: &str) -> ToolDefinition {

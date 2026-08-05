@@ -262,6 +262,80 @@ fn row_to_record(row: (String, String, serde_json::Value, Vec<String>)) -> TagRe
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tag_normalize::{normalize_tag, normalize_tags};
+
+    /// One table of raw tag names, driven through both the registry path and
+    /// the knowledge-base path.
+    ///
+    /// Why a shared table: the registry key and the tag written on a
+    /// knowledge-base row must be byte-identical, or a lookup cannot connect
+    /// them. Two normalisers with two test tables can agree on the day they
+    /// are written and drift apart afterwards, which is the defect this table
+    /// exists to prevent.
+    const CROSS_PATH_TAG_INPUTS: &[&str] = &[
+        "project:adelie-ai",
+        "Project: Adelie AI",
+        "PROJECT:Adelie-AI",
+        "topic:Deploy",
+        "Topic:Release:2026",
+        "person:Ada Lovelace",
+        "tool:ripgrep",
+        "Preference",
+        "  Memory  ",
+        "INSTRUCTION",
+        "multi   word\ttag",
+        ":deploy",
+        "user_preference",
+        "--leading-trailing--",
+        "weird!chars@here",
+    ];
+
+    #[test]
+    fn registry_preserves_a_facet_tag_colon() {
+        // The knowledge-base prompt asks for `project:<name>` shaped tags, so a
+        // registry that drops the colon holds a key no row can ever carry.
+        assert_eq!(normalize_tag_name("project:adelie-ai"), "project:adelie-ai");
+        assert_eq!(normalize_tag_name("Project:Adelie-AI"), "project:adelie-ai");
+        assert_eq!(normalize_tag_name("topic:deploy"), "topic:deploy");
+        assert_eq!(normalize_tag_name("person:ada"), "person:ada");
+        assert_eq!(normalize_tag_name("tool:ripgrep"), "tool:ripgrep");
+    }
+
+    #[test]
+    fn registry_normalises_the_facet_and_value_halves_independently() {
+        // Both halves are lowercased and whitespace-collapsed on their own, and
+        // only the FIRST colon separates them.
+        assert_eq!(normalize_tag_name("Project: Adelie AI"), "project:adelie-ai");
+        assert_eq!(
+            normalize_tag_name("  TOPIC : Deploy Steps "),
+            "topic:deploy-steps"
+        );
+        assert_eq!(
+            normalize_tag_name("Topic:Release:2026"),
+            "topic:release:2026"
+        );
+        // A leading colon has no facet name, so it is not a facet tag.
+        assert_eq!(normalize_tag_name(":deploy"), ":deploy");
+    }
+
+    #[test]
+    fn registry_and_knowledge_base_normalise_a_tag_identically() {
+        for raw in CROSS_PATH_TAG_INPUTS {
+            let registry = normalize_tag_name(raw);
+            let knowledge_base = normalize_tag(raw);
+            assert_eq!(
+                registry, knowledge_base,
+                "registry and knowledge base disagree on {raw:?}"
+            );
+            // The knowledge base writes through the plural entry point, so it
+            // is held to the same table.
+            assert_eq!(
+                normalize_tags([raw]),
+                vec![registry.clone()],
+                "the knowledge-base write path disagrees on {raw:?}"
+            );
+        }
+    }
 
     #[test]
     fn normalize_handles_common_variants() {
