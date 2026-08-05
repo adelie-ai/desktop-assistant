@@ -1547,6 +1547,34 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
             client_tool_names: client_tool_defs.iter().map(|d| d.name.clone()).collect(),
         };
 
+        // Report the client tools this turn cannot reach (#1083). The tool-set
+        // merge below drops a client definition whose name a server-side tool
+        // already holds, so the model is never offered it and dispatch routes
+        // the name to the server executor. Reported once here, where the
+        // collision is resolved, rather than on every note build.
+        //
+        // On one machine that is the intended collapse of one capability that
+        // happens to be registered twice, so it is an ordinary outcome. On two
+        // machines it is a real loss: the operator registered a tool meant to
+        // act on the user's own machine, and nothing can call it.
+        let shadowed = tool_locality.shadowed_client_tools();
+        if !shadowed.is_empty() {
+            if tool_locality.is_co_located() {
+                tracing::info!(
+                    tools = ?shadowed,
+                    "client tools share a name with a daemon-side tool; the daemon-side \
+                     one is used, and both run on this one machine"
+                );
+            } else {
+                tracing::warn!(
+                    tools = ?shadowed,
+                    "client tools share a name with a daemon-side tool, so they cannot be \
+                     called; the daemon-side tool wins and acts on the daemon's machine. \
+                     Rename them (for example with a namespace) to make them reachable"
+                );
+            }
+        }
+
         // Per-turn step stack for the planning + compaction tools (#240).
         // Frames hold watermarks into `conv.messages`; `complete_step` evicts a
         // scope's raw tool results down to a searchable scratchpad pointer.
@@ -7569,12 +7597,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_ws_turn_twins_duplicated_capability_with_locality_labels() {
-        // Issue #243 end-to-end through the dispatch loop: a server-side
-        // `terminal` plus a client-registered `terminal` over a REMOTE
-        // (WebSocket) connection. The per-turn tool note must expose BOTH with
-        // locality labels (server host vs your device) and a routing hint —
-        // i.e. the remote case does not collapse the capability.
+    async fn remote_ws_turn_does_not_offer_a_shadowed_client_twin() {
+        // End-to-end through the dispatch loop: a server-side `terminal` plus a
+        // client-registered `terminal` over a remote (WebSocket) connection.
+        // Only the server-side one is offered to the model and dispatched, so
+        // the note labels that one and never names the client twin.
         use crate::ports::client_tools::with_client_tools;
         use crate::ports::transport::with_transport_kind;
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -7635,12 +7662,19 @@ mod tests {
             "remote note must label the server tool: {system}"
         );
         assert!(
-            system.contains("terminal — your device"),
-            "remote note must label the client twin: {system}"
+            !system.contains("terminal — your device"),
+            "the shadowed client twin is not offered to the model, so the note \
+             must not name it: {system}"
         );
         assert!(
-            system.contains("ask which machine"),
-            "remote duplicated capability must carry the routing hint: {system}"
+            !system.contains("(alternative)"),
+            "and must not present it as an alternative: {system}"
+        );
+        // The two machines are still described, so the model knows the
+        // daemon-side `terminal` does not reach the user's own computer.
+        assert!(
+            system.contains("Two different machines"),
+            "the topology must still say the machines differ: {system}"
         );
     }
 

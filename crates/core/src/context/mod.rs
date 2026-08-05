@@ -432,7 +432,7 @@ impl ToolLocalityContext {
     /// Prefers the authoritative system-id match (#248) when the client
     /// reported an id ([`Self::co_located`] is `Some`); otherwise falls back to
     /// the transport heuristic (#243) for older clients that send no id.
-    fn is_co_located(&self) -> bool {
+    pub(crate) fn is_co_located(&self) -> bool {
         self.co_located
             .unwrap_or_else(|| self.transport.is_co_located())
     }
@@ -443,6 +443,21 @@ impl ToolLocalityContext {
 
     fn is_client(&self, name: &str) -> bool {
         self.client_tool_names.iter().any(|n| n == name)
+    }
+
+    /// Client-registered tools this turn cannot call, because a daemon-side
+    /// tool already holds the name (#1083).
+    ///
+    /// The turn loop's tool-set merge drops a client definition whose name a
+    /// server-side tool already holds, so the model is never offered it and
+    /// dispatch routes the name to the server executor. Names are returned in
+    /// registration order, so a report of them is stable.
+    pub(crate) fn shadowed_client_tools(&self) -> Vec<&str> {
+        self.client_tool_names
+            .iter()
+            .map(String::as_str)
+            .filter(|name| self.is_server(name))
+            .collect()
     }
 
     /// The topology this turn's connection describes (#534), for the
@@ -478,25 +493,25 @@ pub(crate) struct ToolLocalityEntry {
 
 /// Resolve the flat tool set into a locality plan (issue #243).
 ///
-/// Behaviour:
-/// - **Co-located** (UDS / D-Bus): the client and daemon are the same machine,
-///   so a server tool and a client tool with the same name are physically the
-///   same capability. We collapse them — keep the server-side tool, drop the
-///   duplicate client one — so the LLM sees one tool per capability and the
-///   note carries no confusing per-machine distinction.
-/// - **Remote** (WebSocket): server and client are distinct hosts. Both tools
-///   of a duplicated capability are exposed, each tagged with its locality, and
-///   the **server-side** one is marked primary (daemon-side execution is the
-///   safe default; the prompt rule tells the model to prefer the client tool
-///   for work on the user's own device and to ask when genuinely ambiguous).
+/// A tool registered on both machines resolves to the **server-side** entry
+/// alone, on every transport. Only that one can be called: the turn loop's
+/// tool-set merge drops a client definition whose name a server-side tool
+/// already holds, so the model never receives the client one and dispatch
+/// routes the name to the server executor. Naming the client twin as an
+/// alternative would advertise a tool that does not exist for this turn.
+/// A co-located connection has nothing to choose between anyway - the two are
+/// one machine - and a remote one has lost the client capability, which the
+/// turn loop reports once when it resolves the collision.
 ///
-/// Tool order is preserved (server entries keep their position; in the remote
-/// case the matching client entry is appended right after its server twin).
+/// Everything else keeps its own locality: a client-only tool is tagged to the
+/// client, and anything not registered client-side is server-side.
+///
+/// Tool order is preserved: each entry keeps the position of its name in
+/// `tool_names`, one entry per name.
 pub(crate) fn resolve_tool_localities(
     tool_names: &[&str],
     ctx: &ToolLocalityContext,
 ) -> Vec<ToolLocalityEntry> {
-    let co_located = ctx.is_co_located();
     let mut entries: Vec<ToolLocalityEntry> = Vec::with_capacity(tool_names.len());
 
     for &name in tool_names {
@@ -505,22 +520,21 @@ pub(crate) fn resolve_tool_localities(
         let duplicated = is_server && is_client;
 
         if duplicated {
-            // Capability on both machines. Co-located ⇒ the two are physically
-            // the same, so keep only the server-side tool. Remote ⇒ expose both
-            // with the server tool as the primary and the client tool as the
-            // labelled alternative.
+            // The same name on both machines. Only the server-side tool is
+            // reachable either way: the turn loop's tool-set merge drops a
+            // client definition whose name a server-side tool already holds, so
+            // the model is never offered the client one and dispatch routes the
+            // name to the server executor. Naming a "your device (alternative)"
+            // entry here would advertise a tool that cannot be called - true of
+            // a remote connection as much as a co-located one, where the two
+            // are the same machine anyway. So emit the server entry alone.
+            // The loss of the client capability is reported once per turn,
+            // where the merge happens, rather than on every note build.
             entries.push(ToolLocalityEntry {
                 name: name.to_string(),
                 locality: ToolLocality::server(&ctx.host),
                 primary: true,
             });
-            if !co_located {
-                entries.push(ToolLocalityEntry {
-                    name: name.to_string(),
-                    locality: ToolLocality::client(name, &ctx.client_label),
-                    primary: false,
-                });
-            }
         } else if is_client {
             // Client-only capability: a plain local tool when co-located, a
             // labelled remote tool otherwise.
@@ -606,11 +620,12 @@ fn assemble_for_test(
 /// assembled system block exceeds [`SYSTEM_BLOCK_BUDGET_RATIO`].
 ///
 /// When `locality` is `Some`, tools are tagged with where they run (issue
-/// #243): co-located connections (UDS / D-Bus) get a plain list because
-/// everything is on this machine, while a remote (WebSocket) connection gets
-/// per-tool locality labels and a short routing hint. When `None` (callers
-/// that don't thread a transport context) the listing is the plain name list,
-/// byte-identical to the pre-#243 behaviour.
+/// #243): a co-located connection gets a plain list because everything is on
+/// this machine, while a connection to another machine gets per-tool locality
+/// labels. How to choose between the machines is stated once, in the
+/// `Where things run` prompt section, rather than repeated here. When `None`
+/// (callers that don't thread a transport context) the listing is the plain
+/// name list, byte-identical to the pre-#243 behaviour.
 fn build_full_tool_note(
     tool_defs: &[ToolDefinition],
     deferred_namespaces: &[ToolNamespace],
@@ -627,43 +642,26 @@ fn build_full_tool_note(
         // Resolve locality and render the tool list. The co-located common
         // case (and the no-context fallback) produce the plain comma-joined
         // list; a remote connection produces per-tool locality labels.
-        let (names, remote_routing_hint) = match locality {
+        let names = match locality {
             Some(ctx) => {
                 let tool_names: Vec<&str> = tool_defs.iter().map(|t| t.name.as_str()).collect();
                 let entries = resolve_tool_localities(&tool_names, ctx);
-                let co_located = ctx.is_co_located();
-                let rendered = render_locality_list(&entries, co_located);
-                // Only emit a routing hint when a capability is genuinely
-                // duplicated across distinct machines (remote case).
-                let has_remote_dup =
-                    !co_located && entries.iter().any(|e| !e.primary && e.locality.is_client());
-                let hint = if has_remote_dup {
-                    " Some capabilities exist on both the server and your device — \
-                     prefer the tool on your device for work on your own machine, the \
-                     server tool for daemon-side work, and ask which machine when it's \
-                     genuinely ambiguous."
-                } else {
-                    ""
-                };
-                (rendered, hint)
+                render_locality_list(&entries, ctx.is_co_located())
             }
-            None => (
-                tool_defs
-                    .iter()
-                    .map(|t| t.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                "",
-            ),
+            None => tool_defs
+                .iter()
+                .map(|t| t.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
         };
         if has_tool_search {
             note = format!(
-                "Available tools in this turn: {names}.{remote_routing_hint} \
+                "Available tools in this turn: {names}. \
                  Additional tools may be available — use builtin_tool_search to discover \
                  tools for tasks not covered by the tools listed above."
             );
         } else {
-            note = format!("Available tools in this turn: {names}.{remote_routing_hint}");
+            note = format!("Available tools in this turn: {names}.");
         }
     }
 
@@ -692,9 +690,18 @@ fn build_full_tool_note(
 /// displaces conversation history. The model still has
 /// `builtin_tool_search` as a real tool definition (in `tool_defs`); the
 /// listing demotion only collapses what the system prompt enumerates.
+///
+/// The collapsed listing is where the per-tool machine labels lived, so when
+/// the connection reaches a second machine this note names the tools that run
+/// on the user's own. They are few, and they are the part the model cannot
+/// recover for itself: what it collapsed is the daemon-side listing, and
+/// daemon-side tools are exactly what `builtin_tool_search` returns. A
+/// co-located connection keeps the plain summary - one machine draws no
+/// per-machine distinction.
 fn build_demoted_tool_note(
     tool_defs: &[ToolDefinition],
     deferred_namespaces: &[ToolNamespace],
+    locality: Option<&ToolLocalityContext>,
 ) -> String {
     let total_tools: usize = tool_defs.len()
         + deferred_namespaces
@@ -702,10 +709,22 @@ fn build_demoted_tool_note(
             .map(|ns| ns.tools.len())
             .sum::<usize>();
     let namespace_count = deferred_namespaces.len();
-    format!(
+    let mut note = format!(
         "There are {total_tools} tools across {namespace_count} namespaces. \
          Use builtin_tool_search to discover a tool for any task you need."
-    )
+    );
+
+    if let Some(ctx) = locality
+        && !ctx.is_co_located()
+        && !ctx.client_tool_names.is_empty()
+    {
+        let device_tools = ctx.client_tool_names.join(", ");
+        note.push_str(&format!(
+            " These run on the user's own machine: {device_tools}. Every other tool \
+             runs on the daemon's machine."
+        ));
+    }
+    note
 }
 
 /// Render the assembled system instruction containing `tool_note` as the
@@ -868,7 +887,8 @@ fn system_block(
         return system_instruction;
     }
 
-    let demoted_note = build_demoted_tool_note(tools.tool_defs, tools.deferred_namespaces);
+    let demoted_note =
+        build_demoted_tool_note(tools.tool_defs, tools.deferred_namespaces, tools.locality);
     let demoted_system = assemble_system_instruction(demoted_note, topology, ambient);
     let system_tokens_after = estimate(&demoted_system);
     tracing::warn!(
@@ -1472,6 +1492,77 @@ mod tests {
         let entries = resolve_tool_localities(&["device_terminal"], &ctx);
         let rendered = render_locality_list(&entries, false);
         assert_eq!(rendered, "device_terminal — your device");
+    }
+
+    #[test]
+    fn shadowing_a_client_tool_is_reported_by_name() {
+        // The names the turn loop reports once, where it resolves the
+        // collision. Registration order, so the report is stable, and only the
+        // names a daemon-side tool actually holds.
+        let ctx = locality_ctx(
+            TransportKind::WebSocket,
+            "daemon-host",
+            &["terminal", "read_file"],
+            &["terminal", "device_only", "read_file"],
+        );
+        assert_eq!(ctx.shadowed_client_tools(), vec!["terminal", "read_file"]);
+
+        // Nothing to report when every client tool has its own name - which is
+        // what a namespaced client registration produces.
+        let clean = locality_ctx(
+            TransportKind::WebSocket,
+            "daemon-host",
+            &["terminal"],
+            &["device__terminal"],
+        );
+        assert!(clean.shadowed_client_tools().is_empty());
+    }
+
+    #[test]
+    fn the_demoted_note_names_the_tools_on_the_users_machine() {
+        // Demotion collapses the tool listing, which is where the per-tool
+        // machine labels live. What the model cannot recover by searching is
+        // which tools reach the user's own machine, because tool search returns
+        // the daemon-side set the listing collapsed.
+        let ctx = locality_ctx(
+            TransportKind::WebSocket,
+            "daemon-host",
+            &["terminal"],
+            &["device_terminal", "device_read_file"],
+        );
+        let note = build_demoted_tool_note(&[], &[], Some(&ctx));
+        assert!(
+            note.contains("device_terminal") && note.contains("device_read_file"),
+            "the demoted note must name the user's own tools: {note}"
+        );
+        assert!(
+            note.contains("Every other tool runs on the daemon's machine"),
+            "and say where the rest run: {note}"
+        );
+    }
+
+    #[test]
+    fn the_demoted_note_is_unchanged_when_the_daemon_and_client_are_one_machine() {
+        // One machine draws no per-machine distinction, so the summary stays
+        // exactly what it was, and costs no extra tokens on the turns that are
+        // already over budget.
+        let plain = build_demoted_tool_note(&[], &[], None);
+        let co_located = locality_ctx(
+            TransportKind::Uds,
+            "daemon-host",
+            &["terminal"],
+            &["device_terminal"],
+        );
+        assert_eq!(build_demoted_tool_note(&[], &[], Some(&co_located)), plain);
+
+        // A remote connection that registered no client tools has nothing extra
+        // to say either.
+        let no_client_tools =
+            locality_ctx(TransportKind::WebSocket, "daemon-host", &["terminal"], &[]);
+        assert_eq!(
+            build_demoted_tool_note(&[], &[], Some(&no_client_tools)),
+            plain
+        );
     }
 
     #[test]
@@ -3969,10 +4060,11 @@ mod tests {
     }
 
     #[test]
-    fn resolve_localities_remote_exposes_both_with_primary_server() {
-        // `terminal` on both server and client + a remote (WebSocket)
-        // transport: both are exposed, server is primary, client is the
-        // labelled alternative.
+    fn a_shadowed_client_tool_is_not_advertised_as_an_alternative() {
+        // `terminal` on both machines, over a remote transport. The turn loop
+        // offers the model only the server-side definition and routes the name
+        // to the server executor, so naming a client alternative would point at
+        // a tool that cannot be called.
         let ctx = locality_ctx(
             TransportKind::WebSocket,
             "daemon-host",
@@ -3981,17 +4073,19 @@ mod tests {
         );
         let entries = resolve_tool_localities(&["terminal", "kb_search"], &ctx);
         let terminal: Vec<_> = entries.iter().filter(|e| e.name == "terminal").collect();
-        assert_eq!(terminal.len(), 2, "remote duplicate must expose both tools");
-        // Exactly one is server (primary), one is client (alternative).
-        let server = terminal.iter().find(|e| e.locality.is_server()).unwrap();
-        let client = terminal.iter().find(|e| e.locality.is_client()).unwrap();
-        assert!(
-            server.primary,
-            "server side is the primary in the remote case"
+        assert_eq!(
+            terminal.len(),
+            1,
+            "a shadowed client tool must not be advertised: {terminal:?}"
         );
+        assert!(terminal[0].locality.is_server());
+        assert!(terminal[0].primary);
+
+        // And the rendered note carries no phantom alternative.
+        let rendered = render_locality_list(&entries, false);
         assert!(
-            !client.primary,
-            "client side is the non-primary alternative"
+            !rendered.contains("(alternative)"),
+            "no unreachable alternative may be named: {rendered}"
         );
     }
 
@@ -4018,11 +4112,11 @@ mod tests {
     }
 
     #[test]
-    fn resolve_localities_id_mismatch_keeps_distinct_over_local_transport() {
-        // #248: an authoritative system-id MISMATCH keeps the localities
-        // distinct even on a nominally-local transport — overriding the
-        // transport heuristic (which would co-locate). Both `terminal` entries
-        // survive, server primary + client alternative.
+    fn resolve_localities_id_mismatch_still_shadows_the_client_twin() {
+        // #248: an authoritative system-id MISMATCH keeps the two machines
+        // distinct even over a nominally-local transport. That changes the
+        // topology, not what can be dispatched: the client `terminal` is still
+        // shadowed by the server one, so only the server entry is advertised.
         let ctx = locality_ctx_with_id(
             false,
             TransportKind::Uds,
@@ -4032,51 +4126,78 @@ mod tests {
         );
         let entries = resolve_tool_localities(&["terminal"], &ctx);
         let terminal: Vec<_> = entries.iter().filter(|e| e.name == "terminal").collect();
-        assert_eq!(
-            terminal.len(),
-            2,
-            "id-mismatch must keep both tools distinct even over a local transport"
-        );
-        assert!(terminal.iter().any(|e| e.locality.is_server() && e.primary));
-        assert!(
-            terminal
-                .iter()
-                .any(|e| e.locality.is_client() && !e.primary)
-        );
+        assert_eq!(terminal.len(), 1);
+        assert!(terminal[0].locality.is_server() && terminal[0].primary);
+        // The distinct-machines finding still shows in the context itself, so
+        // the topology section and the client-only tools remain correct.
+        assert!(!ctx.is_co_located());
+    }
+
+    #[test]
+    fn a_client_only_tool_keeps_its_client_locality_on_every_transport() {
+        // Shadowing applies to a name the server also holds. A client-only
+        // capability is unaffected and stays tagged to the user's machine.
+        for (co_located, transport) in [
+            (Some(false), TransportKind::WebSocket),
+            (Some(true), TransportKind::Uds),
+            (None, TransportKind::WebSocket),
+        ] {
+            let ctx = ToolLocalityContext {
+                co_located,
+                transport,
+                host: "daemon-host".to_string(),
+                daemon_on_workstation: true,
+                client_label: "user-laptop".to_string(),
+                server_tool_names: vec!["kb_search".to_string()],
+                client_tool_names: vec!["device_terminal".to_string()],
+            };
+            let entries = resolve_tool_localities(&["device_terminal", "kb_search"], &ctx);
+            assert_eq!(entries.len(), 2);
+            assert!(
+                entries[0].locality.is_client(),
+                "a client-only tool stays on the client for {transport:?}"
+            );
+            assert!(entries[1].locality.is_server());
+        }
     }
 
     #[test]
     fn resolve_localities_no_id_falls_back_to_transport() {
         // #248: with no system id reported (`co_located: None`), co-location is
-        // the Phase-1 transport heuristic — WS remote (distinct), UDS local
-        // (collapsed). This is the backward-compat path for older clients.
+        // the Phase-1 transport heuristic — WebSocket remote, UDS local. This is
+        // the backward-compat path for older clients. The signal shows in how a
+        // client-only tool is labelled: a remote connection names the user's
+        // machine, a co-located one lists a plain name.
         let ws = locality_ctx(
             TransportKind::WebSocket,
             "daemon-host",
-            &["terminal"],
-            &["terminal"],
+            &["kb_search"],
+            &["device_terminal"],
         );
-        assert_eq!(
-            resolve_tool_localities(&["terminal"], &ws)
-                .iter()
-                .filter(|e| e.name == "terminal")
-                .count(),
-            2,
-            "no-id + WebSocket must stay remote (transport fallback, distinct tools)"
+        assert!(!ws.is_co_located(), "WebSocket must fall back to remote");
+        let rendered = render_locality_list(
+            &resolve_tool_localities(&["device_terminal"], &ws),
+            ws.is_co_located(),
         );
+        assert!(
+            rendered.contains("your device"),
+            "a remote connection labels the user's machine: {rendered}"
+        );
+
         let uds = locality_ctx(
             TransportKind::Uds,
             "daemon-host",
-            &["terminal"],
-            &["terminal"],
+            &["kb_search"],
+            &["device_terminal"],
+        );
+        assert!(uds.is_co_located(), "UDS must fall back to co-located");
+        let rendered = render_locality_list(
+            &resolve_tool_localities(&["device_terminal"], &uds),
+            uds.is_co_located(),
         );
         assert_eq!(
-            resolve_tool_localities(&["terminal"], &uds)
-                .iter()
-                .filter(|e| e.name == "terminal")
-                .count(),
-            1,
-            "no-id + UDS must co-locate (transport fallback, collapsed)"
+            rendered, "device_terminal",
+            "one machine draws no per-machine distinction"
         );
     }
 
@@ -4100,31 +4221,29 @@ mod tests {
     }
 
     #[test]
-    fn build_tool_note_remote_labels_localities_and_routes() {
-        // Remote duplicate: per-tool locality labels plus a routing hint. The
-        // flat list carries the deduped (server) `terminal`; the context marks
-        // it as also client-registered, so the note twins it.
-        let tools = vec![ToolDefinition::new(
-            "terminal",
-            "run",
-            serde_json::json!({}),
-        )];
+    fn build_tool_note_remote_labels_each_tool_by_machine() {
+        // Two machines: every tool carries the machine it runs on, so the model
+        // reads the location beside the name. How to choose between them is
+        // stated once, in the topology section, not repeated here.
+        let tools = vec![
+            ToolDefinition::new("terminal", "run", serde_json::json!({})),
+            ToolDefinition::new("device_terminal", "run here", serde_json::json!({})),
+        ];
         let ctx = locality_ctx(
             TransportKind::WebSocket,
             "daemon-host",
             &["terminal"],
-            &["terminal"],
+            &["device_terminal"],
         );
         let note = build_full_tool_note(&tools, &[], Some(&ctx));
         assert!(
             note.contains("terminal — server 'daemon-host'"),
             "note: {note}"
         );
-        assert!(note.contains("your device"), "note: {note}");
-        // Routing hint for the duplicated capability.
         assert!(
-            note.contains("prefer the tool on your device") && note.contains("ask which machine"),
-            "remote routing hint must be present: {note}"
+            note.contains("device_terminal — your device 'your device'")
+                || note.contains("device_terminal — your device"),
+            "note: {note}"
         );
     }
 
