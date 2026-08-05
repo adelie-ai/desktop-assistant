@@ -1785,6 +1785,12 @@ struct ModelModalities {
     vision: bool,
     /// The model returns vectors rather than text.
     is_embedding: bool,
+    /// The model returns text.
+    ///
+    /// Read from the output modalities rather than assumed, because it is
+    /// what separates a model this connector can serve from an
+    /// image-generation or video-generation model it cannot.
+    outputs_text: bool,
 }
 
 impl ModelModalities {
@@ -1795,7 +1801,23 @@ impl ModelModalities {
             is_embedding: summary
                 .output_modalities()
                 .contains(&ModelModality::Embedding),
+            outputs_text: summary.output_modalities().contains(&ModelModality::Text),
         }
+    }
+
+    /// Whether this connector can serve the model at all.
+    ///
+    /// It answers a conversation with text, or an embedding request with
+    /// vectors. A model that returns neither - image generation, video
+    /// generation, reranking - has no purpose to bind to here, so it belongs
+    /// in no catalogue this connector produces.
+    ///
+    /// Stated as positive evidence, and deliberately not as a list of rejected
+    /// modalities. `ModelModality` models only TEXT, IMAGE and EMBEDDING, so
+    /// every modality AWS adds later arrives as the SDK's `Unknown` variant. A
+    /// rejection list would let each new one through.
+    fn serves_a_purpose(self) -> bool {
+        self.outputs_text || self.is_embedding
     }
 }
 
@@ -1838,7 +1860,7 @@ impl ModalityIndex {
 fn summary_to_model_info(
     summary: &aws_sdk_bedrock::types::FoundationModelSummary,
 ) -> Option<ModelInfo> {
-    use aws_sdk_bedrock::types::{FoundationModelLifecycleStatus, InferenceType, ModelModality};
+    use aws_sdk_bedrock::types::{FoundationModelLifecycleStatus, InferenceType};
 
     // Filter: lifecycle must be ACTIVE (skip LEGACY / deprecated models).
     if let Some(lifecycle) = summary.model_lifecycle.as_ref()
@@ -1866,7 +1888,7 @@ fn summary_to_model_info(
     // Invoke surface that can serve them. Pure IMAGE/VIDEO generation models
     // are reached by no surface yet.
     let modalities = ModelModalities::from_summary(summary);
-    if !summary.output_modalities().contains(&ModelModality::Text) {
+    if !modalities.outputs_text {
         return None;
     }
 
@@ -1971,6 +1993,21 @@ fn inference_profile_to_model_info(
         fallback_modalities_from_id(base_id)
     });
 
+    // The same rule the foundation path applies, so a model is kept or dropped
+    // for the same reason whichever listing carried it. Without it an
+    // image-generation or video-generation model that Bedrock exposes only
+    // through a profile reaches the picker as a chat model, and fails at AWS
+    // when a turn goes out against it.
+    if !resolved.serves_a_purpose() {
+        tracing::debug!(
+            profile_id,
+            base_id,
+            "inference profile routes to a model that returns neither text nor \
+             vectors; leaving it out of the catalogue"
+        );
+        return None;
+    }
+
     let display_name = if profile.inference_profile_name.is_empty() {
         profile_id.to_string()
     } else {
@@ -2024,6 +2061,10 @@ fn fallback_modalities_from_id(base_id: &str) -> ModelModalities {
     ModelModalities {
         vision,
         is_embedding: false,
+        // No metadata is not evidence against the model. A profile whose base
+        // model this listing did not describe is kept, so a gap in provider
+        // data costs a picker badge rather than a model the account can use.
+        outputs_text: true,
     }
 }
 
