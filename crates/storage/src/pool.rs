@@ -190,12 +190,6 @@ const MIGRATIONS: &[Migration] = &[
     migration!("038_kb_delete_provenance.sql"),
     // Per-conversation override for the tool-provenance gate (#1007).
     migration!("039_conversation_tool_gate.sql"),
-    // #1069: the registry used to strip the colon out of a facet tag, so
-    // `project:adelie-ai` was stored as `projectadelie-ai` and matched no row.
-    // Restores the colon on the rows written before the fix, drops a mangled
-    // row whose facet-correct twin already exists, and clears the embedding of
-    // every renamed row because the vector is built from the name.
-    migration!("040_tag_registry_facet_names.sql"),
 ];
 
 /// Second half of the advisory-lock key: the schema the migrations write to.
