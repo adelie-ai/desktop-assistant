@@ -116,14 +116,8 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
         // The scope is then reported as `Unknown`, never `None`. `None` is the
         // positive claim that no entry passes the caller's filters, which is an
         // actively harmful falsehood when the truth is that nobody measured.
-        let (scope_size, available_tags) = match self.tag_census(&tags, &exclude_tags, limit).await
-        {
-            Ok(census) => census,
-            Err(e) => {
-                tracing::warn!(error = %e, "knowledge base tag census failed; reporting an unmeasured scope");
-                (ScopeSize::Unknown, Vec::new())
-            }
-        };
+        let (scope_size, available_tags) =
+            census_or_unmeasured(self.tag_census(&tags, &exclude_tags, limit).await);
 
         Ok(KnowledgeSearchPage {
             entries,
@@ -623,9 +617,63 @@ impl KbSearchRow {
     }
 }
 
+/// Fold a tag-census result into what the search page should report.
+///
+/// Why this is a named function rather than an inline `match`: it is the whole
+/// of the best-effort contract, and the failure it guards against is a silent
+/// one. The census is an extra statement issued after the search has already
+/// returned its entries, so propagating its error with `?` would discard a
+/// search that succeeded. Naming it lets that be tested directly, without
+/// contriving a database that fails one statement and not the other.
+fn census_or_unmeasured(
+    census: Result<(ScopeSize, Vec<String>), CoreError>,
+) -> (ScopeSize, Vec<String>) {
+    match census {
+        Ok(census) => census,
+        Err(e) => {
+            tracing::warn!(error = %e, "knowledge base tag census failed; reporting an unmeasured scope");
+            (ScopeSize::Unknown, Vec::new())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_census_costs_the_measurement_not_the_search() {
+        // The whole of the best-effort contract. A `?` here would discard a
+        // search that had already returned its entries, and the system prompt
+        // makes this search mandatory before the assistant asks the user
+        // anything, so that would spend a turn on a decoration.
+        let (scope_size, tags) =
+            census_or_unmeasured(Err(CoreError::Storage("pool timed out".to_string())));
+
+        assert_eq!(scope_size, ScopeSize::Unknown);
+        assert!(tags.is_empty(), "an unmeasured scope reports no tags");
+    }
+
+    #[test]
+    fn a_failed_census_never_reports_an_empty_scope() {
+        // `None` is the positive claim that no entry passes the caller's
+        // filters. Reporting it for a census that did not run tells the model
+        // the store is empty when it may hold exactly what was asked for.
+        let (scope_size, _) =
+            census_or_unmeasured(Err(CoreError::Storage("connection reset".to_string())));
+
+        assert_ne!(scope_size, ScopeSize::None);
+    }
+
+    #[test]
+    fn a_successful_census_passes_through_unchanged() {
+        let census = (ScopeSize::Few, vec!["preference".to_string()]);
+
+        let (scope_size, tags) = census_or_unmeasured(Ok(census));
+
+        assert_eq!(scope_size, ScopeSize::Few);
+        assert_eq!(tags, vec!["preference".to_string()]);
+    }
 
     #[test]
     fn tag_filter_none_stays_none() {
