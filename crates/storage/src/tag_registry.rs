@@ -13,7 +13,7 @@
 //! accepts a proposal with no description, because a model that omits one must
 //! not cost the user a memory.
 //!
-//! A tag name is normalized by [`crate::tag_normalize::normalize_tag`], the
+//! A tag name is normalized by [`desktop_assistant_core::tag_normalize::normalize_tag`], the
 //! same function the knowledge-base write path uses, so a registry key is
 //! always exactly the tag written on the rows it describes — including the
 //! `facet:value` colon the knowledge-base prompt asks for.
@@ -359,7 +359,7 @@ pub async fn resolve_proposed_tag(
 /// Why this delegates rather than deciding anything itself: a registry key has
 /// to be byte-identical to the tag written on the knowledge-base row it
 /// describes, or no lookup can connect the two. So the registry uses the
-/// knowledge base's own normalizer, [`crate::tag_normalize::normalize_tag`],
+/// knowledge base's own normalizer, [`desktop_assistant_core::tag_normalize::normalize_tag`],
 /// and holds no rule of its own that could drift from it.
 pub fn normalize_tag_name(raw: &str) -> String {
     crate::tag_normalize::normalize_tag(raw)
