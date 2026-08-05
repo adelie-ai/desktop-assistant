@@ -26,8 +26,10 @@
 --
 -- The glued reading has its own limit: a one-word tag that begins with a facet
 -- word is split as well (`toolchain` becomes `tool:chain`). Nothing in the
--- stored name separates the two cases. Every rename is therefore reported with
--- RAISE NOTICE, so an operator can see what moved and undo a wrong split.
+-- stored name separates the two cases. Every rename is therefore named in a
+-- RAISE NOTICE, which sqlx logs at INFO on the `sqlx::postgres::notice` target,
+-- so a daemon started at the shipped `RUST_LOG=info` records what moved and an
+-- operator can undo a wrong split.
 --
 -- A renamed row loses its embedding. The dedup vector is built from
 -- `"<name>: <description>"`, so a rename makes the vector stale, and a stale
@@ -36,10 +38,15 @@
 -- vector search. Nothing re-embeds a tag row today, so a renamed row stays out
 -- of that search until #516 lands.
 --
--- Where a rename would collide with a row that already holds the correct name,
--- the correct row is kept and the mangled one is removed. Deprecation pointers
--- and `distinguish_from` entries follow in both cases, so no reference is left
--- on a name no row holds.
+-- Two rows can want the same repaired name, in two ways: a row may already
+-- hold the correct name, and two mangled spellings of one tag (`topicdeploy`
+-- and `topic--deploy`) repair to the same thing. Both are collisions, and both
+-- resolve the same way -- one row survives and the rest are removed. A row
+-- already holding the correct name always wins; between mangled spellings the
+-- first by `C` collation wins, an arbitrary but stable choice that does not
+-- move with the database's own collation. Deprecation pointers and
+-- `distinguish_from` entries follow in every case, so no reference is left on
+-- a name no row holds, and no row is left naming itself.
 --
 -- The self-referential foreign key is dropped for the duration and rebuilt
 -- afterwards, so the rows may move in any order inside the one transaction the
@@ -59,10 +66,7 @@ BEGIN
     DROP TABLE IF EXISTS pg_temp.tag_registry_facet_rename;
 
     CREATE TEMP TABLE tag_registry_facet_rename ON COMMIT DROP AS
-    SELECT user_id,
-           old_name,
-           facet || ':' || facet_value AS new_name
-      FROM (
+    WITH split AS (
         SELECT r.user_id,
                r.name AS old_name,
                f.facet,
@@ -78,22 +82,38 @@ BEGIN
             ON r.name LIKE f.facet || '%'
            AND length(r.name) > length(f.facet)
          WHERE strpos(r.name, ':') = 0
-      ) candidate
-     WHERE facet_value IS NOT NULL
-       AND facet_value <> '';
+    ),
+    candidate AS (
+        SELECT user_id,
+               old_name,
+               facet || ':' || facet_value AS new_name
+          FROM split
+         WHERE facet_value IS NOT NULL
+           AND facet_value <> ''
+    )
+    SELECT user_id,
+           old_name,
+           new_name,
+           row_number() OVER (PARTITION BY user_id, new_name
+                              ORDER BY old_name COLLATE "C") = 1 AS is_winner
+      FROM candidate;
 
     ALTER TABLE tag_registry
         DROP CONSTRAINT IF EXISTS tag_registry_deprecated_for_tag_fkey;
 
-    -- Collision: the facet-correct row already exists, so the mangled row goes.
+    -- Remove every mangled row that cannot keep its repaired name: one whose
+    -- facet-correct row already exists, and one that lost to another mangled
+    -- spelling of the same tag. Renaming a loser would give two rows the same
+    -- primary key and abort the migration on every boot.
     DELETE FROM tag_registry t
      USING tag_registry_facet_rename m
      WHERE t.user_id = m.user_id
        AND t.name = m.old_name
-       AND EXISTS (SELECT 1
-                     FROM tag_registry k
-                    WHERE k.user_id = m.user_id
-                      AND k.name = m.new_name);
+       AND (NOT m.is_winner
+            OR EXISTS (SELECT 1
+                         FROM tag_registry k
+                        WHERE k.user_id = m.user_id
+                          AND k.name = m.new_name));
     GET DIAGNOSTICS dropped_count = ROW_COUNT;
 
     FOR rename_row IN
@@ -129,13 +149,24 @@ BEGIN
     -- `distinguish_from` names siblings a tag must stay apart from. It is a
     -- plain array with no foreign key, so it needs the same rewrite; a stale
     -- entry there points the extractor at a tag that no longer exists.
+    --
+    -- A row that named its own mangled duplicate would otherwise end up naming
+    -- itself, so a resolved sibling equal to the row's own name is dropped, and
+    -- two siblings that resolve to one name collapse to a single entry at the
+    -- position of the first. This runs after the rename, so `t.name` is already
+    -- the repaired name.
     UPDATE tag_registry t
        SET distinguish_from = ARRAY(
-               SELECT COALESCE(m.new_name, sibling.name)
-                 FROM unnest(t.distinguish_from) WITH ORDINALITY AS sibling(name, ord)
-                 LEFT JOIN tag_registry_facet_rename m
-                   ON m.user_id = t.user_id AND m.old_name = sibling.name
-                ORDER BY sibling.ord)
+               SELECT resolved.name
+                 FROM (SELECT COALESCE(m.new_name, sibling.name) AS name,
+                              min(sibling.ord) AS ord
+                         FROM unnest(t.distinguish_from)
+                                  WITH ORDINALITY AS sibling(name, ord)
+                         LEFT JOIN tag_registry_facet_rename m
+                           ON m.user_id = t.user_id AND m.old_name = sibling.name
+                        GROUP BY 1) resolved
+                WHERE resolved.name <> t.name
+                ORDER BY resolved.ord)
      WHERE EXISTS (SELECT 1
                      FROM unnest(t.distinguish_from) AS sibling(name)
                      JOIN tag_registry_facet_rename m

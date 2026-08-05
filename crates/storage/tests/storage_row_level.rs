@@ -745,17 +745,36 @@ async fn migration_repairs_mangled_facet_tag_names() {
                 ("alice", "projectadele-gtk", None, vec![]),
                 // Renamed: a double dash is what `Project : Adele KDE` became.
                 ("alice", "project--adele-kde", None, vec![]),
-                // Collision: both forms present, the correct one wins.
-                ("alice", "project:adele-tui", None, vec![]),
+                // Collision with a correct row: the correct one wins, and it
+                // must not end up naming itself as a sibling to stay apart from.
+                (
+                    "alice",
+                    "project:adele-tui",
+                    None,
+                    vec!["projectadele-tui", "preference"],
+                ),
                 ("alice", "projectadele-tui", None, vec![]),
+                // Collision between two mangled spellings of ONE tag, with no
+                // correct row present. Both repair to `topic:deploy-steps`, so
+                // one must survive and the other must go; renaming both would
+                // give two rows the same primary key.
+                ("alice", "topicdeploy-steps", None, vec![]),
+                ("alice", "topic--deploy-steps", None, vec![]),
+                // Known limit, pinned deliberately: a one-word tag beginning
+                // with a facet word is split too. Nothing in the stored name
+                // separates it from a real mangled facet tag. Changing this is
+                // a decision, not an accident.
+                ("alice", "toolchain", None, vec![]),
                 // Untouched: no facet prefix; a bare facet word with no value;
                 // and a single dash, which an ordinary multi-word tag also has.
                 ("alice", "preference", None, vec![]),
                 ("alice", "project", None, vec![]),
                 ("alice", "project-context", None, vec![]),
-                // Pointers into both a renamed row and a dropped row.
+                // Pointers into a renamed row, a row dropped against a correct
+                // twin, and a row dropped against another mangled spelling.
                 ("alice", "old-gtk", Some("projectadele-gtk"), vec![]),
                 ("alice", "old-tui", Some("projectadele-tui"), vec![]),
+                ("alice", "old-steps", Some("topicdeploy-steps"), vec![]),
                 // A sibling list naming a renamed row, a dropped row and a row
                 // the repair leaves alone.
                 (
@@ -799,6 +818,7 @@ async fn migration_repairs_mangled_facet_tag_names() {
                 names,
                 vec![
                     ("alice".to_string(), "old-gtk".to_string()),
+                    ("alice".to_string(), "old-steps".to_string()),
                     ("alice".to_string(), "old-tui".to_string()),
                     ("alice".to_string(), "preference".to_string()),
                     ("alice".to_string(), "project".to_string()),
@@ -807,9 +827,11 @@ async fn migration_repairs_mangled_facet_tag_names() {
                     ("alice".to_string(), "project:adele-kde".to_string()),
                     ("alice".to_string(), "project:adele-tui".to_string()),
                     ("alice".to_string(), "sibling-list".to_string()),
+                    ("alice".to_string(), "tool:chain".to_string()),
+                    ("alice".to_string(), "topic:deploy-steps".to_string()),
                     ("bob".to_string(), "topic:deploy".to_string()),
                 ],
-                "the mangled duplicate must be dropped and every other row repaired in place"
+                "every duplicate must be dropped and every other row repaired in place"
             );
 
             // A renamed row's embedding is stale, so it is cleared (#516 re-embeds
@@ -835,20 +857,25 @@ async fn migration_repairs_mangled_facet_tag_names() {
                 "a renamed row loses its embedding; an untouched row keeps its own"
             );
 
-            let pointers: Vec<(String, Option<String>)> = sqlx::query_as(
+            let mut pointers: Vec<(String, Option<String>)> = sqlx::query_as(
                 "SELECT name, deprecated_for_tag FROM tag_registry \
-             WHERE user_id = 'alice' AND name IN ('old-gtk', 'old-tui') ORDER BY name",
+                 WHERE user_id = 'alice' AND name IN ('old-gtk', 'old-tui', 'old-steps')",
             )
             .fetch_all(&fx.pool)
             .await
             .expect("read back deprecation pointers");
+            pointers.sort();
             assert_eq!(
                 pointers,
                 vec![
                     ("old-gtk".to_string(), Some("project:adele-gtk".to_string())),
+                    (
+                        "old-steps".to_string(),
+                        Some("topic:deploy-steps".to_string())
+                    ),
                     ("old-tui".to_string(), Some("project:adele-tui".to_string())),
                 ],
-                "a deprecation pointer must follow both a rename and a dropped duplicate"
+                "a deprecation pointer must follow a rename and either kind of dropped duplicate"
             );
 
             let siblings: (Vec<String>,) = sqlx::query_as(
@@ -866,6 +893,19 @@ async fn migration_repairs_mangled_facet_tag_names() {
                     "preference".to_string(),
                 ],
                 "a sibling list must follow the repair in order, leaving unrepaired names alone"
+            );
+
+            let own: (Vec<String>,) = sqlx::query_as(
+                "SELECT distinguish_from FROM tag_registry \
+                 WHERE user_id = 'alice' AND name = 'project:adele-tui'",
+            )
+            .fetch_one(&fx.pool)
+            .await
+            .expect("read back the surviving twin's sibling list");
+            assert_eq!(
+                own.0,
+                vec!["preference".to_string()],
+                "a row must not end up naming itself as a concept to stay apart from"
             );
 
             // Replaying is a no-op: a repaired name already carries a colon.

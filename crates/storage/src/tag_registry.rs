@@ -277,14 +277,14 @@ mod tests {
     use super::*;
     use crate::tag_normalize::{normalize_tag, normalize_tags};
 
-    /// One table of raw tag names, driven through both the registry path and
-    /// the knowledge-base path.
+    /// One table of raw tag names, driven through the registry entry point and
+    /// through both knowledge-base entry points.
     ///
     /// Why a shared table: the registry key and the tag written on a
     /// knowledge-base row must be byte-identical, or a lookup cannot connect
-    /// them. Two normalisers with two test tables can agree on the day they
-    /// are written and drift apart afterwards, which is the defect this table
-    /// exists to prevent.
+    /// them. What guarantees that today is that there is one implementation,
+    /// not two that agree; this table is the tripwire that fires if someone
+    /// gives the registry a rule of its own again.
     const CROSS_PATH_TAG_INPUTS: &[&str] = &[
         "project:adelie-ai",
         "Project: Adelie AI",
