@@ -44,6 +44,17 @@ pub enum ScopeSize {
     Few,
     /// The scope holds more entries than this page could show.
     Many,
+    /// The scope was not measured, so its size is not known.
+    ///
+    /// The census is one extra statement after the search has already returned
+    /// its entries. When that statement fails the entries still travel, and
+    /// this value says the measurement is missing.
+    ///
+    /// Why this is not [`ScopeSize::None`]: `None` is a positive claim that no
+    /// entry passes the caller's filters. Reporting it for an unmeasured scope
+    /// would tell the caller the store is empty when the store may hold
+    /// everything the caller asked for. Treat `Unknown` as no information.
+    Unknown,
 }
 
 impl ScopeSize {
@@ -53,6 +64,7 @@ impl ScopeSize {
             Self::None => "NONE",
             Self::Few => "FEW",
             Self::Many => "MANY",
+            Self::Unknown => "UNKNOWN",
         }
     }
 
@@ -65,6 +77,10 @@ impl ScopeSize {
     /// only "at least `cap`", so answering [`ScopeSize::Few`] there would claim
     /// the whole scope fit in a page that the caller may have sized above the
     /// cap.
+    ///
+    /// This never answers [`ScopeSize::Unknown`]. A caller that has a sample
+    /// has a measurement; `Unknown` belongs to the caller whose census did not
+    /// run at all.
     pub fn classify(sampled: usize, cap: usize, page_limit: usize) -> Self {
         if sampled == 0 {
             Self::None
@@ -94,6 +110,9 @@ pub struct KnowledgeSearchPage {
     /// at most the [`KNOWLEDGE_TAG_CENSUS_SAMPLE`] most recent entries in
     /// scope. No counts travel with them: the counts come from a sample, so
     /// they would need a caveat that the ordering does not.
+    ///
+    /// Empty when `scope_size` is [`ScopeSize::Unknown`], because the census
+    /// that would have produced them did not run.
     pub available_tags: Vec<String>,
 }
 
@@ -386,6 +405,7 @@ mod tests {
         assert_eq!(ScopeSize::None.as_str(), "NONE");
         assert_eq!(ScopeSize::Few.as_str(), "FEW");
         assert_eq!(ScopeSize::Many.as_str(), "MANY");
+        assert_eq!(ScopeSize::Unknown.as_str(), "UNKNOWN");
     }
 
     fn _assert_knowledge_store<T: KnowledgeBaseStore>() {}

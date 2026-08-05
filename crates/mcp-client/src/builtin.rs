@@ -3823,6 +3823,127 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn kb_search_reports_unknown_scope_when_the_census_fails() {
+        // The census runs after the search has already returned its entries, so
+        // a census that fails must cost the measurement and nothing else. The
+        // store therefore hands back UNKNOWN rather than raising, and the tool
+        // must pass that through: reporting NONE here would tell the model the
+        // store is empty when it is not.
+        let (service, _probe) = kb_service_reporting(KnowledgeSearchPage {
+            entries: vec![kb_entry("kb-1", &["preference"])],
+            scope_size: ScopeSize::Unknown,
+            available_tags: Vec::new(),
+        });
+
+        let json = kb_search_response(&service, serde_json::json!({"query": "dark mode"})).await;
+
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["scope_size"], "UNKNOWN");
+        assert_eq!(json["returned"], 1);
+        assert_eq!(json["results"][0]["id"], "kb-1");
+        assert_eq!(json["available_tags"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn kb_search_still_reports_truncated_under_unknown_scope() {
+        // FEW suppresses `truncated` because it proves the page holds the whole
+        // scope. UNKNOWN proves nothing, so a full page under it is still
+        // evidence that entries were left behind.
+        let (service, _probe) = kb_service_reporting(KnowledgeSearchPage {
+            entries: vec![kb_entry("kb-1", &["preference"]), kb_entry("kb-2", &[])],
+            scope_size: ScopeSize::Unknown,
+            available_tags: Vec::new(),
+        });
+
+        let json =
+            kb_search_response(&service, serde_json::json!({"query": "notes", "limit": 2})).await;
+
+        assert_eq!(json["scope_size"], "UNKNOWN");
+        assert_eq!(json["truncated"], true);
+        assert!(
+            json["message"].as_str().is_some_and(|m| !m.is_empty()),
+            "a truncated page must say how to get the rest"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_search_omits_truncated_when_the_scope_is_few() {
+        // A full page is normally evidence that entries were left behind. Under
+        // FEW it is not: the scope is no larger than the page, and what matched
+        // is a subset of the scope, so the page holds everything there was.
+        // Claiming truncation here sends the model narrowing a search that
+        // already returned the whole scope.
+        let (service, _probe) = kb_service_reporting(KnowledgeSearchPage {
+            entries: vec![kb_entry("kb-1", &["preference"]), kb_entry("kb-2", &[])],
+            scope_size: ScopeSize::Few,
+            available_tags: vec!["preference".to_string()],
+        });
+
+        let json =
+            kb_search_response(&service, serde_json::json!({"query": "notes", "limit": 2})).await;
+
+        assert_eq!(json["returned"], 2, "premise: the page filled up");
+        assert!(
+            json.get("truncated").is_none(),
+            "FEW proves the page holds the whole scope, so nothing was left behind"
+        );
+        assert!(
+            json.get("message").is_none(),
+            "the truncation message must not travel without `truncated`"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_search_clamps_a_zero_limit() {
+        // `results.len() >= limit` holds vacuously at a limit of zero, so an
+        // unclamped zero would return nothing and then claim the page filled
+        // up. The schema's minimum is honoured here, not merely advertised.
+        let (service, probe) = kb_service_reporting(KnowledgeSearchPage {
+            entries: Vec::new(),
+            scope_size: ScopeSize::None,
+            available_tags: Vec::new(),
+        });
+
+        let json = kb_search_response(&service, serde_json::json!({"query": "x", "limit": 0})).await;
+
+        assert_eq!(
+            probe.lock().unwrap().limit,
+            1,
+            "a zero limit is clamped to the schema's minimum before it reaches the store"
+        );
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["returned"], 0);
+        assert!(
+            json.get("truncated").is_none(),
+            "an empty page must never claim it was truncated"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_search_clamps_a_limit_above_the_maximum() {
+        // The store multiplies the limit by two to seed the RRF fetch, so an
+        // unbounded limit overflows there. The clamp must land before the call,
+        // which is what the probe reads - the response cannot show it.
+        let (service, probe) = kb_service_reporting(KnowledgeSearchPage {
+            entries: Vec::new(),
+            scope_size: ScopeSize::None,
+            available_tags: Vec::new(),
+        });
+
+        let _ = kb_search_response(
+            &service,
+            serde_json::json!({"query": "x", "limit": u64::MAX}),
+        )
+        .await;
+
+        assert_eq!(
+            probe.lock().unwrap().limit,
+            KB_SEARCH_MAX_LIMIT as usize,
+            "a limit past the cap is clamped to the cap before it reaches the store"
+        );
+    }
+
+    #[tokio::test]
     async fn kb_search_reports_scope_and_tags_on_the_text_only_fallback_path() {
         // With no embedding backend wired the query embedding is empty and the
         // store falls back to full-text search. That is a recall degradation,

@@ -10,7 +10,7 @@
 //! ## Running locally
 //!
 //! ```sh
-//! just test-db -- --test knowledge_tag_census
+//! just test-db --test knowledge_tag_census
 //! ```
 //!
 //! When `TEST_DATABASE_URL` is unset every test pass-skips.
@@ -214,6 +214,86 @@ async fn tag_census_samples_the_thousand_most_recent_entries() {
             fx
         },
     )
+    .await;
+}
+
+#[tokio::test]
+async fn tag_census_sample_ordering_is_total() {
+    // `created_at` alone does not order the sample: rows that share one
+    // timestamp are cut apart by whatever secondary order the plan happens to
+    // produce, and that order follows the rows' physical position. So an edit
+    // anywhere in the table can change which tags a search reports, and the
+    // model sees the vocabulary churn with no cause it can act on. `id` breaks
+    // the tie, and ids are unique, so the order is total.
+    //
+    // Every row here shares one `created_at`, and ten rows carry `topic:cut`.
+    // Under `created_at DESC, id DESC` those ten hold the lowest ids, so the
+    // sample cap always drops them.
+    //
+    // MUTATION: drop `, id DESC` from the census. The rows carrying
+    // `topic:kept` are then rewritten between the two searches, which moves
+    // them behind the untouched `topic:cut` rows in physical order, so
+    // `topic:cut` enters the sample and the second run reports a tag the first
+    // did not -> this test goes RED.
+    with_fixture("tag_census_sample_ordering_is_total", |fx| async move {
+        let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+        let cut = 10_i64;
+        let total = KNOWLEDGE_TAG_CENSUS_SAMPLE as i64 + cut;
+
+        sqlx::query(
+            "INSERT INTO knowledge_base
+                 (id, user_id, content, tags, metadata, created_at, updated_at)
+             SELECT 'tie-' || lpad(i::text, 4, '0'), 'alice', 'tied entry ' || i,
+                    CASE WHEN i <= $1 THEN ARRAY['topic:cut'] ELSE ARRAY['topic:kept'] END,
+                    '{}'::jsonb, to_timestamp(1000), to_timestamp(1000)
+             FROM generate_series(1, $2) AS i",
+        )
+        .bind(cut)
+        .bind(total)
+        .execute(&fx.pool)
+        .await
+        .expect("seed tied rows");
+
+        let census = |store: PgKnowledgeBaseStore| async move {
+            with_user_id(UserId::new("alice"), async move {
+                store.search("tied", Vec::new(), MODEL, None, None, 10).await
+            })
+            .await
+            .expect("search")
+        };
+
+        let first = census(PgKnowledgeBaseStore::new(fx.pool.clone())).await;
+        assert_eq!(
+            first.available_tags,
+            vec!["topic:kept".to_string()],
+            "the id tiebreak drops the lowest ids, which are the only `topic:cut` rows"
+        );
+        assert_eq!(
+            first.scope_size,
+            ScopeSize::Many,
+            "a scope that reached the sample cap is at least that large"
+        );
+
+        // Rewrite the kept rows. Each update writes a new tuple version at the
+        // end of the heap, so the untouched `topic:cut` rows now sit first in
+        // physical order - the exact reordering a `VACUUM` or an unrelated edit
+        // produces in a live store.
+        sqlx::query(
+            "UPDATE knowledge_base SET content = content
+             WHERE user_id = 'alice' AND tags && ARRAY['topic:kept']",
+        )
+        .execute(&fx.pool)
+        .await
+        .expect("rewrite the kept rows");
+
+        let second = census(store).await;
+        assert_eq!(
+            second.available_tags, first.available_tags,
+            "the same scope must report the same tags after the rows move"
+        );
+        assert_eq!(second.scope_size, first.scope_size);
+        fx
+    })
     .await;
 }
 
