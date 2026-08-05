@@ -1105,7 +1105,7 @@ impl BuiltinToolService {
 
         let (query_embedding, embedding_model) = self.embed_query(&query).await;
 
-        let results = search_fn(
+        let page = search_fn(
             query,
             query_embedding,
             embedding_model,
@@ -1115,7 +1115,8 @@ impl BuiltinToolService {
         )
         .await?;
 
-        let items: Vec<serde_json::Value> = results
+        let items: Vec<serde_json::Value> = page
+            .entries
             .into_iter()
             .map(|entry| {
                 serde_json::json!({
@@ -2108,6 +2109,7 @@ fn parse_os_release_field(contents: &str, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use desktop_assistant_core::ports::knowledge::{KnowledgeSearchPage, ScopeSize};
 
     #[test]
     fn builtin_provider_map_is_exhaustive() {
@@ -3394,7 +3396,11 @@ mod tests {
                 let s = Arc::clone(&search_store);
                 Box::pin(async move {
                     let entries = s.lock().unwrap();
-                    Ok(entries.iter().take(limit).cloned().collect())
+                    Ok(KnowledgeSearchPage {
+                        entries: entries.iter().take(limit).cloned().collect(),
+                        scope_size: ScopeSize::Few,
+                        available_tags: Vec::new(),
+                    })
                 })
             });
 
@@ -3500,6 +3506,281 @@ mod tests {
         let dj: serde_json::Value = serde_json::from_str(&del).unwrap();
         assert_eq!(dj["deleted"], 1);
         assert!(store.lock().unwrap().is_empty());
+    }
+
+    // -- knowledge-base search: scope reporting (#1068) ----------------------
+
+    /// What the store saw on the last search, captured so a test can pin the
+    /// arguments the tool passed down as well as the response it built.
+    #[derive(Default)]
+    struct SearchProbe {
+        tags: Option<Vec<String>>,
+        exclude_tags: Option<Vec<String>>,
+        limit: usize,
+        /// True when the tool passed no query embedding, which is what makes
+        /// the store take its full-text-only path.
+        embedding_was_empty: bool,
+    }
+
+    /// A knowledge-base service whose store answers every search with `page`,
+    /// and records what the tool asked for in the returned probe.
+    ///
+    /// The store is the component that computes the scope. The tool's own
+    /// contract is that it passes the filters down unchanged and reports what
+    /// the store said, without reordering, re-counting, or dropping it.
+    fn kb_service_reporting(
+        page: KnowledgeSearchPage,
+    ) -> (
+        BuiltinToolService,
+        std::sync::Arc<std::sync::Mutex<SearchProbe>>,
+    ) {
+        use std::sync::{Arc, Mutex};
+
+        let probe = Arc::new(Mutex::new(SearchProbe::default()));
+        let probe_for_fn = Arc::clone(&probe);
+        let search_fn: KnowledgeSearchFn = Arc::new(
+            move |_query, emb: Vec<f32>, _model, tags, exclude_tags, limit| {
+                let page = page.clone();
+                let probe = Arc::clone(&probe_for_fn);
+                Box::pin(async move {
+                    *probe.lock().unwrap() = SearchProbe {
+                        tags,
+                        exclude_tags,
+                        limit,
+                        embedding_was_empty: emb.is_empty(),
+                    };
+                    Ok(page)
+                })
+            },
+        );
+        let write_fn: KnowledgeWriteFn = Arc::new(|entry| Box::pin(async move { Ok(entry) }));
+        let delete_fn: KnowledgeDeleteFn = Arc::new(|_ids| Box::pin(async { Ok(0) }));
+        let list_fn: KnowledgeListFn = Arc::new(|_q| {
+            Box::pin(async {
+                Ok(
+                    desktop_assistant_core::ports::knowledge::KnowledgeListPage {
+                        entries: Vec::new(),
+                        next_cursor: None,
+                    },
+                )
+            })
+        });
+        let get_fn: KnowledgeGetFn = Arc::new(|_id| Box::pin(async { Ok(None) }));
+        let service = BuiltinToolService::new()
+            .with_knowledge_base(write_fn, search_fn, delete_fn, list_fn, get_fn);
+        (service, probe)
+    }
+
+    /// Run `builtin_knowledge_base_search` and parse its response.
+    async fn kb_search_response(
+        service: &BuiltinToolService,
+        arguments: serde_json::Value,
+    ) -> serde_json::Value {
+        let raw = service
+            .execute_tool(TOOL_KB_SEARCH, arguments)
+            .await
+            .expect("knowledge base search succeeds");
+        serde_json::from_str(&raw).expect("search response is JSON")
+    }
+
+    fn kb_entry(id: &str, tags: &[&str]) -> desktop_assistant_core::domain::KnowledgeEntry {
+        desktop_assistant_core::domain::KnowledgeEntry::new(
+            id,
+            "content",
+            tags.iter().map(|t| (*t).to_string()).collect(),
+        )
+    }
+
+    #[tokio::test]
+    async fn kb_search_reports_scope_size_none_for_an_empty_scope() {
+        // An empty page alone cannot tell the model whether its tag filter
+        // found nothing or the store holds nothing. NONE says the scope itself
+        // is empty, so no other filter would have done better.
+        let (service, _probe) = kb_service_reporting(KnowledgeSearchPage {
+            entries: Vec::new(),
+            scope_size: ScopeSize::None,
+            available_tags: Vec::new(),
+        });
+
+        let json = kb_search_response(&service, serde_json::json!({"query": "anything"})).await;
+
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["scope_size"], "NONE");
+        assert_eq!(json["returned"], 0);
+        assert_eq!(json["available_tags"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn kb_search_reports_scope_size_few_when_every_entry_fits_the_page() {
+        // FEW means narrowing gains nothing: the whole scope is already on the
+        // page, so a tag filter can only remove entries the model can see.
+        let (service, _probe) = kb_service_reporting(KnowledgeSearchPage {
+            entries: vec![kb_entry("kb-1", &["preference"])],
+            scope_size: ScopeSize::Few,
+            available_tags: vec!["preference".to_string()],
+        });
+
+        let json = kb_search_response(&service, serde_json::json!({"query": "dark mode"})).await;
+
+        assert_eq!(json["scope_size"], "FEW");
+        assert_eq!(json["returned"], 1);
+    }
+
+    #[tokio::test]
+    async fn kb_search_reports_scope_size_many_when_the_scope_exceeds_the_page() {
+        // MANY is the only value that tells the model a narrower filter can
+        // still pay off, so it must survive the trip to the wire. The page also
+        // filled up here, which is a separate claim: `truncated`.
+        let (service, probe) = kb_service_reporting(KnowledgeSearchPage {
+            entries: vec![kb_entry("kb-1", &["preference"]), kb_entry("kb-2", &[])],
+            scope_size: ScopeSize::Many,
+            available_tags: vec!["preference".to_string()],
+        });
+
+        let json =
+            kb_search_response(&service, serde_json::json!({"query": "notes", "limit": 2})).await;
+
+        assert_eq!(
+            probe.lock().unwrap().limit,
+            2,
+            "premise: the caller's page size reached the store"
+        );
+        assert_eq!(json["scope_size"], "MANY");
+        assert_eq!(json["returned"], 2);
+        assert_eq!(json["truncated"], true);
+        assert!(
+            json["message"].as_str().is_some_and(|m| !m.is_empty()),
+            "a truncated page must say how to get the rest"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_search_available_tags_are_ordered_by_frequency_then_name() {
+        // The order carries the whole signal, because no counts travel with the
+        // tags. The tool must report the store's order unchanged - re-sorting
+        // it (alphabetically, say) would destroy the signal silently.
+        let store_order = vec![
+            "project:adelie-ai".to_string(),
+            "preference".to_string(),
+            "topic:weather".to_string(),
+        ];
+        let (service, _probe) = kb_service_reporting(KnowledgeSearchPage {
+            entries: Vec::new(),
+            scope_size: ScopeSize::Many,
+            available_tags: store_order.clone(),
+        });
+
+        let json = kb_search_response(&service, serde_json::json!({"query": "anything"})).await;
+
+        let reported: Vec<String> = serde_json::from_value(json["available_tags"].clone())
+            .expect("available_tags is an array of strings");
+        assert_eq!(reported, store_order);
+    }
+
+    #[tokio::test]
+    async fn kb_search_available_tags_honour_include_and_exclude_filters() {
+        // The filters define the scope, so the census must see the same ones
+        // the search did. A tool that dropped `exclude_tags` on the way down
+        // would report a tag vocabulary for a scope nobody searched.
+        let (service, probe) = kb_service_reporting(KnowledgeSearchPage {
+            entries: Vec::new(),
+            scope_size: ScopeSize::Few,
+            available_tags: vec!["project:adelie-ai".to_string()],
+        });
+
+        let json = kb_search_response(
+            &service,
+            serde_json::json!({
+                "query": "deploy",
+                "tags": ["project:adelie-ai"],
+                "exclude_tags": ["archived"],
+            }),
+        )
+        .await;
+
+        let seen = probe.lock().unwrap();
+        assert_eq!(
+            seen.tags.as_deref(),
+            Some(["project:adelie-ai".to_string()].as_slice())
+        );
+        assert_eq!(
+            seen.exclude_tags.as_deref(),
+            Some(["archived".to_string()].as_slice())
+        );
+        assert_eq!(
+            json["available_tags"],
+            serde_json::json!(["project:adelie-ai"])
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_search_available_tags_are_capped_at_fifty() {
+        // The list travels to the model inside a tool result, so the cap is a
+        // context budget, not a storage detail. The tool enforces it on what it
+        // reports, whatever the store hands it.
+        let over_cap: Vec<String> = (0..60).map(|i| format!("topic:t{i:02}")).collect();
+        let (service, _probe) = kb_service_reporting(KnowledgeSearchPage {
+            entries: Vec::new(),
+            scope_size: ScopeSize::Many,
+            available_tags: over_cap.clone(),
+        });
+
+        let json = kb_search_response(&service, serde_json::json!({"query": "anything"})).await;
+
+        let reported: Vec<String> = serde_json::from_value(json["available_tags"].clone())
+            .expect("available_tags is an array of strings");
+        assert_eq!(reported.len(), 50);
+        assert_eq!(reported, over_cap[..50]);
+    }
+
+    #[tokio::test]
+    async fn kb_search_omits_truncated_when_the_results_fit() {
+        // `truncated` is a claim that entries were left behind. Sending it on
+        // every response would train the model to ignore it.
+        let (service, _probe) = kb_service_reporting(KnowledgeSearchPage {
+            entries: vec![kb_entry("kb-1", &["preference"])],
+            scope_size: ScopeSize::Few,
+            available_tags: vec!["preference".to_string()],
+        });
+
+        let json =
+            kb_search_response(&service, serde_json::json!({"query": "notes", "limit": 5})).await;
+
+        assert_eq!(json["returned"], 1);
+        assert!(
+            json.get("truncated").is_none(),
+            "truncated must be absent when the page did not fill up"
+        );
+        assert!(
+            json.get("message").is_none(),
+            "the truncation message must not travel without `truncated`"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_search_reports_scope_and_tags_on_the_text_only_fallback_path() {
+        // With no embedding backend wired the query embedding is empty and the
+        // store falls back to full-text search. That is a recall degradation,
+        // not a contract change: the response keeps every field.
+        let (service, probe) = kb_service_reporting(KnowledgeSearchPage {
+            entries: vec![kb_entry("kb-1", &["preference"])],
+            scope_size: ScopeSize::Many,
+            available_tags: vec!["preference".to_string(), "topic:weather".to_string()],
+        });
+
+        let json = kb_search_response(&service, serde_json::json!({"query": "weather"})).await;
+
+        assert!(
+            probe.lock().unwrap().embedding_was_empty,
+            "premise: with no embedding backend the store gets an empty embedding, \
+             which is what makes it take the full-text-only path"
+        );
+        assert_eq!(json["scope_size"], "MANY");
+        assert_eq!(
+            json["available_tags"],
+            serde_json::json!(["preference", "topic:weather"])
+        );
+        assert_eq!(json["returned"], 1);
     }
 
     #[tokio::test]
@@ -3824,7 +4105,13 @@ mod tests {
         let kb_write: KnowledgeWriteFn = Arc::new(|entry| Box::pin(async move { Ok(entry) }));
         let kb_search: KnowledgeSearchFn =
             Arc::new(|_query, _emb, _model, _tags, _exclude_tags, _limit| {
-                Box::pin(async { Ok(Vec::new()) })
+                Box::pin(async {
+                    Ok(KnowledgeSearchPage {
+                        entries: Vec::new(),
+                        scope_size: ScopeSize::None,
+                        available_tags: Vec::new(),
+                    })
+                })
             });
         let kb_delete: KnowledgeDeleteFn = Arc::new(|_ids| Box::pin(async { Ok(0) }));
         let kb_list: KnowledgeListFn = Arc::new(|_query| {

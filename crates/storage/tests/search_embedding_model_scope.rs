@@ -123,6 +123,7 @@ async fn kb_search(pool: &PgPool, user: &str, query: &str, model: &str) -> Vec<S
     })
     .await
     .expect("kb search must not raise on a mixed-model table")
+    .entries
     .into_iter()
     .map(|e| e.id)
     .collect()
@@ -315,7 +316,10 @@ async fn knowledge_search_with_an_empty_embedding_falls_back_to_full_text() {
     .expect("empty-embedding search");
 
     assert_eq!(
-        hits.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+        hits.entries
+            .iter()
+            .map(|e| e.id.as_str())
+            .collect::<Vec<_>>(),
         vec!["kb-old"],
         "no query vector means no vector arm, so no model scoping applies"
     );

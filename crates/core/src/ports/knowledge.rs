@@ -5,6 +5,86 @@ use std::sync::Arc;
 use crate::CoreError;
 use crate::domain::KnowledgeEntry;
 
+/// How many of the most recent in-scope entries the tag census reads.
+///
+/// Why a cap: the census is one extra aggregate on every knowledge-base search,
+/// so it must never be able to become a full table scan on a large
+/// multi-tenant store. It is a tail guardrail, not an optimisation of the
+/// common path - a personal knowledge base never reaches it.
+pub const KNOWLEDGE_TAG_CENSUS_SAMPLE: usize = 1000;
+
+/// How many tags a search reports in [`KnowledgeSearchPage::available_tags`].
+///
+/// Why a cap: the list travels to a language model inside a tool result, so an
+/// unbounded tag vocabulary would spend context without adding signal - the
+/// frequency ordering puts the useful tags first.
+pub const AVAILABLE_TAGS_LIMIT: usize = 50;
+
+/// How many entries the searched scope holds, relative to the page returned.
+///
+/// "Scope" means the entries that pass the caller's `tags` and `exclude_tags`
+/// filters. It is never the set that matched the query: a hybrid search whose
+/// vector arm is defined for every embedded row cannot count query matches, so
+/// reporting one would state a falsehood.
+///
+/// Why a bucket rather than a number: the count behind it comes from a capped
+/// sample (see [`KNOWLEDGE_TAG_CENSUS_SAMPLE`]), and a raw figure invites the
+/// caller to trust a number that is only exact below the cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopeSize {
+    /// The scope holds no entries. No filter can find anything here.
+    None,
+    /// Every entry in the scope fit in this page, so narrowing gains nothing.
+    Few,
+    /// The scope holds more entries than this page could show.
+    Many,
+}
+
+impl ScopeSize {
+    /// The value reported on the wire.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "NONE",
+            Self::Few => "FEW",
+            Self::Many => "MANY",
+        }
+    }
+
+    /// Classify a scope from a capped sample of it.
+    ///
+    /// `sampled` is how many rows the census actually read, `cap` the cap it
+    /// stopped at, and `page_limit` the caller's page size.
+    ///
+    /// Why a sample that reached the cap is always [`ScopeSize::Many`]: it says
+    /// only "at least `cap`", so answering [`ScopeSize::Few`] there would claim
+    /// the whole scope fit in a page that the caller may have sized above the
+    /// cap.
+    pub fn classify(_sampled: usize, _cap: usize, _page_limit: usize) -> Self {
+        Self::None
+    }
+}
+
+/// One page of a knowledge-base search: the entries found, plus what the caller
+/// needs to judge whether it saw everything.
+///
+/// Why the extra fields: the caller is a language model that would otherwise
+/// guess tag filters, and a guessed tag that no entry carries returns nothing.
+/// Both extra fields describe the scope, never the query match set - see
+/// [`ScopeSize`].
+#[derive(Debug, Clone)]
+pub struct KnowledgeSearchPage {
+    /// The entries this page returns, best match first.
+    pub entries: Vec<KnowledgeEntry>,
+    /// How many entries the scope holds, relative to this page.
+    pub scope_size: ScopeSize,
+    /// Tags carried by entries in the scope, most frequent first and ties
+    /// broken by tag name. At most [`AVAILABLE_TAGS_LIMIT`] tags, counted over
+    /// at most the [`KNOWLEDGE_TAG_CENSUS_SAMPLE`] most recent entries in
+    /// scope. No counts travel with them: the counts come from a sample, so
+    /// they would need a caveat that the ordering does not.
+    pub available_tags: Vec<String>,
+}
+
 /// Outbound port for the unified knowledge base (replaces preferences + memory).
 pub trait KnowledgeBaseStore: Send + Sync {
     /// Write (upsert) a knowledge entry. If an entry with the same id exists,
@@ -31,6 +111,11 @@ pub trait KnowledgeBaseStore: Send + Sync {
     /// vector dimensions, which the database answers with an error rather than
     /// a miss. The full-text arm is deliberately unscoped, so a model change
     /// degrades semantic recall to lexical search instead of hiding content.
+    ///
+    /// The returned [`KnowledgeSearchPage`] also reports how large the scope
+    /// selected by `tags`/`exclude_tags` is and which tags that scope carries,
+    /// so a caller can tell an empty page caused by a tag no entry carries from
+    /// an empty page caused by a store that holds nothing.
     fn search(
         &self,
         query: &str,
@@ -39,7 +124,7 @@ pub trait KnowledgeBaseStore: Send + Sync {
         tags: Option<Vec<String>>,
         exclude_tags: Option<Vec<String>>,
         limit: usize,
-    ) -> impl Future<Output = Result<Vec<KnowledgeEntry>, CoreError>> + Send;
+    ) -> impl Future<Output = Result<KnowledgeSearchPage, CoreError>> + Send;
 
     /// Full-text search only (no vector similarity). Used by client-side
     /// browsers that need responsive search without embedding round-trips
@@ -105,7 +190,7 @@ pub type KnowledgeSearchFn = Arc<
             Option<Vec<String>>,
             Option<Vec<String>>,
             usize,
-        ) -> Pin<Box<dyn Future<Output = Result<Vec<KnowledgeEntry>, CoreError>> + Send>>
+        ) -> Pin<Box<dyn Future<Output = Result<KnowledgeSearchPage, CoreError>> + Send>>
         + Send
         + Sync,
 >;
@@ -199,8 +284,12 @@ mod tests {
             _tags: Option<Vec<String>>,
             _exclude_tags: Option<Vec<String>>,
             _limit: usize,
-        ) -> Result<Vec<KnowledgeEntry>, CoreError> {
-            Ok(vec![])
+        ) -> Result<KnowledgeSearchPage, CoreError> {
+            Ok(KnowledgeSearchPage {
+                entries: vec![],
+                scope_size: ScopeSize::None,
+                available_tags: vec![],
+            })
         }
 
         async fn search_text(
@@ -249,11 +338,42 @@ mod tests {
     #[tokio::test]
     async fn mock_knowledge_store_search_returns_empty() {
         let store = MockKnowledgeStore;
-        let results = store
+        let page = store
             .search("test", vec![0.0], "test-model", None, None, 10)
             .await
             .unwrap();
-        assert!(results.is_empty());
+        assert!(page.entries.is_empty());
+        assert_eq!(page.scope_size, ScopeSize::None);
+        assert!(page.available_tags.is_empty());
+    }
+
+    #[test]
+    fn scope_size_is_none_when_the_sample_is_empty() {
+        // An empty scope is not "small"; it is a scope in which no tag filter
+        // can ever find anything, and the caller must be able to tell the two
+        // apart.
+        assert_eq!(ScopeSize::classify(0, 1000, 10), ScopeSize::None);
+    }
+
+    #[test]
+    fn scope_size_is_few_only_when_the_whole_scope_fits_the_page() {
+        assert_eq!(ScopeSize::classify(10, 1000, 10), ScopeSize::Few);
+        assert_eq!(ScopeSize::classify(11, 1000, 10), ScopeSize::Many);
+    }
+
+    #[test]
+    fn scope_size_is_many_when_the_sample_reached_the_cap() {
+        // A sample that stopped at the cap says only "at least `cap`". Calling
+        // that `Few` because the caller asked for a larger page would claim the
+        // whole scope fit, which the sample cannot show.
+        assert_eq!(ScopeSize::classify(1000, 1000, 5000), ScopeSize::Many);
+    }
+
+    #[test]
+    fn scope_size_wire_values_are_stable() {
+        assert_eq!(ScopeSize::None.as_str(), "NONE");
+        assert_eq!(ScopeSize::Few.as_str(), "FEW");
+        assert_eq!(ScopeSize::Many.as_str(), "MANY");
     }
 
     fn _assert_knowledge_store<T: KnowledgeBaseStore>() {}

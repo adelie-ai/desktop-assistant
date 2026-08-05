@@ -2,7 +2,8 @@ use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::KnowledgeEntry;
 use desktop_assistant_core::ports::auth::current_user_id;
 use desktop_assistant_core::ports::knowledge::{
-    KnowledgeBaseStore, KnowledgeListPage, KnowledgeListQuery, ListOrder,
+    KnowledgeBaseStore, KnowledgeListPage, KnowledgeListQuery, KnowledgeSearchPage, ListOrder,
+    ScopeSize,
 };
 use pgvector::Vector;
 use sqlx::PgPool;
@@ -78,108 +79,39 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
         tags: Option<Vec<String>>,
         exclude_tags: Option<Vec<String>>,
         limit: usize,
-    ) -> Result<Vec<KnowledgeEntry>, CoreError> {
+    ) -> Result<KnowledgeSearchPage, CoreError> {
+        // Normalize the include/exclude filters the same way writes normalize
+        // stored tags, so a differently-cased filter still matches (write/read
+        // symmetry). Normalizing once here also keeps the census below reading
+        // the same scope the search itself read.
+        let tags = normalize_tag_filter(tags);
+        let exclude_tags = normalize_tag_filter(exclude_tags);
+
         // No query embedding (e.g. the embedding backend timed out — see
         // `EMBED_TIMEOUT` in mcp-client): the hybrid query's vector branch
         // (`chunk <=> $1`) would error on a 0-dimension vector, so fall back to
-        // the full-text-only path.
-        if query_embedding.is_empty() {
-            return self
-                .search_text_filtered(query, tags, exclude_tags, limit)
-                .await;
-        }
-
-        // Normalize the include/exclude filters the same way writes normalize
-        // stored tags, so a differently-cased filter still matches (write/read
-        // symmetry). The FTS fallback above normalizes inside
-        // `search_text_filtered`, so this covers only the vector-branch path.
-        let tags = normalize_tag_filter(tags);
-        let exclude_tags = normalize_tag_filter(exclude_tags);
-        let user_id = current_user_id();
-        let embedding_vec = Vector::from(query_embedding);
-        let fetch_limit = (limit * 2) as i64;
-        let result_limit = limit as i64;
-
-        // $7 = exclude_tags: drop any row carrying one of these tags.
-        //
-        // $8 = the model that produced $1. Only rows embedded by that model can
-        // be compared against it, so the predicate belongs on this branch and
-        // this branch alone: `text_ranked` below stays model-blind, which is
-        // what turns a model change into degraded (lexical-only) recall instead
-        // of content that cannot be found at all.
-        //
-        // Sameness is decided on the digest half of the `<name>@<digest>` stamp
-        // wherever both sides carry one, matching
-        // `embedding_backfill::invalidate_stale_embeddings`: a purely cosmetic
-        // rename leaves usable vectors in place, and hiding them until the
-        // sweep restamps them would blank semantic search for no reason.
-        // `split_part(x, '@', 2)` yields '' when there is no '@', so the
-        // non-empty test doubles as "both sides carry a digest". A NULL stamp is
-        // a vector of unknown provenance, hence unknown dimension, and is
-        // excluded.
-        let rows: Vec<KbSearchRow> = sqlx::query_as(
-            "WITH chunk_distances AS (
-                SELECT id, content, tags, metadata, created_at, updated_at,
-                       MIN(chunk <=> $1) AS min_distance
-                FROM knowledge_base, unnest(embedding) AS chunk
-                WHERE user_id = $6
-                  AND deleted_at IS NULL
-                  AND ($2::text[] IS NULL OR tags && $2)
-                  AND ($7::text[] IS NULL OR NOT (tags && $7))
-                  AND embedding IS NOT NULL
-                  AND embedding_model IS NOT NULL
-                  AND (embedding_model = $8
-                       OR (split_part($8, '@', 2) <> ''
-                           AND split_part(embedding_model, '@', 2)
-                               = split_part($8, '@', 2)))
-                GROUP BY id, content, tags, metadata, created_at, updated_at
-            ),
-            vector_ranked AS (
-                SELECT id, content, tags, metadata, created_at, updated_at,
-                       ROW_NUMBER() OVER (ORDER BY min_distance) AS rank_v
-                FROM chunk_distances
-                LIMIT $3
-            ),
-            text_ranked AS (
-                SELECT id, content, tags, metadata, created_at, updated_at,
-                       ROW_NUMBER() OVER (ORDER BY ts_rank_cd(tsv, query) DESC) AS rank_t
-                FROM knowledge_base, plainto_tsquery('english', $4) query
-                WHERE user_id = $6
-                  AND deleted_at IS NULL
-                  AND ($2::text[] IS NULL OR tags && $2)
-                  AND ($7::text[] IS NULL OR NOT (tags && $7))
-                  AND tsv @@ query
-                ORDER BY ts_rank_cd(tsv, query) DESC
-                LIMIT $3
-            ),
-            fused AS (
-                SELECT COALESCE(v.id, t.id) AS id,
-                       COALESCE(v.content, t.content) AS content,
-                       COALESCE(v.tags, t.tags) AS tags,
-                       COALESCE(v.metadata, t.metadata) AS metadata,
-                       COALESCE(v.created_at, t.created_at) AS created_at,
-                       COALESCE(v.updated_at, t.updated_at) AS updated_at,
-                       (COALESCE(1.0 / (60 + v.rank_v), 0) +
-                        COALESCE(1.0 / (60 + t.rank_t), 0))::FLOAT8 AS rrf_score
-                FROM vector_ranked v
-                FULL OUTER JOIN text_ranked t ON v.id = t.id
+        // the full-text-only path. The fallback reports the same fields, so a
+        // missing embedding backend degrades recall and nothing else.
+        let entries = if query_embedding.is_empty() {
+            self.search_text_scoped(query, &tags, &exclude_tags, limit)
+                .await?
+        } else {
+            self.search_hybrid(
+                query,
+                query_embedding,
+                embedding_model,
+                &tags,
+                &exclude_tags,
+                limit,
             )
-            SELECT id, content, tags, metadata, created_at, updated_at
-            FROM fused ORDER BY rrf_score DESC LIMIT $5",
-        )
-        .bind(embedding_vec)
-        .bind(&tags)
-        .bind(fetch_limit)
-        .bind(query)
-        .bind(result_limit)
-        .bind(user_id.as_str())
-        .bind(&exclude_tags)
-        .bind(embedding_model)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CoreError::Storage(e.to_string()))?;
+            .await?
+        };
 
-        Ok(rows.into_iter().map(|r| r.into_entry()).collect())
+        Ok(KnowledgeSearchPage {
+            entries,
+            scope_size: ScopeSize::None,
+            available_tags: Vec::new(),
+        })
     }
 
     async fn search_text(
@@ -188,7 +120,8 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
         tags: Option<Vec<String>>,
         limit: usize,
     ) -> Result<Vec<KnowledgeEntry>, CoreError> {
-        self.search_text_filtered(query, tags, None, limit).await
+        let tags = normalize_tag_filter(tags);
+        self.search_text_scoped(query, &tags, &None, limit).await
     }
 
     async fn list(
@@ -265,18 +198,117 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
 /// daemon). These sit outside the [`KnowledgeBaseStore`] port because they are
 /// tool-surface concerns, not part of the application's outbound contract.
 impl PgKnowledgeBaseStore {
+    /// The vector + full-text (RRF) arm of [`KnowledgeBaseStore::search`].
+    ///
+    /// Both tag filters must already be normalized (`normalize_tag_filter`).
+    async fn search_hybrid(
+        &self,
+        query: &str,
+        query_embedding: Vec<f32>,
+        embedding_model: &str,
+        tags: &Option<Vec<String>>,
+        exclude_tags: &Option<Vec<String>>,
+        limit: usize,
+    ) -> Result<Vec<KnowledgeEntry>, CoreError> {
+        let user_id = current_user_id();
+        let embedding_vec = Vector::from(query_embedding);
+        let fetch_limit = (limit * 2) as i64;
+        let result_limit = limit as i64;
+
+        // $7 = exclude_tags: drop any row carrying one of these tags.
+        //
+        // $8 = the model that produced $1. Only rows embedded by that model can
+        // be compared against it, so the predicate belongs on this branch and
+        // this branch alone: `text_ranked` below stays model-blind, which is
+        // what turns a model change into degraded (lexical-only) recall instead
+        // of content that cannot be found at all.
+        //
+        // Sameness is decided on the digest half of the `<name>@<digest>` stamp
+        // wherever both sides carry one, matching
+        // `embedding_backfill::invalidate_stale_embeddings`: a purely cosmetic
+        // rename leaves usable vectors in place, and hiding them until the
+        // sweep restamps them would blank semantic search for no reason.
+        // `split_part(x, '@', 2)` yields '' when there is no '@', so the
+        // non-empty test doubles as "both sides carry a digest". A NULL stamp is
+        // a vector of unknown provenance, hence unknown dimension, and is
+        // excluded.
+        let rows: Vec<KbSearchRow> = sqlx::query_as(
+            "WITH chunk_distances AS (
+                SELECT id, content, tags, metadata, created_at, updated_at,
+                       MIN(chunk <=> $1) AS min_distance
+                FROM knowledge_base, unnest(embedding) AS chunk
+                WHERE user_id = $6
+                  AND deleted_at IS NULL
+                  AND ($2::text[] IS NULL OR tags && $2)
+                  AND ($7::text[] IS NULL OR NOT (tags && $7))
+                  AND embedding IS NOT NULL
+                  AND embedding_model IS NOT NULL
+                  AND (embedding_model = $8
+                       OR (split_part($8, '@', 2) <> ''
+                           AND split_part(embedding_model, '@', 2)
+                               = split_part($8, '@', 2)))
+                GROUP BY id, content, tags, metadata, created_at, updated_at
+            ),
+            vector_ranked AS (
+                SELECT id, content, tags, metadata, created_at, updated_at,
+                       ROW_NUMBER() OVER (ORDER BY min_distance) AS rank_v
+                FROM chunk_distances
+                LIMIT $3
+            ),
+            text_ranked AS (
+                SELECT id, content, tags, metadata, created_at, updated_at,
+                       ROW_NUMBER() OVER (ORDER BY ts_rank_cd(tsv, query) DESC) AS rank_t
+                FROM knowledge_base, plainto_tsquery('english', $4) query
+                WHERE user_id = $6
+                  AND deleted_at IS NULL
+                  AND ($2::text[] IS NULL OR tags && $2)
+                  AND ($7::text[] IS NULL OR NOT (tags && $7))
+                  AND tsv @@ query
+                ORDER BY ts_rank_cd(tsv, query) DESC
+                LIMIT $3
+            ),
+            fused AS (
+                SELECT COALESCE(v.id, t.id) AS id,
+                       COALESCE(v.content, t.content) AS content,
+                       COALESCE(v.tags, t.tags) AS tags,
+                       COALESCE(v.metadata, t.metadata) AS metadata,
+                       COALESCE(v.created_at, t.created_at) AS created_at,
+                       COALESCE(v.updated_at, t.updated_at) AS updated_at,
+                       (COALESCE(1.0 / (60 + v.rank_v), 0) +
+                        COALESCE(1.0 / (60 + t.rank_t), 0))::FLOAT8 AS rrf_score
+                FROM vector_ranked v
+                FULL OUTER JOIN text_ranked t ON v.id = t.id
+            )
+            SELECT id, content, tags, metadata, created_at, updated_at
+            FROM fused ORDER BY rrf_score DESC LIMIT $5",
+        )
+        .bind(embedding_vec)
+        .bind(tags)
+        .bind(fetch_limit)
+        .bind(query)
+        .bind(result_limit)
+        .bind(user_id.as_str())
+        .bind(exclude_tags)
+        .bind(embedding_model)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CoreError::Storage(e.to_string()))?;
+
+        Ok(rows.into_iter().map(|r| r.into_entry()).collect())
+    }
+
     /// FTS-only search with both include- and exclude-tag filters. Backs the
     /// trait `search_text` (exclude = None) and the no-embedding fallback of
     /// `search`.
-    async fn search_text_filtered(
+    ///
+    /// Both tag filters must already be normalized (`normalize_tag_filter`).
+    async fn search_text_scoped(
         &self,
         query: &str,
-        tags: Option<Vec<String>>,
-        exclude_tags: Option<Vec<String>>,
+        tags: &Option<Vec<String>>,
+        exclude_tags: &Option<Vec<String>>,
         limit: usize,
     ) -> Result<Vec<KnowledgeEntry>, CoreError> {
-        let tags = normalize_tag_filter(tags);
-        let exclude_tags = normalize_tag_filter(exclude_tags);
         let user_id = current_user_id();
         let result_limit = limit as i64;
         let rows: Vec<KbRow> = sqlx::query_as(
@@ -293,10 +325,10 @@ impl PgKnowledgeBaseStore {
              LIMIT $3",
         )
         .bind(query)
-        .bind(&tags)
+        .bind(tags)
         .bind(result_limit)
         .bind(user_id.as_str())
-        .bind(&exclude_tags)
+        .bind(exclude_tags)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;

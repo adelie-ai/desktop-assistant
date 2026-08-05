@@ -464,7 +464,8 @@ async fn knowledge_search_with_empty_embedding_falls_back_to_fts() {
                         10,
                     )
                     .await
-                    .expect("empty-embedding search must fall back to FTS, not error");
+                    .expect("empty-embedding search must fall back to FTS, not error")
+                    .entries;
                 assert!(
                     hits.iter().any(|e| e.id == "kb-forecast-doc"),
                     "FTS fallback must find the indexed doc, got {} hit(s)",
