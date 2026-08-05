@@ -1,9 +1,11 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::clock::NowSnapshot;
-use desktop_assistant_core::domain::{Role, ToolDefinition};
+use desktop_assistant_core::domain::{Role, ToolDefinition, ToolRunner};
+use desktop_assistant_core::ports::client_tools::current_client_tools;
 use desktop_assistant_core::ports::conversation_ctx::current_conversation_id;
 use desktop_assistant_core::ports::conversation_search::ConversationSearchFn;
 use desktop_assistant_core::ports::database::DbQueryFn;
@@ -22,9 +24,89 @@ use desktop_assistant_core::ports::scratchpad::{
 };
 use desktop_assistant_core::ports::skill_index::{SkillGetFn, SkillSearchFn};
 use desktop_assistant_core::ports::tool_registry::{ToolDefinitionFn, ToolSearchFn};
-use desktop_assistant_core::ports::transport::current_client_context;
+use desktop_assistant_core::ports::transport::{
+    current_client_context, current_client_label, current_co_location, current_transport_kind,
+};
 
 use crate::executor::McpControlHandle;
+
+/// Machine label used until the daemon supplies its own hostname, so a search
+/// result is coherent in tests and in a build that never called
+/// `BuiltinToolService::with_topology`.
+const DEFAULT_DAEMON_HOST: &str = "this machine";
+
+/// How many daemon-side hits the tool registry is asked for.
+const REGISTRY_SEARCH_LIMIT: usize = 10;
+
+/// How many client-registered tools one search may return.
+///
+/// A connection registers tens of tools at most, not thousands, so this is a
+/// backstop rather than a working limit. A search that hits it reports the
+/// number it dropped.
+const DEVICE_SEARCH_LIMIT: usize = 10;
+
+/// Shortest word the client-tool matcher will consider, in characters.
+///
+/// Below this a "term" is a preposition or an article, which matches nearly
+/// every description and therefore separates nothing.
+const MIN_MATCH_TERM_CHARS: usize = 3;
+
+/// Split text into lowercase alphanumeric words worth matching on.
+fn match_terms(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.chars().count() >= MIN_MATCH_TERM_CHARS)
+        .map(|w| w.to_lowercase())
+        .collect()
+}
+
+/// Whether two words describe the same thing closely enough to count as a hit.
+///
+/// A prefix match in either direction, so "file" finds "files" and "run" finds
+/// "running". Deliberately cruder than a stemmer: the set being searched is
+/// small, and a wrong extra hit costs the model one line to read, while a
+/// missed hit costs it the only tool that acts on the user's own machine.
+fn terms_agree(a: &str, b: &str) -> bool {
+    a.starts_with(b) || b.starts_with(a)
+}
+
+/// Rank client-registered tools against a search query.
+///
+/// Scores each tool by how many distinct query terms appear in its name or its
+/// description, keeps those that match at least one, and orders by score then
+/// by name so the result never depends on registration order. Returns the kept
+/// tools and the number dropped by `limit`, because a truncated set presented
+/// as the whole answer reads as "nothing else matched".
+///
+/// Lexical rather than vector-based: client tools are registered per connection
+/// and never indexed, so no embedding exists for them, and computing one per
+/// search would put an embedding round-trip in front of every discovery.
+fn match_client_tools<'a>(
+    query: &str,
+    tools: &'a [ToolDefinition],
+    limit: usize,
+) -> (Vec<&'a ToolDefinition>, usize) {
+    let query_terms = match_terms(query);
+    if query_terms.is_empty() {
+        return (Vec::new(), 0);
+    }
+    let mut scored: Vec<(usize, &'a ToolDefinition)> = tools
+        .iter()
+        .filter_map(|tool| {
+            let haystack = match_terms(&format!("{} {}", tool.name, tool.description));
+            let score = query_terms
+                .iter()
+                .filter(|q| haystack.iter().any(|h| terms_agree(q, h)))
+                .count();
+            (score > 0).then_some((score, tool))
+        })
+        .collect();
+    // Descending score, then ascending name: a stable, explainable order that
+    // does not depend on how the client happened to register its tools.
+    scored.sort_by(|(a_score, a), (b_score, b)| b_score.cmp(a_score).then(a.name.cmp(&b.name)));
+    let dropped = scored.len().saturating_sub(limit);
+    scored.truncate(limit);
+    (scored.into_iter().map(|(_, tool)| tool).collect(), dropped)
+}
 
 const TOOL_KB_WRITE: &str = "builtin_knowledge_base_write";
 const TOOL_KB_SEARCH: &str = "builtin_knowledge_base_search";
@@ -104,6 +186,12 @@ pub struct BuiltinToolService {
     notify_fn: Option<NotifyFn>,
     skill_search_fn: Option<SkillSearchFn>,
     skill_get_fn: Option<SkillGetFn>,
+    /// The daemon's own machine, as named to the model in a tool-search result.
+    daemon_host: String,
+    /// Whether that machine is the user's own workstation. When it is not, a
+    /// search result says so, because a daemon-side file tool then acts on a
+    /// machine the user is not sitting at.
+    daemon_on_workstation: bool,
 }
 
 impl Default for BuiltinToolService {
@@ -138,7 +226,23 @@ impl BuiltinToolService {
             notify_fn: None,
             skill_search_fn: None,
             skill_get_fn: None,
+            daemon_host: DEFAULT_DAEMON_HOST.to_string(),
+            daemon_on_workstation: true,
         }
+    }
+
+    /// Name the machine the daemon runs on, and say whether it is the user's
+    /// own workstation (issue #1082).
+    ///
+    /// Why: a tool-search result tells the model what each hit acts on. A
+    /// daemon-side file tool acts on the user's files when the daemon runs on
+    /// their computer, and on a container's files when it does not. Without
+    /// this the result can only say "the daemon", which the model reads as
+    /// "here".
+    pub fn with_topology(mut self, host: impl Into<String>, on_workstation: bool) -> Self {
+        self.daemon_host = host.into();
+        self.daemon_on_workstation = on_workstation;
+        self
     }
 
     /// Configure the embedding function for generating query vectors, and the
@@ -1484,30 +1588,134 @@ impl BuiltinToolService {
 
         let query_embedding = self.embed_text(&query).await.unwrap_or_default();
 
-        let results = search_fn(query, query_embedding, 10).await?;
+        let results = search_fn(query.clone(), query_embedding, REGISTRY_SEARCH_LIMIT).await?;
 
-        let tools: Vec<serde_json::Value> = results
+        // Classify each registry hit. Everything in the registry is reached
+        // from the daemon, but a server behind HTTP acts on a third-party
+        // service rather than on the daemon's own files, and the model has to
+        // be able to tell those apart.
+        let daemon_names: Vec<&str> = results.iter().map(|t| t.name.as_str()).collect();
+        let routed = match &self.mcp_handle {
+            Some(handle) => handle.tool_runners(&daemon_names).await,
+            // No MCP executor wired: every registry row is a built-in, which
+            // runs inside the daemon process.
+            None => std::collections::HashMap::new(),
+        };
+        let daemon_name_set: HashSet<&str> = daemon_names.iter().copied().collect();
+
+        // The connected client's own tools are never in the registry - they are
+        // registered per connection, not indexed - so a search that consulted
+        // only the registry could never offer the option that acts on the
+        // user's own machine.
+        let client_defs = match current_client_tools() {
+            Some(port) => port.tool_definitions().await,
+            None => Vec::new(),
+        };
+        let same_machine =
+            current_co_location().unwrap_or_else(|| current_transport_kind().is_co_located());
+        let (device_hits, device_matches_dropped) =
+            match_client_tools(&query, &client_defs, DEVICE_SEARCH_LIMIT);
+        // On one machine a client tool and a daemon tool of the same name are
+        // the same capability, so offering both would be a choice with no
+        // difference. The daemon entry is kept, matching how the turn loop
+        // resolves that collision.
+        let device_hits: Vec<&ToolDefinition> = device_hits
             .into_iter()
-            .map(|tool| {
-                serde_json::json!({
-                    "name": tool.name,
-                    "description": tool.description,
-                })
-            })
+            .filter(|t| !(same_machine && daemon_name_set.contains(t.name.as_str())))
             .collect();
+
+        let mut tools: Vec<serde_json::Value> =
+            Vec::with_capacity(results.len() + device_hits.len());
+        let mut runners_present: HashSet<ToolRunner> = HashSet::new();
+        for tool in &results {
+            let runner = routed
+                .get(tool.name.as_str())
+                .copied()
+                .unwrap_or(ToolRunner::Daemon);
+            runners_present.insert(runner);
+            tools.push(serde_json::json!({
+                "name": tool.name,
+                "description": tool.description,
+                "runs_on": runner.as_str(),
+            }));
+        }
+        for tool in &device_hits {
+            runners_present.insert(ToolRunner::Device);
+            tools.push(serde_json::json!({
+                "name": tool.name,
+                "description": tool.description,
+                "runs_on": ToolRunner::Device.as_str(),
+            }));
+        }
 
         let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
         tracing::info!(
             result_count = tools.len(),
+            device_count = device_hits.len(),
+            device_matches_dropped,
+            same_machine,
             ?tool_names,
             "tool search results"
         );
 
-        Ok(serde_json::json!({
+        let mut response = serde_json::json!({
             "ok": true,
+            "same_machine": same_machine,
+            "runs_on": self.runner_legend(&runners_present),
             "tools": tools,
-        })
-        .to_string())
+        });
+        // Never present a truncated match set as the whole answer.
+        if device_matches_dropped > 0 {
+            response["more_device_tools_matched"] = serde_json::json!(device_matches_dropped);
+        }
+        Ok(response.to_string())
+    }
+
+    /// Explain each runner value that appears in a search result, once per
+    /// response rather than once per hit.
+    ///
+    /// Only the values actually present are described. A legend for a runner
+    /// that produced no hit spends context describing a choice the model does
+    /// not have.
+    fn runner_legend(&self, present: &HashSet<ToolRunner>) -> serde_json::Value {
+        let mut legend = serde_json::Map::new();
+        if present.contains(&ToolRunner::Daemon) {
+            let kind = if self.daemon_on_workstation {
+                String::new()
+            } else {
+                " (a container or a server, not the user's own computer)".to_string()
+            };
+            legend.insert(
+                ToolRunner::Daemon.as_str().to_string(),
+                serde_json::json!(format!(
+                    "the daemon's own machine, \"{}\"{kind}. Acts on that machine's files \
+                     and processes.",
+                    self.daemon_host
+                )),
+            );
+        }
+        if present.contains(&ToolRunner::RemoteService) {
+            legend.insert(
+                ToolRunner::RemoteService.as_str().to_string(),
+                serde_json::json!(
+                    "a service the daemon calls over the network. Acts on that service, \
+                     and on no local files at all."
+                ),
+            );
+        }
+        if present.contains(&ToolRunner::Device) {
+            let label = match current_client_label().filter(|l| !l.trim().is_empty()) {
+                Some(label) => format!(", \"{label}\""),
+                None => String::new(),
+            };
+            legend.insert(
+                ToolRunner::Device.as_str().to_string(),
+                serde_json::json!(format!(
+                    "the user's own machine{label}. Acts on the user's own files."
+                )),
+            );
+        }
+        serde_json::Value::Object(legend)
     }
 
     async fn db_query(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
@@ -4014,6 +4222,330 @@ mod tests {
         let tools = json["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["name"], "jira__create_issue");
+    }
+
+    // --- Runner on search results (#1082) ---------------------------------
+
+    /// A registry search that always returns the given tools.
+    fn fixed_search(tools: Vec<ToolDefinition>) -> ToolSearchFn {
+        std::sync::Arc::new(move |_query, _emb, _limit| {
+            let tools = tools.clone();
+            Box::pin(async move { Ok(tools) })
+        })
+    }
+
+    fn noop_definition_fn() -> ToolDefinitionFn {
+        std::sync::Arc::new(|_name| Box::pin(async { Ok(None) }))
+    }
+
+    /// A client-tool port registering the given definitions, so a search can
+    /// see what the connected client offers.
+    struct FakeClientTools(Vec<ToolDefinition>);
+
+    #[async_trait::async_trait]
+    impl desktop_assistant_core::ports::client_tools::ClientToolPort for FakeClientTools {
+        async fn tool_definitions(&self) -> Vec<ToolDefinition> {
+            self.0.clone()
+        }
+        async fn is_registered(&self, name: &str) -> bool {
+            self.0.iter().any(|t| t.name == name)
+        }
+        async fn execute(
+            &self,
+            _id: &str,
+            _name: &str,
+            _args: serde_json::Value,
+        ) -> Result<String, CoreError> {
+            Ok(String::new())
+        }
+    }
+
+    /// Run a tool search with the given client-registered tools in scope.
+    async fn search_with_client_tools(
+        service: &BuiltinToolService,
+        query: &str,
+        client_tools: Vec<ToolDefinition>,
+    ) -> serde_json::Value {
+        use desktop_assistant_core::ports::client_tools::with_client_tools;
+        let port: std::sync::Arc<dyn desktop_assistant_core::ports::client_tools::ClientToolPort> =
+            std::sync::Arc::new(FakeClientTools(client_tools));
+        let result = with_client_tools(
+            port,
+            service.execute_tool(TOOL_SEARCH, serde_json::json!({ "query": query })),
+        )
+        .await
+        .expect("tool search must succeed");
+        serde_json::from_str(&result).expect("tool search must return JSON")
+    }
+
+    #[tokio::test]
+    async fn search_result_carries_daemon_runner_for_mcp_tool() {
+        // No MCP executor is wired, so nothing is routed to an HTTP server and
+        // every registry row runs inside the daemon.
+        let service = BuiltinToolService::new()
+            .with_tool_registry(
+                fixed_search(vec![ToolDefinition::new(
+                    "fileio__read_file",
+                    "Read a file from disk",
+                    serde_json::json!({}),
+                )]),
+                noop_definition_fn(),
+            )
+            .with_topology("daemon-host", false);
+
+        let result = service
+            .execute_tool(TOOL_SEARCH, serde_json::json!({"query": "read a file"}))
+            .await
+            .expect("tool search must succeed");
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(json["tools"][0]["runs_on"], "daemon");
+        let legend = json["runs_on"]["daemon"].as_str().expect("daemon legend");
+        assert!(
+            legend.contains("daemon-host"),
+            "the legend must name the daemon's machine: {legend}"
+        );
+        assert!(
+            legend.contains("not the user's own computer"),
+            "and say it is not the user's, since it is not on a workstation: {legend}"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_result_carries_remote_service_runner_for_http_mcp_server() {
+        // A server reached over HTTP acts on a third-party service. Reporting
+        // it as "the daemon's machine" is what makes a model believe a remote
+        // calendar tool can read local files.
+        use crate::executor::McpServerConfig;
+        // Built through deserialization, the same path a real config takes, so
+        // a new field on either struct does not break this fixture.
+        let http_server: McpServerConfig = serde_json::from_value(serde_json::json!({
+            "name": "calendar",
+            "http": { "url": "https://mcp.example.com/calendar" },
+        }))
+        .expect("http server fixture must deserialize");
+        let stdio_server: McpServerConfig = serde_json::from_value(serde_json::json!({
+            "name": "fileio",
+            "command": "fileio-mcp",
+        }))
+        .expect("stdio server fixture must deserialize");
+        let routing = std::collections::HashMap::from([
+            (
+                "calendar__list_events".to_string(),
+                (0usize, "list_events".to_string()),
+            ),
+            (
+                "fileio__read_file".to_string(),
+                (1usize, "read_file".to_string()),
+            ),
+        ]);
+        let handle = McpControlHandle::seeded_for_test(vec![http_server, stdio_server], routing);
+
+        let mut service = BuiltinToolService::new().with_tool_registry(
+            fixed_search(vec![
+                ToolDefinition::new(
+                    "calendar__list_events",
+                    "List calendar events",
+                    serde_json::json!({}),
+                ),
+                ToolDefinition::new(
+                    "fileio__read_file",
+                    "Read a file from disk",
+                    serde_json::json!({}),
+                ),
+            ]),
+            noop_definition_fn(),
+        );
+        service.set_mcp_control(handle);
+
+        let result = service
+            .execute_tool(
+                TOOL_SEARCH,
+                serde_json::json!({"query": "events and files"}),
+            )
+            .await
+            .expect("tool search must succeed");
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let by_name: std::collections::HashMap<&str, &str> = json["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| (t["name"].as_str().unwrap(), t["runs_on"].as_str().unwrap()))
+            .collect();
+        assert_eq!(by_name["calendar__list_events"], "remote-service");
+        assert_eq!(by_name["fileio__read_file"], "daemon");
+        assert!(
+            json["runs_on"]["remote-service"]
+                .as_str()
+                .is_some_and(|l| l.contains("no local files")),
+            "the legend must say a remote service touches no local files: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_result_carries_device_runner_for_client_registered_tool() {
+        let service = BuiltinToolService::new()
+            .with_tool_registry(fixed_search(Vec::new()), noop_definition_fn());
+        let json = search_with_client_tools(
+            &service,
+            "read a file",
+            vec![ToolDefinition::new(
+                "device__read_file",
+                "Read a file on the user's own computer",
+                serde_json::json!({}),
+            )],
+        )
+        .await;
+        assert_eq!(json["tools"][0]["name"], "device__read_file");
+        assert_eq!(json["tools"][0]["runs_on"], "device");
+        assert!(
+            json["runs_on"]["device"]
+                .as_str()
+                .is_some_and(|l| l.contains("the user's own")),
+            "the device legend must say whose machine it is: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_tools_match_the_query_and_join_the_results() {
+        // The registry hit and the client tool answer the same need on two
+        // different machines. Both must be offered, so the model can choose.
+        let service = BuiltinToolService::new().with_tool_registry(
+            fixed_search(vec![ToolDefinition::new(
+                "fileio__read_file",
+                "Read a file from disk",
+                serde_json::json!({}),
+            )]),
+            noop_definition_fn(),
+        );
+        let json = search_with_client_tools(
+            &service,
+            "read a file",
+            vec![
+                ToolDefinition::new(
+                    "device__read_file",
+                    "Read a file on the user's own computer",
+                    serde_json::json!({}),
+                ),
+                ToolDefinition::new(
+                    "device__play_music",
+                    "Start playback on the speakers",
+                    serde_json::json!({}),
+                ),
+            ],
+        )
+        .await;
+        let names: Vec<&str> = json["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        assert!(
+            names.contains(&"fileio__read_file") && names.contains(&"device__read_file"),
+            "both machines' answers must be offered: {names:?}"
+        );
+        assert!(
+            !names.contains(&"device__play_music"),
+            "an unrelated client tool must not be returned: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn co_located_turn_collapses_a_duplicated_capability_to_the_daemon_entry() {
+        // On one machine a client tool and a daemon tool of the same name are
+        // the same capability, so offering both is a choice with no difference.
+        // The default transport is UDS, which means co-located.
+        let service = BuiltinToolService::new().with_tool_registry(
+            fixed_search(vec![ToolDefinition::new(
+                "read_file",
+                "Read a file from disk",
+                serde_json::json!({}),
+            )]),
+            noop_definition_fn(),
+        );
+        let json = search_with_client_tools(
+            &service,
+            "read a file",
+            vec![ToolDefinition::new(
+                "read_file",
+                "Read a file from disk",
+                serde_json::json!({}),
+            )],
+        )
+        .await;
+        assert_eq!(json["same_machine"], true);
+        let tools = json["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1, "the duplicate must collapse: {json}");
+        assert_eq!(tools[0]["runs_on"], "daemon");
+    }
+
+    #[tokio::test]
+    async fn search_response_carries_one_locations_block() {
+        // The legend is emitted once per response, and only for the runners
+        // that actually appear, so it never describes a choice the model does
+        // not have.
+        let service = BuiltinToolService::new().with_tool_registry(
+            fixed_search(vec![
+                ToolDefinition::new("a__one", "First tool", serde_json::json!({})),
+                ToolDefinition::new("a__two", "Second tool", serde_json::json!({})),
+            ]),
+            noop_definition_fn(),
+        );
+        let result = service
+            .execute_tool(TOOL_SEARCH, serde_json::json!({"query": "tool"}))
+            .await
+            .expect("tool search must succeed");
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let legend = json["runs_on"].as_object().expect("a legend object");
+        assert_eq!(legend.len(), 1, "only the present runner: {json}");
+        assert!(legend.contains_key("daemon"));
+        assert!(json["tools"].as_array().unwrap().len() == 2);
+    }
+
+    #[tokio::test]
+    async fn unknown_source_falls_back_to_daemon_runner() {
+        // A built-in has no MCP route at all. It still runs inside the daemon
+        // process, so reporting anything else would be wrong.
+        let service = BuiltinToolService::new().with_tool_registry(
+            fixed_search(vec![ToolDefinition::new(
+                "builtin_knowledge_base_search",
+                "Search the knowledge base",
+                serde_json::json!({}),
+            )]),
+            noop_definition_fn(),
+        );
+        let result = service
+            .execute_tool(TOOL_SEARCH, serde_json::json!({"query": "knowledge"}))
+            .await
+            .expect("tool search must succeed");
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(json["tools"][0]["runs_on"], "daemon");
+    }
+
+    #[test]
+    fn client_tool_matching_ranks_and_reports_what_it_dropped() {
+        let tools: Vec<ToolDefinition> = (0..12)
+            .map(|i| {
+                ToolDefinition::new(
+                    format!("device__read_{i:02}"),
+                    "Read a file",
+                    serde_json::json!({}),
+                )
+            })
+            .collect();
+        let (kept, dropped) = match_client_tools("read files", &tools, 10);
+        assert_eq!(kept.len(), 10);
+        assert_eq!(dropped, 2, "a truncated set must report what it dropped");
+        // Deterministic order: equal scores fall back to the name.
+        assert_eq!(kept[0].name, "device__read_00");
+
+        // "files" must find "file": the matcher agrees on a prefix either way.
+        let (kept, _) = match_client_tools("files", &tools[..1], 10);
+        assert_eq!(kept.len(), 1);
+
+        // A query of only short words separates nothing, so it matches nothing.
+        let (kept, _) = match_client_tools("a of", &tools, 10);
+        assert!(kept.is_empty());
     }
 
     #[tokio::test]

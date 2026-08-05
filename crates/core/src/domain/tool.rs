@@ -58,6 +58,47 @@ impl ToolLocality {
     }
 }
 
+/// What a tool acts on, as tool discovery reports it to the model (issue
+/// #1082).
+///
+/// ## Why this is not [`ToolLocality`]
+///
+/// The two answer different questions and both are needed.
+/// [`ToolLocality`] answers "which machine issues this call", which is what the
+/// per-turn tool note needs to route work between the daemon and a client.
+/// `ToolRunner` answers "what does this tool reach", which is what the model
+/// needs when it picks a tool out of a search result. They differ on one case:
+/// an MCP server the daemon reaches over HTTP is issued *from* the daemon, so
+/// its locality is `Server`, but it acts on a third-party service and touches
+/// no local filesystem at all. Reporting that as "the daemon's machine" is what
+/// makes a model believe a remote calendar tool can read local files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ToolRunner {
+    /// Runs on the daemon's own machine: a built-in, or an MCP server the
+    /// daemon spawned as a subprocess. Acts on that machine's filesystem and
+    /// processes.
+    Daemon,
+    /// An MCP server the daemon reaches over HTTP. The call leaves the daemon's
+    /// machine, so it acts on a third-party service and on neither machine's
+    /// files.
+    RemoteService,
+    /// Runs on the user's own machine: a tool the connected client registered.
+    Device,
+}
+
+impl ToolRunner {
+    /// The stable identifier reported to the model, and the value a caller
+    /// matches on. Kebab-case, matching the serde representation.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Daemon => "daemon",
+            Self::RemoteService => "remote-service",
+            Self::Device => "device",
+        }
+    }
+}
+
 /// How a connection reaches the daemon, used to infer tool co-location
 /// (issue #243).
 ///

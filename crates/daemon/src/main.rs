@@ -1448,8 +1448,31 @@ async fn main() -> Result<()> {
             Vec::new()
         });
 
+    // Where this daemon runs (#534), resolved once at startup: the environment
+    // variable, else `[deployment] on_workstation`, else container detection.
+    let on_workstation = resolve_on_workstation(
+        parse_env_opt_bool(
+            std::env::var("DESKTOP_ASSISTANT_ON_WORKSTATION")
+                .ok()
+                .as_deref(),
+        ),
+        daemon_config
+            .as_ref()
+            .and_then(|c| c.deployment.on_workstation),
+        is_container_environment(),
+    );
+    tracing::info!(
+        on_workstation,
+        "daemon deployment topology resolved; the assistant describes its \
+         daemon-side tools accordingly"
+    );
+
     // Build the MCP tool executor with builtin tools
-    let mut builtin_tools = BuiltinToolService::new();
+    // Tool-search results name the daemon's machine and say whether it is the
+    // user's own, so the model can tell a daemon-side file tool from one that
+    // acts on the user's files (#1082).
+    let mut builtin_tools =
+        BuiltinToolService::new().with_topology(daemon_host_label(), on_workstation);
     if let Some(embed_fn) = embedding_fn {
         tracing::info!(
             "enabling built-in vector search with model={}",
@@ -2426,24 +2449,6 @@ async fn main() -> Result<()> {
     // conversation -> handler -> executor cycle non-owning so nothing leaks.
     let conversation_slot: desktop_assistant_application::subagent_executor::ConversationSlot =
         Arc::new(std::sync::OnceLock::new());
-    // Where this daemon runs (#534), resolved once at startup: the environment
-    // variable, else `[deployment] on_workstation`, else container detection.
-    let on_workstation = resolve_on_workstation(
-        parse_env_opt_bool(
-            std::env::var("DESKTOP_ASSISTANT_ON_WORKSTATION")
-                .ok()
-                .as_deref(),
-        ),
-        daemon_config
-            .as_ref()
-            .and_then(|c| c.deployment.on_workstation),
-        is_container_environment(),
-    );
-    tracing::info!(
-        on_workstation,
-        "daemon deployment topology resolved; the assistant describes its \
-         daemon-side tools accordingly"
-    );
     let mut handler = ConversationHandler::with_tools(
         conversation_store.clone(),
         llm,
