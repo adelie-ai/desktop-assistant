@@ -627,8 +627,10 @@ async fn sweep_one_table(
 /// than a `vector[]`.
 ///
 /// The embed text must stay byte-identical to the one
-/// [`crate::tag_registry::create_or_match_tag`] builds when it looks for a
-/// near-duplicate. A backfilled vector is compared directly against vectors
+/// [`crate::tag_registry::tag_embed_text`] builds for
+/// [`crate::tag_registry::create_or_match_tag`] when it looks for a
+/// near-duplicate — including its rule that a tag with no description embeds as
+/// its name alone. A backfilled vector is compared directly against vectors
 /// produced by that path, so embedding a different string here would make the
 /// dedup distances meaningless rather than merely imprecise.
 ///
@@ -644,7 +646,9 @@ pub async fn backfill_tag_embeddings(
 
     loop {
         let rows: Vec<(String, String, String)> = sqlx::query_as(
-            "SELECT user_id, name, name || ': ' || description AS text \
+            "SELECT user_id, name, \
+                    CASE WHEN btrim(description) = '' \
+                         THEN name ELSE name || ': ' || description END AS text \
              FROM tag_registry \
              WHERE deprecated_for_tag IS NULL \
                AND (embedding IS NULL \

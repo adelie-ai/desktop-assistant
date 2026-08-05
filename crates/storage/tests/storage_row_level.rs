@@ -28,13 +28,13 @@ use desktop_assistant_core::domain::{
     Conversation, ConversationId, KnowledgeEntry, Message, Role, ToolDefinition,
 };
 use desktop_assistant_core::ports::knowledge::KnowledgeBaseStore;
+use desktop_assistant_core::ports::knowledge::ProposedTag;
 use desktop_assistant_core::ports::store::{
     BackgroundTaskRow, BackgroundTaskStatus, BackgroundTaskStore, ConversationStore, TurnRow,
     TurnStateJson, TurnStateStore, TurnStatus,
 };
 use desktop_assistant_core::ports::tool_registry::ToolRegistryStore;
 use desktop_assistant_storage::embedding_backfill::BackfillEmbedFn;
-use desktop_assistant_core::ports::knowledge::ProposedTag;
 use desktop_assistant_storage::tag_registry::{
     CreateTagOutcome, TagProposal, create_or_match_tag, get_tag, list_active_tags,
     resolve_active_name, resolve_proposed_tag,
@@ -733,7 +733,9 @@ fn counting_embed_fn(seen: Arc<std::sync::Mutex<Vec<String>>>) -> BackfillEmbedF
     Box::new(move |texts| {
         let seen = Arc::clone(&seen);
         Box::pin(async move {
-            seen.lock().expect("record embed texts").extend(texts.iter().cloned());
+            seen.lock()
+                .expect("record embed texts")
+                .extend(texts.iter().cloned());
             Ok(texts.iter().map(|_| vec![1.0f32, 0.0, 0.0]).collect())
         })
     })
@@ -818,62 +820,65 @@ async fn kb_write_registers_tags_under_the_calling_user() {
     //
     // MUTATION: dropping the `user_id = $2` predicate from the nearest-neighbour
     // search in `create_or_match_tag` redirects bob onto alice's tag → RED.
-    with_fixture("kb_write_registers_tags_under_the_calling_user", |fx| async move {
-        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let embed_fn = counting_embed_fn(Arc::clone(&seen));
+    with_fixture(
+        "kb_write_registers_tags_under_the_calling_user",
+        |fx| async move {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let embed_fn = counting_embed_fn(Arc::clone(&seen));
 
-        with_user_id(UserId::new("alice"), async {
-            let name = resolve_proposed_tag(
-                &fx.pool,
-                &embed_fn,
-                "test-model",
-                &ProposedTag {
-                    name: "project:alpha".into(),
-                    description: Some("Alice's first project".into()),
-                },
-            )
-            .await
-            .expect("alice registers her tag");
-            assert_eq!(name, "project:alpha");
-        })
-        .await;
-
-        with_user_id(UserId::new("bob"), async {
-            // A different name, so the exact-match short-circuit cannot fire,
-            // and an identical embedding, so only the user scope can keep the
-            // two apart.
-            let name = resolve_proposed_tag(
-                &fx.pool,
-                &embed_fn,
-                "test-model",
-                &ProposedTag {
-                    name: "project:alphas".into(),
-                    description: Some("Bob's own project".into()),
-                },
-            )
-            .await
-            .expect("bob registers his tag");
-            assert_eq!(
-                name, "project:alphas",
-                "bob's tag must not redirect onto alice's vocabulary"
-            );
-
-            let visible = list_active_tags(&fx.pool)
+            with_user_id(UserId::new("alice"), async {
+                let name = resolve_proposed_tag(
+                    &fx.pool,
+                    &embed_fn,
+                    "test-model",
+                    &ProposedTag {
+                        name: "project:alpha".into(),
+                        description: Some("Alice's first project".into()),
+                    },
+                )
                 .await
-                .expect("list bob's tags")
-                .into_iter()
-                .map(|t| t.name)
-                .collect::<Vec<_>>();
-            assert_eq!(
-                visible,
-                vec!["project:alphas".to_string()],
-                "bob sees only his own tag"
-            );
-        })
-        .await;
+                .expect("alice registers her tag");
+                assert_eq!(name, "project:alpha");
+            })
+            .await;
 
-        fx
-    })
+            with_user_id(UserId::new("bob"), async {
+                // A different name, so the exact-match short-circuit cannot fire,
+                // and an identical embedding, so only the user scope can keep the
+                // two apart.
+                let name = resolve_proposed_tag(
+                    &fx.pool,
+                    &embed_fn,
+                    "test-model",
+                    &ProposedTag {
+                        name: "project:alphas".into(),
+                        description: Some("Bob's own project".into()),
+                    },
+                )
+                .await
+                .expect("bob registers his tag");
+                assert_eq!(
+                    name, "project:alphas",
+                    "bob's tag must not redirect onto alice's vocabulary"
+                );
+
+                let visible = list_active_tags(&fx.pool)
+                    .await
+                    .expect("list bob's tags")
+                    .into_iter()
+                    .map(|t| t.name)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    visible,
+                    vec!["project:alphas".to_string()],
+                    "bob sees only his own tag"
+                );
+            })
+            .await;
+
+            fx
+        },
+    )
     .await;
 }
 

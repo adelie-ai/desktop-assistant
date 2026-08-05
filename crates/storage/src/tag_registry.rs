@@ -1,10 +1,17 @@
 //! Formal tag vocabulary for the knowledge base (issue #108).
 //!
 //! Tags are categorical: each is a named, described concept rather than a
-//! free-form string. The extractor picks from the registry; new tags must be
+//! free-form string. The extractor picks from the registry; new tags are
 //! proposed with a description and (ideally) examples, and a pre-flight
 //! similarity check redirects near-duplicates to the existing tag instead of
 //! letting the vocabulary drift.
+//!
+//! Two paths propose tags. Dreaming extraction proposes them in bulk through
+//! [`create_or_match_tag`]. The knowledge-base write tool proposes them one at
+//! a time through [`resolve_proposed_tag`], which is the same check with a
+//! narrower door: it answers with a tag name rather than a record, and it
+//! accepts a proposal with no description, because a model that omits one must
+//! not cost the user a memory.
 //!
 //! A tag name is normalized by [`crate::tag_normalize::normalize_tag`], the
 //! same function the knowledge-base write path uses, so a registry key is
@@ -19,6 +26,7 @@
 
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::ports::auth::current_user_id;
+use desktop_assistant_core::ports::knowledge::ProposedTag;
 use pgvector::Vector;
 use sqlx::PgPool;
 
@@ -165,7 +173,7 @@ pub async fn create_or_match_tag(
         });
     }
 
-    let embed_text = format!("{}: {}", normalized, proposal.description);
+    let embed_text = tag_embed_text(&normalized, &proposal.description);
     let embeddings = embed_fn(vec![embed_text])
         .await
         .map_err(CoreError::Storage)?;
@@ -241,6 +249,84 @@ pub async fn create_or_match_tag(
         examples: proposal.examples,
         distinguish_from: proposal.distinguish_from,
     }))
+}
+
+/// Build the text a tag is embedded from, given its normalized name and its
+/// description.
+///
+/// Why one function: the vector stored on a tag row is compared directly
+/// against the vector a new proposal produces, so the creation path and the
+/// backfill must embed byte-identical text or the distances between them mean
+/// nothing. `backfill_tag_embeddings` reproduces this rule in SQL and
+/// `tag_backfill_reproduces_the_creation_embed_text` holds the two together.
+///
+/// A tag with no description embeds as its name alone. Appending an empty
+/// description would put a separator with nothing after it into the vector,
+/// which is signal the tag does not have.
+pub fn tag_embed_text(normalized_name: &str, description: &str) -> String {
+    if description.trim().is_empty() {
+        normalized_name.to_string()
+    } else {
+        format!("{normalized_name}: {description}")
+    }
+}
+
+/// Resolve one tool-proposed tag to the name the knowledge base should store.
+///
+/// This is the knowledge-base write tool's door into the tag vocabulary. It
+/// answers with the proposed name when the vocabulary accepts the tag as a new
+/// concept, and with an existing tag's name when the two are the same concept,
+/// so a near duplicate never becomes a second tag that no read can match.
+///
+/// A proposal with no description is registered under its name alone. That is
+/// weaker signal for the dedup, and it is still better than refusing a write:
+/// the model omitting a description must never cost the user a memory.
+///
+/// Errors are the caller's cue to store the tag as written, not to fail the
+/// write - see [`desktop_assistant_core::ports::knowledge::KnowledgeTagResolveFn`].
+pub async fn resolve_proposed_tag(
+    pool: &PgPool,
+    embed_fn: &BackfillEmbedFn,
+    embedding_model: &str,
+    proposed: &ProposedTag,
+) -> Result<String, CoreError> {
+    let description = proposed.description.clone().unwrap_or_default();
+    if description.trim().is_empty() {
+        tracing::debug!(
+            tag = %proposed.name,
+            "no description for a proposed tag; the vocabulary matches on its name alone"
+        );
+    }
+
+    let outcome = create_or_match_tag(
+        pool,
+        embed_fn,
+        embedding_model,
+        TagProposal {
+            name: proposed.name.clone(),
+            description,
+            examples: Vec::new(),
+            distinguish_from: Vec::new(),
+        },
+    )
+    .await?;
+
+    Ok(match outcome {
+        CreateTagOutcome::Created(record) => record.name,
+        CreateTagOutcome::RedirectedTo {
+            proposed_name,
+            existing,
+            distance,
+        } => {
+            tracing::debug!(
+                proposed = %proposed_name,
+                existing = %existing.name,
+                distance,
+                "tool-path tag redirected to an existing tag"
+            );
+            existing.name
+        }
+    })
 }
 
 /// Normalize a proposed tag name into the key the registry stores.

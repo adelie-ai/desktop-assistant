@@ -12,8 +12,8 @@ use desktop_assistant_core::ports::database::DbQueryFn;
 use desktop_assistant_core::ports::embedding::EmbedFn;
 use desktop_assistant_core::ports::knowledge::{
     AVAILABLE_TAGS_LIMIT, KNOWLEDGE_TAG_CENSUS_SAMPLE, KnowledgeDeleteFn, KnowledgeGetFn,
-    KnowledgeListFn, KnowledgeListQuery, KnowledgeSearchFn, KnowledgeWriteFn, ListOrder,
-    ListOrderOpt, ScopeSize,
+    KnowledgeListFn, KnowledgeListQuery, KnowledgeSearchFn, KnowledgeTagResolveFn,
+    KnowledgeWriteFn, ListOrder, ListOrderOpt, ProposedTag, ScopeSize,
 };
 use desktop_assistant_core::ports::notify::{NotifyFn, NotifyUrgency};
 use desktop_assistant_core::ports::scratchpad::{
@@ -170,6 +170,7 @@ pub struct BuiltinToolService {
     kb_delete_fn: Option<KnowledgeDeleteFn>,
     kb_list_fn: Option<KnowledgeListFn>,
     kb_get_fn: Option<KnowledgeGetFn>,
+    kb_tag_resolve_fn: Option<KnowledgeTagResolveFn>,
     tool_search_fn: Option<ToolSearchFn>,
     #[allow(dead_code)]
     tool_definition_fn: Option<ToolDefinitionFn>,
@@ -211,6 +212,7 @@ impl BuiltinToolService {
             kb_delete_fn: None,
             kb_list_fn: None,
             kb_get_fn: None,
+            kb_tag_resolve_fn: None,
             tool_search_fn: None,
             tool_definition_fn: None,
             db_query_fn: None,
@@ -292,6 +294,19 @@ impl BuiltinToolService {
         self.kb_delete_fn = Some(delete_fn);
         self.kb_list_fn = Some(list_fn);
         self.kb_get_fn = Some(get_fn);
+        self
+    }
+
+    /// Put the formal tag vocabulary in front of the knowledge-base write path,
+    /// so a tag the model writes is checked against the tags that already exist
+    /// before it is stored.
+    ///
+    /// Why capability-gated: the vocabulary lives in the database and needs an
+    /// embedding backend to recognise a near duplicate. Without this the write
+    /// path keeps its prior behaviour and stores the tag as written, which is a
+    /// weaker knowledge base rather than a broken one.
+    pub fn with_tag_registry(mut self, resolve_fn: KnowledgeTagResolveFn) -> Self {
+        self.kb_tag_resolve_fn = Some(resolve_fn);
         self
     }
 
@@ -404,7 +419,11 @@ impl BuiltinToolService {
                  this information is useful) and the information itself. Provide either a single \
                  entry (top-level `content`/`tags`/`id`) or a batch via `entries`. To update only \
                  the tags of an existing entry, pass its `id` and omit `content` — the existing \
-                 content is preserved.",
+                 content is preserved. Tags are checked against the tags that already exist: a \
+                 tag that means the same as one already in use is stored under the existing \
+                 name, so the response reports the tags actually stored, which may differ from \
+                 the ones you sent. Describe any tag you believe is new in \
+                 `new_tag_descriptions` — that description is what the check compares.",
                 serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -419,6 +438,11 @@ impl BuiltinToolService {
                             "type": "array",
                             "items": {"type": "string"},
                             "description": "Two-level tags. Give a coarse KIND ('preference', 'memory', or 'instruction') PLUS at least one SPECIFIC facet: 'project:<name>', 'tool:<name>', 'topic:<subject>', or 'person:<name>'. Prefer specific over generic. Good: ['instruction', 'project:adelie-ai', 'topic:deploy']. Too generic: ['instruction']."
+                        },
+                        "new_tag_descriptions": {
+                            "type": "object",
+                            "additionalProperties": {"type": "string"},
+                            "description": "Optional map from a tag in `tags` to a one-line description of what that tag means, e.g. {'topic:embeddings': 'Vector embedding generation, models, and backfill'}. Needed only for a tag you believe is new: it is what decides whether your tag means the same as one already in use. A tag already in use ignores its entry here. Omitting a description never fails the write, it only makes the check weaker."
                         },
                         "id": {
                             "type": "string",
@@ -435,6 +459,11 @@ impl BuiltinToolService {
                                         "type": "array",
                                         "items": {"type": "string"},
                                         "description": "Two-level tags: a coarse KIND ('preference'/'memory'/'instruction') PLUS at least one SPECIFIC facet ('project:<name>', 'tool:<name>', 'topic:<subject>', 'person:<name>'). Prefer specific over generic."
+                                    },
+                                    "new_tag_descriptions": {
+                                        "type": "object",
+                                        "additionalProperties": {"type": "string"},
+                                        "description": "Per-entry map from a tag in this entry's `tags` to a one-line description of what it means. Needed only for a tag you believe is new."
                                     },
                                     "id": {"type": "string"}
                                 }
@@ -1132,6 +1161,11 @@ impl BuiltinToolService {
             let saved = write_fn(entry).await?;
             saved_out.push(serde_json::json!({
                 "id": saved.id,
+                // The tags actually stored, which the vocabulary check may have
+                // redirected away from the ones the caller sent. Reporting them
+                // stops the model believing an entry carries a tag it does not,
+                // and then searching for that tag and finding nothing.
+                "tags": saved.tags,
                 "created_at": saved.created_at,
                 "updated_at": saved.updated_at,
             }));
@@ -1186,8 +1220,11 @@ impl BuiltinToolService {
             .ok_or_else(|| {
                 CoreError::ToolExecution("knowledge_base write requires content".into())
             })?;
+        // Tags the caller supplied go through the formal vocabulary; tags
+        // carried over from the existing entry are already in it, so a
+        // content-only update re-registers nothing.
         let tags = if tags_present {
-            tags
+            self.resolve_tags(tags, spec).await
         } else {
             existing
                 .as_ref()
@@ -1221,6 +1258,59 @@ impl BuiltinToolService {
             updated_at: String::new(),
             source: Some("explicit".to_string()),
         })
+    }
+
+    /// Put every tag the caller supplied through the formal tag vocabulary and
+    /// return the names to store.
+    ///
+    /// Each tag is offered with its entry from the spec's
+    /// `new_tag_descriptions` map, which is what lets the vocabulary tell one
+    /// short facet tag from another. A tag the vocabulary already holds matches
+    /// on its name and costs no embedding, so sending a description for every
+    /// tag is free.
+    ///
+    /// Why nothing here can fail the write: the vocabulary is optional. It is
+    /// absent when no database or embedding backend is wired, and it can fail
+    /// per call when the embedding backend is unreachable. Both degrade to the
+    /// prior behaviour - store the tag as the caller wrote it - and say so once
+    /// rather than once per tag.
+    async fn resolve_tags(&self, tags: Vec<String>, spec: &serde_json::Value) -> Vec<String> {
+        let Some(resolve_fn) = self.kb_tag_resolve_fn.as_ref() else {
+            return tags;
+        };
+        let descriptions = spec.get("new_tag_descriptions");
+
+        let mut resolved = Vec::with_capacity(tags.len());
+        let mut first_error: Option<CoreError> = None;
+        for tag in tags {
+            let description = descriptions
+                .and_then(|d| d.get(&tag))
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|d| !d.is_empty())
+                .map(str::to_string);
+            let proposed = ProposedTag {
+                name: tag.clone(),
+                description,
+            };
+            match resolve_fn(proposed).await {
+                Ok(name) => resolved.push(name),
+                Err(e) => {
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                    resolved.push(tag);
+                }
+            }
+        }
+
+        if let Some(e) = first_error {
+            tracing::warn!(
+                error = %e,
+                "the tag vocabulary was unavailable for this write; tags stored as written"
+            );
+        }
+        resolved
     }
 
     async fn kb_search(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
@@ -2391,9 +2481,7 @@ fn parse_os_release_field(contents: &str, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use desktop_assistant_core::ports::knowledge::{
-        KnowledgeSearchPage, KnowledgeTagResolveFn, ProposedTag, ScopeSize,
-    };
+    use desktop_assistant_core::ports::knowledge::{KnowledgeSearchPage, ScopeSize};
 
     #[test]
     fn builtin_provider_map_is_exhaustive() {
@@ -4234,16 +4322,15 @@ mod tests {
                 Ok(entry)
             })
         });
-        let search_fn: KnowledgeSearchFn =
-            Arc::new(|_q, _emb, _model, _tags, _exclude, _limit| {
-                Box::pin(async {
-                    Ok(KnowledgeSearchPage {
-                        entries: Vec::new(),
-                        scope_size: ScopeSize::None,
-                        available_tags: Vec::new(),
-                    })
+        let search_fn: KnowledgeSearchFn = Arc::new(|_q, _emb, _model, _tags, _exclude, _limit| {
+            Box::pin(async {
+                Ok(KnowledgeSearchPage {
+                    entries: Vec::new(),
+                    scope_size: ScopeSize::None,
+                    available_tags: Vec::new(),
                 })
-            });
+            })
+        });
         let delete_fn: KnowledgeDeleteFn = Arc::new(|_ids| Box::pin(async { Ok(0) }));
         let list_fn: KnowledgeListFn = Arc::new(|_q| {
             Box::pin(async {
@@ -4575,7 +4662,9 @@ mod tests {
             "each value is a one-line description: {single}"
         );
         assert!(
-            single["description"].as_str().is_some_and(|d| !d.is_empty()),
+            single["description"]
+                .as_str()
+                .is_some_and(|d| !d.is_empty()),
             "the field carries a description of its own: {single}"
         );
 
