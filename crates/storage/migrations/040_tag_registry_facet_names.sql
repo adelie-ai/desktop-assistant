@@ -151,10 +151,14 @@ BEGIN
     -- entry there points the extractor at a tag that no longer exists.
     --
     -- A row that named its own mangled duplicate would otherwise end up naming
-    -- itself, so a resolved sibling equal to the row's own name is dropped, and
-    -- two siblings that resolve to one name collapse to a single entry at the
-    -- position of the first. This runs after the rename, so `t.name` is already
-    -- the repaired name.
+    -- itself, so a resolved sibling equal to the row's own name is dropped.
+    -- The rewrite also keeps one entry per distinct name, at the position of
+    -- the first: that removes a pair the repair itself created, and equally an
+    -- ordinary duplicate that was already in the array. Neither carries
+    -- meaning here, because the list is read as a set of concepts to stay
+    -- apart from. Only a row that names a repaired tag is rewritten at all, so
+    -- a list with a pre-existing duplicate and no repaired name is untouched.
+    -- This runs after the rename, so `t.name` is already the repaired name.
     UPDATE tag_registry t
        SET distinguish_from = ARRAY(
                SELECT resolved.name
