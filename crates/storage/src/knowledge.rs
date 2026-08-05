@@ -2,8 +2,8 @@ use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::KnowledgeEntry;
 use desktop_assistant_core::ports::auth::current_user_id;
 use desktop_assistant_core::ports::knowledge::{
-    KnowledgeBaseStore, KnowledgeListPage, KnowledgeListQuery, KnowledgeSearchPage, ListOrder,
-    ScopeSize,
+    AVAILABLE_TAGS_LIMIT, KNOWLEDGE_TAG_CENSUS_SAMPLE, KnowledgeBaseStore, KnowledgeListPage,
+    KnowledgeListQuery, KnowledgeSearchPage, ListOrder, ScopeSize,
 };
 use pgvector::Vector;
 use sqlx::PgPool;
@@ -107,10 +107,12 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
             .await?
         };
 
+        let (scope_size, available_tags) = self.tag_census(&tags, &exclude_tags, limit).await?;
+
         Ok(KnowledgeSearchPage {
             entries,
-            scope_size: ScopeSize::None,
-            available_tags: Vec::new(),
+            scope_size,
+            available_tags,
         })
     }
 
@@ -198,6 +200,81 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
 /// daemon). These sit outside the [`KnowledgeBaseStore`] port because they are
 /// tool-surface concerns, not part of the application's outbound contract.
 impl PgKnowledgeBaseStore {
+    /// Measure the scope a search selected: how many entries it holds and which
+    /// tags they carry, most frequent first with the tag name breaking ties.
+    ///
+    /// "Scope" is the set of entries that pass the caller's tag filters, not
+    /// the set that matched the query. One aggregate answers both questions, so
+    /// a search costs one extra round trip rather than two.
+    ///
+    /// Why the sample is ordered by `created_at DESC` rather than merely
+    /// capped, and why the cap exists at all:
+    ///
+    /// - The order rides `knowledge_base_user_id_created_at_idx` (migration
+    ///   016), so the read stops after [`KNOWLEDGE_TAG_CENSUS_SAMPLE`] rows
+    ///   instead of scanning the table.
+    /// - It also makes the sample stable. A bare `LIMIT` takes rows in heap
+    ///   order, which moves after any `VACUUM` or update, so two identical
+    ///   searches would report different tags.
+    /// - The cap is a tail guardrail for a large multi-tenant store, not an
+    ///   optimisation of the common path. A personal knowledge base never
+    ///   reaches it.
+    ///
+    /// Both tag filters must already be normalized (`normalize_tag_filter`), or
+    /// a differently-cased filter measures a different scope from the one the
+    /// search itself read.
+    async fn tag_census(
+        &self,
+        tags: &Option<Vec<String>>,
+        exclude_tags: &Option<Vec<String>>,
+        page_limit: usize,
+    ) -> Result<(ScopeSize, Vec<String>), CoreError> {
+        let user_id = current_user_id();
+
+        // `unnest` sits in the FROM clause, not the target list: a
+        // set-returning function cannot be grouped by in the target list, and
+        // the lateral form makes the "one row per (entry, tag)" shape explicit.
+        // Entries carrying no tags drop out of `census` but still count in
+        // `scope_count`, which is what makes an untagged store report a real
+        // size with an empty tag list.
+        let row: CensusRow = sqlx::query_as(
+            "WITH scope AS (
+                 SELECT tags
+                 FROM knowledge_base
+                 WHERE user_id = $1
+                   AND deleted_at IS NULL
+                   AND ($2::text[] IS NULL OR tags && $2)
+                   AND ($3::text[] IS NULL OR NOT (tags && $3))
+                 ORDER BY created_at DESC
+                 LIMIT $4
+             ),
+             census AS (
+                 SELECT t.tag, count(*) AS n
+                 FROM scope, unnest(scope.tags) AS t(tag)
+                 GROUP BY t.tag
+                 ORDER BY n DESC, t.tag
+                 LIMIT $5
+             )
+             SELECT (SELECT count(*) FROM scope) AS scope_count,
+                    COALESCE(
+                        (SELECT array_agg(tag ORDER BY n DESC, tag) FROM census),
+                        ARRAY[]::text[]
+                    ) AS available_tags",
+        )
+        .bind(user_id.as_str())
+        .bind(tags)
+        .bind(exclude_tags)
+        .bind(KNOWLEDGE_TAG_CENSUS_SAMPLE as i64)
+        .bind(AVAILABLE_TAGS_LIMIT as i64)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| CoreError::Storage(e.to_string()))?;
+
+        let sampled = row.scope_count.max(0) as usize;
+        let scope_size = ScopeSize::classify(sampled, KNOWLEDGE_TAG_CENSUS_SAMPLE, page_limit);
+        Ok((scope_size, row.available_tags))
+    }
+
     /// The vector + full-text (RRF) arm of [`KnowledgeBaseStore::search`].
     ///
     /// Both tag filters must already be normalized (`normalize_tag_filter`).
@@ -484,6 +561,14 @@ impl KbRow {
             source: self.source,
         }
     }
+}
+
+/// The single row the tag census returns: how many entries the capped sample
+/// read, and the scope's tags in the order they are reported.
+#[derive(sqlx::FromRow)]
+struct CensusRow {
+    scope_count: i64,
+    available_tags: Vec<String>,
 }
 
 #[derive(sqlx::FromRow)]

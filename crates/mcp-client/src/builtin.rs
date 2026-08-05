@@ -9,8 +9,9 @@ use desktop_assistant_core::ports::conversation_search::ConversationSearchFn;
 use desktop_assistant_core::ports::database::DbQueryFn;
 use desktop_assistant_core::ports::embedding::EmbedFn;
 use desktop_assistant_core::ports::knowledge::{
-    KnowledgeDeleteFn, KnowledgeGetFn, KnowledgeListFn, KnowledgeListQuery, KnowledgeSearchFn,
-    KnowledgeWriteFn, ListOrder, ListOrderOpt,
+    AVAILABLE_TAGS_LIMIT, KNOWLEDGE_TAG_CENSUS_SAMPLE, KnowledgeDeleteFn, KnowledgeGetFn,
+    KnowledgeListFn, KnowledgeListQuery, KnowledgeSearchFn, KnowledgeWriteFn, ListOrder,
+    ListOrderOpt,
 };
 use desktop_assistant_core::ports::notify::{NotifyFn, NotifyUrgency};
 use desktop_assistant_core::ports::scratchpad::{
@@ -332,8 +333,19 @@ impl BuiltinToolService {
             ),
             ToolDefinition::new(
                 TOOL_KB_SEARCH,
-                "Search the knowledge base for preferences, memories, and stored context. \
-                 Uses hybrid vector + full-text search.",
+                format!(
+                    "Search the knowledge base for preferences, memories, and stored context. \
+                     Uses hybrid vector + full-text search. Returns `results`, `returned` (how \
+                     many entries are in this page), `scope_size`, and `available_tags`; plus \
+                     `truncated` and a `message` when the page filled up. `scope_size` is NONE, \
+                     FEW, or MANY, and `available_tags` lists tag names most frequent first, \
+                     without counts. Both describe the SCOPE - the entries that pass the `tags` \
+                     and `exclude_tags` filters - and never the number of entries that matched \
+                     the query, which this search cannot count. `available_tags` reports at most \
+                     {AVAILABLE_TAGS_LIMIT} tags, counted over at most the \
+                     {KNOWLEDGE_TAG_CENSUS_SAMPLE} most recent entries in scope, so a tag \
+                     carried only by older entries can be missing from it."
+                ),
                 serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1096,10 +1108,14 @@ impl BuiltinToolService {
         let query = required_string(&arguments, "query")?;
         let tags = optional_string_array_nonempty(&arguments, "tags");
         let exclude_tags = optional_string_array_nonempty(&arguments, "exclude_tags");
+        // The schema advertises a minimum of 1. Honour it here rather than
+        // trusting it: a limit of 0 would return nothing and then report
+        // `truncated`, because `results.len() >= limit` holds vacuously.
         let limit = arguments
             .get("limit")
             .and_then(serde_json::Value::as_u64)
-            .unwrap_or(10) as usize;
+            .unwrap_or(10)
+            .max(1) as usize;
 
         tracing::info!(query = %query, ?tags, ?exclude_tags, limit, "knowledge base search");
 
@@ -1115,6 +1131,13 @@ impl BuiltinToolService {
         )
         .await?;
 
+        let scope_size = page.scope_size;
+        // The cap is a context budget: the list travels to the model inside
+        // this tool result. Enforce it here, at the point of serialization,
+        // whatever the store hands over.
+        let mut available_tags = page.available_tags;
+        available_tags.truncate(AVAILABLE_TAGS_LIMIT);
+
         let items: Vec<serde_json::Value> = page
             .entries
             .into_iter()
@@ -1129,14 +1152,33 @@ impl BuiltinToolService {
             })
             .collect();
 
-        tracing::info!(result_count = items.len(), "knowledge base search results");
+        tracing::info!(
+            result_count = items.len(),
+            scope_size = scope_size.as_str(),
+            available_tag_count = available_tags.len(),
+            "knowledge base search results"
+        );
         tracing::debug!(results = %serde_json::to_string(&items).unwrap_or_default(), "knowledge base search response");
 
-        Ok(serde_json::json!({
+        // A full page is evidence that entries were left behind, so say so and
+        // say what to do about it — the same shape `builtin_scratchpad_search`
+        // uses. An absent `truncated` is the claim that nothing was dropped.
+        let truncated = items.len() >= limit;
+        let mut response = serde_json::json!({
             "ok": true,
             "results": items,
-        })
-        .to_string())
+            "returned": items.len(),
+            "scope_size": scope_size.as_str(),
+            "available_tags": available_tags,
+        });
+        if truncated {
+            response["truncated"] = serde_json::Value::Bool(true);
+            response["message"] = serde_json::json!(
+                "results were truncated; narrow with a more specific `query`, a `tags` \
+                 filter drawn from `available_tags`, or `exclude_tags`"
+            );
+        }
+        Ok(response.to_string())
     }
 
     async fn skill_search(&self, arguments: serde_json::Value) -> Result<String, CoreError> {

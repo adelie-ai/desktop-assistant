@@ -59,8 +59,14 @@ impl ScopeSize {
     /// only "at least `cap`", so answering [`ScopeSize::Few`] there would claim
     /// the whole scope fit in a page that the caller may have sized above the
     /// cap.
-    pub fn classify(_sampled: usize, _cap: usize, _page_limit: usize) -> Self {
-        Self::None
+    pub fn classify(sampled: usize, cap: usize, page_limit: usize) -> Self {
+        if sampled == 0 {
+            Self::None
+        } else if sampled < cap && sampled <= page_limit {
+            Self::Few
+        } else {
+            Self::Many
+        }
     }
 }
 
