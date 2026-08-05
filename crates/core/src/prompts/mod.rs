@@ -235,8 +235,11 @@ pub struct Topology {
 pub fn render_topology(t: &Topology) -> String {
     let daemon_host = crate::sanitize::sanitize_client_field(&t.daemon_host)
         .unwrap_or_else(|| "this machine".to_string());
-    let client_label = crate::sanitize::sanitize_client_field(&t.client_label)
-        .unwrap_or_else(|| UNLABELLED_DEVICE.to_string());
+    // A client that reported no hostname gets an unquoted phrase. Quoting a
+    // placeholder would offer the model a machine name that does not exist.
+    let client_where = crate::sanitize::sanitize_client_field(&t.client_label)
+        .map(|label| format!("at \"{label}\""))
+        .unwrap_or_else(|| format!("at {UNLABELLED_DEVICE}"));
 
     let body = if t.same_machine {
         let kind = if t.daemon_on_workstation {
@@ -259,8 +262,8 @@ pub fn render_topology(t: &Topology) -> String {
         if t.client_has_tools {
             format!(
                 "Two different machines are involved. {daemon_kind}; tools that run \
-                 there act on its filesystem and its processes. The user is at \
-                 \"{client_label}\"; tools that run on their device act on their own \
+                 there act on its filesystem and its processes. The user is \
+                 {client_where}; tools that run on their device act on their own \
                  files. Neither machine can see the other's files or processes. Each \
                  tool tells you where it runs, so read that before you act: use a \
                  device tool for the user's own files and work, a daemon tool for work \
@@ -270,7 +273,7 @@ pub fn render_topology(t: &Topology) -> String {
         } else {
             format!(
                 "Two different machines are involved. {daemon_kind}, and every tool you \
-                 have acts there. The user is at \"{client_label}\", and no tool you have \
+                 have acts there. The user is {client_where}, and no tool you have \
                  reaches it. So when the user asks you to read their own files, or to run \
                  something on their machine, say plainly that you can act only on \
                  \"{daemon_host}\" and offer what you can do there instead. Never claim \
@@ -552,6 +555,24 @@ mod tests {
         assert!(
             rendered.contains("this machine"),
             "a blank daemon host falls back to a legible label: {rendered}"
+        );
+    }
+
+    #[test]
+    fn an_unreported_client_label_is_phrased_not_quoted() {
+        // An older client sends no hostname. Quoting the placeholder would hand
+        // the model a machine name it could repeat back as if it were real.
+        let rendered = render_topology(&Topology {
+            client_label: String::new(),
+            ..split_topology()
+        });
+        assert!(
+            rendered.contains("The user is at the user's device"),
+            "an absent label must read as a phrase: {rendered}"
+        );
+        assert!(
+            !rendered.contains("\"\""),
+            "and must never render empty quotes: {rendered}"
         );
     }
 

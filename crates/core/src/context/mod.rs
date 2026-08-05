@@ -413,8 +413,9 @@ pub(crate) struct ToolLocalityContext {
     /// container or on a server (#534). Decides whether the topology section
     /// may describe daemon-side tools as acting on the user's own machine.
     pub daemon_on_workstation: bool,
-    /// Label shown for a client tool's machine in the remote tool note (e.g.
-    /// `your device`, or a hostname the client reported in the handshake, #248).
+    /// Hostname the client reported in the handshake (#248), for the remote
+    /// tool note and the topology section. Empty when the client reported none,
+    /// which each renderer phrases for itself.
     pub client_label: String,
     /// Names of the tools that run server-side (MCP / built-in) on the daemon
     /// host. A name in BOTH this set and [`Self::client_tool_names`] is a
@@ -562,7 +563,13 @@ fn render_locality_list(entries: &[ToolLocalityEntry], co_located: bool) -> Stri
             ToolLocality::Server { host } => format!("{} — server '{host}'", e.name),
             ToolLocality::Client { label, .. } => {
                 let alt = if e.primary { "" } else { " (alternative)" };
-                format!("{} — your device '{label}'{alt}", e.name)
+                // A client that reported no hostname leaves the label empty;
+                // "your device ''" would read as a name the model could quote.
+                if label.trim().is_empty() {
+                    format!("{} — your device{alt}", e.name)
+                } else {
+                    format!("{} — your device '{label}'{alt}", e.name)
+                }
             }
         })
         .collect::<Vec<_>>()
@@ -1449,6 +1456,22 @@ mod tests {
             budget,
             &default_estimate,
         )
+    }
+
+    #[test]
+    fn a_client_that_reported_no_label_is_not_quoted_in_the_tool_note() {
+        // The label is empty for a client that sent no hostname. The note must
+        // not render "your device ''", which reads as a name.
+        let mut ctx = locality_ctx(
+            TransportKind::WebSocket,
+            "daemon-host",
+            &[],
+            &["device_terminal"],
+        );
+        ctx.client_label = String::new();
+        let entries = resolve_tool_localities(&["device_terminal"], &ctx);
+        let rendered = render_locality_list(&entries, false);
+        assert_eq!(rendered, "device_terminal — your device");
     }
 
     #[test]

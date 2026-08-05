@@ -1529,11 +1529,14 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                     .flat_map(|ns| ns.tools.iter().map(|t| t.name.clone())),
             )
             .collect();
-        // Prefer a client-reported host label for the remote tool note; fall
-        // back to the generic "your device" when none was sent (#248).
+        // The client-reported host label for the remote tool note (#248), or
+        // empty when the client sent none. Empty is left for each renderer to
+        // phrase, rather than substituted here: the tool note and the topology
+        // section address the reader differently, so one shared placeholder
+        // reads wrong in at least one of them.
         let client_label = current_client_label()
             .filter(|l| !l.trim().is_empty())
-            .unwrap_or_else(|| "your device".to_string());
+            .unwrap_or_default();
         let tool_locality = ToolLocalityContext {
             co_located: current_co_location(),
             transport: current_transport_kind(),
