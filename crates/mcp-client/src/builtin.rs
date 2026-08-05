@@ -345,7 +345,9 @@ impl BuiltinToolService {
                     "Search the knowledge base for preferences, memories, and stored context. \
                      Uses hybrid vector + full-text search. Returns `results`, `returned` (how \
                      many entries are in this page), `scope_size`, and `available_tags`; plus \
-                     `truncated` and a `message` when the page filled up. `scope_size` is NONE \
+                     `truncated` and a `message` when the page filled up and entries were left \
+                     behind - a full page under FEW carries neither, because FEW already means \
+                     you have the whole scope. `scope_size` is NONE \
                      (no entry passes the filters you supplied - retry without them, the store \
                      may still hold plenty), FEW (the scope is no larger than this page, so a \
                      `builtin_knowledge_base_list` sweep would show all of it), MANY (the \
@@ -3812,9 +3814,13 @@ mod tests {
     async fn kb_search_omits_truncated_when_the_results_fit() {
         // `truncated` is a claim that entries were left behind. Sending it on
         // every response would train the model to ignore it.
+        //
+        // The scope is `Many` on purpose. Under `Few` the suppression arm hides
+        // whether the page-not-full half of the rule works at all, so this
+        // would pass against a rule that ignored `limit` entirely.
         let (service, _probe) = kb_service_reporting(KnowledgeSearchPage {
             entries: vec![kb_entry("kb-1", &["preference"])],
-            scope_size: ScopeSize::Few,
+            scope_size: ScopeSize::Many,
             available_tags: vec!["preference".to_string()],
         });
 

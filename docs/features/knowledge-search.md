@@ -24,7 +24,7 @@ The response therefore reports what was searched, not only what was found.
 | ----- | ------- |
 | `results` | The matched entries, best match first. |
 | `returned` | How many entries are in `results`. Same name `builtin_scratchpad_search` uses. |
-| `truncated` | Present, and `true`, only when the page filled up (`returned` reached `limit`). It always travels with `message`, which says how to narrow. Its absence is the claim that nothing was left behind. |
+| `truncated` | Present, and `true`, only when the page filled up (`returned` reached `limit`) **and** the scope is larger than the page. A full page under `FEW` carries neither it nor `message`, because `FEW` already means the page holds the whole scope. It always travels with `message`, which says how to narrow. Its absence is the claim that nothing was left behind. |
 | `scope_size` | `NONE`, `FEW`, `MANY`, or `UNKNOWN`. See below. |
 | `available_tags` | Tag names carried by entries in the scope, most frequent first with the tag name breaking ties. No counts. At most 50. Empty when `scope_size` is `UNKNOWN`. |
 

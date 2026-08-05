@@ -5,12 +5,19 @@ use std::sync::Arc;
 use crate::CoreError;
 use crate::domain::KnowledgeEntry;
 
-/// How many of the most recent in-scope entries the tag census reads.
+/// How many of the most recent in-scope entries the tag census aggregates.
 ///
 /// Why a cap: the census is one extra aggregate on every knowledge-base search,
-/// so it must never be able to become a full table scan on a large
-/// multi-tenant store. It is a tail guardrail, not an optimisation of the
-/// common path - a personal knowledge base never reaches it.
+/// so the work it hands the aggregate must stay bounded however large the store
+/// grows. It is a tail guardrail, not an optimisation of the common path - a
+/// personal knowledge base never reaches it.
+///
+/// This bounds rows *aggregated*, not rows *read*. The cap stops the scan once
+/// this many rows pass the caller's tag filters, so a filter that excludes most
+/// recent entries reads further back - up to the whole of that user's index.
+/// Sampling first and filtering afterwards would bound the read and is the
+/// wrong trade: it would report [`ScopeSize::None`] for a scope that is merely
+/// old.
 pub const KNOWLEDGE_TAG_CENSUS_SAMPLE: usize = 1000;
 
 /// How many tags a search reports in [`KnowledgeSearchPage::available_tags`].
@@ -70,7 +77,7 @@ impl ScopeSize {
 
     /// Classify a scope from a capped sample of it.
     ///
-    /// `sampled` is how many rows the census actually read, `cap` the cap it
+    /// `sampled` is how many rows the census aggregated, `cap` the cap it
     /// stopped at, and `page_limit` the caller's page size.
     ///
     /// Why a sample that reached the cap is always [`ScopeSize::Many`]: it says
