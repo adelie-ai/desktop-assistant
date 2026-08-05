@@ -2391,7 +2391,9 @@ fn parse_os_release_field(contents: &str, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use desktop_assistant_core::ports::knowledge::{KnowledgeSearchPage, ScopeSize};
+    use desktop_assistant_core::ports::knowledge::{
+        KnowledgeSearchPage, KnowledgeTagResolveFn, ProposedTag, ScopeSize,
+    };
 
     #[test]
     fn builtin_provider_map_is_exhaustive() {
@@ -4192,6 +4194,397 @@ mod tests {
             serde_json::json!(["preference", "topic:weather"])
         );
         assert_eq!(json["returned"], 1);
+    }
+
+    // --- The tag-registry gate on tool-path writes (#1070) -----------------
+
+    /// What one call of the tag-registry gate saw and answered with.
+    #[derive(Debug, Clone)]
+    struct TagProbe {
+        /// Every tag the write path proposed, in the order it proposed them.
+        proposals: Vec<ProposedTag>,
+    }
+
+    /// A knowledge-base service whose store keeps its entries in memory, with
+    /// an optional tag-registry gate in front of the write path.
+    ///
+    /// The probe records the proposals the gate received, so a test can tell
+    /// "the gate was consulted and answered" from "the tag was stored as the
+    /// model wrote it".
+    fn kb_service_with_tag_gate(
+        resolve: Option<KnowledgeTagResolveFn>,
+    ) -> (
+        BuiltinToolService,
+        std::sync::Arc<std::sync::Mutex<Vec<desktop_assistant_core::domain::KnowledgeEntry>>>,
+    ) {
+        use desktop_assistant_core::domain::KnowledgeEntry;
+        use std::sync::{Arc, Mutex};
+
+        let store: Arc<Mutex<Vec<KnowledgeEntry>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let write_store = Arc::clone(&store);
+        let write_fn: KnowledgeWriteFn = Arc::new(move |mut entry| {
+            let s = Arc::clone(&write_store);
+            Box::pin(async move {
+                entry.created_at = "2026-01-01".to_string();
+                entry.updated_at = "2026-01-01".to_string();
+                let mut g = s.lock().expect("write store lock");
+                g.retain(|e| e.id != entry.id);
+                g.push(entry.clone());
+                Ok(entry)
+            })
+        });
+        let search_fn: KnowledgeSearchFn =
+            Arc::new(|_q, _emb, _model, _tags, _exclude, _limit| {
+                Box::pin(async {
+                    Ok(KnowledgeSearchPage {
+                        entries: Vec::new(),
+                        scope_size: ScopeSize::None,
+                        available_tags: Vec::new(),
+                    })
+                })
+            });
+        let delete_fn: KnowledgeDeleteFn = Arc::new(|_ids| Box::pin(async { Ok(0) }));
+        let list_fn: KnowledgeListFn = Arc::new(|_q| {
+            Box::pin(async {
+                Ok(
+                    desktop_assistant_core::ports::knowledge::KnowledgeListPage {
+                        entries: Vec::new(),
+                        next_cursor: None,
+                    },
+                )
+            })
+        });
+        let get_store = Arc::clone(&store);
+        let get_fn: KnowledgeGetFn = Arc::new(move |id| {
+            let s = Arc::clone(&get_store);
+            Box::pin(async move {
+                Ok(s.lock()
+                    .expect("get store lock")
+                    .iter()
+                    .find(|e| e.id == id)
+                    .cloned())
+            })
+        });
+
+        let mut service = BuiltinToolService::new()
+            .with_knowledge_base(write_fn, search_fn, delete_fn, list_fn, get_fn);
+        if let Some(resolve) = resolve {
+            service = service.with_tag_registry(resolve);
+        }
+        (service, store)
+    }
+
+    /// A tag-registry gate that answers from a fixed proposed-name -> stored-name
+    /// table, and records every proposal it saw. A name absent from the table is
+    /// returned unchanged, which is what the registry does for a genuinely new
+    /// tag it just created.
+    fn recording_tag_gate(
+        redirects: &[(&str, &str)],
+    ) -> (
+        KnowledgeTagResolveFn,
+        std::sync::Arc<std::sync::Mutex<TagProbe>>,
+    ) {
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+
+        let table: HashMap<String, String> = redirects
+            .iter()
+            .map(|(from, to)| ((*from).to_string(), (*to).to_string()))
+            .collect();
+        let probe = Arc::new(Mutex::new(TagProbe {
+            proposals: Vec::new(),
+        }));
+        let probe_for_fn = Arc::clone(&probe);
+        let resolve: KnowledgeTagResolveFn = Arc::new(move |proposed: ProposedTag| {
+            let table = table.clone();
+            let probe = Arc::clone(&probe_for_fn);
+            Box::pin(async move {
+                let resolved = table
+                    .get(&proposed.name)
+                    .cloned()
+                    .unwrap_or_else(|| proposed.name.clone());
+                probe.lock().expect("probe lock").proposals.push(proposed);
+                Ok(resolved)
+            })
+        });
+        (resolve, probe)
+    }
+
+    /// Run `builtin_knowledge_base_write` and parse its response.
+    async fn kb_write_response(
+        service: &BuiltinToolService,
+        arguments: serde_json::Value,
+    ) -> serde_json::Value {
+        let raw = service
+            .execute_tool(TOOL_KB_WRITE, arguments)
+            .await
+            .expect("knowledge base write succeeds");
+        serde_json::from_str(&raw).expect("write response is JSON")
+    }
+
+    #[tokio::test]
+    async fn kb_write_redirects_a_near_duplicate_tag_to_the_existing_tag() {
+        // The vocabulary fragments when `topic:forecast` lands beside
+        // `topic:weather`: reads filter by exact array overlap, so the two
+        // never match each other. The registry already knows they are the same
+        // concept, so the entry must carry the tag the registry chose.
+        let (resolve, probe) = recording_tag_gate(&[("topic:forecast", "topic:weather")]);
+        let (service, store) = kb_service_with_tag_gate(Some(resolve));
+
+        let json = kb_write_response(
+            &service,
+            serde_json::json!({
+                "content": "Rain is expected on Tuesday.",
+                "tags": ["memory", "topic:forecast"],
+            }),
+        )
+        .await;
+
+        assert_eq!(json["ok"], true);
+        let stored = store.lock().expect("store lock");
+        assert_eq!(stored.len(), 1, "one entry was written");
+        assert_eq!(
+            stored[0].tags,
+            vec!["memory".to_string(), "topic:weather".to_string()],
+            "the near-duplicate must be stored under the existing tag"
+        );
+        assert_eq!(
+            probe
+                .lock()
+                .expect("probe lock")
+                .proposals
+                .iter()
+                .map(|p| p.name.clone())
+                .collect::<Vec<_>>(),
+            vec!["memory".to_string(), "topic:forecast".to_string()],
+            "every tag on the write goes through the registry, not just the new one"
+        );
+        assert_eq!(
+            json["entries"][0]["tags"],
+            serde_json::json!(["memory", "topic:weather"]),
+            "the response reports the tags actually stored, so the model does not \
+             believe the entry carries a tag it does not"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_write_stores_a_genuinely_new_tag_and_registers_it_with_its_description() {
+        // A short facet tag carries almost no signal on its own, so the dedup
+        // needs the model's one-line description of what the tag means. It
+        // arrives in `new_tag_descriptions`, keyed by tag name.
+        let (resolve, probe) = recording_tag_gate(&[]);
+        let (service, store) = kb_service_with_tag_gate(Some(resolve));
+
+        kb_write_response(
+            &service,
+            serde_json::json!({
+                "content": "Embeddings are backfilled by the maintenance task.",
+                "tags": ["topic:embeddings"],
+                "new_tag_descriptions": {
+                    "topic:embeddings": "Vector embedding generation, models, and backfill",
+                },
+            }),
+        )
+        .await;
+
+        let proposals = probe.lock().expect("probe lock").proposals.clone();
+        assert_eq!(proposals.len(), 1, "one tag was proposed");
+        assert_eq!(proposals[0].name, "topic:embeddings");
+        assert_eq!(
+            proposals[0].description.as_deref(),
+            Some("Vector embedding generation, models, and backfill"),
+            "the description must reach the registry, or the dedup has nothing to compare"
+        );
+        assert_eq!(
+            store.lock().expect("store lock")[0].tags,
+            vec!["topic:embeddings".to_string()],
+            "a tag with no near duplicate is stored as proposed"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_write_registers_a_new_tag_that_arrived_without_a_description() {
+        // A missing description is not an error. The write must never fail
+        // because the model omitted one, and the tag still goes through the
+        // registry - the registry falls back to the name alone as its embed
+        // text.
+        let (resolve, probe) = recording_tag_gate(&[]);
+        let (service, store) = kb_service_with_tag_gate(Some(resolve));
+
+        let json = kb_write_response(
+            &service,
+            serde_json::json!({
+                "content": "The deploy runs from the justfile.",
+                "tags": ["topic:deploy"],
+            }),
+        )
+        .await;
+
+        assert_eq!(json["ok"], true, "the write succeeds without a description");
+        let proposals = probe.lock().expect("probe lock").proposals.clone();
+        assert_eq!(proposals.len(), 1, "the tag still reached the registry");
+        assert_eq!(proposals[0].name, "topic:deploy");
+        assert_eq!(
+            proposals[0].description, None,
+            "no description was supplied, and the gate is told so rather than \
+             being handed an empty string"
+        );
+        assert_eq!(
+            store.lock().expect("store lock")[0].tags,
+            vec!["topic:deploy".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_write_ignores_a_description_for_a_tag_the_registry_already_holds() {
+        // A description for a tag the registry already holds changes nothing:
+        // the registry matches on the name and answers with the stored tag. The
+        // write path must not treat the description as an instruction to
+        // re-describe or to create a second tag.
+        let (resolve, probe) = recording_tag_gate(&[("topic:weather", "topic:weather")]);
+        let (service, store) = kb_service_with_tag_gate(Some(resolve));
+
+        kb_write_response(
+            &service,
+            serde_json::json!({
+                "content": "It rained on Tuesday.",
+                "tags": ["topic:weather"],
+                "new_tag_descriptions": {
+                    "topic:weather": "Something else entirely",
+                },
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            store.lock().expect("store lock")[0].tags,
+            vec!["topic:weather".to_string()],
+            "the stored tag is the one the registry answered with"
+        );
+        assert_eq!(
+            probe.lock().expect("probe lock").proposals.len(),
+            1,
+            "one proposal, not one per description"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_write_keeps_the_normalised_tag_when_the_embedding_backend_is_unavailable() {
+        // The registry needs an embedding to find a near duplicate. When the
+        // embedding backend is down the gate fails, and the prior behaviour -
+        // store the tag as written - is the fallback. A write must never fail
+        // because an optional backend is absent.
+        use std::sync::Arc;
+
+        let resolve: KnowledgeTagResolveFn = Arc::new(|_proposed: ProposedTag| {
+            Box::pin(async {
+                Err(CoreError::Storage(
+                    "tag_registry: embed returned no vectors".to_string(),
+                ))
+            })
+        });
+        let (service, store) = kb_service_with_tag_gate(Some(resolve));
+
+        let json = kb_write_response(
+            &service,
+            serde_json::json!({
+                "content": "Rain is expected on Tuesday.",
+                "tags": ["memory", "topic:forecast"],
+            }),
+        )
+        .await;
+
+        assert_eq!(json["ok"], true, "the write succeeds");
+        let stored = store.lock().expect("store lock");
+        assert_eq!(stored.len(), 1, "the entry landed");
+        assert_eq!(
+            stored[0].tags,
+            vec!["memory".to_string(), "topic:forecast".to_string()],
+            "the entry keeps the tags the model wrote"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_retag_by_id_goes_through_the_registry() {
+        // Re-tagging an entry the model found is the path that adds tags most
+        // often, so an ungated one defeats the whole gate. It carries an `id`
+        // and `tags` with no `content`.
+        let (resolve, probe) = recording_tag_gate(&[("topic:forecast", "topic:weather")]);
+        let (service, store) = kb_service_with_tag_gate(Some(resolve));
+
+        // Seed an entry through the write path, then re-tag it by id.
+        let created = kb_write_response(
+            &service,
+            serde_json::json!({"content": "Rain is expected on Tuesday.", "tags": ["memory"]}),
+        )
+        .await;
+        let id = created["entries"][0]["id"]
+            .as_str()
+            .expect("the write reports the entry id")
+            .to_string();
+
+        kb_write_response(
+            &service,
+            serde_json::json!({"id": id, "tags": ["memory", "topic:forecast"]}),
+        )
+        .await;
+
+        let stored = store.lock().expect("store lock");
+        assert_eq!(stored.len(), 1, "the re-tag updated the entry in place");
+        assert_eq!(
+            stored[0].content, "Rain is expected on Tuesday.",
+            "premise: the content is preserved, so this is the tags-only path"
+        );
+        assert_eq!(
+            stored[0].tags,
+            vec!["memory".to_string(), "topic:weather".to_string()],
+            "the re-tag path is gated too"
+        );
+        assert!(
+            probe
+                .lock()
+                .expect("probe lock")
+                .proposals
+                .iter()
+                .any(|p| p.name == "topic:forecast"),
+            "the re-tagged tag reached the registry"
+        );
+    }
+
+    #[test]
+    fn kb_write_schema_advertises_new_tag_descriptions() {
+        // A schema that promises what the code does not honour is a false
+        // contract, and so is code that honours what the schema never
+        // advertised: the model cannot supply a field it was never told about.
+        let service = BuiltinToolService::new();
+        let def = service
+            .tool_definitions()
+            .into_iter()
+            .find(|t| t.name == TOOL_KB_WRITE)
+            .expect("kb_write tool is advertised");
+        let props = &def.parameters["properties"];
+
+        let single = &props["new_tag_descriptions"];
+        assert_eq!(
+            single["type"], "object",
+            "new_tag_descriptions is a map from tag name to description: {single}"
+        );
+        assert_eq!(
+            single["additionalProperties"]["type"], "string",
+            "each value is a one-line description: {single}"
+        );
+        assert!(
+            single["description"].as_str().is_some_and(|d| !d.is_empty()),
+            "the field carries a description of its own: {single}"
+        );
+
+        let batch = &props["entries"]["items"]["properties"]["new_tag_descriptions"];
+        assert_eq!(
+            batch["type"], "object",
+            "the batch form advertises the field too, or a batched write cannot \
+             describe its new tags: {batch}"
+        );
     }
 
     #[tokio::test]

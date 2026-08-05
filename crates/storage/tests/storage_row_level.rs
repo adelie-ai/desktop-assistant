@@ -10,7 +10,9 @@
 //!   `expand_summary` clearing it via `ON DELETE SET NULL`);
 //! - `archive` opacity (foreign/missing ⇒ `NotFound`, already-archived ⇒ `Ok`);
 //! - `tag_registry` embedding-dedup redirect and deprecation-chain / cycle
-//!   guard;
+//!   guard, plus the gate the knowledge-base write tool puts in front of it
+//!   (a known tag costs no embedding; one tenant never redirects onto
+//!   another's vocabulary);
 //! - `tool_registry` upsert / hybrid search / source-scoped unregister;
 //! - JSON→Postgres migration of conversations + knowledge and the empty-table
 //!   probes.
@@ -32,8 +34,10 @@ use desktop_assistant_core::ports::store::{
 };
 use desktop_assistant_core::ports::tool_registry::ToolRegistryStore;
 use desktop_assistant_storage::embedding_backfill::BackfillEmbedFn;
+use desktop_assistant_core::ports::knowledge::ProposedTag;
 use desktop_assistant_storage::tag_registry::{
-    CreateTagOutcome, TagProposal, create_or_match_tag, resolve_active_name,
+    CreateTagOutcome, TagProposal, create_or_match_tag, get_tag, list_active_tags,
+    resolve_active_name, resolve_proposed_tag,
 };
 use desktop_assistant_storage::{
     PgBackgroundTaskStore, PgConversationStore, PgKnowledgeBaseStore, PgToolRegistryStore,
@@ -717,6 +721,159 @@ async fn registry_dedup_still_separates_distinct_facet_tags() {
             fx
         },
     )
+    .await;
+}
+
+// -- tag_registry: the tool-path gate (#1070) --------------------------------
+
+/// An embedding function that records every text it was asked to embed and
+/// answers with one fixed vector, so a proposal deterministically sits at
+/// cosine distance 0 from anything already stored.
+fn counting_embed_fn(seen: Arc<std::sync::Mutex<Vec<String>>>) -> BackfillEmbedFn {
+    Box::new(move |texts| {
+        let seen = Arc::clone(&seen);
+        Box::pin(async move {
+            seen.lock().expect("record embed texts").extend(texts.iter().cloned());
+            Ok(texts.iter().map(|_| vec![1.0f32, 0.0, 0.0]).collect())
+        })
+    })
+}
+
+#[tokio::test]
+async fn kb_write_ignores_a_description_for_a_tag_the_registry_already_holds() {
+    // A tag the registry already holds matches on its name and answers before
+    // any embedding happens, so its description costs nothing and changes
+    // nothing. The write path can therefore send a description for every tag
+    // without paying for the ones already known.
+    //
+    // MUTATION: removing the exact-name short-circuit in `create_or_match_tag`
+    // makes the second proposal embed → RED on the recorded embed texts.
+    with_fixture(
+        "kb_write_ignores_a_description_for_a_tag_the_registry_already_holds",
+        |fx| async move {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let embed_fn = counting_embed_fn(Arc::clone(&seen));
+
+            with_user_id(UserId::new("alice"), async {
+                let first = resolve_proposed_tag(
+                    &fx.pool,
+                    &embed_fn,
+                    "test-model",
+                    &ProposedTag {
+                        name: "topic:weather".into(),
+                        description: Some("Forecasts, rain, and temperature".into()),
+                    },
+                )
+                .await
+                .expect("register the tag");
+                assert_eq!(first, "topic:weather");
+                let after_create = seen.lock().expect("read embed texts").len();
+                assert_eq!(
+                    after_create, 1,
+                    "premise: a genuinely new tag costs one embedding"
+                );
+
+                let second = resolve_proposed_tag(
+                    &fx.pool,
+                    &embed_fn,
+                    "test-model",
+                    &ProposedTag {
+                        name: "topic:weather".into(),
+                        description: Some("Something else entirely".into()),
+                    },
+                )
+                .await
+                .expect("resolve the known tag");
+                assert_eq!(
+                    second, "topic:weather",
+                    "a known tag resolves to itself, whatever description came with it"
+                );
+                assert_eq!(
+                    seen.lock().expect("read embed texts").len(),
+                    after_create,
+                    "a tag the registry already holds must cost no embedding"
+                );
+
+                let stored = get_tag(&fx.pool, "topic:weather")
+                    .await
+                    .expect("read the stored tag")
+                    .expect("the tag is registered");
+                assert_eq!(
+                    stored.description, "Forecasts, rain, and temperature",
+                    "the second description must not overwrite the registered one"
+                );
+            })
+            .await;
+            fx
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn kb_write_registers_tags_under_the_calling_user() {
+    // The registry is per-user. A tag proposed by one tenant must never
+    // redirect against another tenant's vocabulary, even when the two are
+    // identical in embedding space.
+    //
+    // MUTATION: dropping the `user_id = $2` predicate from the nearest-neighbour
+    // search in `create_or_match_tag` redirects bob onto alice's tag → RED.
+    with_fixture("kb_write_registers_tags_under_the_calling_user", |fx| async move {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let embed_fn = counting_embed_fn(Arc::clone(&seen));
+
+        with_user_id(UserId::new("alice"), async {
+            let name = resolve_proposed_tag(
+                &fx.pool,
+                &embed_fn,
+                "test-model",
+                &ProposedTag {
+                    name: "project:alpha".into(),
+                    description: Some("Alice's first project".into()),
+                },
+            )
+            .await
+            .expect("alice registers her tag");
+            assert_eq!(name, "project:alpha");
+        })
+        .await;
+
+        with_user_id(UserId::new("bob"), async {
+            // A different name, so the exact-match short-circuit cannot fire,
+            // and an identical embedding, so only the user scope can keep the
+            // two apart.
+            let name = resolve_proposed_tag(
+                &fx.pool,
+                &embed_fn,
+                "test-model",
+                &ProposedTag {
+                    name: "project:alphas".into(),
+                    description: Some("Bob's own project".into()),
+                },
+            )
+            .await
+            .expect("bob registers his tag");
+            assert_eq!(
+                name, "project:alphas",
+                "bob's tag must not redirect onto alice's vocabulary"
+            );
+
+            let visible = list_active_tags(&fx.pool)
+                .await
+                .expect("list bob's tags")
+                .into_iter()
+                .map(|t| t.name)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                visible,
+                vec!["project:alphas".to_string()],
+                "bob sees only his own tag"
+            );
+        })
+        .await;
+
+        fx
+    })
     .await;
 }
 

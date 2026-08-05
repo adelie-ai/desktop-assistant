@@ -354,6 +354,20 @@ mod tests {
     }
 
     #[test]
+    fn registry_embed_text_falls_back_to_the_name_without_a_description() {
+        // A tag written through the knowledge-base tool can arrive with no
+        // description, and the write must not fail over it. The embed text is
+        // then the name alone: `"topic:deploy: "` would put a separator with
+        // nothing after it into the vector the dedup compares.
+        assert_eq!(
+            tag_embed_text("topic:deploy", "runs and releases"),
+            "topic:deploy: runs and releases"
+        );
+        assert_eq!(tag_embed_text("topic:deploy", ""), "topic:deploy");
+        assert_eq!(tag_embed_text("topic:deploy", "   "), "topic:deploy");
+    }
+
+    #[test]
     fn normalize_handles_common_variants() {
         assert_eq!(normalize_tag_name("Project"), "project");
         assert_eq!(normalize_tag_name("  Architecture  "), "architecture");
