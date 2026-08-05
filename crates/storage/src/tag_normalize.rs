@@ -6,12 +6,16 @@
 //! fragments across variants and filters silently miss. This collapses that
 //! drift on the write path.
 //!
-//! Unlike [`crate::tag_registry::normalize_tag_name`] — which strips every
-//! non-alphanumeric character and so mangles a facet tag `project:adelie-ai`
-//! into `projectadelie-ai` — this preserves a single `facet:value` colon by
-//! normalizing the facet and value halves independently. Facet tags carry
-//! meaning in that shape (`project:<name>`, `topic:<subject>`); losing the
-//! separator would break the whole facet scheme.
+//! This is the only tag normalizer. The tag registry
+//! ([`crate::tag_registry::normalize_tag_name`]) calls straight into it,
+//! because a registry key must be byte-identical to the tag written on the
+//! row it describes — a second rule that agrees today drifts tomorrow, and a
+//! key that no row carries makes every registry lookup a miss.
+//!
+//! A single `facet:value` colon survives: the facet and value halves are
+//! normalized independently and rejoined. Facet tags carry meaning in that
+//! shape (`project:<name>`, `topic:<subject>`), so losing the separator would
+//! break the whole facet scheme.
 
 use std::collections::HashSet;
 

@@ -640,10 +640,12 @@ async fn registry_dedup_still_separates_distinct_facet_tags() {
     // MUTATION: widening the threshold to 0.15 collapses gtk and tui into one
     // tag → RED. Narrowing it to 0.02 stops the near-duplicate redirecting →
     // also RED.
-    with_fixture("registry_dedup_still_separates_distinct_facet_tags", |fx| async move {
-        let embed_fn = tag_dedup_fixture_embed_fn();
+    with_fixture(
+        "registry_dedup_still_separates_distinct_facet_tags",
+        |fx| async move {
+            let embed_fn = tag_dedup_fixture_embed_fn();
 
-        with_user_id(UserId::new("alice"), async {
+            with_user_id(UserId::new("alice"), async {
             let gtk = create_or_match_tag(
                 &fx.pool,
                 &embed_fn,
@@ -712,8 +714,9 @@ async fn registry_dedup_still_separates_distinct_facet_tags() {
             }
         })
         .await;
-        fx
-    })
+            fx
+        },
+    )
     .await;
 }
 
@@ -722,124 +725,165 @@ async fn migration_repairs_mangled_facet_tag_names() {
     // Rows written before the facet-preserving normaliser carry a name with the
     // colon removed (`projectadele-gtk`). Migration 040 restores the colon,
     // clears the now-stale embedding, drops a mangled row whose facet-correct
-    // twin already exists, and carries every deprecation pointer across.
+    // twin already exists, and carries every reference across. A name where a
+    // single dash sits after the facet word is ambiguous with an ordinary
+    // multi-word tag, so it is left alone.
     //
-    // MUTATION: dropping the final `deprecated_for_tag` UPDATE strands the
-    // pointer on a name no row holds → RED on the two pointer assertions.
+    // MUTATION: dropping the `deprecated_for_tag` UPDATE strands the pointer on
+    // a name no row holds → RED on the two pointer assertions. Reading the
+    // single-dash form as a facet tag renames `project-context` → RED on the
+    // name list.
     const MIGRATION: &str = include_str!("../migrations/040_tag_registry_facet_names.sql");
 
-    with_fixture("migration_repairs_mangled_facet_tag_names", |fx| async move {
-        // Staged as the old normaliser would have written them, plus rows the
-        // repair must leave alone.
-        for (user, name, deprecated_for) in [
-            // Renamed: no facet-correct twin.
-            ("alice", "projectadele-gtk", None),
-            // Collision: both forms present, the correct one wins.
-            ("alice", "project:adele-tui", None),
-            ("alice", "projectadele-tui", None),
-            // Untouched: no facet prefix, and a bare facet word with no value.
-            ("alice", "preference", None),
-            ("alice", "project", None),
-            // Pointers into both a renamed row and a dropped row.
-            ("alice", "old-gtk", Some("projectadele-gtk")),
-            ("alice", "old-tui", Some("projectadele-tui")),
-            // A second tenant's rows are repaired independently.
-            ("bob", "topicdeploy", None),
-        ] {
-            sqlx::query(
-                "INSERT INTO tag_registry \
-                    (user_id, name, description, embedding, embedding_model, deprecated_for_tag) \
-                 VALUES ($1, $2, 'staged', '[1,0,0]'::vector, 'stale-model', $3)",
-            )
-            .bind(user)
-            .bind(name)
-            .bind(deprecated_for)
-            .execute(&fx.pool)
-            .await
-            .expect("stage a pre-repair tag row");
-        }
-
-        sqlx::raw_sql(MIGRATION)
-            .execute(&fx.pool)
-            .await
-            .expect("migration 040 replays cleanly");
-
-        // Sorted in Rust, not by Postgres: `ORDER BY name` would rank `project`
-        // against `project:adele-gtk` by the database's collation, which varies.
-        let mut names: Vec<(String, String)> =
-            sqlx::query_as("SELECT user_id, name FROM tag_registry")
-                .fetch_all(&fx.pool)
+    with_fixture(
+        "migration_repairs_mangled_facet_tag_names",
+        |fx| async move {
+            // Staged as the old normaliser would have written them, plus rows the
+            // repair must leave alone.
+            for (user, name, deprecated_for, distinguish_from) in [
+                // Renamed: glued, and no facet-correct twin.
+                ("alice", "projectadele-gtk", None, vec![]),
+                // Renamed: a double dash is what `Project : Adele KDE` became.
+                ("alice", "project--adele-kde", None, vec![]),
+                // Collision: both forms present, the correct one wins.
+                ("alice", "project:adele-tui", None, vec![]),
+                ("alice", "projectadele-tui", None, vec![]),
+                // Untouched: no facet prefix; a bare facet word with no value;
+                // and a single dash, which an ordinary multi-word tag also has.
+                ("alice", "preference", None, vec![]),
+                ("alice", "project", None, vec![]),
+                ("alice", "project-context", None, vec![]),
+                // Pointers into both a renamed row and a dropped row.
+                ("alice", "old-gtk", Some("projectadele-gtk"), vec![]),
+                ("alice", "old-tui", Some("projectadele-tui"), vec![]),
+                // A sibling list naming a renamed row, a dropped row and a row
+                // the repair leaves alone.
+                (
+                    "alice",
+                    "sibling-list",
+                    None,
+                    vec!["projectadele-gtk", "projectadele-tui", "preference"],
+                ),
+                // A second tenant's rows are repaired independently.
+                ("bob", "topicdeploy", None, vec![]),
+            ] {
+                sqlx::query(
+                    "INSERT INTO tag_registry \
+                        (user_id, name, description, embedding, embedding_model, \
+                         deprecated_for_tag, distinguish_from) \
+                     VALUES ($1, $2, 'staged', '[1,0,0]'::vector, 'stale-model', $3, $4)",
+                )
+                .bind(user)
+                .bind(name)
+                .bind(deprecated_for)
+                .bind(&distinguish_from)
+                .execute(&fx.pool)
                 .await
-                .expect("read back repaired names");
-        names.sort();
-        assert_eq!(
-            names,
-            vec![
-                ("alice".to_string(), "old-gtk".to_string()),
-                ("alice".to_string(), "old-tui".to_string()),
-                ("alice".to_string(), "preference".to_string()),
-                ("alice".to_string(), "project".to_string()),
-                ("alice".to_string(), "project:adele-gtk".to_string()),
-                ("alice".to_string(), "project:adele-tui".to_string()),
-                ("bob".to_string(), "topic:deploy".to_string()),
-            ],
-            "the mangled duplicate must be dropped and every other row repaired in place"
-        );
+                .expect("stage a pre-repair tag row");
+            }
 
-        // A renamed row's embedding is stale, so it is cleared (#516 re-embeds
-        // it later). The surviving twin was never renamed and keeps its vector.
-        let cleared: Vec<(String, bool, Option<String>)> = sqlx::query_as(
-            "SELECT name, embedding IS NULL, embedding_model FROM tag_registry \
+            sqlx::raw_sql(MIGRATION)
+                .execute(&fx.pool)
+                .await
+                .expect("migration 040 replays cleanly");
+
+            // Sorted in Rust, not by Postgres: `ORDER BY name` would rank `project`
+            // against `project:adele-gtk` by the database's collation, which varies.
+            let mut names: Vec<(String, String)> =
+                sqlx::query_as("SELECT user_id, name FROM tag_registry")
+                    .fetch_all(&fx.pool)
+                    .await
+                    .expect("read back repaired names");
+            names.sort();
+            assert_eq!(
+                names,
+                vec![
+                    ("alice".to_string(), "old-gtk".to_string()),
+                    ("alice".to_string(), "old-tui".to_string()),
+                    ("alice".to_string(), "preference".to_string()),
+                    ("alice".to_string(), "project".to_string()),
+                    ("alice".to_string(), "project-context".to_string()),
+                    ("alice".to_string(), "project:adele-gtk".to_string()),
+                    ("alice".to_string(), "project:adele-kde".to_string()),
+                    ("alice".to_string(), "project:adele-tui".to_string()),
+                    ("alice".to_string(), "sibling-list".to_string()),
+                    ("bob".to_string(), "topic:deploy".to_string()),
+                ],
+                "the mangled duplicate must be dropped and every other row repaired in place"
+            );
+
+            // A renamed row's embedding is stale, so it is cleared (#516 re-embeds
+            // it later). The surviving twin was never renamed and keeps its vector.
+            let cleared: Vec<(String, bool, Option<String>)> = sqlx::query_as(
+                "SELECT name, embedding IS NULL, embedding_model FROM tag_registry \
              WHERE user_id = 'alice' AND name IN ('project:adele-gtk', 'project:adele-tui') \
              ORDER BY name",
-        )
-        .fetch_all(&fx.pool)
-        .await
-        .expect("read back embeddings");
-        assert_eq!(
-            cleared,
-            vec![
-                ("project:adele-gtk".to_string(), true, None),
-                (
-                    "project:adele-tui".to_string(),
-                    false,
-                    Some("stale-model".to_string())
-                ),
-            ],
-            "a renamed row loses its embedding; an untouched row keeps its own"
-        );
-
-        let pointers: Vec<(String, Option<String>)> = sqlx::query_as(
-            "SELECT name, deprecated_for_tag FROM tag_registry \
-             WHERE user_id = 'alice' AND name IN ('old-gtk', 'old-tui') ORDER BY name",
-        )
-        .fetch_all(&fx.pool)
-        .await
-        .expect("read back deprecation pointers");
-        assert_eq!(
-            pointers,
-            vec![
-                ("old-gtk".to_string(), Some("project:adele-gtk".to_string())),
-                ("old-tui".to_string(), Some("project:adele-tui".to_string())),
-            ],
-            "a deprecation pointer must follow both a rename and a dropped duplicate"
-        );
-
-        // Replaying is a no-op: a repaired name already carries a colon.
-        sqlx::raw_sql(MIGRATION)
-            .execute(&fx.pool)
+            )
+            .fetch_all(&fx.pool)
             .await
-            .expect("migration 040 is idempotent");
-        let mut after: Vec<(String, String)> =
-            sqlx::query_as("SELECT user_id, name FROM tag_registry")
-                .fetch_all(&fx.pool)
-                .await
-                .expect("read back names after replay");
-        after.sort();
-        assert_eq!(names, after, "a replay must change nothing");
+            .expect("read back embeddings");
+            assert_eq!(
+                cleared,
+                vec![
+                    ("project:adele-gtk".to_string(), true, None),
+                    (
+                        "project:adele-tui".to_string(),
+                        false,
+                        Some("stale-model".to_string())
+                    ),
+                ],
+                "a renamed row loses its embedding; an untouched row keeps its own"
+            );
 
-        fx
-    })
+            let pointers: Vec<(String, Option<String>)> = sqlx::query_as(
+                "SELECT name, deprecated_for_tag FROM tag_registry \
+             WHERE user_id = 'alice' AND name IN ('old-gtk', 'old-tui') ORDER BY name",
+            )
+            .fetch_all(&fx.pool)
+            .await
+            .expect("read back deprecation pointers");
+            assert_eq!(
+                pointers,
+                vec![
+                    ("old-gtk".to_string(), Some("project:adele-gtk".to_string())),
+                    ("old-tui".to_string(), Some("project:adele-tui".to_string())),
+                ],
+                "a deprecation pointer must follow both a rename and a dropped duplicate"
+            );
+
+            let siblings: (Vec<String>,) = sqlx::query_as(
+                "SELECT distinguish_from FROM tag_registry \
+                 WHERE user_id = 'alice' AND name = 'sibling-list'",
+            )
+            .fetch_one(&fx.pool)
+            .await
+            .expect("read back the sibling list");
+            assert_eq!(
+                siblings.0,
+                vec![
+                    "project:adele-gtk".to_string(),
+                    "project:adele-tui".to_string(),
+                    "preference".to_string(),
+                ],
+                "a sibling list must follow the repair in order, leaving unrepaired names alone"
+            );
+
+            // Replaying is a no-op: a repaired name already carries a colon.
+            sqlx::raw_sql(MIGRATION)
+                .execute(&fx.pool)
+                .await
+                .expect("migration 040 is idempotent");
+            let mut after: Vec<(String, String)> =
+                sqlx::query_as("SELECT user_id, name FROM tag_registry")
+                    .fetch_all(&fx.pool)
+                    .await
+                    .expect("read back names after replay");
+            after.sort();
+            assert_eq!(names, after, "a replay must change nothing");
+
+            fx
+        },
+    )
     .await;
 }
 

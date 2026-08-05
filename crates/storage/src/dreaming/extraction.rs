@@ -572,11 +572,13 @@ mod tests {
 
     #[test]
     fn normalizes_tag_names_on_parse() {
+        // The same normalizer the knowledge-base write path uses, so a facet
+        // tag keeps its colon and a parsed tag can match a registry key.
         let response = r#"{"facts": [
-            {"content": "x", "tags": ["User_Preference", "Architecture"]}
+            {"content": "x", "tags": ["Project: Adelie AI", "Architecture"]}
         ]}"#;
         let facts = parse_extraction_response(response);
-        assert_eq!(facts[0].tags, vec!["user-preference", "architecture"]);
+        assert_eq!(facts[0].tags, vec!["project:adelie-ai", "architecture"]);
     }
 
     #[test]

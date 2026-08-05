@@ -6,6 +6,11 @@
 //! similarity check redirects near-duplicates to the existing tag instead of
 //! letting the vocabulary drift.
 //!
+//! A tag name is normalized by [`crate::tag_normalize::normalize_tag`], the
+//! same function the knowledge-base write path uses, so a registry key is
+//! always exactly the tag written on the rows it describes — including the
+//! `facet:value` colon the knowledge-base prompt asks for.
+//!
 //! Storage shape mirrors migration `014_tag_registry.sql`: name PK,
 //! description, examples (jsonb array of strings), `distinguish_from` siblings
 //! intended to keep close concepts apart, a single embedding over
@@ -23,6 +28,14 @@ use crate::embedding_backfill::BackfillEmbedFn;
 /// as an existing one. pgvector `<=>` returns cosine distance in `[0, 2]`;
 /// lower = more similar. Empirically `0.10` is tight enough that genuinely
 /// different concepts pass, while typos and trivial variations get caught.
+///
+/// The dedup vector is built from `"<name>: <description>"`, so restoring the
+/// facet colon changed that string for every facet tag and moved two facet
+/// tags of the same facet closer together. Measured on `nomic-embed-text`:
+/// `project:adele-gtk` against `project:adele-tui` is `0.129`, down from
+/// `0.175` for the colon-stripped names, and a near-duplicate
+/// (`project:adelegtk`) is `0.028`. The band still separates them, and
+/// `registry_dedup_still_separates_distinct_facet_tags` holds it there.
 pub const TAG_DEDUP_DISTANCE_THRESHOLD: f64 = 0.10;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,8 +141,9 @@ pub async fn resolve_active_name(pool: &PgPool, name: &str) -> Result<Option<Str
 /// Create a new tag, or redirect to an existing similar one.
 ///
 /// Steps:
-/// 1. Normalize the proposed name (lowercase, dashes preferred over
-///    underscores) and check for an exact match — if found, redirect.
+/// 1. Normalize the proposed name with [`normalize_tag_name`] — the knowledge
+///    base's own normalizer, so a facet tag such as `project:adelie-ai` keeps
+///    its colon — and check for an exact match; if found, redirect.
 /// 2. Embed `name + description` and search the registry for any active
 ///    tag within `TAG_DEDUP_DISTANCE_THRESHOLD` cosine distance — if found,
 ///    redirect to that tag.
@@ -229,16 +243,15 @@ pub async fn create_or_match_tag(
     }))
 }
 
-/// Lowercase, trim, and prefer dashes over underscores/spaces.
+/// Normalize a proposed tag name into the key the registry stores.
+///
+/// Why this delegates rather than deciding anything itself: a registry key has
+/// to be byte-identical to the tag written on the knowledge-base row it
+/// describes, or no lookup can connect the two. So the registry uses the
+/// knowledge base's own normalizer, [`crate::tag_normalize::normalize_tag`],
+/// and holds no rule of its own that could drift from it.
 pub fn normalize_tag_name(raw: &str) -> String {
-    raw.trim()
-        .to_lowercase()
-        .replace([' ', '_'], "-")
-        .chars()
-        .filter(|c| c.is_alphanumeric() || *c == '-')
-        .collect::<String>()
-        .trim_matches('-')
-        .to_string()
+    crate::tag_normalize::normalize_tag(raw)
 }
 
 fn row_to_record(row: (String, String, serde_json::Value, Vec<String>)) -> TagRecord {
@@ -305,7 +318,10 @@ mod tests {
     fn registry_normalises_the_facet_and_value_halves_independently() {
         // Both halves are lowercased and whitespace-collapsed on their own, and
         // only the FIRST colon separates them.
-        assert_eq!(normalize_tag_name("Project: Adelie AI"), "project:adelie-ai");
+        assert_eq!(
+            normalize_tag_name("Project: Adelie AI"),
+            "project:adelie-ai"
+        );
         assert_eq!(
             normalize_tag_name("  TOPIC : Deploy Steps "),
             "topic:deploy-steps"
@@ -340,13 +356,20 @@ mod tests {
     #[test]
     fn normalize_handles_common_variants() {
         assert_eq!(normalize_tag_name("Project"), "project");
-        assert_eq!(normalize_tag_name("user_preference"), "user-preference");
         assert_eq!(normalize_tag_name("  Architecture  "), "architecture");
         assert_eq!(normalize_tag_name("multi word tag"), "multi-word-tag");
+    }
+
+    #[test]
+    fn normalize_keeps_characters_the_knowledge_base_keeps() {
+        // The registry stores exactly what the knowledge base writes on a row,
+        // so it no longer edits underscores, punctuation or edge dashes out of
+        // a name. Doing so would put a key in the registry that no row carries.
+        assert_eq!(normalize_tag_name("user_preference"), "user_preference");
+        assert_eq!(normalize_tag_name("weird!chars@here"), "weird!chars@here");
         assert_eq!(
             normalize_tag_name("--leading-trailing--"),
-            "leading-trailing"
+            "--leading-trailing--"
         );
-        assert_eq!(normalize_tag_name("weird!chars@here"), "weirdcharshere");
     }
 }
