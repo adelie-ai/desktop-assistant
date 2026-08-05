@@ -282,6 +282,11 @@ pub fn tag_embed_text(normalized_name: &str, description: &str) -> String {
 /// weaker signal for the dedup, and it is still better than refusing a write:
 /// the model omitting a description must never cost the user a memory.
 ///
+/// Repeating the same proposal gives the same answer and registers nothing
+/// twice, including when a concurrent write registered the tag first: the
+/// registration is keyed by `(user_id, name)`, so a lost race leaves the tag
+/// present and this reads it back rather than reporting a failure.
+///
 /// Errors are the caller's cue to store the tag as written, not to fail the
 /// write - see [`desktop_assistant_core::ports::knowledge::KnowledgeTagResolveFn`].
 pub async fn resolve_proposed_tag(
@@ -298,7 +303,7 @@ pub async fn resolve_proposed_tag(
         );
     }
 
-    let outcome = create_or_match_tag(
+    let outcome = match create_or_match_tag(
         pool,
         embed_fn,
         embedding_model,
@@ -309,7 +314,27 @@ pub async fn resolve_proposed_tag(
             distinguish_from: Vec::new(),
         },
     )
-    .await?;
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            // A concurrent write can register the same name between this
+            // proposal's name check and its insert. Read it back before
+            // reporting a failure: the vocabulary holds the tag, so the answer
+            // is the same one the winner got.
+            let normalized = normalize_tag_name(&proposed.name);
+            match get_tag(pool, &normalized).await {
+                Ok(Some(existing)) => {
+                    tracing::debug!(
+                        tag = %existing.name,
+                        "a concurrent write registered this tag first; using it"
+                    );
+                    return Ok(existing.name);
+                }
+                _ => return Err(e),
+            }
+        }
+    };
 
     Ok(match outcome {
         CreateTagOutcome::Created(record) => record.name,

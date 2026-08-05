@@ -813,6 +813,81 @@ async fn kb_write_ignores_a_description_for_a_tag_the_registry_already_holds() {
 }
 
 #[tokio::test]
+async fn kb_write_resolves_a_tag_a_concurrent_write_registered_first() {
+    // Two writes can propose the same new tag at once - a second client, or a
+    // retried turn. The loser's INSERT hits the `(user_id, name)` primary key.
+    // That is a race the registry won, not a registry that failed: the tag now
+    // exists, so the resolver reads it and answers with it.
+    //
+    // The race is simulated deterministically. The embedding call is the window
+    // between the exact-name check and the INSERT, so registering the row from
+    // inside the embed function puts the row there at exactly the moment a
+    // concurrent write would have.
+    //
+    // MUTATION: dropping the post-INSERT re-read makes the resolver return the
+    // primary-key error, which the write path degrades into "store the tag as
+    // written" - so the returned name check goes RED.
+    with_fixture(
+        "kb_write_resolves_a_tag_a_concurrent_write_registered_first",
+        |fx| async move {
+            let pool = fx.pool.clone();
+            // No embedding on the row it plants, so the nearest-neighbour search
+            // skips it (`embedding IS NOT NULL`) and the INSERT is still reached.
+            let racing_embed: BackfillEmbedFn = Box::new(move |texts| {
+                let pool = pool.clone();
+                Box::pin(async move {
+                    sqlx::query(
+                        "INSERT INTO tag_registry \
+                            (user_id, name, description, examples, distinguish_from) \
+                         VALUES ($1, 'topic:weather', 'registered by the other write', \
+                                 '[]'::jsonb, '{}') \
+                         ON CONFLICT DO NOTHING",
+                    )
+                    .bind("alice")
+                    .execute(&pool)
+                    .await
+                    .expect("the concurrent write registers the tag");
+                    Ok(texts.iter().map(|_| vec![1.0f32, 0.0, 0.0]).collect())
+                })
+            });
+
+            with_user_id(UserId::new("alice"), async {
+                let name = resolve_proposed_tag(
+                    &fx.pool,
+                    &racing_embed,
+                    "test-model",
+                    &ProposedTag {
+                        name: "topic:weather".into(),
+                        description: Some("Forecasts, rain, and temperature".into()),
+                    },
+                )
+                .await
+                .expect("a lost race is not a failure");
+                assert_eq!(
+                    name, "topic:weather",
+                    "the resolver answers with the tag the winner registered"
+                );
+
+                let stored = list_active_tags(&fx.pool)
+                    .await
+                    .expect("list alice's tags")
+                    .into_iter()
+                    .map(|t| t.name)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    stored,
+                    vec!["topic:weather".to_string()],
+                    "one tag, not two"
+                );
+            })
+            .await;
+            fx
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn kb_write_registers_tags_under_the_calling_user() {
     // The registry is per-user. A tag proposed by one tenant must never
     // redirect against another tenant's vocabulary, even when the two are

@@ -30,6 +30,67 @@ use desktop_assistant_core::ports::transport::{
 
 use crate::executor::McpControlHandle;
 
+/// How long one `builtin_knowledge_base_write` call may spend consulting the
+/// tag vocabulary, counted across every entry in the call.
+///
+/// Why a budget at all: the caller chooses how many tags one write carries, and
+/// each tag the vocabulary has not seen before costs an embedding. Without a
+/// ceiling the wait a person sits through grows with the tag count, inside a
+/// live turn. When the budget runs out the remaining tags are stored as
+/// written, which is the same fallback every other absent-vocabulary state
+/// uses.
+const TAG_RESOLVE_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The tag vocabulary's share of one `builtin_knowledge_base_write` call.
+///
+/// It carries the deadline, and the reason the vocabulary stopped being
+/// consulted once anything has stopped it. Both stopping conditions - a failure
+/// and a spent budget - mean the same thing for the rest of the call: store the
+/// tags as the caller wrote them.
+///
+/// Why it spans the call rather than one entry: a batch write is one tool call
+/// to the person waiting on it, so a per-entry budget would bound nothing that
+/// they can feel.
+struct TagGateBudget {
+    deadline: tokio::time::Instant,
+    stopped: Option<String>,
+}
+
+impl TagGateBudget {
+    /// Start the budget for one write call.
+    fn new() -> Self {
+        Self {
+            deadline: tokio::time::Instant::now() + TAG_RESOLVE_BUDGET,
+            stopped: None,
+        }
+    }
+
+    /// Whether the vocabulary may still be consulted.
+    fn is_open(&self) -> bool {
+        self.stopped.is_none() && tokio::time::Instant::now() < self.deadline
+    }
+
+    /// Stop consulting the vocabulary for the rest of this call, keeping the
+    /// first reason. A later reason is a consequence of the first, so it would
+    /// only bury it.
+    fn stop(&mut self, reason: impl Into<String>) {
+        if self.stopped.is_none() {
+            self.stopped = Some(reason.into());
+        }
+    }
+
+    /// Say once, for the whole call, that the tags were stored as written.
+    fn report(&self) {
+        if let Some(reason) = &self.stopped {
+            tracing::warn!(
+                reason = %reason,
+                "the tag vocabulary was not consulted for the rest of this write; \
+                 those tags are stored as written"
+            );
+        }
+    }
+}
+
 /// Machine label used until the daemon supplies its own hostname, so a search
 /// result is coherent in tests and in a build that never called
 /// `BuiltinToolService::with_topology`.
@@ -450,7 +511,7 @@ impl BuiltinToolService {
                         },
                         "entries": {
                             "type": "array",
-                            "description": "Batch form: a list of {content?, tags?, id?} objects. When present, the top-level content/tags/id are ignored.",
+                            "description": "Batch form: a list of {content?, tags?, id?, new_tag_descriptions?} objects. When present, every top-level field is ignored — content, tags, id and new_tag_descriptions alike — so describe each entry's new tags inside that entry.",
                             "items": {
                                 "type": "object",
                                 "properties": {
@@ -1151,8 +1212,10 @@ impl BuiltinToolService {
         };
 
         let mut saved_out = Vec::with_capacity(specs.len());
+        // One budget for the whole call, so a batch cannot spend it per entry.
+        let mut tag_budget = TagGateBudget::new();
         for spec in &specs {
-            let entry = self.build_write_entry(spec).await?;
+            let entry = self.build_write_entry(spec, &mut tag_budget).await?;
             // Embedding generation is decoupled from the write: the entry lands
             // immediately (NULL embedding on create, stale embedding left in
             // place on update) and the background embedding-backfill task
@@ -1170,6 +1233,7 @@ impl BuiltinToolService {
                 "updated_at": saved.updated_at,
             }));
         }
+        tag_budget.report();
 
         Ok(serde_json::json!({
             "ok": true,
@@ -1187,6 +1251,7 @@ impl BuiltinToolService {
     async fn build_write_entry(
         &self,
         spec: &serde_json::Value,
+        tag_budget: &mut TagGateBudget,
     ) -> Result<desktop_assistant_core::domain::KnowledgeEntry, CoreError> {
         use desktop_assistant_core::domain::KnowledgeEntry;
 
@@ -1224,7 +1289,7 @@ impl BuiltinToolService {
         // carried over from the existing entry are already in it, so a
         // content-only update re-registers nothing.
         let tags = if tags_present {
-            self.resolve_tags(tags, spec).await
+            self.resolve_tags(tags, spec, tag_budget).await
         } else {
             existing
                 .as_ref()
@@ -1272,17 +1337,31 @@ impl BuiltinToolService {
     /// Why nothing here can fail the write: the vocabulary is optional. It is
     /// absent when no database or embedding backend is wired, and it can fail
     /// per call when the embedding backend is unreachable. Both degrade to the
-    /// prior behaviour - store the tag as the caller wrote it - and say so once
-    /// rather than once per tag.
-    async fn resolve_tags(&self, tags: Vec<String>, spec: &serde_json::Value) -> Vec<String> {
+    /// prior behaviour - store the tag as the caller wrote it.
+    ///
+    /// Two things stop the vocabulary being consulted again for the rest of the
+    /// write call: its first failure, and a spent [`TagGateBudget`]. A
+    /// vocabulary that just failed will not answer the next tag either, and
+    /// asking it again pays the embedding timeout for nothing. The caller
+    /// reports both once for the call, not once per tag.
+    async fn resolve_tags(
+        &self,
+        tags: Vec<String>,
+        spec: &serde_json::Value,
+        budget: &mut TagGateBudget,
+    ) -> Vec<String> {
         let Some(resolve_fn) = self.kb_tag_resolve_fn.as_ref() else {
             return tags;
         };
         let descriptions = spec.get("new_tag_descriptions");
 
         let mut resolved = Vec::with_capacity(tags.len());
-        let mut first_error: Option<CoreError> = None;
         for tag in tags {
+            if !budget.is_open() {
+                budget.stop("the tag vocabulary budget for this write was spent");
+                resolved.push(tag);
+                continue;
+            }
             let description = descriptions
                 .and_then(|d| d.get(&tag))
                 .and_then(serde_json::Value::as_str)
@@ -1296,19 +1375,10 @@ impl BuiltinToolService {
             match resolve_fn(proposed).await {
                 Ok(name) => resolved.push(name),
                 Err(e) => {
-                    if first_error.is_none() {
-                        first_error = Some(e);
-                    }
+                    budget.stop(e.to_string());
                     resolved.push(tag);
                 }
             }
-        }
-
-        if let Some(e) = first_error {
-            tracing::warn!(
-                error = %e,
-                "the tag vocabulary was unavailable for this write; tags stored as written"
-            );
         }
         resolved
     }
@@ -4639,6 +4709,111 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn kb_write_stops_consulting_the_tag_vocabulary_after_it_fails_once() {
+        // A failure means the vocabulary cannot answer. Asking it again for
+        // every remaining tag buys nothing and pays the embedding timeout each
+        // time, so one write with many tags would add minutes to a live turn.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_fn = Arc::clone(&calls);
+        let resolve: KnowledgeTagResolveFn = Arc::new(move |_proposed: ProposedTag| {
+            let calls = Arc::clone(&calls_for_fn);
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(CoreError::Storage(
+                    "embedding backend unreachable".to_string(),
+                ))
+            })
+        });
+        let (service, store) = kb_service_with_tag_gate(Some(resolve));
+
+        kb_write_response(
+            &service,
+            serde_json::json!({
+                "entries": [
+                    {"content": "one", "tags": ["memory", "topic:a", "topic:b"]},
+                    {"content": "two", "tags": ["topic:c", "topic:d"]},
+                ],
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the vocabulary is asked once, then left alone for the rest of the call - \
+             across entries, not just within one"
+        );
+        let stored = store.lock().expect("store lock");
+        assert_eq!(stored.len(), 2, "both entries landed");
+        assert_eq!(
+            stored[0].tags,
+            vec![
+                "memory".to_string(),
+                "topic:a".to_string(),
+                "topic:b".to_string()
+            ],
+            "every tag is stored as written"
+        );
+        assert_eq!(
+            stored[1].tags,
+            vec!["topic:c".to_string(), "topic:d".to_string()]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn kb_write_stops_consulting_the_tag_vocabulary_when_the_write_budget_is_spent() {
+        // A vocabulary that answers, but slowly, is not an error, so nothing
+        // else stops it. One write carries as many tags as the model chose to
+        // send, so without a budget the added wait grows with the tag count
+        // inside a live turn.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Each answer costs well over half the budget, so the third tag finds
+        // the budget spent.
+        let per_call = TAG_RESOLVE_BUDGET.mul_f32(0.6);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_fn = Arc::clone(&calls);
+        let resolve: KnowledgeTagResolveFn = Arc::new(move |proposed: ProposedTag| {
+            let calls = Arc::clone(&calls_for_fn);
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(per_call).await;
+                Ok(format!("resolved:{}", proposed.name))
+            })
+        });
+        let (service, store) = kb_service_with_tag_gate(Some(resolve));
+
+        kb_write_response(
+            &service,
+            serde_json::json!({
+                "content": "slow",
+                "tags": ["topic:a", "topic:b", "topic:c"],
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the budget stops the third consultation"
+        );
+        assert_eq!(
+            store.lock().expect("store lock")[0].tags,
+            vec![
+                "resolved:topic:a".to_string(),
+                "resolved:topic:b".to_string(),
+                "topic:c".to_string(),
+            ],
+            "tags resolved before the budget ran out keep their answers; the rest \
+             are stored as written"
+        );
+    }
+
     #[test]
     fn kb_write_schema_advertises_new_tag_descriptions() {
         // A schema that promises what the code does not honour is a false
@@ -4668,11 +4843,33 @@ mod tests {
             "the field carries a description of its own: {single}"
         );
 
+        // The batch form is held to the same shape. A model that batches its
+        // writes reads only this half of the schema.
         let batch = &props["entries"]["items"]["properties"]["new_tag_descriptions"];
         assert_eq!(
             batch["type"], "object",
             "the batch form advertises the field too, or a batched write cannot \
              describe its new tags: {batch}"
+        );
+        assert_eq!(
+            batch["additionalProperties"]["type"], "string",
+            "each batch value is a one-line description: {batch}"
+        );
+        assert!(
+            batch["description"].as_str().is_some_and(|d| !d.is_empty()),
+            "the batch field carries a description of its own: {batch}"
+        );
+
+        // The batch form ignores every top-level field, this one included. A
+        // description sent at the top level beside `entries` is dropped in
+        // silence, so the list of what `entries` ignores has to name it.
+        let entries = props["entries"]["description"]
+            .as_str()
+            .expect("entries carries a description");
+        assert!(
+            entries.contains("new_tag_descriptions"),
+            "the entries description must say that a top-level \
+             new_tag_descriptions is ignored: {entries}"
         );
     }
 

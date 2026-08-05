@@ -40,7 +40,8 @@ predictions for coming days"` sits close to `"topic:weather: Forecasts, rain,
 and temperature"`; the two bare names do not.
 
 Both the single-entry form and each object in the `entries` batch accept the
-field.
+field. A batch ignores every top-level field, `new_tag_descriptions` included,
+so a batched write describes its new tags inside each entry.
 
 ## What the write reports back
 
@@ -79,11 +80,26 @@ states, and none of them fails a write:
 | State | Behaviour |
 | ----- | --------- |
 | No database, or no embedding backend | The gate is not wired. Tags are stored as written, exactly as before. The daemon says so once at startup. |
-| Wired, but the embedding backend fails or times out on this call | The tags on that write are stored as written. The daemon logs once for the write, not once per tag. |
+| Wired, but the embedding backend fails or times out | The vocabulary is not consulted again for the rest of that write. Its remaining tags are stored as written. The daemon logs once for the write, not once per tag. |
 | Wired and answering | Tags are resolved against the vocabulary. |
 
 Losing a user's memory because an optional backend was unreachable would be a
 far worse outcome than a duplicate tag.
+
+## The time it can take
+
+Two ceilings bound what a person waits for.
+
+One embedding call is bounded at 5 seconds, matching the query-embedding timeout
+the built-in tools already apply. A hung backend therefore costs one timeout,
+not one per tag: the timeout is a failure, and the first failure stops the
+vocabulary being consulted for the rest of that write.
+
+One write call may spend 15 seconds in total consulting the vocabulary, counted
+across every entry in the call. A backend that answers slowly raises no error,
+so nothing else would stop it, and the caller chooses how many tags one write
+carries. When the budget runs out the remaining tags are stored as written.
+
 
 ## What it does not do
 
