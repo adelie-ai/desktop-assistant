@@ -1038,3 +1038,296 @@ async fn delete_owner_subtree_idempotent() {
     })
     .await;
 }
+
+// --- #1104: a note attaches a knowledge entry ------------------------------
+
+/// Insert a knowledge entry owned by the current user, so a note may attach it.
+/// Uses the knowledge store rather than raw SQL, so the row is exactly what the
+/// product writes.
+async fn write_entry(pool: &PgPool, id: &str, content: &str) {
+    use desktop_assistant_core::domain::KnowledgeEntry;
+    use desktop_assistant_core::ports::knowledge::KnowledgeBaseStore;
+    desktop_assistant_storage::PgKnowledgeBaseStore::new(pool.clone())
+        .write(KnowledgeEntry::new(id, content, vec![]))
+        .await
+        .expect("write knowledge entry");
+}
+
+/// A note that attaches `entry_id`.
+fn note_attaching(key: &str, content: &str, entry_id: &str) -> NewScratchpadNote {
+    let mut n = NewScratchpadNote::new(key, content);
+    n.knowledge_entry_id = Some(entry_id.to_string());
+    n
+}
+
+#[tokio::test]
+async fn pinned_reference_stays_within_the_calling_user() {
+    // Row-level security is a backstop the table owner bypasses, so the
+    // `user_id` predicate is the real guard. Bob must neither read alice's
+    // attachment nor repair it out from under her.
+    with_fixture(
+        "pinned_reference_stays_within_the_calling_user",
+        |fx| async move {
+            let convs = PgConversationStore::new(fx.pool.clone());
+            let pad = PgScratchpadStore::new(fx.pool.clone());
+
+            let alice_note_id = with_user_id(UserId::new("alice"), async {
+                convs.create(make_conversation("c1")).await.expect("conv");
+                write_entry(&fx.pool, "kb-alice", "alice's durable fact").await;
+                let saved = pad
+                    .write(
+                        "c1",
+                        &[note_attaching("deploy-target", "settled", "kb-alice")],
+                    )
+                    .await
+                    .expect("alice write");
+                pad.set_pinned("c1", &["deploy-target".to_string()], true)
+                    .await
+                    .expect("alice pin");
+                saved[0].id.clone()
+            })
+            .await;
+
+            with_user_id(UserId::new("bob"), async {
+                assert!(
+                    pad.list("c1", None, 50).await.expect("bob list").is_empty(),
+                    "bob must not see alice's note, attachment and all"
+                );
+                assert_eq!(
+                    pad.release_knowledge_references(&[alice_note_id.clone()])
+                        .await
+                        .expect("bob release"),
+                    0,
+                    "bob must not repair alice's row"
+                );
+            })
+            .await;
+
+            with_user_id(UserId::new("alice"), async {
+                let notes = pad.list("c1", None, 50).await.expect("alice list");
+                assert_eq!(
+                    notes[0].knowledge_entry_id.as_deref(),
+                    Some("kb-alice"),
+                    "alice's attachment survives bob's attempt"
+                );
+                assert!(notes[0].pinned, "and so does her pin");
+            })
+            .await;
+            fx
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn pinned_reference_stays_within_the_subagent_namespace() {
+    // Confinement matches what `set_pinned` already enforces: a subagent may
+    // attach and pin in its own namespace, never in the parent's.
+    with_fixture(
+        "pinned_reference_stays_within_the_subagent_namespace",
+        |fx| async move {
+            let convs = PgConversationStore::new(fx.pool.clone());
+            let pad = PgScratchpadStore::new(fx.pool.clone());
+            with_user_id(UserId::new("alice"), async {
+                convs.create(make_conversation("c1")).await.expect("conv");
+                write_entry(&fx.pool, "kb-1", "the durable fact").await;
+
+                // The parent attaches and pins in the root namespace.
+                pad.write("c1", &[note_attaching("shared-key", "parent", "kb-1")])
+                    .await
+                    .expect("parent write");
+                pad.set_pinned("c1", &["shared-key".to_string()], true)
+                    .await
+                    .expect("parent pin");
+
+                // A subagent writing the SAME key gets its own row in its own
+                // namespace, and its pin does not reach the parent's.
+                with_subagent_scope(sub_scope("1.1", "", &[]), async {
+                    pad.write("c1", &[note_attaching("shared-key", "child", "kb-1")])
+                        .await
+                        .expect("child write");
+                    pad.set_pinned("c1", &["shared-key".to_string()], true)
+                        .await
+                        .expect("child pin");
+                })
+                .await;
+
+                let notes = pad.list("c1", None, 50).await.expect("list");
+                let parent = notes
+                    .iter()
+                    .find(|n| n.owner_todo.is_empty())
+                    .expect("the parent's row");
+                let child = notes
+                    .iter()
+                    .find(|n| n.owner_todo == "1.1")
+                    .expect("the child's row");
+                assert_eq!(parent.content, "parent", "the child must not overwrite it");
+                assert_eq!(child.content, "child");
+                assert_eq!(parent.knowledge_entry_id.as_deref(), Some("kb-1"));
+                assert_eq!(child.knowledge_entry_id.as_deref(), Some("kb-1"));
+
+                // The child's own unpin reaches only its own row.
+                with_subagent_scope(sub_scope("1.1", "", &[]), async {
+                    pad.set_pinned("c1", &["shared-key".to_string()], false)
+                        .await
+                        .expect("child unpin");
+                })
+                .await;
+                let notes = pad.list("c1", None, 50).await.expect("list again");
+                assert!(
+                    notes
+                        .iter()
+                        .find(|n| n.owner_todo.is_empty())
+                        .expect("parent row")
+                        .pinned,
+                    "a subagent must not unpin the parent's note"
+                );
+            })
+            .await;
+            fx
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_goal_note_and_a_todo_note_are_both_pinnable() {
+    // `set_pinned` filters on `note_key` only. Locking that in stops a later
+    // change quietly restricting pinning to one kind of note.
+    with_fixture(
+        "a_goal_note_and_a_todo_note_are_both_pinnable",
+        |fx| async move {
+            let convs = PgConversationStore::new(fx.pool.clone());
+            let pad = PgScratchpadStore::new(fx.pool.clone());
+            with_user_id(UserId::new("alice"), async {
+                convs.create(make_conversation("c1")).await.expect("conv");
+                pad.write("c1", &[note("goal", "ship it"), todo("1", "wire it", 1)])
+                    .await
+                    .expect("write");
+                assert_eq!(
+                    pad.set_pinned("c1", &["goal".to_string(), "1".to_string()], true)
+                        .await
+                        .expect("pin both"),
+                    2,
+                    "both a goal note and a todo note must be pinnable"
+                );
+                let notes = pad.list("c1", None, 50).await.expect("list");
+                assert!(notes.iter().all(|n| n.pinned), "both rows are pinned");
+            })
+            .await;
+            fx
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_note_keeps_its_attachment_when_its_content_is_rewritten() {
+    // `None` preserves. A caller that rewrites the text and knows nothing about
+    // the attachment must not silently drop it.
+    with_fixture(
+        "a_note_keeps_its_attachment_when_its_content_is_rewritten",
+        |fx| async move {
+            let convs = PgConversationStore::new(fx.pool.clone());
+            let pad = PgScratchpadStore::new(fx.pool.clone());
+            with_user_id(UserId::new("alice"), async {
+                convs.create(make_conversation("c1")).await.expect("conv");
+                write_entry(&fx.pool, "kb-1", "the durable fact").await;
+                pad.write("c1", &[note_attaching("deploy-target", "first", "kb-1")])
+                    .await
+                    .expect("attach");
+                let saved = pad
+                    .write("c1", &[note("deploy-target", "rewritten")])
+                    .await
+                    .expect("rewrite");
+                assert_eq!(saved[0].content, "rewritten");
+                assert_eq!(
+                    saved[0].knowledge_entry_id.as_deref(),
+                    Some("kb-1"),
+                    "an ordinary rewrite must not drop the attachment"
+                );
+            })
+            .await;
+            fx
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn releasing_a_reference_clears_the_attachment_and_the_pin() {
+    // The repair the render path calls when an entry no longer resolves, plus
+    // its idempotence: a second call changes nothing.
+    with_fixture(
+        "releasing_a_reference_clears_the_attachment_and_the_pin",
+        |fx| async move {
+            let convs = PgConversationStore::new(fx.pool.clone());
+            let pad = PgScratchpadStore::new(fx.pool.clone());
+            with_user_id(UserId::new("alice"), async {
+                convs.create(make_conversation("c1")).await.expect("conv");
+                write_entry(&fx.pool, "kb-1", "the durable fact").await;
+                let saved = pad
+                    .write("c1", &[note_attaching("deploy-target", "settled", "kb-1")])
+                    .await
+                    .expect("attach");
+                pad.set_pinned("c1", &["deploy-target".to_string()], true)
+                    .await
+                    .expect("pin");
+                let id = saved[0].id.clone();
+
+                assert_eq!(
+                    pad.release_knowledge_references(&[id.clone()])
+                        .await
+                        .expect("release"),
+                    1
+                );
+                let notes = pad.list("c1", None, 50).await.expect("list");
+                assert_eq!(notes[0].knowledge_entry_id, None, "attachment cleared");
+                assert!(!notes[0].pinned, "and the pin released with it");
+                assert_eq!(notes[0].content, "settled", "the model's own words survive");
+
+                assert_eq!(
+                    pad.release_knowledge_references(&[id])
+                        .await
+                        .expect("release again"),
+                    0,
+                    "the repair is idempotent"
+                );
+            })
+            .await;
+            fx
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn deleting_a_knowledge_entry_clears_the_attachment_it_left_behind() {
+    // The structural half of "a reference never outlives its entry": the
+    // foreign key clears the column when the entry row goes.
+    with_fixture(
+        "deleting_a_knowledge_entry_clears_the_attachment_it_left_behind",
+        |fx| async move {
+            use desktop_assistant_core::ports::knowledge::KnowledgeBaseStore;
+            let convs = PgConversationStore::new(fx.pool.clone());
+            let pad = PgScratchpadStore::new(fx.pool.clone());
+            let kb = desktop_assistant_storage::PgKnowledgeBaseStore::new(fx.pool.clone());
+            with_user_id(UserId::new("alice"), async {
+                convs.create(make_conversation("c1")).await.expect("conv");
+                write_entry(&fx.pool, "kb-1", "the durable fact").await;
+                pad.write("c1", &[note_attaching("deploy-target", "settled", "kb-1")])
+                    .await
+                    .expect("attach");
+                kb.delete("kb-1").await.expect("delete entry");
+                let notes = pad.list("c1", None, 50).await.expect("list");
+                assert_eq!(
+                    notes[0].knowledge_entry_id, None,
+                    "a deleted entry must leave no dangling id behind"
+                );
+            })
+            .await;
+            fx
+        },
+    )
+    .await;
+}

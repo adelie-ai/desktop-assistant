@@ -516,6 +516,15 @@ pub(crate) fn render_scratchpad_index(keys: &[&str], max_items: usize) -> Option
     Some(out)
 }
 
+/// The live content of the knowledge entries attached to this round's pinned
+/// notes, keyed by entry id (#1104).
+///
+/// Built fresh every round from one batched knowledge read, so [`render_pinned`]
+/// dereferences at render time and an edit to an entry reaches the block. An id
+/// absent from the map is an attachment whose entry no longer resolves — it was
+/// deleted, trashed, or belongs to another user.
+pub(crate) type PinnedEntries<'a> = std::collections::HashMap<&'a str, &'a str>;
+
 /// Render the per-turn `[Pinned]` block: the full content of every pinned note
 /// (#597).
 ///
@@ -537,8 +546,16 @@ pub(crate) fn render_scratchpad_index(keys: &[&str], max_items: usize) -> Option
 /// `… (truncated)` marker on an over-long note, and a trailing count of notes
 /// that did not fit — because a silently dropped pin is exactly the failure this
 /// feature exists to prevent. Returns `None` when nothing is pinned.
-pub(crate) fn render_pinned(notes: &[RawNote<'_>], budget: usize) -> Option<String> {
-    let mut pinned: Vec<&RawNote<'_>> = notes.iter().filter(|n| n.pinned).collect();
+pub(crate) fn render_pinned(
+    notes: &[RawNote<'_>],
+    entries: Option<&PinnedEntries<'_>>,
+    budget: usize,
+) -> Option<String> {
+    let _ = entries;
+    let mut pinned: Vec<&RawNote<'_>> = notes
+        .iter()
+        .filter(|n| n.pinned && n.knowledge_entry_id.is_none())
+        .collect();
     if pinned.is_empty() {
         return None;
     }
@@ -673,6 +690,9 @@ pub(crate) struct RawNote<'a> {
     pub done: bool,
     /// Whether this note's content is re-surfaced in full every turn (#597).
     pub pinned: bool,
+    /// The knowledge entry this note attaches, when it carries one (#1104).
+    /// [`render_pinned`] resolves it against the entries read for this round.
+    pub knowledge_entry_id: Option<&'a str>,
 }
 
 /// Build the plan surface from a conversation's scratchpad notes (#240).
@@ -792,7 +812,9 @@ pub(crate) fn complete_step_tool() -> ToolDefinition {
 mod tests {
     use super::*;
     use crate::domain::{Message, Role, ToolCall};
-    use crate::ports::scratchpad::PINNED_BLOCK_BYTE_BUDGET;
+    use crate::ports::scratchpad::{
+        MAX_PINNED_NOTES, PINNED_BLOCK_BYTE_BUDGET, PINNED_ENTRY_MAX_CHARS,
+    };
 
     #[test]
     fn stack_auto_numbers_roots_and_nested_children() {
@@ -1214,6 +1236,7 @@ mod tests {
             note_type: ty,
             done,
             pinned: false,
+            knowledge_entry_id: None,
         }
     }
 
@@ -1226,7 +1249,21 @@ mod tests {
             note_type: OUTCOME_NOTE_TYPE,
             done: false,
             pinned: true,
+            knowledge_entry_id: None,
         }
+    }
+
+    /// A pinned note that attaches a knowledge entry (#1104).
+    fn raw_pinned_ref<'a>(key: &'a str, content: &'a str, entry_id: &'a str) -> RawNote<'a> {
+        RawNote {
+            knowledge_entry_id: Some(entry_id),
+            ..raw_pinned(key, content)
+        }
+    }
+
+    /// The resolved entries for a round, as [`render_pinned`] takes them.
+    fn resolved<'a>(pairs: &[(&'a str, &'a str)]) -> PinnedEntries<'a> {
+        pairs.iter().copied().collect()
     }
 
     #[test]
@@ -1280,8 +1317,8 @@ mod tests {
             "note",
             false,
         )];
-        assert!(render_pinned(&notes, PINNED_BLOCK_BYTE_BUDGET).is_none());
-        assert!(render_pinned(&[], PINNED_BLOCK_BYTE_BUDGET).is_none());
+        assert!(render_pinned(&notes, None, PINNED_BLOCK_BYTE_BUDGET).is_none());
+        assert!(render_pinned(&[], None, PINNED_BLOCK_BYTE_BUDGET).is_none());
     }
 
     #[test]
@@ -1291,7 +1328,8 @@ mod tests {
             raw_pinned("deploy-target", "k3s at 192.168.1.2, NOT docker-compose"),
             raw_owned("", "other", "unpinned filler", "note", false),
         ];
-        let out = render_pinned(&notes, PINNED_BLOCK_BYTE_BUDGET).expect("something is pinned");
+        let out =
+            render_pinned(&notes, None, PINNED_BLOCK_BYTE_BUDGET).expect("something is pinned");
         assert!(out.contains("deploy-target"), "{out}");
         assert!(
             out.contains("k3s at 192.168.1.2, NOT docker-compose"),
@@ -1309,8 +1347,8 @@ mod tests {
         let forward = vec![raw_pinned("alpha", "a"), raw_pinned("zeta", "z")];
         let reversed = vec![raw_pinned("zeta", "z"), raw_pinned("alpha", "a")];
         assert_eq!(
-            render_pinned(&forward, PINNED_BLOCK_BYTE_BUDGET),
-            render_pinned(&reversed, PINNED_BLOCK_BYTE_BUDGET),
+            render_pinned(&forward, None, PINNED_BLOCK_BYTE_BUDGET),
+            render_pinned(&reversed, None, PINNED_BLOCK_BYTE_BUDGET),
             "input order must not change the rendered block"
         );
     }
@@ -1319,7 +1357,7 @@ mod tests {
     fn render_pinned_truncates_at_the_byte_budget_with_an_explicit_marker() {
         let huge = "x".repeat(PINNED_BLOCK_BYTE_BUDGET * 2);
         let notes = vec![raw_pinned("big", &huge)];
-        let out = render_pinned(&notes, 256).expect("pinned note renders");
+        let out = render_pinned(&notes, None, 256).expect("pinned note renders");
         assert!(
             out.contains("(truncated)"),
             "over-long content must be marked, never silently cut: {out}"
@@ -1339,7 +1377,7 @@ mod tests {
             raw_pinned("b", &body),
             raw_pinned("c", &body),
         ];
-        let out = render_pinned(&notes, 260).expect("at least one fits");
+        let out = render_pinned(&notes, None, 260).expect("at least one fits");
         assert!(
             out.contains("did not fit"),
             "notes beyond the budget must be reported: {out}"
@@ -1355,8 +1393,8 @@ mod tests {
         let emoji = "🐧".repeat(64);
         for budget in 8..40 {
             let notes = vec![raw_pinned("penguins", &emoji)];
-            let out =
-                render_pinned(&notes, budget).expect("something is pinned, so a block is owed");
+            let out = render_pinned(&notes, None, budget)
+                .expect("something is pinned, so a block is owed");
             assert!(
                 out.is_char_boundary(out.len()),
                 "output must stay valid UTF-8"
@@ -1368,6 +1406,184 @@ mod tests {
                 "a pin must never vanish without a word (budget {budget}): {out}"
             );
         }
+    }
+
+    // --- #1104 a pinned note that attaches a knowledge entry ----------------
+
+    #[test]
+    fn pinned_reference_renders_the_note_text_and_the_entry_content() {
+        // Both, in that order: the note says why the entry matters right now,
+        // the entry carries the fact.
+        let notes = vec![raw_pinned_ref(
+            "deploy-target",
+            "this is the target we finally settled on",
+            "kb-1",
+        )];
+        let entries = resolved(&[("kb-1", "Deploys go to the k3s cluster, never compose.")]);
+        let out = render_pinned(&notes, Some(&entries), PINNED_BLOCK_BYTE_BUDGET)
+            .expect("something is pinned");
+        let note_at = out
+            .find("this is the target we finally settled on")
+            .expect("the note's own text must be present: {out}");
+        let entry_at = out
+            .find("Deploys go to the k3s cluster, never compose.")
+            .expect("the referenced entry's content must be present: {out}");
+        assert!(
+            note_at < entry_at,
+            "the note text comes first, the entry beneath it: {out}"
+        );
+    }
+
+    #[test]
+    fn pinned_reference_renders_an_entry_for_a_note_with_no_content_of_its_own() {
+        // A note may be nothing but a pointer; the entry is then the whole
+        // payload.
+        let notes = vec![raw_pinned_ref("deploy-target", "", "kb-1")];
+        let entries = resolved(&[("kb-1", "Deploys go to the k3s cluster.")]);
+        let out = render_pinned(&notes, Some(&entries), PINNED_BLOCK_BYTE_BUDGET)
+            .expect("something is pinned");
+        assert!(out.contains("deploy-target"), "{out}");
+        assert!(
+            out.contains("Deploys go to the k3s cluster."),
+            "an empty note must still render its entry: {out}"
+        );
+    }
+
+    #[test]
+    fn pinned_reference_reflects_an_edit_to_the_entry() {
+        // The whole advantage over copying the entry into a note: the block is
+        // built from the entry as it is now, not as it was when pinned.
+        let notes = vec![raw_pinned_ref("deploy-target", "settled", "kb-1")];
+        let before = resolved(&[("kb-1", "the old cluster")]);
+        let after = resolved(&[("kb-1", "the new cluster")]);
+        let first = render_pinned(&notes, Some(&before), PINNED_BLOCK_BYTE_BUDGET)
+            .expect("something is pinned");
+        let second = render_pinned(&notes, Some(&after), PINNED_BLOCK_BYTE_BUDGET)
+            .expect("something is pinned");
+        assert!(first.contains("the old cluster"), "{first}");
+        assert!(
+            second.contains("the new cluster") && !second.contains("the old cluster"),
+            "an edit to the entry must reach the block: {second}"
+        );
+    }
+
+    #[test]
+    fn pinned_references_and_note_pins_share_one_cap() {
+        // Not five of each. Both halves of the cap are checked: the count cap
+        // that decides what may be pinned, and the byte budget that decides
+        // what fits once pinned.
+        let mixed = ["plain-a", "plain-b", "ref-a", "ref-b", "ref-c"];
+        let at_cap: Vec<String> = mixed.iter().map(|k| k.to_string()).collect();
+        assert_eq!(at_cap.len(), MAX_PINNED_NOTES, "precondition: at the cap");
+        crate::ports::scratchpad::plan_pin(&at_cap, &["ref-d".to_string()], true)
+            .expect_err("a referencing note draws on the same cap as any other pin");
+
+        // One byte budget over both kinds: a referencing pin cannot be given an
+        // allowance of its own on top of the plain pins.
+        let body = "y".repeat(200);
+        let entry = "z".repeat(200);
+        let notes = vec![
+            raw_pinned("a", &body),
+            raw_pinned_ref("b", &body, "kb-1"),
+            raw_pinned_ref("c", &body, "kb-2"),
+        ];
+        let entries = resolved(&[("kb-1", entry.as_str()), ("kb-2", entry.as_str())]);
+        let out = render_pinned(&notes, Some(&entries), 300).expect("at least one fits");
+        assert!(
+            out.contains("did not fit"),
+            "the block budget must bound both kinds together: {out}"
+        );
+    }
+
+    #[test]
+    fn pinned_reference_truncates_an_over_long_entry_and_marks_it() {
+        // A note is capped at MAX_NOTE_BYTES; an entry has no such bound, so
+        // one long entry must not spend the whole block.
+        let huge = "w".repeat(PINNED_ENTRY_MAX_CHARS * 3);
+        let notes = vec![raw_pinned_ref("deploy-target", "settled", "kb-1")];
+        let entries = resolved(&[("kb-1", huge.as_str())]);
+        let out = render_pinned(&notes, Some(&entries), PINNED_BLOCK_BYTE_BUDGET)
+            .expect("something is pinned");
+        assert!(
+            out.contains("..."),
+            "a cut entry must be marked, never silently shortened: {out}"
+        );
+        assert!(
+            out.len() < huge.len(),
+            "the entry must actually be bounded: {} bytes",
+            out.len()
+        );
+    }
+
+    #[test]
+    fn unpinning_a_reference_removes_it_from_the_block() {
+        // An attachment is not a pin. Clearing the pin takes the whole note out
+        // of the block, entry and all.
+        let notes = vec![RawNote {
+            pinned: false,
+            ..raw_pinned_ref("deploy-target", "settled", "kb-1")
+        }];
+        let entries = resolved(&[("kb-1", "Deploys go to the k3s cluster.")]);
+        assert!(
+            render_pinned(&notes, Some(&entries), PINNED_BLOCK_BYTE_BUDGET).is_none(),
+            "an unpinned note must not render, however it is attached"
+        );
+    }
+
+    #[test]
+    fn a_dangling_reference_renders_nothing_and_says_so() {
+        // The reap itself is the service's job; this is the render half. A pin
+        // that renders empty is a fact the model believes it has and does not,
+        // so the block drops it and names it.
+        let notes = vec![raw_pinned_ref("deploy-target", "settled", "kb-gone")];
+        let entries = resolved(&[]);
+        let out = render_pinned(&notes, Some(&entries), PINNED_BLOCK_BYTE_BUDGET)
+            .expect("the model must be told, so a block is still owed");
+        assert!(
+            !out.contains("settled"),
+            "a reference whose entry has gone renders nothing: {out}"
+        );
+        assert!(
+            out.contains("deploy-target"),
+            "the released note must be named, never dropped in silence: {out}"
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_round_renders_the_note_text_and_reaps_nothing() {
+        // `None` means the resolving read did not run. That is not evidence an
+        // entry has gone, so the note still renders and nothing is called
+        // released.
+        let notes = vec![raw_pinned_ref("deploy-target", "settled", "kb-1")];
+        let out =
+            render_pinned(&notes, None, PINNED_BLOCK_BYTE_BUDGET).expect("something is pinned");
+        assert!(out.contains("settled"), "{out}");
+        assert!(
+            !out.contains("no longer exists"),
+            "an unread round must not claim the entry has gone: {out}"
+        );
+    }
+
+    #[test]
+    fn a_pinned_todo_still_renders_in_the_plan() {
+        // Decided while building #1104: `[Plan]` does NOT yield to `[Pinned]`
+        // the way the `[Scratchpad]` index does. The index is a flat list of
+        // keys, so dropping one costs a key. The plan is a tree, and a step's
+        // line carries its position, its children, its done state and the
+        // you-are-here marker - none of which `[Pinned]` can express - so
+        // dropping the node would break the block that steers the whole task.
+        // The duplicated text is bounded (a step goal renders at most 160
+        // characters) and pinning a step is rare.
+        let notes = vec![RawNote {
+            note_type: STEP_NOTE_TYPE,
+            pinned: true,
+            ..raw("1", "wire the client", "todo", false)
+        }];
+        let plan = render_plan_from_notes(&notes, Some("1"), 50).expect("a step exists");
+        assert!(
+            plan.contains("wire the client"),
+            "a pinned step must keep its node in the plan tree: {plan}"
+        );
     }
 
     #[test]

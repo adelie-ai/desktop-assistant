@@ -2630,6 +2630,11 @@ where
                         // Filled in by the write closure, the one place every
                         // scratchpad write passes through (#717).
                         embedding: None,
+                        // A client edits a note's text; attaching a knowledge
+                        // entry is the model's move, through the scratchpad
+                        // write tool. `None` preserves whatever the stored note
+                        // already attaches, so a client edit cannot drop it.
+                        knowledge_entry_id: None,
                     }],
                 )
                 .await

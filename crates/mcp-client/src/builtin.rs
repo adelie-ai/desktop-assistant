@@ -2748,6 +2748,7 @@ fn parse_new_note(obj: &serde_json::Value) -> Option<NewScratchpadNote> {
         // Filled in by the write closure, the one place every scratchpad write
         // passes through (#717).
         embedding: None,
+        knowledge_entry_id: None,
     })
 }
 
@@ -3098,6 +3099,11 @@ mod tests {
                             existing.note_type = note.note_type;
                             existing.sequence = note.sequence;
                             existing.done = note.done;
+                            // `None` preserves, matching the storage adapter's
+                            // COALESCE: a rewrite must not drop an attachment.
+                            if note.knowledge_entry_id.is_some() {
+                                existing.knowledge_entry_id = note.knowledge_entry_id;
+                            }
                             existing.updated_at = "t1".into();
                             saved.push(existing.clone());
                         } else {
@@ -3110,6 +3116,7 @@ mod tests {
                             n.note_type = note.note_type;
                             n.sequence = note.sequence;
                             n.done = note.done;
+                            n.knowledge_entry_id = note.knowledge_entry_id;
                             n.updated_at = "t0".into();
                             guard.push(n.clone());
                             saved.push(n);
@@ -7061,6 +7068,142 @@ mod tests {
             .with_skills(skill_search, skill_get);
         service.set_mcp_control(crate::executor::McpToolExecutor::new(Vec::new()).control_handle());
         service
+    }
+
+    // --- #1104: attaching a knowledge entry to a note -----------------------
+
+    /// A scratchpad service whose knowledge base holds exactly `entry_id`, so a
+    /// write can attach one id that resolves and one that does not.
+    fn service_with_one_entry(
+        entry_id: &'static str,
+    ) -> (
+        BuiltinToolService,
+        Arc<std::sync::Mutex<Vec<ScratchpadNote>>>,
+    ) {
+        let kb_write: KnowledgeWriteFn = Arc::new(|entry| Box::pin(async move { Ok(entry) }));
+        let kb_search: KnowledgeSearchFn = Arc::new(|_q, _e, _m, _t, _x, _l| {
+            Box::pin(async {
+                Ok(
+                    desktop_assistant_core::ports::knowledge::KnowledgeSearchPage {
+                        entries: Vec::new(),
+                        scope_size: desktop_assistant_core::ports::knowledge::ScopeSize::None,
+                        available_tags: Vec::new(),
+                    },
+                )
+            })
+        });
+        let kb_delete: KnowledgeDeleteFn = Arc::new(|_ids| Box::pin(async { Ok(0) }));
+        let kb_list: KnowledgeListFn = Arc::new(|_query| {
+            Box::pin(async {
+                Ok(
+                    desktop_assistant_core::ports::knowledge::KnowledgeListPage {
+                        entries: Vec::new(),
+                        next_cursor: None,
+                    },
+                )
+            })
+        });
+        let kb_get: KnowledgeGetFn = Arc::new(move |id: String| {
+            Box::pin(async move {
+                Ok((id == entry_id).then(|| {
+                    desktop_assistant_core::domain::KnowledgeEntry::new(
+                        entry_id,
+                        "the durable fact",
+                        vec![],
+                    )
+                }))
+            })
+        });
+        let (service, store) = scratchpad_service();
+        (
+            service.with_knowledge_base(kb_write, kb_search, kb_delete, kb_list, kb_get),
+            store,
+        )
+    }
+
+    #[tokio::test]
+    async fn scratchpad_write_attaches_a_knowledge_entry_to_a_note() {
+        let (service, store) = service_with_one_entry("kb-1");
+        let out = with_conversation_id(ConversationId::from("conv-1"), async {
+            service
+                .execute_tool(
+                    TOOL_SCRATCHPAD_WRITE,
+                    serde_json::json!({
+                        "key": "deploy-target",
+                        "content": "this is the target we finally settled on",
+                        "knowledge_entry_id": "kb-1"
+                    }),
+                )
+                .await
+                .expect("write succeeds")
+        })
+        .await;
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("json");
+        assert_eq!(parsed["ok"], true, "{out}");
+        assert!(
+            parsed.get("rejected").is_none(),
+            "an entry that resolves must not be rejected: {out}"
+        );
+        let notes = store.lock().unwrap();
+        assert_eq!(
+            notes[0].knowledge_entry_id.as_deref(),
+            Some("kb-1"),
+            "the note must carry the attachment"
+        );
+    }
+
+    #[tokio::test]
+    async fn scratchpad_write_rejects_an_attachment_whose_entry_does_not_resolve() {
+        // Storing an id that names nothing would leave the model believing it
+        // pinned a fact it never attached. It is told at the write instead.
+        let (service, store) = service_with_one_entry("kb-1");
+        let out = with_conversation_id(ConversationId::from("conv-1"), async {
+            service
+                .execute_tool(
+                    TOOL_SCRATCHPAD_WRITE,
+                    serde_json::json!({
+                        "key": "deploy-target",
+                        "content": "settled",
+                        "knowledge_entry_id": "kb-nope"
+                    }),
+                )
+                .await
+                .expect("the call reports the refusal, it does not fail")
+        })
+        .await;
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("json");
+        let rejected = parsed["rejected"]
+            .as_array()
+            .expect("the note must be rejected, not stored");
+        assert_eq!(rejected[0]["key"], "deploy-target", "{out}");
+        assert!(
+            rejected[0]["reason"]
+                .as_str()
+                .expect("a reason")
+                .contains("kb-nope"),
+            "the reason must name the id that did not resolve: {out}"
+        );
+        assert!(
+            store.lock().unwrap().is_empty(),
+            "nothing is written when the attachment does not resolve"
+        );
+    }
+
+    #[test]
+    fn scratchpad_write_advertises_the_knowledge_entry_attachment() {
+        // A schema that does not name the field is a contract the model cannot
+        // use.
+        let (service, _store) = service_with_one_entry("kb-1");
+        let def = service
+            .tool_definitions()
+            .into_iter()
+            .find(|t| t.name == TOOL_SCRATCHPAD_WRITE)
+            .expect("the write tool is advertised");
+        let schema = serde_json::to_string(&def.parameters).expect("schema");
+        assert!(
+            schema.contains("knowledge_entry_id"),
+            "the attachment must be advertised: {schema}"
+        );
     }
 
     #[test]

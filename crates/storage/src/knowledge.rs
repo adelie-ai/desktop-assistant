@@ -471,6 +471,33 @@ impl PgKnowledgeBaseStore {
         Ok(rows.into_iter().map(|r| r.into_entry()).collect())
     }
 
+    /// Fetch a batch of entries by id in a single statement (#1104).
+    ///
+    /// Ids that name no live entry the calling user owns are absent from the
+    /// result rather than an error: a caller resolving scratchpad attachments
+    /// treats an absent id as an attachment that no longer resolves, which is
+    /// the same answer for a deleted entry, a trashed one, and another user's.
+    /// Retired (`deleted_at`) rows are excluded, exactly as
+    /// [`KnowledgeBaseStore::get`](desktop_assistant_core::ports::knowledge::KnowledgeBaseStore::get)
+    /// excludes them.
+    pub async fn get_many(&self, ids: &[String]) -> Result<Vec<KnowledgeEntry>, CoreError> {
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let user_id = current_user_id();
+        let rows: Vec<KbRow> = sqlx::query_as(
+            "SELECT id, content, tags, metadata, created_at, updated_at, source, summary \
+             FROM knowledge_base \
+             WHERE user_id = $1 AND id = ANY($2) AND deleted_at IS NULL",
+        )
+        .bind(user_id.as_str())
+        .bind(ids)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CoreError::Storage(e.to_string()))?;
+        Ok(rows.into_iter().map(|r| r.into_entry()).collect())
+    }
+
     /// Delete a batch of entries by id in a single statement. Returns the
     /// number of rows actually removed (ids not owned by the user are no-ops).
     pub async fn delete_many(&self, ids: &[String]) -> Result<usize, CoreError> {

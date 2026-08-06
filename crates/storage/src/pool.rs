@@ -196,6 +196,9 @@ const MIGRATIONS: &[Migration] = &[
     // #1097: a one-line summary per knowledge entry, so a reader can list many
     // entries without printing or truncating each whole body.
     migration!("041_knowledge_base_summary.sql"),
+    // #1104: a scratchpad note can attach a knowledge entry, so pinning that
+    // note keeps the entry's live content in view instead of a stale copy.
+    migration!("042_scratchpad_knowledge_entry.sql"),
 ];
 
 /// Second half of the advisory-lock key: the schema the migrations write to.
