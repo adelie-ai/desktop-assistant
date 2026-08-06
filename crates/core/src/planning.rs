@@ -525,6 +525,55 @@ pub(crate) fn render_scratchpad_index(keys: &[&str], max_items: usize) -> Option
 /// deleted, trashed, or belongs to another user.
 pub(crate) type PinnedEntries<'a> = std::collections::HashMap<&'a str, &'a str>;
 
+/// True when this note attaches a knowledge entry that the round's read did not
+/// find (#1104): the entry was deleted, trashed, or belongs to another user.
+///
+/// `entries` of `None` means the read did not run, which is not evidence that
+/// anything has gone, so nothing is dangling then.
+fn dangling_attachment(note: &RawNote<'_>, entries: Option<&PinnedEntries<'_>>) -> bool {
+    match (note.knowledge_entry_id, entries) {
+        (Some(id), Some(found)) => !found.contains_key(id),
+        _ => false,
+    }
+}
+
+/// The live content of the entry this note attaches, when there is one and the
+/// round resolved it.
+fn attached_entry<'a>(
+    note: &RawNote<'_>,
+    entries: Option<&'a PinnedEntries<'_>>,
+) -> Option<&'a str> {
+    let id = note.knowledge_entry_id?;
+    entries?.get(id).copied()
+}
+
+/// One pinned note as it renders: its own text, then the attached entry's live
+/// content on an indented line beneath it.
+///
+/// The entry is reduced to one bounded line
+/// ([`PINNED_ENTRY_MAX_CHARS`](crate::ports::scratchpad::PINNED_ENTRY_MAX_CHARS)),
+/// because a note is capped at
+/// [`MAX_NOTE_BYTES`](crate::ports::scratchpad::MAX_NOTE_BYTES) and an entry is
+/// not. The id travels with it so the model can read the whole entry with
+/// `builtin_knowledge_base_get` when the bounded form is not enough.
+fn pinned_chunk(note: &RawNote<'_>, entry: Option<&str>) -> String {
+    let mut chunk = format!("- {}:", note.key);
+    if !note.content.is_empty() {
+        chunk.push(' ');
+        chunk.push_str(note.content);
+    }
+    if let (Some(id), Some(text)) = (note.knowledge_entry_id, entry) {
+        chunk.push_str("\n  knowledge entry ");
+        chunk.push_str(id);
+        chunk.push_str(": ");
+        chunk.push_str(&desktop_assistant_protocol::one_line(
+            text,
+            crate::ports::scratchpad::PINNED_ENTRY_MAX_CHARS,
+        ));
+    }
+    chunk
+}
+
 /// Render the per-turn `[Pinned]` block: the full content of every pinned note
 /// (#597).
 ///
@@ -542,47 +591,60 @@ pub(crate) type PinnedEntries<'a> = std::collections::HashMap<&'a str, &'a str>;
 /// so a stable order keeps the prompt prefix byte-identical between turns
 /// instead of reshuffling and defeating provider prompt caching.
 ///
-/// `budget` bounds the whole block. Truncation is always explicit — a
-/// `… (truncated)` marker on an over-long note, and a trailing count of notes
-/// that did not fit — because a silently dropped pin is exactly the failure this
-/// feature exists to prevent. Returns `None` when nothing is pinned.
+/// A note may also attach a knowledge entry (#1104). `entries` carries the
+/// content read for this round, so the entry is dereferenced here and not when
+/// the note was written - edit the entry and the block follows. The note's own
+/// text renders first and the entry beneath it, because the note says why the
+/// entry matters right now and the entry carries the fact. An attachment that
+/// no longer resolves takes its note out of the block and is named in a trailing
+/// line, never left to render as an empty pin. `entries` is `None` when the
+/// resolving read did not run at all, and then no attachment counts as gone.
+///
+/// `budget` bounds the whole block, both kinds of pin together. Truncation is
+/// always explicit — a `… (truncated)` marker on an over-long note, `...` on an
+/// over-long entry, and a trailing count of notes that did not fit — because a
+/// silently dropped pin is exactly the failure this feature exists to prevent.
+/// Returns `None` when nothing is pinned.
 pub(crate) fn render_pinned(
     notes: &[RawNote<'_>],
     entries: Option<&PinnedEntries<'_>>,
     budget: usize,
 ) -> Option<String> {
-    let _ = entries;
-    let mut pinned: Vec<&RawNote<'_>> = notes
-        .iter()
-        .filter(|n| n.pinned && n.knowledge_entry_id.is_none())
-        .collect();
+    let mut pinned: Vec<&RawNote<'_>> = notes.iter().filter(|n| n.pinned).collect();
     if pinned.is_empty() {
         return None;
     }
     pinned.sort_by_key(|n| (n.owner_todo, n.key));
     pinned.dedup_by_key(|n| (n.owner_todo, n.key));
 
-    let total = pinned.len();
+    // Split out the attachments whose entry no longer resolves. They are not
+    // rendered at all - a pin that shows nothing is a fact the model believes
+    // it has and does not - and they are named below instead.
+    let (released, live): (Vec<&&RawNote<'_>>, Vec<&&RawNote<'_>>) =
+        pinned.iter().partition(|n| dangling_attachment(n, entries));
+
+    let total = live.len();
     let mut lines: Vec<String> = Vec::new();
     let mut used = 0usize;
-    for note in &pinned {
-        // Reserve room for the "- key: " prefix so a single huge note is
+    for note in &live {
+        // Reserve room for the "- key: " prefix so a single huge pin is
         // trimmed to fit rather than blowing past the budget on its own.
         let overhead = note.key.len() + 4;
-        let remaining = budget.saturating_sub(used + overhead);
-        if remaining == 0 {
+        let allowed = budget.saturating_sub(used);
+        if allowed <= overhead {
             break;
         }
-        let content = if note.content.len() > remaining {
+        let chunk = pinned_chunk(note, attached_entry(note, entries));
+        let chunk = if chunk.len() > allowed {
             format!(
                 "{}… (truncated)",
-                truncate_on_char_boundary(note.content, remaining)
+                truncate_on_char_boundary(&chunk, allowed)
             )
         } else {
-            note.content.to_string()
+            chunk
         };
-        used += overhead + content.len();
-        lines.push(format!("- {}: {}", note.key, content));
+        used += chunk.len();
+        lines.push(chunk);
     }
 
     // NB: `lines` may be empty here if even one note could not be trimmed to
@@ -603,6 +665,18 @@ pub(crate) fn render_pinned(
         out.push_str(&format!(
             "({dropped} pinned note(s) did not fit here; unpin some or shorten them, \
              or read them with builtin_scratchpad_search.)"
+        ));
+    }
+    if !released.is_empty() {
+        if !lines.is_empty() || dropped > 0 {
+            out.push('\n');
+        }
+        let mut keys: Vec<&str> = released.iter().map(|n| n.key).collect();
+        keys.sort_unstable();
+        out.push_str(&format!(
+            "(unpinned, because the knowledge entry it pointed at no longer exists: {}. \
+             Write it again from what you know, or pin a different entry.)",
+            keys.join(", ")
         ));
     }
     Some(out)

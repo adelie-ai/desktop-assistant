@@ -391,7 +391,11 @@ impl ScratchpadStore for PgScratchpadStore {
         Ok(result.rows_affected())
     }
 
-    async fn release_knowledge_references(&self, note_ids: &[String]) -> Result<u64, CoreError> {
+    async fn release_knowledge_references(
+        &self,
+        conversation_id: &str,
+        note_ids: &[String],
+    ) -> Result<u64, CoreError> {
         if note_ids.is_empty() {
             return Ok(0);
         }
@@ -413,9 +417,11 @@ impl ScratchpadStore for PgScratchpadStore {
         // actually repaired and makes a second call a true no-op.
         let result = sqlx::query(
             "UPDATE scratchpads SET knowledge_entry_id = NULL, pinned = FALSE \
-             WHERE user_id = $1 AND id = ANY($2) AND knowledge_entry_id IS NOT NULL",
+             WHERE user_id = $1 AND conversation_id = $2 AND id = ANY($3) \
+               AND knowledge_entry_id IS NOT NULL",
         )
         .bind(user_id.as_str())
+        .bind(conversation_id)
         .bind(note_ids)
         .execute(&self.pool)
         .await

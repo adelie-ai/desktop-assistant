@@ -1649,6 +1649,11 @@ async fn main() -> Result<()> {
     let mut scratchpad_delete_subtree_fn: Option<
         desktop_assistant_core::ports::scratchpad::ScratchpadDeleteSubtreeFn,
     > = None;
+    // #1104: the repair that drops a note's knowledge-entry attachment once the
+    // entry no longer resolves, so a reference never outlives its entry.
+    let mut scratchpad_release_references_fn: Option<
+        desktop_assistant_core::ports::scratchpad::ScratchpadReleaseReferencesFn,
+    > = None;
     let mut descendant_task_probe: Option<desktop_assistant_core::service::DescendantTaskProbe> =
         None;
 
@@ -1849,6 +1854,28 @@ async fn main() -> Result<()> {
                 })
             });
         scratchpad_delete_subtree_fn = Some(delete_subtree_fn);
+
+        // #1104: the render path calls this with the notes whose attached
+        // knowledge entry no longer resolves. It emits ScratchpadChanged like
+        // every other mutation, because a released pin is a visible change to
+        // the pad a client may be showing.
+        let sp_rr = Arc::clone(&sp_store);
+        let reg_rr = Arc::clone(&background_task_registry);
+        let release_references_fn: desktop_assistant_core::ports::scratchpad::ScratchpadReleaseReferencesFn =
+            Arc::new(move |conv: String, note_ids: Vec<String>| {
+                let store = Arc::clone(&sp_rr);
+                let reg = Arc::clone(&reg_rr);
+                Box::pin(async move {
+                    let released = store
+                        .release_knowledge_references(&conv, &note_ids)
+                        .await?;
+                    if released > 0 {
+                        reg.notify_scratchpad_changed(&current_user_id(), conv);
+                    }
+                    Ok(released)
+                })
+            });
+        scratchpad_release_references_fn = Some(release_references_fn);
 
         let reg_probe = Arc::clone(&background_task_registry);
         let probe: desktop_assistant_core::service::DescendantTaskProbe =
@@ -2721,6 +2748,19 @@ async fn main() -> Result<()> {
     }
     if let Some(list_fn) = scratchpad_list_fn {
         handler = handler.with_scratchpad_list(list_fn);
+    }
+    // #1104: resolve the knowledge entries pinned notes attach, one batched read
+    // per round, and repair a note whose entry has gone. Both need a database;
+    // without one a note cannot carry an attachment in the first place.
+    if let Some(kb) = &kb_store {
+        let kb_gm = Arc::clone(kb);
+        handler = handler.with_knowledge_get_many(Arc::new(move |ids: Vec<String>| {
+            let store = Arc::clone(&kb_gm);
+            Box::pin(async move { store.get_many(&ids).await })
+        }));
+    }
+    if let Some(release_fn) = scratchpad_release_references_fn {
+        handler = handler.with_scratchpad_release_references(release_fn);
     }
     // #287: the complete_step cascade (subtree-delete) + its lifecycle gate.
     if let Some(delete_subtree_fn) = scratchpad_delete_subtree_fn {

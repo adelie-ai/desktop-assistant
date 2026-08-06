@@ -196,7 +196,8 @@ pub(crate) struct TurnAnchors<'a> {
     pub plan: Option<&'a str>,
     pub scratchpad_index: Option<&'a str>,
     /// Rendered `[Pinned]` block (#597): the full content of the notes the
-    /// model pinned. Ungated — unlike `scratchpad_index`, it renders every turn
+    /// model pinned, and the live content of the knowledge entries they attach
+    /// (#1104). Ungated — unlike `scratchpad_index`, it renders every turn
     /// whenever anything is pinned.
     pub pinned: Option<&'a str>,
     /// Counts behind the always-on `[Working state]` nudge (#598), carried as
@@ -914,9 +915,11 @@ fn system_block(
 ///   every turn either count is non-zero, minus whichever half a fuller block
 ///   below already covers.
 /// - `[Plan]` — the open todo tree, whenever one exists.
-/// - `[Pinned]` — the full content of the model's pinned notes, whenever any
-///   are pinned. Deliberately ungated: the point of a pin is that the fact stays
-///   in view without the model having to notice context is under pressure.
+/// - `[Pinned]` — the full content of the model's pinned notes, plus the live
+///   content of any knowledge entry those notes attach (#1104), whenever
+///   anything is pinned. Deliberately ungated: the point of a pin is that the
+///   fact stays in view without the model having to notice context is under
+///   pressure.
 /// - `[Scratchpad]` — the free-form note-key index, gated on the same
 ///   "context is dropping" signal as `[Current task]`.
 fn surfaced_blocks(

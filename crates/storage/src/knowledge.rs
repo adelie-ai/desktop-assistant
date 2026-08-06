@@ -478,8 +478,7 @@ impl PgKnowledgeBaseStore {
     /// treats an absent id as an attachment that no longer resolves, which is
     /// the same answer for a deleted entry, a trashed one, and another user's.
     /// Retired (`deleted_at`) rows are excluded, exactly as
-    /// [`KnowledgeBaseStore::get`](desktop_assistant_core::ports::knowledge::KnowledgeBaseStore::get)
-    /// excludes them.
+    /// [`KnowledgeBaseStore::get`] excludes them.
     pub async fn get_many(&self, ids: &[String]) -> Result<Vec<KnowledgeEntry>, CoreError> {
         if ids.is_empty() {
             return Ok(vec![]);

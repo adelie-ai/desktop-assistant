@@ -1094,7 +1094,7 @@ async fn pinned_reference_stays_within_the_calling_user() {
                     "bob must not see alice's note, attachment and all"
                 );
                 assert_eq!(
-                    pad.release_knowledge_references(&[alice_note_id.clone()])
+                    pad.release_knowledge_references("c1", std::slice::from_ref(&alice_note_id))
                         .await
                         .expect("bob release"),
                     0,
@@ -1276,7 +1276,7 @@ async fn releasing_a_reference_clears_the_attachment_and_the_pin() {
                 let id = saved[0].id.clone();
 
                 assert_eq!(
-                    pad.release_knowledge_references(&[id.clone()])
+                    pad.release_knowledge_references("c1", std::slice::from_ref(&id))
                         .await
                         .expect("release"),
                     1
@@ -1287,7 +1287,7 @@ async fn releasing_a_reference_clears_the_attachment_and_the_pin() {
                 assert_eq!(notes[0].content, "settled", "the model's own words survive");
 
                 assert_eq!(
-                    pad.release_knowledge_references(&[id])
+                    pad.release_knowledge_references("c1", &[id])
                         .await
                         .expect("release again"),
                     0,

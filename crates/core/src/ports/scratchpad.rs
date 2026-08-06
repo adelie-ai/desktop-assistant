@@ -342,7 +342,8 @@ pub trait ScratchpadStore: Send + Sync {
     ///
     /// Why note ids and not keys: a key is unique per `(conversation,
     /// owner_todo)`, and the render reads a whole subagent subtree, so a key
-    /// alone could name a row in a different namespace.
+    /// alone could name a row in a different namespace. `conversation_id`
+    /// still travels, so the repair cannot reach outside the pad it read.
     ///
     /// Why it is not namespace-confined the way [`Self::set_pinned`] and
     /// [`Self::delete_many`] are: those confine what a *subagent* may reach,
@@ -354,6 +355,7 @@ pub trait ScratchpadStore: Send + Sync {
     /// returns 0.
     fn release_knowledge_references(
         &self,
+        conversation_id: &str,
         note_ids: &[String],
     ) -> impl Future<Output = Result<u64, CoreError>> + Send;
 
@@ -455,7 +457,7 @@ pub type ScratchpadSetPinnedFn = Arc<
 /// note id (#1104). Returns the count changed. See
 /// [`ScratchpadStore::release_knowledge_references`].
 pub type ScratchpadReleaseReferencesFn = Arc<
-    dyn Fn(Vec<String>) -> Pin<Box<dyn Future<Output = Result<u64, CoreError>> + Send>>
+    dyn Fn(String, Vec<String>) -> Pin<Box<dyn Future<Output = Result<u64, CoreError>> + Send>>
         + Send
         + Sync,
 >;
@@ -711,6 +713,7 @@ mod tests {
 
         async fn release_knowledge_references(
             &self,
+            _conversation_id: &str,
             note_ids: &[String],
         ) -> Result<u64, CoreError> {
             Ok(note_ids.len() as u64)

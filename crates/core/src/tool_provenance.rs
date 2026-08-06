@@ -841,6 +841,14 @@ pub fn subagent_payload_carries_an_answer(result: &str) -> bool {
 /// general answer is the durable taint marker that would let a rendered
 /// surface carry its own provenance, not a third special case here.
 ///
+/// A pinned note may also attach a knowledge entry (#1104), whose content
+/// renders into every later turn by the same route. That widens the surface but
+/// not the exposure: an entry is written by `builtin_knowledge_base_write`,
+/// which is `Mutate` and so refused for the rest of a tainted turn, and
+/// attaching one goes through `builtin_scratchpad_write`, which is `Mutate`
+/// too. The entry is the user's own store either way, which is why the
+/// knowledge reads are `Trusted`.
+///
 /// The stamp is also a disclosure. It is prepended to the text the model
 /// reads, so the model is told where the content came from rather than left to
 /// treat it as the assistant's own words.

@@ -876,7 +876,11 @@ impl BuiltinToolService {
                  step's raw work into a note — rather than hand-managing `todo` notes here. The \
                  scratchpad is discarded when the conversation is deleted and is NOT durable across \
                  conversations — promote anything worth keeping to the knowledge base with \
-                 builtin_knowledge_base_write, then delete the note here.",
+                 builtin_knowledge_base_write, then delete the note here. A note can also attach a \
+                 knowledge entry with `knowledge_entry_id`; pin that note and you get its live \
+                 content back every turn, so prefer attaching over copying an entry's text into a \
+                 note. Omitting `knowledge_entry_id` keeps whatever the note already attaches, so \
+                 an ordinary rewrite never drops it.",
                 serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -889,7 +893,8 @@ impl BuiltinToolService {
                                     "content": {"type": "string", "description": "The note body (keep it small and high-signal)."},
                                     "type": {"type": "string", "description": "Category, e.g. \"todo\"/\"note\"/\"other\". Defaults to \"note\". Used for filtering/grouping; same-type notes sort by `sequence`."},
                                     "sequence": {"type": "integer", "description": "Optional ordering hint within the type (ascending). Use for ordered todos."},
-                                    "done": {"type": "boolean", "description": "Whether this note (e.g. a todo) is checked off. Defaults to false."}
+                                    "done": {"type": "boolean", "description": "Whether this note (e.g. a todo) is checked off. Defaults to false."},
+                                    "knowledge_entry_id": {"type": "string", "description": "Attach a knowledge-base entry (its id from builtin_knowledge_base_search/get). Pinning the note then shows the entry's live content under [Pinned]. Omit to keep whatever is already attached; a wrong id is refused."}
                                 },
                                 "required": ["key", "content"]
                             },
@@ -899,7 +904,8 @@ impl BuiltinToolService {
                         "content": {"type": "string", "description": "Single-note convenience: the note body (use with `key`)."},
                         "type": {"type": "string", "description": "Single-note convenience: the note type (default \"note\")."},
                         "sequence": {"type": "integer", "description": "Single-note convenience: ordering hint within the type."},
-                        "done": {"type": "boolean", "description": "Single-note convenience: checked-off flag."}
+                        "done": {"type": "boolean", "description": "Single-note convenience: checked-off flag."},
+                        "knowledge_entry_id": {"type": "string", "description": "Single-note convenience: attach a knowledge-base entry by id."}
                     }
                 }),
             ),
@@ -967,7 +973,10 @@ impl BuiltinToolService {
                  harmful to get wrong — not something merely interesting. Unpin the moment it \
                  stops mattering; a stale pin costs you context every single turn. At most 5 \
                  notes can be pinned at once, and hitting that is the signal to unpin \
-                 something, not to shuffle.",
+                 something, not to shuffle. A note that attaches a knowledge entry \
+                 (builtin_scratchpad_write `knowledge_entry_id`) renders the entry's live \
+                 content under the note, read fresh every turn — so pin one of those rather \
+                 than copying an entry's text into a note, and draw on the same 5.",
                 serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -2222,6 +2231,34 @@ impl BuiltinToolService {
                 }));
                 continue;
             }
+            // An attachment is checked before it is stored. An id that names no
+            // entry this user owns would otherwise sit on the note until the
+            // next render dropped it, and the model would believe it had
+            // attached a fact it never did.
+            if let Some(entry_id) = note.knowledge_entry_id.as_deref() {
+                match self.resolve_attachment(entry_id).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        rejected.push(serde_json::json!({
+                            "key": note.key,
+                            "reason": format!(
+                                "knowledge entry {entry_id} was not found; search for it \
+                                 with builtin_knowledge_base_search and use the id it returns"
+                            )
+                        }));
+                        continue;
+                    }
+                    Err(e) => {
+                        rejected.push(serde_json::json!({
+                            "key": note.key,
+                            "reason": format!(
+                                "could not check knowledge entry {entry_id}: {e}"
+                            )
+                        }));
+                        continue;
+                    }
+                }
+            }
             if let Some(existing) = accepted.iter_mut().find(|n| n.key == note.key) {
                 *existing = note;
             } else {
@@ -2264,6 +2301,20 @@ impl BuiltinToolService {
             ));
         }
         Ok(response.to_string())
+    }
+
+    /// Whether `entry_id` names a live knowledge entry the caller owns (#1104).
+    ///
+    /// `Err` is a technical failure to check - no knowledge base is wired, or
+    /// the read failed - and is reported as such rather than as "not found", so
+    /// the model can tell a wrong id from an unavailable store.
+    async fn resolve_attachment(&self, entry_id: &str) -> Result<bool, CoreError> {
+        let get_fn = self.kb_get_fn.as_ref().ok_or_else(|| {
+            CoreError::ToolExecution(
+                "knowledge base not configured, so a note cannot attach an entry".to_string(),
+            )
+        })?;
+        Ok(get_fn(entry_id.to_string()).await?.is_some())
     }
 
     async fn scratchpad_search(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
@@ -2341,6 +2392,9 @@ impl BuiltinToolService {
                 // So the model can see what it has already pinned without a
                 // second call — the cap makes that worth knowing (#597).
                 "pinned": note.pinned,
+                // And what it has attached, so a note it wrote turns back up
+                // carrying the same reference it was given (#1104).
+                "knowledge_entry_id": note.knowledge_entry_id,
                 "updated_at": note.updated_at,
             });
             let size = entry.to_string().len();
@@ -2739,6 +2793,16 @@ fn parse_new_note(obj: &serde_json::Value) -> Option<NewScratchpadNote> {
         .get("done")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
+    // An omitted id preserves whatever the stored note already attaches, so a
+    // plain content rewrite cannot drop an attachment (the storage upsert
+    // COALESCEs it). A blank string is treated as omitted rather than as an id
+    // that will never resolve.
+    let knowledge_entry_id = obj
+        .get("knowledge_entry_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
     Some(NewScratchpadNote {
         key: key.trim().to_string(),
         content: content.to_string(),
@@ -2748,7 +2812,7 @@ fn parse_new_note(obj: &serde_json::Value) -> Option<NewScratchpadNote> {
         // Filled in by the write closure, the one place every scratchpad write
         // passes through (#717).
         embedding: None,
-        knowledge_entry_id: None,
+        knowledge_entry_id,
     })
 }
 
