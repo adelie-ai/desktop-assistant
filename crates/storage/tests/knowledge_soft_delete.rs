@@ -345,6 +345,90 @@ async fn get_returns_none_for_soft_deleted() {
     fx.cleanup().await;
 }
 
+// --- the write path ---------------------------------------------------------
+
+/// Read a row's stored fields whatever its `deleted_at`, which no port does.
+async fn raw_row(pool: &PgPool, id: &str) -> (String, Vec<String>, bool) {
+    let row: (String, Vec<String>, Option<chrono::DateTime<chrono::Utc>>) =
+        sqlx::query_as("SELECT content, tags, deleted_at FROM knowledge_base WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("read the raw row");
+    (row.0, row.1, row.2.is_some())
+}
+
+#[tokio::test]
+async fn write_to_a_retired_entry_is_refused_and_changes_nothing() {
+    // `get` hides a retired entry, so a caller that looks first sees a free
+    // id and writes to it. The upsert conflicts on the tombstone, which it
+    // never revives, so the new content lands in a row no read can reach and
+    // the reap removes it on its original clock. The write reported success.
+    //
+    // Reachable without a race: consolidation retires an entry overnight and
+    // the assistant still holds that id the next day.
+    let Some(fx) = fixture().await else {
+        eprintln!("skip: TEST_DATABASE_URL not set");
+        return;
+    };
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+
+    write_entry(&store, "retired", "the original text").await;
+    soft_delete(&fx.pool, "retired").await;
+
+    let err = with_user_id(UserId::new(USER), async {
+        store
+            .write(KnowledgeEntry::new(
+                "retired",
+                "text the assistant wanted to keep",
+                vec!["memory".into()],
+            ))
+            .await
+    })
+    .await
+    .expect_err("a write onto a retired entry is refused");
+    assert!(
+        err.to_string().contains("retired"),
+        "the refusal must say the id belongs to a retired entry: {err}"
+    );
+
+    let (content, tags, deleted) = raw_row(&fx.pool, "retired").await;
+    assert_eq!(
+        content, "the original text",
+        "the refused write left the retired row's content alone"
+    );
+    assert_eq!(
+        tags,
+        vec!["notes".to_string()],
+        "the refused write left the retired row's tags alone"
+    );
+    assert!(deleted, "the refused write did not revive the row");
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn write_to_a_restored_entry_succeeds_again() {
+    // The refusal is about the tombstone, not about the id. Once the row is
+    // live again a write must land on it as any other update would, or the
+    // refusal has quietly become permanent.
+    let Some(fx) = fixture().await else {
+        eprintln!("skip: TEST_DATABASE_URL not set");
+        return;
+    };
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+
+    write_entry(&store, "retired", "the original text").await;
+    soft_delete(&fx.pool, "retired").await;
+    restore(&fx.pool, "retired").await;
+
+    write_entry(&store, "retired", "the updated text").await;
+
+    let (content, _, deleted) = raw_row(&fx.pool, "retired").await;
+    assert_eq!(content, "the updated text");
+    assert!(!deleted, "premise: the row is live for this write");
+    fx.cleanup().await;
+}
+
 // --- embedding pipeline -----------------------------------------------------
 
 #[tokio::test]

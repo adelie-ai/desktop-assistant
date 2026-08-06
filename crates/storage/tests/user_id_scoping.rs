@@ -517,6 +517,67 @@ async fn knowledge_get_by_id_does_not_leak_across_users() {
     .await;
 }
 
+#[tokio::test]
+async fn knowledge_write_to_another_users_id_is_refused_and_changes_nothing() {
+    // `knowledge_base.id` is a global primary key, so one user's id can
+    // conflict with another's row. The upsert's conflict clause is scoped by
+    // `user_id`, so the update matches nothing and the write must fail rather
+    // than overwrite, create, or report success. Ids are UUIDs, so this is a
+    // backstop and not an expected path - but it is the backstop the scoping
+    // predicate provides, so it is pinned.
+    with_fixture(
+        "knowledge_write_to_another_users_id_is_refused_and_changes_nothing",
+        |fx| async move {
+            let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+
+            with_user_id(UserId::new("alice"), async {
+                let entry =
+                    KnowledgeEntry::new("kb-shared-id", "alice content", vec!["pref".into()]);
+                store.write(entry).await.expect("alice write");
+            })
+            .await;
+
+            let bob_write = with_user_id(UserId::new("bob"), async {
+                store
+                    .write(KnowledgeEntry::new(
+                        "kb-shared-id",
+                        "bob content",
+                        vec!["memory".into()],
+                    ))
+                    .await
+            })
+            .await;
+            assert!(
+                bob_write.is_err(),
+                "bob's write onto alice's id must fail, got {bob_write:?}"
+            );
+
+            // Alice's row is exactly as she left it.
+            let alice_fetch = with_user_id(UserId::new("alice"), async {
+                store.get("kb-shared-id").await
+            })
+            .await
+            .expect("alice get")
+            .expect("alice still holds the entry");
+            assert_eq!(alice_fetch.content, "alice content");
+            assert_eq!(alice_fetch.tags, vec!["pref".to_string()]);
+
+            // And bob has nothing.
+            let bob_fetch = with_user_id(UserId::new("bob"), async {
+                store.get("kb-shared-id").await
+            })
+            .await
+            .expect("bob get");
+            assert!(
+                bob_fetch.is_none(),
+                "the refused write created nothing for bob"
+            );
+            fx
+        },
+    )
+    .await;
+}
+
 // -- turn state (issue #107) -------------------------------------------------
 
 fn turn_row(id: &str, user_id: &str, conversation_id: &str, status: TurnStatus) -> TurnRow {
