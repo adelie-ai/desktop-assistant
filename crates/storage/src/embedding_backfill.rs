@@ -658,11 +658,23 @@ pub async fn backfill_scratchpad_embeddings(
                             total += 1;
                             any_succeeded = true;
                         }
-                        Ok(_) | Err(_) => {
-                            // Stamp the model without a vector so a permanently
-                            // failing note is retried once per model change
-                            // rather than on every pass.
-                            tracing::warn!("skipping scratchpad note {id}");
+                        // Both remaining arms stamp the model without a vector,
+                        // so a permanently failing note is retried once per
+                        // model change rather than on every pass. They are kept
+                        // apart because the operator's next step differs: a
+                        // short answer points at a provider that silently caps
+                        // its batch, an error at a backend that is down or
+                        // rate-limiting.
+                        Ok(embeddings) => {
+                            tracing::warn!(
+                                "skipping scratchpad note {id}: embedder returned {} vector(s) \
+                                 for {expected} chunk(s)",
+                                embeddings.len()
+                            );
+                            write_scratchpad_embedding(pool, id, None, current_model).await?;
+                        }
+                        Err(e) => {
+                            tracing::warn!("skipping scratchpad note {id}: {e}");
                             write_scratchpad_embedding(pool, id, None, current_model).await?;
                         }
                     }
