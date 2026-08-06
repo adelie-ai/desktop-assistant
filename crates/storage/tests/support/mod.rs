@@ -223,6 +223,32 @@ impl io::Write for SharedBuf {
     }
 }
 
+static PERMISSIVE_GLOBAL_DEFAULT: Once = Once::new();
+
+/// Install a permissive baseline subscriber as the process-wide global
+/// default, once per test binary.
+///
+/// `tracing` caches each callsite's `Interest` globally, not per thread. Without
+/// this, a callsite first evaluated on a thread that has no `set_default`
+/// override (the ambient no-op default, which accepts nothing) latches
+/// "never" for the whole process -- and then a *different* thread's
+/// `capture_tracing` call below never sees that callsite's event at all,
+/// because interest is checked before dispatch, upstream of which subscriber
+/// is current. This showed up as a rare flake: the assertion failed only when
+/// several tests using `capture_tracing` ran concurrently with tests that
+/// don't, never when run alone.
+///
+/// The fix is to make every subscriber this module ever installs -- this one
+/// and the per-call one below -- accept everything unconditionally, so no
+/// concurrent cache rebuild can ever regress a callsite back to "never".
+fn ensure_permissive_global_default() {
+    PERMISSIVE_GLOBAL_DEFAULT.call_once(|| {
+        let sink = tracing_subscriber::fmt().with_writer(io::sink).finish();
+        tracing::subscriber::set_global_default(sink)
+            .expect("install the permissive global default subscriber exactly once");
+    });
+}
+
 /// Run `f` under a `fmt` subscriber that writes every emitted event into a
 /// buffer, and return `f`'s result alongside the captured text. Used to
 /// assert on a log line's content -- e.g. that a warning names both the
@@ -239,6 +265,7 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = T>,
 {
+    ensure_permissive_global_default();
     let buf = SharedBuf(Arc::new(Mutex::new(Vec::new())));
     let for_writer = buf.clone();
     let subscriber = tracing_subscriber::fmt()
