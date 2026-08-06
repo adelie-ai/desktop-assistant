@@ -16,6 +16,10 @@
 //!    another model has another dimension, and the vector operator answers that
 //!    with an error rather than a miss - which would fail the read instead of
 //!    degrading it.
+//! 4. **The degraded arm answers.** `search_text_any_term` is what runs when no
+//!    embedding is available. It has to match on *any* of a whole user
+//!    sentence's terms, because a fallback that answers nothing is not a
+//!    fallback.
 //!
 //! ## Running locally
 //!
@@ -398,6 +402,239 @@ async fn nearest_tags_answer_nothing_without_an_embedding() {
             .await
             .expect("an absent embedding is not an error");
         assert!(hits.is_empty());
+    })
+    .await;
+
+    fx.cleanup().await;
+}
+
+// -- the degraded (no embedding) arm ----------------------------------------
+
+#[tokio::test]
+async fn any_term_search_matches_an_entry_that_carries_one_of_the_prompts_words() {
+    // The defect this query exists to avoid: `plainto_tsquery` ANDs every
+    // lexeme, so a whole sentence asks one entry to contain all of it. The
+    // entry below says nothing about "live", and must still be found.
+    let Some(fx) = fixture().await else { return };
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+
+    with_user_id(UserId::new(USER), async {
+        store
+            .write(KnowledgeEntry::new(
+                "kb-registry",
+                "The registry is on the storage host.",
+                vec!["infra".to_string()],
+            ))
+            .await
+            .expect("write succeeds");
+
+        let all_terms = store
+            .search_text("where does the registry live?", None, 10)
+            .await
+            .expect("the read succeeds");
+        assert!(
+            all_terms.is_empty(),
+            "precondition: the AND-joined search finds nothing for a sentence"
+        );
+
+        let any_term = store
+            .search_text_any_term("where does the registry live?", 10)
+            .await
+            .expect("the read succeeds");
+        let ids: Vec<&str> = any_term.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, vec!["kb-registry"]);
+    })
+    .await;
+
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn any_term_search_ranks_the_entry_that_carries_more_of_the_terms_first() {
+    // Widening the match set must not put the weakest hit at the top: the block
+    // renders the first eight and drops the rest.
+    let Some(fx) = fixture().await else { return };
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+
+    with_user_id(UserId::new(USER), async {
+        // Both entries match, so the ordering is what is under test: `kb-weak`
+        // carries one of the query's terms and `kb-strong` carries both.
+        for (id, content) in [
+            ("kb-weak", "A note about where the lab equipment lives."),
+            (
+                "kb-strong",
+                "The registry lives on the storage host in the lab.",
+            ),
+        ] {
+            store
+                .write(KnowledgeEntry::new(id, content, vec![]))
+                .await
+                .expect("write succeeds");
+        }
+
+        let hits = store
+            .search_text_any_term("where does the registry live?", 10)
+            .await
+            .expect("the read succeeds");
+        let ids: Vec<&str> = hits.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["kb-strong", "kb-weak"],
+            "both match, and the one carrying more of the terms ranks first"
+        );
+    })
+    .await;
+
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn any_term_search_never_crosses_the_user_boundary() {
+    let Some(fx) = fixture().await else { return };
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+
+    with_user_id(UserId::new(OTHER_USER), async {
+        store
+            .write(KnowledgeEntry::new(
+                "kb-theirs",
+                "The registry is on their storage host.",
+                vec![],
+            ))
+            .await
+            .expect("write succeeds");
+    })
+    .await;
+
+    with_user_id(UserId::new(USER), async {
+        let hits = store
+            .search_text_any_term("where does the registry live?", 10)
+            .await
+            .expect("the read succeeds");
+        assert!(
+            hits.is_empty(),
+            "the degraded arm is scoped exactly like the semantic one"
+        );
+    })
+    .await;
+
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn any_term_search_skips_a_retired_entry() {
+    let Some(fx) = fixture().await else { return };
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+
+    with_user_id(UserId::new(USER), async {
+        store
+            .write(KnowledgeEntry::new(
+                "kb-retired",
+                "The registry is on the storage host.",
+                vec![],
+            ))
+            .await
+            .expect("write succeeds");
+    })
+    .await;
+    sqlx::query("UPDATE knowledge_base SET deleted_at = NOW() WHERE id = $1")
+        .bind("kb-retired")
+        .execute(&fx.pool)
+        .await
+        .expect("retire the entry");
+
+    with_user_id(UserId::new(USER), async {
+        let hits = store
+            .search_text_any_term("where does the registry live?", 10)
+            .await
+            .expect("the read succeeds");
+        assert!(hits.is_empty());
+    })
+    .await;
+
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn any_term_search_answers_nothing_for_a_prompt_with_no_terms() {
+    // "the a of" reduces to no lexemes at all, which builds a NULL query. It
+    // must match no row rather than every row.
+    let Some(fx) = fixture().await else { return };
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+
+    with_user_id(UserId::new(USER), async {
+        store
+            .write(KnowledgeEntry::new("kb-mine", "Some content here.", vec![]))
+            .await
+            .expect("write succeeds");
+
+        for prompt in ["the a of", "   ", ""] {
+            let hits = store
+                .search_text_any_term(prompt, 10)
+                .await
+                .expect("the read succeeds");
+            assert!(
+                hits.is_empty(),
+                "prompt {prompt:?} matched {} rows",
+                hits.len()
+            );
+        }
+    })
+    .await;
+
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn any_term_search_treats_tsquery_operators_as_text() {
+    // A user prompt is text. Left as syntax, `!` and `&` and `<->` would either
+    // raise or silently change what was asked.
+    let Some(fx) = fixture().await else { return };
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+
+    with_user_id(UserId::new(USER), async {
+        store
+            .write(KnowledgeEntry::new(
+                "kb-mine",
+                "A note about the registry.",
+                vec![],
+            ))
+            .await
+            .expect("write succeeds");
+
+        let hits = store
+            .search_text_any_term("registry & !nonsense <-> 'quoted' | more", 10)
+            .await
+            .expect("operators in a prompt must not fail the read");
+        let ids: Vec<&str> = hits.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, vec!["kb-mine"]);
+    })
+    .await;
+
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn any_term_search_stops_at_its_limit() {
+    let Some(fx) = fixture().await else { return };
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+
+    with_user_id(UserId::new(USER), async {
+        for i in 0..5 {
+            store
+                .write(KnowledgeEntry::new(
+                    format!("kb-{i}"),
+                    "A note about the registry.",
+                    vec![],
+                ))
+                .await
+                .expect("write succeeds");
+        }
+
+        let hits = store
+            .search_text_any_term("registry", 3)
+            .await
+            .expect("the read succeeds");
+        assert_eq!(hits.len(), 3);
     })
     .await;
 

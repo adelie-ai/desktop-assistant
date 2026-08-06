@@ -19,7 +19,7 @@ it matters.
 - kb-1a2b [preference, ui] Prefers dark themes in every editor
 - kb-9f31 [infra, deploy] The deploy target is the lab cluster
 ...and 17 more entries matched less closely.
-Tags near this prompt: deploy, infra, preference, project:adelie-ai, ui
+Tags near this prompt: project:adelie-ai, infra, deploy, ui, preference
 ```
 
 Each entry line carries the entry id, the entry's tags, and the one line that
@@ -27,7 +27,21 @@ stands for it. That line is `KnowledgeEntry::display_line()`: the stored
 `summary` where there is one, and otherwise a whitespace-collapsed prefix of
 `content` capped at 200 characters. An entry with no summary is **not** skipped -
 until the dream cycle has filled the column in, almost every entry has none, so a
-block that skipped them would show nothing.
+block that skipped them would show nothing. An entry whose line comes out empty
+is skipped, because it would spend a line of the budget to say nothing.
+
+Tag names are listed nearest first, not alphabetically.
+
+**Every part of the block is bounded.** The id passes through the same one-line
+rule the summary does. The block is line-structured and it is a system message,
+so a stored value carrying a newline would forge a line - and the line above it
+is a block header the model is taught to trust. An entry id is taken from the
+write tool's caller and stored as written, so nothing before this point bounds
+it.
+
+Tag names are bounded by size rather than cut: a name that does not fit the
+remaining width is left out. Half a tag name is a tag no row carries, and the
+model is handed these names precisely so it can search on one.
 
 ## Two arms, one embedding
 
@@ -57,8 +71,11 @@ deliberately conservative starting points rather than measured values: a block
 that stays quiet costs nothing, and a block full of unrelated memory can pull the
 model off the ask.
 
-**A line budget.** Eight entry lines and five tag names, each entry line bounded
-at 200 characters, which puts the whole block near 300 tokens.
+**A line budget.** Eight entry lines and five tag names. Every part is capped -
+64 characters of id, 120 of an entry's tags, 200 of summary, and 240 for the
+whole tag line - so the block cannot exceed about 3400 characters whatever the
+store holds. Real entries carry a short id and a few tags, which puts the usual
+block near 300 tokens.
 
 **One round.** Every other per-turn block re-renders each round, because each is
 answering "is this still in view?". `[Recall]` answers "what might this prompt be
@@ -93,9 +110,23 @@ knowledge arm degrades to full-text search, and the tag arm goes quiet - the
 registry carries no full-text index to fall back to. The degradation is logged
 once, not once per arm.
 
+The whole lookup carries a second ceiling of ten seconds. The embedding timeout
+bounds only the embedding; the database round trips around it are bounded by the
+connection pool acquire timeout, which is measured in tens of seconds. Recall
+runs before every turn's first round, so a saturated pool would otherwise hold
+each turn far longer than the embedding timeout suggests.
+
+The degraded search asks for **any** of the prompt's terms, not all of them. The
+ordinary `search_text` joins every lexeme with `AND`, which is right for a
+model-authored query of two or three words and wrong for a whole user sentence:
+"where does the registry live?" becomes `registri & live`, and an entry saying
+"the registry is on the storage host" never says "live". The fallback would then
+answer nothing at exactly the moment it exists to answer something. Ranking still
+puts the entry carrying more of the terms first.
+
 Over the full-text path there is no distance to compare, and no floor is applied:
-`tsv @@ query` is itself a binary relevance test, so a row that does not carry the
-prompt's terms is never returned.
+a row that carries none of the prompt's terms is never returned, which is a floor
+of its own.
 
 If the degraded read fails as well, the block is omitted and the turn proceeds.
 
@@ -119,6 +150,24 @@ backend, and the daemon says which of the three reasons applies at startup.
 Turning it off restores exactly the behaviour that preceded the feature: the
 assistant reaches its knowledge base only when it decides to search.
 
+## Known limits
+
+**The floors are untuned.** Both are conservative starting points chosen to keep
+the block quiet, not values measured against a real store. Widening them is the
+safe direction.
+
+**The scan reads whole rows.** Fifty entries are read to render eight lines,
+because the count of what did not fit has to be a count. The row count is
+bounded; the bytes those rows carry are not, so a store of unusually long entries
+pays more per prompt than a store of one-liners.
+
+**It fires on every turn, including agent and subagent runs.** Any turn that goes
+through `send_prompt` gets a lookup, so a spawned agent working from a
+machine-written brief pays one embedding and two reads as well.
+
+**Cancellation waits on the lookup.** A turn cancelled while the lookup is in
+flight still waits for it, bounded by the ten-second whole-lookup ceiling.
+
 ## Where the code is
 
 | Piece | Path |
@@ -129,4 +178,5 @@ assistant reaches its knowledge base only when it decides to search.
 | Rendered on the first round | `surfaced_blocks`, `crates/core/src/context/mod.rs` |
 | Embedding, both queries, degradation | `crates/daemon/src/recall.rs` |
 | The knowledge query | `PgKnowledgeBaseStore::nearest_by_embedding`, `crates/storage/src/knowledge.rs` |
+| The degraded query | `PgKnowledgeBaseStore::search_text_any_term`, same file |
 | The tag query | `tag_registry::nearest_tags`, `crates/storage/src/tag_registry.rs` |

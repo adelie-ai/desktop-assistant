@@ -1171,8 +1171,9 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             entry_limit: crate::recall::RECALL_ENTRY_SCAN_LIMIT,
             tag_limit: crate::recall::RECALL_TAG_SCAN_LIMIT,
         };
+        let entry_limit = request.entry_limit;
         match lookup(request).await {
-            Ok(candidates) => crate::recall::render_recall(&candidates),
+            Ok(candidates) => crate::recall::render_recall(&candidates, entry_limit),
             Err(e) => {
                 tracing::warn!(error = %e, "pre-prompt recall lookup failed; continuing without it");
                 None
@@ -6326,6 +6327,109 @@ mod tests {
             block.contains("The registry runs on the storage host"),
             "{block}"
         );
+    }
+
+    /// A recall lookup that answers with one near hit and counts its calls.
+    fn counting_recall_hit() -> (crate::ports::recall::RecallSearchFn, Arc<Mutex<usize>>) {
+        let calls = Arc::new(Mutex::new(0usize));
+        let seen = Arc::clone(&calls);
+        let inner = recall_hit();
+        let counting: crate::ports::recall::RecallSearchFn = Arc::new(move |request| {
+            *seen.lock().unwrap() += 1;
+            inner(request)
+        });
+        (counting, calls)
+    }
+
+    #[tokio::test]
+    async fn recall_is_looked_up_once_for_a_whole_multi_round_turn() {
+        // The block answers "what might this prompt be about?", and the prompt
+        // asks that once. A lookup per round would spend an embedding and two
+        // reads on every tool call, and repeat an answer the model already took
+        // or ignored.
+        let captured: Arc<Mutex<Vec<Vec<Message>>>> = Arc::new(Mutex::new(Vec::new()));
+        let llm = PlanContextCapturingLlm {
+            responses: Mutex::new(vec![
+                LlmResponse::with_tool_calls("", vec![ToolCall::new("t1", "probe", "{}")]),
+                LlmResponse::with_tool_calls("", vec![ToolCall::new("t2", "probe", "{}")]),
+                LlmResponse::text("done"),
+            ]),
+            captured: Arc::clone(&captured),
+        };
+        let mut results = HashMap::new();
+        results.insert("probe".to_string(), "ok".to_string());
+        let (lookup, calls) = counting_recall_hit();
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            llm,
+            MockToolExecutor::new(
+                vec![ToolDefinition::new("probe", "Probe", serde_json::json!({}))],
+                results,
+            ),
+            id_gen(),
+        )
+        .with_recall_search(lookup);
+
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(
+                &conv.id,
+                "where does the registry live?".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *calls.lock().unwrap(),
+            1,
+            "one lookup per turn, not per round"
+        );
+
+        let rounds = captured.lock().unwrap();
+        let dispatch_rounds: Vec<&Vec<Message>> = rounds.iter().collect();
+        assert!(
+            dispatch_rounds.len() >= 3,
+            "precondition: the turn ran more than one round, got {}",
+            dispatch_rounds.len()
+        );
+        let carrying = dispatch_rounds
+            .iter()
+            .filter(|msgs| {
+                msgs.iter()
+                    .any(|m| m.role == Role::System && m.content.starts_with("[Recall]"))
+            })
+            .count();
+        assert_eq!(
+            carrying, 1,
+            "the block reaches the model on the first round and no other"
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_is_not_looked_up_for_a_prompt_with_nothing_in_it() {
+        // A whitespace-only prompt has nothing to embed. Spending the embedding
+        // and two reads on it would cost the turn for a block that could only
+        // ever be noise.
+        let (lookup, calls) = counting_recall_hit();
+        let handler =
+            ConversationHandler::new(MockStore::new(), MockLlm::new(vec!["ok"]), id_gen())
+                .with_recall_search(lookup);
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+
+        handler
+            .send_prompt(&conv.id, "   \n\t ".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+
+        assert_eq!(*calls.lock().unwrap(), 0);
     }
 
     #[tokio::test]

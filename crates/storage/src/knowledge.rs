@@ -563,6 +563,59 @@ impl PgKnowledgeBaseStore {
             .collect())
     }
 
+    /// Full-text search that asks for **any** of the query's terms, best match
+    /// first.
+    ///
+    /// The degraded arm of the `[Recall]` block (#1100) when no embedding is
+    /// available. It exists because `search_text` cannot serve that caller:
+    /// `plainto_tsquery` joins every surviving lexeme with `AND`, which is right
+    /// for a model-authored search query of two or three words, and wrong for a
+    /// whole user sentence. "where does the registry live?" becomes
+    /// `'registri' & 'live'`, and an entry saying "the registry is on the
+    /// storage host" does not match, because it never says "live". The fallback
+    /// would then answer with nothing at exactly the moment it exists to answer
+    /// with something.
+    ///
+    /// The query is built from `to_tsvector`'s own lexemes, so stop words and
+    /// stemming are handled once by the same configuration the index uses, and
+    /// `quote_literal` makes every lexeme a literal - a prompt full of
+    /// `tsquery` operators is text, not syntax. A prompt that reduces to no
+    /// lexemes at all yields a NULL query, which matches no row.
+    ///
+    /// Ranking still rewards an entry that carries more of the terms, so the
+    /// widened match set does not put the weakest hit first.
+    ///
+    /// Scoped to the task-local user by an explicit `WHERE user_id` predicate.
+    pub async fn search_text_any_term(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<KnowledgeEntry>, CoreError> {
+        let user_id = current_user_id();
+        let rows: Vec<KbRow> = sqlx::query_as(
+            "WITH q AS (
+                 SELECT to_tsquery('english', string_agg(quote_literal(lexeme), ' | ')) AS query
+                 FROM unnest(to_tsvector('english', $1))
+             )
+             SELECT id, content, tags, metadata, created_at, updated_at, source, summary
+             FROM knowledge_base, q
+             WHERE user_id = $3
+               AND deleted_at IS NULL
+               AND q.query IS NOT NULL
+               AND tsv @@ q.query
+             ORDER BY ts_rank_cd(tsv, q.query) DESC, updated_at DESC
+             LIMIT $2",
+        )
+        .bind(query)
+        .bind(limit as i64)
+        .bind(user_id.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CoreError::Storage(e.to_string()))?;
+
+        Ok(rows.into_iter().map(|r| r.into_entry()).collect())
+    }
+
     /// Delete a batch of entries by id in a single statement. Returns the
     /// number of rows actually removed (ids not owned by the user are no-ops).
     pub async fn delete_many(&self, ids: &[String]) -> Result<usize, CoreError> {
