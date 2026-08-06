@@ -993,11 +993,15 @@ mod tests {
     /// allows it, at the hedged form and the longer noun.
     #[test]
     fn the_did_not_fit_line_stays_inside_the_bound_the_budget_assumes() {
+        // The constant carries the line's own newline, so the text itself has
+        // one character less to spend.
+        let bound = RECALL_DROPPED_LINE_MAX_CHARS - 1;
         for noun in ["entries", "notes"] {
             let line = dropped_line(usize::MAX, true, noun).expect("a count that dropped rows");
             assert!(
-                line.chars().count() <= 65,
-                "the widest \"did not fit\" line is {} characters: {line}",
+                line.chars().count() <= bound,
+                "the widest \"did not fit\" line is {} characters, over the {bound} the budget \
+                 allows it: {line}",
                 line.chars().count()
             );
         }
