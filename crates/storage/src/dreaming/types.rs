@@ -82,6 +82,19 @@ pub const MAX_HOLISTIC_PROMPT_CHARS: usize = 40_000;
 /// at 3, one slice costs at most 15 calls before it is declared a real failure.
 pub const MAX_SLICE_SPLIT_DEPTH: usize = 3;
 
+/// Upper bound on the knowledge entries one dream cycle may summarise.
+///
+/// The pass is a backfill, not a deadline. The reference instance carried 722
+/// live entries with no summary at all, and a single unbounded pass over a store
+/// that size is a large, unattended spend on a model that may be metered. At
+/// this cap and the default hourly cycle a backlog that size drains in an
+/// afternoon, and what is left over is simply taken next time.
+///
+/// The budget is shared across the users that have work, so total spend per
+/// cycle is bounded by this number whatever the tenancy, and one user's large
+/// backlog cannot starve another's small one.
+pub const MAX_SUMMARIES_PER_CYCLE: usize = 200;
+
 /// Safety cap: the fraction of a user's active entries a single holistic run
 /// may prune outright. Merges don't count - their content survives in the
 /// canonical row. Excess prunes are dropped with a warning.
