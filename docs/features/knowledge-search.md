@@ -75,14 +75,19 @@ a render site would print a blank row instead of falling back to the content, an
 a pass over the entries that have none would look for them with
 `WHERE summary IS NULL`.
 
-Two consumers of the field are designed and not yet built: the pass that writes
-the summaries of entries stored before the argument existed (#1099), and the
-`[Recall]` block that offers candidate entries to the model before its first move
-(#1100). Until they land, a summary travels on every read - the knowledge tools report
-it beside the content, and it reaches each client on the wire - and nothing
-fills one in that the model did not write. What a given client's knowledge
-browser does with it is that repository's own work; `display_line` on the
-domain and wire types is the shared rule for it.
+Two consumers of the field are built. The `[Recall]` block offers candidate
+entries to the model before its first move, one line per entry, and that line is
+the summary (#1100). The dream cycle's summary backfill writes the line for
+entries that carry none - every entry stored before the argument existed, and any
+later write that named no summary - and writes it again when the body changes
+after it (#1099); see `docs/features/knowledge-maintenance.md`. That pass is
+bounded per cycle, so an entry written moments ago, or one in a store still
+draining its backlog, has none yet, and a reader falls back to the body.
+
+Beyond those two, a summary travels on every read: the knowledge tools report it
+beside the content, and it reaches each client on the wire. What a given client's
+knowledge browser does with it is that repository's own work; `display_line` on
+the domain and wire types is the shared rule for it.
 
 ## Scope, not match count
 

@@ -34,7 +34,7 @@ use desktop_assistant_core::CoreError;
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 
-pub use summarize::SummaryStats;
+pub use summarize::{SummaryStats, run_summary_phase};
 pub use trash::{empty_trash, reap_expired_trash, sweep_expired_trash, trash_count};
 pub use types::{
     BackfillEmbedFn, ConsolidationStats, DreamingLlmFn, KbDeleteKind, KnowledgeChangeFn,

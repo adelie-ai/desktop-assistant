@@ -38,7 +38,7 @@ use std::sync::{Arc, Mutex};
 use desktop_assistant_core::domain::{KnowledgeEntry, SUMMARY_MAX_CHARS};
 use desktop_assistant_core::ports::knowledge::KnowledgeBaseStore;
 use desktop_assistant_storage::dreaming::{
-    BackfillEmbedFn, DreamingLlmFn, MAX_SUMMARIES_PER_CYCLE, run_dreaming_scan,
+    BackfillEmbedFn, DreamingLlmFn, MAX_SUMMARIES_PER_CYCLE, run_dreaming_scan, run_summary_phase,
 };
 use desktop_assistant_storage::{PgKnowledgeBaseStore, UserId, with_user_id};
 use sqlx::PgPool;
@@ -115,6 +115,19 @@ fn llm_summarising_everything(prompts: Arc<Mutex<Vec<String>>>) -> DreamingLlmFn
 /// unauthorized backend.
 fn failing_llm() -> DreamingLlmFn {
     Box::new(move |_system, _user| Box::pin(async move { Err("backend refused".to_string()) }))
+}
+
+/// A dreaming LLM that fails any call whose prompt carries `marker`, and answers
+/// every other call. One user's rows carry the marker, so that user's pass fails
+/// while the users around it succeed.
+fn failing_for(prompts: Arc<Mutex<Vec<String>>>, marker: &'static str) -> DreamingLlmFn {
+    let answering = summarising_llm(prompts, |content| Some(content.to_string()));
+    Box::new(move |system, user| {
+        if user.contains(marker) {
+            return Box::pin(async move { Err("backend refused".to_string()) });
+        }
+        answering(system, user)
+    })
 }
 
 /// An embedder that must never be called: none of these tests seed a
@@ -206,12 +219,16 @@ async fn seed_many(pool: &PgPool, user_id: &str, count: i32) {
     seed_many_for(pool, user_id, "bulk", count).await;
 }
 
-/// [`seed_many`] with an id prefix, so two users' backlogs do not collide on
-/// the globally-unique entry id.
+/// [`seed_many`] with a prefix, so two users' backlogs do not collide on the
+/// globally-unique entry id.
+///
+/// The prefix goes in the body as well as the id, because the prompt numbers
+/// entries rather than naming them: a fake that has to recognise one user's rows
+/// can only do it from the content.
 async fn seed_many_for(pool: &PgPool, user_id: &str, prefix: &str, count: i32) {
     sqlx::query(
         "INSERT INTO knowledge_base (id, user_id, content, tags) \
-         SELECT $3 || '-' || g, $1, 'A durable fact numbered ' || g, '{}'::text[] \
+         SELECT $3 || '-' || g, $1, $3 || ' durable fact numbered ' || g, '{}'::text[] \
          FROM generate_series(1, $2) g",
     )
     .bind(user_id)
@@ -566,6 +583,101 @@ async fn dream_summary_pass_leaves_a_summary_supplied_through_the_store_alone() 
         kb_summary(pool, "kb-supplied").await.as_deref(),
         Some("Keeps facet colons in tag names"),
         "a summary a caller supplied is current, not work for the pass"
+    );
+
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn dream_summary_pass_charges_the_cycle_budget_for_a_user_whose_pass_failed() {
+    // A user whose every batch fails still read its rows and spent its calls.
+    // Handing that share back to the users behind it would let one cycle take
+    // more rows than the cap allows, which is exactly what the cap is for.
+    //
+    // Three users, so the shares do not divide evenly and the last one is
+    // limited by what the budget has left rather than by its own share. That is
+    // the only place the charge is visible from outside.
+    let Some(fx) = support::DbFixture::try_new("dream1099").await else {
+        return;
+    };
+    let pool = &fx.pool;
+
+    let share = MAX_SUMMARIES_PER_CYCLE.div_ceil(3) as i32;
+    // Users are taken in id order, so `u1` runs first and fails.
+    seed_many_for(pool, "u1", "doomed", share).await;
+    seed_many_for(pool, "u2", "b", share).await;
+    seed_many_for(pool, "u3", "c", share).await;
+
+    // Content is what the fake reads, and only the first user's rows carry the
+    // marker, so exactly that user's calls fail.
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let llm = failing_for(prompts, "doomed");
+    run_cycle(pool, &llm).await;
+
+    assert_eq!(
+        kb_summarised_count(pool, "u1").await,
+        0,
+        "premise: the first user's pass failed outright"
+    );
+    assert_eq!(
+        kb_summarised_count(pool, "u2").await + kb_summarised_count(pool, "u3").await,
+        (MAX_SUMMARIES_PER_CYCLE - share as usize) as i64,
+        "the failed user's share is spent, not handed to the users behind it"
+    );
+
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn dream_summary_pass_counts_only_the_rows_it_showed_the_model() {
+    // The pass reports what it did and what it left behind, and an operator
+    // reads that to decide whether the backfill is progressing. Counting the
+    // rows pulled from the worklist rather than the rows actually sent would
+    // make a cancelled pass claim work it never did.
+    let Some(fx) = support::DbFixture::try_new("dream1099").await else {
+        return;
+    };
+    let pool = &fx.pool;
+
+    // More than one batch, so there is work left to cancel before.
+    let seeded = 40;
+    seed_many_for(pool, "u1", "d", seeded).await;
+
+    // Cancels itself after answering the first batch, so the batches behind it
+    // are never sent.
+    let cancellation = CancellationToken::new();
+    let token = cancellation.clone();
+    let llm: DreamingLlmFn = Box::new(move |_system, user| {
+        let token = token.clone();
+        let answered = entries_in_prompt(&user)
+            .iter()
+            .map(|(number, content)| {
+                format!(
+                    r#"{{"entry":{number},"summary":{}}}"#,
+                    serde_json::to_string(content).expect("a summary serializes")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        Box::pin(async move {
+            token.cancel();
+            Ok(format!(r#"{{"summaries":[{answered}]}}"#))
+        })
+    });
+
+    let stats = run_summary_phase(pool, &llm, &cancellation, None)
+        .await
+        .expect("a cancelled pass is not a failed pass");
+
+    assert!(
+        stats.attempted < seeded as usize,
+        "a cancelled pass must not report the rows it never sent: attempted {} of {seeded}",
+        stats.attempted
+    );
+    assert_eq!(
+        stats.attempted,
+        kb_summarised_count(pool, "u1").await as usize,
+        "every row it showed the model was answered, so attempted matches what landed"
     );
 
     fx.cleanup().await;
