@@ -3332,6 +3332,45 @@ mod tests {
     }
 
     #[test]
+    fn pinned_and_recall_both_render_and_recall_sits_last() {
+        // Two blocks that arrived from different work and answer different
+        // questions. `[Pinned]` says "this is current, do not re-read it";
+        // `[Recall]` says "this may not fit, ignore it if not". Order matters:
+        // the least authoritative block sits closest to the user prompt that
+        // follows, so a hint is never read as a standing fact.
+        let msgs = vec![Message::new(Role::User, "where does the registry live?")];
+        let result = assemble_for_test(
+            &ConversationView {
+                messages: &msgs,
+                ..Default::default()
+            },
+            &ToolContext::default(),
+            &TurnAnchors {
+                active_task: Some("where does the registry live?"),
+                pinned: Some("- api-quirk: /login is form-encoded, not JSON"),
+                recall: Some("Memory that may relate.\n- kb-1 [infra] The registry host"),
+                tool_rounds_since_anchor: 0,
+                ..Default::default()
+            },
+            None,
+            &default_estimate,
+        );
+
+        let pinned_at = result
+            .iter()
+            .position(|m| m.content.starts_with("[Pinned]"))
+            .expect("[Pinned] must still render alongside [Recall]");
+        let recall_at = result
+            .iter()
+            .position(|m| m.content.starts_with("[Recall]"))
+            .expect("[Recall] must still render alongside [Pinned]");
+        assert!(
+            pinned_at < recall_at,
+            "the hint goes last, nearest the prompt it is a hint about"
+        );
+    }
+
+    #[test]
     fn recall_block_is_absent_when_the_lookup_produced_nothing() {
         // No candidate cleared a floor, so the producer hands over nothing and
         // the seam emits no empty block.
