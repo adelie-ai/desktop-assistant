@@ -155,14 +155,32 @@ branches, so a caller never has to handle a degraded contract.
 A field the model is never told to read is a field it does not use, so the
 knowledge-base prompt section states the procedure:
 
-1. Search with a natural-language query and no tags, then filter on a tag from
-   `available_tags`. Never invent one.
+1. Search with a natural-language question and no tags, then filter on a tag
+   from `available_tags`. Never invent one. The standing advice to filter on the
+   narrowest tag is explicitly ordered after this step, so the model cannot
+   filter on a guess before it has seen the vocabulary.
 2. When no tag fits, sweep with `builtin_knowledge_base_list` and its
-   `next_cursor`, up to three pages. A larger `limit` on search is named as the
-   wrong move, because it re-ranks the whole store rather than reaching further
-   into it.
+   `next_cursor`, bounded at three pages of fifty.
 3. When the sweep finds the entry, re-tag it, preferring a tag that
-   `available_tags` already reports.
+   `available_tags` already reports, and carrying the entry's existing tags
+   forward.
+
+Two of those are worth stating plainly, because both invite a wrong instruction.
+
+**A larger search `limit` is not a way to reach further, but not because it
+finds nothing new.** It does: `search_hybrid` derives `fetch_limit` as
+`limit * 2` for both retrieval arms and `result_limit` as `limit` for the page,
+so a bigger limit really does surface entries a smaller one truncated away. It
+is the wrong move because the model cannot tell how far down the ranking the
+entry sits, so the retry is a guess that costs an embedding round-trip. A sweep
+is bounded and it reports what has already been read. The prompt says that,
+rather than the tidier falsehood.
+
+**A re-tag replaces the whole tag list.** `build_write_entry` uses the supplied
+`tags` array verbatim, and the upsert is `SET tags = EXCLUDED.tags`. A model
+told only to "add the missing facet" sends one tag and destroys the entry's KIND
+tag and its project scope - so the prompt says the tags sent replace the old
+ones, and to carry the existing ones forward.
 
 Step 3 needs the tag-registry dedup gate on `builtin_knowledge_base_write`.
 Without it, an instruction to add tags splits the vocabulary faster than the

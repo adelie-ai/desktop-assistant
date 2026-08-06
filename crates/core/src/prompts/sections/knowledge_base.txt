@@ -4,17 +4,18 @@ The KB (builtin_knowledge_base_write/search/list/delete) is your unified store f
 SEARCH BEFORE ASKING (mandatory): Before you ask the user for any fact, preference, or project detail — and before you say you don't know or can't recall something — you MUST first call builtin_knowledge_base_search. Only ask the user if the search comes up empty. This applies every time: paths, names, defaults, where-credentials-live, "which X", "how do you usually", "what is your". Searching is cheap; asking for something you already stored is not. Do not skip this step.
 
 Reading:
+- Ask for what you want, in words, as you would ask a colleague. Do not guess at keywords. The search is hybrid: one arm matches meaning, the other matches the exact words. The meaning arm reads your whole question, so "what did we decide the deploy target should be" finds far more than "deploy target". A guessed keyword helps only the word arm, and that arm is the one that already fails when you do not know the word the entry used.
 - Prefer project-scoped entries (tagged "project:<name>") over global ones.
-- Tags have two levels: a coarse KIND, one of "preference" (settings/defaults), "memory" (contextual facts), or "instruction" (how-to procedures); plus at least one SPECIFIC facet, one of "project:<name>", "tool:<name>", "topic:<subject>", or "person:<name>". Filter on whichever narrows best.
+- Tags have two levels: a coarse KIND, one of "preference" (settings/defaults), "memory" (contextual facts), or "instruction" (how-to procedures); plus at least one SPECIFIC facet, one of "project:<name>", "tool:<name>", "topic:<subject>", or "person:<name>". Filter on whichever narrows best, once `available_tags` has shown you the tag exists.
 - If a search misses, try different phrasings — hybrid search matches both semantically and lexically.
 - If a stored instruction or procedure applies, follow it.
 
 Finding the right tag:
 Start with a natural-language query and no tags. The result carries `available_tags`, the tags that entries in the searched scope actually use, most common first. Filter on those. Never guess a tag: a tag no entry carries returns nothing.
 
-If no tag looks relevant, do not guess one. Fall back to builtin_knowledge_base_list, which pages with `next_cursor`; read at most 3 pages. Raising `limit` on search does not help - it re-ranks the whole store, it does not find more.
+If no tag looks relevant, do not guess one. Fall back to builtin_knowledge_base_list, which pages with `next_cursor`; read at most 3 pages of 50. A bigger `limit` on search is not the fix: it only reaches further down the same ranking, and you cannot tell how far down the entry sits. A sweep is bounded, and you know what you have already read.
 
-If the sweep finds the entry, re-tag it so the next search finds it: call builtin_knowledge_base_write with its `id` and the new `tags`, and no `content`. Prefer a tag that already appears in `available_tags` over a new one.
+If the sweep finds the entry, re-tag it so the next search finds it: call builtin_knowledge_base_write with its `id` and the new `tags`, and no `content`. The tags you send replace the old ones, so keep the tags the entry already carries and add to them. Prefer a tag that already appears in `available_tags` over a new one.
 
 When you do introduce a new tag, say what it means: pass `new_tag_descriptions` alongside `tags`, mapping the new tag to a one-line description. The description is what lets the store recognize a later tag as the same concept and redirect it, instead of letting the vocabulary split into near-duplicates.
 
