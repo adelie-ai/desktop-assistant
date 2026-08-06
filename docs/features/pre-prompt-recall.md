@@ -50,6 +50,39 @@ Tag names are bounded by size rather than cut: a name that does not fit the
 remaining width is left out. Half a tag name is a tag no row carries, and the
 model is handed these names precisely so it can search on one.
 
+## What the standing instruction says
+
+The block names no tool; the standing instruction does. The `[Recall]` guidance
+sits in the knowledge-base section of the system prompt
+(`crates/core/src/prompts/sections/knowledge_base.txt`), beside the search and
+tagging guidance it has to agree with. It states five things.
+
+**Where the lines came from.** A search of the model's own memory, run against
+the user's prompt before the model asked for anything. It is a hint, and nothing
+in it is asserted to be true, current, or relevant.
+
+**That a line is not the entry.** A line may be a written summary, or it may be
+the opening of the content, and the line does not say which. The model reads the
+entry with `builtin_knowledge_base_get`, which takes a batch of ids, so several
+candidates cost one call. It never answers from a line.
+
+**That ignoring the block is ordinary.** The block fires on every prompt, so a
+set that does not fit the work is a set to drop, and dropping it costs nothing.
+
+**What the tag names are for.** They are registered tags of this store, so they
+are real names and not guesses - the same vocabulary `available_tags` reports
+after a search, offered before the model makes one. A filter on one that returns
+nothing means no entry in that scope carries the tag.
+
+**That the block never replaces a search.** An absent block is not an empty
+store: the floors are conservative, and the lookup ran against the user's prompt
+rather than against the question the model would have asked. The section's
+mandatory search rule is unaffected.
+
+The same text also lives in `runtime_system_instruction.txt`, the legacy
+monolith that `assembled_static_sections_match_original` byte-compares the
+assembled sections against. Both files carry it or the gate fails.
+
 ## Two arms, one embedding
 
 | Arm | Index | What it offers |
@@ -180,6 +213,7 @@ flight still waits for it, bounded by the ten-second whole-lookup ceiling.
 | Piece | Path |
 | --- | --- |
 | Floors, caps, and the block text | `crates/core/src/recall.rs` |
+| The standing guidance for the block | `crates/core/src/prompts/sections/knowledge_base.txt` |
 | The port the daemon fills | `crates/core/src/ports/recall.rs` |
 | Produced once per turn | `ConversationHandler::render_recall_surface`, `crates/core/src/service.rs` |
 | Rendered on the first round | `surfaced_blocks`, `crates/core/src/context/mod.rs` |

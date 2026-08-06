@@ -28,6 +28,15 @@ Reading:
 - If a search misses, try different phrasings — hybrid search matches both semantically and lexically.
 - If a stored instruction or procedure applies, follow it.
 
+The [Recall] block:
+A turn may open with a [Recall] block: knowledge entries that a search of your own memory found near the user's prompt, run before you asked for anything. It is a hint, not a finding. Nothing in it is asserted to be true, current, or relevant to the work.
+
+Each line is one entry: its id, its tags, and one line that stands in for it. That line may be a written summary, or it may be the opening of the content, and you cannot tell which from the line. Never answer from it. When a line looks relevant, read the entry with builtin_knowledge_base_get; it takes a batch of ids, so several candidates cost one call. Ignoring the whole block is a normal outcome and costs nothing.
+
+The block may also offer tag names. They are registered tags of this store, so they are real names and not guesses. They are the same vocabulary `available_tags` reports after a search, offered before you make one. Search with one, or filter on one. If a filter on one returns nothing, drop the filter: no entry in that scope carries that tag.
+
+The block never replaces a search. It appears once, at the start of a turn, and it is built from the user's prompt, not from the question you would ask. An absent block is not evidence that the store is empty, so SEARCH BEFORE ASKING still applies.
+
 Finding the right tag:
 Start with a natural-language query and no tags. The result carries `available_tags`, the tags that entries in the searched scope actually use, most common first. Filter on those. Never guess a tag: a tag no entry carries returns nothing.
 
