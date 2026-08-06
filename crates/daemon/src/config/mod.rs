@@ -169,6 +169,49 @@ pub struct DaemonConfig {
     /// `[deployment]` — where this daemon runs. Absent section => detect it.
     #[serde(default, skip_serializing_if = "DeploymentConfig::is_default")]
     pub deployment: DeploymentConfig,
+    /// `[recall]` — pre-prompt memory recall (#1100). Absent section =>
+    /// defaults (on).
+    #[serde(default, skip_serializing_if = "RecallConfig::is_default")]
+    pub recall: RecallConfig,
+}
+
+/// `[recall]` configuration: whether a user prompt is looked up against the
+/// assistant's memory before the model sees it.
+///
+/// On by default. The lookup costs one embedding and two indexed reads per
+/// turn, and the block it produces stays silent unless something clears its
+/// relevance floor - but it does fire on every prompt, so an operator who does
+/// not want that spend has one switch for it.
+///
+/// Turning it off restores exactly the behaviour that preceded the feature: the
+/// assistant reaches its knowledge base only when it decides to search.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RecallConfig {
+    /// Whether the daemon runs the pre-prompt recall lookup. It also degrades
+    /// off on its own when no knowledge store or no embedding backend is
+    /// configured.
+    #[serde(default = "default_recall_enabled")]
+    pub enabled: bool,
+}
+
+impl Default for RecallConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_recall_enabled(),
+        }
+    }
+}
+
+impl RecallConfig {
+    /// Whether this equals the default section, so a default `[recall]` is not
+    /// serialized (keeping migrated `daemon.toml` output stable).
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+fn default_recall_enabled() -> bool {
+    true
 }
 
 /// `[deployment]` configuration: what kind of machine this daemon runs on.
@@ -4013,6 +4056,45 @@ max_context_tokens = 1000000
         let serialized = toml::to_string(&config).unwrap();
         let reparsed: DaemonConfig = toml::from_str(&serialized).unwrap();
         assert_eq!(config.personality, reparsed.personality);
+    }
+
+    // --- [recall] section (#1100) ------------------------------------------
+
+    #[test]
+    fn recall_defaults_to_on_when_the_section_is_absent() {
+        // Memory that arrives unasked is the point of the feature, so an
+        // install that says nothing gets it.
+        let config: DaemonConfig = toml::from_str("").unwrap();
+        assert!(config.recall.enabled);
+    }
+
+    #[test]
+    fn recall_section_switches_the_feature_off_and_round_trips() {
+        let config: DaemonConfig = toml::from_str(
+            r#"
+            [recall]
+            enabled = false
+            "#,
+        )
+        .unwrap();
+
+        assert!(!config.recall.enabled);
+
+        let serialized = toml::to_string(&config).unwrap();
+        let reparsed: DaemonConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(config.recall, reparsed.recall);
+    }
+
+    #[test]
+    fn a_default_recall_section_is_not_written_back_out() {
+        // Migration output and freshly written configs stay minimal: an absent
+        // `[recall]` table already means "all defaults".
+        let config: DaemonConfig = toml::from_str("").unwrap();
+        let serialized = toml::to_string(&config).unwrap();
+        assert!(
+            !serialized.contains("[recall]"),
+            "a default section must not be serialized: {serialized}"
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────

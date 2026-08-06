@@ -497,6 +497,72 @@ impl PgKnowledgeBaseStore {
         Ok(rows.into_iter().map(|r| r.into_entry()).collect())
     }
 
+    /// The entries nearest a query embedding, with the cosine distance that put
+    /// them there, nearest first.
+    ///
+    /// Backs the knowledge arm of the `[Recall]` block (#1100). It is a plain
+    /// vector search rather than the hybrid `search`, because the block applies
+    /// a relevance floor and a fused RRF score is not a quantity a floor can be
+    /// set against: over a hybrid search every row scores non-zero against any
+    /// query. A cosine distance is comparable, so a floor over it means
+    /// something.
+    ///
+    /// Scoped to the task-local user by an explicit `WHERE user_id` predicate.
+    /// Row-level security is a backstop the table owner bypasses, so the
+    /// predicate is the guard, not the decoration.
+    ///
+    /// `embedding_model` identifies the model that produced `query_embedding`,
+    /// and only rows embedded by that model take part - the same rule the
+    /// hybrid search's vector arm follows, for the same reason: a comparison
+    /// across models is a comparison across vector dimensions, which the
+    /// database answers with an error rather than a miss.
+    ///
+    /// An empty `query_embedding` yields no rows. The vector operator raises on
+    /// a zero-dimension vector, and the caller that has no embedding has a
+    /// full-text path to fall back to (`search_text`).
+    pub async fn nearest_by_embedding(
+        &self,
+        query_embedding: Vec<f32>,
+        embedding_model: &str,
+        limit: usize,
+    ) -> Result<Vec<(KnowledgeEntry, f64)>, CoreError> {
+        if query_embedding.is_empty() {
+            return Ok(Vec::new());
+        }
+        let user_id = current_user_id();
+        let rows: Vec<KbNearestRow> = sqlx::query_as(
+            "SELECT id, content, tags, metadata, created_at, updated_at, source, summary,
+                    MIN(chunk <=> $1) AS distance
+             FROM knowledge_base, unnest(embedding) AS chunk
+             WHERE user_id = $2
+               AND deleted_at IS NULL
+               AND embedding IS NOT NULL
+               AND embedding_model IS NOT NULL
+               AND (embedding_model = $3
+                    OR (split_part($3, '@', 2) <> ''
+                        AND split_part(embedding_model, '@', 2)
+                            = split_part($3, '@', 2)))
+             GROUP BY id, content, tags, metadata, created_at, updated_at, source, summary
+             ORDER BY distance
+             LIMIT $4",
+        )
+        .bind(Vector::from(query_embedding))
+        .bind(user_id.as_str())
+        .bind(embedding_model)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CoreError::Storage(e.to_string()))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let distance = r.distance;
+                (r.row.into_entry(), distance)
+            })
+            .collect())
+    }
+
     /// Delete a batch of entries by id in a single statement. Returns the
     /// number of rows actually removed (ids not owned by the user are no-ops).
     pub async fn delete_many(&self, ids: &[String]) -> Result<usize, CoreError> {
@@ -620,6 +686,15 @@ fn decode_cursor(cursor: &str) -> Result<(chrono::DateTime<chrono::Utc>, String)
     let ts = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(micros)
         .ok_or_else(|| CoreError::Storage("invalid knowledge list cursor timestamp".to_string()))?;
     Ok((ts, id.to_string()))
+}
+
+/// A [`KbRow`] plus the cosine distance that ranked it, for
+/// [`PgKnowledgeBaseStore::nearest_by_embedding`].
+#[derive(sqlx::FromRow)]
+struct KbNearestRow {
+    #[sqlx(flatten)]
+    row: KbRow,
+    distance: f64,
 }
 
 #[derive(sqlx::FromRow)]
