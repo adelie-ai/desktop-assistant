@@ -100,10 +100,19 @@ Both paths that set tags:
 - creating an entry (`content` plus `tags`);
 - re-tagging an existing entry (`id` plus `tags`, with or without `content`).
 
-A write that carries no `tags` field registers nothing, because there is nothing
-to register. It keeps the tags the stored entry already carries, and those tags
-are already in the vocabulary, so a content update by `id` consults it for
-nothing and costs no embedding.
+A write that carries no `tags` field registers nothing, because it proposes
+nothing. The gate acts on the tags a write asks to store, not on the tags an
+entry already holds, so a content update by `id` keeps the stored tags and
+consults the vocabulary for none of them.
+
+That is deliberate, and the reason is not that those tags are known to be
+registered - most are not, per "What a tag is checked against" above. It is that
+a redirect must not reach a tag the write never mentioned. Re-proposing the
+stored tags would let the vocabulary rename them on a write whose author only
+changed the text, and the caller would have no way to see it. The gap that
+leaves - a tag carried by an existing entry that the vocabulary cannot match
+against - belongs to #1094, which seeds the registry from the tags entries
+already carry.
 
 ## Cost
 

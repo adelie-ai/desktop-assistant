@@ -557,10 +557,14 @@ impl BuiltinToolService {
                  Content should be self-contained prose that describes both the context (when/why \
                  this information is useful) and the information itself. Provide either a single \
                  entry (top-level `content`/`tags`/`id`) or a batch via `entries`. A write that \
-                 gives the `id` of an existing entry keeps every field it leaves out, so send \
-                 only what changes: `id` plus `content` rewrites the text and keeps the tags, \
-                 and `id` plus `tags` re-tags the entry and keeps the text. To clear the tags, \
-                 send an empty `tags` list. Tags are checked against the tag vocabulary, which holds \
+                 gives the `id` of an existing entry keeps the content, the tags and the stored \
+                 metadata it leaves out, so send only what changes: `id` plus `content` rewrites \
+                 the text and keeps the tags, and `id` plus `tags` re-tags the entry and keeps \
+                 the text. To clear the tags, send an empty `tags` list. One field is not kept: \
+                 every write through this tool records the entry's provenance as 'explicit', so \
+                 an entry that dreaming had extracted or consolidated counts as explicitly saved \
+                 from then on, and `builtin_knowledge_base_list` with that `source` filter stops \
+                 listing it. Tags are checked against the tag vocabulary, which holds \
                  the tags registered so far and grows as tags are written; it starts empty, so \
                  early writes have little to match against. A tag that means the same as one \
                  already registered is stored under the registered name, so the response \
@@ -593,11 +597,17 @@ impl BuiltinToolService {
                         "id": {
                             "type": "string",
                             "description": "Optional ID. Omit to create a new entry with a generated \
-                                            id. Give the id of an existing entry to update it, and \
-                                            the fields you leave out keep the values that entry \
+                                            id, which is what almost every write should do. Give \
+                                            the id of an existing entry to update it, and the \
+                                            fields you leave out keep the values that entry \
                                             already holds. An id no entry holds creates the entry \
                                             at that id, so a write that carries `content` can be \
-                                            repeated safely."
+                                            repeated safely. An id you make up yourself must be a \
+                                            fresh random identifier such as a UUID, never a \
+                                            readable name like 'user-coffee-preference': ids are \
+                                            not yours to name, so a readable one may already be \
+                                            taken, and the write then fails instead of storing \
+                                            anything."
                         },
                         "entries": {
                             "type": "array",
@@ -1385,11 +1395,11 @@ impl BuiltinToolService {
 
         let content_opt = optional_string(spec, "content");
         let id_opt = optional_string(spec, "id");
-        // `Some` exactly when the spec named `tags`, so a present-but-empty
-        // list stays distinct from an absent one.
-        let supplied_tags = spec
-            .get("tags")
-            .map(|_| optional_string_array(spec, "tags"));
+        // `Some` exactly when the write asked to set the tags, so a
+        // present-but-empty list stays distinct from an absent one. A `tags`
+        // this cannot read is refused rather than stored as empty, because an
+        // empty list now means "clear them".
+        let supplied_tags = supplied_string_array(spec, "tags")?;
 
         let existing = self
             .existing_entry(id_opt.as_deref(), content_opt.is_some())
@@ -2559,6 +2569,71 @@ fn optional_string_array(args: &serde_json::Value, key: &str) -> Vec<String> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default()
+}
+
+/// Read a string list the caller may or may not have supplied, for a field
+/// where "not supplied" and "supplied empty" mean different things.
+///
+/// `None` means the write said nothing about the field. `Some` means the write
+/// asked to set it, and an empty list then asks to clear it. On the
+/// knowledge-base write path that distinction decides whether a stored entry
+/// keeps its tags, so the three shapes that are not a list of strings cannot be
+/// folded into an empty list the way [`optional_string_array`] folds them:
+///
+/// - `null` reads as absent. Several model providers encode "I am not setting
+///   this field" as an explicit null, and reading that as an empty list clears
+///   the field on every write they send.
+/// - A value that is not a list is an error. The caller asked to set the field
+///   and named something this cannot read, so storing an empty list would
+///   answer a set with a wipe, and report success.
+/// - A list holding a value that is not a string is an error, for the same
+///   reason applied to one element: the caller named that tag.
+///
+/// A blank or whitespace-only string is dropped rather than refused. An empty
+/// tag is not a tag, so trimming it away loses no intent.
+fn supplied_string_array(
+    args: &serde_json::Value,
+    key: &str,
+) -> Result<Option<Vec<String>>, CoreError> {
+    let Some(value) = args.get(key) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let items = value.as_array().ok_or_else(|| {
+        CoreError::ToolExecution(format!(
+            "`{key}` must be a list of strings, and this one is {}",
+            json_shape(value)
+        ))
+    })?;
+    let mut supplied = Vec::with_capacity(items.len());
+    for item in items {
+        let text = item.as_str().ok_or_else(|| {
+            CoreError::ToolExecution(format!(
+                "every tag in `{key}` must be a string, and one of them is {}",
+                json_shape(item)
+            ))
+        })?;
+        let text = text.trim();
+        if !text.is_empty() {
+            supplied.push(text.to_string());
+        }
+    }
+    Ok(Some(supplied))
+}
+
+/// Name the JSON shape of `value`, so an error can tell the caller what it
+/// actually sent rather than only what was wanted.
+fn json_shape(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "a list",
+        serde_json::Value::Object(_) => "an object",
+    }
 }
 
 /// Read one write spec's `new_tag_descriptions` map, keyed by the normalized
@@ -5914,10 +5989,20 @@ mod tests {
             .expect("kb_write tool is advertised");
 
         let lower = def.description.to_lowercase();
+        // Named, not summarised as "every field". A write does not keep the
+        // entry's provenance, so a description that says "every" is a promise
+        // the code breaks - see
+        // `kb_write_schema_says_a_write_records_the_entry_as_explicit`.
         assert!(
-            lower.contains("keeps every field it leaves out"),
-            "the description must state that a write by id preserves what it \
-             does not mention: {}",
+            lower.contains("keeps the content, the tags and the stored metadata"),
+            "the description must name what a write by id keeps, field by \
+             field: {}",
+            def.description
+        );
+        assert!(
+            !lower.contains("keeps every field"),
+            "a write does not keep every field - it overwrites the entry's \
+             provenance - so the description must not claim it does: {}",
             def.description
         );
         assert!(
@@ -5937,6 +6022,66 @@ mod tests {
             id.contains("no entry holds") && id.contains("repeated"),
             "the id description must say that an unheld id creates, so a write \
              can be repeated: {id}"
+        );
+    }
+
+    #[test]
+    fn kb_write_schema_says_a_write_records_the_entry_as_explicit() {
+        // `build_write_entry` always sends `source = "explicit"`, and the
+        // upsert only preserves the stored value when the write sends none. So
+        // a write flips a consolidated entry's provenance, and
+        // `builtin_knowledge_base_list` with `source: "consolidation"` stops
+        // returning it. A model that reads "a write keeps what it leaves out"
+        // and then cannot find that entry again has been told something false.
+        let service = BuiltinToolService::new();
+        let def = service
+            .tool_definitions()
+            .into_iter()
+            .find(|t| t.name == TOOL_KB_WRITE)
+            .expect("kb_write tool is advertised");
+
+        let lower = def.description.to_lowercase();
+        assert!(
+            lower.contains("provenance") && lower.contains("'explicit'"),
+            "the description must say that a write records the entry as \
+             explicit: {}",
+            def.description
+        );
+        assert!(
+            lower.contains("builtin_knowledge_base_list"),
+            "the description must say which read that provenance change \
+             affects, or the model cannot tell what it costs: {}",
+            def.description
+        );
+    }
+
+    #[test]
+    fn kb_write_schema_warns_against_a_readable_caller_chosen_id() {
+        // An id is a bare key, not scoped to this conversation or this topic.
+        // A model told it may choose one picks a readable name, that name can
+        // already be taken, and the write then fails with nothing stored -
+        // which reads to the model as a broken tool rather than a naming rule
+        // it broke.
+        let service = BuiltinToolService::new();
+        let def = service
+            .tool_definitions()
+            .into_iter()
+            .find(|t| t.name == TOOL_KB_WRITE)
+            .expect("kb_write tool is advertised");
+
+        let id = def.parameters["properties"]["id"]["description"]
+            .as_str()
+            .expect("id carries a description")
+            .to_lowercase();
+        assert!(
+            id.contains("uuid") && id.contains("readable name"),
+            "the id description must say a made-up id is a fresh random one, \
+             never a readable name: {id}"
+        );
+        assert!(
+            id.contains("already be taken") && id.contains("fails"),
+            "the id description must say what a readable name costs, or the \
+             rule reads as arbitrary: {id}"
         );
     }
 
