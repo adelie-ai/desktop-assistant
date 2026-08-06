@@ -157,8 +157,9 @@ knowledge-base prompt section states the procedure:
 
 1. Search with a natural-language question and no tags, then filter on a tag
    from `available_tags`. Never invent one. The standing advice to filter on the
-   narrowest tag is explicitly ordered after this step, so the model cannot
-   filter on a guess before it has seen the vocabulary.
+   narrowest tag carries a condition in its own sentence - only once
+   `available_tags` has shown the tag exists - so the model cannot read it as
+   licence to filter on a guess, whichever line it reaches first.
 2. When no tag fits, sweep with `builtin_knowledge_base_list` and its
    `next_cursor`, bounded at three pages of fifty.
 3. When the sweep finds the entry, re-tag it, preferring a tag that
@@ -167,14 +168,14 @@ knowledge-base prompt section states the procedure:
 
 Two of those are worth stating plainly, because both invite a wrong instruction.
 
-**A larger search `limit` is not a way to reach further, but not because it
-finds nothing new.** It does: `search_hybrid` derives `fetch_limit` as
-`limit * 2` for both retrieval arms and `result_limit` as `limit` for the page,
-so a bigger limit really does surface entries a smaller one truncated away. It
-is the wrong move because the model cannot tell how far down the ranking the
-entry sits, so the retry is a guess that costs an embedding round-trip. A sweep
-is bounded and it reports what has already been read. The prompt says that,
-rather than the tidier falsehood.
+**A larger search `limit` does find more entries, and is still the wrong
+retry.** It finds more: `search_hybrid` derives `fetch_limit` as `limit * 2` for
+both retrieval arms and `result_limit` as `limit` for the page, so a bigger
+limit really does surface entries a smaller one truncated away. It is the wrong
+move for a different reason - the model cannot tell how far down the ranking the
+entry sits, so the retry is a guess that costs an embedding round-trip and may
+still miss. A sweep is bounded and it reports what has already been read. The
+prompt gives that reason rather than the tidier falsehood.
 
 **A re-tag replaces the whole tag list.** `build_write_entry` uses the supplied
 `tags` array verbatim, and the upsert is `SET tags = EXCLUDED.tags`. A model
