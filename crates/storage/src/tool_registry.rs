@@ -243,6 +243,16 @@ impl PgToolRegistryStore {
         // plain query returns the full requested count of real tools. The
         // provider rows are ranked among THEMSELVES (a small set) with the same
         // RRF formula to compute a comparable `provider_score` for the boost.
+        //
+        // `vector_ranked` and `text_ranked` both carry an explicit `ORDER BY`
+        // before their `LIMIT`, and both are load-bearing rather than
+        // decorative (#1107). `ORDER BY` inside `OVER (…)` orders the window
+        // computation, not the statement's output, so a `LIMIT` with no
+        // statement-level order truncates an undefined set: the arm still
+        // returns rows and the fusion still ranks them, so the caller gets a
+        // plausible page that quietly omits the best matches.
+        // `provider_vector_ranked` below carries no `LIMIT` at all, so it is
+        // not subject to this defect.
         let rows: Vec<ToolSearchRow> = sqlx::query_as(
             "WITH real_chunk_distances AS (
                 SELECT name, description, parameters, provider,
@@ -255,6 +265,7 @@ impl PgToolRegistryStore {
                 SELECT name, description, parameters, provider,
                        ROW_NUMBER() OVER (ORDER BY min_distance) AS rank_v
                 FROM real_chunk_distances
+                ORDER BY min_distance
                 LIMIT $2
             ),
             text_ranked AS (

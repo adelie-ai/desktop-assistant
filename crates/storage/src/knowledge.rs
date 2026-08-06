@@ -372,6 +372,18 @@ impl PgKnowledgeBaseStore {
     ) -> Result<Vec<KnowledgeEntry>, CoreError> {
         let user_id = current_user_id();
         let embedding_vec = Vector::from(query_embedding);
+        // Over-fetch each arm so the fusion has something to fuse: a row that
+        // ranks well on one arm and modestly on the other must still be
+        // reachable from both lists.
+        //
+        // Both `vector_ranked` and `text_ranked` below carry an explicit
+        // `ORDER BY` before their `LIMIT`, and both are load-bearing rather
+        // than decorative (#1107). `ORDER BY` inside `OVER (…)` orders the
+        // window computation, not the statement's output, so a `LIMIT` with
+        // no statement-level order truncates an undefined set: the arm still
+        // returns rows and the fusion still ranks them, so the caller gets a
+        // plausible page that quietly omits the best matches. Removing either
+        // one costs nothing at the time and breaks recall later.
         let fetch_limit = (limit * 2) as i64;
         let result_limit = limit as i64;
 
@@ -413,6 +425,7 @@ impl PgKnowledgeBaseStore {
                 SELECT id, content, tags, metadata, created_at, updated_at, summary,
                        ROW_NUMBER() OVER (ORDER BY min_distance) AS rank_v
                 FROM chunk_distances
+                ORDER BY min_distance
                 LIMIT $3
             ),
             text_ranked AS (

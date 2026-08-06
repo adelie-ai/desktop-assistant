@@ -136,6 +136,14 @@ impl PgSkillIndexStore {
         // wherever both sides carry one, matching
         // `embedding_backfill::invalidate_stale_embeddings`, so a cosmetic
         // rename does not blank search until the sweep restamps the rows.
+        //
+        // `vr` and `tr` both carry an explicit `ORDER BY` before their `LIMIT`,
+        // and both are load-bearing rather than decorative (#1107). `ORDER BY`
+        // inside `OVER (…)` orders the window computation, not the statement's
+        // output, so a `LIMIT` with no statement-level order truncates an
+        // undefined set: the arm still returns rows and the fusion still ranks
+        // them, so the caller gets a plausible page that quietly omits the
+        // best matches.
         let rows: Vec<SkillRow> = sqlx::query_as(
             "WITH scope AS ( \
                  SELECT * FROM skill_index \
@@ -154,7 +162,7 @@ impl PgSkillIndexStore {
              ), \
              vr AS ( \
                  SELECT name, owner_key, ROW_NUMBER() OVER (ORDER BY dist) AS rank_v \
-                 FROM vector_ranked LIMIT $4 \
+                 FROM vector_ranked ORDER BY dist LIMIT $4 \
              ), \
              tr AS ( \
                  SELECT name, owner_key, \
