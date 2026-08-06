@@ -261,26 +261,29 @@ const TOOL_KB_WRITE: &str = "builtin_knowledge_base_write";
 /// reader nothing it can act on. Told what the line will be offered back as,
 /// it writes the fact.
 ///
-/// The purpose is written in the future tense on purpose: the block that offers
-/// candidate entries back is a later piece of work, and a schema that describes
-/// it as already running tells the model something it can falsify on its next
-/// search. What the line does *today* - stand in for the entry wherever many
-/// entries are listed at once - is stated as present fact beside it.
+/// Every sentence has to be true of the running system, and a schema is the one
+/// document the reader can check against its own next tool call. So the purpose
+/// is stated as purpose ("the entry's short form, for a reader that...") and the
+/// block that offers candidate entries back is stated in the future, because it
+/// is a later piece of work. Nothing here claims a reader that condenses an
+/// entry today, because the read tools return whole entries and each client's
+/// knowledge browser is its own repository's work.
 fn summary_arg_description() -> String {
     format!(
         "One line saying what this entry says, written as a statement rather than as a topic \
-         label. It stands in for the entry wherever entries are listed rather than read, and it \
-         is the line this entry will be offered back to you as, a candidate you decide whether \
-         to open - so it has to carry the fact on its own: 'The user wants tag names to keep the \
-         facet colon' is useful, 'tag naming' is not. Write one for every entry. Line breaks and \
-         runs of spaces collapse to one space, and what is then longer than \
-         {SUMMARY_MAX_CHARS} characters is cut to {SUMMARY_MAX_CHARS}, never rejected - a long \
-         one costs you the tail of the line, not the write. Leaving it out never fails the write \
-         either; the entry then has no line of its own, and a reader listing it falls back to \
-         the start of your `content`. On a write that gives an `id`, leaving it out keeps the \
-         stored summary, and sending an empty or whitespace-only string clears it. The response \
-         reports the summary actually stored, which is the cut line rather than the one you \
-         sent when you sent a long one."
+         label. It is the entry's short form, for a reader that shows many entries at once and \
+         cannot spend a whole body on each, and it is the line this entry will be offered back \
+         to you as, a candidate you decide whether to open - so it has to carry the fact on its \
+         own: 'The user wants tag names to keep the facet colon' is useful, 'tag naming' is not. \
+         Write one for every entry. Runs of whitespace collapse to one space, and what is then \
+         longer than {SUMMARY_MAX_CHARS} characters is cut to {SUMMARY_MAX_CHARS}, never \
+         rejected - a long one costs you the tail of the line, not the write. Leaving it out \
+         never fails the write either; the entry then has no short form, and every read reports \
+         its summary as null. On a write that gives an `id`, leaving it out keeps the stored \
+         summary - including when you rewrite the `content`, so send a new summary with a \
+         rewrite or the old line stays - and sending an empty or whitespace-only string clears \
+         it. The response reports the summary actually stored, which is the cut line rather \
+         than the one you sent when you sent a long one."
     )
 }
 
@@ -1457,8 +1460,10 @@ impl BuiltinToolService {
         // empty list now means "clear them".
         let supplied_tags = supplied_string_array(spec, "tags")?;
         // `Some` exactly when the write asked to set the summary, cut to the
-        // cap on the way in. Read before anything is stored, so a summary of
-        // the wrong shape refuses the whole write rather than half of it.
+        // cap on the way in. Read before this spec reaches the store, so a
+        // summary of the wrong shape costs the entry nothing. It does not
+        // unwind a batch: entries earlier in the same call have already landed
+        // (#1113).
         let supplied_summary = supplied_one_line(spec, "summary", SUMMARY_MAX_CHARS)?;
 
         let existing = self
@@ -5023,6 +5028,15 @@ mod tests {
                 }
                 entry.created_at = "2026-01-01".to_string();
                 entry.updated_at = "2026-01-01".to_string();
+                // The one rule of `KnowledgeBaseStore::write` this fake has to
+                // model rather than echo: an empty summary clears the field,
+                // and cleared means absent. Postgres does it with `NULLIF` on
+                // the insert and a `CASE` arm on the update. A fake that stored
+                // the empty string instead would let a tool-path test assert a
+                // "clear" that the real store never produces.
+                if entry.summary.as_deref() == Some("") {
+                    entry.summary = None;
+                }
                 let mut g = s.lock().expect("write store lock");
                 g.retain(|e| e.id != entry.id);
                 g.push(entry.clone());
@@ -6590,7 +6604,7 @@ mod tests {
         // The schema asks for a summary and says why it matters, but the
         // boundary does not enforce it. Refusing the write would lose the fact
         // to gain a one-liner, which is the wrong trade for a memory store: a
-        // missing summary is a gap the maintenance pass closes later.
+        // missing summary is a gap #1099's pass is meant to close later.
         let (service, store) = kb_service_with_tag_gate(None);
 
         let response = kb_write_response(
@@ -6619,8 +6633,9 @@ mod tests {
         // Absent means "leave the stored value alone" - the rule every other
         // optional field on this path follows. The summary the update keeps
         // may now be stale, and that is the accepted cost of never wiping one:
-        // the maintenance pass rewrites a stale summary, and nothing rewrites
-        // one that was deleted.
+        // a stale summary can be rewritten, by the model on its next write or
+        // by #1099's pass, and nothing recovers one that was deleted. The
+        // schema tells the model to send a new summary with a rewrite.
         let (service, store) = kb_service_with_tag_gate(None);
         seed_kb_entry(
             &store,
@@ -6653,10 +6668,11 @@ mod tests {
         // it a summary is write-once, and a model that wrote a wrong one has
         // no way to take it back.
         //
-        // An empty summary is what the tool hands the store, and the store
-        // reads it as "this entry has no summary" - see
-        // `a_write_with_an_empty_summary_clears_the_stored_one` in
-        // `crates/storage/tests/knowledge_summary.rs`.
+        // Cleared means absent, not empty: the store maps an empty summary to
+        // NULL, so a cleared entry reads back exactly like one that never had
+        // a summary. `a_write_with_an_empty_summary_clears_the_stored_one` in
+        // `crates/storage/tests/knowledge_summary.rs` holds real Postgres to
+        // that; the fake here models the same rule.
         let (service, store) = kb_service_with_tag_gate(None);
         seed_kb_entry(
             &store,
@@ -6675,8 +6691,7 @@ mod tests {
 
         let stored = kb_stored(&store);
         assert_eq!(
-            stored[0].summary.as_deref(),
-            Some(""),
+            stored[0].summary, None,
             "an empty summary clears the stored one rather than keeping it"
         );
         assert_eq!(
@@ -6791,9 +6806,10 @@ mod tests {
 
     #[tokio::test]
     async fn kb_write_collapses_a_multi_line_summary_to_one_line() {
-        // The summary is rendered into a line-oriented block, one entry per
-        // row. An embedded newline breaks the block rather than the entry's
-        // own row, so the line is made one physical line on the way in.
+        // The line goes to readers that put one entry per row - a client's
+        // knowledge browser, and #1100's candidate block. An embedded newline
+        // breaks the row structure rather than that entry's own row, so the
+        // text is made one physical line on the way in.
         let (service, store) = kb_service_with_tag_gate(None);
 
         kb_write_response(
@@ -6848,6 +6864,30 @@ mod tests {
             serde_json::Value::Null,
             "an entry with no summary reports null rather than omitting the field"
         );
+
+        // A clear reports null too, and not the empty string that was sent.
+        // This is the one answer most likely to surprise: the model asked for
+        // "", and the entry now holds nothing at all.
+        let (clearing, store) = kb_service_with_tag_gate(None);
+        seed_kb_entry(
+            &store,
+            "entry-1",
+            "Rain is expected on Tuesday.",
+            &["memory"],
+            serde_json::json!({}),
+        );
+        seed_kb_summary(&store, "entry-1", "Rain is coming this week");
+
+        let cleared = kb_write_response(
+            &clearing,
+            serde_json::json!({"id": "entry-1", "summary": ""}),
+        )
+        .await;
+        assert_eq!(
+            cleared["entries"][0]["summary"],
+            serde_json::Value::Null,
+            "a cleared entry reports no summary, not an empty one"
+        );
     }
 
     #[tokio::test]
@@ -6859,8 +6899,9 @@ mod tests {
         // way to tell which one it had triggered.
         //
         // Safe to decide this way round because a summary is a convenience
-        // line, not the fact: the entry's content is untouched, and the
-        // maintenance pass writes a new summary for an entry that has none.
+        // line, not the fact: the entry's content is untouched, and a cleared
+        // summary can be written again - by the next write, or by #1099's
+        // pass over entries that have none.
         let (service, store) = kb_service_with_tag_gate(None);
         seed_kb_entry(
             &store,
@@ -6878,7 +6919,7 @@ mod tests {
         .await;
 
         let stored = kb_stored(&store);
-        assert_eq!(stored[0].summary.as_deref(), Some(""));
+        assert_eq!(stored[0].summary, None);
         assert_eq!(
             stored[0].content, "Rain is expected on Tuesday.",
             "the fact itself is untouched"

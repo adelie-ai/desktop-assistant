@@ -23,7 +23,7 @@ The response therefore reports what was searched, not only what was found.
 
 | Field | Meaning |
 | ----- | ------- |
-| `results` | The matched entries, best match first. Each carries a `summary`: one line condensing what that entry says, so a caller can judge a hit without reading the whole `content`. It is `null` for an entry that has none yet, which is every entry stored before the field existed. |
+| `results` | The matched entries, best match first. Each carries a `summary`: one line condensing what that entry says, so a caller can judge a hit without reading the whole `content`. It is `null` for an entry that has none: one stored before the field existed, one whose write named no summary, or one whose summary was cleared. |
 | `returned` | How many entries are in `results`. Same name `builtin_scratchpad_search` uses. |
 | `truncated` | Present, and `true`, only when the page filled up (`returned` reached `limit`) **and** the scope is larger than the page. A full page under `FEW` carries neither it nor `message`, because `FEW` already means the page holds the whole scope. It always travels with `message`, which says how to narrow. Its absence is the claim that nothing was left behind. |
 | `scope_size` | `NONE`, `FEW`, `MANY`, or `UNKNOWN`. See below. |
@@ -72,15 +72,17 @@ does not otherwise change.
 Cleared means absent, not empty: the store maps an empty summary to `NULL`, on
 both halves of the upsert. An empty string would be a third state nothing wants —
 a render site would print a blank row instead of falling back to the content, and
-a maintenance pass looking for entries to summarize selects `WHERE summary IS
-NULL`.
+a pass over the entries that have none would look for them with
+`WHERE summary IS NULL`.
 
 Two consumers of the field are designed and not yet built: the pass that writes
 the summaries of entries stored before the argument existed (#1099), and the
 `[Recall]` block that offers candidate entries to the model before its first move
-(#1100). Until they land, a summary is read by the knowledge tools and by each
-client's knowledge browser, and nothing fills one in that the model did not
-write.
+(#1100). Until they land, a summary travels on every read - the knowledge tools report
+it beside the content, and it reaches each client on the wire - and nothing
+fills one in that the model did not write. What a given client's knowledge
+browser does with it is that repository's own work; `display_line` on the
+domain and wire types is the shared rule for it.
 
 ## Scope, not match count
 

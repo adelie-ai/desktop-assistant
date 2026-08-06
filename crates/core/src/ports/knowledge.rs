@@ -140,8 +140,9 @@ pub trait KnowledgeBaseStore: Send + Sync {
     /// wrong summary can take it back: an **empty** summary clears the stored
     /// one, and the entry then reads back with `None`. A cleared summary is
     /// therefore indistinguishable from one never written, which is the point -
-    /// both are an entry with no short form, and the maintenance pass that
-    /// fills the field treats them alike.
+    /// both are an entry with no short form, and the pass that fills the
+    /// field for entries that have none (#1099, not yet built) will treat
+    /// them alike.
     ///
     /// An id held by an entry this caller cannot write - one that was retired,
     /// or one belonging to another user - is refused with

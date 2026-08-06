@@ -68,8 +68,8 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
         // upsert - `NULLIF` on the insert and the `= ''` arm on the update. An
         // empty string would be a third state nothing wants: the render site
         // would show a blank line rather than falling back to the content, and
-        // the maintenance pass that fills the field selects
-        // `WHERE summary IS NULL`, so it would never write one again.
+        // a pass that fills the field for entries with none (#1099) finds its
+        // work with `WHERE summary IS NULL`, so it would never reach one.
         let row: Option<KbRow> = sqlx::query_as(
             "INSERT INTO knowledge_base \
                 (id, user_id, content, tags, metadata, source, summary) \

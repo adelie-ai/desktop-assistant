@@ -8,7 +8,7 @@ license = "AGPL-3.0-or-later"
 desktop-assistant-core.workspace = true
 # `one_line`, the shared rule for reducing text to one display line. The tool
 # boundary cuts a knowledge summary with it so that a written summary and the
-# content stand-in a reader falls back to are cut the same way. Taken from the
+# content a reader falls back to when there is none are cut the same way. Taken from the
 # crate that owns the rule; `core` re-exports the cap beside its own types but
 # not the function. Path dependency, serde only, no native tail.
 desktop-assistant-protocol.workspace = true

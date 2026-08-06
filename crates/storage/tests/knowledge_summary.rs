@@ -2,8 +2,8 @@
 //!
 //! A knowledge entry had no short form: a reader that wanted to show many
 //! entries at once printed the whole content or cut it at a byte count. The
-//! `summary` column is that short form, and these tests pin the three things
-//! the storage layer owes it.
+//! `summary` column is that short form, and these tests pin what the storage
+//! layer owes it.
 //!
 //! 1. **Every read path carries it.** `get`, `list`, `list_page`, `search_text`
 //!    and the hybrid `search` all select the column. The hybrid query fuses two
@@ -19,8 +19,8 @@
 //! 4. **A write that carries an empty summary clears it, to NULL.** The third
 //!    state (issue #1098), and the one that keeps the field correctable. It
 //!    lands as NULL rather than as an empty string, so a cleared entry falls
-//!    back to its content at the render site and the maintenance pass finds it
-//!    again.
+//!    back to its content at the render site, and a pass over the entries
+//!    that have none (#1099) can reach it again.
 //!
 //! ## Running locally
 //!
@@ -444,7 +444,7 @@ async fn a_write_with_an_empty_summary_clears_the_stored_one() {
 async fn a_create_with_an_empty_summary_stores_none() {
     // The same rule on the insert half of the upsert. A create carrying an
     // empty summary has no stored value to clear, so the row must simply hold
-    // none - the state the maintenance pass looks for.
+    // none - the state a pass over unsummarised entries (#1099) looks for.
     let Some(fx) = fixture().await else { return };
     let store = PgKnowledgeBaseStore::new(fx.pool.clone());
 

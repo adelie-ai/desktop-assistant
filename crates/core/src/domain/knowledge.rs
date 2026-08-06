@@ -21,10 +21,17 @@ pub struct KnowledgeEntry {
     /// A one-line condensation of what this entry says, for a reader that
     /// shows many entries at once and cannot spend the whole body on each.
     ///
-    /// `None` means no summary has been written yet, which is true of every
-    /// entry stored before the field existed. It is not a definition of the
-    /// entry's subject the way a tag's description is: it condenses what this
-    /// particular entry says, and is rewritten when the content changes.
+    /// `None` means no summary has been written yet: an entry stored before
+    /// the field existed, one whose write named no summary, or one whose
+    /// summary was cleared. It is not a definition of the entry's subject the
+    /// way a tag's description is - it condenses what this particular entry
+    /// says, so it goes stale when the content changes under it.
+    ///
+    /// Nothing rewrites it on its own. A write that changes the content and
+    /// names no summary keeps the old line, deliberately, because the
+    /// alternative is wiping one on every partial update. The remedies are a
+    /// write that sends a new summary, which the tool schema asks for, and
+    /// #1099's pass over the entries that have none.
     ///
     /// On write, `None` preserves any existing value rather than clearing it -
     /// the same rule [`KnowledgeEntry::source`] follows, so a caller that knows
@@ -61,18 +68,18 @@ impl KnowledgeEntry {
     /// and ending in `...` when it was cut short - see
     /// [`desktop_assistant_protocol::one_line`].
     ///
-    /// Every render site calls this - a client's knowledge browser, and the
-    /// recall block that offers candidate entries to the model - so the
-    /// fallback is decided once instead of once per caller.
+    /// This is the shared rule for every render site - a client's knowledge
+    /// browser, and #1100's recall block once it lands - so the fallback is
+    /// decided here instead of once per caller.
     /// `desktop_assistant_api_model::KnowledgeEntryView` carries the same
     /// method for callers that hold the wire type instead.
     ///
     /// Why the fallback lives here and not in the read queries: a
     /// `COALESCE(summary, content)` in SQL would make every read report a
-    /// summary for an entry that has none. The maintenance pass that fills the
-    /// field finds its work with `WHERE summary IS NULL`, and a list row that
-    /// wants to render a stand-in differently from a written summary needs the
-    /// same distinction. Both survive only while the read paths stay honest.
+    /// summary for an entry that has none. A pass over the entries that have
+    /// none (#1099) finds its work with `WHERE summary IS NULL`, and a list row
+    /// that wants to render a stand-in differently from a written summary needs
+    /// the same distinction. Both survive only while the read paths stay honest.
     ///
     /// The cap covers a stored summary as well as a fallback body. Nothing in
     /// the schema bounds either, and the budget this protects counts what is
@@ -114,8 +121,9 @@ mod tests {
 
     #[test]
     fn display_line_falls_back_to_the_content_when_there_is_no_summary() {
-        // Until a maintenance pass has written summaries, most entries have
-        // none. A render site that skipped them would show almost nothing.
+        // Most entries have no summary: every one stored before the field
+        // existed, and every write that named none. A render site that skipped
+        // them would show almost nothing.
         let entry = KnowledgeEntry::new("kb-1", "User prefers dark mode", vec![]);
 
         assert_eq!(entry.display_line(), "User prefers dark mode");
