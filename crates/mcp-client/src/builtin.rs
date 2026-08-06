@@ -4,15 +4,17 @@ use std::path::PathBuf;
 
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::clock::NowSnapshot;
-use desktop_assistant_core::domain::{Role, SUMMARY_MAX_CHARS, ToolDefinition, ToolRunner};
+use desktop_assistant_core::domain::{
+    KnowledgeEntry, Role, SUMMARY_MAX_CHARS, ToolDefinition, ToolRunner,
+};
 use desktop_assistant_core::ports::client_tools::current_client_tools;
 use desktop_assistant_core::ports::conversation_ctx::current_conversation_id;
 use desktop_assistant_core::ports::conversation_search::ConversationSearchFn;
 use desktop_assistant_core::ports::database::DbQueryFn;
 use desktop_assistant_core::ports::embedding::{EMBED_TIMEOUT, EmbedFn};
 use desktop_assistant_core::ports::knowledge::{
-    AVAILABLE_TAGS_LIMIT, KNOWLEDGE_TAG_CENSUS_SAMPLE, KnowledgeDeleteFn, KnowledgeGetFn,
-    KnowledgeGetManyFn, KnowledgeListFn, KnowledgeListQuery, KnowledgeSearchFn,
+    AVAILABLE_TAGS_LIMIT, KNOWLEDGE_GET_MAX_IDS, KNOWLEDGE_TAG_CENSUS_SAMPLE, KnowledgeDeleteFn,
+    KnowledgeGetFn, KnowledgeGetManyFn, KnowledgeListFn, KnowledgeListQuery, KnowledgeSearchFn,
     KnowledgeTagResolveFn, KnowledgeWriteFn, ListOrder, ListOrderOpt, ProposedTag, ScopeSize,
 };
 use desktop_assistant_core::ports::notify::{NotifyFn, NotifyUrgency};
@@ -749,6 +751,41 @@ impl BuiltinToolService {
                 }),
             ),
             ToolDefinition::new(
+                TOOL_KB_GET,
+                format!(
+                    "Read knowledge base entries by id - how you act on an id you already \
+                     hold. Ids come from the `[Recall]` block at the top of a turn, when one \
+                     is present, and from the `id` on any {TOOL_KB_SEARCH} or {TOOL_KB_LIST} \
+                     result. Ask for up to {KNOWLEDGE_GET_MAX_IDS} ids in one call and each \
+                     entry comes back whole: content, summary, tags, metadata, source and \
+                     timestamps. Use this rather than searching for the id itself - search \
+                     matches an entry's TEXT, so an id finds an entry only when that entry \
+                     happens to mention it. An id that names no entry you can read is listed \
+                     in `not_found` and the rest of the batch still returns, so a stale \
+                     reference costs you nothing; treat it as a reference worth dropping, not \
+                     as an error. Ids past the cap are dropped, and a response too large to \
+                     carry every entry drops entries as well; either way the response reports \
+                     `truncated` and you ask for the rest in a smaller batch."
+                ),
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": format!(
+                                "Ids of the entries to read, at most {KNOWLEDGE_GET_MAX_IDS} \
+                                 per call."
+                            )
+                        },
+                        "id": {
+                            "type": "string",
+                            "description": "Single-entry convenience: read one id. Combined with `ids` when both are given."
+                        }
+                    }
+                }),
+            ),
+            ToolDefinition::new(
                 TOOL_KB_DELETE,
                 "Delete knowledge base entries by ID. Accepts a single `id` or a list of `ids`.",
                 serde_json::json!({
@@ -1240,7 +1277,9 @@ impl BuiltinToolService {
     /// on that fallback.
     pub fn provider_group(tool_name: &str) -> Option<&'static str> {
         match tool_name {
-            TOOL_KB_WRITE | TOOL_KB_SEARCH | TOOL_KB_DELETE | TOOL_KB_LIST => Some("knowledge"),
+            TOOL_KB_WRITE | TOOL_KB_SEARCH | TOOL_KB_DELETE | TOOL_KB_LIST | TOOL_KB_GET => {
+                Some("knowledge")
+            }
             TOOL_SCRATCHPAD_WRITE
             | TOOL_SCRATCHPAD_SEARCH
             | TOOL_SCRATCHPAD_DELETE
@@ -1277,6 +1316,7 @@ impl BuiltinToolService {
             TOOL_KB_SEARCH => self.kb_search(arguments).await,
             TOOL_KB_DELETE => self.kb_delete(arguments).await,
             TOOL_KB_LIST => self.kb_list(arguments).await,
+            TOOL_KB_GET => self.kb_get(arguments).await,
             TOOL_SEARCH => self.tool_search(arguments).await,
             TOOL_NOTIFY => self.notify(arguments).await,
             TOOL_SYS_PROPS => Ok(self.sys_props()),
@@ -2001,6 +2041,107 @@ impl BuiltinToolService {
             "next_cursor": page.next_cursor,
         })
         .to_string())
+    }
+
+    /// Read knowledge entries by id (`builtin_knowledge_base_get`).
+    ///
+    /// The read the `[Recall]` block depends on: that block offers ids and no
+    /// content, so an id has to be worth something on its own. Neither search
+    /// (which matches an entry's text) nor list (which has no id filter) can
+    /// answer one.
+    ///
+    /// Two rules shape the response. An id that does not resolve is a normal
+    /// outcome, not a failure, so it is named in `not_found` while the rest of
+    /// the batch returns. And every way an id fails to resolve gives the same
+    /// answer: the store scopes the read by `user_id` and hides retired rows,
+    /// so another user's id, a retired id and an id that never existed are one
+    /// case here, described one way. Nothing in the response says which.
+    async fn kb_get(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
+        let get_many = self
+            .kb_get_many_fn
+            .as_ref()
+            .ok_or_else(|| CoreError::ToolExecution("knowledge base not configured".to_string()))?;
+
+        // Accept either a single `id` or a list of `ids`, the shapes
+        // `builtin_knowledge_base_delete` already accepts.
+        let mut ids = optional_string_array(&arguments, "ids");
+        if let Some(id) = optional_string(&arguments, "id") {
+            ids.push(id);
+        }
+        // A model assembling ids from a `[Recall]` block and a search result
+        // can name the same entry twice. That is one read and one row.
+        let mut seen = HashSet::new();
+        ids.retain(|id| seen.insert(id.clone()));
+        if ids.is_empty() {
+            return Err(CoreError::ToolExecution(
+                "knowledge_base get requires `id` or `ids`".to_string(),
+            ));
+        }
+        let mut cap_truncated = false;
+        if ids.len() > KNOWLEDGE_GET_MAX_IDS {
+            cap_truncated = true;
+            ids.truncate(KNOWLEDGE_GET_MAX_IDS);
+        }
+
+        let found: HashMap<String, KnowledgeEntry> = get_many(ids.clone())
+            .await?
+            .into_iter()
+            .map(|entry| (entry.id.clone(), entry))
+            .collect();
+
+        // Report every miss before spending the byte budget, so a stale
+        // reference is always named even when the entries that did resolve fill
+        // the response.
+        let not_found: Vec<&String> = ids.iter().filter(|id| !found.contains_key(*id)).collect();
+
+        // Enforce the response byte budget so one read cannot blow out context.
+        // Always include at least one entry even if it alone is large.
+        let mut items: Vec<serde_json::Value> = Vec::new();
+        let mut bytes = 0usize;
+        let mut budget_truncated = false;
+        for id in &ids {
+            let Some(entry) = found.get(id) else { continue };
+            let item = serde_json::json!({
+                "id": entry.id,
+                "content": entry.content,
+                "summary": entry.summary,
+                "tags": entry.tags,
+                "metadata": entry.metadata,
+                "source": entry.source,
+                "created_at": entry.created_at,
+                "updated_at": entry.updated_at,
+            });
+            let size = item.to_string().len();
+            if !items.is_empty() && bytes + size > RESPONSE_BYTE_BUDGET {
+                budget_truncated = true;
+                break;
+            }
+            bytes += size;
+            items.push(item);
+        }
+
+        tracing::info!(
+            asked = ids.len(),
+            returned = items.len(),
+            missing = not_found.len(),
+            "knowledge base get"
+        );
+
+        let mut response = serde_json::json!({
+            "ok": true,
+            "entries": items,
+            "returned": items.len(),
+            "not_found": not_found,
+        });
+        if cap_truncated || budget_truncated {
+            response["truncated"] = serde_json::Value::Bool(true);
+            response["message"] = serde_json::json!(format!(
+                "not every id was answered; ask for at most {KNOWLEDGE_GET_MAX_IDS} ids at a \
+                 time, and fewer when the entries are long. An id in neither `entries` nor \
+                 `not_found` was left out here, not lost - ask for it again."
+            ));
+        }
+        Ok(response.to_string())
     }
 
     async fn notify(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
@@ -3090,9 +3231,7 @@ fn parse_os_release_field(contents: &str, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use desktop_assistant_core::ports::knowledge::{
-        KNOWLEDGE_GET_MAX_IDS, KnowledgeSearchPage, ScopeSize,
-    };
+    use desktop_assistant_core::ports::knowledge::{KnowledgeSearchPage, ScopeSize};
 
     #[test]
     fn builtin_provider_map_is_exhaustive() {

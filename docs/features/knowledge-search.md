@@ -243,6 +243,47 @@ Step 3 needs the tag-registry dedup gate on `builtin_knowledge_base_write`.
 Without it, an instruction to add tags splits the vocabulary faster than the
 census can report it.
 
+## Reading an entry by id
+
+Search cannot answer an id. It matches an entry's **content**, so an id finds an
+entry only when that entry happens to mention it, and `builtin_knowledge_base_list`
+filters by tag and source but never by id. `builtin_knowledge_base_get` is the
+read that answers one:
+
+```json
+{"ok": true,
+ "entries": [{"id": "...", "content": "...", "summary": "...", "tags": ["..."],
+              "metadata": {}, "source": "explicit",
+              "created_at": "...", "updated_at": "..."}],
+ "returned": 1,
+ "not_found": ["..."],
+ "truncated": true,
+ "message": "not every id was answered; ask for at most 64 ids at a time, ..."}
+```
+
+It takes a batch (`ids`, or `id` for one), because the `[Recall]` block offers
+several candidates and the model often wants two or three of them. Entries come
+back in the order the ids were asked for, and a repeated id is read once.
+
+Three rules matter more than the shape.
+
+**A miss is a normal outcome.** An id that does not resolve is named in
+`not_found` and the rest of the batch still returns. A stale reference is a
+reference worth dropping, not an error (base rule 8.2).
+
+**Every miss reads the same.** The store scopes the read by `user_id` and hides
+retired rows, so another user's id, a retired id, and an id that never existed
+are one case. The response says nothing about which, and carries no per-id
+reason at all. Row-level security is a non-FORCE backstop that the table owner
+bypasses, so the `user_id` predicate in `get_many` is the real guard;
+`crates/storage/tests/knowledge_get_many.rs` holds it against a real database.
+
+**Both bounds report themselves.** At most 64 ids per call
+(`KNOWLEDGE_GET_MAX_IDS`), and the response carries the same byte budget the
+scratchpad read uses, so a batch of long entries cannot spend the whole context.
+Either bound sets `truncated` and a `message`. An id in neither `entries` nor
+`not_found` was left out by the budget, not lost.
+
 ## Where things live
 
 | Concern | Location |
@@ -252,4 +293,5 @@ census can report it.
 | Tool response and schema | `crates/mcp-client/src/builtin.rs` |
 | Census behaviour under a real database | `crates/storage/tests/knowledge_tag_census.rs` |
 | The summary's write rules under a real database | `crates/storage/tests/knowledge_summary.rs` |
+| Batch read by id, scoping and retirement | `crates/storage/tests/knowledge_get_many.rs` |
 | Prompt guidance that consumes these fields | `crates/core/src/prompts/sections/knowledge_base.txt` |

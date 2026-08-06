@@ -1549,6 +1549,7 @@ async fn main() -> Result<()> {
         let kb_d = Arc::clone(kb);
         let kb_l = Arc::clone(kb);
         let kb_g = Arc::clone(kb);
+        let kb_gm = Arc::clone(kb);
         use desktop_assistant_core::ports::knowledge::KnowledgeBaseStore;
         builtin_tools = builtin_tools.with_knowledge_base(
             Arc::new(move |entry| {
@@ -1585,6 +1586,13 @@ async fn main() -> Result<()> {
                 Box::pin(async move { store.get(&id).await })
             }),
         );
+        // The batch read behind `builtin_knowledge_base_get`: one statement for
+        // a whole batch of ids, scoped by `user_id` and hiding retired rows, so
+        // an id the model cannot read is simply absent from the answer.
+        builtin_tools = builtin_tools.with_knowledge_get_many(Arc::new(move |ids| {
+            let store = Arc::clone(&kb_gm);
+            Box::pin(async move { store.get_many(&ids).await })
+        }));
     }
 
     // Desktop notifications (builtin_notify). Capability-gated: only wired when
