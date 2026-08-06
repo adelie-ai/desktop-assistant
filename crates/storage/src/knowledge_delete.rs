@@ -244,9 +244,17 @@ pub struct HardDeleteOutcome {
 impl HardDeleteOutcome {
     /// The row count, turning a refusal into a rules-based decline. Use this
     /// where a caller asked for the delete and must learn why nothing went.
+    ///
+    /// The refusal is logged as well as returned. Every refusal is logged
+    /// whichever path reached it, because the point of the record is to make
+    /// the volume of what would have gone measurable before the flag is
+    /// relaxed, and a caller may swallow the error it receives.
     pub fn into_removed_or_refusal(self) -> Result<u64, CoreError> {
         match self.refusal {
-            Some(refusal) => Err(refusal.into_core_error()),
+            Some(refusal) => {
+                tracing::warn!("{}", refusal.log_line());
+                Err(refusal.into_core_error())
+            }
             None => Ok(self.removed),
         }
     }
