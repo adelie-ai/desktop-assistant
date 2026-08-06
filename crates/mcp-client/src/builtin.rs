@@ -876,7 +876,11 @@ impl BuiltinToolService {
                  step's raw work into a note — rather than hand-managing `todo` notes here. The \
                  scratchpad is discarded when the conversation is deleted and is NOT durable across \
                  conversations — promote anything worth keeping to the knowledge base with \
-                 builtin_knowledge_base_write, then delete the note here.",
+                 builtin_knowledge_base_write, then delete the note here. A note can also attach a \
+                 knowledge entry with `knowledge_entry_id`; pin that note and you get its live \
+                 content back every turn, so prefer attaching over copying an entry's text into a \
+                 note. Omitting `knowledge_entry_id` keeps whatever the note already attaches, so \
+                 an ordinary rewrite never drops it.",
                 serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -889,7 +893,8 @@ impl BuiltinToolService {
                                     "content": {"type": "string", "description": "The note body (keep it small and high-signal)."},
                                     "type": {"type": "string", "description": "Category, e.g. \"todo\"/\"note\"/\"other\". Defaults to \"note\". Used for filtering/grouping; same-type notes sort by `sequence`."},
                                     "sequence": {"type": "integer", "description": "Optional ordering hint within the type (ascending). Use for ordered todos."},
-                                    "done": {"type": "boolean", "description": "Whether this note (e.g. a todo) is checked off. Defaults to false."}
+                                    "done": {"type": "boolean", "description": "Whether this note (e.g. a todo) is checked off. Defaults to false."},
+                                    "knowledge_entry_id": {"type": "string", "description": "Attach a knowledge-base entry (its id from builtin_knowledge_base_search). Pinning the note then shows the entry's live content under [Pinned]. Omit to keep whatever is already attached; a wrong id is refused."}
                                 },
                                 "required": ["key", "content"]
                             },
@@ -899,7 +904,8 @@ impl BuiltinToolService {
                         "content": {"type": "string", "description": "Single-note convenience: the note body (use with `key`)."},
                         "type": {"type": "string", "description": "Single-note convenience: the note type (default \"note\")."},
                         "sequence": {"type": "integer", "description": "Single-note convenience: ordering hint within the type."},
-                        "done": {"type": "boolean", "description": "Single-note convenience: checked-off flag."}
+                        "done": {"type": "boolean", "description": "Single-note convenience: checked-off flag."},
+                        "knowledge_entry_id": {"type": "string", "description": "Single-note convenience: attach a knowledge-base entry by id."}
                     }
                 }),
             ),
@@ -967,7 +973,10 @@ impl BuiltinToolService {
                  harmful to get wrong — not something merely interesting. Unpin the moment it \
                  stops mattering; a stale pin costs you context every single turn. At most 5 \
                  notes can be pinned at once, and hitting that is the signal to unpin \
-                 something, not to shuffle.",
+                 something, not to shuffle. A note that attaches a knowledge entry \
+                 (builtin_scratchpad_write `knowledge_entry_id`) renders the entry's live \
+                 content under the note, read fresh every turn — so pin one of those rather \
+                 than copying an entry's text into a note, and draw on the same 5.",
                 serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -2223,7 +2232,19 @@ impl BuiltinToolService {
                 continue;
             }
             if let Some(existing) = accepted.iter_mut().find(|n| n.key == note.key) {
+                // Last write wins on everything the later note states, but an
+                // attachment it does not state is inherited rather than
+                // dropped, because that is what the storage upsert does with an
+                // absent id (`COALESCE(EXCLUDED.knowledge_entry_id, ...)`), and
+                // a second note for the same key must not mean something
+                // different from a second call. Otherwise the model attaches an
+                // entry, rewrites the same key in the same call, and is told
+                // the write succeeded with nothing attached. Only the
+                // attachment reads an absent value this way: `seq` and the rest
+                // are replaced by the later note whether it states them or not.
+                let carried = existing.knowledge_entry_id.take();
                 *existing = note;
+                existing.knowledge_entry_id = existing.knowledge_entry_id.take().or(carried);
             } else {
                 accepted.push(note);
             }
@@ -2240,6 +2261,35 @@ impl BuiltinToolService {
                 .map(|n| n.key)
                 .collect();
         }
+
+        // Check each attachment against the caller's own entries, after the
+        // batch has been de-duplicated and capped, so the reads are bounded by
+        // `MAX_NOTES_PER_WRITE` rather than by whatever the model sent. An id
+        // that names no entry this user owns would otherwise sit on the note
+        // until the next render dropped it, and the model would believe it had
+        // attached a fact it never did.
+        let mut checked: Vec<NewScratchpadNote> = Vec::with_capacity(accepted.len());
+        for note in accepted {
+            let Some(entry_id) = note.knowledge_entry_id.clone() else {
+                checked.push(note);
+                continue;
+            };
+            match self.resolve_attachment(&entry_id).await {
+                Ok(true) => checked.push(note),
+                Ok(false) => rejected.push(serde_json::json!({
+                    "key": note.key,
+                    "reason": format!(
+                        "knowledge entry {entry_id} was not found; search for it with \
+                         builtin_knowledge_base_search and use the id it returns"
+                    )
+                })),
+                Err(e) => rejected.push(serde_json::json!({
+                    "key": note.key,
+                    "reason": format!("could not check knowledge entry {entry_id}: {e}")
+                })),
+            }
+        }
+        let accepted = checked;
 
         let saved = if accepted.is_empty() {
             Vec::new()
@@ -2264,6 +2314,20 @@ impl BuiltinToolService {
             ));
         }
         Ok(response.to_string())
+    }
+
+    /// Whether `entry_id` names a live knowledge entry the caller owns (#1104).
+    ///
+    /// `Err` is a technical failure to check - no knowledge base is wired, or
+    /// the read failed - and is reported as such rather than as "not found", so
+    /// the model can tell a wrong id from an unavailable store.
+    async fn resolve_attachment(&self, entry_id: &str) -> Result<bool, CoreError> {
+        let get_fn = self.kb_get_fn.as_ref().ok_or_else(|| {
+            CoreError::ToolExecution(
+                "knowledge base not configured, so a note cannot attach an entry".to_string(),
+            )
+        })?;
+        Ok(get_fn(entry_id.to_string()).await?.is_some())
     }
 
     async fn scratchpad_search(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
@@ -2341,6 +2405,9 @@ impl BuiltinToolService {
                 // So the model can see what it has already pinned without a
                 // second call — the cap makes that worth knowing (#597).
                 "pinned": note.pinned,
+                // And what it has attached, so a note it wrote turns back up
+                // carrying the same reference it was given (#1104).
+                "knowledge_entry_id": note.knowledge_entry_id,
                 "updated_at": note.updated_at,
             });
             let size = entry.to_string().len();
@@ -2739,6 +2806,16 @@ fn parse_new_note(obj: &serde_json::Value) -> Option<NewScratchpadNote> {
         .get("done")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
+    // An omitted id preserves whatever the stored note already attaches, so a
+    // plain content rewrite cannot drop an attachment (the storage upsert
+    // COALESCEs it). A blank string is treated as omitted rather than as an id
+    // that will never resolve.
+    let knowledge_entry_id = obj
+        .get("knowledge_entry_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
     Some(NewScratchpadNote {
         key: key.trim().to_string(),
         content: content.to_string(),
@@ -2748,6 +2825,7 @@ fn parse_new_note(obj: &serde_json::Value) -> Option<NewScratchpadNote> {
         // Filled in by the write closure, the one place every scratchpad write
         // passes through (#717).
         embedding: None,
+        knowledge_entry_id,
     })
 }
 
@@ -3098,6 +3176,11 @@ mod tests {
                             existing.note_type = note.note_type;
                             existing.sequence = note.sequence;
                             existing.done = note.done;
+                            // `None` preserves, matching the storage adapter's
+                            // COALESCE: a rewrite must not drop an attachment.
+                            if note.knowledge_entry_id.is_some() {
+                                existing.knowledge_entry_id = note.knowledge_entry_id;
+                            }
                             existing.updated_at = "t1".into();
                             saved.push(existing.clone());
                         } else {
@@ -3110,6 +3193,7 @@ mod tests {
                             n.note_type = note.note_type;
                             n.sequence = note.sequence;
                             n.done = note.done;
+                            n.knowledge_entry_id = note.knowledge_entry_id;
                             n.updated_at = "t0".into();
                             guard.push(n.clone());
                             saved.push(n);
@@ -7061,6 +7145,174 @@ mod tests {
             .with_skills(skill_search, skill_get);
         service.set_mcp_control(crate::executor::McpToolExecutor::new(Vec::new()).control_handle());
         service
+    }
+
+    // --- #1104: attaching a knowledge entry to a note -----------------------
+
+    /// A scratchpad service whose knowledge base holds exactly `entry_id`, so a
+    /// write can attach one id that resolves and one that does not.
+    fn service_with_one_entry(
+        entry_id: &'static str,
+    ) -> (
+        BuiltinToolService,
+        Arc<std::sync::Mutex<Vec<ScratchpadNote>>>,
+    ) {
+        let kb_write: KnowledgeWriteFn = Arc::new(|entry| Box::pin(async move { Ok(entry) }));
+        let kb_search: KnowledgeSearchFn = Arc::new(|_q, _e, _m, _t, _x, _l| {
+            Box::pin(async {
+                Ok(
+                    desktop_assistant_core::ports::knowledge::KnowledgeSearchPage {
+                        entries: Vec::new(),
+                        scope_size: desktop_assistant_core::ports::knowledge::ScopeSize::None,
+                        available_tags: Vec::new(),
+                    },
+                )
+            })
+        });
+        let kb_delete: KnowledgeDeleteFn = Arc::new(|_ids| Box::pin(async { Ok(0) }));
+        let kb_list: KnowledgeListFn = Arc::new(|_query| {
+            Box::pin(async {
+                Ok(
+                    desktop_assistant_core::ports::knowledge::KnowledgeListPage {
+                        entries: Vec::new(),
+                        next_cursor: None,
+                    },
+                )
+            })
+        });
+        let kb_get: KnowledgeGetFn = Arc::new(move |id: String| {
+            Box::pin(async move {
+                Ok((id == entry_id).then(|| {
+                    desktop_assistant_core::domain::KnowledgeEntry::new(
+                        entry_id,
+                        "the durable fact",
+                        vec![],
+                    )
+                }))
+            })
+        });
+        let (service, store) = scratchpad_service();
+        (
+            service.with_knowledge_base(kb_write, kb_search, kb_delete, kb_list, kb_get),
+            store,
+        )
+    }
+
+    #[tokio::test]
+    async fn scratchpad_write_attaches_a_knowledge_entry_to_a_note() {
+        let (service, store) = service_with_one_entry("kb-1");
+        let out = with_conversation_id(ConversationId::from("conv-1"), async {
+            service
+                .execute_tool(
+                    TOOL_SCRATCHPAD_WRITE,
+                    serde_json::json!({
+                        "key": "deploy-target",
+                        "content": "this is the target we finally settled on",
+                        "knowledge_entry_id": "kb-1"
+                    }),
+                )
+                .await
+                .expect("write succeeds")
+        })
+        .await;
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("json");
+        assert_eq!(parsed["ok"], true, "{out}");
+        assert!(
+            parsed.get("rejected").is_none(),
+            "an entry that resolves must not be rejected: {out}"
+        );
+        let notes = store.lock().unwrap();
+        assert_eq!(
+            notes[0].knowledge_entry_id.as_deref(),
+            Some("kb-1"),
+            "the note must carry the attachment"
+        );
+    }
+
+    #[tokio::test]
+    async fn scratchpad_write_rejects_an_attachment_whose_entry_does_not_resolve() {
+        // Storing an id that names nothing would leave the model believing it
+        // pinned a fact it never attached. It is told at the write instead.
+        let (service, store) = service_with_one_entry("kb-1");
+        let out = with_conversation_id(ConversationId::from("conv-1"), async {
+            service
+                .execute_tool(
+                    TOOL_SCRATCHPAD_WRITE,
+                    serde_json::json!({
+                        "key": "deploy-target",
+                        "content": "settled",
+                        "knowledge_entry_id": "kb-nope"
+                    }),
+                )
+                .await
+                .expect("the call reports the refusal, it does not fail")
+        })
+        .await;
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("json");
+        let rejected = parsed["rejected"]
+            .as_array()
+            .expect("the note must be rejected, not stored");
+        assert_eq!(rejected[0]["key"], "deploy-target", "{out}");
+        assert!(
+            rejected[0]["reason"]
+                .as_str()
+                .expect("a reason")
+                .contains("kb-nope"),
+            "the reason must name the id that did not resolve: {out}"
+        );
+        assert!(
+            store.lock().unwrap().is_empty(),
+            "nothing is written when the attachment does not resolve"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repeated_key_in_one_batch_keeps_the_attachment_it_was_given() {
+        // Last write wins on the text, but an attachment the later note does
+        // not state is inherited. Otherwise the model attaches an entry,
+        // rewrites the same key in the same call, and is told the write
+        // succeeded with nothing attached.
+        let (service, store) = service_with_one_entry("kb-1");
+        let out = with_conversation_id(ConversationId::from("conv-1"), async {
+            service
+                .execute_tool(
+                    TOOL_SCRATCHPAD_WRITE,
+                    serde_json::json!({"notes": [
+                        {"key": "deploy-target", "content": "first", "knowledge_entry_id": "kb-1"},
+                        {"key": "deploy-target", "content": "second"}
+                    ]}),
+                )
+                .await
+                .expect("write succeeds")
+        })
+        .await;
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("json");
+        assert!(parsed.get("rejected").is_none(), "{out}");
+        let notes = store.lock().unwrap();
+        assert_eq!(notes.len(), 1, "the repeated key is one note");
+        assert_eq!(notes[0].content, "second", "last write wins on the text");
+        assert_eq!(
+            notes[0].knowledge_entry_id.as_deref(),
+            Some("kb-1"),
+            "the attachment the batch asked for must survive the repeat"
+        );
+    }
+
+    #[test]
+    fn scratchpad_write_advertises_the_knowledge_entry_attachment() {
+        // A schema that does not name the field is a contract the model cannot
+        // use.
+        let (service, _store) = service_with_one_entry("kb-1");
+        let def = service
+            .tool_definitions()
+            .into_iter()
+            .find(|t| t.name == TOOL_SCRATCHPAD_WRITE)
+            .expect("the write tool is advertised");
+        let schema = serde_json::to_string(&def.parameters).expect("schema");
+        assert!(
+            schema.contains("knowledge_entry_id"),
+            "the attachment must be advertised: {schema}"
+        );
     }
 
     #[test]

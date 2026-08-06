@@ -41,11 +41,18 @@ pub struct NewScratchpadNote {
     /// the background backfill, which is the normal degraded state when no
     /// embedding backend is configured or the backend stalled.
     pub embedding: Option<NoteEmbedding>,
+    /// The knowledge entry this note attaches, when it carries one (#1104).
+    ///
+    /// `None` on an upsert **preserves** whatever the stored note already
+    /// attaches, exactly as `source` and `summary` behave on a knowledge write:
+    /// a caller that rewrites a note's text and knows nothing about the
+    /// attachment must not silently drop it.
+    pub knowledge_entry_id: Option<String>,
 }
 
 impl NewScratchpadNote {
     /// A `note`-typed, unsequenced, not-done, unembedded upsert for
-    /// `key` / `content`.
+    /// `key` / `content`, attaching no knowledge entry.
     pub fn new(key: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
             key: key.into(),
@@ -54,6 +61,7 @@ impl NewScratchpadNote {
             sequence: None,
             done: false,
             embedding: None,
+            knowledge_entry_id: None,
         }
     }
 
@@ -188,6 +196,27 @@ pub const MAX_PINNED_NOTES: usize = 5;
 /// individual notes are near [`MAX_NOTE_BYTES`].
 pub const PINNED_BLOCK_BYTE_BUDGET: usize = 4 * 1024;
 
+/// How much of a referenced knowledge entry one pinned note may render, in
+/// characters (#1104).
+///
+/// A note is capped at [`MAX_NOTE_BYTES`]; a knowledge entry has no equivalent
+/// bound, so a single long entry would otherwise spend the whole
+/// [`PINNED_BLOCK_BYTE_BUDGET`] by itself.
+///
+/// Why this size: four times
+/// [`SUMMARY_MAX_CHARS`](desktop_assistant_protocol::SUMMARY_MAX_CHARS). A
+/// summary line answers "is this the entry I want?", and the point of a pin is
+/// having the fact itself, so a pinned entry must render more than a headline.
+///
+/// This is a per-entry cap, not a share of the block. It is measured in
+/// characters and [`PINNED_BLOCK_BYTE_BUDGET`] in bytes, and the notes render
+/// beside the entries, so [`MAX_PINNED_NOTES`] entries at this size do NOT fit
+/// inside the block - a few long entries, or one entry outside ASCII, and the
+/// block budget bites first. That is the intended order: this cap stops one
+/// entry from spending everything, and the block budget decides how much
+/// survives, with the cut marked and the notes that did not fit counted.
+pub const PINNED_ENTRY_MAX_CHARS: usize = 4 * desktop_assistant_protocol::SUMMARY_MAX_CHARS;
+
 /// Decide which keys a pin request may set, enforcing [`MAX_PINNED_NOTES`].
 ///
 /// Pure so the cap is testable without a database. `currently_pinned` is the
@@ -308,6 +337,48 @@ pub trait ScratchpadStore: Send + Sync {
         pinned: bool,
     ) -> impl Future<Output = Result<u64, CoreError>> + Send;
 
+    /// Drop the knowledge-entry attachment from the given notes (by note id)
+    /// and release any pin those notes held, returning the number changed
+    /// (#1104).
+    ///
+    /// Why it exists: a reference must never outlive its entry. The render path
+    /// resolves each pinned note's entry every round, and an entry that no
+    /// longer resolves leaves a pin that asserts nothing — a fact the model
+    /// believes it has and does not. This is the repair.
+    ///
+    /// Why note ids and not keys: a key is unique per `(conversation,
+    /// owner_todo)`, and the render reads a whole subagent subtree, so a key
+    /// alone could name a row in a different namespace. `conversation_id`
+    /// still travels, so the repair cannot reach outside the pad it read.
+    ///
+    /// Confined to the caller's own `owner_todo` **subtree**, which is wider
+    /// than [`Self::set_pinned`] and [`Self::delete_many`] (own namespace only)
+    /// and narrower than [`Self::list`] (namespace-blind at the top level).
+    /// Both extremes fail:
+    ///
+    /// - Unconfined, a subagent round releases a pin in an ancestor's
+    ///   namespace, and the line saying so renders into the subagent's block
+    ///   where the parent never sees it.
+    /// - Own-namespace-only, a note the top-level read can see but not repair
+    ///   keeps a dead attachment for the life of the conversation, holds a slot
+    ///   of the pin cap, and costs a knowledge read every round - and the model
+    ///   cannot clear it either, because the pin and delete verbs are confined
+    ///   the same way.
+    ///
+    /// Own-subtree fits both: the root namespace repairs anything, matching its
+    /// namespace-blind read, and a subagent repairs itself and its descendants
+    /// but never an ancestor or a sibling.
+    ///
+    /// Scoped by the task-local `UserId`, which is the tenant guard.
+    ///
+    /// Idempotent: a second call over the same ids changes nothing and
+    /// returns 0.
+    fn release_knowledge_references(
+        &self,
+        conversation_id: &str,
+        note_ids: &[String],
+    ) -> impl Future<Output = Result<u64, CoreError>> + Send;
+
     /// Delete every note for a conversation. Returns the number deleted.
     fn clear(&self, conversation_id: &str) -> impl Future<Output = Result<u64, CoreError>> + Send;
 
@@ -398,6 +469,15 @@ pub type ScratchpadSetPinnedFn = Arc<
             Vec<String>,
             bool,
         ) -> Pin<Box<dyn Future<Output = Result<u64, CoreError>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Boxed async closure for releasing dangling knowledge-entry attachments by
+/// note id (#1104). Returns the count changed. See
+/// [`ScratchpadStore::release_knowledge_references`].
+pub type ScratchpadReleaseReferencesFn = Arc<
+    dyn Fn(String, Vec<String>) -> Pin<Box<dyn Future<Output = Result<u64, CoreError>> + Send>>
         + Send
         + Sync,
 >;
@@ -649,6 +729,14 @@ mod tests {
             keys: &[String],
         ) -> Result<u64, CoreError> {
             Ok(keys.len() as u64)
+        }
+
+        async fn release_knowledge_references(
+            &self,
+            _conversation_id: &str,
+            note_ids: &[String],
+        ) -> Result<u64, CoreError> {
+            Ok(note_ids.len() as u64)
         }
 
         async fn clear(&self, _conversation_id: &str) -> Result<u64, CoreError> {

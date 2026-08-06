@@ -304,6 +304,21 @@ pub type KnowledgeGetFn = Arc<
         + Sync,
 >;
 
+/// Boxed async closure for fetching several entries by id in one read (#1104).
+///
+/// Why a batch and not repeated [`KnowledgeGetFn`] calls: the `[Pinned]` block
+/// resolves every attached entry on every dispatch round, so a per-pin read
+/// would multiply the round's storage traffic by the pin cap. Ids that name no
+/// entry the caller owns are simply absent from the result, which is what marks
+/// a reference as no longer resolving.
+pub type KnowledgeGetManyFn = Arc<
+    dyn Fn(
+            Vec<String>,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<KnowledgeEntry>, CoreError>> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Direction for a paginated [`KnowledgeListQuery`]. Surfaced explicitly to the
 /// LLM so it always knows which way it is paging.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

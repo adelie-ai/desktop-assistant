@@ -1,0 +1,33 @@
+-- Issue #1104: a scratchpad note can attach a knowledge entry, so pinning that
+-- note keeps the entry's live content in view.
+--
+-- The attachment is additive, beside `content` and not in place of it: the note
+-- says in the model's words why the entry matters right now, and the entry
+-- carries the durable fact. A typed column (rather than an id encoded into
+-- `content` behind a magic `note_type`) is checkable by the database and
+-- greppable by a reader.
+--
+-- No foreign key to `knowledge_base(id)`, deliberately. An `ON DELETE SET NULL`
+-- reference reads as the structural half of "a reference never outlives its
+-- entry", and it is the opposite: it clears the column the instant the entry
+-- row goes, which destroys the only evidence the render path has that the note
+-- ever pointed anywhere. The note would then keep its pin, render nothing under
+-- that pin, and never be told - the exact failure this feature exists to
+-- prevent. So the column is a plain nullable id, and the render path owns the
+-- whole repair: it resolves every attachment each round, and one that no longer
+-- answers is dropped from the block, named to the model, and cleared with its
+-- pin. A hard delete and a soft delete then take the same path.
+--
+-- The write tool checks the id against the caller's own entries before storing
+-- it, so a wrong id is refused at the boundary rather than stored and reaped.
+--
+-- Row level security needs nothing here: migration 029 already enabled it on
+-- `scratchpads`, and its policy is on `user_id`, which this column does not
+-- change.
+--
+-- The migration runner (pool.rs) applies each migration at most once, tracked
+-- in the `schema_migrations` ledger, but every statement here MUST still be
+-- idempotent: a database migrated before that ledger existed replays the whole
+-- set once on its first boot under it.
+
+ALTER TABLE scratchpads ADD COLUMN IF NOT EXISTS knowledge_entry_id TEXT;

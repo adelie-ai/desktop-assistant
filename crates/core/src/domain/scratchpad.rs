@@ -39,6 +39,19 @@ pub struct ScratchpadNote {
     /// Bounded by [`crate::ports::scratchpad::MAX_PINNED_NOTES`]; only the
     /// dedicated pin path changes it, so rewriting a note never clears its pin.
     pub pinned: bool,
+    /// The knowledge entry this note attaches, when it carries one (#1104).
+    ///
+    /// The attachment is additive: the note keeps its own `content`, which says
+    /// in the model's words why the entry matters right now, and the entry
+    /// carries the durable fact. A pinned note with an attachment renders both,
+    /// the note text first and the entry's **live** content beneath it.
+    ///
+    /// It is dereferenced when the block is rendered, never when the note is
+    /// written, so an edit to the entry reaches the pinned view. A reference
+    /// never outlives its entry: one that no longer resolves is dropped and its
+    /// pin released (see
+    /// [`ScratchpadStore::release_knowledge_references`](crate::ports::scratchpad::ScratchpadStore::release_knowledge_references)).
+    pub knowledge_entry_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -67,6 +80,7 @@ impl ScratchpadNote {
             sequence: None,
             done: false,
             pinned: false,
+            knowledge_entry_id: None,
             created_at: String::new(),
             updated_at: String::new(),
         }

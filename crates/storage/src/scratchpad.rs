@@ -73,6 +73,7 @@ struct SpRow {
     seq: Option<i32>,
     done: bool,
     pinned: bool,
+    knowledge_entry_id: Option<String>,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -89,6 +90,7 @@ impl SpRow {
             sequence: self.seq,
             done: self.done,
             pinned: self.pinned,
+            knowledge_entry_id: self.knowledge_entry_id,
             created_at: self.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
             updated_at: self.updated_at.format("%Y-%m-%d %H:%M:%S").to_string(),
         }
@@ -127,6 +129,12 @@ impl ScratchpadStore for PgScratchpadStore {
         // `seq` is nullable; UNNEST of a `Vec<Option<i32>>` preserves NULLs.
         let seqs: Vec<Option<i32>> = notes.iter().map(|n| n.sequence).collect();
         let dones: Vec<bool> = notes.iter().map(|n| n.done).collect();
+        // `None` means "leave whatever is attached alone", not "detach", so a
+        // caller that rewrites a note's text without knowing about the
+        // attachment cannot drop it — the same rule `source` and `summary`
+        // follow on a knowledge write. The COALESCE below is what applies it.
+        let entry_ids: Vec<Option<String>> =
+            notes.iter().map(|n| n.knowledge_entry_id.clone()).collect();
 
         // The conflict target `(conversation_id, owner_todo, note_key)`
         // (migration 031) has no `user_id` component, so without a `WHERE`
@@ -158,16 +166,20 @@ impl ScratchpadStore for PgScratchpadStore {
 
         let rows: Vec<SpRow> = sqlx::query_as(
             "INSERT INTO scratchpads \
-                 (id, user_id, conversation_id, owner_todo, note_key, content, note_type, seq, done) \
+                 (id, user_id, conversation_id, owner_todo, note_key, content, note_type, seq, done, \
+                  knowledge_entry_id) \
              SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], \
-                                  $5::text[], $6::text[], $7::text[], $8::int4[], $9::bool[]) \
+                                  $5::text[], $6::text[], $7::text[], $8::int4[], $9::bool[], \
+                                  $10::text[]) \
              ON CONFLICT (conversation_id, owner_todo, note_key) \
              DO UPDATE SET content = EXCLUDED.content, note_type = EXCLUDED.note_type, \
                            seq = EXCLUDED.seq, done = EXCLUDED.done, updated_at = NOW(), \
-                           embedding = NULL, embedding_model = NULL \
+                           embedding = NULL, embedding_model = NULL, \
+                           knowledge_entry_id = COALESCE(EXCLUDED.knowledge_entry_id, \
+                                                         scratchpads.knowledge_entry_id) \
              WHERE scratchpads.user_id = EXCLUDED.user_id \
              RETURNING id, conversation_id, owner_todo, note_key, content, note_type, seq, done, pinned, \
-                       created_at, updated_at",
+                       knowledge_entry_id, created_at, updated_at",
         )
         .bind(&ids)
         .bind(&user_ids)
@@ -178,6 +190,7 @@ impl ScratchpadStore for PgScratchpadStore {
         .bind(&types)
         .bind(&seqs)
         .bind(&dones)
+        .bind(&entry_ids)
         .fetch_all(&mut *tx)
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;
@@ -236,7 +249,7 @@ impl ScratchpadStore for PgScratchpadStore {
         let (vb, me, ancestors) = read_snapshot();
         let rows: Vec<SpRow> = sqlx::query_as(
             "SELECT id, conversation_id, owner_todo, note_key, content, note_type, seq, done, pinned, \
-                    created_at, updated_at \
+                    knowledge_entry_id, created_at, updated_at \
              FROM scratchpads \
              WHERE user_id = $1 AND conversation_id = $2 AND note_key = ANY($3) \
                AND ($5::text IS NULL OR (owner_todo = $6 OR owner_todo LIKE $6 || '.%' \
@@ -269,7 +282,7 @@ impl ScratchpadStore for PgScratchpadStore {
         let (vb, me, ancestors) = read_snapshot();
         let rows: Vec<SpRow> = sqlx::query_as(
             "SELECT id, conversation_id, owner_todo, note_key, content, note_type, seq, done, pinned, \
-                    created_at, updated_at \
+                    knowledge_entry_id, created_at, updated_at \
              FROM scratchpads \
              WHERE user_id = $1 AND conversation_id = $2 \
                AND ($3::text IS NULL OR note_type = $3) \
@@ -378,6 +391,65 @@ impl ScratchpadStore for PgScratchpadStore {
         Ok(result.rows_affected())
     }
 
+    async fn release_knowledge_references(
+        &self,
+        conversation_id: &str,
+        note_ids: &[String],
+    ) -> Result<u64, CoreError> {
+        if note_ids.is_empty() {
+            return Ok(0);
+        }
+        let user_id = current_user_id();
+        // Confined to the caller's own SUBTREE, which is not what `set_pinned`
+        // and `delete_many` do - they confine to the caller's own namespace
+        // exactly. Two failures bound this, one on each side.
+        //
+        // Reaching too far: a subagent round must never clear a pin in an
+        // ancestor's namespace. Its read spans its ancestors, so an unconfined
+        // repair let it release the parent's pin, and the line saying so
+        // rendered into the subagent's block where the parent never sees it.
+        //
+        // Reaching too little: the top-level read is namespace-blind, so a
+        // top-level round sees a subagent's note. Confining the repair to the
+        // caller's own namespace alone left that note stuck for the life of the
+        // conversation - a dead attachment, a slot of the pin cap consumed, a
+        // knowledge read spent every round, and no verb the model could use to
+        // clear it, because `set_pinned` and `delete_many` are confined too.
+        //
+        // Own-subtree is the rule that fits both: the root namespace repairs
+        // anything, matching its namespace-blind read, and a subagent repairs
+        // itself and its descendants but never an ancestor or a sibling. The
+        // repair only ever touches rows this round has just read and just named
+        // to the model, so no round clears something it did not report.
+        let me = current_namespace();
+        //
+        // The pin goes with the attachment. A note whose entry has gone renders
+        // nothing under `[Pinned]`, and a pin that renders nothing is a fact the
+        // model believes it has and does not, so the pin is released and the
+        // note falls back to the `[Scratchpad]` index like any other note.
+        //
+        // `updated_at` is deliberately left alone: this is a repair, not an edit
+        // the model made, and bumping it would move the note to the top of the
+        // pad for a reason nothing can see.
+        //
+        // `knowledge_entry_id IS NOT NULL` makes `rows_affected` the count
+        // actually repaired and makes a second call a true no-op.
+        let result = sqlx::query(
+            "UPDATE scratchpads SET knowledge_entry_id = NULL, pinned = FALSE \
+             WHERE user_id = $1 AND conversation_id = $2 AND id = ANY($4) \
+               AND ($3 = '' OR owner_todo = $3 OR owner_todo LIKE $3 || '.%') \
+               AND knowledge_entry_id IS NOT NULL",
+        )
+        .bind(user_id.as_str())
+        .bind(conversation_id)
+        .bind(&me)
+        .bind(note_ids)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CoreError::Storage(e.to_string()))?;
+        Ok(result.rows_affected())
+    }
+
     async fn clear(&self, conversation_id: &str) -> Result<u64, CoreError> {
         let user_id = current_user_id();
         // Namespace-confined (see delete_many): `clear`/`delete all:true` from a
@@ -440,7 +512,7 @@ impl PgScratchpadStore {
         let rows: Vec<SpRow> = sqlx::query_as(
             "WITH q AS (SELECT plainto_tsquery('english', $3) AS query) \
              SELECT id, conversation_id, owner_todo, note_key, content, note_type, seq, done, pinned, \
-                    created_at, updated_at \
+                    knowledge_entry_id, created_at, updated_at \
              FROM scratchpads, q \
              WHERE user_id = $1 AND conversation_id = $2 AND tsv @@ q.query \
                AND ($4::text IS NULL OR note_type = $4) \
@@ -517,7 +589,7 @@ impl PgScratchpadStore {
         let rows: Vec<SpRow> = sqlx::query_as(
             "WITH chunk_distances AS (
                 SELECT id, conversation_id, owner_todo, note_key, content, note_type,
-                       seq, done, pinned, created_at, updated_at,
+                       seq, done, pinned, knowledge_entry_id, created_at, updated_at,
                        MIN(chunk <=> $1) AS min_distance
                 FROM scratchpads, unnest(embedding) AS chunk
                 WHERE user_id = $2 AND conversation_id = $3
@@ -531,11 +603,11 @@ impl PgScratchpadStore {
                            AND split_part(embedding_model, '@', 2)
                                = split_part($9, '@', 2)))
                 GROUP BY id, conversation_id, owner_todo, note_key, content, note_type,
-                         seq, done, pinned, created_at, updated_at
+                         seq, done, pinned, knowledge_entry_id, created_at, updated_at
             ),
             vector_ranked AS (
                 SELECT id, conversation_id, owner_todo, note_key, content, note_type,
-                       seq, done, pinned, created_at, updated_at,
+                       seq, done, pinned, knowledge_entry_id, created_at, updated_at,
                        ROW_NUMBER() OVER (ORDER BY min_distance) AS rank_v
                 FROM chunk_distances
                 ORDER BY min_distance
@@ -543,7 +615,7 @@ impl PgScratchpadStore {
             ),
             text_ranked AS (
                 SELECT id, conversation_id, owner_todo, note_key, content, note_type,
-                       seq, done, pinned, created_at, updated_at,
+                       seq, done, pinned, knowledge_entry_id, created_at, updated_at,
                        ROW_NUMBER() OVER (ORDER BY ts_rank_cd(tsv, q.query) DESC) AS rank_t
                 FROM scratchpads, plainto_tsquery('english', $5) AS q(query)
                 WHERE user_id = $2 AND conversation_id = $3
@@ -564,6 +636,7 @@ impl PgScratchpadStore {
                        COALESCE(v.seq, t.seq) AS seq,
                        COALESCE(v.done, t.done) AS done,
                        COALESCE(v.pinned, t.pinned) AS pinned,
+                       COALESCE(v.knowledge_entry_id, t.knowledge_entry_id) AS knowledge_entry_id,
                        COALESCE(v.created_at, t.created_at) AS created_at,
                        COALESCE(v.updated_at, t.updated_at) AS updated_at,
                        (COALESCE(1.0 / (60 + v.rank_v), 0) +
@@ -572,7 +645,7 @@ impl PgScratchpadStore {
                 FULL OUTER JOIN text_ranked t ON v.id = t.id
             )
             SELECT id, conversation_id, owner_todo, note_key, content, note_type,
-                   seq, done, pinned, created_at, updated_at
+                   seq, done, pinned, knowledge_entry_id, created_at, updated_at
             FROM fused ORDER BY rrf_score DESC, updated_at DESC, id DESC LIMIT $11",
         )
         .bind(embedding_vec)

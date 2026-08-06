@@ -13,13 +13,15 @@ use crate::planning::{self, StepStack};
 use crate::ports::client_tools::current_client_tools;
 use crate::ports::conversation_ctx::with_conversation_id;
 use crate::ports::inbound::ConversationService;
+use crate::ports::knowledge::KnowledgeGetManyFn;
 use crate::ports::llm::{
     ChunkCallback, LlmClient, ReasoningConfig, StatusCallback, current_cancellation_token,
     current_context_budget, current_tool_allowlist, current_tool_gate_disabled,
 };
 use crate::ports::scratchpad::{
     MAX_NOTE_BYTES, NewScratchpadNote, PINNED_BLOCK_BYTE_BUDGET, SCRATCHPAD_GOAL_KEY,
-    ScratchpadDeleteSubtreeFn, ScratchpadGetManyFn, ScratchpadListFn, ScratchpadWriteFn,
+    ScratchpadDeleteSubtreeFn, ScratchpadGetManyFn, ScratchpadListFn,
+    ScratchpadReleaseReferencesFn, ScratchpadWriteFn,
 };
 use crate::ports::scratchpad_scope::{
     SPAWN_SUBAGENT_TOOL, SubagentScope, current_ancestors, current_owner_todo,
@@ -479,6 +481,17 @@ pub struct ConversationHandler<S, L, T = NoopToolExecutor> {
     /// don't linger. `None` disables the cascade (tests / pre-#287 path). Wire
     /// the daemon's event-emitting delete so reclaimed notes reach clients.
     scratchpad_delete_subtree: Option<ScratchpadDeleteSubtreeFn>,
+    /// Optional repair for a scratchpad note whose attached knowledge entry no
+    /// longer resolves (#1104). The per-round render calls it so a reference
+    /// never outlives its entry. `None` leaves a dangling attachment in place;
+    /// the render still refuses to assert it.
+    scratchpad_release_references: Option<ScratchpadReleaseReferencesFn>,
+    /// Optional batched reader for the knowledge entries attached to pinned
+    /// notes (#1104). Set means the `[Pinned]` block dereferences attachments
+    /// at render time, so an edit to an entry reaches the block. `None` means
+    /// attachments cannot be resolved this round, and the block renders each
+    /// note's own text without claiming anything about its entry.
+    knowledge_get_many: Option<KnowledgeGetManyFn>,
     /// Optional lifecycle probe (#287) answering "is any of this user's
     /// background tasks under this `owner_todo` subtree (in this session) still
     /// non-terminal?" The cascade DEFERS while it returns true, so a running
@@ -536,6 +549,8 @@ impl<S, L> ConversationHandler<S, L, NoopToolExecutor> {
             scratchpad_write: None,
             scratchpad_list: None,
             scratchpad_delete_subtree: None,
+            scratchpad_release_references: None,
+            knowledge_get_many: None,
             descendant_task_probe: None,
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             host: DEFAULT_HOST_LABEL.to_string(),
@@ -600,6 +615,8 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             scratchpad_write: None,
             scratchpad_list: None,
             scratchpad_delete_subtree: None,
+            scratchpad_release_references: None,
+            knowledge_get_many: None,
             descendant_task_probe: None,
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             host: DEFAULT_HOST_LABEL.to_string(),
@@ -669,6 +686,24 @@ impl<S, L, T> ConversationHandler<S, L, T> {
     /// subagents deletes their `owner_todo` subtree from the session pad.
     pub fn with_scratchpad_delete_subtree(mut self, delete: ScratchpadDeleteSubtreeFn) -> Self {
         self.scratchpad_delete_subtree = Some(delete);
+        self
+    }
+
+    /// Wire the repair for a scratchpad note whose attached knowledge entry no
+    /// longer resolves (#1104). The per-round render calls it with the note ids
+    /// it found dangling, so a reference never outlives its entry.
+    pub fn with_scratchpad_release_references(
+        mut self,
+        release: ScratchpadReleaseReferencesFn,
+    ) -> Self {
+        self.scratchpad_release_references = Some(release);
+        self
+    }
+
+    /// Wire the batched knowledge read that resolves the entries attached to
+    /// pinned notes (#1104), one read per round rather than one per pin.
+    pub fn with_knowledge_get_many(mut self, get_many: KnowledgeGetManyFn) -> Self {
+        self.knowledge_get_many = Some(get_many);
         self
     }
 
@@ -772,6 +807,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
                 sequence: Some(sequence),
                 done: false,
                 embedding: None,
+                knowledge_entry_id: None,
             };
             if let Err(e) = write(conv_id, vec![note]).await {
                 tracing::warn!(step = %key, error = %e, "failed to record plan step note");
@@ -816,6 +852,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
                     sequence: None,
                     done: false,
                     embedding: None,
+                    knowledge_entry_id: None,
                 };
                 if let Err(e) = write(conv_id, vec![note]).await {
                     tracing::warn!(error = %e, "failed to record standalone outcome note");
@@ -846,6 +883,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             sequence: Some(frame.sequence),
             done: true,
             embedding: None,
+            knowledge_entry_id: None,
         }];
         let mut note_keys: Vec<String> = Vec::new();
         if let Some(o) = outcome {
@@ -863,6 +901,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
                 sequence: None,
                 done: false,
                 embedding: None,
+                knowledge_entry_id: None,
             });
             note_keys.push(okey);
         }
@@ -981,8 +1020,19 @@ impl<S, L, T> ConversationHandler<S, L, T> {
                 note_type: n.note_type.as_str(),
                 done: n.done,
                 pinned: n.pinned,
+                knowledge_entry_id: n.knowledge_entry_id.as_deref(),
             })
             .collect();
+
+        let resolved = self.resolve_pinned_entries(&notes).await;
+        let entries: Option<planning::PinnedEntries> = resolved.as_ref().map(|found| {
+            found
+                .iter()
+                .map(|e| (e.id.as_str(), e.content.as_str()))
+                .collect()
+        });
+        self.release_dangling_references(conversation_id, &notes, entries.as_ref())
+            .await;
 
         let keys = planning::freeform_note_keys(&raw);
         ScratchpadSurfaces {
@@ -996,7 +1046,83 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             // block costs no extra storage round-trip. `list` orders pinned
             // first, so the pinned set is always inside the row limit however
             // many notes the conversation has accrued.
-            pinned: planning::render_pinned(&raw, PINNED_BLOCK_BYTE_BUDGET),
+            pinned: planning::render_pinned(&raw, entries.as_ref(), PINNED_BLOCK_BYTE_BUDGET),
+        }
+    }
+
+    /// Read the knowledge entries attached to this round's pinned notes
+    /// (#1104), in one batched read.
+    ///
+    /// `Some` means the read ran and its result is the truth about which
+    /// attachments still resolve. `None` means it did not run at all - no
+    /// reader is wired, or the read failed - and the caller must then treat no
+    /// attachment as dangling, because reaping on a transient storage failure
+    /// would destroy live references.
+    ///
+    /// A pad with no attached entries needs no read and answers `Some(&[])`.
+    async fn resolve_pinned_entries(
+        &self,
+        notes: &[crate::domain::ScratchpadNote],
+    ) -> Option<Vec<crate::domain::KnowledgeEntry>> {
+        let mut ids: Vec<String> = notes
+            .iter()
+            .filter(|n| n.pinned)
+            .filter_map(|n| n.knowledge_entry_id.clone())
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.is_empty() {
+            return Some(Vec::new());
+        }
+        let get_many = self.knowledge_get_many.as_ref()?;
+        match get_many(ids).await {
+            Ok(found) => Some(found),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "could not read the knowledge entries pinned notes attach; \
+                     [Pinned] renders their note text only this round"
+                );
+                None
+            }
+        }
+    }
+
+    /// Drop the attachments that no longer resolve, and release the pins they
+    /// held (#1104), so a reference never outlives its entry.
+    ///
+    /// Does nothing when `entries` is `None`: that means the resolving read did
+    /// not run, which is not evidence that any entry is gone. Best-effort - a
+    /// failed repair is logged and retried on the next round, never returned,
+    /// because a reminder must not break the turn.
+    async fn release_dangling_references(
+        &self,
+        conversation_id: &ConversationId,
+        notes: &[crate::domain::ScratchpadNote],
+        entries: Option<&planning::PinnedEntries<'_>>,
+    ) {
+        let (Some(entries), Some(release)) = (entries, self.scratchpad_release_references.as_ref())
+        else {
+            return;
+        };
+        let dangling: Vec<String> = notes
+            .iter()
+            .filter(|n| n.pinned)
+            .filter(|n| {
+                n.knowledge_entry_id
+                    .as_deref()
+                    .is_some_and(|id| !entries.contains_key(id))
+            })
+            .map(|n| n.id.clone())
+            .collect();
+        if dangling.is_empty() {
+            return;
+        }
+        if let Err(e) = release(conversation_id.0.clone(), dangling).await {
+            tracing::warn!(
+                error = %e,
+                "could not release pinned notes whose knowledge entry has gone"
+            );
         }
     }
 
@@ -5773,6 +5899,223 @@ mod tests {
             .expect("the open plan must be surfaced once a todo exists");
         assert!(plan_msg.content.contains("map the plan"));
         assert!(plan_msg.content.contains("← you are here"));
+    }
+
+    // --- #1104 a pinned note that attaches a knowledge entry ----------------
+
+    /// A pad holding one pinned note that attaches a knowledge entry, plus the
+    /// LLM that captures each round's assembled context.
+    struct PinnedReferenceFixture {
+        write: ScratchpadWriteFn,
+        list: ScratchpadListFn,
+        captured: Arc<Mutex<Vec<Vec<Message>>>>,
+        llm: PlanContextCapturingLlm,
+    }
+
+    /// Build one. Every `(key, entry_id)` pair becomes a pinned note attaching
+    /// that entry; the first is `deploy-target` in every test that needs only
+    /// one.
+    fn pinned_reference_fixture(attachments: &[(&str, &str)]) -> PinnedReferenceFixture {
+        let (write, list, sp) = in_memory_scratchpad();
+        for (key, entry_id) in attachments {
+            let mut note = crate::domain::ScratchpadNote::new(
+                format!("note-{key}"),
+                "conv",
+                *key,
+                format!("this is the {key} we finally settled on"),
+            );
+            note.pinned = true;
+            note.knowledge_entry_id = Some((*entry_id).to_string());
+            sp.lock().unwrap().insert((*key).to_string(), note);
+        }
+
+        let captured: Arc<Mutex<Vec<Vec<Message>>>> = Arc::new(Mutex::new(Vec::new()));
+        let llm = PlanContextCapturingLlm {
+            responses: Mutex::new(vec![LlmResponse::text("done")]),
+            captured: Arc::clone(&captured),
+        };
+        PinnedReferenceFixture {
+            write,
+            list,
+            captured,
+            llm,
+        }
+    }
+
+    /// The `[Pinned]` block from any captured round, if one rendered.
+    fn captured_pinned_block(rounds: &[Vec<Message>]) -> Option<String> {
+        rounds
+            .iter()
+            .flatten()
+            .find(|m| m.role == Role::System && m.content.starts_with("[Pinned]"))
+            .map(|m| m.content.clone())
+    }
+
+    #[tokio::test]
+    async fn pinned_reference_to_a_deleted_entry_renders_nothing_and_is_reaped() {
+        // A pin that renders empty is a fact the model believes it has and does
+        // not, so the block must not assert it and the attachment must not
+        // survive the entry.
+        let fx = pinned_reference_fixture(&[("deploy-target", "kb-gone")]);
+        let (write, list, captured, llm) = (fx.write, fx.list, fx.captured, fx.llm);
+        // The read runs and finds nothing: the entry was deleted or trashed.
+        let get_many: KnowledgeGetManyFn = Arc::new(|_ids| Box::pin(async { Ok(Vec::new()) }));
+        let reaped: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&reaped);
+        let release: ScratchpadReleaseReferencesFn = Arc::new(move |_conv, ids: Vec<String>| {
+            let seen = Arc::clone(&seen);
+            Box::pin(async move {
+                let n = ids.len() as u64;
+                seen.lock().unwrap().extend(ids);
+                Ok(n)
+            })
+        });
+
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            llm,
+            MockToolExecutor::new(vec![], HashMap::new()),
+            id_gen(),
+        )
+        .with_scratchpad_write(write)
+        .with_scratchpad_list(list)
+        .with_knowledge_get_many(get_many)
+        .with_scratchpad_release_references(release);
+
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+
+        let block = captured_pinned_block(&captured.lock().unwrap())
+            .expect("the model must be told a pin was released, so a block is owed");
+        assert!(
+            !block.contains("this is the deploy-target we finally settled on"),
+            "a reference whose entry has gone must render nothing: {block}"
+        );
+        assert!(
+            block.contains("deploy-target") && block.contains("no longer exists"),
+            "the released note must be named, never dropped in silence: {block}"
+        );
+        assert_eq!(
+            *reaped.lock().unwrap(),
+            vec!["note-deploy-target".to_string()],
+            "the dangling attachment must be reaped, by note id"
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_references_are_resolved_in_one_batched_read_per_round() {
+        // One read per round, never one per pin: the block re-renders every
+        // round, so a per-pin read multiplies the round's storage traffic by
+        // the pin cap.
+        let fx = pinned_reference_fixture(&[("deploy-target", "kb-1"), ("api-quirk", "kb-2")]);
+        let (write, list, llm) = (fx.write, fx.list, fx.llm);
+        let reads: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&reads);
+        let get_many: KnowledgeGetManyFn = Arc::new(move |ids: Vec<String>| {
+            seen.lock().unwrap().push(ids);
+            Box::pin(async {
+                Ok(vec![
+                    crate::domain::KnowledgeEntry::new(
+                        "kb-1",
+                        "Deploys go to the managed cluster.",
+                        vec![],
+                    ),
+                    crate::domain::KnowledgeEntry::new(
+                        "kb-2",
+                        "The login form is form-encoded, not JSON.",
+                        vec![],
+                    ),
+                ])
+            })
+        });
+
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            llm,
+            MockToolExecutor::new(vec![], HashMap::new()),
+            id_gen(),
+        )
+        .with_scratchpad_write(write)
+        .with_scratchpad_list(list)
+        .with_knowledge_get_many(get_many);
+
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+
+        let reads = reads.lock().unwrap();
+        assert!(!reads.is_empty(), "the attachments must be resolved at all");
+        for ids in reads.iter() {
+            let mut ids = ids.clone();
+            ids.sort();
+            assert_eq!(
+                ids,
+                vec!["kb-1".to_string(), "kb-2".to_string()],
+                "a round must resolve BOTH attachments in one read, not one read each: {ids:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_transient_knowledge_read_failure_does_not_reap_a_pinned_reference() {
+        // A failed read says nothing about whether the entry still exists.
+        // Reaping on it would destroy a live reference the model is relying on.
+        let fx = pinned_reference_fixture(&[("deploy-target", "kb-1")]);
+        let (write, list, captured, llm) = (fx.write, fx.list, fx.captured, fx.llm);
+        let get_many: KnowledgeGetManyFn = Arc::new(|_ids| {
+            Box::pin(async { Err(CoreError::Storage("connection reset".to_string())) })
+        });
+        let reaped: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&reaped);
+        let release: ScratchpadReleaseReferencesFn = Arc::new(move |_conv, ids: Vec<String>| {
+            let seen = Arc::clone(&seen);
+            Box::pin(async move {
+                seen.lock().unwrap().extend(ids);
+                Ok(0)
+            })
+        });
+
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            llm,
+            MockToolExecutor::new(vec![], HashMap::new()),
+            id_gen(),
+        )
+        .with_scratchpad_write(write)
+        .with_scratchpad_list(list)
+        .with_knowledge_get_many(get_many)
+        .with_scratchpad_release_references(release);
+
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+
+        assert!(
+            reaped.lock().unwrap().is_empty(),
+            "a failed read must not be read as a missing entry"
+        );
+        let block = captured_pinned_block(&captured.lock().unwrap())
+            .expect("the note is still pinned, so the block still renders");
+        assert!(
+            block.contains("this is the deploy-target we finally settled on"),
+            "the note's own text survives a failed resolve: {block}"
+        );
     }
 
     #[tokio::test]
