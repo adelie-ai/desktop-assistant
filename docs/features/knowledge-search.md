@@ -261,6 +261,14 @@ read that answers one:
  "message": "not every id was answered; ask for at most 64 ids at a time, ..."}
 ```
 
+A row whose content had to be cut carries one extra field:
+
+```json
+{"id": "...", "content": "the start of a very long entry", "content_truncated": true,
+ "summary": "...", "tags": ["..."], "metadata": {}, "source": "...",
+ "created_at": "...", "updated_at": "..."}
+```
+
 It takes a batch (`ids`, or `id` for one), because the `[Recall]` block offers
 several candidates and the model often wants two or three of them. Entries come
 back in the order the ids were asked for, and a repeated id is read once.
@@ -278,11 +286,22 @@ reason at all. Row-level security is a non-FORCE backstop that the table owner
 bypasses, so the `user_id` predicate in `get_many` is the real guard;
 `crates/storage/tests/knowledge_get_many.rs` holds it against a real database.
 
-**Both bounds report themselves.** At most 64 ids per call
+**Every bound reports itself.** At most 64 ids per call
 (`KNOWLEDGE_GET_MAX_IDS`), and the response carries the same byte budget the
 scratchpad read uses, so a batch of long entries cannot spend the whole context.
-Either bound sets `truncated` and a `message`. An id in neither `entries` nor
-`not_found` was left out by the budget, not lost.
+Any bound that bites sets `truncated` and a `message`. An id in neither `entries`
+nor `not_found` was left out by the budget, not lost.
+
+The third bound is the one the scratchpad read does not need. A note is capped at
+`MAX_NOTE_BYTES` on write, so a single note always fits the response budget; a
+knowledge entry has no write-side length cap at all. So the first row of a
+response is not admitted on trust: an entry that alone overruns the budget
+arrives with its `content` cut and `content_truncated: true` on the row. Leaving
+it out instead would make a long entry unreadable by any call, and letting it
+through whole would hand it to the generic 256 KiB tool-result cap
+(`crates/core/src/context/mod.rs`), which cuts raw bytes and lands mid-JSON. A
+later row is never cut - it waits for its own call, and the caller still holds
+its id.
 
 ## Where things live
 

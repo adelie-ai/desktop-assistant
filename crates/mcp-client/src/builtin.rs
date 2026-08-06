@@ -765,7 +765,10 @@ impl BuiltinToolService {
                      reference costs you nothing; treat it as a reference worth dropping, not \
                      as an error. Ids past the cap are dropped, and a response too large to \
                      carry every entry drops entries as well; either way the response reports \
-                     `truncated` and you ask for the rest in a smaller batch."
+                     `truncated` and you ask for the rest in a smaller batch. One entry can \
+                     be too long to deliver whole even on its own: that entry arrives marked \
+                     `content_truncated`, and its `content` is the start of the entry rather \
+                     than the entry, so do not act on it as if it were complete."
                 ),
                 serde_json::json!({
                     "type": "object",
@@ -2095,24 +2098,27 @@ impl BuiltinToolService {
         let not_found: Vec<&String> = ids.iter().filter(|id| !found.contains_key(*id)).collect();
 
         // Enforce the response byte budget so one read cannot blow out context.
-        // Always include at least one entry even if it alone is large.
         let mut items: Vec<serde_json::Value> = Vec::new();
         let mut bytes = 0usize;
         let mut budget_truncated = false;
+        let mut content_cut = false;
         for id in &ids {
             let Some(entry) = found.get(id) else { continue };
-            let item = serde_json::json!({
-                "id": entry.id,
-                "content": entry.content,
-                "summary": entry.summary,
-                "tags": entry.tags,
-                "metadata": entry.metadata,
-                "source": entry.source,
-                "created_at": entry.created_at,
-                "updated_at": entry.updated_at,
-            });
+            let item = kb_get_row(entry, &entry.content, false);
             let size = item.to_string().len();
-            if !items.is_empty() && bytes + size > RESPONSE_BYTE_BUDGET {
+            if items.is_empty() {
+                // The first row always travels, so it is the one that has to be
+                // made to fit: leaving it out would make a long entry
+                // unreadable by any means.
+                let (row, cut) = kb_get_row_within(entry, RESPONSE_BYTE_BUDGET);
+                content_cut = cut;
+                bytes += row.to_string().len();
+                items.push(row);
+                continue;
+            }
+            if bytes + size > RESPONSE_BYTE_BUDGET {
+                // A later row waits for its own call rather than being cut. It
+                // is whole somewhere, and the caller still holds its id.
                 budget_truncated = true;
                 break;
             }
@@ -2133,13 +2139,29 @@ impl BuiltinToolService {
             "returned": items.len(),
             "not_found": not_found,
         });
+        // One flag for both ways a response falls short of what was asked, and
+        // a message that names whichever applies. They are separate failures:
+        // an id left out is answerable by asking again, and a cut row is not.
+        let mut message = String::new();
         if cap_truncated || budget_truncated {
-            response["truncated"] = serde_json::Value::Bool(true);
-            response["message"] = serde_json::json!(format!(
+            message.push_str(&format!(
                 "not every id was answered; ask for at most {KNOWLEDGE_GET_MAX_IDS} ids at a \
                  time, and fewer when the entries are long. An id in neither `entries` nor \
                  `not_found` was left out here, not lost - ask for it again."
             ));
+        }
+        if content_cut {
+            if !message.is_empty() {
+                message.push(' ');
+            }
+            message.push_str(
+                "An entry marked `content_truncated` is too long to deliver whole: you hold \
+                 the start of it, not the entry, so do not treat it as complete.",
+            );
+        }
+        if !message.is_empty() {
+            response["truncated"] = serde_json::Value::Bool(true);
+            response["message"] = serde_json::json!(message);
         }
         Ok(response.to_string())
     }
@@ -2847,6 +2869,60 @@ fn required_string(args: &serde_json::Value, key: &str) -> Result<String, CoreEr
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| CoreError::ToolExecution(format!("missing required string argument: {key}")))
+}
+
+/// One `builtin_knowledge_base_get` row, carrying `content` in place of the
+/// entry's own. `content_truncated` marks a row whose content is a prefix.
+///
+/// The marker is only ever set, never cleared: a caller reading a row without
+/// it holds the whole entry, which is the claim every other read of this store
+/// makes too.
+fn kb_get_row(entry: &KnowledgeEntry, content: &str, content_truncated: bool) -> serde_json::Value {
+    let mut row = serde_json::json!({
+        "id": entry.id,
+        "content": content,
+        "summary": entry.summary,
+        "tags": entry.tags,
+        "metadata": entry.metadata,
+        "source": entry.source,
+        "created_at": entry.created_at,
+        "updated_at": entry.updated_at,
+    });
+    if content_truncated {
+        row["content_truncated"] = serde_json::Value::Bool(true);
+    }
+    row
+}
+
+/// One `builtin_knowledge_base_get` row, cut to `budget` bytes if it has to be.
+/// Answers the row and whether the content was cut.
+///
+/// Why cutting is needed at all: nothing on the knowledge write path bounds an
+/// entry's length, unlike a scratchpad note, which `MAX_NOTE_BYTES` holds under
+/// the response budget by construction. So one ordinary read can produce a row
+/// of any size, and the generic tool-result cap downstream cuts raw bytes -
+/// which lands mid-JSON and hands the model a row it cannot parse. A row cut
+/// here stays valid JSON and says it was cut.
+///
+/// Why the search rather than one subtraction: JSON escaping means a character
+/// count does not convert to a byte count, so the allowance is halved until the
+/// row fits. It converges in a few steps and terminates at an empty content,
+/// which is the floor - a row whose other fields alone overrun the budget still
+/// travels, because the alternative is an entry no call can ever read.
+fn kb_get_row_within(entry: &KnowledgeEntry, budget: usize) -> (serde_json::Value, bool) {
+    let whole = kb_get_row(entry, &entry.content, false);
+    if whole.to_string().len() <= budget {
+        return (whole, false);
+    }
+    let mut allowance = entry.content.chars().count();
+    loop {
+        allowance /= 2;
+        let cut: String = entry.content.chars().take(allowance).collect();
+        let row = kb_get_row(entry, &cut, true);
+        if allowance == 0 || row.to_string().len() <= budget {
+            return (row, true);
+        }
+    }
 }
 
 fn optional_string(args: &serde_json::Value, key: &str) -> Option<String> {
@@ -7185,7 +7261,6 @@ mod tests {
         );
     }
 
-
     // -- knowledge-base reads: entries by id (#1120) -------------------------
 
     /// Every id batch one `builtin_knowledge_base_get` call handed the store.
@@ -7415,6 +7490,49 @@ mod tests {
         );
         assert!(returned >= 1, "at least one entry always travels: {json}");
         assert_eq!(json["truncated"], true, "{json}");
+    }
+
+    #[tokio::test]
+    async fn kb_get_cuts_an_entry_that_alone_overruns_the_response() {
+        // Nothing on the knowledge write path bounds an entry's length, unlike
+        // a scratchpad note. So "always emit at least one row" would emit a row
+        // of any size at all, and the generic tool-result cap downstream cuts
+        // raw bytes - landing mid-JSON and handing the model a row it cannot
+        // parse. The row travels cut instead, and says it was cut: a prefix
+        // taken for the whole entry is a fact acted on in half.
+        let mut entry = kb_full_entry("kb-huge");
+        entry.content = "z".repeat(RESPONSE_BYTE_BUDGET * 3);
+        let original = entry.content.len();
+        let (service, _probe) = kb_service_holding(vec![entry]);
+
+        let json = kb_get_response(&service, serde_json::json!({"ids": ["kb-huge"]})).await;
+
+        assert_eq!(json["returned"], 1, "the entry still travels: {json}");
+        let row = &json["entries"][0];
+        assert_eq!(
+            row["content_truncated"], true,
+            "a cut row must say it is a prefix, not the whole entry"
+        );
+        let carried = row["content"].as_str().expect("content is a string");
+        assert!(
+            carried.len() < original,
+            "the content must actually be cut, got {} of {original} bytes",
+            carried.len()
+        );
+        assert!(
+            serde_json::to_string(&json["entries"])
+                .expect("entries serialize")
+                .len()
+                <= RESPONSE_BYTE_BUDGET,
+            "the cut row must fit the response budget"
+        );
+        assert_eq!(json["truncated"], true, "{json}");
+        assert!(
+            json["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("content_truncated")),
+            "the message must name the marker the model has to look for: {json}"
+        );
     }
 
     #[tokio::test]
