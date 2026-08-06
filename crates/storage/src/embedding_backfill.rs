@@ -626,9 +626,8 @@ async fn sweep_one_table(
 /// chunking: one embedding per tag, stored in a scalar `vector` column rather
 /// than a `vector[]`.
 ///
-/// The embed text must stay byte-identical to the one
-/// [`crate::tag_registry::tag_embed_text`] builds for
-/// [`crate::tag_registry::create_or_match_tag`] when it looks for a
+/// The embed text must stay byte-identical to the one `tag_embed_text` builds
+/// for [`crate::tag_registry::create_or_match_tag`] when it looks for a
 /// near-duplicate — including its rule that a tag with no description embeds as
 /// its name alone. A backfilled vector is compared directly against vectors
 /// produced by that path, so embedding a different string here would make the

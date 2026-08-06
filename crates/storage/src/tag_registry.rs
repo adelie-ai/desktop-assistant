@@ -340,7 +340,7 @@ fn redirect_refusal(candidate: &str) -> Option<&'static str> {
 /// A tag with no description embeds as its name alone. Appending an empty
 /// description would put a separator with nothing after it into the vector,
 /// which is signal the tag does not have.
-pub fn tag_embed_text(normalized_name: &str, description: &str) -> String {
+pub(crate) fn tag_embed_text(normalized_name: &str, description: &str) -> String {
     if description.trim().is_empty() {
         normalized_name.to_string()
     } else {

@@ -68,6 +68,28 @@ const TAG_RESOLVE_BUDGET: std::time::Duration = std::time::Duration::from_secs(1
 /// round trips around it.
 const TAG_RESOLVE_CALL_CEILING: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How long one tag description may be, in characters.
+///
+/// Why bounded at all: a description is written once and read forever. It is
+/// stored on the registry row, and `build_extraction_system_prompt` renders
+/// every active tag's description into the dreaming extraction prompt in full.
+/// Nothing deletes a registry row, so an oversized description is a permanent
+/// charge on every later extraction. Before the tool path was gated, dreaming
+/// was the only writer; now every knowledge write is one, so the rate that
+/// surface grows at changes by orders of magnitude.
+///
+/// Why this size: the field is advertised as one line, and
+/// [`desktop_assistant_core::ports::knowledge::AVAILABLE_TAGS_LIMIT`] already
+/// treats 50 tags as the working size of a vocabulary. Fifty descriptions of
+/// 200 characters is about 10 kB of prompt - bounded, and still generous for
+/// one line. A longer description is truncated, never refused: refusing it
+/// would cost the tag its description and drop the dedup back to matching bare
+/// names, which is the weak option #1070 rejected.
+///
+/// Bounding how many tags that prompt renders is the other half of the same
+/// surface, and is #1103.
+const TAG_DESCRIPTION_MAX_CHARS: usize = 200;
+
 /// The tag vocabulary's share of one `builtin_knowledge_base_write` call.
 ///
 /// It carries the time already spent consulting, the reason the vocabulary
@@ -564,7 +586,7 @@ impl BuiltinToolService {
                         "new_tag_descriptions": {
                             "type": "object",
                             "additionalProperties": {"type": "string"},
-                            "description": "Optional map from a tag in `tags` to a one-line description of what that tag means, e.g. {'topic:embeddings': 'Vector embedding generation, models, and backfill'}. Needed only for a tag you believe is new: it is what decides whether your tag means the same as one already in use. A tag already in use ignores its entry here. Omitting a description never fails the write, it only makes the check weaker."
+                            "description": "Optional map from a tag in `tags` to a one-line description of what that tag means, e.g. {'topic:embeddings': 'Vector embedding generation, models, and backfill'}. Needed only for a tag you believe is new: it is what decides whether your tag means the same as one already in use. A tag already in use ignores its entry here. Omitting a description never fails the write, it only makes the check weaker. Keep it to one line: a description longer than 200 characters is truncated to 200, never rejected."
                         },
                         "id": {
                             "type": "string",
@@ -585,7 +607,7 @@ impl BuiltinToolService {
                                     "new_tag_descriptions": {
                                         "type": "object",
                                         "additionalProperties": {"type": "string"},
-                                        "description": "Per-entry map from a tag in this entry's `tags` to a one-line description of what it means. Needed only for a tag you believe is new."
+                                        "description": "Per-entry map from a tag in this entry's `tags` to a one-line description of what it means. Needed only for a tag you believe is new. A description longer than 200 characters is truncated to 200, never rejected."
                                     },
                                     "id": {"type": "string"}
                                 }
@@ -2485,9 +2507,15 @@ fn optional_string_array(args: &serde_json::Value, key: &str) -> Vec<String> {
 /// reverse. Matching the two raw strings drops the description in both
 /// directions, and a tag with no description embeds as its bare name.
 ///
-/// Two keys that normalize together keep the first, matching the first-seen
-/// rule [`desktop_assistant_core::tag_normalize::normalize_tags`] applies to
-/// the tags themselves.
+/// Each description is capped at [`TAG_DESCRIPTION_MAX_CHARS`]. It is truncated
+/// rather than refused, because refusing it would cost the tag its description
+/// and drop the check back to matching bare names.
+///
+/// Where two keys normalize together, one of them wins. Which one is
+/// deterministic but arbitrary: this workspace does not enable `serde_json`'s
+/// `preserve_order`, so a `Value::Object` iterates in byte order rather than in
+/// the order the model wrote its keys. Two keys for one tag is a malformed
+/// argument, not a case worth a rule.
 fn normalized_tag_descriptions(spec: &serde_json::Value) -> HashMap<String, String> {
     let mut out = HashMap::new();
     let Some(map) = spec
@@ -2501,7 +2529,7 @@ fn normalized_tag_descriptions(spec: &serde_json::Value) -> HashMap<String, Stri
             .as_str()
             .map(str::trim)
             .filter(|d| !d.is_empty())
-            .map(str::to_string)
+            .map(cap_tag_description)
         else {
             continue;
         };
@@ -2512,6 +2540,23 @@ fn normalized_tag_descriptions(spec: &serde_json::Value) -> HashMap<String, Stri
         out.entry(key).or_insert(description);
     }
     out
+}
+
+/// Cut one tag description down to [`TAG_DESCRIPTION_MAX_CHARS`] characters.
+///
+/// Counted in characters, not bytes, so the cut always lands on a character
+/// boundary and a description in any script gets the same allowance. Trailing
+/// whitespace left by the cut goes, so the stored text never ends mid-space.
+fn cap_tag_description(description: &str) -> String {
+    if description.chars().count() <= TAG_DESCRIPTION_MAX_CHARS {
+        return description.to_string();
+    }
+    description
+        .chars()
+        .take(TAG_DESCRIPTION_MAX_CHARS)
+        .collect::<String>()
+        .trim_end()
+        .to_string()
 }
 
 fn optional_string_array_nonempty(args: &serde_json::Value, key: &str) -> Option<Vec<String>> {
@@ -4773,6 +4818,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn kb_write_caps_a_tag_description_at_the_tool_boundary() {
+        // A description is written once and read forever: it lands on a registry
+        // row that nothing deletes, and the dreaming extraction prompt renders
+        // every active tag's description in full. Every knowledge write is now a
+        // writer of that surface, so an uncapped description is a permanent
+        // charge on every later extraction.
+        //
+        // It is truncated, never refused. Refusing it would cost the tag its
+        // description and drop the check back to matching bare names.
+        let (resolve, probe) = recording_tag_gate(&[]);
+        let (service, _store) = kb_service_with_tag_gate(Some(resolve));
+
+        let long = "x".repeat(TAG_DESCRIPTION_MAX_CHARS * 3);
+        let json = kb_write_response(
+            &service,
+            serde_json::json!({
+                "content": "Embeddings are backfilled by the maintenance task.",
+                "tags": ["topic:embeddings"],
+                "new_tag_descriptions": {"topic:embeddings": long},
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            json["ok"], true,
+            "an over-long description never fails a write"
+        );
+        let proposals = probe.lock().expect("probe lock").proposals.clone();
+        let description = proposals[0]
+            .description
+            .as_deref()
+            .expect("the tag keeps a description rather than losing it");
+        assert_eq!(
+            description.chars().count(),
+            TAG_DESCRIPTION_MAX_CHARS,
+            "the description reaching the vocabulary is capped"
+        );
+    }
+
+    #[test]
+    fn tag_description_cap_cuts_on_a_character_boundary() {
+        // Counted in characters, not bytes, so a description in any script gets
+        // the same allowance and the cut can never split one character.
+        let multibyte = "\u{e6f8}".repeat(TAG_DESCRIPTION_MAX_CHARS + 10);
+        let capped = cap_tag_description(&multibyte);
+        assert_eq!(capped.chars().count(), TAG_DESCRIPTION_MAX_CHARS);
+
+        // A description inside the cap is untouched, trailing space and all -
+        // the caller already trimmed it.
+        assert_eq!(cap_tag_description("short one"), "short one");
+
+        // Whitespace exposed by the cut goes, so the text never ends mid-space.
+        let padded = format!("{}   tail", "y".repeat(TAG_DESCRIPTION_MAX_CHARS - 2));
+        assert_eq!(
+            cap_tag_description(&padded),
+            "y".repeat(TAG_DESCRIPTION_MAX_CHARS - 2)
+        );
+    }
+
+    #[tokio::test]
     async fn kb_write_registers_a_new_tag_that_arrived_without_a_description() {
         // A missing description is not an error. The write must never fail
         // because the model omitted one, and the tag still goes through the
@@ -5251,6 +5356,16 @@ mod tests {
                 .as_str()
                 .is_some_and(|d| !d.is_empty()),
             "the field carries a description of its own: {single}"
+        );
+        // A schema that promises what the code does not honour is a false
+        // contract, and so is one that stays silent about a constraint the code
+        // applies. The cap is enforced, so it is advertised.
+        assert!(
+            single["description"]
+                .as_str()
+                .is_some_and(|d| d.contains(&TAG_DESCRIPTION_MAX_CHARS.to_string())
+                    && d.contains("truncated")),
+            "the field must advertise the length cap it enforces: {single}"
         );
 
         // The batch form is held to the same shape. A model that batches its
