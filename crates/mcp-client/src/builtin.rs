@@ -602,12 +602,14 @@ impl BuiltinToolService {
                                             fields you leave out keep the values that entry \
                                             already holds. An id no entry holds creates the entry \
                                             at that id, so a write that carries `content` can be \
-                                            repeated safely. An id you make up yourself must be a \
-                                            fresh random identifier such as a UUID, never a \
-                                            readable name like 'user-coffee-preference': ids are \
-                                            not yours to name, so a readable one may already be \
-                                            taken, and the write then fails instead of storing \
-                                            anything."
+                                            repeated safely. An id whose entry was retired is \
+                                            refused instead: the write does not revive it, so \
+                                            store the text as a new entry with no id. An id you \
+                                            make up yourself must be a fresh random identifier \
+                                            such as a UUID, never a readable name like \
+                                            'user-coffee-preference': ids are not yours to name, \
+                                            so a readable one may already be taken, and the write \
+                                            then fails instead of storing anything."
                         },
                         "entries": {
                             "type": "array",
@@ -6052,6 +6054,35 @@ mod tests {
             "the description must say which read that provenance change \
              affects, or the model cannot tell what it costs: {}",
             def.description
+        );
+    }
+
+    #[test]
+    fn kb_write_schema_says_a_retired_id_is_refused() {
+        // Consolidation retires an entry overnight while the model still holds
+        // its id, so this is a live outcome, not a corner. Told that an id no
+        // entry holds simply creates, a model reads the refusal as a broken
+        // tool and retries the same call. Told the rule, it drops the id and
+        // the fact is saved.
+        let service = BuiltinToolService::new();
+        let def = service
+            .tool_definitions()
+            .into_iter()
+            .find(|t| t.name == TOOL_KB_WRITE)
+            .expect("kb_write tool is advertised");
+
+        let id = def.parameters["properties"]["id"]["description"]
+            .as_str()
+            .expect("id carries a description")
+            .to_lowercase();
+        assert!(
+            id.contains("retired") && id.contains("refused"),
+            "the id description must say a retired id is refused: {id}"
+        );
+        assert!(
+            id.contains("new entry with no id"),
+            "the id description must say what to do about a refusal, or the \
+             model retries the same call: {id}"
         );
     }
 

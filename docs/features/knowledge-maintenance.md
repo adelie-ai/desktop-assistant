@@ -77,7 +77,19 @@ signal about whether an entry was ever retrieved or cited. Three rules bound it
 Consolidation retires an entry by stamping `deleted_at`, not by deleting the
 row. A retired entry is excluded from every read path — search, list, get, the
 embedding pipeline — so the tombstone behaves as if it were gone while staying
-recoverable and auditable. What happens next is a three-step lifecycle, all in
+recoverable and auditable.
+
+A write cannot land on one either. The upsert's conflict clause excludes a
+retired row, so a caller that still holds the id of an entry consolidation
+retired is refused and told to store the text as a new entry instead. Without
+that exclusion the write would put live content into a row no read path can
+reach, which the reap then frees on the tombstone's original clock — and the
+caller would be told it succeeded. The write does not revive the row: that would
+resurrect a duplicate a merge had absorbed, and leave `superseded_by` pointing at
+the row that replaced it. Restoring a tombstone is not something any write path
+does.
+
+What happens next is a three-step lifecycle, all in
 `crates/storage/src/dreaming/trash.rs`:
 
 1. **Retention.** `[backend_tasks] knowledge_trash_retention_days` (default 30,

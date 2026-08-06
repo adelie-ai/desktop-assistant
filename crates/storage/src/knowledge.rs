@@ -42,13 +42,26 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
         // own partition because the WHERE filter on the conflict update
         // matches only their row, and the insert path stamps user_id
         // from the current request.
+        //
+        // That WHERE also excludes a soft-deleted row. `deleted_at` is not in
+        // the SET clause, so an update that reached a tombstone would write
+        // real content into a row every read path hides and the retention reap
+        // removes on its original clock — and report success. There is no
+        // restore path through this call, deliberately: reviving a row that
+        // consolidation retired would resurrect a duplicate it had merged away
+        // and leave `superseded_by` pointing at the row that replaced it.
+        //
+        // Both exclusions land in the same place: the conflict update matches
+        // no row, so nothing is written, and the caller is told rather than
+        // being handed a success it did not get.
+        //
         // `source` ($6) records provenance and `summary` ($7) the one-line
         // condensation. On update a NULL in either preserves the existing value
         // (COALESCE) rather than clearing it, so a path that doesn't care about
         // provenance, or knows nothing about summaries, can't wipe one. There
         // is deliberately no way to clear either through this call: absent is
         // the only meaning NULL carries here.
-        let row: KbRow = sqlx::query_as(
+        let row: Option<KbRow> = sqlx::query_as(
             "INSERT INTO knowledge_base \
                 (id, user_id, content, tags, metadata, source, summary) \
              VALUES ($1, $2, $3, $4, $5, $6, $7) \
@@ -60,6 +73,7 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
                     summary = COALESCE(EXCLUDED.summary, knowledge_base.summary), \
                     updated_at = NOW() \
                 WHERE knowledge_base.user_id = $2 \
+                  AND knowledge_base.deleted_at IS NULL \
              RETURNING id, content, tags, metadata, created_at, updated_at, \
                        source, summary",
         )
@@ -70,9 +84,25 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
         .bind(&entry.metadata)
         .bind(&entry.source)
         .bind(&entry.summary)
-        .fetch_one(&self.pool)
+        .fetch_optional(&self.pool)
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;
+
+        // No row back means the insert conflicted and the update matched
+        // nothing: the id is held by an entry this caller cannot write —
+        // retired, or another user's. A decline, not a failure (base rule 8.2),
+        // and repeating the identical write cannot succeed.
+        let row = row.ok_or_else(|| CoreError::InvalidInput {
+            code: "knowledge_entry_not_writable",
+            description: format!(
+                "knowledge entry {} was not written: its id is held by a retired entry, or by \
+                 one belonging to another user. Store this as a new entry instead, with no id.",
+                entry.id
+            ),
+            message: "That entry cannot be updated, because the id belongs to an entry that was \
+                      retired. Store this as a new entry instead, without an id."
+                .to_string(),
+        })?;
 
         Ok(row.into_entry())
     }
