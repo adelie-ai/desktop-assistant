@@ -6302,8 +6302,7 @@ mod tests {
             .send_prompt(&conv.id, prompt.into(), noop_callback(), noop_status())
             .await
             .unwrap();
-        let rounds = captured.lock().unwrap().clone();
-        rounds
+        captured.lock().unwrap().clone()
     }
 
     fn recall_block(rounds: &[Vec<Message>]) -> Option<String> {

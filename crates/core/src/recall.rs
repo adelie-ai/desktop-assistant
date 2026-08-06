@@ -34,7 +34,7 @@
 //! [`RECALL_ENTRY_SCAN_LIMIT`] and no further, so when the scan fills up the
 //! count is a lower bound and says so.
 
-use crate::ports::recall::RecallCandidates;
+use crate::ports::recall::{RecallCandidates, RecallEntry, RecallTag};
 
 /// How many knowledge lines the block may show.
 ///
@@ -111,8 +111,101 @@ const RECALL_TAG_LABEL: &str = "Tags near this prompt:";
 /// Both candidate lists are taken in the order they arrive - nearest first -
 /// and are never reordered: a cosine distance and a lexical match are not
 /// comparable, and one lookup only ever produces one of the two.
-pub(crate) fn render_recall(_candidates: &RecallCandidates) -> Option<String> {
-    unimplemented!("the [Recall] block body")
+pub(crate) fn render_recall(candidates: &RecallCandidates) -> Option<String> {
+    let near_entries: Vec<&RecallEntry> = candidates
+        .entries
+        .iter()
+        .filter(|hit| hit.relevance.clears_floor(RECALL_ENTRY_MAX_DISTANCE))
+        .collect();
+    let near_tags: Vec<&RecallTag> = candidates
+        .tags
+        .iter()
+        .filter(|tag| tag.relevance.clears_floor(RECALL_TAG_MAX_DISTANCE))
+        .take(MAX_RECALL_TAGS)
+        .collect();
+
+    if near_entries.is_empty() && near_tags.is_empty() {
+        return None;
+    }
+
+    let mut header = RECALL_HEADER.to_string();
+    if !near_entries.is_empty() {
+        header.push(' ');
+        header.push_str(RECALL_ENTRY_HINT);
+    }
+    let mut block = header;
+
+    for hit in near_entries.iter().take(MAX_RECALL_ENTRIES) {
+        block.push('\n');
+        block.push_str(&entry_line(hit));
+    }
+
+    // A scan that filled up and cleared the floor on every row it read knows
+    // only that there are "at least this many" beyond the page.
+    let scan_filled = candidates.entries.len() >= RECALL_ENTRY_SCAN_LIMIT;
+    let capped = scan_filled && near_entries.len() == candidates.entries.len();
+    let dropped = near_entries.len().saturating_sub(MAX_RECALL_ENTRIES);
+    if let Some(line) = dropped_line(dropped, capped) {
+        block.push('\n');
+        block.push_str(&line);
+    }
+
+    if let Some(line) = tag_line(&near_tags) {
+        block.push('\n');
+        block.push_str(&line);
+    }
+
+    Some(block)
+}
+
+/// One entry line: the id, the entry's tags, and the line that stands for it.
+///
+/// The tags travel even though they cost width: they are what lets the model
+/// turn a hit into a better search of its own.
+///
+/// [`crate::domain::KnowledgeEntry::display_line`] decides what stands for an
+/// entry that has no stored summary, and bounds the result to one physical line
+/// of at most [`crate::domain::knowledge::SUMMARY_MAX_CHARS`] characters. That
+/// fallback is the normal path until the maintenance pass has filled the column
+/// in, so nothing here skips an entry for the lack of a summary.
+fn entry_line(hit: &RecallEntry) -> String {
+    let line = hit.entry.display_line();
+    if hit.entry.tags.is_empty() {
+        format!("- {} {}", hit.entry.id, line)
+    } else {
+        format!(
+            "- {} [{}] {}",
+            hit.entry.id,
+            hit.entry.tags.join(", "),
+            line
+        )
+    }
+}
+
+/// The "did not fit" line, or `None` when nothing was dropped.
+///
+/// `capped` renders the count as a lower bound. Reporting a capped number as if
+/// it were exact is the dishonesty this line exists to avoid, and "and 0 more"
+/// is noise, so both edges answer with no line at all rather than a hedged one.
+fn dropped_line(dropped: usize, capped: bool) -> Option<String> {
+    if dropped == 0 {
+        return None;
+    }
+    let quantity = if capped {
+        format!("{dropped} or more")
+    } else {
+        format!("{dropped} more")
+    };
+    Some(format!("...and {quantity} entries matched less closely."))
+}
+
+/// The tag line, or `None` when no tag cleared the floor.
+fn tag_line(tags: &[&RecallTag]) -> Option<String> {
+    if tags.is_empty() {
+        return None;
+    }
+    let names: Vec<&str> = tags.iter().map(|t| t.name.as_str()).collect();
+    Some(format!("{RECALL_TAG_LABEL} {}", names.join(", ")))
 }
 
 #[cfg(test)]
