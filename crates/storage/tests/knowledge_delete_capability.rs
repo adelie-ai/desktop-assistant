@@ -192,8 +192,11 @@ async fn zero_prune_fraction_merges_and_edits_but_deletes_nothing() {
         {"op":"edit","id":"zero-edit","content":"TIGHTENED"},
         {"op":"delete","ids":["zero-prune"],"reason":"trivial"}
     ]}"#;
+    // Only the prune share is under test here, so the rewrite share is opened
+    // up to keep its own cap out of the result.
     let policy = KnowledgeDeletePolicy {
         prune_fraction: 0.0,
+        rewrite_fraction: 1.0,
         ..KnowledgeDeletePolicy::default()
     };
     let llm = llm_returning(plan);
@@ -332,8 +335,14 @@ async fn refusals_are_logged_with_entry_id_and_calling_path() {
     assert!(refusal.entry_ids.contains(&"refused-2".to_string()));
 
     let line = refusal.log_line();
-    assert!(line.contains("refused-1"), "log line names the entry: {line}");
-    assert!(line.contains("refused-2"), "log line names the entry: {line}");
+    assert!(
+        line.contains("refused-1"),
+        "log line names the entry: {line}"
+    );
+    assert!(
+        line.contains("refused-2"),
+        "log line names the entry: {line}"
+    );
     assert!(
         line.contains("test::refusal_path"),
         "log line names the calling path: {line}"

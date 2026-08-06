@@ -19,6 +19,7 @@ use sqlx::PgPool;
 
 use super::types::{ConsolidationStats, KbDeleteKind, MAX_REVIEW_GENERATION, SOURCE_EXPLICIT};
 use crate::kb_metadata::{KbMetadata, KbScope};
+use crate::knowledge_delete::KnowledgeDeletePolicy;
 
 /// Operations a per-memory review can propose.
 #[derive(Debug, Clone)]
@@ -200,7 +201,7 @@ pub async fn apply_ops(
     pool: &PgPool,
     buffer: &OpBuffer,
     synthesized: &[SynthesizedMerge],
-    soft_delete_retention_days: u32,
+    policy: KnowledgeDeletePolicy,
 ) -> Result<ConsolidationStats, CoreError> {
     let user_id = current_user_id();
     let mut stats = ConsolidationStats::default();
@@ -214,9 +215,11 @@ pub async fn apply_ops(
     // and happens in the same tx so a single cycle stays atomic. Scoped to the
     // current user. This is a convenience trigger, not the only one: the
     // daemon's periodic sweep (`dreaming::sweep_expired_trash`) reaps
-    // regardless of whether consolidation is enabled at all.
-    super::trash::reap_expired_for_user(&mut *tx, user_id.as_str(), soft_delete_retention_days)
-        .await?;
+    // regardless of whether consolidation is enabled at all. A policy that
+    // reserves hard deletes to a person frees nothing here; the merges and
+    // edits below still apply, because the refusal is a decline rather than a
+    // failure and must not roll the transaction back.
+    super::trash::reap_expired_for_user(&mut *tx, user_id.as_str(), policy).await?;
 
     // Apply merges: update canonical row, soft-delete cluster members. The
     // canonical row's embedding is left stale (not regenerated here) — the

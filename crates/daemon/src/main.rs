@@ -1338,10 +1338,23 @@ async fn main() -> Result<()> {
     }
 
     // --- Knowledge base & tool registry stores ---
+    // The deletion policy travels with the store, so every path that removes a
+    // knowledge row reads the same configured answer (#1122).
+    let knowledge_delete_policy = daemon_config
+        .as_ref()
+        .map(|c| c.backend_tasks.knowledge_delete_policy())
+        .unwrap_or_default();
+    if knowledge_delete_policy.require_person_for_hard_delete {
+        tracing::info!(
+            "knowledge deletion reserved to a person: the trash sweep, the consolidation reap \
+             and the model's delete tool free nothing; each refusal is logged"
+        );
+    }
     let kb_store = pg_pool.as_ref().map(|pool| {
-        Arc::new(desktop_assistant_storage::PgKnowledgeBaseStore::new(
-            pool.clone(),
-        ))
+        Arc::new(
+            desktop_assistant_storage::PgKnowledgeBaseStore::new(pool.clone())
+                .with_delete_policy(knowledge_delete_policy),
+        )
     });
 
     let tool_registry_store = pg_pool.as_ref().map(|pool| {
@@ -2215,7 +2228,7 @@ async fn main() -> Result<()> {
                 loop {
                     match desktop_assistant_storage::dreaming::sweep_expired_trash(
                         &pool,
-                        trash_retention_days,
+                        knowledge_delete_policy,
                     )
                     .await
                     {
@@ -2347,7 +2360,7 @@ async fn main() -> Result<()> {
                     Arc::clone(emb_client),
                     embedding_model_id.clone(),
                     archive_after_days,
-                    trash_retention_days,
+                    knowledge_delete_policy,
                     on_change,
                 ),
             ))

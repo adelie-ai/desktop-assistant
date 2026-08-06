@@ -30,6 +30,14 @@ consolidation_interval_secs = 86400
 # of dreaming — otherwise an instance with dreaming off keeps every tombstone.
 knowledge_trash_retention_days = 30
 knowledge_trash_sweep_interval_secs = 3600
+# What one consolidation run may destroy and rewrite, as a share of the active
+# set. Set the prune share to 0 to keep a run's merges and decline its deletes.
+knowledge_prune_fraction = 0.1
+knowledge_rewrite_fraction = 0.25
+# Set to true to reserve every permanent delete of a knowledge row to a person.
+# A person's delete and empty-trash still erase; the sweep, the consolidation
+# reap and the model's delete tool free nothing and log what they spared.
+knowledge_hard_delete_requires_person = false
 
 [purposes.interactive]
 connection = "default"

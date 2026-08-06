@@ -80,8 +80,8 @@ fn unguarded_delete_against_the_knowledge_table_fails_the_audit() {
 #[test]
 fn the_guard_module_holds_the_only_knowledge_delete() {
     let guard = crates_root().join(GUARD_MODULE);
-    let content = std::fs::read_to_string(&guard)
-        .unwrap_or_else(|e| panic!("read {}: {e}", guard.display()));
+    let content =
+        std::fs::read_to_string(&guard).unwrap_or_else(|e| panic!("read {}: {e}", guard.display()));
     assert!(
         !destructive_statements(&content).is_empty(),
         "{} no longer holds a knowledge-base delete, so the audit would pass \
@@ -287,7 +287,10 @@ fn scanner_ignores_the_knowledge_table_named_by_a_neighbouring_statement() {
 
 #[test]
 fn scanner_finds_a_truncate_and_a_schema_qualified_delete() {
-    assert_eq!(destructive_statements("\"TRUNCATE knowledge_base\"").len(), 1);
+    assert_eq!(
+        destructive_statements("\"TRUNCATE knowledge_base\"").len(),
+        1
+    );
     assert_eq!(
         destructive_statements("\"DELETE FROM public.knowledge_base WHERE id = $1\"").len(),
         1

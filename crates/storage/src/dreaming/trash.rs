@@ -19,57 +19,54 @@
 //! Every operation is scoped to a single user's partition. The one cross-user
 //! query is the sweep's "which users have tombstones" scan, which immediately
 //! installs a per-user scope before deleting anything.
+//!
+//! No statement here removes a row by itself. Every reap goes through
+//! [`crate::knowledge_delete::hard_delete_knowledge`], which reads who asked
+//! for the delete and applies the configured policy, so an instance can keep
+//! its tombstones until a person frees them.
 
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::ports::auth::{UserId, current_user_id, with_user_id};
 use sqlx::{PgExecutor, PgPool};
 
 use super::common::is_total_failure;
-
-/// Upper bound on a configured retention, in days (~1000 years).
-///
-/// Why: the reap compares against `NOW() - make_interval(days => $1)`. An
-/// absurd configured value would push that timestamp outside the range
-/// Postgres can represent and error the whole sweep, so clamp instead — a
-/// retention this long already means "effectively never reap".
-const MAX_RETENTION_DAYS: u32 = 365_000;
+use crate::knowledge_delete::{HardDeleteTarget, KnowledgeDeletePolicy, hard_delete_knowledge};
 
 /// Delete the current user's soft-deleted entries whose `deleted_at` is older
-/// than `retention_days`. Returns how many rows were freed.
+/// than the policy's retention window. Returns how many rows were freed.
 ///
 /// A retention of 0 reaps every tombstone written before this call — the
-/// documented "do not retain" setting.
-pub async fn reap_expired_trash(pool: &PgPool, retention_days: u32) -> Result<usize, CoreError> {
+/// documented "do not retain" setting. A policy that reserves hard deletes to
+/// a person frees nothing here and logs what it spared.
+pub async fn reap_expired_trash(
+    pool: &PgPool,
+    policy: KnowledgeDeletePolicy,
+) -> Result<usize, CoreError> {
     let user_id = current_user_id();
-    let removed = reap_expired_for_user(pool, user_id.as_str(), retention_days).await?;
+    let removed = reap_expired_for_user(pool, user_id.as_str(), policy).await?;
     Ok(removed as usize)
 }
 
-/// Shared reap statement, so the periodic sweep and the consolidation
-/// transaction delete by exactly the same rule. Generic over the executor
-/// because the consolidation call site runs inside an open transaction.
+/// Shared reap, so the periodic sweep and the consolidation transaction delete
+/// by exactly the same rule. Generic over the executor because the
+/// consolidation call site runs inside an open transaction.
 pub(super) async fn reap_expired_for_user<'e, E>(
     executor: E,
     user_id: &str,
-    retention_days: u32,
+    policy: KnowledgeDeletePolicy,
 ) -> Result<u64, CoreError>
 where
     E: PgExecutor<'e>,
 {
-    let days = i32::try_from(retention_days.min(MAX_RETENTION_DAYS))
-        .expect("clamped retention always fits in i32");
-    let result = sqlx::query(
-        "DELETE FROM knowledge_base \
-         WHERE user_id = $2 \
-           AND deleted_at IS NOT NULL \
-           AND deleted_at < NOW() - make_interval(days => $1)",
+    let outcome = hard_delete_knowledge(
+        executor,
+        user_id,
+        HardDeleteTarget::ExpiredTombstones,
+        policy,
+        "dreaming::trash::reap_expired_for_user",
     )
-    .bind(days)
-    .bind(user_id)
-    .execute(executor)
-    .await
-    .map_err(|e| CoreError::Storage(format!("knowledge trash: TTL reap failed: {e}")))?;
-    Ok(result.rows_affected())
+    .await?;
+    Ok(outcome.into_removed_or_log())
 }
 
 /// Reap every user's expired trash. The daemon's periodic backend task calls
@@ -79,7 +76,10 @@ where
 /// partition cannot stop the rest; if *every* user failed the error is
 /// surfaced, since that means the database itself is unhappy rather than one
 /// tenant. Returns the total number of rows freed.
-pub async fn sweep_expired_trash(pool: &PgPool, retention_days: u32) -> Result<usize, CoreError> {
+pub async fn sweep_expired_trash(
+    pool: &PgPool,
+    policy: KnowledgeDeletePolicy,
+) -> Result<usize, CoreError> {
     let user_ids = load_user_ids_with_trash(pool).await?;
     if user_ids.is_empty() {
         tracing::debug!("knowledge trash: nothing to sweep");
@@ -92,11 +92,7 @@ pub async fn sweep_expired_trash(pool: &PgPool, retention_days: u32) -> Result<u
     let mut total = 0usize;
     for user_id in user_ids {
         let scoped = UserId::new(user_id.clone());
-        match with_user_id(scoped, async {
-            reap_expired_trash(pool, retention_days).await
-        })
-        .await
-        {
+        match with_user_id(scoped, async { reap_expired_trash(pool, policy).await }).await {
             Ok(0) => {}
             Ok(n) => {
                 total += n;
@@ -126,15 +122,22 @@ pub async fn sweep_expired_trash(pool: &PgPool, retention_days: u32) -> Result<u
 /// Permanently delete every soft-deleted entry belonging to the current user,
 /// ignoring the retention window. Returns how many rows were freed; an already
 /// empty trash is a successful `0`, not an error.
-pub async fn empty_trash(pool: &PgPool) -> Result<usize, CoreError> {
+///
+/// This is a person's own control, so a caller installs
+/// `DeleteInitiator::Person` and the safety flag never stands in its way. A
+/// caller that does not is refused, and is told why.
+pub async fn empty_trash(pool: &PgPool, policy: KnowledgeDeletePolicy) -> Result<usize, CoreError> {
     let user_id = current_user_id();
-    let result =
-        sqlx::query("DELETE FROM knowledge_base WHERE user_id = $1 AND deleted_at IS NOT NULL")
-            .bind(user_id.as_str())
-            .execute(pool)
-            .await
-            .map_err(|e| CoreError::Storage(format!("knowledge trash: empty failed: {e}")))?;
-    Ok(result.rows_affected() as usize)
+    let removed = hard_delete_knowledge(
+        pool,
+        user_id.as_str(),
+        HardDeleteTarget::AllTombstones,
+        policy,
+        "dreaming::trash::empty_trash",
+    )
+    .await?
+    .into_removed_or_refusal()?;
+    Ok(removed as usize)
 }
 
 /// How many soft-deleted entries the current user has — what a panel shows as

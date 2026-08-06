@@ -126,20 +126,6 @@ pub const MAX_SUMMARY_SOURCE_CHARS: usize = 2_000;
 /// as well as an unbounded one.
 pub const MAX_SUMMARY_TAGS_CHARS: usize = 200;
 
-/// Safety cap: the fraction of a user's active entries a single holistic run
-/// may prune outright. Merges don't count - their content survives in the
-/// canonical row. Excess prunes are dropped with a warning.
-///
-/// Why 0.1: consolidation runs nightly and decides "trivial" from prose alone,
-/// with no signal about whether an entry was ever retrieved or cited, so one
-/// pass is one unreviewed opinion. At a tenth, a wrong opinion costs a tenth of
-/// the store and is recoverable from the tombstones, while a real backlog of
-/// trivia still drains within about a week of runs. The previous 0.5 let a
-/// single night halve the store, which is how 606 of 608 extracted facts were
-/// lost on the reference instance (#694) - the blast radius was wide enough
-/// that no one bad run stood out from the ordinary ones.
-pub const MAX_DELETE_FRACTION: f64 = 0.1;
-
 /// Upper bound on the stored length of a model-supplied delete reason.
 ///
 /// Why: the reason is free text straight from the model and is persisted on the
@@ -196,4 +182,10 @@ pub struct ConsolidationStats {
     /// entry has already been rewritten [`MAX_REVIEW_GENERATION`] times, so its
     /// prose is settled.
     pub settled_unchanged: usize,
+    /// Proposed prunes dropped because the run had spent its share of the
+    /// store. The work is not lost - the next run sees the same entries.
+    pub prunes_over_cap: usize,
+    /// Proposed edits and merges dropped because the run had spent its rewrite
+    /// share. Reported for the same reason.
+    pub rewrites_over_cap: usize,
 }

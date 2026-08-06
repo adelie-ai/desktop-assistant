@@ -24,6 +24,7 @@ use desktop_assistant_core::ports::inbound::{
     KnowledgeMaintenanceService, KnowledgeService, PromptSelectionOverride, PurposeConfigPayload,
     SettingsService,
 };
+use desktop_assistant_core::ports::knowledge_delete::{DeleteInitiator, with_delete_initiator};
 use desktop_assistant_core::ports::request_scope::RequestScope;
 use desktop_assistant_core::ports::scratchpad::{
     MAX_KEYS_PER_CALL, MAX_NOTE_BYTES, MAX_RESULTS_CEILING, NewScratchpadNote, ScratchpadClearFn,
@@ -2080,8 +2081,11 @@ where
                 ))
             }
             api::Command::DeleteKnowledgeEntry { id } => {
-                self.knowledge
-                    .delete_entry(id)
+                // A person named this entry in a client control, so the delete
+                // erases whatever the deployment's deletion safety says. A
+                // request to be forgotten cannot be answered with a tombstone
+                // (#1122).
+                with_delete_initiator(DeleteInitiator::Person, self.knowledge.delete_entry(id))
                     .await
                     .map_err(Self::map_core_err)?;
                 self.notify_knowledge_changed();
@@ -2098,11 +2102,12 @@ where
                 })
             }
             api::Command::EmptyKnowledgeTrash => {
-                let deleted = self
-                    .knowledge
-                    .empty_trash()
-                    .await
-                    .map_err(Self::map_core_err)?;
+                // The person's own "empty it now" control, so it erases under
+                // every deletion safety, the same as a single delete (#1122).
+                let deleted =
+                    with_delete_initiator(DeleteInitiator::Person, self.knowledge.empty_trash())
+                        .await
+                        .map_err(Self::map_core_err)?;
                 // Only a reap that freed something is worth a refetch; an empty
                 // trash is a no-op and must not churn every connected panel.
                 if deleted > 0 {

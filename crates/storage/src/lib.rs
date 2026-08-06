@@ -12,6 +12,7 @@ pub mod error_classifications;
 pub mod idempotency_keys;
 pub mod kb_metadata;
 pub mod knowledge;
+pub mod knowledge_delete;
 pub mod migrate_json;
 pub mod pool;
 pub mod scratchpad;

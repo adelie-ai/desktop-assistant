@@ -41,6 +41,7 @@ pub mod conversation_search;
 pub mod auth;
 pub mod client_tools;
 pub mod conversation_ctx;
+pub mod knowledge_delete;
 pub mod notify;
 pub mod recall;
 pub mod request_scope;

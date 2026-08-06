@@ -131,7 +131,7 @@ row stays in the worklist for the next cycle.
 
 The model sees the whole active store and returns a plan. The plan is not applied
 verbatim, because the judgment behind it is formed from prose alone with no
-signal about whether an entry was ever retrieved or cited. Three rules bound it
+signal about whether an entry was ever retrieved or cited. Four rules bound it
 (`crates/storage/src/dreaming/consolidation.rs`):
 
 1. **A deliberately promoted entry is never pruned.** Rows written during a live
@@ -149,10 +149,21 @@ signal about whether an entry was ever retrieved or cited. Three rules bound it
    model believes. This settles individual entries, not the store - extraction
    keeps adding generation-0 rows, scope can still be attached, and a settled
    entry stays prunable, so consolidation's own output never becomes permanent.
-3. **Outright prunes are capped per run** at `MAX_DELETE_FRACTION` (0.1) of the
-   active set, floor 1, with the excess dropped and a warning logged. Merges do
-   not count against it: their content survives in the canonical row. The cap is
-   a blast-radius bound on one night's unreviewed opinion.
+3. **Outright prunes are capped per run** at `[backend_tasks]
+   knowledge_prune_fraction` (default 0.1) of the active set, floor 1, with the
+   excess deferred to a later run and a warning logged. Merges do not count
+   against it: their content survives in the canonical row. The cap is a
+   blast-radius bound on one run's unreviewed opinion. A fraction of `0` is the
+   documented "merge, but do not destroy" setting: the run applies its merges
+   and edits and retires nothing, and the floor of 1 does not apply.
+4. **Rewrites are capped per run** at `[backend_tasks]
+   knowledge_rewrite_fraction` (default 0.25) of the active set, on the same
+   floor-and-defer rule. An edit and a merge both overwrite `content` and no
+   prior version is kept, so the prune cap says nothing about how much text one
+   answer can restate. A merge counts once whatever its cluster size, because
+   only the canonical row's content is replaced - every other member keeps its
+   own text on its tombstone. Merges are taken before edits, since merging
+   duplicates is the work consolidation exists to do.
 
 ## The trash: soft delete, retention, reaping
 
@@ -196,6 +207,41 @@ Every one of these is scoped to a single `user_id`: one user's sweep, empty, or
 count never touches another's rows. The only cross-user statement is the
 sweep's "which users hold tombstones" scan, which installs a per-user scope
 before deleting anything.
+
+### Reserving deletion to a person
+
+`[backend_tasks] knowledge_hard_delete_requires_person` refuses any permanent
+delete of a knowledge row that a person did not ask for. It is `false` by
+default, which is the behaviour every instance already has.
+
+With it set:
+
+- The periodic sweep, the reap inside a consolidation transaction, and the
+  model's `builtin_knowledge_base_delete` all free nothing. Tombstones
+  accumulate until a person frees them.
+- Deleting an entry from a client panel, and emptying the trash, still erase. A
+  request to be forgotten is not answered with a tombstone.
+- Every refusal is logged at warning level with the calling path and the ids it
+  spared, up to fifty per statement with the true count beside them, so the
+  volume of what would have gone is measurable before the flag is relaxed.
+- The model's delete tool receives a rules-based decline carrying the code
+  `knowledge_hard_delete_requires_person`, not a silent count of zero, so it can
+  tell the user to remove the entry from the knowledge panel.
+
+Who asked is ambient context, not a property of the code path
+(`crates/core/src/ports/knowledge_delete.rs`). A handler that receives a delete
+command from a client control installs `DeleteInitiator::Person` around the
+call; an unset scope reads as `Machine`. A path added later is therefore
+refused until someone decides it carries a person's intent.
+
+Every statement that removes a `knowledge_base` row lives in
+`crates/storage/src/knowledge_delete.rs`, and the static audit
+`crates/storage/tests/knowledge_hard_delete_audit.rs` fails when a second one
+appears anywhere in the workspace.
+
+This is temporary. It exists because the model still holds a destructive verb
+and a wrong decision cannot be undone, and it is removed once deletion is a
+human verb by construction and a retired entry can be restored.
 
 ### What a tombstone records
 
@@ -296,7 +342,9 @@ is a broader, cross-cutting change tracked separately.
 | Port | `crates/core/src/ports/inbound.rs` (`KnowledgeMaintenanceService`) |
 | Scans + force-recalc | `crates/storage/src/dreaming/`, `crates/storage/src/embedding_backfill.rs` |
 | Trash lifecycle (count / empty / reap / sweep) | `crates/storage/src/dreaming/trash.rs`, sweep loop in `crates/daemon/src/main.rs` |
-| Retention + sweep cadence config | `crates/daemon/src/config/mod.rs` (`BackendTasksConfig::knowledge_trash_retention_days`, `knowledge_trash_sweep_interval_secs`, `trash_sweep_enabled`) |
+| The one hard-delete statement + the policy | `crates/storage/src/knowledge_delete.rs`, audited by `crates/storage/tests/knowledge_hard_delete_audit.rs` |
+| Who asked for a delete | `crates/core/src/ports/knowledge_delete.rs` (`DeleteInitiator`, `with_delete_initiator`), installed in `crates/application/src/lib.rs` |
+| Retention + sweep cadence + deletion policy config | `crates/daemon/src/config/mod.rs` (`BackendTasksConfig::knowledge_trash_retention_days`, `knowledge_trash_sweep_interval_secs`, `trash_sweep_enabled`, `knowledge_prune_fraction`, `knowledge_rewrite_fraction`, `knowledge_hard_delete_requires_person`, `knowledge_delete_policy`) |
 | Handler arm + `notify_knowledge_changed` | `crates/application/src/lib.rs`, `crates/application/src/background_tasks.rs` |
 | Daemon service + timer wiring | `crates/daemon/src/maintenance_service.rs`, `crates/daemon/src/main.rs` |
 | D-Bus method + signal | `crates/dbus-bridge/src/adapter/knowledge.rs`, `crates/dbus-bridge/src/adapter/event_forwarder.rs` |
