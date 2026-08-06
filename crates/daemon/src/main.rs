@@ -29,6 +29,7 @@ mod notifications;
 mod parent_wake;
 mod provider_reindex;
 mod purposes;
+mod recall;
 mod registry;
 mod routing_llm;
 mod settings_service;
@@ -2768,6 +2769,37 @@ async fn main() -> Result<()> {
     }
     if let Some(probe) = descendant_task_probe {
         handler = handler.with_descendant_task_probe(probe);
+    }
+
+    // Pre-prompt recall (#1100): embed the user prompt once before the model's
+    // first move and put the memory nearest it in front of the model as a
+    // `[Recall]` block. Default-on; `[recall] enabled = false` switches it off.
+    //
+    // Three ways it stays off, all of them the same absence: no knowledge
+    // store, no embedding backend, or the operator said so. Leaving the lookup
+    // unwired is what "off" means to the handler, so a turn then behaves
+    // exactly as it did before the block existed.
+    let recall_enabled = daemon_config
+        .as_ref()
+        .map(|c| c.recall.enabled)
+        .unwrap_or(true);
+    match (recall_enabled, &kb_store, &pg_pool, embedding_fn.as_ref()) {
+        (true, Some(kb), Some(pool), Some(embed)) => {
+            handler = handler.with_recall_search(recall::build_recall_search(
+                Arc::clone(kb),
+                pool.clone(),
+                Arc::clone(embed),
+                embedding_model_id.clone(),
+            ));
+            tracing::info!("pre-prompt recall wired: prompts are looked up against memory");
+        }
+        (false, _, _, _) => tracing::info!("pre-prompt recall disabled by configuration"),
+        (true, None, _, _) | (true, _, None, _) => {
+            tracing::info!("pre-prompt recall off: no knowledge store is configured")
+        }
+        (true, _, _, None) => {
+            tracing::info!("pre-prompt recall off: no embedding backend is configured")
+        }
     }
 
     // Wrap the core `ConversationHandler` in the routing wrapper so adapters

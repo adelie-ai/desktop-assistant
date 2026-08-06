@@ -200,6 +200,12 @@ pub(crate) struct TurnAnchors<'a> {
     /// (#1104). Ungated — unlike `scratchpad_index`, it renders every turn
     /// whenever anything is pinned.
     pub pinned: Option<&'a str>,
+    /// Rendered `[Recall]` block (#1100): candidate memory the user's prompt
+    /// may be about, found by a semantic lookup the model did not have to ask
+    /// for. Rendered on the **first round of a turn only** - see
+    /// [`surfaced_blocks`] - so it is produced once per turn and simply carried
+    /// through the later rounds.
+    pub recall: Option<&'a str>,
     /// Counts behind the always-on `[Working state]` nudge (#598), carried as
     /// counts rather than a rendered line so the block can drop whichever half
     /// a fuller block covers on this particular turn.
@@ -922,6 +928,12 @@ fn system_block(
 ///   pressure.
 /// - `[Scratchpad]` — the free-form note-key index, gated on the same
 ///   "context is dropping" signal as `[Current task]`.
+/// - `[Recall]` — candidate memory for the user's prompt, on the first round of
+///   a turn only. Every block above re-renders each round because each answers
+///   "is this still in view?". This one answers "what might this prompt be
+///   about?", which the user prompt asks once, so repeating it across twenty
+///   tool rounds would spend thousands of tokens on an answer the model has
+///   already taken or ignored.
 fn surfaced_blocks(
     anchors: &TurnAnchors,
     ambient: &AmbientContext,
@@ -1025,6 +1037,17 @@ fn surfaced_blocks(
 
     if let Some(index) = scratchpad_index {
         blocks.push(Message::new(Role::System, format!("[Scratchpad] {index}")));
+    }
+
+    // Pre-prompt recall (#1100). Last, and closest to the user prompt that
+    // follows: it is the least authoritative block here - a hint about what the
+    // prompt may be about, which the model is told to ignore where it does not
+    // fit. The first-round gate is what bounds its cost.
+    if let Some(recall) = anchors
+        .recall
+        .filter(|r| !r.is_empty() && anchors.tool_rounds_since_anchor == 0)
+    {
+        blocks.push(Message::new(Role::System, format!("[Recall] {recall}")));
     }
 
     blocks
@@ -3250,6 +3273,129 @@ mod tests {
             .map(|m| m.content.as_str())
     }
 
+    fn recall_text(result: &[Message]) -> Option<&str> {
+        result
+            .iter()
+            .find(|m| m.role == Role::System && m.content.starts_with("[Recall]"))
+            .map(|m| m.content.as_str())
+    }
+
+    // --- #1100 [Recall] block ------------------------------------------------
+
+    #[test]
+    fn recall_block_renders_only_on_the_first_round_of_a_turn() {
+        // Every other block re-renders each round because each answers "is
+        // this still in view?". This one answers "what might this prompt be
+        // about?", and the prompt asks that once.
+        let msgs = vec![Message::new(Role::User, "where does the registry live?")];
+        let body = "Memory that may relate.\n- kb-1 [infra] The registry is on the storage host";
+
+        let first = assemble_for_test(
+            &ConversationView {
+                messages: &msgs,
+                ..Default::default()
+            },
+            &ToolContext::default(),
+            &TurnAnchors {
+                recall: Some(body),
+                tool_rounds_since_anchor: 0,
+                ..Default::default()
+            },
+            None,
+            &default_estimate,
+        );
+        assert!(
+            recall_text(&first).is_some_and(|t| t.contains("the storage host")),
+            "the first round must carry the block"
+        );
+
+        for round in [1u32, 2, 7, u32::MAX] {
+            let later = assemble_for_test(
+                &ConversationView {
+                    messages: &msgs,
+                    ..Default::default()
+                },
+                &ToolContext::default(),
+                &TurnAnchors {
+                    recall: Some(body),
+                    tool_rounds_since_anchor: round,
+                    ..Default::default()
+                },
+                None,
+                &default_estimate,
+            );
+            assert!(
+                recall_text(&later).is_none(),
+                "round {round} must not repeat the block"
+            );
+        }
+    }
+
+    #[test]
+    fn pinned_and_recall_both_render_and_recall_sits_last() {
+        // Two blocks that arrived from different work and answer different
+        // questions. `[Pinned]` says "this is current, do not re-read it";
+        // `[Recall]` says "this may not fit, ignore it if not". Order matters:
+        // the least authoritative block sits closest to the user prompt that
+        // follows, so a hint is never read as a standing fact.
+        let msgs = vec![Message::new(Role::User, "where does the registry live?")];
+        let result = assemble_for_test(
+            &ConversationView {
+                messages: &msgs,
+                ..Default::default()
+            },
+            &ToolContext::default(),
+            &TurnAnchors {
+                active_task: Some("where does the registry live?"),
+                pinned: Some("- api-quirk: /login is form-encoded, not JSON"),
+                recall: Some("Memory that may relate.\n- kb-1 [infra] The registry host"),
+                tool_rounds_since_anchor: 0,
+                ..Default::default()
+            },
+            None,
+            &default_estimate,
+        );
+
+        let pinned_at = result
+            .iter()
+            .position(|m| m.content.starts_with("[Pinned]"))
+            .expect("[Pinned] must still render alongside [Recall]");
+        let recall_at = result
+            .iter()
+            .position(|m| m.content.starts_with("[Recall]"))
+            .expect("[Recall] must still render alongside [Pinned]");
+        assert!(
+            pinned_at < recall_at,
+            "the hint goes last, nearest the prompt it is a hint about"
+        );
+    }
+
+    #[test]
+    fn recall_block_is_absent_when_the_lookup_produced_nothing() {
+        // No candidate cleared a floor, so the producer hands over nothing and
+        // the seam emits no empty block.
+        let msgs = vec![Message::new(Role::User, "thanks")];
+        for recall in [None, Some("")] {
+            let result = assemble_for_test(
+                &ConversationView {
+                    messages: &msgs,
+                    ..Default::default()
+                },
+                &ToolContext::default(),
+                &TurnAnchors {
+                    recall,
+                    ..Default::default()
+                },
+                None,
+                &default_estimate,
+            );
+            assert!(
+                recall_text(&result).is_none(),
+                "no [Recall] block when there is nothing to recall (recall = {recall:?})"
+            );
+        }
+    }
+
     // --- #597 [Pinned] block -------------------------------------------------
 
     #[test]
@@ -3469,6 +3615,7 @@ mod tests {
                 scratchpad_index: Some(index),
                 working_state,
                 pinned: None,
+                recall: None,
                 tool_rounds_since_anchor: ACTIVE_TASK_ROUND_THRESHOLD + 1,
             },
             None,

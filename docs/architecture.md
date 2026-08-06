@@ -71,12 +71,15 @@ The project follows a ports-and-adapters (hexagonal) layout:
 
 1. TUI (or any D-Bus client) calls `SendPrompt`
 2. D-Bus adapter forwards to core service
-3. Core requests LLM streaming completion
-4. If tool calls are requested, core checks each one against the caller's tool
+3. Core looks the prompt up against memory and surfaces the candidates as a
+   `[Recall]` block on the turn's first round - see
+   [pre-prompt recall](features/pre-prompt-recall.md)
+4. Core requests LLM streaming completion
+5. If tool calls are requested, core checks each one against the caller's tool
    allowlist and the turn's provenance gate, then executes the permitted ones
    through the MCP executor
-5. D-Bus adapter emits chunk/complete/error signals
-6. Client renders updates incrementally
+6. D-Bus adapter emits chunk/complete/error signals
+7. Client renders updates incrementally
 
 ### Tool-provenance gating
 

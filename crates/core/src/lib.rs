@@ -9,6 +9,7 @@ pub mod error_classify;
 pub mod planning;
 pub mod ports;
 pub mod prompts;
+pub mod recall;
 pub mod sanitize;
 pub mod service;
 pub mod skill_catalog;

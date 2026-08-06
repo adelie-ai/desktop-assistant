@@ -146,6 +146,58 @@ pub async fn resolve_active_name(pool: &PgPool, name: &str) -> Result<Option<Str
     ))
 }
 
+/// The active tag names nearest a query embedding, with the cosine distance
+/// that put them there, nearest first.
+///
+/// Backs the tag arm of the `[Recall]` block (#1100). Registry rows are already
+/// embedded, for near-duplicate detection, so this reads what dedup built and
+/// writes nothing: the point is to hand the model this user's working
+/// vocabulary before its first knowledge search, rather than to let it guess
+/// what words the tags use.
+///
+/// Names only. A tag's `description` says what the tag *means* - a definition
+/// written once - which is not what the caller is asking about.
+///
+/// Same scope and same model rule as [`create_or_match_tag`]'s own nearest
+/// search: one user by an explicit predicate, active tags only, and only rows
+/// embedded by the model that produced the query vector, because a comparison
+/// across models is a comparison across vector dimensions.
+///
+/// An empty `query_embedding` yields no tags: the vector operator raises on a
+/// zero-dimension vector, and the registry carries no full-text index to fall
+/// back to, so the tag arm simply goes quiet when there is no embedding.
+pub async fn nearest_tags(
+    pool: &PgPool,
+    query_embedding: Vec<f32>,
+    embedding_model: &str,
+    limit: usize,
+) -> Result<Vec<(String, f64)>, CoreError> {
+    if query_embedding.is_empty() {
+        return Ok(Vec::new());
+    }
+    let user_id = current_user_id();
+    let rows: Vec<(String, f64)> = sqlx::query_as(
+        "SELECT name, (embedding <=> $1) AS distance \
+         FROM tag_registry \
+         WHERE user_id = $2 AND deprecated_for_tag IS NULL AND embedding IS NOT NULL \
+           AND embedding_model IS NOT NULL \
+           AND (embedding_model = $3 \
+                OR (split_part($3, '@', 2) <> '' \
+                    AND split_part(embedding_model, '@', 2) = split_part($3, '@', 2))) \
+         ORDER BY embedding <=> $1 \
+         LIMIT $4",
+    )
+    .bind(Vector::from(query_embedding))
+    .bind(user_id.as_str())
+    .bind(embedding_model)
+    .bind(limit as i64)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| CoreError::Storage(format!("tag_registry: nearest tags failed: {e}")))?;
+
+    Ok(rows)
+}
+
 /// Create a new tag, or redirect to an existing similar one.
 ///
 /// Steps:

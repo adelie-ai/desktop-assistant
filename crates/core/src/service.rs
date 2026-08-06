@@ -18,6 +18,7 @@ use crate::ports::llm::{
     ChunkCallback, LlmClient, ReasoningConfig, StatusCallback, current_cancellation_token,
     current_context_budget, current_tool_allowlist, current_tool_gate_disabled,
 };
+use crate::ports::recall::{RecallRequest, RecallSearchFn};
 use crate::ports::scratchpad::{
     MAX_NOTE_BYTES, NewScratchpadNote, PINNED_BLOCK_BYTE_BUDGET, SCRATCHPAD_GOAL_KEY,
     ScratchpadDeleteSubtreeFn, ScratchpadGetManyFn, ScratchpadListFn,
@@ -498,6 +499,12 @@ pub struct ConversationHandler<S, L, T = NoopToolExecutor> {
     /// `wait=false` subagent's pad-borne result is never deleted mid-flight.
     /// `None` means no probe (cascade unconditionally when the delete is set).
     descendant_task_probe: Option<DescendantTaskProbe>,
+    /// Optional pre-prompt recall lookup (#1100). When set, the turn embeds the
+    /// user prompt once before its first round and surfaces the candidate
+    /// memory it finds as a `[Recall]` system block. `None` - no knowledge
+    /// store, or the feature switched off - leaves the turn exactly as it was
+    /// before the block existed.
+    recall_search: Option<RecallSearchFn>,
     /// Maximum byte length a single tool result may occupy before it is
     /// truncated at ingestion (issue #174). Defaults to
     /// [`DEFAULT_MAX_TOOL_RESULT_BYTES`]; override via
@@ -552,6 +559,7 @@ impl<S, L> ConversationHandler<S, L, NoopToolExecutor> {
             scratchpad_release_references: None,
             knowledge_get_many: None,
             descendant_task_probe: None,
+            recall_search: None,
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             host: DEFAULT_HOST_LABEL.to_string(),
             on_workstation: true,
@@ -618,6 +626,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             scratchpad_release_references: None,
             knowledge_get_many: None,
             descendant_task_probe: None,
+            recall_search: None,
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             host: DEFAULT_HOST_LABEL.to_string(),
             on_workstation: true,
@@ -712,6 +721,19 @@ impl<S, L, T> ConversationHandler<S, L, T> {
     /// running (deleting its subtree mid-flight would destroy its result).
     pub fn with_descendant_task_probe(mut self, probe: DescendantTaskProbe) -> Self {
         self.descendant_task_probe = Some(probe);
+        self
+    }
+
+    /// Wire the pre-prompt recall lookup (#1100), which turns a user prompt
+    /// into the `[Recall]` block of candidate memory shown before the model's
+    /// first move.
+    ///
+    /// Leaving it unwired is how the feature is switched off: the daemon does
+    /// not wire it when there is no knowledge store, or when the operator
+    /// disabled recall, and the turn then behaves exactly as it did before the
+    /// block existed.
+    pub fn with_recall_search(mut self, recall_search: RecallSearchFn) -> Self {
+        self.recall_search = Some(recall_search);
         self
     }
 
@@ -1123,6 +1145,39 @@ impl<S, L, T> ConversationHandler<S, L, T> {
                 error = %e,
                 "could not release pinned notes whose knowledge entry has gone"
             );
+        }
+    }
+
+    /// Render the `[Recall]` block for this turn's user prompt (#1100), or
+    /// `None` when there is nothing worth showing.
+    ///
+    /// Once per turn, not once per round: the block answers "what might this
+    /// prompt be about?", which the user prompt asks once.
+    ///
+    /// **Recall never fails a turn.** No lookup wired, an empty prompt, a
+    /// lookup that errored, or a lookup whose candidates all fell below the
+    /// relevance floor all give the same answer - no block - and the turn
+    /// proceeds. The lookup itself bounds its embedding call and degrades to
+    /// full-text; a failure that reaches here is one it could not absorb, and
+    /// it is logged once rather than once per arm.
+    async fn render_recall_surface(&self, prompt: &str) -> Option<String> {
+        let lookup = self.recall_search.as_ref()?;
+        if prompt.trim().is_empty() {
+            return None;
+        }
+
+        let request = RecallRequest {
+            prompt: prompt.to_string(),
+            entry_limit: crate::recall::RECALL_ENTRY_SCAN_LIMIT,
+            tag_limit: crate::recall::RECALL_TAG_SCAN_LIMIT,
+        };
+        let entry_limit = request.entry_limit;
+        match lookup(request).await {
+            Ok(candidates) => crate::recall::render_recall(&candidates, entry_limit),
+            Err(e) => {
+                tracing::warn!(error = %e, "pre-prompt recall lookup failed; continuing without it");
+                None
+            }
         }
     }
 
@@ -1724,6 +1779,11 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         // and travels with the floor, because it cannot change mid-turn.
         let mut narration_floor = NarrationFloor::new(current_turn_interactivity());
 
+        // Pre-prompt recall (#1100), computed once for the whole turn. The
+        // block is gated to the first round in `surfaced_blocks`, so it is
+        // simply carried through the later ones rather than looked up again.
+        let recall = self.render_recall_surface(&prompt).await;
+
         for round in 0..MAX_TOOL_ROUNDS {
             // Between-rounds cancellation checkpoint (issue #109): if the
             // caller cancelled while the previous tool round was
@@ -1853,6 +1913,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                     scratchpad_index: surfaces.scratchpad_index.as_deref(),
                     working_state: surfaces.working_state,
                     pinned: surfaces.pinned.as_deref(),
+                    recall: recall.as_deref(),
                     tool_rounds_since_anchor,
                 },
                 target_window,
@@ -2656,6 +2717,9 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                     scratchpad_index: wind_down_surfaces.scratchpad_index.as_deref(),
                     working_state: wind_down_surfaces.working_state,
                     pinned: wind_down_surfaces.pinned.as_deref(),
+                    // The wind-down closes a turn out; recall answers a question
+                    // the turn asked at its start and has long since acted on.
+                    recall: None,
                     tool_rounds_since_anchor: u32::MAX,
                 },
                 target_window,
@@ -6189,6 +6253,231 @@ mod tests {
             filters.iter().filter(|f| f.is_some()).count(),
             1,
             "only build_step_stack reads with a type filter: {filters:?}"
+        );
+    }
+
+    // --- Pre-prompt recall (#1100) ------------------------------------------
+
+    /// A recall lookup that answers with one near knowledge hit.
+    fn recall_hit() -> crate::ports::recall::RecallSearchFn {
+        use crate::domain::KnowledgeEntry;
+        use crate::ports::recall::{RecallCandidates, RecallEntry, RecallRelevance};
+        Arc::new(move |_request| {
+            Box::pin(async move {
+                let mut entry = KnowledgeEntry::new(
+                    "kb-registry",
+                    "body",
+                    vec!["infra".to_string(), "deploy".to_string()],
+                );
+                entry.summary = Some("The registry runs on the storage host".to_string());
+                Ok(RecallCandidates {
+                    entries: vec![RecallEntry {
+                        entry,
+                        relevance: RecallRelevance::Distance(0.12),
+                    }],
+                    tags: vec![],
+                })
+            })
+        })
+    }
+
+    /// Run one turn against a capturing LLM and return every message list it
+    /// was handed, so a test can look for a surfaced block across all rounds.
+    async fn capture_rounds<F>(prompt: &str, wire: F) -> Vec<Vec<Message>>
+    where
+        F: FnOnce(
+            ConversationHandler<MockStore, PlanContextCapturingLlm>,
+        ) -> ConversationHandler<MockStore, PlanContextCapturingLlm>,
+    {
+        let captured: Arc<Mutex<Vec<Vec<Message>>>> = Arc::new(Mutex::new(Vec::new()));
+        let llm = PlanContextCapturingLlm {
+            responses: Mutex::new(vec![LlmResponse::text("done")]),
+            captured: Arc::clone(&captured),
+        };
+        let handler = wire(ConversationHandler::new(MockStore::new(), llm, id_gen()));
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, prompt.into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+        captured.lock().unwrap().clone()
+    }
+
+    fn recall_block(rounds: &[Vec<Message>]) -> Option<String> {
+        rounds
+            .iter()
+            .flatten()
+            .find(|m| m.role == Role::System && m.content.starts_with("[Recall]"))
+            .map(|m| m.content.clone())
+    }
+
+    #[tokio::test]
+    async fn recall_block_reaches_the_model_on_the_first_round() {
+        let rounds = capture_rounds("where does the registry live?", |h| {
+            h.with_recall_search(recall_hit())
+        })
+        .await;
+
+        let block = recall_block(&rounds).expect("a wired lookup with a near hit must surface");
+        assert!(block.contains("kb-registry"), "{block}");
+        assert!(
+            block.contains("The registry runs on the storage host"),
+            "{block}"
+        );
+    }
+
+    /// A recall lookup that answers with one near hit and counts its calls.
+    fn counting_recall_hit() -> (crate::ports::recall::RecallSearchFn, Arc<Mutex<usize>>) {
+        let calls = Arc::new(Mutex::new(0usize));
+        let seen = Arc::clone(&calls);
+        let inner = recall_hit();
+        let counting: crate::ports::recall::RecallSearchFn = Arc::new(move |request| {
+            *seen.lock().unwrap() += 1;
+            inner(request)
+        });
+        (counting, calls)
+    }
+
+    #[tokio::test]
+    async fn recall_is_looked_up_once_for_a_whole_multi_round_turn() {
+        // The block answers "what might this prompt be about?", and the prompt
+        // asks that once. A lookup per round would spend an embedding and two
+        // reads on every tool call, and repeat an answer the model already took
+        // or ignored.
+        let captured: Arc<Mutex<Vec<Vec<Message>>>> = Arc::new(Mutex::new(Vec::new()));
+        let llm = PlanContextCapturingLlm {
+            responses: Mutex::new(vec![
+                LlmResponse::with_tool_calls("", vec![ToolCall::new("t1", "probe", "{}")]),
+                LlmResponse::with_tool_calls("", vec![ToolCall::new("t2", "probe", "{}")]),
+                LlmResponse::text("done"),
+            ]),
+            captured: Arc::clone(&captured),
+        };
+        let mut results = HashMap::new();
+        results.insert("probe".to_string(), "ok".to_string());
+        let (lookup, calls) = counting_recall_hit();
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            llm,
+            MockToolExecutor::new(
+                vec![ToolDefinition::new("probe", "Probe", serde_json::json!({}))],
+                results,
+            ),
+            id_gen(),
+        )
+        .with_recall_search(lookup);
+
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(
+                &conv.id,
+                "where does the registry live?".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *calls.lock().unwrap(),
+            1,
+            "one lookup per turn, not per round"
+        );
+
+        let rounds = captured.lock().unwrap();
+        let dispatch_rounds: Vec<&Vec<Message>> = rounds.iter().collect();
+        assert!(
+            dispatch_rounds.len() >= 3,
+            "precondition: the turn ran more than one round, got {}",
+            dispatch_rounds.len()
+        );
+        let carrying = dispatch_rounds
+            .iter()
+            .filter(|msgs| {
+                msgs.iter()
+                    .any(|m| m.role == Role::System && m.content.starts_with("[Recall]"))
+            })
+            .count();
+        assert_eq!(
+            carrying, 1,
+            "the block reaches the model on the first round and no other"
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_is_not_looked_up_for_a_prompt_with_nothing_in_it() {
+        // A whitespace-only prompt has nothing to embed. Spending the embedding
+        // and two reads on it would cost the turn for a block that could only
+        // ever be noise.
+        let (lookup, calls) = counting_recall_hit();
+        let handler =
+            ConversationHandler::new(MockStore::new(), MockLlm::new(vec!["ok"]), id_gen())
+                .with_recall_search(lookup);
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+
+        handler
+            .send_prompt(&conv.id, "   \n\t ".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+
+        assert_eq!(*calls.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn recall_block_is_absent_when_the_feature_is_disabled() {
+        // "Disabled" is expressed by not wiring the lookup: the daemon skips
+        // the wiring when the operator switched recall off, and the turn is
+        // then byte-for-byte what it was before the block existed.
+        let rounds = capture_rounds("where does the registry live?", |h| h).await;
+
+        assert!(
+            recall_block(&rounds).is_none(),
+            "no lookup wired means no block"
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_block_is_omitted_when_the_search_fails() {
+        // Recall never fails a turn. A lookup that errors costs the block and
+        // nothing else.
+        let failing: crate::ports::recall::RecallSearchFn = Arc::new(move |_request| {
+            Box::pin(async move { Err(CoreError::Storage("embedding backend down".into())) })
+        });
+        let captured: Arc<Mutex<Vec<Vec<Message>>>> = Arc::new(Mutex::new(Vec::new()));
+        let llm = PlanContextCapturingLlm {
+            responses: Mutex::new(vec![LlmResponse::text("still answered")]),
+            captured: Arc::clone(&captured),
+        };
+        let handler =
+            ConversationHandler::new(MockStore::new(), llm, id_gen()).with_recall_search(failing);
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+
+        let reply = handler
+            .send_prompt(
+                &conv.id,
+                "where does the registry live?".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await
+            .expect("a failed recall lookup must not fail the turn");
+
+        assert_eq!(reply, "still answered");
+        assert!(
+            recall_block(&captured.lock().unwrap()).is_none(),
+            "a failed lookup emits no block"
         );
     }
 

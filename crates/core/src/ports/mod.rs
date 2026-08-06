@@ -42,6 +42,7 @@ pub mod auth;
 pub mod client_tools;
 pub mod conversation_ctx;
 pub mod notify;
+pub mod recall;
 pub mod request_scope;
 pub mod scratchpad_scope;
 pub mod session;
