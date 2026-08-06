@@ -4778,6 +4778,7 @@ mod tests {
             created_at: "2026-01-01".to_string(),
             updated_at: "2026-01-01".to_string(),
             source: Some("explicit".to_string()),
+            summary: None,
         });
     }
 
@@ -4939,6 +4940,129 @@ mod tests {
             second.content, "Snow is expected on Friday.",
             "clearing the tags does not touch the content"
         );
+    }
+
+    #[tokio::test]
+    async fn kb_write_reads_a_null_tags_field_as_absent() {
+        // Several providers encode "I am not setting this field" as an
+        // explicit null. Reading that as an empty list clears the tags of
+        // every entry those writes touch, which is the loss this whole path
+        // exists to stop.
+        let (service, store) = kb_service_with_tag_gate(None);
+        seed_kb_entry(
+            &store,
+            "entry-1",
+            "Rain is expected on Tuesday.",
+            &["memory", "topic:weather"],
+            serde_json::json!({}),
+        );
+
+        kb_write_response(
+            &service,
+            serde_json::json!({
+                "id": "entry-1",
+                "content": "Rain is expected on Wednesday.",
+                "tags": null,
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            kb_stored(&store)[0].tags,
+            vec!["memory".to_string(), "topic:weather".to_string()],
+            "a null tag field means the write said nothing about tags"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_write_refuses_a_tags_field_that_is_not_a_list() {
+        // Nothing validates the tool schema between the model and this code,
+        // so a `tags` of the wrong shape arrives as written. Reading it as an
+        // empty list answers "set this tag" with a wipe, and reports `ok`.
+        let (service, store) = kb_service_with_tag_gate(None);
+        seed_kb_entry(
+            &store,
+            "entry-1",
+            "Rain is expected on Tuesday.",
+            &["memory", "topic:weather"],
+            serde_json::json!({}),
+        );
+
+        let err = service
+            .execute_tool(
+                TOOL_KB_WRITE,
+                serde_json::json!({
+                    "id": "entry-1",
+                    "content": "Rain is expected on Wednesday.",
+                    "tags": "topic:weather",
+                }),
+            )
+            .await
+            .expect_err("a `tags` that is not a list is refused");
+        assert!(
+            err.to_string().contains("`tags` must be a list of strings"),
+            "the error says what shape `tags` takes: {err}"
+        );
+        assert_eq!(
+            kb_stored(&store)[0].tags,
+            vec!["memory".to_string(), "topic:weather".to_string()],
+            "the refused write stored nothing, so the entry is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_write_refuses_a_tag_that_is_not_a_string() {
+        // A tag that arrives as an object is a tag the caller asked to store.
+        // Dropping it silently loses the caller's intent, and dropping the
+        // only one wipes the entry.
+        let (service, store) = kb_service_with_tag_gate(None);
+        seed_kb_entry(
+            &store,
+            "entry-1",
+            "Rain is expected on Tuesday.",
+            &["memory", "topic:weather"],
+            serde_json::json!({}),
+        );
+
+        let err = service
+            .execute_tool(
+                TOOL_KB_WRITE,
+                serde_json::json!({
+                    "id": "entry-1",
+                    "content": "Rain is expected on Wednesday.",
+                    "tags": [{"name": "memory"}],
+                }),
+            )
+            .await
+            .expect_err("a tag that is not a string is refused");
+        assert!(
+            err.to_string()
+                .contains("every tag in `tags` must be a string"),
+            "the error says what a tag is: {err}"
+        );
+        assert_eq!(
+            kb_stored(&store)[0].tags,
+            vec!["memory".to_string(), "topic:weather".to_string()],
+            "the refused write stored nothing, so the entry is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_write_still_drops_a_blank_tag() {
+        // A blank string is not a tag, and trimming it away loses no intent,
+        // so it stays a normalisation rather than joining the refusals above.
+        let (service, store) = kb_service_with_tag_gate(None);
+
+        kb_write_response(
+            &service,
+            serde_json::json!({
+                "content": "Rain is expected on Tuesday.",
+                "tags": ["memory", "   ", ""],
+            }),
+        )
+        .await;
+
+        assert_eq!(kb_stored(&store)[0].tags, vec!["memory".to_string()]);
     }
 
     #[tokio::test]
