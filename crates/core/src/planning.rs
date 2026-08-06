@@ -686,9 +686,15 @@ pub(crate) fn render_pinned(
         }
         let mut keys: Vec<&str> = released.iter().map(|n| n.key).collect();
         keys.sort_unstable();
+        // Worded as a statement about the block, not about the pin. The pin is
+        // released by the round that owns the note's namespace, which is not
+        // always the round that first notices - a parent's read spans its
+        // subagents' notes. Claiming "unpinned" here would be false on that
+        // round, and the model would act on it.
         out.push_str(&format!(
-            "(unpinned, because the knowledge entry it pointed at no longer exists: {}. \
-             Search the knowledge base again if you still need that fact.)",
+            "(not shown, because the knowledge entry it pointed at no longer exists: {}. \
+             The pin is being released; search the knowledge base again if you still \
+             need that fact.)",
             keys.join(", ")
         ));
     }
