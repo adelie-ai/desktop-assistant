@@ -23,11 +23,66 @@ The response therefore reports what was searched, not only what was found.
 
 | Field | Meaning |
 | ----- | ------- |
-| `results` | The matched entries, best match first. Each carries a `summary`: one line condensing what that entry says, so a caller can judge a hit without reading the whole `content`. It is `null` for an entry that has none yet, which is every entry stored before the field existed. |
+| `results` | The matched entries, best match first. Each carries a `summary`: one line condensing what that entry says, so a caller can judge a hit without reading the whole `content`. It is `null` for an entry that has none: one stored before the field existed, one whose write named no summary, or one whose summary was cleared. |
 | `returned` | How many entries are in `results`. Same name `builtin_scratchpad_search` uses. |
 | `truncated` | Present, and `true`, only when the page filled up (`returned` reached `limit`) **and** the scope is larger than the page. A full page under `FEW` carries neither it nor `message`, because `FEW` already means the page holds the whole scope. It always travels with `message`, which says how to narrow. Its absence is the claim that nothing was left behind. |
 | `scope_size` | `NONE`, `FEW`, `MANY`, or `UNKNOWN`. See below. |
 | `available_tags` | Tag names carried by entries in the scope, most frequent first with the tag name breaking ties. No counts. At most 50. Empty when `scope_size` is `UNKNOWN`. |
+
+## Where a summary comes from
+
+`builtin_knowledge_base_write` takes a `summary` argument, in the single form and
+inside each object of the batch `entries` form. The model writes it, one line,
+saying what the entry says rather than naming its topic — because that line is
+what stands in for the entry wherever entries are listed rather than read, and a
+topic label tells a reader nothing it can act on.
+
+The argument follows the same rule `tags` follows:
+
+| The write sends | What happens |
+| --- | --- |
+| nothing, or `null` | The stored summary is kept. A create then stores none. |
+| a string | Collapsed to one physical line, then cut to `SUMMARY_MAX_CHARS` (200) and stored. |
+| an empty string, or one that is only whitespace | The stored summary is cleared, and the entry reads back with no summary again. |
+| anything else | The write is refused. |
+
+The collapse comes before the cut, so a loosely-formatted line is not cut far
+shorter than a dense one saying the same thing — the rule and its reason live in
+`desktop_assistant_protocol::one_line`. Whitespace-only counts as empty for the
+same reason: the line is normalized first, and what is empty after that is empty.
+
+Two boundaries hold, and both are deliberate:
+
+- **A write with no summary is not refused.** Refusing it would lose the fact to
+  gain a one-liner, which is the wrong trade for a memory store. Every read path
+  reports the missing summary honestly as `null`, and a reader listing that entry
+  falls back to the start of its content.
+- **An over-long summary is cut, not refused.** A model that answers "one line"
+  with a paragraph loses the tail of the line, never the write.
+
+The write response reports the summary actually stored, next to the tags it
+reports for the same reason: the boundary rewrites both, and a caller that cannot
+see the stored value believes the entry carries what it sent.
+
+"The write is refused" is per entry, not per call. A batch whose third entry is
+malformed has already stored the first two, and the error carries none of their
+ids — the shape #1113 tracks, which this argument gives one more way to reach and
+does not otherwise change.
+
+Cleared means absent, not empty: the store maps an empty summary to `NULL`, on
+both halves of the upsert. An empty string would be a third state nothing wants —
+a render site would print a blank row instead of falling back to the content, and
+a pass over the entries that have none would look for them with
+`WHERE summary IS NULL`.
+
+Two consumers of the field are designed and not yet built: the pass that writes
+the summaries of entries stored before the argument existed (#1099), and the
+`[Recall]` block that offers candidate entries to the model before its first move
+(#1100). Until they land, a summary travels on every read - the knowledge tools report
+it beside the content, and it reaches each client on the wire - and nothing
+fills one in that the model did not write. What a given client's knowledge
+browser does with it is that repository's own work; `display_line` on the
+domain and wire types is the shared rule for it.
 
 ## Scope, not match count
 
@@ -196,4 +251,5 @@ census can report it.
 | The census SQL and both search arms | `crates/storage/src/knowledge.rs` |
 | Tool response and schema | `crates/mcp-client/src/builtin.rs` |
 | Census behaviour under a real database | `crates/storage/tests/knowledge_tag_census.rs` |
+| The summary's write rules under a real database | `crates/storage/tests/knowledge_summary.rs` |
 | Prompt guidance that consumes these fields | `crates/core/src/prompts/sections/knowledge_base.txt` |

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::clock::NowSnapshot;
-use desktop_assistant_core::domain::{Role, ToolDefinition, ToolRunner};
+use desktop_assistant_core::domain::{Role, SUMMARY_MAX_CHARS, ToolDefinition, ToolRunner};
 use desktop_assistant_core::ports::client_tools::current_client_tools;
 use desktop_assistant_core::ports::conversation_ctx::current_conversation_id;
 use desktop_assistant_core::ports::conversation_search::ConversationSearchFn;
@@ -248,6 +248,45 @@ fn match_client_tools<'a>(
 }
 
 const TOOL_KB_WRITE: &str = "builtin_knowledge_base_write";
+
+/// What `builtin_knowledge_base_write` tells the model the `summary` argument
+/// is for.
+///
+/// One text, used by both the single and the batch form, because a model that
+/// batches its writes reads only the batch half of the schema and must be told
+/// the same thing.
+///
+/// It says what the line is *for* rather than only what it is. A model told
+/// "a summary" writes a topic label, and a list of topic labels tells a later
+/// reader nothing it can act on. Told what the line will be offered back as,
+/// it writes the fact.
+///
+/// Every sentence has to be true of the running system, and a schema is the one
+/// document the reader can check against its own next tool call. So the purpose
+/// is stated as purpose ("the entry's short form, for a reader that...") and the
+/// block that offers candidate entries back is stated in the future, because it
+/// is a later piece of work. Nothing here claims a reader that condenses an
+/// entry today, because the read tools return whole entries and each client's
+/// knowledge browser is its own repository's work.
+fn summary_arg_description() -> String {
+    format!(
+        "One line saying what this entry says, written as a statement rather than as a topic \
+         label. It is the entry's short form, for a reader that shows many entries at once and \
+         cannot spend a whole body on each, and it is the line this entry will be offered back \
+         to you as, a candidate you decide whether to open - so it has to carry the fact on its \
+         own: 'The user wants tag names to keep the facet colon' is useful, 'tag naming' is not. \
+         Write one for every entry. Runs of whitespace collapse to one space, and what is then \
+         longer than {SUMMARY_MAX_CHARS} characters is cut to {SUMMARY_MAX_CHARS}, never \
+         rejected - a long one costs you the tail of the line, not the write. Leaving it out \
+         never fails the write either; the entry then has no short form, and every read reports \
+         its summary as null. On a write that gives an `id`, leaving it out keeps the stored \
+         summary - including when you rewrite the `content`, so send a new summary with a \
+         rewrite or the old line stays - and sending an empty or whitespace-only string clears \
+         it. The response reports the summary actually stored, which is the cut line rather \
+         than the one you sent when you sent a long one."
+    )
+}
+
 const TOOL_KB_SEARCH: &str = "builtin_knowledge_base_search";
 /// Largest `limit` `builtin_knowledge_base_search` will honour, matching the
 /// cap `builtin_knowledge_base_list` already advertises.
@@ -549,11 +588,12 @@ impl BuiltinToolService {
                  instructions, project context, or any durable information the user wants remembered. \
                  Content should be self-contained prose that describes both the context (when/why \
                  this information is useful) and the information itself. Provide either a single \
-                 entry (top-level `content`/`tags`/`id`) or a batch via `entries`. A write that \
-                 gives the `id` of an existing entry keeps the content, the tags and the stored \
-                 metadata it leaves out, so send only what changes: `id` plus `content` rewrites \
-                 the text and keeps the tags, and `id` plus `tags` re-tags the entry and keeps \
-                 the text. To clear the tags, send an empty `tags` list. One field is not kept: \
+                 entry (top-level `content`/`tags`/`summary`/`id`) or a batch via `entries`. A \
+                 write that gives the `id` of an existing entry keeps the content, the tags, the \
+                 summary and the stored metadata it leaves out, so send only what changes: `id` \
+                 plus `content` rewrites the text and keeps the tags, and `id` plus `tags` \
+                 re-tags the entry and keeps the text. To clear the tags, send an empty `tags` \
+                 list. One field is not kept: \
                  every write through this tool records the entry's provenance as 'explicit', so \
                  an entry that dreaming had extracted or consolidated counts as explicitly saved \
                  from then on, and `builtin_knowledge_base_list` with that `source` filter stops \
@@ -582,6 +622,10 @@ impl BuiltinToolService {
                             "items": {"type": "string"},
                             "description": "Two-level tags. Give a coarse KIND ('preference', 'memory', or 'instruction') PLUS at least one SPECIFIC facet: 'project:<name>', 'tool:<name>', 'topic:<subject>', or 'person:<name>'. Prefer specific over generic. Good: ['instruction', 'project:adelie-ai', 'topic:deploy']. Too generic: ['instruction']."
                         },
+                        "summary": {
+                            "type": "string",
+                            "description": summary_arg_description(),
+                        },
                         "new_tag_descriptions": {
                             "type": "object",
                             "additionalProperties": {"type": "string"},
@@ -606,7 +650,7 @@ impl BuiltinToolService {
                         },
                         "entries": {
                             "type": "array",
-                            "description": "Batch form: a list of {content?, tags?, id?, new_tag_descriptions?} objects. When present, every top-level field is ignored — content, tags, id and new_tag_descriptions alike — so describe each entry's new tags inside that entry.",
+                            "description": "Batch form: a list of {content?, tags?, summary?, id?, new_tag_descriptions?} objects. When present, every top-level field is ignored — content, tags, summary, id and new_tag_descriptions alike — so summarise each entry, and describe its new tags, inside that entry.",
                             "items": {
                                 "type": "object",
                                 "properties": {
@@ -615,6 +659,10 @@ impl BuiltinToolService {
                                         "type": "array",
                                         "items": {"type": "string"},
                                         "description": "Two-level tags: a coarse KIND ('preference'/'memory'/'instruction') PLUS at least one SPECIFIC facet ('project:<name>', 'tool:<name>', 'topic:<subject>', 'person:<name>'). Prefer specific over generic."
+                                    },
+                                    "summary": {
+                                        "type": "string",
+                                        "description": summary_arg_description(),
                                     },
                                     "new_tag_descriptions": {
                                         "type": "object",
@@ -1350,6 +1398,12 @@ impl BuiltinToolService {
                 // stops the model believing an entry carries a tag it does not,
                 // and then searching for that tag and finding nothing.
                 "tags": saved.tags,
+                // The summary actually stored, for the same reason: the write
+                // path collapses the supplied line and cuts it at
+                // `SUMMARY_MAX_CHARS`, and an empty one clears the field
+                // outright. Without this the model cannot see that the line it
+                // sent is not the line the entry now carries.
+                "summary": saved.summary,
                 "created_at": saved.created_at,
                 "updated_at": saved.updated_at,
             }));
@@ -1405,6 +1459,12 @@ impl BuiltinToolService {
         // this cannot read is refused rather than stored as empty, because an
         // empty list now means "clear them".
         let supplied_tags = supplied_string_array(spec, "tags")?;
+        // `Some` exactly when the write asked to set the summary, cut to the
+        // cap on the way in. Read before this spec reaches the store, so a
+        // summary of the wrong shape costs the entry nothing. It does not
+        // unwind a batch: entries earlier in the same call have already landed
+        // (#1113).
+        let supplied_summary = supplied_one_line(spec, "summary", SUMMARY_MAX_CHARS)?;
 
         let existing = self
             .existing_entry(id_opt.as_deref(), content_opt.is_some())
@@ -1429,6 +1489,8 @@ impl BuiltinToolService {
         let tags = supplied_tags
             .or_else(|| existing.as_ref().map(|e| e.tags.clone()))
             .unwrap_or_default();
+        let summary =
+            supplied_summary.or_else(|| existing.as_ref().and_then(|e| e.summary.clone()));
         // `metadata` has no argument of its own, so a write only ever carries
         // the stored value forward. Its empty value is an object, not JSON
         // null, because the provenance stamp below writes into it.
@@ -1458,9 +1520,7 @@ impl BuiltinToolService {
             created_at: String::new(),
             updated_at: String::new(),
             source: Some("explicit".to_string()),
-            // The write tool takes no summary yet. `None` preserves whatever
-            // the row already holds; it never clears it.
-            summary: None,
+            summary,
         })
     }
 
@@ -2699,6 +2759,43 @@ fn supplied_string_array(
         }
     }
     Ok(Some(supplied))
+}
+
+/// Read a one-line string the caller may or may not have supplied, cut to
+/// `max_chars` by [`desktop_assistant_protocol::one_line`].
+///
+/// `None` means the write said nothing about the field. `Some` means the write
+/// asked to set it, and an empty string then asks to clear it. The three shapes
+/// that are not a string are read exactly as [`supplied_string_array`] reads
+/// them, and for the same reason: an empty value clears the field, so nothing
+/// this cannot read may be folded into one.
+///
+/// - `null` reads as absent. Several model providers encode "I am not setting
+///   this field" as an explicit null.
+/// - A value that is not a string is an error, because storing an empty string
+///   would answer a set with a wipe, and report success.
+///
+/// Text longer than `max_chars` is cut, never refused. The caller's real
+/// payload is elsewhere - this is a convenience line for a later reader - so
+/// losing the whole write over a long one is the wrong trade.
+fn supplied_one_line(
+    args: &serde_json::Value,
+    key: &str,
+    max_chars: usize,
+) -> Result<Option<String>, CoreError> {
+    let Some(value) = args.get(key) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let text = value.as_str().ok_or_else(|| {
+        CoreError::ToolExecution(format!(
+            "`{key}` must be a string, and this one is {}",
+            json_shape(value)
+        ))
+    })?;
+    Ok(Some(desktop_assistant_protocol::one_line(text, max_chars)))
 }
 
 /// Name the JSON shape of `value`, so an error can tell the caller what it
@@ -4931,6 +5028,15 @@ mod tests {
                 }
                 entry.created_at = "2026-01-01".to_string();
                 entry.updated_at = "2026-01-01".to_string();
+                // The one rule of `KnowledgeBaseStore::write` this fake has to
+                // model rather than echo: an empty summary clears the field,
+                // and cleared means absent. Postgres does it with `NULLIF` on
+                // the insert and a `CASE` arm on the update. A fake that stored
+                // the empty string instead would let a tool-path test assert a
+                // "clear" that the real store never produces.
+                if entry.summary.as_deref() == Some("") {
+                    entry.summary = None;
+                }
                 let mut g = s.lock().expect("write store lock");
                 g.retain(|e| e.id != entry.id);
                 g.push(entry.clone());
@@ -6192,7 +6298,7 @@ mod tests {
         // the code breaks - see
         // `kb_write_schema_says_a_write_records_the_entry_as_explicit`.
         assert!(
-            lower.contains("keeps the content, the tags and the stored metadata"),
+            lower.contains("keeps the content, the tags, the summary and the stored metadata"),
             "the description must name what a write by id keeps, field by \
              field: {}",
             def.description
@@ -6451,6 +6557,470 @@ mod tests {
         assert_eq!(
             json["entries"][0]["summary"], "Prefers dark mode in every editor",
             "the list row carries the entry's one-line summary"
+        );
+    }
+
+    // -- knowledge-base writes: the one-line summary (#1098) -----------------
+
+    /// Put a summary onto a row already in the fake store.
+    ///
+    /// [`seed_kb_entry`] seeds none, and the write path is what these tests
+    /// measure, so a stored summary has to arrive around it.
+    fn seed_kb_summary(store: &KbStore, id: &str, summary: &str) {
+        let mut rows = store.lock().expect("seed summary store lock");
+        let row = rows
+            .iter_mut()
+            .find(|e| e.id == id)
+            .expect("the row to summarise is in the store");
+        row.summary = Some(summary.to_string());
+    }
+
+    #[tokio::test]
+    async fn kb_write_stores_a_supplied_summary() {
+        // The summary is what a later reader is offered instead of the whole
+        // body. A write that supplies one must land it, or the field stays
+        // empty however well the model writes.
+        let (service, store) = kb_service_with_tag_gate(None);
+
+        kb_write_response(
+            &service,
+            serde_json::json!({
+                "content": "The tag registry keeps the facet colon in a tag name, so \
+                            'topic:embeddings' stays one tag rather than becoming two.",
+                "tags": ["preference"],
+                "summary": "Tag names keep the facet colon",
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            kb_stored(&store)[0].summary.as_deref(),
+            Some("Tag names keep the facet colon"),
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_write_without_a_summary_stores_no_summary() {
+        // The schema asks for a summary and says why it matters, but the
+        // boundary does not enforce it. Refusing the write would lose the fact
+        // to gain a one-liner, which is the wrong trade for a memory store: a
+        // missing summary is a gap #1099's pass is meant to close later.
+        let (service, store) = kb_service_with_tag_gate(None);
+
+        let response = kb_write_response(
+            &service,
+            serde_json::json!({
+                "content": "Rain is expected on Tuesday.",
+                "tags": ["memory"],
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            response["ok"], true,
+            "a write that names no summary still succeeds"
+        );
+        assert_eq!(response["count"], 1, "and it stored the entry");
+        assert_eq!(
+            kb_stored(&store)[0].summary,
+            None,
+            "a create that names no summary stores none"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_write_update_without_a_summary_keeps_the_stored_one() {
+        // Absent means "leave the stored value alone" - the rule every other
+        // optional field on this path follows. The summary the update keeps
+        // may now be stale, and that is the accepted cost of never wiping one:
+        // a stale summary can be rewritten, by the model on its next write or
+        // by #1099's pass, and nothing recovers one that was deleted. The
+        // schema tells the model to send a new summary with a rewrite.
+        let (service, store) = kb_service_with_tag_gate(None);
+        seed_kb_entry(
+            &store,
+            "entry-1",
+            "Rain is expected on Tuesday.",
+            &["memory"],
+            serde_json::json!({}),
+        );
+        seed_kb_summary(&store, "entry-1", "Rain is coming this week");
+
+        kb_write_response(
+            &service,
+            serde_json::json!({
+                "id": "entry-1",
+                "content": "Rain is expected on Wednesday.",
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            kb_stored(&store)[0].summary.as_deref(),
+            Some("Rain is coming this week"),
+            "a write that says nothing about the summary keeps the stored one"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_write_an_explicit_empty_summary_clears_it() {
+        // The other half of the rule: present-and-empty asks to clear. Without
+        // it a summary is write-once, and a model that wrote a wrong one has
+        // no way to take it back.
+        //
+        // Cleared means absent, not empty: the store maps an empty summary to
+        // NULL, so a cleared entry reads back exactly like one that never had
+        // a summary. `a_write_with_an_empty_summary_clears_the_stored_one` in
+        // `crates/storage/tests/knowledge_summary.rs` holds real Postgres to
+        // that; the fake here models the same rule.
+        let (service, store) = kb_service_with_tag_gate(None);
+        seed_kb_entry(
+            &store,
+            "entry-1",
+            "Rain is expected on Tuesday.",
+            &["memory"],
+            serde_json::json!({}),
+        );
+        seed_kb_summary(&store, "entry-1", "Rain is coming this week");
+
+        kb_write_response(
+            &service,
+            serde_json::json!({"id": "entry-1", "summary": ""}),
+        )
+        .await;
+
+        let stored = kb_stored(&store);
+        assert_eq!(
+            stored[0].summary, None,
+            "an empty summary clears the stored one rather than keeping it"
+        );
+        assert_eq!(
+            stored[0].content, "Rain is expected on Tuesday.",
+            "clearing the summary does not touch the content"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_write_truncates_an_over_long_summary_rather_than_refusing_it() {
+        // A model that answers "one line" with a paragraph must not lose the
+        // write over it. The cap is what stops one entry spending a whole
+        // recall budget, so it is enforced - but by cutting, not by refusing.
+        use desktop_assistant_core::domain::SUMMARY_MAX_CHARS;
+
+        let (service, store) = kb_service_with_tag_gate(None);
+
+        let response = kb_write_response(
+            &service,
+            serde_json::json!({
+                "content": "A fact worth keeping.",
+                "summary": "x".repeat(SUMMARY_MAX_CHARS * 3),
+            }),
+        )
+        .await;
+
+        assert_eq!(response["ok"], true, "the write was not refused");
+        let stored = kb_stored(&store)[0]
+            .summary
+            .clone()
+            .expect("the cut summary was stored");
+        assert_eq!(
+            stored.chars().count(),
+            SUMMARY_MAX_CHARS,
+            "the stored summary is cut to the cap: {stored}"
+        );
+        assert!(
+            stored.ends_with("..."),
+            "a summary cut short says so, or it reads as complete: {stored}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_write_reads_a_null_summary_field_as_absent() {
+        // Several model providers encode "I am not setting this field" as an
+        // explicit null. Reading that as an empty string would clear the
+        // summary of every entry those writes touch (#1093, on `tags`).
+        let (service, store) = kb_service_with_tag_gate(None);
+        seed_kb_entry(
+            &store,
+            "entry-1",
+            "Rain is expected on Tuesday.",
+            &["memory"],
+            serde_json::json!({}),
+        );
+        seed_kb_summary(&store, "entry-1", "Rain is coming this week");
+
+        kb_write_response(
+            &service,
+            serde_json::json!({
+                "id": "entry-1",
+                "content": "Rain is expected on Wednesday.",
+                "summary": null,
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            kb_stored(&store)[0].summary.as_deref(),
+            Some("Rain is coming this week"),
+            "a null summary means the write said nothing about the summary"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_write_refuses_a_summary_that_is_not_a_string() {
+        // Nothing validates the tool schema between the model and this code.
+        // Folding a shape this cannot read into an empty string would answer
+        // "set this summary" with a wipe, and report `ok` - the data-loss door
+        // #1093 closed on `tags`.
+        let (service, store) = kb_service_with_tag_gate(None);
+        seed_kb_entry(
+            &store,
+            "entry-1",
+            "Rain is expected on Tuesday.",
+            &["memory"],
+            serde_json::json!({}),
+        );
+        seed_kb_summary(&store, "entry-1", "Rain is coming this week");
+
+        let err = service
+            .execute_tool(
+                TOOL_KB_WRITE,
+                serde_json::json!({
+                    "id": "entry-1",
+                    "content": "Rain is expected on Wednesday.",
+                    "summary": {"text": "Rain is coming"},
+                }),
+            )
+            .await
+            .expect_err("a `summary` that is not a string is refused");
+        assert!(
+            err.to_string().contains("`summary` must be a string"),
+            "the error says what shape `summary` takes: {err}"
+        );
+        assert_eq!(
+            kb_stored(&store)[0].summary.as_deref(),
+            Some("Rain is coming this week"),
+            "the refused write stored nothing, so the entry is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_write_collapses_a_multi_line_summary_to_one_line() {
+        // The line goes to readers that put one entry per row - a client's
+        // knowledge browser, and #1100's candidate block. An embedded newline
+        // breaks the row structure rather than that entry's own row, so the
+        // text is made one physical line on the way in.
+        let (service, store) = kb_service_with_tag_gate(None);
+
+        kb_write_response(
+            &service,
+            serde_json::json!({
+                "content": "A fact worth keeping.",
+                "summary": "  Rain is coming\nthis week\t\tin the north  ",
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            kb_stored(&store)[0].summary.as_deref(),
+            Some("Rain is coming this week in the north"),
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_write_reports_the_summary_it_actually_stored() {
+        // The same reason the response reports the stored tags: this boundary
+        // rewrites what the caller sent - it collapses the line and cuts it at
+        // the cap. A model that cannot see the stored value believes the entry
+        // carries the paragraph it wrote.
+        use desktop_assistant_core::domain::SUMMARY_MAX_CHARS;
+
+        let (service, _store) = kb_service_with_tag_gate(None);
+
+        let response = kb_write_response(
+            &service,
+            serde_json::json!({
+                "content": "A fact worth keeping.",
+                "summary": "y".repeat(SUMMARY_MAX_CHARS * 2),
+            }),
+        )
+        .await;
+
+        let reported = response["entries"][0]["summary"]
+            .as_str()
+            .expect("the response reports the stored summary");
+        assert_eq!(
+            reported.chars().count(),
+            SUMMARY_MAX_CHARS,
+            "the response shows the cut line, not the one that was sent: {reported}"
+        );
+
+        // An entry that has none reports it as null, so "no summary" and "the
+        // response dropped the field" cannot be confused.
+        let bare =
+            kb_write_response(&service, serde_json::json!({"content": "A separate fact."})).await;
+        assert_eq!(
+            bare["entries"][0]["summary"],
+            serde_json::Value::Null,
+            "an entry with no summary reports null rather than omitting the field"
+        );
+
+        // A clear reports null too, and not the empty string that was sent.
+        // This is the one answer most likely to surprise: the model asked for
+        // "", and the entry now holds nothing at all.
+        let (clearing, store) = kb_service_with_tag_gate(None);
+        seed_kb_entry(
+            &store,
+            "entry-1",
+            "Rain is expected on Tuesday.",
+            &["memory"],
+            serde_json::json!({}),
+        );
+        seed_kb_summary(&store, "entry-1", "Rain is coming this week");
+
+        let cleared = kb_write_response(
+            &clearing,
+            serde_json::json!({"id": "entry-1", "summary": ""}),
+        )
+        .await;
+        assert_eq!(
+            cleared["entries"][0]["summary"],
+            serde_json::Value::Null,
+            "a cleared entry reports no summary, not an empty one"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_write_treats_a_whitespace_only_summary_as_a_clear() {
+        // One rule, applied in one order: collapse to a line first, then read
+        // absent / present / empty. A summary of nothing but whitespace
+        // collapses to empty, so it clears - it does not quietly become
+        // "preserve", which would need a second rule and leave the model no
+        // way to tell which one it had triggered.
+        //
+        // Safe to decide this way round because a summary is a convenience
+        // line, not the fact: the entry's content is untouched, and a cleared
+        // summary can be written again - by the next write, or by #1099's
+        // pass over entries that have none.
+        let (service, store) = kb_service_with_tag_gate(None);
+        seed_kb_entry(
+            &store,
+            "entry-1",
+            "Rain is expected on Tuesday.",
+            &["memory"],
+            serde_json::json!({}),
+        );
+        seed_kb_summary(&store, "entry-1", "Rain is coming this week");
+
+        kb_write_response(
+            &service,
+            serde_json::json!({"id": "entry-1", "summary": " \n\t "}),
+        )
+        .await;
+
+        let stored = kb_stored(&store);
+        assert_eq!(stored[0].summary, None);
+        assert_eq!(
+            stored[0].content, "Rain is expected on Tuesday.",
+            "the fact itself is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_write_batch_entry_carries_its_own_summary() {
+        // The batch form ignores every top-level field, so a model that
+        // batches its writes must be able to summarise each entry inside it.
+        let (service, store) = kb_service_with_tag_gate(None);
+
+        kb_write_response(
+            &service,
+            serde_json::json!({
+                "entries": [
+                    {"content": "Rain is expected on Tuesday.", "summary": "Rain on Tuesday"},
+                    {"content": "Snow is expected on Friday.", "summary": "Snow on Friday"},
+                ],
+            }),
+        )
+        .await;
+
+        let stored = kb_stored(&store);
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[0].summary.as_deref(), Some("Rain on Tuesday"));
+        assert_eq!(stored[1].summary.as_deref(), Some("Snow on Friday"));
+    }
+
+    #[test]
+    fn kb_write_schema_advertises_the_summary_argument() {
+        // A schema that promises what the code does not honour is a false
+        // contract, and so is code that honours what the schema never
+        // advertised: the model cannot supply a field it was never told about.
+        use desktop_assistant_core::domain::SUMMARY_MAX_CHARS;
+
+        let service = BuiltinToolService::new();
+        let def = service
+            .tool_definitions()
+            .into_iter()
+            .find(|t| t.name == TOOL_KB_WRITE)
+            .expect("kb_write tool is advertised");
+        let props = &def.parameters["properties"];
+
+        let single = &props["summary"];
+        assert_eq!(
+            single["type"], "string",
+            "the summary is one line of text: {single}"
+        );
+        let text = single["description"]
+            .as_str()
+            .expect("the summary field carries a description");
+
+        // What it is FOR. Told only "a summary", a model writes a topic label
+        // ("tag naming"), and a list of topic labels tells a later reader
+        // nothing it can act on. Told that the line is what it will be offered
+        // back later, it writes the fact itself.
+        assert!(
+            text.contains("candidate"),
+            "the description must say the summary is how this entry is offered \
+             back as a candidate later: {text}"
+        );
+        // The cap is enforced, so it is advertised - including that an
+        // over-long summary is cut rather than refused, or a model that fears
+        // losing the write pads nothing and writes nothing.
+        assert!(
+            text.contains(&SUMMARY_MAX_CHARS.to_string()) && text.contains("cut"),
+            "the description must advertise the length cap it enforces, and \
+             that it cuts rather than refuses: {text}"
+        );
+        // Absent and present-and-empty do different things, and only the
+        // schema can tell the model which is which. A line of nothing but
+        // whitespace clears too, so a description that says only "empty
+        // string" invites a model to wipe a summary while believing it set
+        // one.
+        assert!(
+            text.contains("empty or whitespace-only string clears it"),
+            "the description must say how to clear a summary, and that a blank \
+             line does it too: {text}"
+        );
+        // The block that offers candidate entries back is a later piece of
+        // work. Describing it as already running tells the model something it
+        // can falsify on its next search, so the purpose is written as what
+        // the line WILL be offered back as.
+        assert!(
+            text.contains("will be offered back"),
+            "the candidate list is not built yet, so the description must not \
+             describe it in the present tense: {text}"
+        );
+
+        // The batch form is held to the same shape. A model that batches its
+        // writes reads only this half of the schema.
+        let batch = &props["entries"]["items"]["properties"]["summary"];
+        assert_eq!(
+            batch["type"], "string",
+            "the batch form advertises the field too, or a batched write \
+             cannot summarise its entries: {batch}"
+        );
+        assert!(
+            batch["description"].as_str().is_some_and(|d| !d.is_empty()),
+            "the batch field carries a description of its own: {batch}"
         );
     }
 

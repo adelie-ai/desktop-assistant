@@ -68,6 +68,7 @@ so a batched write describes its new tags inside each entry.
 ```json
 {"ok": true, "count": 1,
  "entries": [{"id": "...", "tags": ["memory", "topic:weather"],
+              "summary": "Rain is expected on Tuesday",
               "created_at": "...", "updated_at": "..."}]}
 ```
 
@@ -75,6 +76,12 @@ so a batched write describes its new tags inside each entry.
 model that wrote `topic:forecast` would go on believing the entry carries that
 tag, search for it later, and find nothing - the exact failure the vocabulary
 exists to prevent.
+
+`summary` is reported for the same reason, and is `null` for an entry that has
+none. The write path collapses the supplied line and cuts it at 200 characters,
+and an empty one clears the field, so what was sent and what was stored differ
+in three ways the model would otherwise not see. See
+[knowledge-search.md](knowledge-search.md) for the argument's own rules.
 
 ### A write that was not checked says so
 

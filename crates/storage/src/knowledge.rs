@@ -57,20 +57,32 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
         //
         // `source` ($6) records provenance and `summary` ($7) the one-line
         // condensation. On update a NULL in either preserves the existing value
-        // (COALESCE) rather than clearing it, so a path that doesn't care about
+        // rather than clearing it, so a path that doesn't care about
         // provenance, or knows nothing about summaries, can't wipe one. There
-        // is deliberately no way to clear either through this call: absent is
-        // the only meaning NULL carries here.
+        // is no way to clear the provenance through this call: absent is the
+        // only meaning NULL carries for `source`.
+        //
+        // `summary` carries one more meaning, because a caller that wrote a
+        // wrong summary must be able to take it back: an EMPTY summary clears
+        // it. Cleared means NULL, not an empty string, on both halves of the
+        // upsert - `NULLIF` on the insert and the `= ''` arm on the update. An
+        // empty string would be a third state nothing wants: the render site
+        // would show a blank line rather than falling back to the content, and
+        // a pass that fills the field for entries with none (#1099) finds its
+        // work with `WHERE summary IS NULL`, so it would never reach one.
         let row: Option<KbRow> = sqlx::query_as(
             "INSERT INTO knowledge_base \
                 (id, user_id, content, tags, metadata, source, summary) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7) \
+             VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, '')) \
              ON CONFLICT (id) DO UPDATE \
                 SET content = EXCLUDED.content, \
                     tags = EXCLUDED.tags, \
                     metadata = EXCLUDED.metadata, \
                     source = COALESCE(EXCLUDED.source, knowledge_base.source), \
-                    summary = COALESCE(EXCLUDED.summary, knowledge_base.summary), \
+                    summary = CASE \
+                        WHEN $7 IS NULL THEN knowledge_base.summary \
+                        WHEN $7 = '' THEN NULL \
+                        ELSE $7 END, \
                     updated_at = NOW() \
                 WHERE knowledge_base.user_id = $2 \
                   AND knowledge_base.deleted_at IS NULL \

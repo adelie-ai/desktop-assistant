@@ -1605,6 +1605,7 @@ dependencies = [
  "base64",
  "chrono",
  "desktop-assistant-core",
+ "desktop-assistant-protocol",
  "httpmock",
  "rand 0.9.5",
  "reqwest",
