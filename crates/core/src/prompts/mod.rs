@@ -799,6 +799,152 @@ mod tests {
         );
     }
 
+    // --- The `[Recall]` block (#1102) ---------------------------------------
+
+    /// The `[Recall]` guidance alone, cut out of the assembled prompt.
+    ///
+    /// Every claim below is about this paragraph group. Asserting against the
+    /// whole prompt would let a sentence that lives elsewhere in the knowledge
+    /// section satisfy a test about the block: the section already names
+    /// `builtin_knowledge_base_get`, already names `available_tags`, and
+    /// already talks about tags an entry carries.
+    fn recall_guidance(assembled: &str) -> &str {
+        let start = assembled
+            .find("The [Recall] block:")
+            .expect("the knowledge section must carry guidance for the [Recall] block");
+        let rest = &assembled[start..];
+        let end = rest
+            .find("Finding the right tag:")
+            .expect("the [Recall] guidance must sit ahead of the tag-finding guidance");
+        &rest[..end]
+    }
+
+    #[test]
+    fn knowledge_prompt_explains_the_recall_block() {
+        // `[Recall]` is the only surfaced block that can be wrong, and it is
+        // the only one that arrives without the model asking. Unexplained, it
+        // reads as an assertion the daemon made (#1102).
+        let assembled = assemble(&static_sections());
+        let recall = recall_guidance(&assembled);
+        assert!(
+            recall.contains("near the user's prompt"),
+            "the guidance must say where the candidates came from"
+        );
+        assert!(
+            recall.contains("before you asked for anything"),
+            "and that they arrived unasked"
+        );
+        assert!(
+            recall.contains("It is a hint, not a finding."),
+            "and that the block is a hint"
+        );
+        assert!(
+            recall.contains("Nothing in it is asserted to be true"),
+            "and that nothing in it is asserted"
+        );
+    }
+
+    #[test]
+    fn knowledge_prompt_says_a_recall_line_is_not_the_entry() {
+        // The honest claim, and the reason this test is not named for
+        // summaries: `display_line` returns the stored summary where there is
+        // one and a bounded prefix of the content where there is not, and the
+        // backfill that writes the missing summaries has not run - so on the
+        // current corpus most lines are content prefixes, and the line itself
+        // does not say which it is (#1102).
+        let assembled = assemble(&static_sections());
+        let recall = recall_guidance(&assembled);
+        assert!(
+            recall.contains("one line that stands in for it"),
+            "the guidance must say a line stands in for its entry"
+        );
+        assert!(
+            recall.contains("you cannot tell which"),
+            "and that the line does not say whether it is a summary or a prefix"
+        );
+        assert!(
+            recall.contains("Never answer from it."),
+            "and forbid answering from the line"
+        );
+    }
+
+    #[test]
+    fn knowledge_prompt_directs_a_relevant_recall_line_to_a_read() {
+        // A line is a candidate, so the block only pays off if the model turns
+        // one into a read. `builtin_knowledge_base_get` takes a batch of ids,
+        // so following several candidates costs one round (#1102).
+        let assembled = assemble(&static_sections());
+        let recall = recall_guidance(&assembled);
+        assert!(
+            recall.contains("builtin_knowledge_base_get"),
+            "the guidance must name the tool that reads a recalled id"
+        );
+        assert!(
+            recall.contains("batch of ids"),
+            "and say the read takes a batch"
+        );
+        assert!(
+            recall.contains("cost one call"),
+            "and that several candidates therefore cost one round"
+        );
+    }
+
+    #[test]
+    fn knowledge_prompt_says_ignoring_recall_is_acceptable() {
+        // The block fires on every prompt, including "thanks". Without this,
+        // a weak match set reads as work the model owes the user (#1102).
+        let assembled = assemble(&static_sections());
+        let recall = recall_guidance(&assembled);
+        assert!(
+            recall.contains("Ignoring the whole block is a normal outcome and costs nothing."),
+            "the guidance must make ignoring the block an ordinary outcome"
+        );
+    }
+
+    #[test]
+    fn knowledge_prompt_says_what_the_recall_tag_names_are_for() {
+        // Same guidance `available_tags` carries, one step earlier, and it must
+        // speak with one voice: a registered name is a real name rather than a
+        // guess, and a filter that returns nothing means no entry in that scope
+        // carries the tag (#1071, #1102).
+        let assembled = assemble(&static_sections());
+        let recall = recall_guidance(&assembled);
+        assert!(
+            recall.contains("registered tags of this store"),
+            "the guidance must say what the tag names are"
+        );
+        assert!(
+            recall.contains("available_tags"),
+            "and tie them to the field that reports the tags a scope really uses"
+        );
+        assert!(
+            recall.contains("drop the filter"),
+            "and say what to do when a filter on one returns nothing"
+        );
+    }
+
+    #[test]
+    fn knowledge_prompt_keeps_the_mandatory_search_when_recall_is_silent() {
+        // The failure this closes: the model reads a quiet block as "memory was
+        // already checked" and tells the user it does not know. Recall searches
+        // the user's prompt against a conservative floor, so silence is not an
+        // empty store, and SEARCH BEFORE ASKING is unaffected (#1102).
+        let assembled = assemble(&static_sections());
+        let recall = recall_guidance(&assembled);
+        assert!(
+            recall.contains("The block never replaces a search."),
+            "the guidance must keep the block from standing in for a search"
+        );
+        assert!(
+            recall.contains("No block is not evidence that the store is empty"),
+            "and say that silence is not an empty store"
+        );
+        assert!(
+            recall.contains("SEARCH BEFORE ASKING still applies"),
+            "and point back at the mandatory rule by name"
+        );
+    }
+
     #[test]
     fn assembled_prompt_advertises_scratchpad_tools() {
         // The scratchpad must be advertised in the always-present system prompt
