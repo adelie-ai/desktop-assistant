@@ -15,7 +15,7 @@ it matters.
 ## What the model sees
 
 ```
-[Recall] Memory that may relate to what was just asked. It may not fit; ignore what does not. To read one in full, search its wording with builtin_knowledge_base_search.
+[Recall] Memory that may relate to what was just asked. It may not fit; ignore what does not. Each line is one entry: its id, its tags, and one line of what it says - not the entry itself. Look one up before you rely on it.
 - kb-1a2b [preference, ui] Prefers dark themes in every editor
 - kb-9f31 [infra, deploy] The deploy target is the lab cluster
 ...and 17 more entries matched less closely.
@@ -31,6 +31,13 @@ block that skipped them would show nothing. An entry whose line comes out empty
 is skipped, because it would spend a line of the budget to say nothing.
 
 Tag names are listed nearest first, not alphabetically.
+
+**The block names no tool.** Which read fetches an entry by its id is a property
+of the tool set on the day the block renders, and a block naming a tool the model
+cannot call is worse than one naming none: the model tries it and spends a round
+on the failure. Saying what a line is - a stand-in for an entry, not the entry -
+leaves the model to pick the read it actually has. Teaching the model what the
+block is belongs in the standing instruction, not in the block.
 
 **Every part of the block is bounded.** The id passes through the same one-line
 rule the summary does. The block is line-structured and it is a system message,

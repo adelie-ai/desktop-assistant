@@ -119,10 +119,16 @@ pub const RECALL_TAG_MAX_DISTANCE: f64 = 0.45;
 const RECALL_HEADER: &str =
     "Memory that may relate to what was just asked. It may not fit; ignore what does not.";
 
-/// Appended to the header when there are entry lines: what to call to read one
-/// in full.
-const RECALL_ENTRY_HINT: &str =
-    "To read one in full, search its wording with builtin_knowledge_base_search.";
+/// Appended to the header when there are entry lines: what a line is, and what
+/// it is not.
+///
+/// It names no tool. Which read fetches an entry by id is a property of the
+/// tool set on the day the block renders, and a block that names a tool the
+/// model cannot call is worse than one that names none - the model tries it,
+/// and spends a round on the failure. Saying what a line is leaves the model to
+/// pick the read it actually has.
+const RECALL_ENTRY_HINT: &str = "Each line is one entry: its id, its tags, and one line of what it says - \
+     not the entry itself. Look one up before you rely on it.";
 
 /// Label on the tag line.
 const RECALL_TAG_LABEL: &str = "Tags near this prompt:";
@@ -368,8 +374,8 @@ mod tests {
             "an entry's tags travel with it so the model can search on them: {block}"
         );
         assert!(
-            block.contains("builtin_knowledge_base_search"),
-            "the block must name what to call to read an entry: {block}"
+            block.contains(RECALL_ENTRY_HINT),
+            "the block must say that a line stands for an entry, not that it is one: {block}"
         );
     }
 
@@ -399,6 +405,25 @@ mod tests {
             "the content stands in for the missing summary: {block}"
         );
         assert_eq!(entry_lines(&block).len(), 1);
+    }
+
+    #[test]
+    fn recall_block_names_no_tool() {
+        // Which read fetches an entry by id is a property of the tool set on
+        // the day the block renders. A block that names a tool the model cannot
+        // call is worse than one that names none: the model tries it, and
+        // spends a round on the failure.
+        let candidates = RecallCandidates {
+            entries: vec![hit("kb-1", "a fact", &["topic"], 0.10)],
+            tags: vec![tag("topic:mine", 0.10)],
+        };
+
+        let block = render_recall(&candidates, RECALL_ENTRY_SCAN_LIMIT).expect("a block");
+
+        assert!(
+            !block.contains("builtin_"),
+            "the block must not prescribe a call: {block}"
+        );
     }
 
     #[test]
