@@ -12,8 +12,9 @@
 //! Included by each integration test via `mod support;` (it lives in a
 //! subdirectory so cargo does not compile it as its own test binary).
 
-use std::sync::Arc;
+use std::io;
 use std::sync::Once;
+use std::sync::{Arc, Mutex};
 
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
@@ -200,4 +201,58 @@ impl DbFixture {
         }
         admin.close().await;
     }
+}
+
+/// An `io::Write` sink that appends into a shared buffer, so a `fmt` layer's
+/// writer closures (which each construct a fresh handle) all land in the same
+/// place.
+#[derive(Clone)]
+struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+impl io::Write for SharedBuf {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.0
+            .lock()
+            .expect("lock capture buffer")
+            .extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Run `f` under a `fmt` subscriber that writes every emitted event into a
+/// buffer, and return `f`'s result alongside the captured text. Used to
+/// assert on a log line's content -- e.g. that a warning names both the
+/// returned and the expected vector count -- rather than only on database
+/// state, which cannot tell "cleared because of a count mismatch" apart from
+/// "cleared because the backend errored".
+///
+/// Safe to hold across `.await`: `#[tokio::test]`'s default `current_thread`
+/// flavor never migrates a task to another OS thread mid-poll, so the
+/// thread-local default subscriber `set_default` installs stays in force for
+/// `f`'s entire run, not just its first poll.
+pub async fn capture_tracing<F, Fut, T>(f: F) -> (T, String)
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let buf = SharedBuf(Arc::new(Mutex::new(Vec::new())));
+    let for_writer = buf.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || for_writer.clone())
+        .with_ansi(false)
+        .with_level(false)
+        .with_target(false)
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+    let result = f().await;
+    drop(guard);
+    let bytes = buf.0.lock().expect("lock capture buffer").clone();
+    (
+        result,
+        String::from_utf8(bytes).expect("captured log output is UTF-8"),
+    )
 }
