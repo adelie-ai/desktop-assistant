@@ -154,8 +154,14 @@ pub async fn resolve_active_name(pool: &PgPool, name: &str) -> Result<Option<Str
 ///    its colon — and check for an exact match; if found, redirect.
 /// 2. Embed `name + description` and search the registry for any active
 ///    tag within `TAG_DEDUP_DISTANCE_THRESHOLD` cosine distance — if found,
-///    redirect to that tag.
-/// 3. Otherwise insert and return `Created`.
+///    and its name is itself in normalized form, redirect to that tag.
+/// 3. Otherwise insert and return `Created`, or redirect to the tag a
+///    concurrent proposal of the same name registered first.
+///
+/// A near neighbour whose name is not in normalized form is passed over rather
+/// than redirected onto. Such a name is one no knowledge-base row can carry,
+/// so storing it on an entry would hide that entry from every search filtered
+/// on the correct tag.
 pub async fn create_or_match_tag(
     pool: &PgPool,
     embed_fn: &BackfillEmbedFn,
@@ -212,11 +218,29 @@ pub async fn create_or_match_tag(
     if let Some((name, description, examples, distinguish_from, distance)) = nearest
         && distance < TAG_DEDUP_DISTANCE_THRESHOLD
     {
-        return Ok(CreateTagOutcome::RedirectedTo {
-            proposed_name: proposal.name,
-            existing: row_to_record((name, description, examples, distinguish_from)),
+        // A redirect answers with a name the caller then writes on a
+        // knowledge-base row, so the name has to be one a row can carry. A row
+        // written before the two paths shared a normalizer holds a mangled key
+        // (`projectadelie-ai` for `project:adelie-ai`). Such a key misses the
+        // exact-name lookup above but is a close vector neighbour of the
+        // correct name, so redirecting onto it would store the mangled tag on
+        // the entry, and every later search filtered on the correct tag would
+        // miss it. Refusing the redirect keeps a mangled row inert until #1089
+        // repairs it.
+        if name == normalize_tag_name(&name) {
+            return Ok(CreateTagOutcome::RedirectedTo {
+                proposed_name: proposal.name,
+                existing: row_to_record((name, description, examples, distinguish_from)),
+                distance,
+            });
+        }
+        tracing::warn!(
+            candidate = %name,
+            proposed = %normalized,
             distance,
-        });
+            "the nearest tag's name is not in normalized form, so no knowledge-base row \
+             can carry it; not redirecting onto it"
+        );
     }
 
     let examples_json = serde_json::Value::Array(
@@ -227,7 +251,7 @@ pub async fn create_or_match_tag(
             .collect(),
     );
 
-    sqlx::query(
+    let inserted = sqlx::query(
         "INSERT INTO tag_registry \
             (user_id, name, description, examples, distinguish_from, embedding, embedding_model) \
          VALUES ($1, $2, $3, $4, $5, $6, $7)",
@@ -240,8 +264,41 @@ pub async fn create_or_match_tag(
     .bind(&query_vec)
     .bind(embedding_model)
     .execute(pool)
-    .await
-    .map_err(|e| CoreError::Storage(format!("tag_registry: insert failed: {e}")))?;
+    .await;
+
+    // A concurrent proposal of the same name can register it between the
+    // exact-name check above and this insert. That is a race the registry won,
+    // not a registry that failed: the tag now exists, so read it back and
+    // redirect onto it.
+    //
+    // The read-back is gated on the primary-key violation alone. Any other
+    // failure - a saturated pool, a dropped connection - would fail the same
+    // way a second time, so retrying it would make the caller wait for two
+    // timeouts instead of one, inside a live turn.
+    if let Err(e) = inserted {
+        let unique_violation = e
+            .as_database_error()
+            .is_some_and(sqlx::error::DatabaseError::is_unique_violation);
+        if !unique_violation {
+            return Err(CoreError::Storage(format!(
+                "tag_registry: insert failed: {e}"
+            )));
+        }
+        let existing = get_tag(pool, &normalized).await?.ok_or_else(|| {
+            CoreError::Storage(format!(
+                "tag_registry: insert of {normalized} conflicted, but no such tag is readable"
+            ))
+        })?;
+        tracing::debug!(
+            tag = %existing.name,
+            "a concurrent write registered this tag first; using it"
+        );
+        return Ok(CreateTagOutcome::RedirectedTo {
+            proposed_name: proposal.name,
+            existing,
+            distance: 0.0,
+        });
+    }
 
     Ok(CreateTagOutcome::Created(TagRecord {
         name: normalized,
@@ -285,7 +342,12 @@ pub fn tag_embed_text(normalized_name: &str, description: &str) -> String {
 /// Repeating the same proposal gives the same answer and registers nothing
 /// twice, including when a concurrent write registered the tag first: the
 /// registration is keyed by `(user_id, name)`, so a lost race leaves the tag
-/// present and this reads it back rather than reporting a failure.
+/// present and [`create_or_match_tag`] redirects onto it rather than reporting
+/// a failure.
+///
+/// Each call is one pass through the vocabulary. It never retries a failure,
+/// because the caller sits inside a live turn and a second attempt at a
+/// failing database would only make the person wait twice.
 ///
 /// Errors are the caller's cue to store the tag as written, not to fail the
 /// write - see [`desktop_assistant_core::ports::knowledge::KnowledgeTagResolveFn`].
@@ -303,7 +365,7 @@ pub async fn resolve_proposed_tag(
         );
     }
 
-    let outcome = match create_or_match_tag(
+    let outcome = create_or_match_tag(
         pool,
         embed_fn,
         embedding_model,
@@ -314,27 +376,7 @@ pub async fn resolve_proposed_tag(
             distinguish_from: Vec::new(),
         },
     )
-    .await
-    {
-        Ok(outcome) => outcome,
-        Err(e) => {
-            // A concurrent write can register the same name between this
-            // proposal's name check and its insert. Read it back before
-            // reporting a failure: the vocabulary holds the tag, so the answer
-            // is the same one the winner got.
-            let normalized = normalize_tag_name(&proposed.name);
-            match get_tag(pool, &normalized).await {
-                Ok(Some(existing)) => {
-                    tracing::debug!(
-                        tag = %existing.name,
-                        "a concurrent write registered this tag first; using it"
-                    );
-                    return Ok(existing.name);
-                }
-                _ => return Err(e),
-            }
-        }
-    };
+    .await?;
 
     Ok(match outcome {
         CreateTagOutcome::Created(record) => record.name,
