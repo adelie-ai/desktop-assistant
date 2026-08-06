@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 
@@ -27,6 +27,7 @@ use desktop_assistant_core::ports::tool_registry::{ToolDefinitionFn, ToolSearchF
 use desktop_assistant_core::ports::transport::{
     current_client_context, current_client_label, current_co_location, current_transport_kind,
 };
+use desktop_assistant_core::tag_normalize::normalize_tag;
 
 use crate::executor::McpControlHandle;
 
@@ -1357,6 +1358,14 @@ impl BuiltinToolService {
     /// on its name and costs no embedding, so sending a description for every
     /// tag is free.
     ///
+    /// A description is matched to its tag on the normalized name, on both
+    /// sides. The model writes what reads well - `"Topic: Embeddings"` in one
+    /// field and `"topic:embeddings"` in the other - and the vocabulary keys on
+    /// the normalized name, so matching the two raw strings drops the
+    /// description. A tag that loses its description embeds as its bare name,
+    /// which carries almost no signal, so the check that this whole path exists
+    /// for would mostly not fire.
+    ///
     /// Why nothing here can fail the write: the vocabulary is optional. It is
     /// absent when no database or embedding backend is wired, and it can fail
     /// per call when the embedding backend is unreachable. Both degrade to the
@@ -1376,7 +1385,7 @@ impl BuiltinToolService {
         let Some(resolve_fn) = self.kb_tag_resolve_fn.as_ref() else {
             return tags;
         };
-        let descriptions = spec.get("new_tag_descriptions");
+        let descriptions = normalized_tag_descriptions(spec);
 
         let mut resolved = Vec::with_capacity(tags.len());
         for tag in tags {
@@ -1385,12 +1394,7 @@ impl BuiltinToolService {
                 resolved.push(tag);
                 continue;
             }
-            let description = descriptions
-                .and_then(|d| d.get(&tag))
-                .and_then(serde_json::Value::as_str)
-                .map(str::trim)
-                .filter(|d| !d.is_empty())
-                .map(str::to_string);
+            let description = descriptions.get(&normalize_tag(&tag)).cloned();
             let proposed = ProposedTag {
                 name: tag.clone(),
                 description,
@@ -2388,6 +2392,44 @@ fn optional_string_array(args: &serde_json::Value, key: &str) -> Vec<String> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default()
+}
+
+/// Read one write spec's `new_tag_descriptions` map, keyed by the normalized
+/// tag name.
+///
+/// Why normalized: the tag vocabulary keys on the normalized name, and the
+/// model writes each field in whatever shape reads well - `"Topic: Embeddings"`
+/// as the description key beside `"topic:embeddings"` in `tags`, or the
+/// reverse. Matching the two raw strings drops the description in both
+/// directions, and a tag with no description embeds as its bare name.
+///
+/// Two keys that normalize together keep the first, matching the first-seen
+/// rule [`desktop_assistant_core::tag_normalize::normalize_tags`] applies to
+/// the tags themselves.
+fn normalized_tag_descriptions(spec: &serde_json::Value) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let Some(map) = spec
+        .get("new_tag_descriptions")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return out;
+    };
+    for (name, value) in map {
+        let Some(description) = value
+            .as_str()
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let key = normalize_tag(name);
+        if key.is_empty() {
+            continue;
+        }
+        out.entry(key).or_insert(description);
+    }
+    out
 }
 
 fn optional_string_array_nonempty(args: &serde_json::Value, key: &str) -> Option<Vec<String>> {
@@ -4580,6 +4622,53 @@ mod tests {
             store.lock().expect("store lock")[0].tags,
             vec!["topic:embeddings".to_string()],
             "a tag with no near duplicate is stored as proposed"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_write_matches_a_description_to_its_tag_on_the_normalised_name() {
+        // The model writes each field in whatever shape reads well, and the two
+        // fields drift apart in both directions: a pretty description key
+        // beside a normalised tag, and a normalised key beside a pretty tag.
+        // The vocabulary keys on the normalised name, so a raw string match
+        // drops the description and the tag embeds as its bare name - the weak
+        // option #1070 rejected.
+        let (resolve, probe) = recording_tag_gate(&[]);
+        let (service, _store) = kb_service_with_tag_gate(Some(resolve));
+
+        kb_write_response(
+            &service,
+            serde_json::json!({
+                "content": "Embeddings are backfilled by the maintenance task.",
+                "tags": ["topic:embeddings", "Topic: Deploy"],
+                "new_tag_descriptions": {
+                    // Pretty key, normalised tag.
+                    "Topic: Embeddings": "Vector embedding generation, models, and backfill",
+                    // Normalised key, pretty tag.
+                    "topic:deploy": "Releases, rollouts, and the justfile recipes",
+                },
+            }),
+        )
+        .await;
+
+        let proposals = probe.lock().expect("probe lock").proposals.clone();
+        let described: Vec<(String, Option<String>)> = proposals
+            .iter()
+            .map(|p| (p.name.clone(), p.description.clone()))
+            .collect();
+        assert_eq!(
+            described,
+            vec![
+                (
+                    "topic:embeddings".to_string(),
+                    Some("Vector embedding generation, models, and backfill".to_string())
+                ),
+                (
+                    "Topic: Deploy".to_string(),
+                    Some("Releases, rollouts, and the justfile recipes".to_string())
+                ),
+            ],
+            "a description reaches its tag whichever side arrived normalised"
         );
     }
 
