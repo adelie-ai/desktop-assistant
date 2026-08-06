@@ -400,9 +400,13 @@ impl ScratchpadStore for PgScratchpadStore {
             return Ok(0);
         }
         let user_id = current_user_id();
-        // Not confined by `owner_todo`: this repairs rows the render path has
-        // just read, so there is no model-driven caller to confine (see the
-        // port doc). `user_id = $1` stays, because that is the tenant guard.
+        // Confined to the caller's own namespace, exactly as `set_pinned` is.
+        // A subagent's read spans its ancestors, so an unconfined repair would
+        // let a subagent round clear the parent's pin - and the one line that
+        // says a pin was released would render into the SUBAGENT's block, where
+        // the parent never sees it. Confining it means whoever owns the pin is
+        // the one told, on its own next round.
+        let me = current_namespace();
         //
         // The pin goes with the attachment. A note whose entry has gone renders
         // nothing under `[Pinned]`, and a pin that renders nothing is a fact the
@@ -417,11 +421,12 @@ impl ScratchpadStore for PgScratchpadStore {
         // actually repaired and makes a second call a true no-op.
         let result = sqlx::query(
             "UPDATE scratchpads SET knowledge_entry_id = NULL, pinned = FALSE \
-             WHERE user_id = $1 AND conversation_id = $2 AND id = ANY($3) \
-               AND knowledge_entry_id IS NOT NULL",
+             WHERE user_id = $1 AND conversation_id = $2 AND owner_todo = $3 \
+               AND id = ANY($4) AND knowledge_entry_id IS NOT NULL",
         )
         .bind(user_id.as_str())
         .bind(conversation_id)
+        .bind(&me)
         .bind(note_ids)
         .execute(&self.pool)
         .await

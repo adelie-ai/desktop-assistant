@@ -7,26 +7,27 @@
 -- `content` behind a magic `note_type`) is checkable by the database and
 -- greppable by a reader.
 --
--- The foreign key is the structural half of "a reference never outlives its
--- entry": ON DELETE SET NULL clears the attachment the moment the entry row
--- goes, so a dangling id cannot exist. It does not cover a soft delete - a
--- trashed entry keeps its row - so the render path drops an attachment it
--- cannot resolve as well.
+-- No foreign key to `knowledge_base(id)`, deliberately. An `ON DELETE SET NULL`
+-- reference reads as the structural half of "a reference never outlives its
+-- entry", and it is the opposite: it clears the column the instant the entry
+-- row goes, which destroys the only evidence the render path has that the note
+-- ever pointed anywhere. The note would then keep its pin, render nothing under
+-- that pin, and never be told - the exact failure this feature exists to
+-- prevent. So the column is a plain nullable id, and the render path owns the
+-- whole repair: it resolves every attachment each round, and one that no longer
+-- answers is dropped from the block, named to the model, and cleared with its
+-- pin. A hard delete and a soft delete then take the same path.
+--
+-- The write tool checks the id against the caller's own entries before storing
+-- it, so a wrong id is refused at the boundary rather than stored and reaped.
+--
+-- Row level security needs nothing here: migration 029 already enabled it on
+-- `scratchpads`, and its policy is on `user_id`, which this column does not
+-- change.
 --
 -- The migration runner (pool.rs) applies each migration at most once, tracked
 -- in the `schema_migrations` ledger, but every statement here MUST still be
 -- idempotent: a database migrated before that ledger existed replays the whole
 -- set once on its first boot under it.
 
-ALTER TABLE scratchpads
-    ADD COLUMN IF NOT EXISTS knowledge_entry_id TEXT
-        REFERENCES knowledge_base(id) ON DELETE SET NULL;
-
--- Deleting a knowledge entry has to find the rows that reference it. Without an
--- index that is a sequential scan of the whole pad per deleted entry, and
--- emptying the trash deletes many at once. Partial, because an attachment is
--- rare: the pin cap keeps the referencing set tiny while plain notes are the
--- overwhelming majority.
-CREATE INDEX IF NOT EXISTS scratchpads_knowledge_entry_idx
-    ON scratchpads (knowledge_entry_id)
-    WHERE knowledge_entry_id IS NOT NULL;
+ALTER TABLE scratchpads ADD COLUMN IF NOT EXISTS knowledge_entry_id TEXT;

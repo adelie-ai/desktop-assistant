@@ -2231,36 +2231,17 @@ impl BuiltinToolService {
                 }));
                 continue;
             }
-            // An attachment is checked before it is stored. An id that names no
-            // entry this user owns would otherwise sit on the note until the
-            // next render dropped it, and the model would believe it had
-            // attached a fact it never did.
-            if let Some(entry_id) = note.knowledge_entry_id.as_deref() {
-                match self.resolve_attachment(entry_id).await {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        rejected.push(serde_json::json!({
-                            "key": note.key,
-                            "reason": format!(
-                                "knowledge entry {entry_id} was not found; search for it \
-                                 with builtin_knowledge_base_search and use the id it returns"
-                            )
-                        }));
-                        continue;
-                    }
-                    Err(e) => {
-                        rejected.push(serde_json::json!({
-                            "key": note.key,
-                            "reason": format!(
-                                "could not check knowledge entry {entry_id}: {e}"
-                            )
-                        }));
-                        continue;
-                    }
-                }
-            }
             if let Some(existing) = accepted.iter_mut().find(|n| n.key == note.key) {
+                // Last write wins on everything the later note states, but an
+                // attachment it does not state is inherited rather than
+                // dropped: `None` means "leave it alone" everywhere else, and a
+                // second note for the same key must not mean something
+                // different. Otherwise the model attaches an entry, rewrites
+                // the same key in the same call, and is told the write
+                // succeeded with nothing attached.
+                let carried = existing.knowledge_entry_id.take();
                 *existing = note;
+                existing.knowledge_entry_id = existing.knowledge_entry_id.take().or(carried);
             } else {
                 accepted.push(note);
             }
@@ -2277,6 +2258,35 @@ impl BuiltinToolService {
                 .map(|n| n.key)
                 .collect();
         }
+
+        // Check each attachment against the caller's own entries, after the
+        // batch has been de-duplicated and capped, so the reads are bounded by
+        // `MAX_NOTES_PER_WRITE` rather than by whatever the model sent. An id
+        // that names no entry this user owns would otherwise sit on the note
+        // until the next render dropped it, and the model would believe it had
+        // attached a fact it never did.
+        let mut checked: Vec<NewScratchpadNote> = Vec::with_capacity(accepted.len());
+        for note in accepted {
+            let Some(entry_id) = note.knowledge_entry_id.clone() else {
+                checked.push(note);
+                continue;
+            };
+            match self.resolve_attachment(&entry_id).await {
+                Ok(true) => checked.push(note),
+                Ok(false) => rejected.push(serde_json::json!({
+                    "key": note.key,
+                    "reason": format!(
+                        "knowledge entry {entry_id} was not found; search for it with \
+                         builtin_knowledge_base_search and use the id it returns"
+                    )
+                })),
+                Err(e) => rejected.push(serde_json::json!({
+                    "key": note.key,
+                    "reason": format!("could not check knowledge entry {entry_id}: {e}")
+                })),
+            }
+        }
+        let accepted = checked;
 
         let saved = if accepted.is_empty() {
             Vec::new()
@@ -7250,6 +7260,38 @@ mod tests {
         assert!(
             store.lock().unwrap().is_empty(),
             "nothing is written when the attachment does not resolve"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repeated_key_in_one_batch_keeps_the_attachment_it_was_given() {
+        // Last write wins on the text, but an attachment the later note does
+        // not state is inherited. Otherwise the model attaches an entry,
+        // rewrites the same key in the same call, and is told the write
+        // succeeded with nothing attached.
+        let (service, store) = service_with_one_entry("kb-1");
+        let out = with_conversation_id(ConversationId::from("conv-1"), async {
+            service
+                .execute_tool(
+                    TOOL_SCRATCHPAD_WRITE,
+                    serde_json::json!({"notes": [
+                        {"key": "deploy-target", "content": "first", "knowledge_entry_id": "kb-1"},
+                        {"key": "deploy-target", "content": "second"}
+                    ]}),
+                )
+                .await
+                .expect("write succeeds")
+        })
+        .await;
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("json");
+        assert!(parsed.get("rejected").is_none(), "{out}");
+        let notes = store.lock().unwrap();
+        assert_eq!(notes.len(), 1, "the repeated key is one note");
+        assert_eq!(notes[0].content, "second", "last write wins on the text");
+        assert_eq!(
+            notes[0].knowledge_entry_id.as_deref(),
+            Some("kb-1"),
+            "the attachment the batch asked for must survive the repeat"
         );
     }
 

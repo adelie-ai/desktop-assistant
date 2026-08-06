@@ -3270,7 +3270,7 @@ mod tests {
             &TurnAnchors {
                 active_task: Some("do a thing"),
                 scratchpad_index: Some(index),
-                pinned: Some("- deploy-target: k3s at 192.168.1.2"),
+                pinned: Some("- deploy-target: the managed k3s cluster"),
                 ..Default::default()
             },
             None,
@@ -3281,7 +3281,7 @@ mod tests {
             "precondition: [Scratchpad] is gated silent on a short, visible turn"
         );
         let text = pinned_text(&result).expect("[Pinned] must render ungated, from turn one");
-        assert!(text.contains("k3s at 192.168.1.2"), "{text}");
+        assert!(text.contains("the managed k3s cluster"), "{text}");
     }
 
     #[test]

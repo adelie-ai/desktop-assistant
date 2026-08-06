@@ -842,12 +842,21 @@ pub fn subagent_payload_carries_an_answer(result: &str) -> bool {
 /// surface carry its own provenance, not a third special case here.
 ///
 /// A pinned note may also attach a knowledge entry (#1104), whose content
-/// renders into every later turn by the same route. That widens the surface but
-/// not the exposure: an entry is written by `builtin_knowledge_base_write`,
-/// which is `Mutate` and so refused for the rest of a tainted turn, and
-/// attaching one goes through `builtin_scratchpad_write`, which is `Mutate`
-/// too. The entry is the user's own store either way, which is why the
-/// knowledge reads are `Trusted`.
+/// renders into every later turn by the same route, so the same gap now reaches
+/// the knowledge base. Two things bound it and neither closes it. Writing an
+/// entry and attaching one are both `Mutate`, so a turn that has already read
+/// outside content can do neither - but that is a same-turn argument, and this
+/// route is cross-turn by construction. And the entry is the user's own store,
+/// which is why the knowledge reads are `Trusted` in the first place.
+///
+/// What is genuinely new is the writer. A subagent shares the user's knowledge
+/// base and gets the parent's tool set by default, so it can rewrite an entry
+/// the parent has pinned, and the parent's next turn renders that text under a
+/// header telling it the pin is current. The same is already true of a note: a
+/// subagent's pinned note renders into the parent's block through the
+/// subtree-inclusive read. So this widens an existing route rather than opening
+/// a new kind, and it wants the same answer - a durable provenance marker on
+/// the rendered surface, not a special case here.
 ///
 /// The stamp is also a disclosure. It is prepended to the text the model
 /// reads, so the model is told where the content came from rather than left to

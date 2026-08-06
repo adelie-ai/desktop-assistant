@@ -5912,18 +5912,22 @@ mod tests {
         llm: PlanContextCapturingLlm,
     }
 
-    /// Build one, with the pinned note attaching `entry_id`.
-    fn pinned_reference_fixture(entry_id: &str) -> PinnedReferenceFixture {
+    /// Build one. Every `(key, entry_id)` pair becomes a pinned note attaching
+    /// that entry; the first is `deploy-target` in every test that needs only
+    /// one.
+    fn pinned_reference_fixture(attachments: &[(&str, &str)]) -> PinnedReferenceFixture {
         let (write, list, sp) = in_memory_scratchpad();
-        let mut note = crate::domain::ScratchpadNote::new(
-            "note-deploy",
-            "conv",
-            "deploy-target",
-            "this is the target we finally settled on",
-        );
-        note.pinned = true;
-        note.knowledge_entry_id = Some(entry_id.to_string());
-        sp.lock().unwrap().insert("deploy-target".into(), note);
+        for (key, entry_id) in attachments {
+            let mut note = crate::domain::ScratchpadNote::new(
+                format!("note-{key}"),
+                "conv",
+                *key,
+                format!("this is the {key} we finally settled on"),
+            );
+            note.pinned = true;
+            note.knowledge_entry_id = Some((*entry_id).to_string());
+            sp.lock().unwrap().insert((*key).to_string(), note);
+        }
 
         let captured: Arc<Mutex<Vec<Vec<Message>>>> = Arc::new(Mutex::new(Vec::new()));
         let llm = PlanContextCapturingLlm {
@@ -5952,7 +5956,7 @@ mod tests {
         // A pin that renders empty is a fact the model believes it has and does
         // not, so the block must not assert it and the attachment must not
         // survive the entry.
-        let fx = pinned_reference_fixture("kb-gone");
+        let fx = pinned_reference_fixture(&[("deploy-target", "kb-gone")]);
         let (write, list, captured, llm) = (fx.write, fx.list, fx.captured, fx.llm);
         // The read runs and finds nothing: the entry was deleted or trashed.
         let get_many: KnowledgeGetManyFn = Arc::new(|_ids| Box::pin(async { Ok(Vec::new()) }));
@@ -5987,16 +5991,19 @@ mod tests {
             .await
             .unwrap();
 
-        let block = captured_pinned_block(&captured.lock().unwrap());
-        if let Some(block) = &block {
-            assert!(
-                !block.contains("this is the target we finally settled on"),
-                "a reference whose entry has gone must render nothing: {block}"
-            );
-        }
+        let block = captured_pinned_block(&captured.lock().unwrap())
+            .expect("the model must be told a pin was released, so a block is owed");
+        assert!(
+            !block.contains("this is the deploy-target we finally settled on"),
+            "a reference whose entry has gone must render nothing: {block}"
+        );
+        assert!(
+            block.contains("deploy-target") && block.contains("no longer exists"),
+            "the released note must be named, never dropped in silence: {block}"
+        );
         assert_eq!(
             *reaped.lock().unwrap(),
-            vec!["note-deploy".to_string()],
+            vec!["note-deploy-target".to_string()],
             "the dangling attachment must be reaped, by note id"
         );
     }
@@ -6006,18 +6013,25 @@ mod tests {
         // One read per round, never one per pin: the block re-renders every
         // round, so a per-pin read multiplies the round's storage traffic by
         // the pin cap.
-        let fx = pinned_reference_fixture("kb-1");
+        let fx = pinned_reference_fixture(&[("deploy-target", "kb-1"), ("api-quirk", "kb-2")]);
         let (write, list, llm) = (fx.write, fx.list, fx.llm);
         let reads: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&reads);
         let get_many: KnowledgeGetManyFn = Arc::new(move |ids: Vec<String>| {
             seen.lock().unwrap().push(ids);
             Box::pin(async {
-                Ok(vec![crate::domain::KnowledgeEntry::new(
-                    "kb-1",
-                    "Deploys go to the k3s cluster.",
-                    vec![],
-                )])
+                Ok(vec![
+                    crate::domain::KnowledgeEntry::new(
+                        "kb-1",
+                        "Deploys go to the managed cluster.",
+                        vec![],
+                    ),
+                    crate::domain::KnowledgeEntry::new(
+                        "kb-2",
+                        "The login form is form-encoded, not JSON.",
+                        vec![],
+                    ),
+                ])
             })
         });
 
@@ -6041,12 +6055,14 @@ mod tests {
             .unwrap();
 
         let reads = reads.lock().unwrap();
-        assert!(!reads.is_empty(), "the attachment must be resolved at all");
+        assert!(!reads.is_empty(), "the attachments must be resolved at all");
         for ids in reads.iter() {
+            let mut ids = ids.clone();
+            ids.sort();
             assert_eq!(
-                ids.len(),
-                1,
-                "every round resolves its attachments in one batched read: {ids:?}"
+                ids,
+                vec!["kb-1".to_string(), "kb-2".to_string()],
+                "a round must resolve BOTH attachments in one read, not one read each: {ids:?}"
             );
         }
     }
@@ -6055,7 +6071,7 @@ mod tests {
     async fn a_transient_knowledge_read_failure_does_not_reap_a_pinned_reference() {
         // A failed read says nothing about whether the entry still exists.
         // Reaping on it would destroy a live reference the model is relying on.
-        let fx = pinned_reference_fixture("kb-1");
+        let fx = pinned_reference_fixture(&[("deploy-target", "kb-1")]);
         let (write, list, captured, llm) = (fx.write, fx.list, fx.captured, fx.llm);
         let get_many: KnowledgeGetManyFn = Arc::new(|_ids| {
             Box::pin(async { Err(CoreError::Storage("connection reset".to_string())) })
@@ -6097,7 +6113,7 @@ mod tests {
         let block = captured_pinned_block(&captured.lock().unwrap())
             .expect("the note is still pinned, so the block still renders");
         assert!(
-            block.contains("this is the target we finally settled on"),
+            block.contains("this is the deploy-target we finally settled on"),
             "the note's own text survives a failed resolve: {block}"
         );
     }

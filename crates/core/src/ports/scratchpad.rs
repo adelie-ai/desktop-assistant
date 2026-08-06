@@ -207,8 +207,14 @@ pub const PINNED_BLOCK_BYTE_BUDGET: usize = 4 * 1024;
 /// [`SUMMARY_MAX_CHARS`](desktop_assistant_protocol::SUMMARY_MAX_CHARS). A
 /// summary line answers "is this the entry I want?", and the point of a pin is
 /// having the fact itself, so a pinned entry must render more than a headline.
-/// [`MAX_PINNED_NOTES`] entries at this size still sit inside the block budget,
-/// so the two caps agree instead of one always cutting the other short.
+///
+/// This is a per-entry cap, not a share of the block. It is measured in
+/// characters and [`PINNED_BLOCK_BYTE_BUDGET`] in bytes, and the notes render
+/// beside the entries, so [`MAX_PINNED_NOTES`] entries at this size do NOT fit
+/// inside the block - a few long entries, or one entry outside ASCII, and the
+/// block budget bites first. That is the intended order: this cap stops one
+/// entry from spending everything, and the block budget decides how much
+/// survives, with the cut marked and the notes that did not fit counted.
 pub const PINNED_ENTRY_MAX_CHARS: usize = 4 * desktop_assistant_protocol::SUMMARY_MAX_CHARS;
 
 /// Decide which keys a pin request may set, enforcing [`MAX_PINNED_NOTES`].
@@ -345,11 +351,13 @@ pub trait ScratchpadStore: Send + Sync {
     /// alone could name a row in a different namespace. `conversation_id`
     /// still travels, so the repair cannot reach outside the pad it read.
     ///
-    /// Why it is not namespace-confined the way [`Self::set_pinned`] and
-    /// [`Self::delete_many`] are: those confine what a *subagent* may reach,
-    /// because the model drives them. This one is driven by the render path
-    /// repairing rows it has just read, so there is no caller to confine. It
-    /// stays scoped by the task-local `UserId`, which is the tenant guard.
+    /// Namespace-confined by `owner_todo`, exactly as [`Self::set_pinned`] and
+    /// [`Self::delete_many`] are. A subagent's read spans its ancestors, so an
+    /// unconfined repair would let a subagent round clear the parent's pin, and
+    /// the one line saying a pin was released would render into the subagent's
+    /// block where the parent never sees it. Confined, the owner is the one
+    /// told, on its own next round. Scoped by the task-local `UserId` too,
+    /// which is the tenant guard.
     ///
     /// Idempotent: a second call over the same ids changes nothing and
     /// returns 0.

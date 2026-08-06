@@ -1302,11 +1302,14 @@ async fn releasing_a_reference_clears_the_attachment_and_the_pin() {
 }
 
 #[tokio::test]
-async fn deleting_a_knowledge_entry_clears_the_attachment_it_left_behind() {
-    // The structural half of "a reference never outlives its entry": the
-    // foreign key clears the column when the entry row goes.
+async fn deleting_a_knowledge_entry_leaves_the_attachment_for_the_render_to_repair() {
+    // There is deliberately no foreign key. `ON DELETE SET NULL` would clear the
+    // column the instant the entry row went, and the note would keep its pin,
+    // render nothing under it, and never be told - because the evidence the
+    // render needs to notice would be gone. The id must survive the delete so a
+    // hard delete and a soft delete take the same repair path.
     with_fixture(
-        "deleting_a_knowledge_entry_clears_the_attachment_it_left_behind",
+        "deleting_a_knowledge_entry_leaves_the_attachment_for_the_render_to_repair",
         |fx| async move {
             use desktop_assistant_core::ports::knowledge::KnowledgeBaseStore;
             let convs = PgConversationStore::new(fx.pool.clone());
@@ -1318,11 +1321,77 @@ async fn deleting_a_knowledge_entry_clears_the_attachment_it_left_behind() {
                 pad.write("c1", &[note_attaching("deploy-target", "settled", "kb-1")])
                     .await
                     .expect("attach");
+                pad.set_pinned("c1", &["deploy-target".to_string()], true)
+                    .await
+                    .expect("pin");
+
                 kb.delete("kb-1").await.expect("delete entry");
+
                 let notes = pad.list("c1", None, 50).await.expect("list");
                 assert_eq!(
-                    notes[0].knowledge_entry_id, None,
-                    "a deleted entry must leave no dangling id behind"
+                    notes[0].knowledge_entry_id.as_deref(),
+                    Some("kb-1"),
+                    "the id must survive, or the render cannot see the pin is empty"
+                );
+                assert!(
+                    notes[0].pinned,
+                    "and the pin is still the render's to release"
+                );
+                // The entry itself is gone, so the render's read finds nothing
+                // and repairs the note.
+                assert!(
+                    kb.get("kb-1").await.expect("get").is_none(),
+                    "the entry really is gone"
+                );
+            })
+            .await;
+            fx
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn releasing_a_reference_stays_within_the_subagent_namespace() {
+    // A subagent's read spans its ancestors, so without confinement a subagent
+    // round would clear the parent's pin and consume the one line that says a
+    // pin was released - in the subagent's block, where the parent never sees
+    // it. Confined, the parent repairs its own on its own next round.
+    with_fixture(
+        "releasing_a_reference_stays_within_the_subagent_namespace",
+        |fx| async move {
+            let convs = PgConversationStore::new(fx.pool.clone());
+            let pad = PgScratchpadStore::new(fx.pool.clone());
+            with_user_id(UserId::new("alice"), async {
+                convs.create(make_conversation("c1")).await.expect("conv");
+                write_entry(&fx.pool, "kb-1", "the durable fact").await;
+                let saved = pad
+                    .write("c1", &[note_attaching("deploy-target", "settled", "kb-1")])
+                    .await
+                    .expect("parent attach");
+                pad.set_pinned("c1", &["deploy-target".to_string()], true)
+                    .await
+                    .expect("parent pin");
+                let parent_note_id = saved[0].id.clone();
+
+                let released = with_subagent_scope(sub_scope("1.1", "", &[]), async {
+                    pad.release_knowledge_references("c1", std::slice::from_ref(&parent_note_id))
+                        .await
+                        .expect("child release")
+                })
+                .await;
+                assert_eq!(released, 0, "a subagent must not repair the parent's row");
+
+                let notes = pad.list("c1", None, 50).await.expect("list");
+                assert_eq!(notes[0].knowledge_entry_id.as_deref(), Some("kb-1"));
+                assert!(notes[0].pinned, "the parent's pin is untouched");
+
+                assert_eq!(
+                    pad.release_knowledge_references("c1", std::slice::from_ref(&parent_note_id))
+                        .await
+                        .expect("parent release"),
+                    1,
+                    "the owner repairs its own"
                 );
             })
             .await;

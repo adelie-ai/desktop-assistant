@@ -562,14 +562,27 @@ fn pinned_chunk(note: &RawNote<'_>, entry: Option<&str>) -> String {
         chunk.push(' ');
         chunk.push_str(note.content);
     }
-    if let (Some(id), Some(text)) = (note.knowledge_entry_id, entry) {
+    if let Some(id) = note.knowledge_entry_id {
         chunk.push_str("\n  knowledge entry ");
         chunk.push_str(id);
-        chunk.push_str(": ");
-        chunk.push_str(&desktop_assistant_protocol::one_line(
-            text,
-            crate::ports::scratchpad::PINNED_ENTRY_MAX_CHARS,
-        ));
+        match entry {
+            Some(text) => {
+                chunk.push_str(": ");
+                chunk.push_str(&desktop_assistant_protocol::one_line(
+                    text,
+                    crate::ports::scratchpad::PINNED_ENTRY_MAX_CHARS,
+                ));
+            }
+            // The round could not read the entry at all. Saying so is not
+            // optional: the block header tells the model its pins are current,
+            // so a note that renders only its key would read as a pin that has
+            // nothing behind it. A note that is nothing but a pointer would
+            // otherwise render as a blank line.
+            None => chunk.push_str(
+                " could not be read this round; \
+                                    builtin_knowledge_base_get it if you need it now",
+            ),
+        }
     }
     chunk
 }
@@ -1387,7 +1400,7 @@ mod tests {
         let notes = vec![raw_owned(
             "",
             "deploy-target",
-            "k3s at 192.168.1.2",
+            "the managed k3s cluster",
             "note",
             false,
         )];
@@ -1399,14 +1412,17 @@ mod tests {
     fn render_pinned_carries_full_content_not_just_keys() {
         // The whole point of a pin: the content is there, so no search round.
         let notes = vec![
-            raw_pinned("deploy-target", "k3s at 192.168.1.2, NOT docker-compose"),
+            raw_pinned(
+                "deploy-target",
+                "the managed k3s cluster, NOT docker-compose",
+            ),
             raw_owned("", "other", "unpinned filler", "note", false),
         ];
         let out =
             render_pinned(&notes, None, PINNED_BLOCK_BYTE_BUDGET).expect("something is pinned");
         assert!(out.contains("deploy-target"), "{out}");
         assert!(
-            out.contains("k3s at 192.168.1.2, NOT docker-compose"),
+            out.contains("the managed k3s cluster, NOT docker-compose"),
             "the note's full content must be present, not just its key: {out}"
         );
         assert!(
@@ -1469,9 +1485,13 @@ mod tests {
             let notes = vec![raw_pinned("penguins", &emoji)];
             let out = render_pinned(&notes, None, budget)
                 .expect("something is pinned, so a block is owed");
+            // Reaching here at all is the assertion: a byte-indexed cut inside
+            // a 4-byte character panics, and `truncate_on_char_boundary` is
+            // what stops it. The rendered text is a prefix of what was asked
+            // for, so no character is ever half-written.
             assert!(
-                out.is_char_boundary(out.len()),
-                "output must stay valid UTF-8"
+                out.starts_with("Notes you pinned"),
+                "the block header must survive every budget: {out}"
             );
             // Whatever the budget, the pin is never silently dropped: either its
             // content is shown, or the block says it could not be.
@@ -1635,6 +1655,21 @@ mod tests {
         assert!(
             !out.contains("no longer exists"),
             "an unread round must not claim the entry has gone: {out}"
+        );
+    }
+
+    #[test]
+    fn an_unread_attachment_says_it_could_not_be_read_rather_than_rendering_blank() {
+        // A note that is nothing but a pointer would otherwise render as
+        // "- key:" and nothing else, under a header saying the pins are
+        // current. The model would read a pin with nothing behind it.
+        let notes = vec![raw_pinned_ref("deploy-target", "", "kb-1")];
+        let out =
+            render_pinned(&notes, None, PINNED_BLOCK_BYTE_BUDGET).expect("something is pinned");
+        assert!(out.contains("kb-1"), "the entry must still be named: {out}");
+        assert!(
+            out.contains("could not be read"),
+            "an unread attachment must say so, not render blank: {out}"
         );
     }
 
