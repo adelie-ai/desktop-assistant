@@ -56,6 +56,27 @@ mod tests {
     }
 
     #[test]
+    fn knowledge_entry_deserializes_without_a_summary() {
+        // Entries serialized before `summary` existed carry no such key at
+        // all. They must still read back, with the field reported as absent
+        // rather than failing the whole payload.
+        let older = r#"{
+            "id": "kb-1",
+            "content": "User prefers dark mode",
+            "tags": ["preference"],
+            "metadata": {},
+            "created_at": "2026-01-01 00:00:00",
+            "updated_at": "2026-01-01 00:00:00"
+        }"#;
+
+        let entry: KnowledgeEntry =
+            serde_json::from_str(older).expect("a payload without a summary still deserializes");
+
+        assert_eq!(entry.id, "kb-1");
+        assert_eq!(entry.summary, None);
+    }
+
+    #[test]
     fn knowledge_entry_serialization_roundtrip() {
         let mut entry = KnowledgeEntry::new("kb-1", "test content", vec!["tag1".to_string()]);
         entry.metadata = serde_json::json!({"key": "editor", "scope": "global"});
