@@ -675,7 +675,7 @@ pub(crate) fn render_pinned(
         keys.sort_unstable();
         out.push_str(&format!(
             "(unpinned, because the knowledge entry it pointed at no longer exists: {}. \
-             Write it again from what you know, or pin a different entry.)",
+             Search the knowledge base again if you still need that fact.)",
             keys.join(", ")
         ));
     }
