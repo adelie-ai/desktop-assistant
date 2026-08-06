@@ -354,6 +354,48 @@ async fn tag_backfill_reproduces_the_creation_embed_text() {
     fx.cleanup().await;
 }
 
+/// Acceptance: a tag registered without a description embeds as its name alone,
+/// on the backfill path as well as the creation path.
+///
+/// A tag written through the knowledge-base tool can arrive with no
+/// description, because a write must never fail over a missing one. The two
+/// paths must agree on what that tag's embed text is, or its backfilled vector
+/// stops being comparable with the vectors new tags are matched against.
+#[tokio::test]
+async fn tag_backfill_reproduces_the_creation_embed_text_without_a_description() {
+    let Some(fx) = fixture("reg1070a").await else {
+        eprintln!("skip: TEST_DATABASE_URL not set");
+        return;
+    };
+    sqlx::query(
+        "INSERT INTO tag_registry (user_id, name, description, examples, distinguish_from) \
+         VALUES ($1, 'topic:deploy', '', '[]'::jsonb, '{}')",
+    )
+    .bind(USER)
+    .execute(&fx.pool)
+    .await
+    .expect("seed a described-less tag");
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    backfill_tag_embeddings(
+        &fx.pool,
+        &recording_embed(Arc::clone(&seen), 4),
+        &new_model(),
+    )
+    .await
+    .expect("backfill tags");
+
+    let texts = seen.lock().expect("read recorded texts").clone();
+    assert_eq!(
+        texts,
+        vec!["topic:deploy".to_string()],
+        "with no description the embed text is the name alone, with no trailing \
+         separator, on both paths"
+    );
+
+    fx.cleanup().await;
+}
+
 /// Acceptance: the end state -- creating a tag against a registry that held
 /// vectors from a superseded model succeeds instead of raising a pgvector
 /// dimension error.

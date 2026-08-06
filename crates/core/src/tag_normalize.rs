@@ -6,9 +6,11 @@
 //! fragments across variants and filters silently miss. This collapses that
 //! drift on the write path.
 //!
-//! This is the only tag normalizer. The tag registry
-//! ([`crate::tag_registry::normalize_tag_name`]) calls straight into it,
-//! because a registry key must be byte-identical to the tag written on the
+//! This is the only tag normalizer, and it sits in the core so that every
+//! layer which has to agree on a tag name can reach it: the storage write
+//! path, the tag registry's `normalize_tag_name`, and the knowledge-base
+//! write tool, which matches a caller's tag description against the tag it
+//! describes. A registry key must be byte-identical to the tag written on the
 //! row it describes — a second rule that agrees today drifts tomorrow, and a
 //! key that no row carries makes every registry lookup a miss.
 //!

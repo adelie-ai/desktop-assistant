@@ -16,7 +16,6 @@ pub mod migrate_json;
 pub mod pool;
 pub mod scratchpad;
 pub mod skill_index;
-pub mod tag_normalize;
 pub mod tag_registry;
 pub mod tool_registry;
 pub mod tool_usage;
@@ -28,6 +27,11 @@ pub use desktop_assistant_auth_jwt::{DEFAULT_USER_ID, UserId};
 /// `desktop_assistant_core::ports::auth`. The actual storage adapters
 /// in this crate use this helper at SQL composition time (issue #105).
 pub use desktop_assistant_core::ports::auth::{current_user_id, with_user_id};
+/// The one tag normalizer, re-exported at the path storage callers already
+/// use. It lives in `core` because the knowledge-base write tool has to apply
+/// the same rule to match a caller's tag description against the tag it
+/// describes, and that tool cannot depend on a storage adapter.
+pub use desktop_assistant_core::tag_normalize;
 
 pub use background_tasks::PgBackgroundTaskStore;
 pub use context_window_observations::PgLearnedWindowStore;
