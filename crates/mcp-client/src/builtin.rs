@@ -4560,6 +4560,11 @@ mod tests {
         proposals: Vec<ProposedTag>,
     }
 
+    /// The in-memory knowledge store the write-path tests share: the rows a
+    /// write landed, in the order it landed them.
+    type KbStore =
+        std::sync::Arc<std::sync::Mutex<Vec<desktop_assistant_core::domain::KnowledgeEntry>>>;
+
     /// A knowledge-base service whose store keeps its entries in memory, with
     /// an optional tag-registry gate in front of the write path.
     ///
@@ -4568,10 +4573,7 @@ mod tests {
     /// model wrote it".
     fn kb_service_with_tag_gate(
         resolve: Option<KnowledgeTagResolveFn>,
-    ) -> (
-        BuiltinToolService,
-        std::sync::Arc<std::sync::Mutex<Vec<desktop_assistant_core::domain::KnowledgeEntry>>>,
-    ) {
+    ) -> (BuiltinToolService, KbStore) {
         kb_service_with_slow_store(resolve, std::time::Duration::ZERO)
     }
 
@@ -4583,10 +4585,7 @@ mod tests {
     fn kb_service_with_slow_store(
         resolve: Option<KnowledgeTagResolveFn>,
         store_delay: std::time::Duration,
-    ) -> (
-        BuiltinToolService,
-        std::sync::Arc<std::sync::Mutex<Vec<desktop_assistant_core::domain::KnowledgeEntry>>>,
-    ) {
+    ) -> (BuiltinToolService, KbStore) {
         use desktop_assistant_core::domain::KnowledgeEntry;
         use std::sync::{Arc, Mutex};
 
@@ -4693,6 +4692,321 @@ mod tests {
             .await
             .expect("knowledge base write succeeds");
         serde_json::from_str(&raw).expect("write response is JSON")
+    }
+
+    /// The fake store's rows, for a test that asserts on what a write stored.
+    fn kb_stored(store: &KbStore) -> Vec<desktop_assistant_core::domain::KnowledgeEntry> {
+        store.lock().expect("store lock").clone()
+    }
+
+    /// Put a row straight into the fake store, around the write path.
+    ///
+    /// The write path is what these tests measure, so the row a test starts
+    /// from has to arrive another way. `metadata` has no tool argument at all,
+    /// so seeding is the only way to give a row any.
+    fn seed_kb_entry(
+        store: &KbStore,
+        id: &str,
+        content: &str,
+        tags: &[&str],
+        metadata: serde_json::Value,
+    ) {
+        use desktop_assistant_core::domain::KnowledgeEntry;
+        store.lock().expect("seed store lock").push(KnowledgeEntry {
+            id: id.to_string(),
+            content: content.to_string(),
+            tags: tags.iter().map(|t| (*t).to_string()).collect(),
+            metadata,
+            created_at: "2026-01-01".to_string(),
+            updated_at: "2026-01-01".to_string(),
+            source: Some("explicit".to_string()),
+        });
+    }
+
+    #[tokio::test]
+    async fn kb_write_content_update_by_id_preserves_tags() {
+        // The prompt tells the model to update an existing entry instead of
+        // creating a near duplicate, and a content update names only `id` and
+        // `content`. Reads filter by tag overlap, so an entry that loses its
+        // tags is still in the store and no tag-scoped search finds it.
+        let (service, store) = kb_service_with_tag_gate(None);
+        seed_kb_entry(
+            &store,
+            "entry-1",
+            "Rain is expected on Tuesday.",
+            &["memory", "topic:weather"],
+            serde_json::json!({}),
+        );
+
+        kb_write_response(
+            &service,
+            serde_json::json!({
+                "id": "entry-1",
+                "content": "Rain is expected on Wednesday.",
+            }),
+        )
+        .await;
+
+        let stored = kb_stored(&store);
+        assert_eq!(stored.len(), 1, "the update replaced the entry in place");
+        assert_eq!(stored[0].content, "Rain is expected on Wednesday.");
+        assert_eq!(
+            stored[0].tags,
+            vec!["memory".to_string(), "topic:weather".to_string()],
+            "a write that does not mention tags keeps the ones the entry carries"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_write_content_update_by_id_preserves_metadata() {
+        // `metadata` has no tool argument, so a caller cannot send it back.
+        // Whatever a content update drops from it is gone for good.
+        let (service, store) = kb_service_with_tag_gate(None);
+        seed_kb_entry(
+            &store,
+            "entry-1",
+            "Rain is expected on Tuesday.",
+            &["memory"],
+            serde_json::json!({"confidence": "high", "source_url": "https://example.com/forecast"}),
+        );
+
+        kb_write_response(
+            &service,
+            serde_json::json!({
+                "id": "entry-1",
+                "content": "Rain is expected on Wednesday.",
+            }),
+        )
+        .await;
+
+        let stored = kb_stored(&store);
+        assert_eq!(
+            stored[0].metadata,
+            serde_json::json!({"confidence": "high", "source_url": "https://example.com/forecast"}),
+            "a write that does not mention a metadata key keeps it"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_write_content_update_by_id_keeps_the_conversation_provenance() {
+        // The #240 stamp names the conversation an entry was learned in. A
+        // content update happens in a later conversation, so losing the stamp
+        // does not leave it blank - it replaces it with the wrong
+        // conversation, which reads as true.
+        use desktop_assistant_core::domain::ConversationId;
+        use desktop_assistant_core::ports::conversation_ctx::with_conversation_id;
+
+        let (service, store) = kb_service_with_tag_gate(None);
+        seed_kb_entry(
+            &store,
+            "entry-1",
+            "Rain is expected on Tuesday.",
+            &["memory"],
+            serde_json::json!({"source_conversation_id": "conversation-where-it-was-learned"}),
+        );
+
+        with_conversation_id(
+            ConversationId::from("a-later-conversation"),
+            kb_write_response(
+                &service,
+                serde_json::json!({
+                    "id": "entry-1",
+                    "content": "Rain is expected on Wednesday.",
+                }),
+            ),
+        )
+        .await;
+
+        let stored = kb_stored(&store);
+        assert_eq!(
+            stored[0].metadata["source_conversation_id"], "conversation-where-it-was-learned",
+            "the stamp names where the fact was learned, not where it was last edited"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_write_explicit_empty_tags_still_clears_them() {
+        // Absent means "leave the stored tags alone"; present-and-empty means
+        // "clear them". Preserving the stored tags whenever the supplied list
+        // came out empty would take the second away.
+        let (service, store) = kb_service_with_tag_gate(None);
+        seed_kb_entry(
+            &store,
+            "entry-1",
+            "Rain is expected on Tuesday.",
+            &["memory", "topic:weather"],
+            serde_json::json!({}),
+        );
+        seed_kb_entry(
+            &store,
+            "entry-2",
+            "Snow is expected on Friday.",
+            &["memory", "topic:weather"],
+            serde_json::json!({}),
+        );
+
+        kb_write_response(
+            &service,
+            serde_json::json!({
+                "id": "entry-1",
+                "content": "Rain is expected on Wednesday.",
+                "tags": [],
+            }),
+        )
+        .await;
+        // The same rule with no content: a tags-only write that sends an empty
+        // list clears the tags and keeps the content.
+        kb_write_response(&service, serde_json::json!({"id": "entry-2", "tags": []})).await;
+
+        let stored = kb_stored(&store);
+        let first = stored
+            .iter()
+            .find(|e| e.id == "entry-1")
+            .expect("entry-1 is in the store");
+        assert!(
+            first.tags.is_empty(),
+            "an empty tag list on a content update clears the tags: {:?}",
+            first.tags
+        );
+        let second = stored
+            .iter()
+            .find(|e| e.id == "entry-2")
+            .expect("entry-2 is in the store");
+        assert!(
+            second.tags.is_empty(),
+            "an empty tag list on a tags-only write clears the tags: {:?}",
+            second.tags
+        );
+        assert_eq!(
+            second.content, "Snow is expected on Friday.",
+            "clearing the tags does not touch the content"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_write_without_an_id_is_unaffected() {
+        // A create starts from nothing. No row already in the store may reach
+        // it, whatever the store holds.
+        let (service, store) = kb_service_with_tag_gate(None);
+        seed_kb_entry(
+            &store,
+            "entry-1",
+            "Rain is expected on Tuesday.",
+            &["memory", "topic:weather"],
+            serde_json::json!({"confidence": "high"}),
+        );
+
+        let created =
+            kb_write_response(&service, serde_json::json!({"content": "A separate fact."})).await;
+        let new_id = created["entries"][0]["id"]
+            .as_str()
+            .expect("the write reports the entry id")
+            .to_string();
+        assert_ne!(new_id, "entry-1", "a write with no id creates a new entry");
+
+        let stored = kb_stored(&store);
+        assert_eq!(stored.len(), 2, "the create left the existing entry alone");
+        let fresh = stored
+            .iter()
+            .find(|e| e.id == new_id)
+            .expect("the create landed");
+        assert!(
+            fresh.tags.is_empty(),
+            "a create that names no tags carries none: {:?}",
+            fresh.tags
+        );
+        assert_eq!(
+            fresh.metadata,
+            serde_json::json!({}),
+            "a create starts with empty metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_write_with_content_creates_at_a_caller_supplied_id() {
+        // `id` is optional, and supplying one is how a caller makes a write
+        // idempotent under retry: the retry lands on the row the first attempt
+        // created instead of a duplicate. A write that carries content holds
+        // everything a create needs, so an id no row holds is a create at that
+        // id, not an error.
+        let (service, store) = kb_service_with_tag_gate(None);
+
+        let spec = serde_json::json!({
+            "id": "caller-chosen-id",
+            "content": "A fact worth keeping.",
+            "tags": ["memory"],
+        });
+        let first = kb_write_response(&service, spec.clone()).await;
+        assert_eq!(
+            first["entries"][0]["id"], "caller-chosen-id",
+            "the create used the id the caller chose"
+        );
+
+        // The same call again, as a retry would send it.
+        kb_write_response(&service, spec).await;
+
+        let stored = kb_stored(&store);
+        assert_eq!(
+            stored.len(),
+            1,
+            "the retry landed on the row the first write created"
+        );
+        assert_eq!(stored[0].tags, vec!["memory".to_string()]);
+        assert_eq!(stored[0].content, "A fact worth keeping.");
+    }
+
+    #[tokio::test]
+    async fn kb_write_by_id_without_content_needs_an_entry_to_update() {
+        // With no content and no stored row there is nothing to write, so this
+        // stays an error even though a create at a caller-chosen id does not.
+        let (service, _store) = kb_service_with_tag_gate(None);
+
+        let err = service
+            .execute_tool(
+                TOOL_KB_WRITE,
+                serde_json::json!({"id": "no-such-entry", "tags": ["memory"]}),
+            )
+            .await
+            .expect_err("a tags-only write needs an entry to re-tag");
+        assert!(
+            err.to_string().contains("no knowledge entry with id"),
+            "the error names the missing entry: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_write_content_update_by_id_does_not_re_register_the_carried_over_tags() {
+        // A tag the entry already carries is already in the vocabulary.
+        // Offering it again on every content update pays an embedding per tag
+        // per write, and lets the registry rename a stored tag behind the
+        // caller's back on a write that never mentioned it.
+        let (resolve, probe) = recording_tag_gate(&[]);
+        let (service, store) = kb_service_with_tag_gate(Some(resolve));
+        seed_kb_entry(
+            &store,
+            "entry-1",
+            "Rain is expected on Tuesday.",
+            &["memory", "topic:weather"],
+            serde_json::json!({}),
+        );
+
+        kb_write_response(
+            &service,
+            serde_json::json!({
+                "id": "entry-1",
+                "content": "Rain is expected on Wednesday.",
+            }),
+        )
+        .await;
+
+        assert!(
+            probe.lock().expect("probe lock").proposals.is_empty(),
+            "a write that does not mention tags consults the vocabulary for none"
+        );
+        assert_eq!(
+            kb_stored(&store)[0].tags,
+            vec!["memory".to_string(), "topic:weather".to_string()],
+        );
     }
 
     #[tokio::test]
