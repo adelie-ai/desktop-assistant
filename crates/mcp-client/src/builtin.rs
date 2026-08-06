@@ -264,8 +264,9 @@ fn summary_arg_description() -> String {
     format!(
         "One line saying what this entry says, written as a statement rather than as a topic \
          label. This line is how the entry is offered back to you later, as a candidate you \
-         decide whether to open, so it has to carry the fact on its own: 'Dave wants tag names \
-         to keep the facet colon' is useful, 'tag naming' is not. Write one for every entry. \
+         decide whether to open, so it has to carry the fact on its own: 'The user wants tag \
+         names to keep the facet colon' is useful, 'tag naming' is not. Write one for every \
+         entry. \
          Line breaks become spaces, and a summary longer than {SUMMARY_MAX_CHARS} characters is \
          cut to {SUMMARY_MAX_CHARS}, never rejected - a long one costs you the tail of the line, \
          not the write. Leaving it out never fails the write either; the entry simply has no \
