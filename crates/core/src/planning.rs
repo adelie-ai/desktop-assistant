@@ -6,9 +6,17 @@
 //! step finishes, the *gist* of what was learned is jotted to the scratchpad
 //! and the verbose raw work (tool results) is **dropped from working
 //! context**, read instead as a short searchable pointer to the note. The plan
-//! itself stays cheaply in view; the firehose does not. Dropped from working
-//! context means exactly that: the pointer goes in the turn's context
-//! projection, and the conversation's stored transcript keeps the raw output.
+//! itself stays cheaply in view; the firehose does not.
+//!
+//! Dropped from working context means exactly that. The pointer goes in the
+//! turn's context projection and the conversation's stored transcript keeps the
+//! raw output, so a user still finds what a tool returned. The projection lives
+//! for one turn, so the saving is a within-turn one: a later turn loads the raw
+//! results again and pays for them until windowing and the rolling summary
+//! carry them out of view. Making the saving last across turns needs the
+//! eviction DECISION recorded on the row - the note key the result was
+//! distilled into - so the next turn can rebuild the projection without
+//! reading back what it replaced.
 //!
 //! This module is the pure mechanism behind that behaviour:
 //!
@@ -185,16 +193,6 @@ impl StepStack {
                 }
             })
             .collect()
-    }
-
-    /// Drop every frame. Called by the dispatch loop after overflow recovery,
-    /// which can drain messages and invalidate the absolute watermarks. The
-    /// root counter is intentionally preserved: the todos written before the
-    /// clear still live on the scratchpad, so a fresh step must keep advancing
-    /// the numbering rather than reuse a key (e.g. `"1"`) that would clobber an
-    /// existing todo via upsert.
-    pub fn clear(&mut self) {
-        self.frames.clear();
     }
 }
 
@@ -1043,19 +1041,6 @@ mod tests {
     fn complete_on_empty_stack_is_none() {
         let mut stack = StepStack::new();
         assert!(stack.complete().is_none());
-    }
-
-    #[test]
-    fn clear_drops_frames_but_preserves_numbering() {
-        let mut stack = StepStack::new();
-        stack.begin("a", 0);
-        stack.begin("b", 1);
-        stack.clear();
-        assert_eq!(stack.depth(), 0);
-        // Numbering does NOT reset: a fresh step after a clear must not reuse a
-        // key (e.g. "1") that an earlier, still-persisted todo already owns.
-        let (k, _) = stack.begin("c", 2);
-        assert_eq!(k, "2");
     }
 
     // --- DA-7: seed root_counter from existing top-level keys ---

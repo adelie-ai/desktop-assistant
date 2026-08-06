@@ -53,6 +53,15 @@ pub(crate) const COMPACTION_INTERVAL: usize = 20;
 /// successful LLM call.
 pub(crate) const COMPACTION_TOKEN_RATIO: f64 = 0.85;
 
+/// How far past the provider's reported gap the recovery ladder must free
+/// before it skips the window-shrinking step.
+///
+/// The ladder measures what it freed with `LlmClient::estimate_tokens`, and the
+/// gap comes from the provider's own tokenizer. The two disagree, and the
+/// direction that costs a retry is the estimator reading high. Doubling is a
+/// coarse guard, not a calibration.
+pub(crate) const ESTIMATE_SAFETY_MARGIN: u64 = 2;
+
 /// Maximum number of `CoreError::ContextOverflow` recoveries allowed within
 /// a single `send_prompt` call. Each recovery applies one step of the
 /// context-recovery ladder; if successive calls still overflow we surface
@@ -260,6 +269,20 @@ impl AmbientContext {
     }
 }
 
+/// One turn's assembled prompt, and where in the conversation it starts.
+pub(crate) struct AssembledTurn {
+    /// The prompt, system block first.
+    pub messages: Vec<Message>,
+    /// Index into the conversation's message list where the assembled window
+    /// begins. Overflow recovery works from here: a message before it is not in
+    /// this prompt, so replacing it frees the provider nothing.
+    ///
+    /// Not the same as the caller's window size. The pre-flight budget check
+    /// can shrink the window further than the caller asked for, and the whole
+    /// point of reporting this is that the caller cannot know that.
+    pub window_from: usize,
+}
+
 /// Build the message list for a single turn, optionally enforcing a
 /// pre-flight token budget by shrinking the window before any LLM call.
 ///
@@ -288,7 +311,7 @@ pub(crate) fn assemble_turn_within_budget(
     max_messages: usize,
     budget: Option<ContextBudget>,
     estimate: &dyn Fn(&str) -> u64,
-) -> Vec<Message> {
+) -> AssembledTurn {
     // Read the per-turn ambient context (personality, `[Now]` line, refinement)
     // once at this boundary. Passing it in keeps `assemble_turn` a
     // pure function of its inputs, so the shrink loop's repeat passes stay
@@ -310,12 +333,16 @@ pub(crate) fn assemble_turn_within_budget(
             estimate,
         )
     };
+    let finish = |messages: Vec<Message>, max: usize| AssembledTurn {
+        messages,
+        window_from: window_start(conversation.messages, max),
+    };
 
     let mut current_max = max_messages;
     let mut assembled = assemble(current_max);
 
     let Some(active_budget) = budget else {
-        return assembled;
+        return finish(assembled, current_max);
     };
 
     // Pre-flight token estimate: sum the cost of every assembled message's
@@ -338,15 +365,15 @@ pub(crate) fn assemble_turn_within_budget(
         let message_tokens: u64 = assembled.iter().map(|m| estimate(&m.content)).sum();
         let assembled_tokens = message_tokens + tool_schema_tokens;
         if assembled_tokens <= threshold {
-            return assembled;
+            return finish(assembled, current_max);
         }
         // Already at the floor — further halving has no effect, so stop.
         if current_max <= MIN_CONTEXT_MESSAGES {
-            return assembled;
+            return finish(assembled, current_max);
         }
         let new_max = (current_max / 2).max(MIN_CONTEXT_MESSAGES);
         if new_max == current_max {
-            return assembled;
+            return finish(assembled, current_max);
         }
         tracing::debug!(
             assembled_tokens,
@@ -359,7 +386,7 @@ pub(crate) fn assemble_turn_within_budget(
         assembled = assemble(current_max);
     }
 
-    assembled
+    finish(assembled, current_max)
 }
 
 /// Estimate the prompt-token cost of the tool schemas sent alongside the
@@ -633,6 +660,7 @@ fn assemble_for_test(
         budget,
         estimate,
     )
+    .messages
 }
 
 /// Build the full tool-availability note enumerating every tool name and
@@ -1099,9 +1127,10 @@ fn surfaced_blocks(
 /// `start`), falling back to a range-less label when no tagged message is
 /// visible in the window.
 ///
-/// This is the one place the projection is read. Every message here is cloned
-/// on its way into the prompt, so reading a replacement costs nothing that the
-/// clone did not already cost, and the stored message is never touched.
+/// This is the one place assembly reads the projection. Every message here is
+/// cloned on its way into the prompt, so reading a replacement costs nothing
+/// that the clone did not already cost, and the stored message is never
+/// touched.
 fn expand_history(
     windowed: &[Message],
     start: usize,
@@ -1216,6 +1245,10 @@ struct CompactionResult {
     compacted: usize,
     /// Message-content bytes the replacement freed.
     freed_bytes: usize,
+    /// Estimated prompt tokens the replacement freed. What the ladder measures
+    /// progress in, because tokens are the currency the provider refused the
+    /// prompt in.
+    freed_tokens: u64,
 }
 
 /// Shrink the oldest assistant(tool_calls)+tool_result groups by reading their
@@ -1235,6 +1268,7 @@ struct CompactionResult {
 fn compact_oldest_tool_groups(
     messages: &[Message],
     projection: &mut ContextProjection,
+    estimate: &dyn Fn(&str) -> u64,
 ) -> CompactionResult {
     // Ranges of (assistant-with-tool-calls, tool_result, ..., tool_result)
     // that still hold something worth compacting, oldest first.
@@ -1273,6 +1307,7 @@ fn compact_oldest_tool_groups(
                 continue;
             }
             let current = projection.content(msg).len();
+            let current_tokens = estimate(projection.content(msg));
             let notice = overflow_compaction_notice(current);
             // Never trade a result for something bigger, whatever the floor
             // above happens to be set to.
@@ -1280,6 +1315,7 @@ fn compact_oldest_tool_groups(
                 continue;
             };
             result.freed_bytes += freed;
+            result.freed_tokens += current_tokens.saturating_sub(estimate(&notice));
             result.compacted += 1;
             projection.replace(msg, notice);
         }
@@ -1353,9 +1389,24 @@ pub(crate) fn compaction_range(conv: &Conversation, max_messages: usize) -> Opti
     None
 }
 
-/// Maximum bytes of one assistant message carried into the summariser's
-/// transcript.
-const SUMMARY_ASSISTANT_BYTES: usize = 2000;
+/// Maximum bytes of one user or assistant message carried into the
+/// summariser's transcript.
+const SUMMARY_PROSE_BYTES: usize = 2000;
+
+/// Maximum number of messages folded into the rolling summary in one call.
+///
+/// The marker only advances when a summary was produced, so a summariser that
+/// keeps failing leaves the range in place and the next turn offers a wider
+/// one. Without a cap that range grows for as long as the failure lasts, and a
+/// prompt too large for the task model can never succeed - the marker would
+/// then be stuck for good. Capping the span makes the fold walk forward in
+/// bounded steps instead: each success advances the marker by at most this
+/// many messages, and the rest is offered on the next turn.
+///
+/// Why 100: five times [`COMPACTION_INTERVAL`], so a healthy conversation
+/// always folds its whole range in one call, and a conversation catching up
+/// after a failure or a bulk import still does it in a few.
+const MAX_COMPACTION_SPAN: usize = 100;
 
 /// Maximum bytes of one tool result carried into the summariser's transcript.
 ///
@@ -1412,13 +1463,13 @@ fn summary_transcript(messages: &[Message]) -> String {
         match msg.role {
             Role::User => {
                 transcript.push_str("User: ");
-                transcript.push_str(&msg.content);
+                push_truncated(&mut transcript, &msg.content, SUMMARY_PROSE_BYTES);
                 transcript.push('\n');
             }
             Role::Assistant => {
                 if !msg.content.is_empty() {
                     transcript.push_str("Assistant: ");
-                    push_truncated(&mut transcript, &msg.content, SUMMARY_ASSISTANT_BYTES);
+                    push_truncated(&mut transcript, &msg.content, SUMMARY_PROSE_BYTES);
                     transcript.push('\n');
                 }
                 if !msg.tool_calls.is_empty() {
@@ -1527,6 +1578,10 @@ pub(crate) async fn compact_into_summary<L: LlmClient>(
     let Some((from, to)) = compaction_range(conv, max_messages) else {
         return false;
     };
+    // Bounded so one long-running summariser failure cannot grow the fold past
+    // what the task model can read. The marker lands on the capped end, so
+    // nothing is skipped - the rest is offered again next turn.
+    let to = to.min(from + MAX_COMPACTION_SPAN);
     match generate_context_summary(&conv.context_summary, &conv.messages[from..to], llm).await {
         SummaryOutcome::Summarised(summary) => {
             conv.context_summary = summary;
@@ -1548,80 +1603,150 @@ pub(crate) async fn compact_into_summary<L: LlmClient>(
     }
 }
 
+/// What one run of the recovery ladder achieved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecoveryOutcome {
+    /// The next prompt is smaller than the one the provider refused: the round
+    /// reads less, the window is narrower, or both. A retry is worth making.
+    Progressed,
+    /// Nothing is left to free and the window is already at its floor. A retry
+    /// would send the provider the prompt it has just refused.
+    Exhausted,
+}
+
 /// Recover from a `ContextOverflow` error by reducing prompt size.
 ///
-/// The ladder runs steps in order until one frees space:
+/// The ladder runs three steps:
 ///   1. Read the largest tool result as a chunking notice (the tool_call and
 ///      result pair stays, so the model still sees what it tried).
-///   2. When no tool result is large enough to be worth truncating, read the
-///      oldest tool groups' results as notices via [`compact_oldest_tool_groups`].
-///   3. When nothing is worth compacting, summarise and shrink the active
-///      window (the same logic the token-pressure path uses).
+///   2. When step 1 frees nothing, read the oldest tool groups' results as
+///      notices via [`compact_oldest_tool_groups`].
+///   3. Shrink the active window and fold what that drops into the rolling
+///      summary, unless steps 1 and 2 provably freed enough on their own.
 ///
-/// Why this order: step 1 is the cleanest because it costs the least history;
-/// step 3 is the last resort.
+/// Why this order: step 1 costs the least history; step 3 costs the most.
+///
+/// Steps 1 and 2 work on `window_from..`, the slice the assembler reported the
+/// prompt was built from. A tool result before it costs the prompt nothing, so
+/// replacing one frees nothing the provider measured - it looked like recovery
+/// and sent the same prompt on the retry. The caller's window size is not the
+/// same answer, because the pre-flight budget check can narrow the window
+/// further than the caller asked for.
+///
+/// Step 3 is not an else-branch. Steps 1 and 2 free a bounded amount each time,
+/// so a conversation with many tool groups could free a little on every attempt
+/// and use up every retry with the window untouched. The step runs unless the
+/// freed estimate clears the gap the provider reported between the prompt and
+/// its limit, by [`ESTIMATE_SAFETY_MARGIN`], which is the one case where a
+/// retry has room to spare.
 ///
 /// Steps 1 and 2 write to the round's projection, not to `conv.messages`. The
 /// caller writes that list to storage at the end of the turn, so a rewrite here
 /// would be a rewrite of the user's stored transcript. The retry counter in
-/// `send_prompt` bounds total attempts across all steps so a
-/// persistently-oversized request cannot loop indefinitely.
+/// `send_prompt` bounds total attempts so a persistently-oversized request
+/// cannot loop indefinitely.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn recover_from_overflow<L: LlmClient>(
     conv: &mut Conversation,
     projection: &mut ContextProjection,
     prompt_tokens: Option<u64>,
     max_tokens: Option<u64>,
+    window_from: usize,
     target_window: &mut usize,
     task_llm: &L,
     estimate: &(dyn Fn(&str) -> u64 + Send + Sync),
-) {
-    // Step 1: largest tool result, if it's >= MIN_TRUNCATION_TOKENS.
+) -> RecoveryOutcome {
+    // The slice the prompt was built from, as the assembler reported it.
+    let window_from = window_from.min(conv.messages.len());
+    let window = &conv.messages[window_from..];
+    let mut freed_tokens = 0u64;
+
+    // Step 1: largest in-window tool result, if it's >= MIN_TRUNCATION_TOKENS.
     if let Some(idx) =
-        find_largest_tool_result_above(&conv.messages, projection, MIN_TRUNCATION_TOKENS, estimate)
+        find_largest_tool_result_above(window, projection, MIN_TRUNCATION_TOKENS, estimate)
     {
-        let msg = &conv.messages[idx];
+        let msg = &window[idx];
         let original_bytes = projection.content(msg).len();
+        let before = estimate(projection.content(msg));
         let notice = overflow_truncation_notice(original_bytes, prompt_tokens, max_tokens);
-        projection.replace(msg, notice);
-        tracing::warn!(
-            tool_result_index = idx,
-            original_bytes,
-            prompt_tokens = ?prompt_tokens,
-            max_tokens = ?max_tokens,
-            "context overflow — truncating tool result (step 1)"
-        );
-        return;
+        let freed = before.saturating_sub(estimate(&notice));
+        if freed > 0 {
+            projection.replace(msg, notice);
+            freed_tokens = freed;
+            tracing::warn!(
+                tool_result_index = window_from + idx,
+                original_bytes,
+                freed_tokens,
+                prompt_tokens = ?prompt_tokens,
+                max_tokens = ?max_tokens,
+                "context overflow — truncating tool result (step 1)"
+            );
+        }
     }
 
-    // Step 2: read the oldest tool results as notices. If nothing was worth
-    // compacting the step frees nothing and recovery falls through to step 3.
-    let compacted = compact_oldest_tool_groups(&conv.messages, projection);
-    if compacted.freed_bytes > 0 {
-        tracing::warn!(
-            compacted = compacted.compacted,
-            freed_bytes = compacted.freed_bytes,
-            "context overflow — compacted oldest tool results (step 2)"
-        );
-        return;
+    // Step 2: read the oldest in-window tool results as notices.
+    if freed_tokens == 0 {
+        let compacted = compact_oldest_tool_groups(window, projection, estimate);
+        freed_tokens = compacted.freed_tokens;
+        if compacted.compacted > 0 {
+            tracing::warn!(
+                compacted = compacted.compacted,
+                freed_bytes = compacted.freed_bytes,
+                freed_tokens,
+                "context overflow — compacted oldest tool results (step 2)"
+            );
+        }
     }
 
-    // Step 3: summarise and shrink the active window. Mirrors the
-    // proactive token-pressure path on the success branch so the
-    // conversation can keep progressing when there's nothing to trim.
+    // How far over its limit the provider said the prompt was. Absent for a
+    // provider that reports neither number, which leaves step 3 to run.
+    //
+    // The two numbers are in different units: the gap is counted by the
+    // provider's tokenizer, and `freed_tokens` by the local estimator, which
+    // over-counts compressible payloads such as a padded table or a log with a
+    // repeated banner. The margin is what keeps an over-count from skipping
+    // step 3 and spending a retry on an unchanged prompt.
+    let deficit = match (prompt_tokens, max_tokens) {
+        (Some(prompt), Some(max)) if prompt > max => Some(prompt - max),
+        _ => None,
+    };
+    if deficit.is_some_and(|gap| freed_tokens >= gap.saturating_mul(ESTIMATE_SAFETY_MARGIN)) {
+        tracing::warn!(
+            freed_tokens,
+            deficit = ?deficit,
+            "context overflow — freed enough to retry without shrinking the window"
+        );
+        return RecoveryOutcome::Progressed;
+    }
+
+    // Step 3: shrink the active window and summarise what that drops. Mirrors
+    // the proactive token-pressure path on the success branch.
     let new_window = (*target_window / 2).max(MIN_CONTEXT_MESSAGES);
-    if new_window < *target_window {
+    let shrank = new_window < *target_window;
+    if shrank {
         *target_window = new_window;
     }
-    if compact_into_summary(conv, *target_window, task_llm).await {
+    let summarised = compact_into_summary(conv, *target_window, task_llm).await;
+    if shrank || summarised {
         tracing::warn!(
             new_window = *target_window,
+            shrank,
+            summarised,
             "context overflow — summarised and shrank window (step 3)"
         );
+    }
+
+    // A new summary alone is not a smaller prompt. It replaces the summary
+    // block rather than dropping messages, and the replacement can be longer
+    // than what it replaced, so it does not on its own earn a retry.
+    if freed_tokens > 0 || shrank {
+        RecoveryOutcome::Progressed
     } else {
         tracing::warn!(
-            new_window = *target_window,
+            window = *target_window,
             "context overflow — no recovery action available"
         );
+        RecoveryOutcome::Exhausted
     }
 }
 
@@ -2095,6 +2220,35 @@ mod tests {
         }
     }
 
+    /// Mock summariser that always succeeds and records the largest prompt it
+    /// was sent, so a test can assert the transcript stays bounded.
+    #[derive(Default)]
+    struct CountingSummariser {
+        longest: std::sync::Mutex<usize>,
+    }
+
+    impl CountingSummariser {
+        fn longest_prompt(&self) -> usize {
+            *self.longest.lock().unwrap()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for CountingSummariser {
+        async fn stream_completion(
+            &self,
+            messages: Vec<Message>,
+            _tools: &[ToolDefinition],
+            _reasoning: ReasoningConfig,
+            _on_chunk: ChunkCallback,
+        ) -> Result<LlmResponse, CoreError> {
+            let bytes: usize = messages.iter().map(|m| m.content.len()).sum();
+            let mut longest = self.longest.lock().unwrap();
+            *longest = (*longest).max(bytes);
+            Ok(LlmResponse::text("- a summary"))
+        }
+    }
+
     /// Mock LLM that returns an error on every call. Used to drive the
     /// fallback branches in [`generate_context_summary`].
     struct FailingLlm;
@@ -2149,6 +2303,7 @@ mod tests {
             projection,
             Some(100_000),
             Some(8_000),
+            window_start(&conv.messages, *target_window),
             target_window,
             &FailingLlm,
             &default_estimate,
@@ -2421,6 +2576,224 @@ mod tests {
         assert_eq!(conv.messages, before);
     }
 
+    // --- The ladder targets the assembled window (#754) --------------------
+
+    /// A conversation long enough to be windowed, whose only large tool group
+    /// sits before the window start. Group `cN` ids the out-of-window call.
+    fn conv_with_out_of_window_tool_result(result: &str) -> Conversation {
+        let mut conv = Conversation::new("c1", "t");
+        conv.messages.push(Message::new(Role::User, "start"));
+        conv.messages
+            .push(Message::assistant_with_tool_calls(vec![ToolCall::new(
+                "old",
+                "read_file",
+                "{}",
+            )]));
+        conv.messages.push(Message::tool_result("old", result));
+        for n in 0..MAX_CONTEXT_MESSAGES * 2 {
+            conv.messages
+                .push(Message::new(Role::User, format!("prompt {n}")));
+            conv.messages
+                .push(Message::new(Role::Assistant, format!("reply {n}")));
+        }
+        conv
+    }
+
+    /// #754: the prompt is built from the last `MAX_CONTEXT_MESSAGES` messages,
+    /// so replacing a tool result before that boundary frees nothing the
+    /// provider measured. The ladder must leave it alone and escalate.
+    #[tokio::test]
+    async fn overflow_recovery_ignores_a_tool_result_outside_the_prompt_window() {
+        let huge = "z".repeat(64_000);
+        let mut conv = conv_with_out_of_window_tool_result(&huge);
+        let out_of_window = conv.messages[2].clone();
+        assert!(
+            window_start(&conv.messages, MAX_CONTEXT_MESSAGES) > 2,
+            "the fixture must put the tool result outside the window"
+        );
+
+        let mut target_window = MAX_CONTEXT_MESSAGES;
+        let projection = recover_once(&mut conv, &mut target_window).await;
+
+        assert!(
+            !projection.is_replaced(&out_of_window),
+            "a result the prompt does not carry must not be touched"
+        );
+        assert!(
+            target_window < MAX_CONTEXT_MESSAGES,
+            "with nothing to free in the window, recovery must shrink it"
+        );
+    }
+
+    /// #754: step 2 used to return as soon as it freed anything, so a
+    /// conversation with two or more tool groups never reached the step that
+    /// shrinks the prompt actually sent. Freeing less than the provider's
+    /// reported gap must shrink the window on the same attempt.
+    #[tokio::test]
+    async fn overflow_recovery_shrinks_the_window_when_it_frees_less_than_the_gap() {
+        let mut conv = conv_with_tool_groups(4);
+        let mut target_window = MAX_CONTEXT_MESSAGES;
+        // run_recovery reports a 92k-token gap; four mid-sized results are
+        // worth about 1k, so the ladder cannot close it on its own.
+        let projection = recover_once(&mut conv, &mut target_window).await;
+
+        assert!(
+            projection.replaced_count() > 0,
+            "step 2 must still compact what it can"
+        );
+        assert!(
+            target_window < MAX_CONTEXT_MESSAGES,
+            "step 3 must run too, so the retry sends a smaller window"
+        );
+    }
+
+    /// #754: the window is not shrunk for its own sake. When the ladder frees
+    /// more than the provider's reported gap, the retry has room and the
+    /// conversation keeps its context.
+    #[tokio::test]
+    async fn overflow_recovery_keeps_the_window_when_it_freed_enough() {
+        let mut conv = Conversation::new("c1", "t");
+        conv.messages.push(Message::new(Role::User, "go"));
+        conv.messages
+            .push(Message::assistant_with_tool_calls(vec![ToolCall::new(
+                "c1",
+                "read_file",
+                "{}",
+            )]));
+        conv.messages
+            .push(Message::tool_result("c1", "x".repeat(32_768)));
+
+        let mut projection = ContextProjection::default();
+        let mut target_window = MAX_CONTEXT_MESSAGES;
+        // 32768 chars is about 8192 estimated tokens; the gap is 1000, so the
+        // freeing clears it several times over.
+        let outcome = recover_from_overflow(
+            &mut conv,
+            &mut projection,
+            Some(10_000),
+            Some(9_000),
+            0,
+            &mut target_window,
+            &FailingLlm,
+            &default_estimate,
+        )
+        .await;
+
+        assert_eq!(outcome, RecoveryOutcome::Progressed);
+        assert_eq!(
+            target_window, MAX_CONTEXT_MESSAGES,
+            "freeing well past the gap must not also cost the window"
+        );
+        assert!(projection.is_replaced(&conv.messages[2]));
+    }
+
+    /// A provider that reports no token counts leaves the gap unknown, so the
+    /// ladder cannot prove the retry has room and must shrink the window too.
+    #[tokio::test]
+    async fn overflow_recovery_shrinks_the_window_when_the_provider_reports_no_counts() {
+        let mut conv = Conversation::new("c1", "t");
+        conv.messages.push(Message::new(Role::User, "go"));
+        conv.messages
+            .push(Message::assistant_with_tool_calls(vec![ToolCall::new(
+                "c1",
+                "read_file",
+                "{}",
+            )]));
+        conv.messages
+            .push(Message::tool_result("c1", "x".repeat(32_768)));
+
+        let mut projection = ContextProjection::default();
+        let mut target_window = MAX_CONTEXT_MESSAGES;
+        let outcome = recover_from_overflow(
+            &mut conv,
+            &mut projection,
+            None,
+            None,
+            0,
+            &mut target_window,
+            &FailingLlm,
+            &default_estimate,
+        )
+        .await;
+
+        assert_eq!(outcome, RecoveryOutcome::Progressed);
+        assert!(projection.is_replaced(&conv.messages[2]));
+        assert!(
+            target_window < MAX_CONTEXT_MESSAGES,
+            "with no gap to measure against, the window must shrink as well"
+        );
+    }
+
+    /// Exactly at the window boundary nothing is out of view, so the ladder
+    /// works on the whole conversation and there is no range to summarise.
+    #[tokio::test]
+    async fn overflow_recovery_at_the_window_boundary_still_compacts_in_view() {
+        let mut conv = Conversation::new("c1", "t");
+        while conv.messages.len() < MAX_CONTEXT_MESSAGES - 4 {
+            let n = conv.messages.len();
+            conv.messages
+                .push(Message::new(Role::User, format!("prompt {n}")));
+        }
+        for n in 1..=2 {
+            conv.messages
+                .push(Message::assistant_with_tool_calls(vec![ToolCall::new(
+                    format!("c{n}"),
+                    "read_file",
+                    "{}",
+                )]));
+            conv.messages
+                .push(Message::tool_result(format!("c{n}"), mid_sized_result('r')));
+        }
+        assert_eq!(conv.messages.len(), MAX_CONTEXT_MESSAGES);
+        assert_eq!(
+            window_start(&conv.messages, MAX_CONTEXT_MESSAGES),
+            0,
+            "the fixture must sit exactly on the boundary"
+        );
+
+        let mut target_window = MAX_CONTEXT_MESSAGES;
+        let projection = recover_once(&mut conv, &mut target_window).await;
+
+        assert_eq!(
+            projection.replaced_count(),
+            1,
+            "the oldest of the two groups is compacted, the newest is kept"
+        );
+        assert_eq!(
+            conv.compacted_through, 0,
+            "nothing was out of view, so there is no range to fold in"
+        );
+    }
+
+    /// #754: a recovery that can free nothing and cannot shrink further says
+    /// so, rather than reporting success and letting the caller spend another
+    /// attempt on the prompt the provider has just refused.
+    #[tokio::test]
+    async fn overflow_recovery_reports_exhausted_when_nothing_is_left() {
+        let mut conv = Conversation::new("c1", "t");
+        conv.messages = vec![
+            Message::new(Role::User, "hello"),
+            Message::new(Role::Assistant, "hi there"),
+        ];
+        let mut projection = ContextProjection::default();
+        let mut target_window = MIN_CONTEXT_MESSAGES;
+        let outcome = recover_from_overflow(
+            &mut conv,
+            &mut projection,
+            Some(100_000),
+            Some(8_000),
+            0,
+            &mut target_window,
+            &FailingLlm,
+            &default_estimate,
+        )
+        .await;
+
+        assert_eq!(outcome, RecoveryOutcome::Exhausted);
+        assert_eq!(target_window, MIN_CONTEXT_MESSAGES);
+        assert_eq!(projection.replaced_count(), 0);
+    }
+
     /// #798: the projection is what the prompt is built from, so a replacement
     /// must reach the assembled messages and nothing else.
     #[test]
@@ -2449,17 +2822,16 @@ mod tests {
         );
 
         let tool_bodies: Vec<&str> = assembled
+            .messages
             .iter()
             .filter(|m| m.role == Role::Tool)
             .map(|m| m.content.as_str())
             .collect();
-        assert!(
-            tool_bodies.contains(&"<a short notice>"),
-            "the prompt must carry the projected content, got {tool_bodies:?}"
-        );
-        assert!(
-            !tool_bodies.iter().any(|b| *b == mid_sized_result('r')) || tool_bodies.len() > 1,
-            "only the projected result changes"
+        let untouched = mid_sized_result('r');
+        assert_eq!(
+            tool_bodies,
+            vec!["<a short notice>", untouched.as_str()],
+            "the prompt carries the projected content for c1 and nothing else changes"
         );
         assert_eq!(
             conv.messages
@@ -4513,12 +4885,19 @@ mod tests {
         assert_eq!(conv.context_summary, "earlier summary");
     }
 
+    /// Where the marker lands when the whole due range is folded in one call.
+    fn expected_marker(conv: &Conversation) -> usize {
+        let (from, to) = compaction_range(conv, MAX_CONTEXT_MESSAGES).expect("a range to compact");
+        to.min(from + MAX_COMPACTION_SPAN)
+    }
+
     #[tokio::test]
     async fn a_range_the_summariser_declined_is_offered_again_on_the_next_turn() {
         // The failure is transient. The second attempt must still see the
         // range the first one could not summarise.
         let mut conv = conv_ready_for_compaction();
         let expected = compaction_range(&conv, MAX_CONTEXT_MESSAGES).expect("a range to compact");
+        let marker = expected_marker(&conv);
         assert!(!compact_into_summary(&mut conv, MAX_CONTEXT_MESSAGES, &FailingLlm).await);
 
         let retry = compaction_range(&conv, MAX_CONTEXT_MESSAGES).expect("the range is still due");
@@ -4530,18 +4909,67 @@ mod tests {
         let llm = MockLlm::new(vec!["- the recovered summary"]);
         assert!(compact_into_summary(&mut conv, MAX_CONTEXT_MESSAGES, &llm).await);
         assert_eq!(conv.context_summary, "- the recovered summary");
-        assert_eq!(conv.compacted_through, expected.1);
+        assert_eq!(conv.compacted_through, marker);
     }
 
     #[tokio::test]
     async fn a_successful_summary_advances_the_compaction_marker() {
         let mut conv = conv_ready_for_compaction();
-        let (_, to) = compaction_range(&conv, MAX_CONTEXT_MESSAGES).expect("a range to compact");
+        let marker = expected_marker(&conv);
         let llm = MockLlm::new(vec!["- what happened earlier"]);
 
         assert!(compact_into_summary(&mut conv, MAX_CONTEXT_MESSAGES, &llm).await);
-        assert_eq!(conv.compacted_through, to);
+        assert_eq!(conv.compacted_through, marker);
         assert_eq!(conv.context_summary, "- what happened earlier");
+    }
+
+    /// Holding the marker back on failure must not let the fold grow without
+    /// limit. A summariser that keeps failing would otherwise be offered a
+    /// wider range every turn until no task model could read it, and the
+    /// marker would be stuck for good.
+    #[tokio::test]
+    async fn the_fold_is_bounded_however_long_the_summariser_stays_down() {
+        let mut conv = Conversation::new("c1", "t");
+        for i in 0..600 {
+            conv.messages
+                .push(Message::new(Role::User, format!("prompt {i}")));
+            conv.messages
+                .push(Message::new(Role::Assistant, format!("reply {i}")));
+        }
+        let (from, to) = compaction_range(&conv, MAX_CONTEXT_MESSAGES).expect("a range to compact");
+        assert!(
+            to - from > MAX_COMPACTION_SPAN,
+            "the fixture must offer more than one span"
+        );
+
+        let llm = CountingSummariser::default();
+        assert!(compact_into_summary(&mut conv, MAX_CONTEXT_MESSAGES, &llm).await);
+        assert_eq!(
+            conv.compacted_through,
+            from + MAX_COMPACTION_SPAN,
+            "one call folds at most one span, and the marker lands on its end"
+        );
+        assert!(
+            llm.longest_prompt() < MAX_COMPACTION_SPAN * (SUMMARY_PROSE_BYTES + 64),
+            "the transcript must stay bounded by the span and the per-message caps"
+        );
+
+        // The rest is not skipped: the next call takes the following span.
+        assert!(compact_into_summary(&mut conv, MAX_CONTEXT_MESSAGES, &llm).await);
+        assert_eq!(conv.compacted_through, from + 2 * MAX_COMPACTION_SPAN);
+    }
+
+    /// A single enormous user message cannot dominate the fold either.
+    #[test]
+    fn the_summariser_transcript_cuts_an_oversized_user_message() {
+        let messages = vec![Message::new(Role::User, "u".repeat(50_000))];
+        let transcript = summary_transcript(&messages);
+        assert!(
+            transcript.len() < SUMMARY_PROSE_BYTES + 100,
+            "the transcript must carry a head, not the whole message, got {} bytes",
+            transcript.len()
+        );
+        assert!(transcript.contains("...[truncated]"));
     }
 
     #[tokio::test]

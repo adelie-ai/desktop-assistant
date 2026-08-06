@@ -16,6 +16,13 @@
 //!
 //! One projection lives for one turn. Entries are keyed by message id, so
 //! appending to the transcript mid-turn never invalidates one.
+//!
+//! Turn-scoped means the saving is within-turn: a later turn loads the stored
+//! content again and pays for it until windowing and the rolling summary carry
+//! it out of view. Carrying a saving across turns needs the DECISION recorded on
+//! the row - which note a result was distilled into - so the next turn can
+//! rebuild the projection without reading back what it replaced. See the
+//! `crates/core/src/planning.rs` module header.
 
 use std::collections::HashMap;
 

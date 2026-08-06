@@ -1,7 +1,7 @@
 use crate::CoreError;
 use crate::context::{
     COMPACTION_TOKEN_RATIO, ContextProjection, ConversationView, DEFAULT_MAX_TOOL_RESULT_BYTES,
-    MAX_CONTEXT_MESSAGES, MAX_OVERFLOW_RETRIES, MIN_CONTEXT_MESSAGES, ToolContext,
+    MAX_CONTEXT_MESSAGES, MAX_OVERFLOW_RETRIES, MIN_CONTEXT_MESSAGES, RecoveryOutcome, ToolContext,
     ToolLocalityContext, TurnAnchors, assemble_turn_within_budget, cap_tool_result,
     compact_into_summary, recover_from_overflow,
 };
@@ -348,6 +348,11 @@ fn user_visible_llm_error_message(error: &CoreError) -> String {
         CoreError::ContextOverflow { detail, .. } => format!(
             "The conversation exceeded the model's context window. We'll truncate older content and retry. Details: {detail}"
         ),
+        CoreError::Llm(detail) if detail == CONTEXT_RECOVERY_EXHAUSTED => format!(
+            "The conversation is too large for this model's context window, and \
+             shortening it further would leave nothing to work from. Start a new \
+             conversation, or switch to a model with a larger window. Details: {detail}"
+        ),
         CoreError::RateLimited { detail, .. } => format!(
             "The API rate limit was exceeded. Please wait a moment and try again. Details: {detail}"
         ),
@@ -370,6 +375,12 @@ fn user_visible_llm_error_message(error: &CoreError) -> String {
         ),
     }
 }
+
+/// Marks the overflow the recovery ladder cannot act on: the prompt is over the
+/// model's limit and there is nothing left to free or shrink. Distinct from an
+/// overflow the ladder is still working on, because the message a user reads
+/// must not promise a retry that will not happen.
+const CONTEXT_RECOVERY_EXHAUSTED: &str = "context recovery exhausted";
 
 /// Strip surrounding quotes/backticks and trailing punctuation from a raw LLM title,
 /// then limit to at most 8 words as a guard-rail.
@@ -1976,7 +1987,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
             // The estimator borrows `&self.llm` so the closure is built
             // each iteration; constructing it is cheap (no allocation).
             let estimate = |text: &str| self.llm.estimate_tokens(text);
-            let llm_messages = assemble_turn_within_budget(
+            let assembled = assemble_turn_within_budget(
                 &ConversationView {
                     messages: &conv.messages,
                     summaries: &conv.summaries,
@@ -2001,6 +2012,11 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 current_context_budget(),
                 &estimate,
             );
+            // Where the assembled prompt starts. Overflow recovery needs it,
+            // because the pre-flight budget check inside assembly can narrow
+            // the window past `target_window` and nothing else here would know.
+            let window_from = assembled.window_from;
+            let llm_messages = assembled.messages;
             // Incremental sanitizer: carries think-block parser state across
             // chunks so each byte is scanned once, instead of re-sanitizing
             // the full accumulated stream on every chunk (O(n²) per turn).
@@ -2076,14 +2092,15 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 Err(CoreError::ContextOverflow {
                     prompt_tokens,
                     max_tokens,
-                    detail: _,
+                    detail,
                 }) if overflow_retries < MAX_OVERFLOW_RETRIES => {
                     // The provider rejected this turn's prompt for
                     // exceeding its context window. Run the recovery
-                    // ladder (truncate large tool result → trim old
-                    // pairs → summarise-and-shrink) and retry. The
-                    // counter bounds total attempts across all steps
-                    // so persistently-oversized requests can't loop.
+                    // ladder (truncate the largest in-window tool result →
+                    // compact the oldest in-window ones → summarise and
+                    // shrink the window) and retry. The counter bounds
+                    // total attempts so persistently-oversized requests
+                    // can't loop.
                     overflow_retries += 1;
                     tracing::warn!(
                         attempt = overflow_retries,
@@ -2092,22 +2109,37 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                         max_tokens = ?max_tokens,
                         "context overflow — running recovery ladder"
                     );
-                    recover_from_overflow(
+                    let outcome = recover_from_overflow(
                         &mut conv,
                         &mut projection,
                         prompt_tokens,
                         max_tokens,
+                        window_from,
                         &mut target_window,
                         self.task_llm(),
                         &estimate,
                     )
                     .await;
-                    // Overflow recovery has already dropped part of the range
-                    // the step stack's watermarks point into. Drop the frames
-                    // so no later complete_step re-evicts what recovery
-                    // compacted — the plan todos persist on the scratchpad
-                    // regardless.
-                    step_stack.clear();
+                    if outcome == RecoveryOutcome::Exhausted {
+                        // The ladder has nothing left to free and the window
+                        // is at its floor, so a retry would send the prompt
+                        // the provider has just refused. Stop here instead of
+                        // spending the remaining attempts on the same call.
+                        tracing::warn!(
+                            attempt = overflow_retries,
+                            prompt_tokens = ?prompt_tokens,
+                            max_tokens = ?max_tokens,
+                            provider_detail = %detail,
+                            "context overflow — recovery exhausted, ending the turn"
+                        );
+                        let friendly = user_visible_llm_error_message(&CoreError::Llm(
+                            CONTEXT_RECOVERY_EXHAUSTED.to_string(),
+                        ));
+                        conv.messages.push(Message::new(Role::Assistant, &friendly));
+                        conv.updated_at = now_timestamp();
+                        self.store.update(conv).await?;
+                        return Ok(friendly);
+                    }
                     continue;
                 }
                 Err(CoreError::Cancelled) => {
@@ -2801,6 +2833,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 current_context_budget(),
                 &estimate,
             )
+            .messages
         };
         conv.messages.pop(); // the transient instruction is never persisted
 
@@ -9052,10 +9085,14 @@ mod tests {
             _reasoning: ReasoningConfig,
             mut on_chunk: ChunkCallback,
         ) -> Result<LlmResponse, CoreError> {
+            // The rolling summariser sends exactly a system message and a
+            // user message. Overflowing that call would test the summariser,
+            // not the turn, so only a prompt carrying history overflows.
+            let is_turn_prompt = messages.len() > 2;
             self.seen.lock().unwrap().push(messages);
             self.call_count.fetch_add(1, Ordering::Relaxed);
             let mut remaining = self.remaining_overflows.lock().unwrap();
-            if *remaining > 0 {
+            if is_turn_prompt && *remaining > 0 {
                 *remaining -= 1;
                 return Err(CoreError::ContextOverflow {
                     prompt_tokens: Some(203_524),
@@ -9256,6 +9293,96 @@ mod tests {
             after.messages.len() > before,
             "the turn only appends (prompt + reply); no history row may vanish"
         );
+    }
+
+    /// #754: the ladder used to work on the whole stored list while the prompt
+    /// was built from the last MAX_CONTEXT_MESSAGES messages, so a
+    /// conversation whose big tool results sit before that boundary could
+    /// spend every retry sending the provider the same bytes. The retry must
+    /// carry a different prompt.
+    #[tokio::test]
+    async fn an_overflow_retry_never_sends_the_same_prompt_twice() {
+        use std::sync::atomic::AtomicU64;
+
+        let call_count = Arc::new(AtomicU32::new(0));
+        let llm = OverflowThenSucceedLlm::new(1, Arc::clone(&call_count), "ok");
+        let prompts = llm.prompts();
+        let counter = Arc::new(AtomicU64::new(0));
+        let handler = ConversationHandler::new(
+            MockStore::new(),
+            llm,
+            Box::new(move || {
+                let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                format!("conv-{n}")
+            }),
+        );
+
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        let mut stored = handler.get_conversation(&conv.id).await.unwrap();
+        // A large tool group first, then enough plain turns to push it out of
+        // the assembled window.
+        let out_of_window = "z".repeat(64_000);
+        stored
+            .messages
+            .push(Message::assistant_with_tool_calls(vec![ToolCall::new(
+                "old", "reader", "{}",
+            )]));
+        stored
+            .messages
+            .push(Message::tool_result("old", &out_of_window));
+        for n in 0..MAX_CONTEXT_MESSAGES {
+            stored
+                .messages
+                .push(Message::new(Role::User, format!("prompt {n}")));
+            stored
+                .messages
+                .push(Message::new(Role::Assistant, format!("reply {n}")));
+        }
+        handler.store.update(stored).await.unwrap();
+
+        let result = handler
+            .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+        assert_eq!(result, "ok");
+
+        {
+            // Side calls (title generation, the rolling summariser) carry no
+            // history, so pick the two prompts the turn itself assembled.
+            let recorded = prompts.lock().unwrap();
+            let turns: Vec<&Vec<Message>> = recorded.iter().filter(|p| p.len() > 2).collect();
+            let lens: Vec<usize> = recorded.iter().map(|p| p.len()).collect();
+            assert_eq!(
+                turns.len(),
+                2,
+                "both attempts must be recorded, saw {lens:?}"
+            );
+            let first: Vec<&str> = turns[0].iter().map(|m| m.content.as_str()).collect();
+            let second: Vec<&str> = turns[1].iter().map(|m| m.content.as_str()).collect();
+            assert_ne!(
+                first, second,
+                "the retry must not send the prompt the provider just refused"
+            );
+            assert!(
+                second.len() < first.len(),
+                "the retry must carry fewer messages, got {} then {}",
+                first.len(),
+                second.len()
+            );
+        }
+
+        // The out-of-window result was never the ladder's target, and the
+        // stored transcript keeps it whole either way (#798).
+        let after = handler.get_conversation(&conv.id).await.unwrap();
+        let stored_result = after
+            .messages
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("old"))
+            .expect("the out-of-window result row");
+        assert_eq!(stored_result.content, out_of_window);
     }
 
     #[tokio::test]
@@ -11516,13 +11643,15 @@ mod tests {
         );
     }
 
-    /// `step_stack.clear()` after overflow recovery (issue #240 / #441): a
-    /// `begin_step` then an in-turn ContextOverflow recovery (which compacts
-    /// the round's view of the range beneath the frame's watermark) must drop
-    /// the step frames, so a later `complete_step` finds NO active step and
-    /// does not evict a range recovery has already compacted.
+    /// A step survives an in-turn ContextOverflow recovery (issues #240 / #441
+    /// / #798). Recovery used to rewrite the message log the frame's absolute
+    /// watermark points into, so the stack had to be cleared and the step lost
+    /// its done-todo and its carry-forward note. Recovery now writes to the
+    /// round's projection, so the log and the watermark are both unchanged and
+    /// the step completes normally. Re-evicting a range recovery has already
+    /// compacted is a no-op: an overflow notice is below the eviction floor.
     #[tokio::test]
-    async fn overflow_recovery_invalidates_step_watermarks() {
+    async fn a_step_survives_overflow_recovery_and_still_completes() {
         // A scripted LLM that can inject a ContextOverflow on a chosen call.
         enum Step {
             Resp(LlmResponse),
@@ -11570,7 +11699,7 @@ mod tests {
                     "",
                     vec![ToolCall::new("b1", "begin_step", r#"{"goal":"do work"}"#)],
                 )),
-                Step::Overflow, // triggers recover_from_overflow + step_stack.clear()
+                Step::Overflow, // triggers recover_from_overflow
                 Step::Resp(LlmResponse::with_tool_calls(
                     "",
                     vec![ToolCall::new("c1", "complete_step", "{}")],
@@ -11615,9 +11744,9 @@ mod tests {
             .unwrap();
         assert_eq!(result, "all done");
 
-        // The complete_step ack must report NO active step: the frame was
-        // cleared by overflow recovery, so it neither marked a todo done nor
-        // evicted via the stale watermark.
+        // The complete_step ack must name the step it closed: the frame was
+        // still there, so the todo is marked done rather than abandoned to the
+        // no-active-step path.
         let updated = handler.get_conversation(&conv.id).await.unwrap();
         let complete_ack = updated
             .messages
@@ -11627,9 +11756,13 @@ mod tests {
             .content
             .clone();
         assert!(
-            complete_ack.contains("no active step to complete"),
-            "after overflow recovery cleared the stack, complete_step must find no \
-             active step (got: {complete_ack})"
+            complete_ack.contains(r#""step":"1""#),
+            "the step opened before the overflow must still complete \
+             (got: {complete_ack})"
+        );
+        assert!(
+            !complete_ack.contains("no active step"),
+            "recovery must not cost the turn its open step (got: {complete_ack})"
         );
     }
 
