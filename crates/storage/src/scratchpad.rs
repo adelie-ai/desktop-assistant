@@ -20,12 +20,11 @@
 //!   scratchpad arm of the `[Recall]` block (#1101). They answer a different
 //!   question from `search` - "what is near this whole user sentence", not
 //!   "find what I asked for" - so they rank differently, and neither replaces
-//!   the other. Both read the **free-form** notes only, which is the set
-//!   `desktop_assistant_core::planning::freeform_note_keys` defines.
+//!   the other. Both leave out the reserved `goal` note, which every turn
+//!   already renders as `[Current task]`.
 
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::ScratchpadNote;
-use desktop_assistant_core::planning::{OUTCOME_KEY_PREFIX, OUTCOME_NOTE_TYPE};
 use desktop_assistant_core::ports::auth::current_user_id;
 use desktop_assistant_core::ports::scratchpad::{
     NewScratchpadNote, SCRATCHPAD_GOAL_KEY, ScratchpadStore,
@@ -522,20 +521,22 @@ impl ScratchpadStore for PgScratchpadStore {
 /// `PgKnowledgeBaseStore::nearest_by_embedding` is not on its trait: they serve
 /// one caller with one ranking need, and the port is what the tools use.
 ///
-/// ## Both read the free-form notes only
+/// ## Both leave out the `goal` note
 ///
-/// "Free-form" is the same set the `[Scratchpad]` index advertises - the
-/// `desktop_assistant_core::planning::freeform_note_keys` carve-out: `note`-typed,
-/// and neither the reserved `goal` key nor an `outcome:<step>` key. The three it
-/// leaves out are rendered by `[Current task]` and `[Plan]` on every round, and
-/// the goal note is by construction the pad row nearest a prompt about the
-/// current task - so an arm without the carve-out would spend its first line
-/// restating the task the prompt already carries.
+/// One exclusion, and only one, belongs in the query. The reserved `goal` note
+/// is what every turn renders as `[Current task]`, and it is by construction the
+/// pad row nearest a prompt about the current task - so without this the arm
+/// would spend its first line restating the task the prompt already carries, on
+/// every turn. Excluding it here rather than after the read means it never
+/// occupies a slot in the scan the block's "and N more" count is measured
+/// against. The key is bound from the core constant that defines it.
 ///
-/// The carve-out is applied in SQL rather than after the read, so an excluded
-/// row never occupies a slot in the scan the block's "and N more" count is
-/// measured against. The values are bound from the core constants that define
-/// them, so the rule has one source even though it is expressed twice.
+/// Nothing else is excluded here, and the omission is deliberate. A `todo` step
+/// and an `outcome:<step>` finding are rendered by `[Plan]` only while the tree
+/// still shows them: a finding is dropped once its parent step is done, and the
+/// tree elides past its cap. Such a note is then durable and invisible, which is
+/// exactly the condition this arm exists for. What the turn actually showed is
+/// the core's business, and it drops those keys at render time.
 impl PgScratchpadStore {
     /// The conversation's notes nearest a query embedding, with the cosine
     /// distance that put them there, nearest first.
@@ -551,13 +552,18 @@ impl PgScratchpadStore {
     /// bounds every other read here carries. Row-level security is a backstop
     /// the table owner bypasses, so the predicates are the guard.
     ///
-    /// Free-form notes only, as the impl block above states.
+    /// The `goal` note is left out, as the impl block above states.
     ///
     /// `embedding_model` identifies the model that produced `query_embedding`,
     /// and only rows embedded by that model take part, matched on the digest
     /// half of the `<name>@<digest>` stamp wherever both sides carry one. A
     /// comparison across models is a comparison across vector dimensions, which
     /// the database answers with an error rather than a miss.
+    ///
+    /// Ties break on `id`, which is unique, so two identical reads return the
+    /// same page. Without a total order the rest is decided by physical row
+    /// position, which moves after any `VACUUM` or update - and notes written in
+    /// one batch carry one vector each, so exact ties are ordinary here.
     ///
     /// An empty `query_embedding` yields no rows: the vector operator raises on
     /// a zero-dimension vector, and a caller with no embedding has
@@ -582,8 +588,7 @@ impl PgScratchpadStore {
              WHERE user_id = $2 AND conversation_id = $3
                AND ($4::text IS NULL OR (owner_todo = $5 OR owner_todo LIKE $5 || '.%'
                     OR (id COLLATE \"C\" < $4 AND owner_todo = ANY($6::text[]))))
-               AND note_type = $9 AND note_key <> $10
-               AND note_key NOT LIKE $11 || '%'
+               AND note_key <> $9
                AND embedding IS NOT NULL
                AND embedding_model IS NOT NULL
                AND (embedding_model = $7
@@ -603,9 +608,7 @@ impl PgScratchpadStore {
         .bind(ancestors)
         .bind(embedding_model)
         .bind(limit as i64)
-        .bind(OUTCOME_NOTE_TYPE)
         .bind(SCRATCHPAD_GOAL_KEY)
-        .bind(OUTCOME_KEY_PREFIX)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;
@@ -638,7 +641,7 @@ impl PgScratchpadStore {
     /// lexemes at all yields a NULL query, which matches no row.
     ///
     /// Carries the same `user_id` / `conversation_id` / `owner_todo` scope as
-    /// every other read here, and the same free-form carve-out as
+    /// every other read here, and leaves out the same `goal` note as
     /// [`Self::nearest_by_embedding`].
     pub async fn search_text_any_term(
         &self,
@@ -661,8 +664,7 @@ impl PgScratchpadStore {
                AND tsv @@ q.query
                AND ($4::text IS NULL OR (owner_todo = $5 OR owner_todo LIKE $5 || '.%'
                     OR (id COLLATE \"C\" < $4 AND owner_todo = ANY($6::text[]))))
-               AND note_type = $8 AND note_key <> $9
-               AND note_key NOT LIKE $10 || '%'
+               AND note_key <> $8
              ORDER BY ts_rank_cd(tsv, q.query) DESC, updated_at DESC, id DESC
              LIMIT $7",
         )
@@ -673,9 +675,7 @@ impl PgScratchpadStore {
         .bind(me)
         .bind(ancestors)
         .bind(limit as i64)
-        .bind(OUTCOME_NOTE_TYPE)
         .bind(SCRATCHPAD_GOAL_KEY)
-        .bind(OUTCOME_KEY_PREFIX)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;

@@ -996,22 +996,24 @@ async fn the_degraded_scratchpad_arm_matches_nothing_for_a_prompt_of_stop_words(
     fx.cleanup().await;
 }
 
-/// The arm must read the same set the `[Scratchpad]` index advertises: the
-/// free-form notes. The `goal` note, `outcome:<step>` notes and `todo`-typed
-/// steps are rendered by `[Current task]` and `[Plan]` on every round, and the
-/// goal note is by construction the pad row nearest a prompt about the current
-/// task - so without the carve-out the arm's first line restates the task the
-/// prompt already carries.
+/// The `goal` note is what `[Current task]` renders every turn, and it is by
+/// construction the pad row nearest a prompt about the current task - so without
+/// the exclusion the arm's first line restates the task the prompt already
+/// carries.
+///
+/// A `todo` step and an `outcome:<step>` finding are NOT excluded: `[Plan]`
+/// shows those only while its tree still holds them, and a rolled-up finding is
+/// durable and invisible, which is what the arm is for. What the turn actually
+/// showed is decided at render time, not here.
 #[tokio::test]
-async fn nearest_notes_read_only_the_free_form_pad() {
+async fn nearest_notes_leave_out_the_goal_note_and_nothing_else() {
     let Some(fx) = fixture().await else { return };
     let convs = PgConversationStore::new(fx.pool.clone());
     let pad = PgScratchpadStore::new(fx.pool.clone());
 
     with_user_id(UserId::new(USER), async {
         convs.create(make_conversation("c1")).await.expect("conv");
-        // Every excluded kind sits at distance 0 from the query, so only the
-        // carve-out can keep it out.
+        // All four sit at distance 0, so only an explicit predicate can act.
         seed_note(&pad, "c1", "goal", "ship the deploy", axis(0), MODEL).await;
         seed_note(
             &pad,
@@ -1023,20 +1025,16 @@ async fn nearest_notes_read_only_the_free_form_pad() {
         )
         .await;
         seed_typed_note(&pad, "c1", "1", "a plan step", "todo", axis(0), MODEL).await;
-        // ...and the one free-form note sits furthest away.
-        seed_note(&pad, "c1", "finding", "the pool leaks", axis(1), MODEL).await;
+        seed_note(&pad, "c1", "finding", "the pool leaks", axis(0), MODEL).await;
 
         let hits = pad
             .nearest_by_embedding("c1", axis(0), MODEL, 10)
             .await
             .expect("the read succeeds");
 
-        let keys: Vec<&str> = hits.iter().map(|(n, _)| n.key.as_str()).collect();
-        assert_eq!(
-            keys,
-            vec!["finding"],
-            "only free-form notes; the rest are already rendered by other blocks"
-        );
+        let mut keys: Vec<&str> = hits.iter().map(|(n, _)| n.key.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["1", "finding", "outcome:1.2"]);
     })
     .await;
 
@@ -1044,7 +1042,7 @@ async fn nearest_notes_read_only_the_free_form_pad() {
 }
 
 #[tokio::test]
-async fn the_degraded_scratchpad_arm_reads_only_the_free_form_pad() {
+async fn the_degraded_scratchpad_arm_leaves_out_the_goal_note() {
     let Some(fx) = fixture().await else { return };
     let convs = PgConversationStore::new(fx.pool.clone());
     let pad = PgScratchpadStore::new(fx.pool.clone());
@@ -1070,8 +1068,45 @@ async fn the_degraded_scratchpad_arm_reads_only_the_free_form_pad() {
             .await
             .expect("the read succeeds");
 
-        let keys: Vec<&str> = hits.iter().map(|n| n.key.as_str()).collect();
-        assert_eq!(keys, vec!["finding"]);
+        let mut keys: Vec<&str> = hits.iter().map(|n| n.key.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["1", "finding", "outcome:1"]);
+    })
+    .await;
+
+    fx.cleanup().await;
+}
+
+/// A batch of notes carries one vector each, so exact distance ties are
+/// ordinary. Without a unique tiebreak the page is decided by physical row
+/// position, which moves after any `VACUUM` or update - two identical reads
+/// would then disagree.
+#[tokio::test]
+async fn nearest_notes_return_the_same_page_for_two_identical_reads() {
+    let Some(fx) = fixture().await else { return };
+    let convs = PgConversationStore::new(fx.pool.clone());
+    let pad = PgScratchpadStore::new(fx.pool.clone());
+
+    with_user_id(UserId::new(USER), async {
+        convs.create(make_conversation("c1")).await.expect("conv");
+        for i in 0..5 {
+            seed_note(&pad, "c1", &format!("n{i}"), "a tied note", axis(0), MODEL).await;
+        }
+
+        let first = pad
+            .nearest_by_embedding("c1", axis(0), MODEL, 3)
+            .await
+            .expect("the read succeeds");
+        let again = pad
+            .nearest_by_embedding("c1", axis(0), MODEL, 3)
+            .await
+            .expect("the read succeeds");
+
+        let keys = |hits: &[(desktop_assistant_core::domain::ScratchpadNote, f64)]| {
+            hits.iter().map(|(n, _)| n.key.clone()).collect::<Vec<_>>()
+        };
+        assert_eq!(keys(&first), keys(&again), "the cut must be repeatable");
+        assert_eq!(first.len(), 3);
     })
     .await;
 

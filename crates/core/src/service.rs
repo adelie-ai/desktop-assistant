@@ -589,6 +589,11 @@ struct ScratchpadSurfaces {
     /// `[Recall]` block drops a key already in this list rather than offering
     /// the same note a second time.
     indexed_keys: Vec<String>,
+    /// The note keys `plan` names: every step it lists and every finding it
+    /// nests beneath one (#1101). A step whose finding the tree has already
+    /// rolled up is deliberately absent - that note is durable and invisible,
+    /// which is what the recall arm is for.
+    planned_keys: Vec<String>,
     /// The ids of the knowledge entries this round's pinned notes attach and
     /// the round resolved (#1104). `[Recall]` drops these from its knowledge
     /// arm, because `[Pinned]` already carries their live content.
@@ -1092,6 +1097,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             .into_iter()
             .map(str::to_string)
             .collect(),
+            planned_keys: planning::plan_note_keys(&raw, current_key, planning::MAX_PLAN_ITEMS),
             // The attachments the round resolved, which is what `[Pinned]`
             // renders. A pin the byte budget cut short is still counted here:
             // the block says so in its own words, so over-suppressing there is
@@ -1954,7 +1960,11 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                     found.entry_scan_limit,
                     found.note_scan_limit,
                 )
-                .already_in_view(&surfaces.indexed_keys, &surfaces.pinned_entry_ids)
+                .already_in_view(
+                    &surfaces.indexed_keys,
+                    &surfaces.planned_keys,
+                    &surfaces.pinned_entry_ids,
+                )
             });
 
             // The estimator borrows `&self.llm` so the closure is built

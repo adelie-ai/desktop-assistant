@@ -56,7 +56,10 @@ leaves the model to pick the read it actually has. Teaching the model what the
 block is belongs in the standing instruction, not in the block.
 
 **Every part of the block is bounded.** The entry id, the note key and the note
-content all pass through the same one-line rule the summary does. The block is
+content all pass through the same one-line rule the summary does. A note key is
+bounded to the same width `[Scratchpad]` uses
+(`ports::scratchpad::NOTE_KEY_MAX_CHARS`), so the same key never renders whole in
+one block and cut in the other, one block apart in the same prompt. The block is
 line-structured and it is a system message, so a stored value carrying a newline
 would forge a line - and the line above it is a block header the model is taught
 to trust. An entry id and a note key are both taken from the write tool's caller
@@ -126,14 +129,19 @@ The arm reads **this conversation's pad only**. The pad is per-conversation by
 design; reaching across conversations is a different feature with its own
 privacy question.
 
-It also reads the **free-form notes only** - the same set the index advertises
-(`planning::freeform_note_keys`): `note`-typed, and neither the reserved `goal`
-key nor an `outcome:<step>` key. Those three are rendered by `[Current task]`
-and `[Plan]` on every round, and the goal note is by construction the pad row
-nearest a prompt about the current task, so an arm without the carve-out would
-spend its first line restating the task the prompt already carries. The
-carve-out is applied in the query rather than after it, so an excluded row never
-occupies a slot in the scan the "and N more" count is measured against.
+The query leaves out exactly one note: the reserved `goal`. That is what every
+turn renders as `[Current task]`, and it is by construction the pad row nearest a
+prompt about the current task, so without the exclusion the arm would spend its
+first line restating the task the prompt already carries, every turn. Excluding
+it in the query rather than after the read means it never occupies a slot in the
+scan the "and N more" count is measured against.
+
+Nothing else is excluded there, deliberately. A `todo` step and an
+`outcome:<step>` finding are in view only while `[Plan]`'s tree still shows them
+- a finding is dropped once its parent step is done, and the tree elides past its
+cap - and a note that has left the tree is durable and invisible, which is the
+condition this arm exists for. What the turn *actually showed* is decided at
+render time instead.
 
 ## Nothing already in view
 
@@ -144,7 +152,13 @@ block drops what the rest of the turn's prompt already shows:
 | --- | --- |
 | A pinned note | `[Pinned]` carries its whole content every turn. |
 | A key the `[Scratchpad]` index has just listed | The index named it on this same round. |
+| A step or finding `[Plan]` has just named | The tree showed it on this same round. |
 | A knowledge entry a pinned note attaches | `[Pinned]` renders that entry's live content (#1104). |
+
+Each list is what the block **showed**, not what the pad holds. That distinction
+is the whole point: `[Scratchpad]` never lists an `outcome:` key, and `[Plan]`
+drops a finding once its parent step is done, so a rolled-up finding appears on
+neither list and the arm offers it - which is exactly its job.
 
 Whether the index speaks is not knowable before assembly - it is gated on the
 window having dropped history, and the window is not fixed until the budget pass
@@ -316,6 +330,7 @@ measured.
 | The standing guidance for the block | `crates/core/src/prompts/sections/knowledge_base.txt` |
 | The port the daemon fills | `crates/core/src/ports/recall.rs` |
 | Looked up once per turn | `ConversationHandler::recall_lookup`, `crates/core/src/service.rs` |
+| What the other blocks showed | `planning::listed_scratchpad_keys` and `planning::plan_note_keys` |
 | Rendered on the first round | `surfaced_blocks`, `crates/core/src/context/mod.rs` |
 | Embedding, every query, degradation | `crates/daemon/src/recall.rs` |
 | The knowledge query | `PgKnowledgeBaseStore::nearest_by_embedding`, `crates/storage/src/knowledge.rs` |

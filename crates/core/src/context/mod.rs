@@ -1051,16 +1051,21 @@ fn surfaced_blocks(
     // prompt may be about, which the model is told to ignore where it does not
     // fit. The first-round gate is what bounds its cost.
     //
-    // The index's own decision, just taken above, feeds the render: when
-    // `[Scratchpad]` has listed the pad's keys, recall drops the ones it named
-    // (#1101), and when the index is silent - the case the scratchpad arm
-    // exists for - it drops nothing.
+    // The two decisions just taken above feed the render: recall drops a note
+    // `[Scratchpad]` has listed and a step or finding `[Plan]` has named (#1101),
+    // and when either block is silent it drops nothing for it - the silent index
+    // is the case the scratchpad arm exists for.
     if anchors.tool_rounds_since_anchor == 0
         && let Some(surface) = anchors.recall
     {
         let surface = crate::recall::RecallSurface {
             indexed_keys: if scratchpad_index.is_some() {
                 surface.indexed_keys
+            } else {
+                &[]
+            },
+            planned_keys: if plan.is_some() {
+                surface.planned_keys
             } else {
                 &[]
             },
@@ -3330,12 +3335,21 @@ mod tests {
         candidates: &'a crate::ports::recall::RecallCandidates,
         indexed_keys: &'a [String],
     ) -> crate::recall::RecallSurface<'a> {
+        planned_recall_surface(candidates, indexed_keys, &[])
+    }
+
+    /// The same, plus the steps and findings `[Plan]` names when it renders.
+    fn planned_recall_surface<'a>(
+        candidates: &'a crate::ports::recall::RecallCandidates,
+        indexed_keys: &'a [String],
+        planned_keys: &'a [String],
+    ) -> crate::recall::RecallSurface<'a> {
         crate::recall::RecallSurface::new(
             candidates,
             crate::recall::RECALL_ENTRY_SCAN_LIMIT,
             crate::recall::RECALL_NOTE_SCAN_LIMIT,
         )
-        .already_in_view(indexed_keys, &[])
+        .already_in_view(indexed_keys, planned_keys, &[])
     }
 
     /// A conversation long enough that assembly windows it, which is the signal

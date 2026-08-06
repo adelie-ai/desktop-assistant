@@ -29,11 +29,11 @@
 //! - **A line budget.** [`MAX_RECALL_ENTRIES`] entry lines,
 //!   [`MAX_RECALL_NOTES`] note lines and [`MAX_RECALL_TAGS`] tag names.
 //! - **Nothing already in view.** A note `[Pinned]` renders in full, a key the
-//!   `[Scratchpad]` index has just listed, and a knowledge entry a pin attaches
-//!   (#1104) are all dropped here. Paying twice for one memory is the failure
-//!   mode a second look at the same pad would otherwise introduce - the
-//!   `RecallSurface` the assembly hands in is what says which memories those
-//!   are.
+//!   `[Scratchpad]` index has just listed, a step or finding `[Plan]` has just
+//!   named, and a knowledge entry a pin attaches (#1104) are all dropped here.
+//!   Paying twice for one memory is the failure mode a second look at the same
+//!   pad would otherwise introduce - the `RecallSurface` the assembly hands in
+//!   is what says which memories those are.
 //! - **One round.** The block answers "what might this prompt be about?", and
 //!   the user prompt asks that once. `crate::context` renders it on the first
 //!   round of a turn only.
@@ -51,6 +51,7 @@
 //! so when a scan fills up the count is a lower bound and says so.
 
 use crate::ports::recall::{RecallCandidates, RecallEntry, RecallNote};
+use crate::ports::scratchpad::NOTE_KEY_MAX_CHARS;
 
 /// How many knowledge lines the block may show.
 ///
@@ -105,13 +106,6 @@ pub const RECALL_ENTRY_SCAN_LIMIT: usize = 50;
 /// working notes, so five is already a large share of a real pad, and the arm
 /// is a second look at material the turn may well be showing another way.
 pub const MAX_RECALL_NOTES: usize = 5;
-
-/// How much of a note key a line may spend.
-///
-/// A key is whatever the write tool's caller passed - the schema bounds neither
-/// its length nor its characters - and it is the handle the model would search
-/// on, so it is bounded rather than dropped.
-pub const RECALL_NOTE_KEY_MAX_CHARS: usize = 64;
 
 /// How much of a note's content a line may spend.
 ///
@@ -225,6 +219,15 @@ pub(crate) struct RecallSurface<'a> {
     /// The note keys the `[Scratchpad]` index lists **when it speaks**. Empty
     /// when it is silent, which is the case this arm exists for.
     pub indexed_keys: &'a [String],
+    /// The note keys `[Plan]` names **when it renders**: every step it lists,
+    /// and every finding it nests beneath one.
+    ///
+    /// A step whose finding the tree has already rolled up is deliberately
+    /// absent from this list. `[Plan]` drops such a finding once its parent step
+    /// is done, and `[Scratchpad]` never lists an `outcome:` key at all, so that
+    /// note is durable and invisible - which is the condition this arm exists
+    /// for, not a duplicate to suppress.
+    pub planned_keys: &'a [String],
     /// The knowledge entries `[Pinned]` already carries, by id (#1104): a
     /// pinned note may attach one, and the block renders that entry's live
     /// content every turn.
@@ -249,6 +252,7 @@ impl<'a> RecallSurface<'a> {
             entry_scan_limit,
             note_scan_limit,
             indexed_keys: &[],
+            planned_keys: &[],
             pinned_entry_ids: &[],
         }
     }
@@ -257,9 +261,11 @@ impl<'a> RecallSurface<'a> {
     pub(crate) fn already_in_view(
         mut self,
         indexed_keys: &'a [String],
+        planned_keys: &'a [String],
         pinned_entry_ids: &'a [String],
     ) -> Self {
         self.indexed_keys = indexed_keys;
+        self.planned_keys = planned_keys;
         self.pinned_entry_ids = pinned_entry_ids;
         self
     }
@@ -342,6 +348,7 @@ pub(crate) fn render_recall(surface: &RecallSurface<'_>) -> Option<String> {
         .filter(|note| {
             !note.pinned
                 && !contains(surface.indexed_keys, &note.key)
+                && !contains(surface.planned_keys, &note.key)
                 && !crate::tool_provenance::carries_external_marker(&note.content)
         })
         .filter_map(|note| note_line(note))
@@ -489,7 +496,7 @@ fn entry_line(hit: &RecallEntry, line: &str) -> String {
 /// [`MAX_NOTE_BYTES`](crate::ports::scratchpad::MAX_NOTE_BYTES) - see
 /// [`bounded`].
 fn note_line(note: &RecallNote) -> Option<String> {
-    let key = bounded(&note.key, RECALL_NOTE_KEY_MAX_CHARS);
+    let key = bounded(&note.key, NOTE_KEY_MAX_CHARS);
     if key.is_empty() {
         return None;
     }
@@ -602,9 +609,19 @@ mod tests {
         indexed_keys: &[String],
         pinned_entry_ids: &[String],
     ) -> Option<String> {
+        render_planned(candidates, indexed_keys, &[], pinned_entry_ids)
+    }
+
+    /// The same, plus the steps and findings `[Plan]` named this round.
+    fn render_planned(
+        candidates: &RecallCandidates,
+        indexed_keys: &[String],
+        planned_keys: &[String],
+        pinned_entry_ids: &[String],
+    ) -> Option<String> {
         render_recall(
             &RecallSurface::new(candidates, RECALL_ENTRY_SCAN_LIMIT, RECALL_NOTE_SCAN_LIMIT)
-                .already_in_view(indexed_keys, pinned_entry_ids),
+                .already_in_view(indexed_keys, planned_keys, pinned_entry_ids),
         )
     }
 
@@ -1373,6 +1390,51 @@ mod tests {
     }
 
     #[test]
+    fn recall_block_omits_a_note_the_plan_has_already_named() {
+        let candidates = RecallCandidates {
+            notes: vec![
+                note("1.2", "read the pool config", 0.05),
+                note("outcome:1.2", "max_connections is 10", 0.06),
+                note("finding", "nothing else shows this", 0.11),
+            ],
+            ..RecallCandidates::default()
+        };
+
+        let block = render_planned(&candidates, &[], &owned(&["1.2", "outcome:1.2"]), &[])
+            .expect("the note the plan did not name still shows");
+
+        assert!(
+            !block.contains("read the pool config"),
+            "a step the plan tree lists is in view: {block}"
+        );
+        assert!(
+            !block.contains("max_connections is 10"),
+            "a finding the plan nested is in view: {block}"
+        );
+        assert_eq!(note_lines(&block).len(), 1, "{block}");
+        assert!(block.contains("nothing else shows this"), "{block}");
+    }
+
+    /// The case the arm exists for, on the plan side. `[Plan]` drops a finding
+    /// once its parent step is done, and `[Scratchpad]` never lists an
+    /// `outcome:` key - so a rolled-up finding is durable and invisible, and
+    /// nothing may drop it from this block.
+    #[test]
+    fn recall_block_surfaces_a_finding_the_plan_has_rolled_up() {
+        let candidates = RecallCandidates {
+            notes: vec![note("outcome:1.2", "max_connections is 10", 0.06)],
+            ..RecallCandidates::default()
+        };
+
+        // The plan named step 1 and its own outcome, but not 1.2's - the tree
+        // absorbed that one when step 1 was marked done.
+        let block = render_planned(&candidates, &[], &owned(&["1", "outcome:1"]), &[])
+            .expect("a rolled-up finding is exactly what this arm is for");
+
+        assert!(block.contains("max_connections is 10"), "{block}");
+    }
+
+    #[test]
     fn recall_block_renders_when_only_the_scratchpad_arm_has_hits() {
         let candidates = RecallCandidates {
             notes: vec![note("finding", "the pool leaks connections", 0.12)],
@@ -1570,7 +1632,7 @@ mod tests {
         let block = render(&candidates).expect("a block");
         let line = note_lines(&block)[0];
 
-        let ceiling = RECALL_NOTE_KEY_MAX_CHARS + RECALL_NOTE_MAX_CHARS
+        let ceiling = NOTE_KEY_MAX_CHARS + RECALL_NOTE_MAX_CHARS
             // "- " and ": "
             + 4;
         assert!(
