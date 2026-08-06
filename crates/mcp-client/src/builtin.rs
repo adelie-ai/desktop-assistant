@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::clock::NowSnapshot;
-use desktop_assistant_core::domain::{Role, ToolDefinition, ToolRunner};
+use desktop_assistant_core::domain::{Role, SUMMARY_MAX_CHARS, ToolDefinition, ToolRunner};
 use desktop_assistant_core::ports::client_tools::current_client_tools;
 use desktop_assistant_core::ports::conversation_ctx::current_conversation_id;
 use desktop_assistant_core::ports::conversation_search::ConversationSearchFn;
@@ -248,6 +248,32 @@ fn match_client_tools<'a>(
 }
 
 const TOOL_KB_WRITE: &str = "builtin_knowledge_base_write";
+
+/// What `builtin_knowledge_base_write` tells the model the `summary` argument
+/// is for.
+///
+/// One text, used by both the single and the batch form, because a model that
+/// batches its writes reads only the batch half of the schema and must be told
+/// the same thing.
+///
+/// It says what the line is *for* rather than only what it is. A model told
+/// "a summary" writes a topic label, and a list of topic labels tells a later
+/// reader nothing it can act on. Told that this line is what the entry is
+/// offered back as, it writes the fact.
+fn summary_arg_description() -> String {
+    format!(
+        "One line saying what this entry says, written as a statement rather than as a topic \
+         label. This line is how the entry is offered back to you later, as a candidate you \
+         decide whether to open, so it has to carry the fact on its own: 'Dave wants tag names \
+         to keep the facet colon' is useful, 'tag naming' is not. Write one for every entry. \
+         Line breaks become spaces, and a summary longer than {SUMMARY_MAX_CHARS} characters is \
+         cut to {SUMMARY_MAX_CHARS}, never rejected - a long one costs you the tail of the line, \
+         not the write. Leaving it out never fails the write either; the entry simply has no \
+         short form until a maintenance pass writes one. On a write that gives an `id`, leaving \
+         it out keeps the stored summary, and sending an empty string clears it."
+    )
+}
+
 const TOOL_KB_SEARCH: &str = "builtin_knowledge_base_search";
 /// Largest `limit` `builtin_knowledge_base_search` will honour, matching the
 /// cap `builtin_knowledge_base_list` already advertises.
@@ -549,11 +575,12 @@ impl BuiltinToolService {
                  instructions, project context, or any durable information the user wants remembered. \
                  Content should be self-contained prose that describes both the context (when/why \
                  this information is useful) and the information itself. Provide either a single \
-                 entry (top-level `content`/`tags`/`id`) or a batch via `entries`. A write that \
-                 gives the `id` of an existing entry keeps the content, the tags and the stored \
-                 metadata it leaves out, so send only what changes: `id` plus `content` rewrites \
-                 the text and keeps the tags, and `id` plus `tags` re-tags the entry and keeps \
-                 the text. To clear the tags, send an empty `tags` list. One field is not kept: \
+                 entry (top-level `content`/`tags`/`summary`/`id`) or a batch via `entries`. A \
+                 write that gives the `id` of an existing entry keeps the content, the tags, the \
+                 summary and the stored metadata it leaves out, so send only what changes: `id` \
+                 plus `content` rewrites the text and keeps the tags, and `id` plus `tags` \
+                 re-tags the entry and keeps the text. To clear the tags, send an empty `tags` \
+                 list. One field is not kept: \
                  every write through this tool records the entry's provenance as 'explicit', so \
                  an entry that dreaming had extracted or consolidated counts as explicitly saved \
                  from then on, and `builtin_knowledge_base_list` with that `source` filter stops \
@@ -582,6 +609,10 @@ impl BuiltinToolService {
                             "items": {"type": "string"},
                             "description": "Two-level tags. Give a coarse KIND ('preference', 'memory', or 'instruction') PLUS at least one SPECIFIC facet: 'project:<name>', 'tool:<name>', 'topic:<subject>', or 'person:<name>'. Prefer specific over generic. Good: ['instruction', 'project:adelie-ai', 'topic:deploy']. Too generic: ['instruction']."
                         },
+                        "summary": {
+                            "type": "string",
+                            "description": summary_arg_description(),
+                        },
                         "new_tag_descriptions": {
                             "type": "object",
                             "additionalProperties": {"type": "string"},
@@ -606,7 +637,7 @@ impl BuiltinToolService {
                         },
                         "entries": {
                             "type": "array",
-                            "description": "Batch form: a list of {content?, tags?, id?, new_tag_descriptions?} objects. When present, every top-level field is ignored — content, tags, id and new_tag_descriptions alike — so describe each entry's new tags inside that entry.",
+                            "description": "Batch form: a list of {content?, tags?, summary?, id?, new_tag_descriptions?} objects. When present, every top-level field is ignored — content, tags, summary, id and new_tag_descriptions alike — so summarise each entry, and describe its new tags, inside that entry.",
                             "items": {
                                 "type": "object",
                                 "properties": {
@@ -615,6 +646,10 @@ impl BuiltinToolService {
                                         "type": "array",
                                         "items": {"type": "string"},
                                         "description": "Two-level tags: a coarse KIND ('preference'/'memory'/'instruction') PLUS at least one SPECIFIC facet ('project:<name>', 'tool:<name>', 'topic:<subject>', 'person:<name>'). Prefer specific over generic."
+                                    },
+                                    "summary": {
+                                        "type": "string",
+                                        "description": summary_arg_description(),
                                     },
                                     "new_tag_descriptions": {
                                         "type": "object",
@@ -1405,6 +1440,10 @@ impl BuiltinToolService {
         // this cannot read is refused rather than stored as empty, because an
         // empty list now means "clear them".
         let supplied_tags = supplied_string_array(spec, "tags")?;
+        // `Some` exactly when the write asked to set the summary, cut to the
+        // cap on the way in. Read before anything is stored, so a summary of
+        // the wrong shape refuses the whole write rather than half of it.
+        let supplied_summary = supplied_one_line(spec, "summary", SUMMARY_MAX_CHARS)?;
 
         let existing = self
             .existing_entry(id_opt.as_deref(), content_opt.is_some())
@@ -1429,6 +1468,8 @@ impl BuiltinToolService {
         let tags = supplied_tags
             .or_else(|| existing.as_ref().map(|e| e.tags.clone()))
             .unwrap_or_default();
+        let summary =
+            supplied_summary.or_else(|| existing.as_ref().and_then(|e| e.summary.clone()));
         // `metadata` has no argument of its own, so a write only ever carries
         // the stored value forward. Its empty value is an object, not JSON
         // null, because the provenance stamp below writes into it.
@@ -1458,9 +1499,7 @@ impl BuiltinToolService {
             created_at: String::new(),
             updated_at: String::new(),
             source: Some("explicit".to_string()),
-            // The write tool takes no summary yet. `None` preserves whatever
-            // the row already holds; it never clears it.
-            summary: None,
+            summary,
         })
     }
 
@@ -2699,6 +2738,43 @@ fn supplied_string_array(
         }
     }
     Ok(Some(supplied))
+}
+
+/// Read a one-line string the caller may or may not have supplied, cut to
+/// `max_chars` by [`desktop_assistant_protocol::one_line`].
+///
+/// `None` means the write said nothing about the field. `Some` means the write
+/// asked to set it, and an empty string then asks to clear it. The three shapes
+/// that are not a string are read exactly as [`supplied_string_array`] reads
+/// them, and for the same reason: an empty value clears the field, so nothing
+/// this cannot read may be folded into one.
+///
+/// - `null` reads as absent. Several model providers encode "I am not setting
+///   this field" as an explicit null.
+/// - A value that is not a string is an error, because storing an empty string
+///   would answer a set with a wipe, and report success.
+///
+/// Text longer than `max_chars` is cut, never refused. The caller's real
+/// payload is elsewhere - this is a convenience line for a later reader - so
+/// losing the whole write over a long one is the wrong trade.
+fn supplied_one_line(
+    args: &serde_json::Value,
+    key: &str,
+    max_chars: usize,
+) -> Result<Option<String>, CoreError> {
+    let Some(value) = args.get(key) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let text = value.as_str().ok_or_else(|| {
+        CoreError::ToolExecution(format!(
+            "`{key}` must be a string, and this one is {}",
+            json_shape(value)
+        ))
+    })?;
+    Ok(Some(desktop_assistant_protocol::one_line(text, max_chars)))
 }
 
 /// Name the JSON shape of `value`, so an error can tell the caller what it

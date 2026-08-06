@@ -6,6 +6,11 @@ license = "AGPL-3.0-or-later"
 
 [dependencies]
 desktop-assistant-core.workspace = true
+# The shared display-line rule (`one_line`, `SUMMARY_MAX_CHARS`). Taken from the
+# crate that owns it rather than through `core`, so the tool boundary cuts a
+# knowledge summary exactly as every render site does. Path dependency, serde
+# only, no native tail.
+desktop-assistant-protocol.workspace = true
 serde.workspace = true
 serde_json = "1"
 tokio.workspace = true

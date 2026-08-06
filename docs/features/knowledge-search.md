@@ -29,6 +29,38 @@ The response therefore reports what was searched, not only what was found.
 | `scope_size` | `NONE`, `FEW`, `MANY`, or `UNKNOWN`. See below. |
 | `available_tags` | Tag names carried by entries in the scope, most frequent first with the tag name breaking ties. No counts. At most 50. Empty when `scope_size` is `UNKNOWN`. |
 
+## Where a summary comes from
+
+`builtin_knowledge_base_write` takes a `summary` argument, in the single form and
+inside each object of the batch `entries` form. The model writes it, one line,
+saying what the entry says rather than naming its topic — because that line is
+what the entry is later offered back as, and a topic label tells a reader nothing
+it can act on.
+
+The argument follows the same three-state rule every other optional field on that
+path follows:
+
+| The write sends | What happens |
+| --- | --- |
+| nothing, or `null` | The stored summary is kept. A create then stores none. |
+| a string | It is stored, cut to 200 characters and collapsed to one physical line. |
+| an empty string | The stored summary is cleared, and the entry reads back with no summary again. |
+| anything else | The write is refused, and nothing is stored. |
+
+Two boundaries hold, and both are deliberate:
+
+- **A write with no summary is not refused.** Refusing it would lose the fact to
+  gain a one-liner, which is the wrong trade for a memory store. An entry with no
+  summary is a gap the maintenance pass closes, and every read path reports it
+  honestly as `null` in the meantime.
+- **An over-long summary is cut, not refused.** A model that answers "one line"
+  with a paragraph loses the tail of the line, never the write.
+
+Cleared means absent, not empty: the store maps an empty summary to `NULL`. An
+empty string would be a third state nothing wants — a render site would print a
+blank row instead of falling back to the content, and the maintenance pass finds
+its work with `WHERE summary IS NULL`.
+
 ## Scope, not match count
 
 `scope_size` and `available_tags` both describe the **scope**: the entries that
@@ -196,4 +228,5 @@ census can report it.
 | The census SQL and both search arms | `crates/storage/src/knowledge.rs` |
 | Tool response and schema | `crates/mcp-client/src/builtin.rs` |
 | Census behaviour under a real database | `crates/storage/tests/knowledge_tag_census.rs` |
+| The summary's write rules under a real database | `crates/storage/tests/knowledge_summary.rs` |
 | Prompt guidance that consumes these fields | `crates/core/src/prompts/sections/knowledge_base.txt` |

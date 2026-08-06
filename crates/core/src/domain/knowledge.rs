@@ -28,7 +28,9 @@ pub struct KnowledgeEntry {
     ///
     /// On write, `None` preserves any existing value rather than clearing it -
     /// the same rule [`KnowledgeEntry::source`] follows, so a caller that knows
-    /// nothing about summaries cannot wipe one.
+    /// nothing about summaries cannot wipe one. An empty summary is the way to
+    /// clear a stored one, and the entry then reads back as `None` again; see
+    /// [`crate::ports::knowledge::KnowledgeBaseStore::write`].
     #[serde(default)]
     pub summary: Option<String>,
 }

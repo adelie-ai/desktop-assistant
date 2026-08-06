@@ -136,6 +136,13 @@ pub trait KnowledgeBaseStore: Send + Sync {
     /// stored value rather than clearing it, so a caller that knows nothing
     /// about them cannot wipe one.
     ///
+    /// `summary` carries one further meaning, so that a caller which wrote a
+    /// wrong summary can take it back: an **empty** summary clears the stored
+    /// one, and the entry then reads back with `None`. A cleared summary is
+    /// therefore indistinguishable from one never written, which is the point -
+    /// both are an entry with no short form, and the maintenance pass that
+    /// fills the field treats them alike.
+    ///
     /// An id held by an entry this caller cannot write - one that was retired,
     /// or one belonging to another user - is refused with
     /// `CoreError::InvalidInput`, and nothing is stored. A retired entry is
