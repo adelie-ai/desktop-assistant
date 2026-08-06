@@ -483,6 +483,12 @@ impl PgScratchpadStore {
     /// Both arms carry the full `user_id` / `conversation_id` / `owner_todo`
     /// scope. A predicate present on one arm and missing from the other would
     /// make the weaker arm a way around the confinement the other enforces.
+    ///
+    /// The final order breaks ties on `id`, which is unique, so two identical
+    /// searches return the same page. Fused scores collide readily -- a note
+    /// found by only one arm scores exactly `1/(60 + rank)` -- and without a
+    /// total order the rest is decided by physical row position, which moves
+    /// after any `VACUUM` or update.
     async fn search_hybrid(
         &self,
         conversation_id: &str,
@@ -558,7 +564,7 @@ impl PgScratchpadStore {
             )
             SELECT id, conversation_id, owner_todo, note_key, content, note_type,
                    seq, done, pinned, created_at, updated_at
-            FROM fused ORDER BY rrf_score DESC, updated_at DESC LIMIT $11",
+            FROM fused ORDER BY rrf_score DESC, updated_at DESC, id DESC LIMIT $11",
         )
         .bind(embedding_vec)
         .bind(user_id.as_str())

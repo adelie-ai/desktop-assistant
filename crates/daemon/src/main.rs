@@ -1715,16 +1715,15 @@ async fn main() -> Result<()> {
         // reading the per-turn / per-command `current_user_id()`. The SAME
         // closures back both the builtin tools (Adele's writes) and the API
         // handler (client writes), so a change from either path emits once.
-        // Every scratchpad write in the process goes through this one closure
-        // — the builtin tool, the plan-step notes `begin_step`/`complete_step`
-        // record, and a client's own write through the API — so embedding here
-        // covers all of them and nothing has to remember to do it (#717).
         //
-        // Inline rather than only in the background backfill because the case
-        // that matters for a pad is the agent looking for what it wrote moments
-        // ago, which is exactly the window the backfill's cadence leaves open.
-        // `embed_notes` is bounded by `EMBED_TIMEOUT`, so a wedged backend
-        // leaves the notes unembedded and the write still lands.
+        // That single funnel is also why the write closure embeds (#717): the
+        // builtin tool, the plan-step notes `begin_step`/`complete_step` record,
+        // and a client's own write all pass through here, so no writer has to
+        // remember to do it. Inline rather than only in the background backfill,
+        // because the case that matters for a pad is the agent looking for what
+        // it wrote moments ago — exactly the window the backfill's cadence
+        // leaves open. `embed_notes` is bounded by `EMBED_TIMEOUT`, so a wedged
+        // backend leaves the notes unembedded and the write still lands.
         let sp_w = Arc::clone(&sp_store);
         let reg_w = Arc::clone(&background_task_registry);
         let sp_embed = embedding_fn
