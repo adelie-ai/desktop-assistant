@@ -2919,6 +2919,18 @@ mod tests {
         BuiltinToolService,
         Arc<std::sync::Mutex<Vec<ScratchpadNote>>>,
     ) {
+        scratchpad_service_with_search(None)
+    }
+
+    /// As [`scratchpad_service`], but with `search` standing in for the
+    /// in-memory substring search, so a test can observe exactly what the tool
+    /// hands the store.
+    fn scratchpad_service_with_search(
+        search: Option<ScratchpadSearchFn>,
+    ) -> (
+        BuiltinToolService,
+        Arc<std::sync::Mutex<Vec<ScratchpadNote>>>,
+    ) {
         use std::pin::Pin;
         let store: Arc<std::sync::Mutex<Vec<ScratchpadNote>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -3012,24 +3024,31 @@ mod tests {
         );
 
         let s = Arc::clone(&store);
-        let search_fn: ScratchpadSearchFn = Arc::new(
-            move |conv: String, query: String, note_type: Option<String>, limit: usize| {
-                let store = Arc::clone(&s);
-                Box::pin(async move {
-                    let guard = store.lock().unwrap();
-                    Ok(guard
-                        .iter()
-                        .filter(|n| {
-                            n.conversation_id == conv
-                                && (n.content.contains(&query) || n.key.contains(&query))
-                                && note_type.as_deref().is_none_or(|t| n.note_type == t)
-                        })
-                        .take(limit)
-                        .cloned()
-                        .collect())
-                })
-            },
-        );
+        let search_fn: ScratchpadSearchFn = search.unwrap_or_else(|| {
+            Arc::new(
+                move |conv: String,
+                      query: String,
+                      _query_embedding: Vec<f32>,
+                      _embedding_model: String,
+                      note_type: Option<String>,
+                      limit: usize| {
+                    let store = Arc::clone(&s);
+                    Box::pin(async move {
+                        let guard = store.lock().unwrap();
+                        Ok(guard
+                            .iter()
+                            .filter(|n| {
+                                n.conversation_id == conv
+                                    && (n.content.contains(&query) || n.key.contains(&query))
+                                    && note_type.as_deref().is_none_or(|t| n.note_type == t)
+                            })
+                            .take(limit)
+                            .cloned()
+                            .collect())
+                    })
+                },
+            )
+        });
 
         let d = Arc::clone(&store);
         let delete_many_fn: ScratchpadDeleteManyFn =
@@ -3628,6 +3647,87 @@ mod tests {
             assert_eq!(results["results"][0]["key"], "t1");
         })
         .await;
+    }
+
+    /// Somewhere to record the `(query vector, model)` pair the search tool
+    /// hands the store.
+    type QueryRecorder = Arc<std::sync::Mutex<Option<(Vec<f32>, String)>>>;
+
+    fn query_recorder() -> QueryRecorder {
+        Arc::new(std::sync::Mutex::new(None))
+    }
+
+    /// A scratchpad search that records what it was handed and returns nothing.
+    fn recording_search(recorder: &QueryRecorder) -> ScratchpadSearchFn {
+        let recorder = Arc::clone(recorder);
+        Arc::new(
+            move |_conv: String,
+                  _query: String,
+                  embedding: Vec<f32>,
+                  model: String,
+                  _note_type: Option<String>,
+                  _limit: usize| {
+                let recorder = Arc::clone(&recorder);
+                Box::pin(async move {
+                    *recorder.lock().unwrap() = Some((embedding, model));
+                    Ok(Vec::new())
+                })
+            },
+        )
+    }
+
+    /// Acceptance (#717): the tool embeds the query and hands the vector to the
+    /// store together with the model that produced it. Without the pair the
+    /// store's vector arm can never run, and a vector paired with the wrong
+    /// model name searches rows of another dimension -- which pgvector answers
+    /// with an error, not a miss.
+    #[tokio::test]
+    async fn scratchpad_search_passes_the_query_embedding_and_its_model_to_the_store() {
+        let seen = query_recorder();
+        let embed: EmbedFn = Arc::new(|_| Box::pin(async { Ok(vec![vec![0.5_f32, 0.25]]) }));
+
+        let (base, _store) = scratchpad_service_with_search(Some(recording_search(&seen)));
+        let service = base.with_embedding(embed, "nomic-embed-text@abc".to_string());
+
+        with_conversation_id(ConversationId::from("c1"), async {
+            service
+                .execute_tool(
+                    TOOL_SCRATCHPAD_SEARCH,
+                    serde_json::json!({"query": "stay hydrated", "max_results": 10}),
+                )
+                .await
+                .unwrap();
+        })
+        .await;
+
+        let recorded = seen.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            Some((vec![0.5_f32, 0.25], "nomic-embed-text@abc".to_string())),
+            "the query vector and its model must both reach the store"
+        );
+    }
+
+    /// With no embedding backend the tool still searches, handing over an empty
+    /// vector -- the store reads that as "take the full-text path".
+    #[tokio::test]
+    async fn scratchpad_search_without_an_embedding_backend_passes_an_empty_vector() {
+        let seen = query_recorder();
+        let (service, _store) = scratchpad_service_with_search(Some(recording_search(&seen)));
+
+        with_conversation_id(ConversationId::from("c1"), async {
+            service
+                .execute_tool(
+                    TOOL_SCRATCHPAD_SEARCH,
+                    serde_json::json!({"query": "deploy", "max_results": 10}),
+                )
+                .await
+                .unwrap();
+        })
+        .await;
+
+        let recorded = seen.lock().unwrap().clone();
+        assert_eq!(recorded, Some((Vec::new(), String::new())));
     }
 
     #[tokio::test]

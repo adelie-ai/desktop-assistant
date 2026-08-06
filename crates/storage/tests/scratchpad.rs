@@ -224,12 +224,15 @@ async fn search_matches_full_text() {
             .await
             .expect("write");
 
-            let hits = pad.search("c1", "deploy", None, 50).await.expect("search");
+            let hits = pad
+                .search("c1", "deploy", Vec::new(), "", None, 50)
+                .await
+                .expect("search");
             assert_eq!(hits.len(), 1, "only the deploy note should match");
             assert_eq!(hits[0].key, "deploy");
 
             let none = pad
-                .search("c1", "bicycle", None, 50)
+                .search("c1", "bicycle", Vec::new(), "", None, 50)
                 .await
                 .expect("search empty");
             assert!(none.is_empty());
@@ -332,7 +335,7 @@ async fn cross_user_isolation() {
                     .is_empty()
             );
             assert!(
-                pad.search("c1", "secret", None, 50)
+                pad.search("c1", "secret", Vec::new(), "", None, 50)
                     .await
                     .unwrap()
                     .is_empty()
@@ -575,10 +578,13 @@ async fn list_and_search_filter_by_type() {
             assert_eq!(todos[0].key, "t1");
 
             // Both notes match the FTS query; the type filter narrows to one.
-            let all_hits = pad.search("c1", "deploy", None, 50).await.expect("search");
+            let all_hits = pad
+                .search("c1", "deploy", Vec::new(), "", None, 50)
+                .await
+                .expect("search");
             assert_eq!(all_hits.len(), 2);
             let todo_hits = pad
-                .search("c1", "deploy", Some("todo"), 50)
+                .search("c1", "deploy", Vec::new(), "", Some("todo"), 50)
                 .await
                 .expect("search todos");
             assert_eq!(todo_hits.len(), 1);
