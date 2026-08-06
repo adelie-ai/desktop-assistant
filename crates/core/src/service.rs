@@ -585,6 +585,33 @@ struct ScratchpadSurfaces {
     /// nothing is pinned. Unlike the index this is not gated: it renders every
     /// turn it is `Some`.
     pinned: Option<String>,
+    /// The note keys `scratchpad_index` names, when it renders (#1101). The
+    /// `[Recall]` block drops a key already in this list rather than offering
+    /// the same note a second time.
+    indexed_keys: Vec<String>,
+    /// The note keys `plan` names: every step it lists and every finding it
+    /// nests beneath one (#1101). A step whose finding the tree has already
+    /// rolled up is deliberately absent - that note is durable and invisible,
+    /// which is what the recall arm is for.
+    planned_keys: Vec<String>,
+    /// The ids of the knowledge entries this round's pinned notes attach and
+    /// the round resolved (#1104). `[Recall]` drops these from its knowledge
+    /// arm, because `[Pinned]` already carries their live content.
+    pinned_entry_ids: Vec<String>,
+}
+
+/// What this turn's one recall lookup produced, and how far it was asked to
+/// read (#1100, #1101).
+///
+/// The ceilings travel with the answer because the block's "and N more matched
+/// less closely" line is a lower bound exactly when a scan filled up. A count
+/// that reports itself as exact when the scan actually filled is the one
+/// dishonesty the block must not commit, so the request's limits and the
+/// render's are the same values rather than two constants that happen to agree.
+struct RecallLookup {
+    candidates: crate::ports::recall::RecallCandidates,
+    entry_scan_limit: usize,
+    note_scan_limit: usize,
 }
 
 /// The text a step note records: the model's own wording in a clean turn, a
@@ -1063,6 +1090,22 @@ impl<S, L, T> ConversationHandler<S, L, T> {
                 &keys,
                 planning::MAX_SCRATCHPAD_INDEX_KEYS,
             ),
+            indexed_keys: planning::listed_scratchpad_keys(
+                &keys,
+                planning::MAX_SCRATCHPAD_INDEX_KEYS,
+            )
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+            planned_keys: planning::plan_note_keys(&raw, current_key, planning::MAX_PLAN_ITEMS),
+            // The attachments the round resolved, which is what `[Pinned]`
+            // renders. A pin the byte budget cut short is still counted here:
+            // the block says so in its own words, so over-suppressing there is
+            // safer than offering the model the same entry twice.
+            pinned_entry_ids: resolved
+                .as_ref()
+                .map(|found| found.iter().map(|e| e.id.clone()).collect())
+                .unwrap_or_default(),
             working_state: planning::WorkingState::from_notes(&raw),
             // Free: rendered from the notes already in hand, so the always-on
             // block costs no extra storage round-trip. `list` orders pinned
@@ -1148,19 +1191,25 @@ impl<S, L, T> ConversationHandler<S, L, T> {
         }
     }
 
-    /// Render the `[Recall]` block for this turn's user prompt (#1100), or
-    /// `None` when there is nothing worth showing.
+    /// Run this turn's one pre-prompt recall lookup (#1100, #1101), or `None`
+    /// when there is nothing to look up or the lookup could not answer.
     ///
     /// Once per turn, not once per round: the block answers "what might this
-    /// prompt be about?", which the user prompt asks once.
+    /// prompt be about?", which the user prompt asks once. What comes back is
+    /// candidates rather than a rendered block, because the render also depends
+    /// on what the rest of the turn's prompt shows - see `recall::RecallSurface`
+    /// and `context::surfaced_blocks`.
     ///
-    /// **Recall never fails a turn.** No lookup wired, an empty prompt, a
-    /// lookup that errored, or a lookup whose candidates all fell below the
-    /// relevance floor all give the same answer - no block - and the turn
+    /// **Recall never fails a turn.** No lookup wired, an empty prompt, or a
+    /// lookup that errored all give the same answer - no block - and the turn
     /// proceeds. The lookup itself bounds its embedding call and degrades to
     /// full-text; a failure that reaches here is one it could not absorb, and
     /// it is logged once rather than once per arm.
-    async fn render_recall_surface(&self, prompt: &str) -> Option<String> {
+    async fn recall_lookup(
+        &self,
+        prompt: &str,
+        conversation_id: &ConversationId,
+    ) -> Option<RecallLookup> {
         let lookup = self.recall_search.as_ref()?;
         if prompt.trim().is_empty() {
             return None;
@@ -1168,12 +1217,19 @@ impl<S, L, T> ConversationHandler<S, L, T> {
 
         let request = RecallRequest {
             prompt: prompt.to_string(),
+            conversation_id: conversation_id.0.clone(),
             entry_limit: crate::recall::RECALL_ENTRY_SCAN_LIMIT,
+            note_limit: crate::recall::RECALL_NOTE_SCAN_LIMIT,
             tag_limit: crate::recall::RECALL_TAG_SCAN_LIMIT,
         };
-        let entry_limit = request.entry_limit;
+        let entry_scan_limit = request.entry_limit;
+        let note_scan_limit = request.note_limit;
         match lookup(request).await {
-            Ok(candidates) => crate::recall::render_recall(&candidates, entry_limit),
+            Ok(candidates) => Some(RecallLookup {
+                candidates,
+                entry_scan_limit,
+                note_scan_limit,
+            }),
             Err(e) => {
                 tracing::warn!(error = %e, "pre-prompt recall lookup failed; continuing without it");
                 None
@@ -1779,10 +1835,11 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         // and travels with the floor, because it cannot change mid-turn.
         let mut narration_floor = NarrationFloor::new(current_turn_interactivity());
 
-        // Pre-prompt recall (#1100), computed once for the whole turn. The
-        // block is gated to the first round in `surfaced_blocks`, so it is
-        // simply carried through the later ones rather than looked up again.
-        let recall = self.render_recall_surface(&prompt).await;
+        // Pre-prompt recall (#1100, #1101), looked up once for the whole turn.
+        // The block is gated to the first round in `surfaced_blocks`, and
+        // rendered there too, because what it may show depends on what the
+        // other blocks of that round already show.
+        let recall = self.recall_lookup(&prompt, conversation_id).await;
 
         for round in 0..MAX_TOOL_ROUNDS {
             // Between-rounds cancellation checkpoint (issue #109): if the
@@ -1893,6 +1950,23 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 .render_scratchpad_surfaces(conversation_id, current_step.as_deref())
                 .await;
 
+            // The turn's candidates, plus what this round's other blocks already
+            // show, so the recall render never offers the same memory twice
+            // (#1101). Rebuilt each round because the pad read above is: a note
+            // pinned or written mid-turn changes what is in view.
+            let recall_surface = recall.as_ref().map(|found| {
+                crate::recall::RecallSurface::new(
+                    &found.candidates,
+                    found.entry_scan_limit,
+                    found.note_scan_limit,
+                )
+                .already_in_view(
+                    &surfaces.indexed_keys,
+                    &surfaces.planned_keys,
+                    &surfaces.pinned_entry_ids,
+                )
+            });
+
             // The estimator borrows `&self.llm` so the closure is built
             // each iteration; constructing it is cheap (no allocation).
             let estimate = |text: &str| self.llm.estimate_tokens(text);
@@ -1913,7 +1987,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                     scratchpad_index: surfaces.scratchpad_index.as_deref(),
                     working_state: surfaces.working_state,
                     pinned: surfaces.pinned.as_deref(),
-                    recall: recall.as_deref(),
+                    recall: recall_surface,
                     tool_rounds_since_anchor,
                 },
                 target_window,
@@ -6275,10 +6349,43 @@ mod tests {
                         entry,
                         relevance: RecallRelevance::Distance(0.12),
                     }],
-                    tags: vec![],
+                    ..RecallCandidates::default()
                 })
             })
         })
+    }
+
+    /// A recall lookup that answers with one near scratchpad note.
+    fn recall_note_hit() -> crate::ports::recall::RecallSearchFn {
+        use crate::ports::recall::{RecallCandidates, RecallNote, RecallRelevance};
+        Arc::new(move |_request| {
+            Box::pin(async move {
+                Ok(RecallCandidates {
+                    notes: vec![RecallNote {
+                        key: "deploy-window".to_string(),
+                        content: "Fridays after 18:00, never before".to_string(),
+                        pinned: false,
+                        relevance: RecallRelevance::Distance(0.12),
+                    }],
+                    ..RecallCandidates::default()
+                })
+            })
+        })
+    }
+
+    /// A recall lookup that records every request it is handed.
+    fn recording_recall() -> (
+        crate::ports::recall::RecallSearchFn,
+        Arc<Mutex<Vec<crate::ports::recall::RecallRequest>>>,
+    ) {
+        let seen: Arc<Mutex<Vec<crate::ports::recall::RecallRequest>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let lookup: crate::ports::recall::RecallSearchFn = Arc::new(move |request| {
+            recorder.lock().unwrap().push(request);
+            Box::pin(async move { Ok(crate::ports::recall::RecallCandidates::default()) })
+        });
+        (lookup, seen)
     }
 
     /// Run one turn against a capturing LLM and return every message list it
@@ -6478,6 +6585,61 @@ mod tests {
         assert!(
             recall_block(&captured.lock().unwrap()).is_none(),
             "a failed lookup emits no block"
+        );
+    }
+
+    // --- The scratchpad arm (#1101) -----------------------------------------
+
+    /// Acceptance (#1101): the pad is per-conversation by design, so the lookup
+    /// names the conversation it is running in. Reaching across conversations
+    /// would put another task's working notes in front of the model as this
+    /// task's own.
+    #[tokio::test]
+    async fn recall_block_scratchpad_arm_stays_within_the_current_conversation() {
+        let (lookup, seen) = recording_recall();
+        let handler =
+            ConversationHandler::new(MockStore::new(), MockLlm::new(vec!["ok"]), id_gen())
+                .with_recall_search(lookup);
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+
+        handler
+            .send_prompt(
+                &conv.id,
+                "when can we deploy?".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await
+            .unwrap();
+
+        let requests = seen.lock().unwrap();
+        assert_eq!(requests.len(), 1, "one lookup per turn");
+        assert_eq!(
+            requests[0].conversation_id, conv.id.0,
+            "the lookup must name this conversation's own pad"
+        );
+        assert_eq!(
+            requests[0].note_limit,
+            crate::recall::RECALL_NOTE_SCAN_LIMIT,
+            "the note arm reads to the ceiling the block's count is measured against"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_scratchpad_note_near_the_prompt_reaches_the_model() {
+        let rounds = capture_rounds("when can we deploy?", |h| {
+            h.with_recall_search(recall_note_hit())
+        })
+        .await;
+
+        let block = recall_block(&rounds).expect("a near note must surface");
+        assert!(block.contains("deploy-window"), "{block}");
+        assert!(
+            block.contains("Fridays after 18:00, never before"),
+            "{block}"
         );
     }
 

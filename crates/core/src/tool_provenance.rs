@@ -842,6 +842,13 @@ pub fn subagent_payload_carries_an_answer(result: &str) -> bool {
 /// general answer is the durable taint marker that would let a rendered
 /// surface carry its own provenance, not a third special case here.
 ///
+/// The `[Recall]` block's scratchpad arm (#1101) would be a second such route,
+/// and a far wider one - it renders pad notes into a system block on every
+/// turn, with no pin and no model choice. It closes it by dropping a stamped
+/// note instead of rendering it. Dropping rather than tainting, because the
+/// note is durable and closing the gate whenever it ranked near the prompt
+/// would degrade the conversation permanently.
+///
 /// A pinned note may also attach a knowledge entry (#1104), whose content
 /// renders into every later turn by the same route, so the same gap now reaches
 /// the knowledge base. Two things bound it and neither closes it. Writing an

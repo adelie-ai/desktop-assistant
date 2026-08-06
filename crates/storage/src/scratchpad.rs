@@ -15,11 +15,20 @@
 //! - `search` is hybrid: a vector arm and a `plainto_tsquery` / `ts_rank_cd`
 //!   arm fused by reciprocal rank, exactly as `PgKnowledgeBaseStore` does it
 //!   (#717).
+//! - [`PgScratchpadStore::nearest_by_embedding`] and
+//!   [`PgScratchpadStore::search_text_any_term`] are the two reads behind the
+//!   scratchpad arm of the `[Recall]` block (#1101). They answer a different
+//!   question from `search` - "what is near this whole user sentence", not
+//!   "find what I asked for" - so they rank differently, and neither replaces
+//!   the other. Both leave out the reserved `goal` note, which every turn
+//!   already renders as `[Current task]`.
 
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::ScratchpadNote;
 use desktop_assistant_core::ports::auth::current_user_id;
-use desktop_assistant_core::ports::scratchpad::{NewScratchpadNote, ScratchpadStore};
+use desktop_assistant_core::ports::scratchpad::{
+    NewScratchpadNote, SCRATCHPAD_GOAL_KEY, ScratchpadStore,
+};
 use desktop_assistant_core::ports::scratchpad_scope::{
     current_ancestors, current_owner_todo, current_visible_before,
 };
@@ -60,6 +69,15 @@ impl PgScratchpadStore {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
+}
+
+/// An [`SpRow`] plus the cosine distance that ranked it, for
+/// [`PgScratchpadStore::nearest_by_embedding`].
+#[derive(sqlx::FromRow)]
+struct SpNearestRow {
+    #[sqlx(flatten)]
+    row: SpRow,
+    distance: f64,
 }
 
 #[derive(sqlx::FromRow)]
@@ -489,6 +507,179 @@ impl ScratchpadStore for PgScratchpadStore {
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;
         Ok(result.rows_affected())
+    }
+}
+
+/// The two reads behind the scratchpad arm of the `[Recall]` block (#1101).
+///
+/// The block searches this conversation's pad with the same prompt embedding it
+/// asks the knowledge base, so a note the model stashed earlier comes back when
+/// the prompt is about it - rather than only once the `[Scratchpad]` index
+/// opens, which is gated on context starting to drop.
+///
+/// Neither read is on [`ScratchpadStore`], for the same reason
+/// `PgKnowledgeBaseStore::nearest_by_embedding` is not on its trait: they serve
+/// one caller with one ranking need, and the port is what the tools use.
+///
+/// ## Both leave out the `goal` note
+///
+/// One exclusion, and only one, belongs in the query. The reserved `goal` note
+/// is what every turn renders as `[Current task]`, and it is by construction the
+/// pad row nearest a prompt about the current task - so without this the arm
+/// would spend its first line restating the task the prompt already carries, on
+/// every turn. Excluding it here rather than after the read means it never
+/// occupies a slot in the scan the block's "and N more" count is measured
+/// against. The key is bound from the core constant that defines it.
+///
+/// Nothing else is excluded here, and the omission is deliberate. A `todo` step
+/// and an `outcome:<step>` finding are rendered by `[Plan]` only while the tree
+/// still shows them: a finding is dropped once its parent step is done, and the
+/// tree elides past its cap. Such a note is then durable and invisible, which is
+/// exactly the condition this arm exists for. What the turn actually showed is
+/// the core's business, and it drops those keys at render time.
+impl PgScratchpadStore {
+    /// The conversation's notes nearest a query embedding, with the cosine
+    /// distance that put them there, nearest first.
+    ///
+    /// A plain vector search rather than the hybrid [`ScratchpadStore::search`],
+    /// because the block applies a relevance floor and a fused RRF score is not
+    /// a quantity a floor can be set against: over a hybrid search every row
+    /// scores non-zero against any query. A cosine distance is comparable, so a
+    /// floor over it means something.
+    ///
+    /// Scoped by an explicit `WHERE user_id` **and** `conversation_id`
+    /// predicate, plus the caller's `owner_todo` read snapshot - the same three
+    /// bounds every other read here carries. Row-level security is a backstop
+    /// the table owner bypasses, so the predicates are the guard.
+    ///
+    /// The `goal` note is left out, as the impl block above states.
+    ///
+    /// `embedding_model` identifies the model that produced `query_embedding`,
+    /// and only rows embedded by that model take part, matched on the digest
+    /// half of the `<name>@<digest>` stamp wherever both sides carry one. A
+    /// comparison across models is a comparison across vector dimensions, which
+    /// the database answers with an error rather than a miss.
+    ///
+    /// Ties break on `id`, which is unique, so two identical reads return the
+    /// same page. Without a total order the rest is decided by physical row
+    /// position, which moves after any `VACUUM` or update - and notes written in
+    /// one batch carry one vector each, so exact ties are ordinary here.
+    ///
+    /// An empty `query_embedding` yields no rows: the vector operator raises on
+    /// a zero-dimension vector, and a caller with no embedding has
+    /// [`Self::search_text_any_term`] to fall back to.
+    pub async fn nearest_by_embedding(
+        &self,
+        conversation_id: &str,
+        query_embedding: Vec<f32>,
+        embedding_model: &str,
+        limit: usize,
+    ) -> Result<Vec<(ScratchpadNote, f64)>, CoreError> {
+        if query_embedding.is_empty() {
+            return Ok(Vec::new());
+        }
+        let user_id = current_user_id();
+        let (vb, me, ancestors) = read_snapshot();
+        let rows: Vec<SpNearestRow> = sqlx::query_as(
+            "SELECT id, conversation_id, owner_todo, note_key, content, note_type,
+                    seq, done, pinned, knowledge_entry_id, created_at, updated_at,
+                    MIN(chunk <=> $1) AS distance
+             FROM scratchpads, unnest(embedding) AS chunk
+             WHERE user_id = $2 AND conversation_id = $3
+               AND ($4::text IS NULL OR (owner_todo = $5 OR owner_todo LIKE $5 || '.%'
+                    OR (id COLLATE \"C\" < $4 AND owner_todo = ANY($6::text[]))))
+               AND note_key <> $9
+               AND embedding IS NOT NULL
+               AND embedding_model IS NOT NULL
+               AND (embedding_model = $7
+                    OR (split_part($7, '@', 2) <> ''
+                        AND split_part(embedding_model, '@', 2)
+                            = split_part($7, '@', 2)))
+             GROUP BY id, conversation_id, owner_todo, note_key, content, note_type,
+                      seq, done, pinned, knowledge_entry_id, created_at, updated_at
+             ORDER BY distance, id DESC
+             LIMIT $8",
+        )
+        .bind(Vector::from(query_embedding))
+        .bind(user_id.as_str())
+        .bind(conversation_id)
+        .bind(vb)
+        .bind(me)
+        .bind(ancestors)
+        .bind(embedding_model)
+        .bind(limit as i64)
+        .bind(SCRATCHPAD_GOAL_KEY)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CoreError::Storage(e.to_string()))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let distance = r.distance;
+                (r.row.into_note(), distance)
+            })
+            .collect())
+    }
+
+    /// Full-text search over the conversation's notes that asks for **any** of
+    /// the query's terms, best match first.
+    ///
+    /// The degraded arm, for the turn where no embedding is available. It
+    /// cannot be the adapter's own `search_text`: `plainto_tsquery` joins every
+    /// surviving lexeme with `AND`, which is right for a model-authored search of two or
+    /// three words and wrong for a whole user sentence. "when is the next
+    /// deploy?" becomes `'next' & 'deploy'`, and a note saying "the deploy runs
+    /// on Fridays" does not match, because it never says "next". The fallback
+    /// would then answer with nothing at exactly the moment it exists to answer
+    /// with something (#1100).
+    ///
+    /// The query is built from `to_tsvector`'s own lexemes, so stop words and
+    /// stemming are handled once by the same configuration the index uses, and
+    /// `quote_literal` makes every lexeme a literal - a prompt full of
+    /// `tsquery` operators is text, not syntax. A prompt that reduces to no
+    /// lexemes at all yields a NULL query, which matches no row.
+    ///
+    /// Carries the same `user_id` / `conversation_id` / `owner_todo` scope as
+    /// every other read here, and leaves out the same `goal` note as
+    /// [`Self::nearest_by_embedding`].
+    pub async fn search_text_any_term(
+        &self,
+        conversation_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<ScratchpadNote>, CoreError> {
+        let user_id = current_user_id();
+        let (vb, me, ancestors) = read_snapshot();
+        let rows: Vec<SpRow> = sqlx::query_as(
+            "WITH q AS (
+                 SELECT to_tsquery('english', string_agg(quote_literal(lexeme), ' | ')) AS query
+                 FROM unnest(to_tsvector('english', $1))
+             )
+             SELECT id, conversation_id, owner_todo, note_key, content, note_type,
+                    seq, done, pinned, knowledge_entry_id, created_at, updated_at
+             FROM scratchpads, q
+             WHERE user_id = $2 AND conversation_id = $3
+               AND q.query IS NOT NULL
+               AND tsv @@ q.query
+               AND ($4::text IS NULL OR (owner_todo = $5 OR owner_todo LIKE $5 || '.%'
+                    OR (id COLLATE \"C\" < $4 AND owner_todo = ANY($6::text[]))))
+               AND note_key <> $8
+             ORDER BY ts_rank_cd(tsv, q.query) DESC, updated_at DESC, id DESC
+             LIMIT $7",
+        )
+        .bind(query)
+        .bind(user_id.as_str())
+        .bind(conversation_id)
+        .bind(vb)
+        .bind(me)
+        .bind(ancestors)
+        .bind(limit as i64)
+        .bind(SCRATCHPAD_GOAL_KEY)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CoreError::Storage(e.to_string()))?;
+        Ok(rows.into_iter().map(SpRow::into_note).collect())
     }
 }
 

@@ -16,6 +16,8 @@ A turn may open with a [Recall] block: knowledge entries that a search of your o
 
 Each line is one entry: its id, its tags, and one line that stands in for it. That line may be a written summary, or it may be the opening of the content, and you cannot tell which from the line. Never answer from it. When a line looks relevant, read the entry with builtin_knowledge_base_get; it takes a batch of ids, so several candidates cost one call. Ignoring the whole block is a normal outcome and costs nothing.
 
+The block may also list notes from this conversation's own scratchpad, under their own heading. Each of those lines is a note key and the start of what the note says - not a knowledge entry, so builtin_knowledge_base_get does not take one. Read the note back with builtin_scratchpad_search when the start of it is not enough. A note that is already shown elsewhere in the turn is left out of the block, so what appears there is material nothing else is showing you.
+
 The block may also offer tag names. They are registered tags of this store, so they are real names and not guesses. They are the same vocabulary `available_tags` reports after a search, offered before you make one. Search with one, or filter on one. If a filter on one returns nothing, drop the filter: no entry in that scope carries that tag.
 
 The block never replaces a search. It appears once, at the start of a turn, and it is built from the user's prompt, not from the question you would ask. An absent block is not evidence that the store is empty, so SEARCH BEFORE ASKING still applies.

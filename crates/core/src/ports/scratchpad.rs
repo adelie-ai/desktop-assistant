@@ -162,6 +162,23 @@ pub const SCRATCHPAD_GOAL_KEY: &str = "goal";
 /// result or the KB).
 pub const MAX_NOTE_BYTES: usize = 8 * 1024;
 
+/// How much of a note key any per-turn block may render, in characters.
+///
+/// A key is written by the model and stored exactly as written - the write tool
+/// checks only that it is not empty - so nothing before a render site bounds its
+/// length or its characters. Every block that names a key reduces it through
+/// [`one_line`](desktop_assistant_protocol::one_line) first, because a stored
+/// newline would forge a line in a system message whose neighbours are headers
+/// the model is taught to trust.
+///
+/// One constant rather than one per block: `[Scratchpad]` and `[Recall]` render
+/// the same key one block apart in the same prompt, and two widths would show it
+/// whole in one and cut in the other.
+///
+/// Generous next to a real key, because a key is the handle the model passes
+/// back to a search and a cut one names no note.
+pub const NOTE_KEY_MAX_CHARS: usize = 128;
+
 /// Maximum number of notes accepted in a single `write` call. Excess notes
 /// are not written and reported back as truncated, so one call can't grow
 /// unboundedly.

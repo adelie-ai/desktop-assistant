@@ -200,12 +200,17 @@ pub(crate) struct TurnAnchors<'a> {
     /// (#1104). Ungated — unlike `scratchpad_index`, it renders every turn
     /// whenever anything is pinned.
     pub pinned: Option<&'a str>,
-    /// Rendered `[Recall]` block (#1100): candidate memory the user's prompt
-    /// may be about, found by a semantic lookup the model did not have to ask
-    /// for. Rendered on the **first round of a turn only** - see
-    /// [`surfaced_blocks`] - so it is produced once per turn and simply carried
-    /// through the later rounds.
-    pub recall: Option<&'a str>,
+    /// Candidate memory for the `[Recall]` block (#1100, #1101): what the
+    /// user's prompt may be about, found by a semantic lookup the model did not
+    /// have to ask for.
+    ///
+    /// Candidates rather than a rendered block, because two of the rules that
+    /// decide what may appear in it are settled here and not by the producer:
+    /// the block renders on the **first round of a turn only**, and it must not
+    /// repeat a scratchpad key the `[Scratchpad]` index has just listed - and
+    /// whether that index speaks depends on the window this assembly chose.
+    /// The lookup still runs once per turn; only the rendering is here.
+    pub recall: Option<crate::recall::RecallSurface<'a>>,
     /// Counts behind the always-on `[Working state]` nudge (#598), carried as
     /// counts rather than a rendered line so the block can drop whichever half
     /// a fuller block covers on this particular turn.
@@ -933,7 +938,9 @@ fn system_block(
 ///   "is this still in view?". This one answers "what might this prompt be
 ///   about?", which the user prompt asks once, so repeating it across twenty
 ///   tool rounds would spend thousands of tokens on an answer the model has
-///   already taken or ignored.
+///   already taken or ignored. It also yields to the two blocks above: a memory
+///   `[Pinned]` or `[Scratchpad]` already shows is dropped from it rather than
+///   paid for twice (#1101).
 fn surfaced_blocks(
     anchors: &TurnAnchors,
     ambient: &AmbientContext,
@@ -1043,11 +1050,30 @@ fn surfaced_blocks(
     // follows: it is the least authoritative block here - a hint about what the
     // prompt may be about, which the model is told to ignore where it does not
     // fit. The first-round gate is what bounds its cost.
-    if let Some(recall) = anchors
-        .recall
-        .filter(|r| !r.is_empty() && anchors.tool_rounds_since_anchor == 0)
+    //
+    // The two decisions just taken above feed the render: recall drops a note
+    // `[Scratchpad]` has listed and a step or finding `[Plan]` has named (#1101),
+    // and when either block is silent it drops nothing for it - the silent index
+    // is the case the scratchpad arm exists for.
+    if anchors.tool_rounds_since_anchor == 0
+        && let Some(surface) = anchors.recall
     {
-        blocks.push(Message::new(Role::System, format!("[Recall] {recall}")));
+        let surface = crate::recall::RecallSurface {
+            indexed_keys: if scratchpad_index.is_some() {
+                surface.indexed_keys
+            } else {
+                &[]
+            },
+            planned_keys: if plan.is_some() {
+                surface.planned_keys
+            } else {
+                &[]
+            },
+            ..surface
+        };
+        if let Some(recall) = crate::recall::render_recall(&surface) {
+            blocks.push(Message::new(Role::System, format!("[Recall] {recall}")));
+        }
     }
 
     blocks
@@ -3282,13 +3308,76 @@ mod tests {
 
     // --- #1100 [Recall] block ------------------------------------------------
 
+    /// One knowledge candidate, near enough to render.
+    fn recall_entry(id: &str, summary: &str) -> crate::ports::recall::RecallEntry {
+        let mut entry = crate::domain::KnowledgeEntry::new(id, "body", vec![]);
+        entry.summary = Some(summary.to_string());
+        crate::ports::recall::RecallEntry {
+            entry,
+            relevance: crate::ports::recall::RecallRelevance::Distance(0.10),
+        }
+    }
+
+    /// One scratchpad candidate, near enough to render.
+    fn recall_note(key: &str, content: &str) -> crate::ports::recall::RecallNote {
+        crate::ports::recall::RecallNote {
+            key: key.to_string(),
+            content: content.to_string(),
+            pinned: false,
+            relevance: crate::ports::recall::RecallRelevance::Distance(0.10),
+        }
+    }
+
+    /// The turn's recall input. `indexed_keys` is what the `[Scratchpad]` index
+    /// lists *when it speaks*; whether it speaks is this builder's call, so the
+    /// keys travel in either way.
+    fn recall_surface<'a>(
+        candidates: &'a crate::ports::recall::RecallCandidates,
+        indexed_keys: &'a [String],
+    ) -> crate::recall::RecallSurface<'a> {
+        planned_recall_surface(candidates, indexed_keys, &[])
+    }
+
+    /// The same, plus the steps and findings `[Plan]` names when it renders.
+    fn planned_recall_surface<'a>(
+        candidates: &'a crate::ports::recall::RecallCandidates,
+        indexed_keys: &'a [String],
+        planned_keys: &'a [String],
+    ) -> crate::recall::RecallSurface<'a> {
+        crate::recall::RecallSurface::new(
+            candidates,
+            crate::recall::RECALL_ENTRY_SCAN_LIMIT,
+            crate::recall::RECALL_NOTE_SCAN_LIMIT,
+        )
+        .already_in_view(indexed_keys, planned_keys, &[])
+    }
+
+    /// A conversation long enough that assembly windows it, which is the signal
+    /// `[Scratchpad]` opens on.
+    fn windowed_messages() -> Vec<Message> {
+        let total = MAX_CONTEXT_MESSAGES + 5;
+        let mut msgs: Vec<Message> = Vec::with_capacity(total);
+        msgs.push(Message::new(Role::User, "original task"));
+        for i in 1..total {
+            if i % 2 == 0 {
+                msgs.push(Message::new(Role::User, format!("u-{i}")));
+            } else {
+                msgs.push(Message::new(Role::Assistant, format!("a-{i}")));
+            }
+        }
+        msgs
+    }
+
     #[test]
     fn recall_block_renders_only_on_the_first_round_of_a_turn() {
         // Every other block re-renders each round because each answers "is
         // this still in view?". This one answers "what might this prompt be
         // about?", and the prompt asks that once.
         let msgs = vec![Message::new(Role::User, "where does the registry live?")];
-        let body = "Memory that may relate.\n- kb-1 [infra] The registry is on the storage host";
+        let candidates = crate::ports::recall::RecallCandidates {
+            entries: vec![recall_entry("kb-1", "The registry is on the storage host")],
+            ..Default::default()
+        };
 
         let first = assemble_for_test(
             &ConversationView {
@@ -3297,7 +3386,7 @@ mod tests {
             },
             &ToolContext::default(),
             &TurnAnchors {
-                recall: Some(body),
+                recall: Some(recall_surface(&candidates, &[])),
                 tool_rounds_since_anchor: 0,
                 ..Default::default()
             },
@@ -3317,7 +3406,7 @@ mod tests {
                 },
                 &ToolContext::default(),
                 &TurnAnchors {
-                    recall: Some(body),
+                    recall: Some(recall_surface(&candidates, &[])),
                     tool_rounds_since_anchor: round,
                     ..Default::default()
                 },
@@ -3339,6 +3428,10 @@ mod tests {
         // the least authoritative block sits closest to the user prompt that
         // follows, so a hint is never read as a standing fact.
         let msgs = vec![Message::new(Role::User, "where does the registry live?")];
+        let candidates = crate::ports::recall::RecallCandidates {
+            entries: vec![recall_entry("kb-1", "The registry host")],
+            ..Default::default()
+        };
         let result = assemble_for_test(
             &ConversationView {
                 messages: &msgs,
@@ -3348,7 +3441,7 @@ mod tests {
             &TurnAnchors {
                 active_task: Some("where does the registry live?"),
                 pinned: Some("- api-quirk: /login is form-encoded, not JSON"),
-                recall: Some("Memory that may relate.\n- kb-1 [infra] The registry host"),
+                recall: Some(recall_surface(&candidates, &[])),
                 tool_rounds_since_anchor: 0,
                 ..Default::default()
             },
@@ -3372,10 +3465,11 @@ mod tests {
 
     #[test]
     fn recall_block_is_absent_when_the_lookup_produced_nothing() {
-        // No candidate cleared a floor, so the producer hands over nothing and
-        // the seam emits no empty block.
+        // No candidate cleared a floor, so the block renders to nothing and the
+        // seam emits no empty message.
         let msgs = vec![Message::new(Role::User, "thanks")];
-        for recall in [None, Some("")] {
+        let empty = crate::ports::recall::RecallCandidates::default();
+        for recall in [None, Some(recall_surface(&empty, &[]))] {
             let result = assemble_for_test(
                 &ConversationView {
                     messages: &msgs,
@@ -3391,9 +3485,97 @@ mod tests {
             );
             assert!(
                 recall_text(&result).is_none(),
-                "no [Recall] block when there is nothing to recall (recall = {recall:?})"
+                "no [Recall] block when there is nothing to recall"
             );
         }
+    }
+
+    // --- #1101 the scratchpad arm -------------------------------------------
+
+    /// Acceptance (#1101): the case the arm exists for. A short, fully-visible
+    /// turn keeps `[Scratchpad]` silent, so a note stashed earlier is durable
+    /// and invisible - and a prompt that is exactly about it must still find it.
+    #[test]
+    fn recall_block_surfaces_a_note_the_scratchpad_index_is_still_gating() {
+        let msgs = vec![
+            Message::new(Role::User, "when can we deploy?"),
+            Message::new(Role::Assistant, "checking"),
+        ];
+        let index = "Notes you've stashed (read with builtin_scratchpad_search): deploy-window.";
+        let candidates = crate::ports::recall::RecallCandidates {
+            notes: vec![recall_note("deploy-window", "Fridays after 18:00")],
+            ..Default::default()
+        };
+        let indexed = vec!["deploy-window".to_string()];
+
+        let result = assemble_for_test(
+            &ConversationView {
+                messages: &msgs,
+                ..Default::default()
+            },
+            &ToolContext::default(),
+            &TurnAnchors {
+                active_task: Some("when can we deploy?"),
+                scratchpad_index: Some(index),
+                recall: Some(recall_surface(&candidates, &indexed)),
+                tool_rounds_since_anchor: 0,
+                ..Default::default()
+            },
+            None,
+            &default_estimate,
+        );
+
+        assert!(
+            scratchpad_index_text(&result).is_none(),
+            "precondition: [Scratchpad] is gated silent on a short, visible turn"
+        );
+        let text = recall_text(&result).expect("[Recall] must carry the note nothing else shows");
+        assert!(text.contains("deploy-window"), "{text}");
+        assert!(text.contains("Fridays after 18:00"), "{text}");
+    }
+
+    /// Acceptance (#1101): once the index has spoken, the key is in view and
+    /// recall must not pay for it a second time.
+    #[test]
+    fn recall_block_omits_a_note_already_listed_in_the_scratchpad_index() {
+        let msgs = windowed_messages();
+        let index = "Notes you've stashed (read with builtin_scratchpad_search): deploy-window.";
+        let candidates = crate::ports::recall::RecallCandidates {
+            entries: vec![recall_entry("kb-1", "The registry is on the storage host")],
+            notes: vec![recall_note("deploy-window", "Fridays after 18:00")],
+            ..Default::default()
+        };
+        let indexed = vec!["deploy-window".to_string()];
+
+        let result = assemble_for_test(
+            &ConversationView {
+                messages: &msgs,
+                ..Default::default()
+            },
+            &ToolContext::default(),
+            &TurnAnchors {
+                scratchpad_index: Some(index),
+                recall: Some(recall_surface(&candidates, &indexed)),
+                tool_rounds_since_anchor: 0,
+                ..Default::default()
+            },
+            None,
+            &default_estimate,
+        );
+
+        assert!(
+            scratchpad_index_text(&result).is_some(),
+            "precondition: windowing has opened [Scratchpad]"
+        );
+        let text = recall_text(&result).expect("the knowledge arm still renders");
+        assert!(
+            !text.contains("Fridays after 18:00"),
+            "the index already named this key: {text}"
+        );
+        assert!(
+            text.contains("the storage host"),
+            "dropping one note must not silence the rest of the block: {text}"
+        );
     }
 
     // --- #597 [Pinned] block -------------------------------------------------
