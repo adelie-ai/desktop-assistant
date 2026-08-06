@@ -88,6 +88,12 @@ candidates cost one call. It never answers from a line.
 **That ignoring the block is ordinary.** The block fires on every prompt, so a
 set that does not fit the work is a set to drop, and dropping it costs nothing.
 
+**What a scratchpad line is.** A note key and the start of what the note says,
+under its own heading - not a knowledge entry, so `builtin_knowledge_base_get`
+does not take one. `builtin_scratchpad_search` reads the note back. A note
+another block is already showing is left out, so what appears there is material
+nothing else in the turn is showing.
+
 **What the tag names are for.** They are registered tags of this store, so they
 are real names and not guesses - the same vocabulary `available_tags` reports
 after a search, offered before the model makes one. A filter on one that returns
