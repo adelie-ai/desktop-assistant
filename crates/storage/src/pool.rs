@@ -190,6 +190,9 @@ const MIGRATIONS: &[Migration] = &[
     migration!("038_kb_delete_provenance.sql"),
     // Per-conversation override for the tool-provenance gate (#1007).
     migration!("039_conversation_tool_gate.sql"),
+    // Scratchpad embeddings (#717) — the pad joins the embedded tables, so the
+    // agent finds its own note by meaning and not only by wording.
+    migration!("040_scratchpad_embeddings.sql"),
     // #1097: a one-line summary per knowledge entry, so a reader can list many
     // entries without printing or truncating each whole body.
     migration!("041_knowledge_base_summary.sql"),

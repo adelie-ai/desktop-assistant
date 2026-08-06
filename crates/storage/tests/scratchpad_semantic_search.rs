@@ -42,9 +42,7 @@ use desktop_assistant_core::ports::store::ConversationStore;
 use desktop_assistant_storage::embedding_backfill::{
     BackfillEmbedFn, backfill_scratchpad_embeddings, invalidate_stale_embeddings,
 };
-use desktop_assistant_storage::{
-    PgConversationStore, PgScratchpadStore, UserId, with_user_id,
-};
+use desktop_assistant_storage::{PgConversationStore, PgScratchpadStore, UserId, with_user_id};
 use sqlx::PgPool;
 
 const USER: &str = "alice";
@@ -324,10 +322,7 @@ async fn a_note_written_without_a_vector_is_still_found_lexically() {
     with_user_id(UserId::new(USER), async {
         convs.create(make_conversation("c1")).await.expect("conv");
 
-        let mut notes = vec![NewScratchpadNote::new(
-            "n1",
-            "the deploy pipeline is red",
-        )];
+        let mut notes = vec![NewScratchpadNote::new("n1", "the deploy pipeline is red")];
         embed_notes(&failing, &current_model(), &mut notes).await;
         assert!(
             notes[0].embedding.is_none(),
@@ -422,6 +417,102 @@ async fn notes_stamped_with_a_superseded_model_are_excluded_from_the_vector_arm(
     fx.cleanup().await;
 }
 
+/// A purely cosmetic model rename with an unchanged digest is the same model
+/// (#655), so its rows stay visible to the vector arm. Hiding them until the
+/// sweep restamps them would blank semantic recall over the whole pad for no
+/// reason.
+#[tokio::test]
+async fn a_renamed_model_with_an_unchanged_digest_stays_visible_to_the_vector_arm() {
+    let Some(fx) = fixture("sp717j").await else {
+        return;
+    };
+    let convs = PgConversationStore::new(fx.pool.clone());
+    let pad = PgScratchpadStore::new(fx.pool.clone());
+
+    with_user_id(UserId::new(USER), async {
+        convs.create(make_conversation("c1")).await.expect("conv");
+        write_embedded(
+            &pad,
+            "c1",
+            "n1",
+            "Remember to drink water at your desk",
+            vec![1.0, 0.0, 0.0],
+            &format!("nomic-embed-text:latest@{DIGEST}"),
+        )
+        .await;
+
+        let hits = pad
+            .search(
+                "c1",
+                "stay hydrated",
+                vec![1.0, 0.0, 0.0],
+                &current_model(),
+                None,
+                10,
+            )
+            .await
+            .expect("hybrid search");
+
+        assert_eq!(
+            key_set(&hits),
+            HashSet::from(["n1".to_string()]),
+            "the same digest means the same model; a rename must not hide the vector"
+        );
+    })
+    .await;
+
+    fx.cleanup().await;
+}
+
+/// Rewriting a note's content must clear the vector that described the old
+/// content. Left in place, that vector would keep a current model stamp and so
+/// sit beyond both the stale sweep and the backfill -- permanently describing
+/// text the note no longer holds.
+#[tokio::test]
+async fn rewriting_a_notes_content_clears_the_vector_of_the_old_content() {
+    let Some(fx) = fixture("sp717k").await else {
+        return;
+    };
+    let convs = PgConversationStore::new(fx.pool.clone());
+    let pad = PgScratchpadStore::new(fx.pool.clone());
+
+    with_user_id(UserId::new(USER), async {
+        convs.create(make_conversation("c1")).await.expect("conv");
+        write_embedded(
+            &pad,
+            "c1",
+            "n1",
+            "the deploy pipeline is red",
+            vec![1.0, 0.0, 0.0],
+            &current_model(),
+        )
+        .await;
+        let (has_embedding, _) = note_state(&fx.pool, "n1").await;
+        assert!(has_embedding, "precondition: the note starts embedded");
+
+        // An unembedded rewrite, as a caller with no embedding backend makes.
+        pad.write(
+            "c1",
+            &[NewScratchpadNote::new("n1", "the deploy pipeline is green")],
+        )
+        .await
+        .expect("rewrite");
+
+        let (has_embedding, model) = note_state(&fx.pool, "n1").await;
+        assert!(
+            !has_embedding,
+            "a vector describing the previous content must not survive the rewrite"
+        );
+        assert!(
+            model.is_none(),
+            "the stamp must clear with the vector, or the backfill never re-embeds the note"
+        );
+    })
+    .await;
+
+    fx.cleanup().await;
+}
+
 /// Acceptance: the stale sweep clears superseded scratchpad vectors, and the
 /// backfill re-embeds them -- so the pad converges instead of going permanently
 /// unembedded after a model change.
@@ -492,9 +583,12 @@ async fn the_backfill_embeds_the_same_text_the_inline_write_does() {
 
     with_user_id(UserId::new(USER), async {
         convs.create(make_conversation("c1")).await.expect("conv");
-        pad.write("c1", &[NewScratchpadNote::new("deploy", "ship it on Friday")])
-            .await
-            .expect("write unembedded note");
+        pad.write(
+            "c1",
+            &[NewScratchpadNote::new("deploy", "ship it on Friday")],
+        )
+        .await
+        .expect("write unembedded note");
     })
     .await;
 
@@ -665,7 +759,10 @@ async fn owner_todo_scoping_confines_a_subagent_to_its_own_subtree() {
         .await;
 
         let keys = key_set(&seen);
-        assert!(keys.contains("ctx"), "ancestor pre-marker context is visible");
+        assert!(
+            keys.contains("ctx"),
+            "ancestor pre-marker context is visible"
+        );
         assert!(keys.contains("own"), "own namespace is visible at any id");
         assert!(
             !keys.contains("sib"),

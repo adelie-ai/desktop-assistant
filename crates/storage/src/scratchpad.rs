@@ -12,8 +12,9 @@
 //!   user-scoped, so the guard is the only thing standing between a
 //!   colliding key and another tenant's row — see `write`, #809).
 //! - Cross-user reads return empty, not an error.
-//! - The full-text `search` reuses the `plainto_tsquery` / `ts_rank_cd`
-//!   shape from the conversation search adapter.
+//! - `search` is hybrid: a vector arm and a `plainto_tsquery` / `ts_rank_cd`
+//!   arm fused by reciprocal rank, exactly as `PgKnowledgeBaseStore` does it
+//!   (#717).
 
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::ScratchpadNote;
@@ -22,6 +23,7 @@ use desktop_assistant_core::ports::scratchpad::{NewScratchpadNote, ScratchpadSto
 use desktop_assistant_core::ports::scratchpad_scope::{
     current_ancestors, current_owner_todo, current_visible_before,
 };
+use pgvector::Vector;
 use sqlx::PgPool;
 
 /// The `owner_todo` namespace the current turn writes under and is confined to
@@ -137,6 +139,23 @@ impl ScratchpadStore for PgScratchpadStore {
         // conflict as a no-op for that row (no update, no error) and
         // `RETURNING` omits it, so a cross-tenant write neither changes the
         // victim's row nor leaks its content back to the writer (#809).
+        //
+        // The upsert always CLEARS the vector, and the statement after it
+        // writes back whatever the caller embedded inline (#717). Clearing is
+        // what keeps a vector honest: an upsert replaces the content, so a
+        // vector left in place would describe text that is no longer there,
+        // while its stamp still named the current model — putting it beyond
+        // both the stale sweep and the backfill, which act only on a missing or
+        // superseded stamp. A cleared row is simply re-embedded.
+        //
+        // Both statements run in one transaction, so no reader ever sees a note
+        // carrying the previous content's vector.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
+
         let rows: Vec<SpRow> = sqlx::query_as(
             "INSERT INTO scratchpads \
                  (id, user_id, conversation_id, owner_todo, note_key, content, note_type, seq, done) \
@@ -144,7 +163,8 @@ impl ScratchpadStore for PgScratchpadStore {
                                   $5::text[], $6::text[], $7::text[], $8::int4[], $9::bool[]) \
              ON CONFLICT (conversation_id, owner_todo, note_key) \
              DO UPDATE SET content = EXCLUDED.content, note_type = EXCLUDED.note_type, \
-                           seq = EXCLUDED.seq, done = EXCLUDED.done, updated_at = NOW() \
+                           seq = EXCLUDED.seq, done = EXCLUDED.done, updated_at = NOW(), \
+                           embedding = NULL, embedding_model = NULL \
              WHERE scratchpads.user_id = EXCLUDED.user_id \
              RETURNING id, conversation_id, owner_todo, note_key, content, note_type, seq, done, pinned, \
                        created_at, updated_at",
@@ -158,9 +178,47 @@ impl ScratchpadStore for PgScratchpadStore {
         .bind(&types)
         .bind(&seqs)
         .bind(&dones)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;
+
+        // One statement per embedded note. A single statement cannot carry them
+        // all: every note's `vector[]` has its own chunk count, and a Postgres
+        // array of arrays must be rectangular. The batch is capped at
+        // `MAX_NOTES_PER_WRITE`, and a real write carries one or two notes.
+        //
+        // A note finds its stored row by `note_key`, which is unique within the
+        // batch (the tool layer de-duplicates last-wins before it calls) and
+        // unique in the table within one `(conversation_id, owner_todo)`. A row
+        // the cross-tenant guard refused is absent from `rows`, so it is skipped
+        // rather than written to.
+        for note in notes {
+            let Some(embedding) = note.embedding.as_ref() else {
+                continue;
+            };
+            if embedding.chunks.is_empty() {
+                continue;
+            }
+            let Some(row) = rows.iter().find(|r| r.note_key == note.key) else {
+                continue;
+            };
+            let vectors: Vec<Vector> = embedding.chunks.iter().cloned().map(Vector::from).collect();
+            sqlx::query(
+                "UPDATE scratchpads SET embedding = $1::vector[], embedding_model = $2 \
+                 WHERE id = $3 AND user_id = $4",
+            )
+            .bind(&vectors)
+            .bind(&embedding.model)
+            .bind(&row.id)
+            .bind(user_id.as_str())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
 
         Ok(rows.into_iter().map(SpRow::into_note).collect())
     }
@@ -236,37 +294,30 @@ impl ScratchpadStore for PgScratchpadStore {
         &self,
         conversation_id: &str,
         query: &str,
+        query_embedding: Vec<f32>,
+        embedding_model: &str,
         note_type: Option<&str>,
         limit: usize,
     ) -> Result<Vec<ScratchpadNote>, CoreError> {
-        let user_id = current_user_id();
-        // plainto_tsquery + ts_rank_cd, scoped — mirrors PgConversationSearchStore.
-        // Search stays relevance-ranked; the optional `note_type` filter rides
-        // a single static query via `IS NULL OR`.
-        let (vb, me, ancestors) = read_snapshot();
-        let rows: Vec<SpRow> = sqlx::query_as(
-            "WITH q AS (SELECT plainto_tsquery('english', $3) AS query) \
-             SELECT id, conversation_id, owner_todo, note_key, content, note_type, seq, done, pinned, \
-                    created_at, updated_at \
-             FROM scratchpads, q \
-             WHERE user_id = $1 AND conversation_id = $2 AND tsv @@ q.query \
-               AND ($4::text IS NULL OR note_type = $4) \
-               AND ($6::text IS NULL OR (owner_todo = $7 OR owner_todo LIKE $7 || '.%' \
-                    OR (id COLLATE \"C\" < $6 AND owner_todo = ANY($8::text[])))) \
-             ORDER BY ts_rank_cd(tsv, q.query) DESC, updated_at DESC LIMIT $5",
-        )
-        .bind(user_id.as_str())
-        .bind(conversation_id)
-        .bind(query)
-        .bind(note_type)
-        .bind(limit as i64)
-        .bind(vb)
-        .bind(me)
-        .bind(ancestors)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CoreError::Storage(e.to_string()))?;
-        Ok(rows.into_iter().map(SpRow::into_note).collect())
+        // No query vector (no embedding backend, or one that stalled — see
+        // `EMBED_TIMEOUT` in core's embedding port): the hybrid query's vector
+        // branch (`chunk <=> $1`) errors on a zero-dimension vector, so take the
+        // full-text-only path. Both paths report the same fields, so a missing
+        // embedding backend costs recall and nothing else.
+        if query_embedding.is_empty() {
+            self.search_text(conversation_id, query, note_type, limit)
+                .await
+        } else {
+            self.search_hybrid(
+                conversation_id,
+                query,
+                query_embedding,
+                embedding_model,
+                note_type,
+                limit,
+            )
+            .await
+        }
     }
 
     async fn delete_many(&self, conversation_id: &str, keys: &[String]) -> Result<u64, CoreError> {
@@ -366,5 +417,163 @@ impl ScratchpadStore for PgScratchpadStore {
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;
         Ok(result.rows_affected())
+    }
+}
+
+/// The two arms behind [`ScratchpadStore::search`]. Private to the adapter:
+/// which arm runs is decided by whether the caller has a query vector, never by
+/// the caller itself.
+impl PgScratchpadStore {
+    /// Full-text-only search: `plainto_tsquery` + `ts_rank_cd`, scoped. Backs
+    /// the no-embedding fallback, and is byte-for-byte the pre-#717 search.
+    async fn search_text(
+        &self,
+        conversation_id: &str,
+        query: &str,
+        note_type: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ScratchpadNote>, CoreError> {
+        let user_id = current_user_id();
+        // Search stays relevance-ranked; the optional `note_type` filter rides
+        // a single static query via `IS NULL OR`.
+        let (vb, me, ancestors) = read_snapshot();
+        let rows: Vec<SpRow> = sqlx::query_as(
+            "WITH q AS (SELECT plainto_tsquery('english', $3) AS query) \
+             SELECT id, conversation_id, owner_todo, note_key, content, note_type, seq, done, pinned, \
+                    created_at, updated_at \
+             FROM scratchpads, q \
+             WHERE user_id = $1 AND conversation_id = $2 AND tsv @@ q.query \
+               AND ($4::text IS NULL OR note_type = $4) \
+               AND ($6::text IS NULL OR (owner_todo = $7 OR owner_todo LIKE $7 || '.%' \
+                    OR (id COLLATE \"C\" < $6 AND owner_todo = ANY($8::text[])))) \
+             ORDER BY ts_rank_cd(tsv, q.query) DESC, updated_at DESC LIMIT $5",
+        )
+        .bind(user_id.as_str())
+        .bind(conversation_id)
+        .bind(query)
+        .bind(note_type)
+        .bind(limit as i64)
+        .bind(vb)
+        .bind(me)
+        .bind(ancestors)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CoreError::Storage(e.to_string()))?;
+        Ok(rows.into_iter().map(SpRow::into_note).collect())
+    }
+
+    /// Vector + full-text search, fused by reciprocal rank — the same shape
+    /// `PgKnowledgeBaseStore::search_hybrid` uses (#717).
+    ///
+    /// Two properties carry the design:
+    ///
+    /// * **Only the vector arm is model-scoped** ($9). A vector of another
+    ///   dimension makes pgvector raise rather than miss, and a table
+    ///   legitimately holds two models' vectors during any reindex and for the
+    ///   whole of a live backend swap. Sameness is decided on the digest half of
+    ///   the `<name>@<digest>` stamp wherever both sides carry one, matching
+    ///   `embedding_backfill::invalidate_stale_embeddings`, so a purely cosmetic
+    ///   rename does not blind the search until the sweep restamps the rows.
+    ///   `split_part(x, '@', 2)` yields '' where there is no '@', so the
+    ///   non-empty test doubles as "both sides carry a digest". A NULL stamp is a
+    ///   vector of unknown provenance, hence unknown dimension, and is excluded.
+    /// * **The full-text arm is never model-scoped**, so changing the embedding
+    ///   model costs recall quality and not all recall.
+    ///
+    /// Both arms carry the full `user_id` / `conversation_id` / `owner_todo`
+    /// scope. A predicate present on one arm and missing from the other would
+    /// make the weaker arm a way around the confinement the other enforces.
+    async fn search_hybrid(
+        &self,
+        conversation_id: &str,
+        query: &str,
+        query_embedding: Vec<f32>,
+        embedding_model: &str,
+        note_type: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ScratchpadNote>, CoreError> {
+        let user_id = current_user_id();
+        let (vb, me, ancestors) = read_snapshot();
+        let embedding_vec = Vector::from(query_embedding);
+        // Over-fetch each arm so the fusion has something to fuse: a row that
+        // ranks well on one arm and modestly on the other must still be
+        // reachable from both lists.
+        let fetch_limit = (limit.saturating_mul(2)) as i64;
+
+        let rows: Vec<SpRow> = sqlx::query_as(
+            "WITH chunk_distances AS (
+                SELECT id, conversation_id, owner_todo, note_key, content, note_type,
+                       seq, done, pinned, created_at, updated_at,
+                       MIN(chunk <=> $1) AS min_distance
+                FROM scratchpads, unnest(embedding) AS chunk
+                WHERE user_id = $2 AND conversation_id = $3
+                  AND ($4::text IS NULL OR note_type = $4)
+                  AND ($6::text IS NULL OR (owner_todo = $7 OR owner_todo LIKE $7 || '.%'
+                       OR (id COLLATE \"C\" < $6 AND owner_todo = ANY($8::text[]))))
+                  AND embedding IS NOT NULL
+                  AND embedding_model IS NOT NULL
+                  AND (embedding_model = $9
+                       OR (split_part($9, '@', 2) <> ''
+                           AND split_part(embedding_model, '@', 2)
+                               = split_part($9, '@', 2)))
+                GROUP BY id, conversation_id, owner_todo, note_key, content, note_type,
+                         seq, done, pinned, created_at, updated_at
+            ),
+            vector_ranked AS (
+                SELECT id, conversation_id, owner_todo, note_key, content, note_type,
+                       seq, done, pinned, created_at, updated_at,
+                       ROW_NUMBER() OVER (ORDER BY min_distance) AS rank_v
+                FROM chunk_distances
+                LIMIT $10
+            ),
+            text_ranked AS (
+                SELECT id, conversation_id, owner_todo, note_key, content, note_type,
+                       seq, done, pinned, created_at, updated_at,
+                       ROW_NUMBER() OVER (ORDER BY ts_rank_cd(tsv, q.query) DESC) AS rank_t
+                FROM scratchpads, plainto_tsquery('english', $5) AS q(query)
+                WHERE user_id = $2 AND conversation_id = $3
+                  AND tsv @@ q.query
+                  AND ($4::text IS NULL OR note_type = $4)
+                  AND ($6::text IS NULL OR (owner_todo = $7 OR owner_todo LIKE $7 || '.%'
+                       OR (id COLLATE \"C\" < $6 AND owner_todo = ANY($8::text[]))))
+                ORDER BY ts_rank_cd(tsv, q.query) DESC
+                LIMIT $10
+            ),
+            fused AS (
+                SELECT COALESCE(v.id, t.id) AS id,
+                       COALESCE(v.conversation_id, t.conversation_id) AS conversation_id,
+                       COALESCE(v.owner_todo, t.owner_todo) AS owner_todo,
+                       COALESCE(v.note_key, t.note_key) AS note_key,
+                       COALESCE(v.content, t.content) AS content,
+                       COALESCE(v.note_type, t.note_type) AS note_type,
+                       COALESCE(v.seq, t.seq) AS seq,
+                       COALESCE(v.done, t.done) AS done,
+                       COALESCE(v.pinned, t.pinned) AS pinned,
+                       COALESCE(v.created_at, t.created_at) AS created_at,
+                       COALESCE(v.updated_at, t.updated_at) AS updated_at,
+                       (COALESCE(1.0 / (60 + v.rank_v), 0) +
+                        COALESCE(1.0 / (60 + t.rank_t), 0))::FLOAT8 AS rrf_score
+                FROM vector_ranked v
+                FULL OUTER JOIN text_ranked t ON v.id = t.id
+            )
+            SELECT id, conversation_id, owner_todo, note_key, content, note_type,
+                   seq, done, pinned, created_at, updated_at
+            FROM fused ORDER BY rrf_score DESC, updated_at DESC LIMIT $11",
+        )
+        .bind(embedding_vec)
+        .bind(user_id.as_str())
+        .bind(conversation_id)
+        .bind(note_type)
+        .bind(query)
+        .bind(vb)
+        .bind(me)
+        .bind(ancestors)
+        .bind(embedding_model)
+        .bind(fetch_limit)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CoreError::Storage(e.to_string()))?;
+        Ok(rows.into_iter().map(SpRow::into_note).collect())
     }
 }

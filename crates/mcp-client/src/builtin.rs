@@ -9,7 +9,7 @@ use desktop_assistant_core::ports::client_tools::current_client_tools;
 use desktop_assistant_core::ports::conversation_ctx::current_conversation_id;
 use desktop_assistant_core::ports::conversation_search::ConversationSearchFn;
 use desktop_assistant_core::ports::database::DbQueryFn;
-use desktop_assistant_core::ports::embedding::EmbedFn;
+use desktop_assistant_core::ports::embedding::{EMBED_TIMEOUT, EmbedFn};
 use desktop_assistant_core::ports::knowledge::{
     AVAILABLE_TAGS_LIMIT, KNOWLEDGE_TAG_CENSUS_SAMPLE, KnowledgeDeleteFn, KnowledgeGetFn,
     KnowledgeListFn, KnowledgeListQuery, KnowledgeSearchFn, KnowledgeTagResolveFn,
@@ -281,13 +281,6 @@ const TOOL_SKILL_GET: &str = "builtin_skill_get";
 /// [`BuiltinToolService::skill_get`]'s call site reads as intent, not a
 /// magic string.
 const SKILL_GET_OWN_SCOPE: &str = "self";
-
-/// Hard cap on how long an embedding call may block a real-time request. A
-/// slow/wedged embedding backend (e.g. a stuck Ollama) must not hang the turn:
-/// on timeout we return no embedding, so semantic search falls back to FTS and
-/// KB writes persist without an embedding for the background dreaming/backfill
-/// cycle to fill in later.
-const EMBED_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The active embedding backend: the function that turns a query into a vector,
 /// together with the identifier of the model behind it.
@@ -894,17 +887,18 @@ impl BuiltinToolService {
             ToolDefinition::new(
                 TOOL_SCRATCHPAD_SEARCH,
                 "Read this conversation's scratchpad. Omit `query` and `keys` to list all notes \
-                 (ordered by type, then `sequence`); pass `query` for a full-text search over \
-                 note keys and content; pass `keys` to fetch specific notes. Pass `type` to \
-                 restrict a list/search to one category, e.g. `type: \"todo\"` for just your \
-                 plan. Each returned note includes its `type`, `sequence`, and `done`. \
-                 `max_results` is required. Results are bounded — if the response is truncated \
-                 you'll get `truncated: true` and should narrow with a `query`, a `type`, or a \
-                 smaller key set.",
+                 (ordered by type, then `sequence`); pass `query` to search note keys and \
+                 content by meaning as well as by wording, so a note is findable even when you \
+                 have since rephrased what it says; pass `keys` to fetch specific notes. Pass \
+                 `type` to restrict a list/search to one category, e.g. `type: \"todo\"` for \
+                 just your plan. Each returned note includes its `type`, `sequence`, and \
+                 `done`. `max_results` is required. Results are bounded — if the response is \
+                 truncated you'll get `truncated: true` and should narrow with a `query`, a \
+                 `type`, or a smaller key set.",
                 serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "query": {"type": "string", "description": "Full-text query over note keys + content. Omit to list all notes."},
+                        "query": {"type": "string", "description": "Search note keys + content. Matches on meaning as well as on exact words, so describing what you are looking for works as well as quoting it. Omit to list all notes."},
                         "keys": {
                             "type": "array",
                             "items": {"type": "string"},
@@ -2237,7 +2231,22 @@ impl BuiltinToolService {
                 let search = self.scratchpad_search_fn.as_ref().ok_or_else(|| {
                     CoreError::ToolExecution("scratchpad not configured".to_string())
                 })?;
-                search(conversation_id, query, note_type, limit).await?
+                // The pad is the agent's own working memory, and it
+                // re-summarizes as it goes -- so the words it searches with are
+                // often not the words it wrote. Embed the query so the store's
+                // vector arm can run; an empty vector (no backend, or one that
+                // stalled inside `EMBED_TIMEOUT`) reads as "full text only"
+                // (#717).
+                let (query_embedding, embedding_model) = self.embed_query(&query).await;
+                search(
+                    conversation_id,
+                    query,
+                    query_embedding,
+                    embedding_model,
+                    note_type,
+                    limit,
+                )
+                .await?
             } else {
                 let list = self.scratchpad_list_fn.as_ref().ok_or_else(|| {
                     CoreError::ToolExecution("scratchpad not configured".to_string())
@@ -2601,6 +2610,9 @@ fn parse_new_note(obj: &serde_json::Value) -> Option<NewScratchpadNote> {
         note_type,
         sequence,
         done,
+        // Filled in by the write closure, the one place every scratchpad write
+        // passes through (#717).
+        embedding: None,
     })
 }
 

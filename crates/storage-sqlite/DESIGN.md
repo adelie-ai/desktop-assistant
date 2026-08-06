@@ -37,10 +37,10 @@ drop-in for increment 1b.
 
 ### Deferred (later increments — see roadmap)
 
-`KnowledgeBaseStore`, `ToolRegistryStore` (vector search), `ScratchpadStore`,
-`ConversationSearchStore` (FTS), the dreaming/consolidation passes, and
-`execute_database_query`. The tables those need are **not** created here; the
-schema is the relational subset only.
+`KnowledgeBaseStore`, `ToolRegistryStore` and `ScratchpadStore` (vector
+search), `ConversationSearchStore` (FTS), the dreaming/consolidation passes,
+and `execute_database_query`. The tables those need are **not** created here;
+the schema is the relational subset only.
 
 ## Postgres → SQLite translation decisions
 
@@ -129,9 +129,9 @@ ratchet + success high-water mark and their independence.
    to `AnyConversationStore` in `crates/daemon/src/main.rs` and select the
    backend from the database-URL scheme (`sqlite://…` vs `postgres://…`) in
    `resolve_database_config`.
-3. **inc2 — vector + FTS hybrid via sqlite-vec + FTS5.** `KnowledgeBaseStore`
-   and `ToolRegistryStore` (vector search + hybrid RRF) on `sqlite-vec`, plus
-   the FTS5 half (`ScratchpadStore` search, `ConversationSearchStore`).
+3. **inc2 — vector + FTS hybrid via sqlite-vec + FTS5.** `KnowledgeBaseStore`,
+   `ToolRegistryStore` and `ScratchpadStore` (vector search + hybrid RRF) on
+   `sqlite-vec`, plus the FTS5-only `ConversationSearchStore`.
 4. **inc3 — dreaming + db_query.** Port `crates/storage/src/dreaming/*` (raw
    `&PgPool` today, not behind a port) and the LLM-facing `execute_database_query`
    tool (Postgres RLS + `sqlparser` `PostgreSqlDialect` today).

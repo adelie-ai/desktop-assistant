@@ -563,6 +563,156 @@ pub async fn backfill_skill_embeddings(
     Ok(total)
 }
 
+/// Backfill NULL / stale-model embeddings for `scratchpads` rows (#717),
+/// mirroring [`backfill_skill_embeddings`].
+///
+/// The scratchpad's own write path embeds a note as it is written, because the
+/// case that matters is the agent looking for what it wrote moments ago. This
+/// backfill is the safety net behind that: it picks up notes the write path
+/// could not embed (no backend configured, a stalled backend), and notes the
+/// stale sweep cleared after a model change.
+///
+/// The embedded text is `note_key + content`, matching both the row's `tsv` and
+/// `NewScratchpadNote::embed_text`. A vector built from a different string is
+/// not comparable with the vectors it would be ranked against, so the two must
+/// stay byte-identical.
+///
+/// Returns the number of rows updated.
+pub async fn backfill_scratchpad_embeddings(
+    pool: &PgPool,
+    embed_fn: &BackfillEmbedFn,
+    current_model: &str,
+) -> Result<usize, String> {
+    let mut total = 0usize;
+    let mut consecutive_failures = 0u32;
+
+    loop {
+        // Selecting on the stamp alone, never on `embedding IS NULL`, is what
+        // makes this converge: the failure path below stamps the row without a
+        // vector, which takes it out of this SELECT. Adding `embedding IS NULL`
+        // would re-select a permanently failing row on every pass, and bill a
+        // metered provider each time.
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT id, note_key || ' ' || content AS text \
+             FROM scratchpads \
+             WHERE embedding_model IS NULL \
+                OR embedding_model != $1 \
+             LIMIT $2",
+        )
+        .bind(current_model)
+        .bind(BATCH_SIZE)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        if rows.is_empty() {
+            break;
+        }
+
+        // Chunk all rows and track which chunks belong to which row.
+        let mut all_chunks: Vec<(usize, String)> = Vec::new();
+        for (i, (_, text)) in rows.iter().enumerate() {
+            for chunk in chunk_text(text, CHUNK_MAX_CHARS, CHUNK_OVERLAP) {
+                all_chunks.push((i, chunk));
+            }
+        }
+
+        let texts: Vec<String> = all_chunks.iter().map(|(_, t)| t.clone()).collect();
+        // A short batch is a failed batch, not a partial success. Zipping a
+        // short answer would pair a note with another note's vector, and nothing
+        // downstream detects that; route it through the per-row retry, which
+        // stamps every row it touches and therefore always converges.
+        let batch = match embed_fn(texts).await {
+            Ok(embeddings) if embeddings.len() == all_chunks.len() => Ok(embeddings),
+            Ok(embeddings) => Err(format!(
+                "embedder returned {} vector(s) for {} chunk(s)",
+                embeddings.len(),
+                all_chunks.len()
+            )),
+            Err(e) => Err(e),
+        };
+
+        match batch {
+            Ok(embeddings) => {
+                consecutive_failures = 0;
+                let mut row_embeddings: Vec<Vec<Vector>> = vec![Vec::new(); rows.len()];
+                for ((row_idx, _), emb) in all_chunks.iter().zip(embeddings) {
+                    row_embeddings[*row_idx].push(Vector::from(emb));
+                }
+                for ((id, _), vecs) in rows.iter().zip(row_embeddings) {
+                    write_scratchpad_embedding(pool, id, Some(vecs), current_model).await?;
+                }
+                total += rows.len();
+            }
+            Err(e) => {
+                tracing::warn!("scratchpad embedding batch failed, retrying individually: {e}");
+                let mut any_succeeded = false;
+                for (id, text) in &rows {
+                    let chunks = chunk_text(text, CHUNK_MAX_CHARS, CHUNK_OVERLAP);
+                    let expected = chunks.len();
+                    match embed_fn(chunks).await {
+                        Ok(embeddings) if embeddings.len() == expected => {
+                            let vecs: Vec<Vector> =
+                                embeddings.into_iter().map(Vector::from).collect();
+                            write_scratchpad_embedding(pool, id, Some(vecs), current_model).await?;
+                            total += 1;
+                            any_succeeded = true;
+                        }
+                        Ok(_) | Err(_) => {
+                            // Stamp the model without a vector so a permanently
+                            // failing note is retried once per model change
+                            // rather than on every pass.
+                            tracing::warn!("skipping scratchpad note {id}");
+                            write_scratchpad_embedding(pool, id, None, current_model).await?;
+                        }
+                    }
+                }
+                if any_succeeded {
+                    consecutive_failures = 0;
+                } else {
+                    consecutive_failures += 1;
+                    if consecutive_failures >= 3 {
+                        tracing::error!(
+                            "scratchpad embedding backfill aborting after {consecutive_failures} consecutive failures"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(total)
+}
+
+/// Write one note's vectors and model stamp.
+///
+/// `vectors: None` records a failed attempt: the vector is cleared and the model
+/// stamped, which marks the row attempted so it is not retried in a tight loop.
+/// Clearing rather than keeping the old vector matters, for the reason
+/// [`write_tag_embedding`] gives -- stamping the current model over a retained
+/// stale vector would declare it current and put it permanently beyond
+/// [`invalidate_stale_embeddings`], which acts only on mismatched stamps.
+async fn write_scratchpad_embedding(
+    pool: &PgPool,
+    id: &str,
+    vectors: Option<Vec<Vector>>,
+    current_model: &str,
+) -> Result<(), String> {
+    sqlx::query(
+        "UPDATE scratchpads \
+         SET embedding = $1::vector[], embedding_model = $2 \
+         WHERE id = $3",
+    )
+    .bind(&vectors)
+    .bind(current_model)
+    .bind(id)
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Sweep one table: restamp what only needs relabelling, invalidate what is
 /// genuinely stale, and clear orphaned stamps. Table names come from
 /// [`EMBEDDED_TABLES`], which holds compile-time constants and never external

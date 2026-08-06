@@ -763,12 +763,15 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             let watermark = conv.messages.len();
             let (key, sequence) = stack.begin(goal, watermark);
             let recorded_goal = step_text_to_record(goal, provenance);
+            // The vector is filled in by the write closure, which is the one
+            // place every scratchpad write passes through (#717).
             let note = NewScratchpadNote {
                 key: key.clone(),
                 content: planning::truncate_on_char_boundary(&recorded_goal, MAX_NOTE_BYTES),
                 note_type: planning::STEP_NOTE_TYPE.to_string(),
                 sequence: Some(sequence),
                 done: false,
+                embedding: None,
             };
             if let Err(e) = write(conv_id, vec![note]).await {
                 tracing::warn!(step = %key, error = %e, "failed to record plan step note");
@@ -812,6 +815,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
                     note_type: planning::OUTCOME_NOTE_TYPE.to_string(),
                     sequence: None,
                     done: false,
+                    embedding: None,
                 };
                 if let Err(e) = write(conv_id, vec![note]).await {
                     tracing::warn!(error = %e, "failed to record standalone outcome note");
@@ -841,6 +845,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             note_type: planning::STEP_NOTE_TYPE.to_string(),
             sequence: Some(frame.sequence),
             done: true,
+            embedding: None,
         }];
         let mut note_keys: Vec<String> = Vec::new();
         if let Some(o) = outcome {
@@ -857,6 +862,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
                 note_type: planning::OUTCOME_NOTE_TYPE.to_string(),
                 sequence: None,
                 done: false,
+                embedding: None,
             });
             note_keys.push(okey);
         }

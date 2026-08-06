@@ -31,6 +31,7 @@ pub const EMBEDDED_TABLES: &[&str] = &[
     "tool_definitions",
     "skill_index",
     "tag_registry",
+    "scratchpads",
 ];
 
 #[cfg(test)]
