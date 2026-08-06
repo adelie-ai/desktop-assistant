@@ -269,6 +269,68 @@ async fn a_row_written_before_the_migration_reads_back_without_a_summary() {
     fx.cleanup().await;
 }
 
+#[tokio::test]
+async fn read_paths_report_no_summary_rather_than_falling_back_to_the_content() {
+    // A `COALESCE(summary, content)` in the read queries would make this pass
+    // for the wrong reason and cost two things: the maintenance pass that
+    // fills the field selects `WHERE summary IS NULL` to find its work, and a
+    // client row could no longer tell a written summary from a stand-in. The
+    // fallback belongs at the render site, in
+    // `KnowledgeEntry::display_line`, not in the query.
+    let Some(fx) = fixture().await else { return };
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+
+    with_user_id(UserId::new(USER), async {
+        store
+            .write(KnowledgeEntry::new(
+                "kb-bare",
+                "The user prefers a dark theme in the terminal.",
+                vec!["preference".into()],
+            ))
+            .await
+            .expect("write succeeds");
+        set_embedding(&fx.pool, "kb-bare", vec![1.0, 0.0, 0.0]).await;
+
+        let got = store
+            .get("kb-bare")
+            .await
+            .expect("get succeeds")
+            .expect("the entry exists");
+        assert_eq!(got.summary, None, "get");
+
+        let listed = store.list(10, 0, None).await.expect("list succeeds");
+        assert_eq!(listed[0].summary, None, "list");
+
+        let paged = store
+            .list_page(KnowledgeListQuery {
+                limit: 10,
+                after: None,
+                order: ListOrderOpt(ListOrder::NewestFirst),
+                tags: None,
+                exclude_tags: None,
+                source: None,
+            })
+            .await
+            .expect("list_page succeeds");
+        assert_eq!(paged.entries[0].summary, None, "list_page");
+
+        let fts = store
+            .search_text("terminal", None, 10)
+            .await
+            .expect("search_text succeeds");
+        assert_eq!(fts[0].summary, None, "search_text");
+
+        let hybrid = store
+            .search("terminal", vec![1.0, 0.0, 0.0], MODEL, None, None, 10)
+            .await
+            .expect("search succeeds");
+        assert_eq!(hybrid.entries[0].summary, None, "search");
+    })
+    .await;
+
+    fx.cleanup().await;
+}
+
 // -- a write that says nothing preserves it ----------------------------------
 
 #[tokio::test]

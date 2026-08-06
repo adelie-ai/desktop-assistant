@@ -70,6 +70,82 @@ mod tests {
     }
 
     #[test]
+    fn display_line_returns_the_stored_summary_when_there_is_one() {
+        let mut entry = KnowledgeEntry::new(
+            "kb-1",
+            "A long body that a reader should never see in a list row.",
+            vec![],
+        );
+        entry.summary = Some("Prefers dark themes".to_string());
+
+        assert_eq!(entry.display_line(), "Prefers dark themes");
+    }
+
+    #[test]
+    fn display_line_falls_back_to_the_content_when_there_is_no_summary() {
+        // Until a maintenance pass has written summaries, most entries have
+        // none. A render site that skipped them would show almost nothing.
+        let entry = KnowledgeEntry::new("kb-1", "User prefers dark mode", vec![]);
+
+        assert_eq!(entry.display_line(), "User prefers dark mode");
+    }
+
+    #[test]
+    fn display_line_marks_a_cut_body_so_it_reads_as_incomplete() {
+        let entry = KnowledgeEntry::new("kb-1", "x".repeat(SUMMARY_MAX_CHARS + 1), vec![]);
+
+        let line = entry.display_line();
+
+        assert!(
+            line.ends_with("..."),
+            "a body cut short must say so: {line}"
+        );
+    }
+
+    #[test]
+    fn display_line_leaves_a_short_body_unmarked() {
+        // The marker means "there is more". A body that fits carries none, so
+        // it cannot be mistaken for a cut one.
+        let entry = KnowledgeEntry::new("kb-1", "User prefers dark mode", vec![]);
+
+        assert!(!entry.display_line().ends_with("..."));
+    }
+
+    #[test]
+    fn display_line_never_exceeds_the_cap() {
+        // The bound is what keeps one long entry from spending a whole recall
+        // budget on its own. It covers the marker too, because the budget
+        // counts what is rendered.
+        let from_content = KnowledgeEntry::new("kb-1", "x".repeat(10_000), vec![]);
+        assert!(from_content.display_line().chars().count() <= SUMMARY_MAX_CHARS);
+
+        let mut from_summary = KnowledgeEntry::new("kb-2", "short", vec![]);
+        from_summary.summary = Some("y".repeat(10_000));
+        assert!(from_summary.display_line().chars().count() <= SUMMARY_MAX_CHARS);
+    }
+
+    #[test]
+    fn display_line_truncates_multibyte_content_on_a_character_boundary() {
+        // Cutting a UTF-8 character in half panics on a byte-indexed slice, so
+        // the cap counts characters. Each of these is three bytes, which puts
+        // the naive byte cut inside a character.
+        let entry = KnowledgeEntry::new("kb-1", "\u{4e16}".repeat(SUMMARY_MAX_CHARS * 2), vec![]);
+
+        let line = entry.display_line();
+
+        assert!(line.chars().count() <= SUMMARY_MAX_CHARS);
+        assert!(line.starts_with('\u{4e16}'));
+        assert!(line.ends_with("..."));
+    }
+
+    #[test]
+    fn display_line_is_empty_for_an_empty_entry() {
+        let entry = KnowledgeEntry::new("kb-1", "", vec![]);
+
+        assert_eq!(entry.display_line(), "");
+    }
+
+    #[test]
     fn knowledge_entry_deserializes_without_a_summary() {
         // Entries serialized before `summary` existed carry no such key at
         // all. They must still read back, with the field reported as absent
