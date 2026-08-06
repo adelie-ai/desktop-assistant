@@ -936,7 +936,7 @@ mod tests {
             "the guidance must keep the block from standing in for a search"
         );
         assert!(
-            recall.contains("No block is not evidence that the store is empty"),
+            recall.contains("An absent block is not evidence that the store is empty"),
             "and say that silence is not an empty store"
         );
         assert!(
