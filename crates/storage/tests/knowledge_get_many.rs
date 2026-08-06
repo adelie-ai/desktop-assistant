@@ -131,6 +131,27 @@ async fn kb_get_treats_a_retired_entry_as_missing() {
 }
 
 #[tokio::test]
+async fn kb_get_treats_an_id_no_row_can_hold_as_missing() {
+    let Some(fx) = fixture().await else { return };
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+
+    // A stored id cannot contain a NUL byte, because Postgres `text` cannot
+    // hold one. So an id carrying one names nothing, and must answer the way
+    // every other id that names nothing answers. Sent to the database it does
+    // not miss, it raises - and takes every other id in the batch with it.
+    write_as(&store, ALICE, "kb-live", "still true").await;
+
+    let found = get_ids_as(&store, ALICE, &["kb-live", "kb\u{0}broken"]).await;
+    assert_eq!(
+        found,
+        vec!["kb-live".to_string()],
+        "an id no row can hold is one miss, not a failed batch"
+    );
+
+    fx.cleanup().await;
+}
+
+#[tokio::test]
 async fn kb_get_resolves_a_batch_in_one_read() {
     let Some(fx) = fixture().await else { return };
     let store = PgKnowledgeBaseStore::new(fx.pool.clone());

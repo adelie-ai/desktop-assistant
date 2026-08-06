@@ -491,7 +491,17 @@ impl PgKnowledgeBaseStore {
     /// the same answer for a deleted entry, a trashed one, and another user's.
     /// Retired (`deleted_at`) rows are excluded, exactly as
     /// [`KnowledgeBaseStore::get`] excludes them.
+    ///
+    /// An id carrying a NUL byte is dropped before the statement runs. Postgres
+    /// `text` cannot hold one, so no stored id can contain one and such an id
+    /// names nothing - but sent as a parameter it raises rather than missing,
+    /// which would break the contract above for every other id in the batch.
     pub async fn get_many(&self, ids: &[String]) -> Result<Vec<KnowledgeEntry>, CoreError> {
+        let ids: Vec<String> = ids
+            .iter()
+            .filter(|id| !id.contains('\0'))
+            .cloned()
+            .collect();
         if ids.is_empty() {
             return Ok(vec![]);
         }
