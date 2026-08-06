@@ -1106,6 +1106,67 @@ async fn registry_redirects_an_underscore_spelling_onto_its_dash_spelling() {
     .await;
 }
 
+#[tokio::test]
+async fn kb_write_pays_a_saturated_connection_pool_once_not_twice() {
+    // The resolver used to read the tag back on *any* failure, not only on the
+    // primary-key conflict that a read-back can answer. A pool with no free
+    // connection therefore cost two acquire timeouts inside one live turn -
+    // measured at 60.0s against sqlx's 30s default.
+    //
+    // The pool here holds one connection, and the test holds it, so every
+    // acquire waits out the timeout and none of the SQL ever runs. One pass
+    // costs one timeout; the old retry cost two.
+    //
+    // MUTATION: reading the tag back on any error, rather than on the unique
+    // violation beside the insert that raises it, doubles the elapsed time →
+    // RED.
+    let Some(url) = support::test_database_url() else {
+        return;
+    };
+    let acquire_timeout = std::time::Duration::from_millis(300);
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(acquire_timeout)
+        .connect(&url)
+        .await
+        .expect("connect the single-connection pool");
+
+    let held = pool.acquire().await.expect("hold the only connection");
+
+    let embed_fn: BackfillEmbedFn =
+        Box::new(|texts| Box::pin(async move { Ok(texts.iter().map(|_| vec![1.0f32]).collect()) }));
+
+    let started = std::time::Instant::now();
+    let outcome = with_user_id(
+        UserId::new("alice"),
+        resolve_proposed_tag(
+            &pool,
+            &embed_fn,
+            "test-model",
+            &ProposedTag {
+                name: "topic:weather".into(),
+                description: Some("Forecasts, rain, and temperature".into()),
+            },
+        ),
+    )
+    .await;
+    let elapsed = started.elapsed();
+
+    drop(held);
+    pool.close().await;
+
+    assert!(
+        outcome.is_err(),
+        "a pool that never yields a connection is a failure, and the write path \
+         degrades it into storing the tag as written"
+    );
+    assert!(
+        elapsed < acquire_timeout * 2,
+        "one pass through the vocabulary pays one acquire timeout, not two: \
+         {elapsed:?} against a {acquire_timeout:?} timeout"
+    );
+}
+
 // -- tool_registry -----------------------------------------------------------
 
 fn tool(name: &str, description: &str) -> ToolDefinition {
