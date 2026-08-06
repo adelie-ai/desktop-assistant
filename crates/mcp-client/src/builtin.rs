@@ -12,8 +12,8 @@ use desktop_assistant_core::ports::database::DbQueryFn;
 use desktop_assistant_core::ports::embedding::{EMBED_TIMEOUT, EmbedFn};
 use desktop_assistant_core::ports::knowledge::{
     AVAILABLE_TAGS_LIMIT, KNOWLEDGE_TAG_CENSUS_SAMPLE, KnowledgeDeleteFn, KnowledgeGetFn,
-    KnowledgeListFn, KnowledgeListQuery, KnowledgeSearchFn, KnowledgeTagResolveFn,
-    KnowledgeWriteFn, ListOrder, ListOrderOpt, ProposedTag, ScopeSize,
+    KnowledgeGetManyFn, KnowledgeListFn, KnowledgeListQuery, KnowledgeSearchFn,
+    KnowledgeTagResolveFn, KnowledgeWriteFn, ListOrder, ListOrderOpt, ProposedTag, ScopeSize,
 };
 use desktop_assistant_core::ports::notify::{NotifyFn, NotifyUrgency};
 use desktop_assistant_core::ports::scratchpad::{
@@ -298,6 +298,7 @@ const KB_SEARCH_MAX_LIMIT: u64 = 500;
 
 const TOOL_KB_DELETE: &str = "builtin_knowledge_base_delete";
 const TOOL_KB_LIST: &str = "builtin_knowledge_base_list";
+const TOOL_KB_GET: &str = "builtin_knowledge_base_get";
 const TOOL_SEARCH: &str = "builtin_tool_search";
 const TOOL_NOTIFY: &str = "builtin_notify";
 const TOOL_SYS_PROPS: &str = "builtin_sys_props";
@@ -341,6 +342,7 @@ pub struct BuiltinToolService {
     kb_delete_fn: Option<KnowledgeDeleteFn>,
     kb_list_fn: Option<KnowledgeListFn>,
     kb_get_fn: Option<KnowledgeGetFn>,
+    kb_get_many_fn: Option<KnowledgeGetManyFn>,
     kb_tag_resolve_fn: Option<KnowledgeTagResolveFn>,
     tool_search_fn: Option<ToolSearchFn>,
     #[allow(dead_code)]
@@ -383,6 +385,7 @@ impl BuiltinToolService {
             kb_delete_fn: None,
             kb_list_fn: None,
             kb_get_fn: None,
+            kb_get_many_fn: None,
             kb_tag_resolve_fn: None,
             tool_search_fn: None,
             tool_definition_fn: None,
@@ -465,6 +468,22 @@ impl BuiltinToolService {
         self.kb_delete_fn = Some(delete_fn);
         self.kb_list_fn = Some(list_fn);
         self.kb_get_fn = Some(get_fn);
+        self
+    }
+
+    /// Wire the batch read behind `builtin_knowledge_base_get`.
+    ///
+    /// Additive and separate from [`Self::with_knowledge_base`], which mirrors
+    /// how `AssistantService` wires the same closure for the `[Pinned]` block:
+    /// an embedder that predates the get tool keeps compiling, and the tool
+    /// then answers "knowledge base not configured" the way every other
+    /// unwired knowledge tool does.
+    ///
+    /// Why this and not repeated [`KnowledgeGetFn`] calls: the tool resolves a
+    /// whole batch of ids, and one statement for the batch keeps the read cost
+    /// flat in the number of ids.
+    pub fn with_knowledge_get_many(mut self, get_many_fn: KnowledgeGetManyFn) -> Self {
+        self.kb_get_many_fn = Some(get_many_fn);
         self
     }
 
@@ -1199,6 +1218,7 @@ impl BuiltinToolService {
         TOOL_KB_SEARCH,
         TOOL_KB_DELETE,
         TOOL_KB_LIST,
+        TOOL_KB_GET,
         TOOL_SEARCH,
         TOOL_NOTIFY,
         TOOL_SYS_PROPS,
@@ -3070,7 +3090,9 @@ fn parse_os_release_field(contents: &str, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use desktop_assistant_core::ports::knowledge::{KnowledgeSearchPage, ScopeSize};
+    use desktop_assistant_core::ports::knowledge::{
+        KNOWLEDGE_GET_MAX_IDS, KnowledgeSearchPage, ScopeSize,
+    };
 
     #[test]
     fn builtin_provider_map_is_exhaustive() {
@@ -7024,6 +7046,324 @@ mod tests {
         );
     }
 
+
+    // -- knowledge-base reads: entries by id (#1120) -------------------------
+
+    /// Every id batch one `builtin_knowledge_base_get` call handed the store.
+    type KbGetProbe = std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>;
+
+    /// A knowledge-base service whose batch read answers out of `entries`, plus
+    /// a probe holding the id batches it was asked for.
+    ///
+    /// The fake resolves an id only when `entries` holds it. That is what the
+    /// store does for an id that never existed, for one that was retired, and
+    /// for one that belongs to another user alike, so a test written against
+    /// this fake cannot tell those three apart - and neither can the model.
+    fn kb_service_holding(
+        entries: Vec<desktop_assistant_core::domain::KnowledgeEntry>,
+    ) -> (BuiltinToolService, KbGetProbe) {
+        use std::sync::{Arc, Mutex};
+
+        let probe: KbGetProbe = Arc::new(Mutex::new(Vec::new()));
+        let probe_for_fn = Arc::clone(&probe);
+        let get_many_fn: KnowledgeGetManyFn = Arc::new(move |ids: Vec<String>| {
+            let entries = entries.clone();
+            let probe = Arc::clone(&probe_for_fn);
+            Box::pin(async move {
+                probe.lock().expect("probe lock").push(ids.clone());
+                Ok(entries
+                    .into_iter()
+                    .filter(|e| ids.contains(&e.id))
+                    .collect())
+            })
+        });
+        (
+            BuiltinToolService::new().with_knowledge_get_many(get_many_fn),
+            probe,
+        )
+    }
+
+    /// An entry with distinguishable content, so a test can prove the whole row
+    /// travelled and not just its id.
+    fn kb_full_entry(id: &str) -> desktop_assistant_core::domain::KnowledgeEntry {
+        let mut entry = desktop_assistant_core::domain::KnowledgeEntry::new(
+            id,
+            format!("the durable fact behind {id}"),
+            vec!["memory".to_string(), format!("topic:{id}")],
+        );
+        entry.summary = Some(format!("one line about {id}"));
+        entry.metadata = serde_json::json!({"confidence": "high"});
+        entry.source = Some("explicit".to_string());
+        entry.created_at = "2026-01-01".to_string();
+        entry.updated_at = "2026-01-02".to_string();
+        entry
+    }
+
+    /// Run `builtin_knowledge_base_get` and parse its response.
+    async fn kb_get_response(
+        service: &BuiltinToolService,
+        arguments: serde_json::Value,
+    ) -> serde_json::Value {
+        let raw = service
+            .execute_tool(TOOL_KB_GET, arguments)
+            .await
+            .expect("knowledge base get succeeds");
+        serde_json::from_str(&raw).expect("get response is JSON")
+    }
+
+    #[tokio::test]
+    async fn kb_get_returns_a_full_entry_by_id() {
+        // The point of the tool: an id the model already holds becomes the
+        // entry's text. Search cannot do this - it matches an entry's content,
+        // so a UUID finds the entry only when the entry mentions it.
+        let (service, _probe) = kb_service_holding(vec![kb_full_entry("kb-1")]);
+
+        let json = kb_get_response(&service, serde_json::json!({"ids": ["kb-1"]})).await;
+
+        assert_eq!(json["ok"], true, "{json}");
+        assert_eq!(json["returned"], 1);
+        let entry = &json["entries"][0];
+        assert_eq!(entry["id"], "kb-1");
+        assert_eq!(entry["content"], "the durable fact behind kb-1");
+        assert_eq!(entry["summary"], "one line about kb-1");
+        assert_eq!(entry["tags"], serde_json::json!(["memory", "topic:kb-1"]));
+        assert_eq!(entry["metadata"], serde_json::json!({"confidence": "high"}));
+        assert_eq!(entry["source"], "explicit");
+        assert_eq!(entry["created_at"], "2026-01-01");
+        assert_eq!(entry["updated_at"], "2026-01-02");
+        assert_eq!(
+            json["not_found"],
+            serde_json::json!([]),
+            "an id that resolved must not also be reported as missing"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_get_resolves_several_ids_in_one_call() {
+        // A recall block offers several candidates and the model often wants
+        // two or three of them. One round for three entries beats three rounds,
+        // so the store must see one batch, not one call per id.
+        let (service, probe) = kb_service_holding(vec![
+            kb_full_entry("kb-1"),
+            kb_full_entry("kb-2"),
+            kb_full_entry("kb-3"),
+        ]);
+
+        let json = kb_get_response(
+            &service,
+            serde_json::json!({"ids": ["kb-3", "kb-1", "kb-2"]}),
+        )
+        .await;
+
+        assert_eq!(json["returned"], 3, "{json}");
+        let ids: Vec<&str> = json["entries"]
+            .as_array()
+            .expect("entries is an array")
+            .iter()
+            .map(|e| e["id"].as_str().expect("id is a string"))
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["kb-3", "kb-1", "kb-2"],
+            "the entries come back in the order the ids were asked for"
+        );
+        let batches = probe.lock().expect("probe lock").clone();
+        assert_eq!(
+            batches.len(),
+            1,
+            "three ids must cost one read, not three: {batches:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_get_reports_a_missing_id_without_failing_the_batch() {
+        // An id that no longer resolves is a normal outcome (AGENTS.md 8.2):
+        // the reference is stale, which the model must be told, while every
+        // other entry it asked for still comes back.
+        let (service, _probe) = kb_service_holding(vec![kb_full_entry("kb-1")]);
+
+        let json = kb_get_response(
+            &service,
+            serde_json::json!({"ids": ["kb-1", "kb-gone", "kb-also-gone"]}),
+        )
+        .await;
+
+        assert_eq!(json["ok"], true, "a miss must not fail the call: {json}");
+        assert_eq!(json["returned"], 1);
+        assert_eq!(json["entries"][0]["id"], "kb-1");
+        assert_eq!(
+            json["not_found"],
+            serde_json::json!(["kb-gone", "kb-also-gone"]),
+            "every id that did not resolve is named, in the order asked for"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_get_gives_one_reason_for_every_miss() {
+        // A cross-tenant id must be indistinguishable from one that never
+        // existed, so the response carries no per-id reason at all - one list,
+        // and one wording that covers every way an id fails to resolve.
+        let (service, _probe) = kb_service_holding(vec![]);
+
+        let json = kb_get_response(&service, serde_json::json!({"ids": ["kb-a", "kb-b"]})).await;
+
+        assert_eq!(json["not_found"], serde_json::json!(["kb-a", "kb-b"]));
+        assert_eq!(json["returned"], 0);
+        let text = json.to_string();
+        for leak in ["another", "other user", "tenant", "retired", "deleted at"] {
+            assert!(
+                !text.to_lowercase().contains(leak),
+                "the response must not say why an id missed, found {leak:?} in {text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn kb_get_caps_the_batch_size() {
+        // The response travels to the model, so one call cannot be allowed to
+        // name an unbounded number of entries. Ids past the cap are dropped and
+        // the drop is reported, never silent.
+        let held: Vec<_> = (0..KNOWLEDGE_GET_MAX_IDS + 5)
+            .map(|i| kb_full_entry(&format!("kb-{i}")))
+            .collect();
+        let asked: Vec<String> = (0..KNOWLEDGE_GET_MAX_IDS + 5)
+            .map(|i| format!("kb-{i}"))
+            .collect();
+        let (service, probe) = kb_service_holding(held);
+
+        let json = kb_get_response(&service, serde_json::json!({"ids": asked})).await;
+
+        let batches = probe.lock().expect("probe lock").clone();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(
+            batches[0].len(),
+            KNOWLEDGE_GET_MAX_IDS,
+            "the store must never be asked for more ids than the cap allows"
+        );
+        assert_eq!(
+            json["truncated"], true,
+            "dropping ids must be reported, not silent: {json}"
+        );
+        assert!(
+            json["message"].as_str().is_some_and(|m| !m.is_empty()),
+            "a truncated response says what to do about it: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_get_bounds_the_response_bytes() {
+        // The batch cap bounds the number of entries, not their size. A handful
+        // of large entries would otherwise spend the model's whole context in
+        // one tool result.
+        let big = "y".repeat(MAX_NOTE_BYTES);
+        let held: Vec<_> = (0..(RESPONSE_BYTE_BUDGET / MAX_NOTE_BYTES) + 3)
+            .map(|i| {
+                let mut entry = kb_full_entry(&format!("kb-{i}"));
+                entry.content = big.clone();
+                entry
+            })
+            .collect();
+        let asked: Vec<String> = held.iter().map(|e| e.id.clone()).collect();
+        let count = asked.len();
+        let (service, _probe) = kb_service_holding(held);
+
+        let json = kb_get_response(&service, serde_json::json!({"ids": asked})).await;
+
+        let returned = json["returned"].as_u64().expect("returned is a number") as usize;
+        assert!(
+            returned < count,
+            "the response budget must drop entries once it is spent, got all {count}"
+        );
+        assert!(returned >= 1, "at least one entry always travels: {json}");
+        assert_eq!(json["truncated"], true, "{json}");
+    }
+
+    #[tokio::test]
+    async fn kb_get_reads_a_single_id_from_the_id_field() {
+        // The delete tool accepts `id` as well as `ids`, and a model that has
+        // one id reaches for the singular field. Accept both rather than
+        // refusing a call that is unambiguous.
+        let (service, _probe) = kb_service_holding(vec![kb_full_entry("kb-1")]);
+
+        let json = kb_get_response(&service, serde_json::json!({"id": "kb-1"})).await;
+
+        assert_eq!(json["returned"], 1, "{json}");
+        assert_eq!(json["entries"][0]["id"], "kb-1");
+    }
+
+    #[tokio::test]
+    async fn kb_get_asks_for_a_repeated_id_once() {
+        // A model assembling ids from a recall block and a search result can
+        // name the same entry twice. That is one read and one row, not two.
+        let (service, probe) = kb_service_holding(vec![kb_full_entry("kb-1")]);
+
+        let json = kb_get_response(
+            &service,
+            serde_json::json!({"ids": ["kb-1", "kb-1"], "id": "kb-1"}),
+        )
+        .await;
+
+        assert_eq!(json["returned"], 1, "{json}");
+        let batches = probe.lock().expect("probe lock").clone();
+        assert_eq!(batches, vec![vec!["kb-1".to_string()]]);
+    }
+
+    #[tokio::test]
+    async fn kb_get_without_an_id_is_refused() {
+        // A call that names nothing is a malformed request, not an empty
+        // result, so it fails the way the delete tool's does.
+        let (service, _probe) = kb_service_holding(vec![kb_full_entry("kb-1")]);
+
+        let err = service
+            .execute_tool(TOOL_KB_GET, serde_json::json!({}))
+            .await
+            .expect_err("a call naming no id is refused");
+
+        assert!(
+            err.to_string().contains("`id` or `ids`"),
+            "the refusal names the arguments the caller should have sent: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_get_says_the_knowledge_base_is_not_configured() {
+        // Advertised unconditionally, like its three siblings, so an unwired
+        // knowledge base must answer the same way they do.
+        let service = BuiltinToolService::new();
+
+        let err = service
+            .execute_tool(TOOL_KB_GET, serde_json::json!({"ids": ["kb-1"]}))
+            .await
+            .expect_err("an unwired knowledge base cannot answer");
+
+        assert!(
+            err.to_string().contains("knowledge base not configured"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn kb_get_schema_says_where_ids_come_from() {
+        // An id is only actionable if the model knows where to find one. The
+        // schema names both sources, and says search cannot stand in for it.
+        let def = fully_wired_service()
+            .tool_definitions()
+            .into_iter()
+            .find(|d| d.name == TOOL_KB_GET)
+            .expect("builtin_knowledge_base_get is advertised");
+        let text = format!("{} {}", def.description, def.parameters);
+        for source in ["[Recall]", TOOL_KB_SEARCH, TOOL_KB_LIST] {
+            assert!(
+                text.contains(source),
+                "the schema must name {source} as a place ids come from: {text}"
+            );
+        }
+        assert!(
+            text.contains(&KNOWLEDGE_GET_MAX_IDS.to_string()),
+            "the schema must advertise the batch cap it enforces: {text}"
+        );
+    }
+
     #[tokio::test]
     async fn tool_search_with_closure() {
         use desktop_assistant_core::domain::ToolDefinition;
@@ -7688,6 +8028,7 @@ mod tests {
             })
         });
         let kb_get: KnowledgeGetFn = Arc::new(|_id| Box::pin(async { Ok(None) }));
+        let kb_get_many: KnowledgeGetManyFn = Arc::new(|_ids| Box::pin(async { Ok(Vec::new()) }));
         let tool_search: ToolSearchFn =
             Arc::new(|_query, _emb, _limit| Box::pin(async { Ok(Vec::new()) }));
         let tool_def: ToolDefinitionFn = Arc::new(|_name| Box::pin(async { Ok(None) }));
@@ -7708,6 +8049,7 @@ mod tests {
             .0
             .with_embedding(embed_fn, "test-embed-model".to_string())
             .with_knowledge_base(kb_write, kb_search, kb_delete, kb_list, kb_get)
+            .with_knowledge_get_many(kb_get_many)
             .with_tool_registry(tool_search, tool_def)
             .with_database(db_query)
             .with_conversation_search(conv_search)

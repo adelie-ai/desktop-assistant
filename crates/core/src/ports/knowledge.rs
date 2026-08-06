@@ -20,6 +20,20 @@ use crate::domain::KnowledgeEntry;
 /// old.
 pub const KNOWLEDGE_TAG_CENSUS_SAMPLE: usize = 1000;
 
+/// How many ids one batch read of the knowledge base may name.
+///
+/// Why a cap: the entries travel to a language model inside a tool result, so
+/// an unbounded batch would spend context the caller cannot see. It bounds the
+/// number of entries only. A batch of large entries is held by the caller's own
+/// response budget, which the batch cap says nothing about.
+///
+/// The figure is the one
+/// [`crate::ports::scratchpad::MAX_KEYS_PER_CALL`] puts on the scratchpad's
+/// batch read, because the two answer the same question for the same reason.
+/// It is copied rather than derived: a change to the scratchpad's cap is a
+/// scratchpad decision, and would not automatically be right here.
+pub const KNOWLEDGE_GET_MAX_IDS: usize = 64;
+
 /// How many tags a search reports in [`KnowledgeSearchPage::available_tags`].
 ///
 /// Why a cap: the list travels to a language model inside a tool result, so an
