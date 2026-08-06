@@ -907,3 +907,141 @@ async fn knowledge_read_filters_are_case_insensitive_and_symmetric() {
     )
     .await;
 }
+
+// -- #1107: the vector and text arms of `search_hybrid` must truncate to a
+// -- DEFINED set (the nearest / highest-ranked candidates), not an arbitrary
+// -- subset of the same size. `ROW_NUMBER() OVER (ORDER BY ...)` orders the
+// -- window computation, not the statement's output; a `LIMIT` with no
+// -- statement-level `ORDER BY` truncates a set the SQL standard never
+// -- promises an order for.
+//
+// Both tests below seed more rows than `fetch_limit` (`limit * 2`), so the
+// `LIMIT` in each CTE has something to actually cut.
+
+#[tokio::test]
+async fn vector_arm_truncates_to_the_nearest_candidates_not_an_arbitrary_subset() {
+    // Contract PIN, not a red-to-green reproduction -- said plainly, per
+    // #1107: this test passes both BEFORE and AFTER the `ORDER BY min_distance`
+    // fix on PostgreSQL 17 today.
+    //
+    // Why it cannot be made to fail against the current query: `rank_v` feeds
+    // `fused.rrf_score`, which the outer `ORDER BY rrf_score DESC` reads. A
+    // column a later node reads is never eliminated, so the planner keeps
+    // `Limit -> WindowAgg -> Sort(min_distance)` for `vector_ranked` -- proven
+    // by `EXPLAIN (ANALYZE, VERBOSE)` against this exact scenario (20 rows,
+    // `fetch_limit` 12): the candidate set IS the nearest 12, in rank order.
+    // That plan shape is a property of how the result is consumed today, not
+    // a guarantee the query states -- which is the whole defect. This test
+    // guards the property going forward: it goes red the moment a refactor
+    // stops reading `rank_v` downstream (or the planner changes), because at
+    // that point the truncation reverts to a genuinely arbitrary subset.
+    //
+    // The FTS query term ("zzznomatchzzz") matches none of the seeded content,
+    // so `text_ranked` is empty and `fused` reduces to `vector_ranked` alone --
+    // isolating the vector arm from the fusion.
+    with_fixture(
+        "vector_arm_truncates_to_the_nearest_candidates_not_an_arbitrary_subset",
+        |fx| async move {
+            let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+
+            // 20 rows -- more than fetch_limit (limit=6 -> fetch_limit=12).
+            with_user_id(UserId::new("alice"), async {
+                for i in 0..20u32 {
+                    store
+                        .write(KnowledgeEntry::new(
+                            format!("row{i:02}"),
+                            format!("distinct filler content row {i}"),
+                            vec![],
+                        ))
+                        .await
+                        .unwrap_or_else(|e| panic!("write row{i:02}: {e}"));
+                }
+            })
+            .await;
+
+            // Embeddings at strictly increasing cosine distance from [1,0,0]:
+            // row00 is nearest, row19 is farthest.
+            for i in 0..20u32 {
+                let f = i as f32 * 0.01;
+                set_embedding(&fx.pool, &format!("row{i:02}"), vec![vec![1.0 - f, f, 0.0]]).await;
+            }
+
+            let hits = with_user_id(UserId::new("alice"), async {
+                store
+                    .search("zzznomatchzzz", vec![1.0, 0.0, 0.0], MODEL, None, None, 6)
+                    .await
+            })
+            .await
+            .expect("search")
+            .entries;
+            let ids: Vec<&str> = hits.iter().map(|e| e.id.as_str()).collect();
+            assert_eq!(
+                ids,
+                vec!["row00", "row01", "row02", "row03", "row04", "row05"],
+                "the vector arm's contribution must be exactly the 6 nearest \
+                 rows, nearest first, out of 20 candidates and a fetch_limit \
+                 of 12; got {ids:?}"
+            );
+            fx
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn text_arm_truncates_to_the_highest_ranked() {
+    // The lexical arm's `ORDER BY ts_rank_cd(...) DESC` already sits before its
+    // `LIMIT` in `text_ranked` -- this test pins that property rather than
+    // proving a fix, matching #1107's acceptance criterion for the lexical arm.
+    //
+    // No row carries an embedding, so `chunk_distances` (which requires
+    // `embedding IS NOT NULL`) is empty and `fused` reduces to `text_ranked`
+    // alone -- isolating the text arm from the fusion.
+    //
+    // Each row's content repeats "wobble" a different number of times, at a
+    // constant total word count, so `ts_rank_cd` (term-frequency weighted)
+    // ranks row00 highest and row19 lowest, strictly monotonically.
+    with_fixture(
+        "text_arm_truncates_to_the_highest_ranked",
+        |fx| async move {
+            let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+
+            // 20 rows -- more than fetch_limit (limit=6 -> fetch_limit=12).
+            with_user_id(UserId::new("alice"), async {
+                for i in 0..20u32 {
+                    let content = format!(
+                        "{}{}",
+                        "wobble ".repeat((20 - i) as usize),
+                        "pad ".repeat(i as usize)
+                    );
+                    store
+                        .write(KnowledgeEntry::new(format!("row{i:02}"), content, vec![]))
+                        .await
+                        .unwrap_or_else(|e| panic!("write row{i:02}: {e}"));
+                }
+            })
+            .await;
+
+            // A non-empty query_embedding routes through search_hybrid rather
+            // than the FTS-only fallback, even though no row is embedded.
+            let hits = with_user_id(UserId::new("alice"), async {
+                store
+                    .search("wobble", vec![1.0, 0.0, 0.0], MODEL, None, None, 6)
+                    .await
+            })
+            .await
+            .expect("search")
+            .entries;
+            let ids: Vec<&str> = hits.iter().map(|e| e.id.as_str()).collect();
+            assert_eq!(
+                ids,
+                vec!["row00", "row01", "row02", "row03", "row04", "row05"],
+                "the text arm's contribution must be exactly the 6 \
+                 highest-ranked rows, highest first, out of 20 candidates and \
+                 a fetch_limit of 12; got {ids:?}"
+            );
+            fx
+        },
+    )
+    .await;
+}

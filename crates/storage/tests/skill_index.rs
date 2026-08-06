@@ -21,6 +21,7 @@ use desktop_assistant_core::ports::skill_index::{SkillIndexStore, conformance};
 use desktop_assistant_core::skill_catalog::reconcile_scan;
 use desktop_assistant_storage::embedding_backfill::{BackfillEmbedFn, backfill_skill_embeddings};
 use desktop_assistant_storage::{PgSkillIndexStore, run_migrations};
+use pgvector::Vector;
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use uuid::Uuid;
@@ -584,5 +585,82 @@ async fn get_scoping_matches_search_and_list() {
         .await;
         fx
     })
+    .await;
+}
+
+// -- #1107 sweep: `search_hybrid`'s vector arm (`vr`) had the same
+// -- `ROW_NUMBER() OVER (ORDER BY dist) ... LIMIT $4` shape as the knowledge
+// -- base's vector arm, with no statement-level `ORDER BY` before the `LIMIT`.
+// -- `tr` (the text arm) already carries `ORDER BY ts_rank_cd(...) DESC`
+// -- before its own `LIMIT` and needed no change.
+
+/// Stamp a `vector[]` embedding onto a global skill by name (mirrors
+/// [`set_embedding`] in `knowledge_hybrid_and_pagination.rs`).
+async fn set_skill_embedding(pool: &PgPool, name: &str, chunk: Vec<f32>) {
+    let vecs: Vec<Vector> = vec![Vector::from(chunk)];
+    sqlx::query(
+        "UPDATE skill_index SET embedding = $1::vector[], embedding_model = 'test-model' \
+         WHERE name = $2 AND owner_key = ''",
+    )
+    .bind(&vecs)
+    .bind(name)
+    .execute(pool)
+    .await
+    .expect("stamp skill embedding");
+}
+
+#[tokio::test]
+async fn skill_search_vector_arm_truncates_to_the_nearest_candidates() {
+    // Contract PIN, not a red-to-green reproduction -- same reasoning as
+    // `vector_arm_truncates_to_the_nearest_candidates_not_an_arbitrary_subset`
+    // in `knowledge_hybrid_and_pagination.rs`: `vr.rank_v` feeds `fused.score`,
+    // which the outer `ORDER BY f.score DESC` reads, so the planner cannot
+    // eliminate the window and today's plan preserves distance order into the
+    // `LIMIT`. This test guards the property, not a live defect.
+    //
+    // The FTS query term ("zzznomatchzzz") matches no seeded skill, so `tr` is
+    // empty and `fused` reduces to `vr` alone -- isolating the vector arm.
+    with_fixture(
+        "skill_search_vector_arm_truncates_to_the_nearest_candidates",
+        |fx| async move {
+            let store = PgSkillIndexStore::new(fx.pool.clone());
+
+            // 20 skills -- more than fetch_limit (limit=6 -> fetch_limit=12).
+            let skills: Vec<IndexedSkill> = (0..20u32)
+                .map(|i| {
+                    skill(
+                        &format!("skill{i:02}"),
+                        &format!("generic filler capability {i}"),
+                        &format!("hash{i:02}"),
+                        "filler body",
+                    )
+                })
+                .collect();
+            seed(&store, skills).await;
+
+            // Embeddings at strictly increasing cosine distance from [1,0,0]:
+            // skill00 is nearest, skill19 is farthest.
+            for i in 0..20u32 {
+                let f = i as f32 * 0.01;
+                set_skill_embedding(&fx.pool, &format!("skill{i:02}"), vec![1.0 - f, f, 0.0]).await;
+            }
+
+            let hits = store
+                .search("zzznomatchzzz", vec![1.0, 0.0, 0.0], "test-model", 6)
+                .await
+                .expect("search");
+            let names: Vec<&str> = hits.iter().map(|s| s.name.as_str()).collect();
+            assert_eq!(
+                names,
+                vec![
+                    "skill00", "skill01", "skill02", "skill03", "skill04", "skill05"
+                ],
+                "the vector arm's contribution must be exactly the 6 nearest \
+                 skills, nearest first, out of 20 candidates and a \
+                 fetch_limit of 12; got {names:?}"
+            );
+            fx
+        },
+    )
     .await;
 }
