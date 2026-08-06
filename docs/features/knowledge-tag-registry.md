@@ -98,13 +98,21 @@ gate exists to prevent, arriving through the gate itself.
 Both paths that set tags:
 
 - creating an entry (`content` plus `tags`);
-- re-tagging an existing entry (`id` plus `tags`, no `content`).
+- re-tagging an existing entry (`id` plus `tags`, with or without `content`).
 
-An update that carries no `tags` field registers nothing, because there is
-nothing to register. Note that a content update by `id` does not carry the
-stored entry's tags forward either - it clears them, along with the entry's
-metadata. That is a pre-existing defect of the write path rather than anything
-this gate does, and it is #1093.
+A write that carries no `tags` field registers nothing, because it proposes
+nothing. The gate acts on the tags a write asks to store, not on the tags an
+entry already holds, so a content update by `id` keeps the stored tags and
+consults the vocabulary for none of them.
+
+That is deliberate, and the reason is not that those tags are known to be
+registered - most are not, per "What a tag is checked against" above. It is that
+a redirect must not reach a tag the write never mentioned. Re-proposing the
+stored tags would let the vocabulary rename them on a write whose author only
+changed the text, and the caller would have no way to see it. The gap that
+leaves - a tag carried by an existing entry that the vocabulary cannot match
+against - belongs to #1094, which seeds the registry from the tags entries
+already carry.
 
 ## Cost
 

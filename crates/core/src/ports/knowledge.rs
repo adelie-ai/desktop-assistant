@@ -136,6 +136,14 @@ pub trait KnowledgeBaseStore: Send + Sync {
     /// stored value rather than clearing it, so a caller that knows nothing
     /// about them cannot wipe one.
     ///
+    /// An id held by an entry this caller cannot write - one that was retired,
+    /// or one belonging to another user - is refused with
+    /// `CoreError::InvalidInput`, and nothing is stored. A retired entry is
+    /// hidden from every read, so a caller that looked first sees a free id;
+    /// writing to it anyway would put live content in a row nothing can read
+    /// and the retention reap frees on the tombstone's own clock. No write path
+    /// revives a retired entry: store the content as a new entry instead.
+    ///
     /// Writes never touch the embedding columns: embedding generation is
     /// decoupled from content writes. New rows land with a NULL embedding and
     /// updates leave the existing (now stale) embedding in place; the

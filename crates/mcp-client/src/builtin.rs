@@ -549,9 +549,15 @@ impl BuiltinToolService {
                  instructions, project context, or any durable information the user wants remembered. \
                  Content should be self-contained prose that describes both the context (when/why \
                  this information is useful) and the information itself. Provide either a single \
-                 entry (top-level `content`/`tags`/`id`) or a batch via `entries`. To update only \
-                 the tags of an existing entry, pass its `id` and omit `content` — the existing \
-                 content is preserved. Tags are checked against the tag vocabulary, which holds \
+                 entry (top-level `content`/`tags`/`id`) or a batch via `entries`. A write that \
+                 gives the `id` of an existing entry keeps the content, the tags and the stored \
+                 metadata it leaves out, so send only what changes: `id` plus `content` rewrites \
+                 the text and keeps the tags, and `id` plus `tags` re-tags the entry and keeps \
+                 the text. To clear the tags, send an empty `tags` list. One field is not kept: \
+                 every write through this tool records the entry's provenance as 'explicit', so \
+                 an entry that dreaming had extracted or consolidated counts as explicitly saved \
+                 from then on, and `builtin_knowledge_base_list` with that `source` filter stops \
+                 listing it. Tags are checked against the tag vocabulary, which holds \
                  the tags registered so far and grows as tags are written; it starts empty, so \
                  early writes have little to match against. A tag that means the same as one \
                  already registered is stored under the registered name, so the response \
@@ -583,7 +589,20 @@ impl BuiltinToolService {
                         },
                         "id": {
                             "type": "string",
-                            "description": "Optional ID for updates. Omit to create a new entry."
+                            "description": "Optional ID. Omit to create a new entry with a generated \
+                                            id, which is what almost every write should do. Give \
+                                            the id of an existing entry to update it, and the \
+                                            fields you leave out keep the values that entry \
+                                            already holds. An id no entry holds creates the entry \
+                                            at that id, so a write that carries `content` can be \
+                                            repeated safely. An id whose entry was retired is \
+                                            refused instead: the write does not revive it, so \
+                                            store the text as a new entry with no id. An id you \
+                                            make up yourself must be a fresh random identifier \
+                                            such as a UUID, never a readable name like \
+                                            'user-coffee-preference': ids are not yours to name, \
+                                            so a readable one may already be taken, and the write \
+                                            then fails instead of storing anything."
                         },
                         "entries": {
                             "type": "array",
@@ -1347,11 +1366,22 @@ impl BuiltinToolService {
         Ok(response.to_string())
     }
 
-    /// Build a [`KnowledgeEntry`] from one write spec. When `content` is
-    /// omitted and an `id` is given, the existing entry is fetched and its
-    /// content (and, if `tags` is also omitted, its tags) are preserved — a
-    /// tags-only / re-tag / promote-to-explicit update. Tool-authored writes
-    /// always carry `source = "explicit"`.
+    /// Build a [`KnowledgeEntry`] from one write spec.
+    ///
+    /// One rule governs every optional field: a field the write does not
+    /// mention keeps the value the stored entry holds, and a field the write
+    /// does mention takes what the write gave, including an empty value, which
+    /// clears the field. So `tags` absent preserves the entry's tags, and
+    /// `"tags": []` clears them. A write with no `id`, or with an `id` no entry
+    /// holds, has nothing to fall back to, so every field it omits starts
+    /// empty.
+    ///
+    /// A field is therefore read out of the spec as "the caller supplied this"
+    /// or "the caller said nothing", and resolved against
+    /// [`Self::existing_entry`] in one line. A new field joins by doing the
+    /// same, without restating the rule.
+    ///
+    /// Tool-authored writes always carry `source = "explicit"`.
     async fn build_write_entry(
         &self,
         spec: &serde_json::Value,
@@ -1361,45 +1391,38 @@ impl BuiltinToolService {
 
         let content_opt = optional_string(spec, "content");
         let id_opt = optional_string(spec, "id");
-        let tags_present = spec.get("tags").is_some();
-        let tags = optional_string_array(spec, "tags");
+        // `Some` exactly when the write asked to set the tags, so a
+        // present-but-empty list stays distinct from an absent one. A `tags`
+        // this cannot read is refused rather than stored as empty, because an
+        // empty list now means "clear them".
+        let supplied_tags = supplied_string_array(spec, "tags")?;
 
-        // Partial update: no content, but an id to look up.
-        let existing = if content_opt.is_none() {
-            let id = id_opt.clone().ok_or_else(|| {
-                CoreError::ToolExecution(
-                    "knowledge_base write requires `content`, or an `id` of an existing entry to \
-                     update its tags"
-                        .to_string(),
-                )
-            })?;
-            let get_fn = self.kb_get_fn.as_ref().ok_or_else(|| {
-                CoreError::ToolExecution("knowledge base not configured".to_string())
-            })?;
-            Some(get_fn(id.clone()).await?.ok_or_else(|| {
-                CoreError::ToolExecution(format!("no knowledge entry with id {id}"))
-            })?)
-        } else {
-            None
-        };
+        let existing = self
+            .existing_entry(id_opt.as_deref(), content_opt.is_some())
+            .await?;
 
         let id = id_opt.unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
+        // `existing_entry` already refused the one case this cannot resolve —
+        // no content and nothing stored — so this guard only keeps the failure
+        // legible if that ever stops holding.
         let content = content_opt
             .or_else(|| existing.as_ref().map(|e| e.content.clone()))
             .ok_or_else(|| {
                 CoreError::ToolExecution("knowledge_base write requires content".into())
             })?;
         // Tags the caller supplied go through the formal vocabulary; tags
-        // carried over from the existing entry are already in it, so a
-        // content-only update re-registers nothing.
-        let tags = if tags_present {
-            self.resolve_tags(tags, spec, tag_budget).await
-        } else {
-            existing
-                .as_ref()
-                .map(|e| e.tags.clone())
-                .unwrap_or_default()
+        // carried over from the stored entry are already in it, so a write that
+        // does not mention tags re-registers nothing.
+        let supplied_tags = match supplied_tags {
+            Some(supplied) => Some(self.resolve_tags(supplied, spec, tag_budget).await),
+            None => None,
         };
+        let tags = supplied_tags
+            .or_else(|| existing.as_ref().map(|e| e.tags.clone()))
+            .unwrap_or_default();
+        // `metadata` has no argument of its own, so a write only ever carries
+        // the stored value forward. Its empty value is an object, not JSON
+        // null, because the provenance stamp below writes into it.
         let mut metadata = existing
             .as_ref()
             .map(|e| e.metadata.clone())
@@ -1430,6 +1453,53 @@ impl BuiltinToolService {
             // the row already holds; it never clears it.
             summary: None,
         })
+    }
+
+    /// Load the entry a write falls back to for the fields it does not mention,
+    /// or `None` when the write starts from nothing.
+    ///
+    /// `id` is what the write named, and `has_content` says whether the write
+    /// carries content of its own. Together they decide the three cases:
+    ///
+    /// - No `id`. A create, so there is nothing to fall back to. Without
+    ///   content there is also nothing to store, which is an error.
+    /// - An `id` an entry holds. An update, and that entry is the fallback.
+    /// - An `id` no entry holds. A create at an id the caller chose, which is
+    ///   how a caller makes a write idempotent under retry: the retry lands on
+    ///   the row the first attempt created instead of a duplicate. This is an
+    ///   error only without content, because then the write carries nothing to
+    ///   create the entry from.
+    ///
+    /// The lookup runs for every write that names an `id`, not only for one
+    /// without content. A content update that skipped it had no fallback, so it
+    /// stored the entry with no tags and no metadata (#1093).
+    async fn existing_entry(
+        &self,
+        id: Option<&str>,
+        has_content: bool,
+    ) -> Result<Option<desktop_assistant_core::domain::KnowledgeEntry>, CoreError> {
+        let Some(id) = id else {
+            return if has_content {
+                Ok(None)
+            } else {
+                Err(CoreError::ToolExecution(
+                    "knowledge_base write requires `content`, or an `id` of an existing entry to \
+                     update its tags"
+                        .to_string(),
+                ))
+            };
+        };
+        let get_fn = self
+            .kb_get_fn
+            .as_ref()
+            .ok_or_else(|| CoreError::ToolExecution("knowledge base not configured".to_string()))?;
+        let found = get_fn(id.to_string()).await?;
+        if found.is_none() && !has_content {
+            return Err(CoreError::ToolExecution(format!(
+                "no knowledge entry with id {id}"
+            )));
+        }
+        Ok(found)
     }
 
     /// Put every tag the caller supplied through the formal tag vocabulary and
@@ -2510,6 +2580,71 @@ fn optional_string_array(args: &serde_json::Value, key: &str) -> Vec<String> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default()
+}
+
+/// Read a string list the caller may or may not have supplied, for a field
+/// where "not supplied" and "supplied empty" mean different things.
+///
+/// `None` means the write said nothing about the field. `Some` means the write
+/// asked to set it, and an empty list then asks to clear it. On the
+/// knowledge-base write path that distinction decides whether a stored entry
+/// keeps its tags, so the three shapes that are not a list of strings cannot be
+/// folded into an empty list the way [`optional_string_array`] folds them:
+///
+/// - `null` reads as absent. Several model providers encode "I am not setting
+///   this field" as an explicit null, and reading that as an empty list clears
+///   the field on every write they send.
+/// - A value that is not a list is an error. The caller asked to set the field
+///   and named something this cannot read, so storing an empty list would
+///   answer a set with a wipe, and report success.
+/// - A list holding a value that is not a string is an error, for the same
+///   reason applied to one element: the caller named that tag.
+///
+/// A blank or whitespace-only string is dropped rather than refused. An empty
+/// tag is not a tag, so trimming it away loses no intent.
+fn supplied_string_array(
+    args: &serde_json::Value,
+    key: &str,
+) -> Result<Option<Vec<String>>, CoreError> {
+    let Some(value) = args.get(key) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let items = value.as_array().ok_or_else(|| {
+        CoreError::ToolExecution(format!(
+            "`{key}` must be a list of strings, and this one is {}",
+            json_shape(value)
+        ))
+    })?;
+    let mut supplied = Vec::with_capacity(items.len());
+    for item in items {
+        let text = item.as_str().ok_or_else(|| {
+            CoreError::ToolExecution(format!(
+                "every tag in `{key}` must be a string, and one of them is {}",
+                json_shape(item)
+            ))
+        })?;
+        let text = text.trim();
+        if !text.is_empty() {
+            supplied.push(text.to_string());
+        }
+    }
+    Ok(Some(supplied))
+}
+
+/// Name the JSON shape of `value`, so an error can tell the caller what it
+/// actually sent rather than only what was wanted.
+fn json_shape(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "a list",
+        serde_json::Value::Object(_) => "an object",
+    }
 }
 
 /// Read one write spec's `new_tag_descriptions` map, keyed by the normalized
@@ -4672,6 +4807,11 @@ mod tests {
         proposals: Vec<ProposedTag>,
     }
 
+    /// The in-memory knowledge store the write-path tests share: the rows a
+    /// write landed, in the order it landed them.
+    type KbStore =
+        std::sync::Arc<std::sync::Mutex<Vec<desktop_assistant_core::domain::KnowledgeEntry>>>;
+
     /// A knowledge-base service whose store keeps its entries in memory, with
     /// an optional tag-registry gate in front of the write path.
     ///
@@ -4680,10 +4820,7 @@ mod tests {
     /// model wrote it".
     fn kb_service_with_tag_gate(
         resolve: Option<KnowledgeTagResolveFn>,
-    ) -> (
-        BuiltinToolService,
-        std::sync::Arc<std::sync::Mutex<Vec<desktop_assistant_core::domain::KnowledgeEntry>>>,
-    ) {
+    ) -> (BuiltinToolService, KbStore) {
         kb_service_with_slow_store(resolve, std::time::Duration::ZERO)
     }
 
@@ -4695,10 +4832,7 @@ mod tests {
     fn kb_service_with_slow_store(
         resolve: Option<KnowledgeTagResolveFn>,
         store_delay: std::time::Duration,
-    ) -> (
-        BuiltinToolService,
-        std::sync::Arc<std::sync::Mutex<Vec<desktop_assistant_core::domain::KnowledgeEntry>>>,
-    ) {
+    ) -> (BuiltinToolService, KbStore) {
         use desktop_assistant_core::domain::KnowledgeEntry;
         use std::sync::{Arc, Mutex};
 
@@ -4805,6 +4939,445 @@ mod tests {
             .await
             .expect("knowledge base write succeeds");
         serde_json::from_str(&raw).expect("write response is JSON")
+    }
+
+    /// The fake store's rows, for a test that asserts on what a write stored.
+    fn kb_stored(store: &KbStore) -> Vec<desktop_assistant_core::domain::KnowledgeEntry> {
+        store.lock().expect("store lock").clone()
+    }
+
+    /// Put a row straight into the fake store, around the write path.
+    ///
+    /// The write path is what these tests measure, so the row a test starts
+    /// from has to arrive another way. `metadata` has no tool argument at all,
+    /// so seeding is the only way to give a row any.
+    fn seed_kb_entry(
+        store: &KbStore,
+        id: &str,
+        content: &str,
+        tags: &[&str],
+        metadata: serde_json::Value,
+    ) {
+        use desktop_assistant_core::domain::KnowledgeEntry;
+        store.lock().expect("seed store lock").push(KnowledgeEntry {
+            id: id.to_string(),
+            content: content.to_string(),
+            tags: tags.iter().map(|t| (*t).to_string()).collect(),
+            metadata,
+            created_at: "2026-01-01".to_string(),
+            updated_at: "2026-01-01".to_string(),
+            source: Some("explicit".to_string()),
+            summary: None,
+        });
+    }
+
+    #[tokio::test]
+    async fn kb_write_content_update_by_id_preserves_tags() {
+        // The prompt tells the model to update an existing entry instead of
+        // creating a near duplicate, and a content update names only `id` and
+        // `content`. Reads filter by tag overlap, so an entry that loses its
+        // tags is still in the store and no tag-scoped search finds it.
+        let (service, store) = kb_service_with_tag_gate(None);
+        seed_kb_entry(
+            &store,
+            "entry-1",
+            "Rain is expected on Tuesday.",
+            &["memory", "topic:weather"],
+            serde_json::json!({}),
+        );
+
+        kb_write_response(
+            &service,
+            serde_json::json!({
+                "id": "entry-1",
+                "content": "Rain is expected on Wednesday.",
+            }),
+        )
+        .await;
+
+        let stored = kb_stored(&store);
+        assert_eq!(stored.len(), 1, "the update replaced the entry in place");
+        assert_eq!(stored[0].content, "Rain is expected on Wednesday.");
+        assert_eq!(
+            stored[0].tags,
+            vec!["memory".to_string(), "topic:weather".to_string()],
+            "a write that does not mention tags keeps the ones the entry carries"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_write_content_update_by_id_preserves_metadata() {
+        // `metadata` has no tool argument, so a caller cannot send it back.
+        // Whatever a content update drops from it is gone for good.
+        let (service, store) = kb_service_with_tag_gate(None);
+        seed_kb_entry(
+            &store,
+            "entry-1",
+            "Rain is expected on Tuesday.",
+            &["memory"],
+            serde_json::json!({"confidence": "high", "source_url": "https://example.com/forecast"}),
+        );
+
+        kb_write_response(
+            &service,
+            serde_json::json!({
+                "id": "entry-1",
+                "content": "Rain is expected on Wednesday.",
+            }),
+        )
+        .await;
+
+        let stored = kb_stored(&store);
+        assert_eq!(
+            stored[0].metadata,
+            serde_json::json!({"confidence": "high", "source_url": "https://example.com/forecast"}),
+            "a write that does not mention a metadata key keeps it"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_write_content_update_by_id_keeps_the_conversation_provenance() {
+        // The #240 stamp names the conversation an entry was learned in. A
+        // content update happens in a later conversation, so losing the stamp
+        // does not leave it blank - it replaces it with the wrong
+        // conversation, which reads as true.
+        use desktop_assistant_core::domain::ConversationId;
+        use desktop_assistant_core::ports::conversation_ctx::with_conversation_id;
+
+        let (service, store) = kb_service_with_tag_gate(None);
+        seed_kb_entry(
+            &store,
+            "entry-1",
+            "Rain is expected on Tuesday.",
+            &["memory"],
+            serde_json::json!({"source_conversation_id": "conversation-where-it-was-learned"}),
+        );
+
+        with_conversation_id(
+            ConversationId::from("a-later-conversation"),
+            kb_write_response(
+                &service,
+                serde_json::json!({
+                    "id": "entry-1",
+                    "content": "Rain is expected on Wednesday.",
+                }),
+            ),
+        )
+        .await;
+
+        let stored = kb_stored(&store);
+        assert_eq!(
+            stored[0].metadata["source_conversation_id"], "conversation-where-it-was-learned",
+            "the stamp names where the fact was learned, not where it was last edited"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_write_explicit_empty_tags_still_clears_them() {
+        // Absent means "leave the stored tags alone"; present-and-empty means
+        // "clear them". Preserving the stored tags whenever the supplied list
+        // came out empty would take the second away.
+        let (service, store) = kb_service_with_tag_gate(None);
+        seed_kb_entry(
+            &store,
+            "entry-1",
+            "Rain is expected on Tuesday.",
+            &["memory", "topic:weather"],
+            serde_json::json!({}),
+        );
+        seed_kb_entry(
+            &store,
+            "entry-2",
+            "Snow is expected on Friday.",
+            &["memory", "topic:weather"],
+            serde_json::json!({}),
+        );
+
+        kb_write_response(
+            &service,
+            serde_json::json!({
+                "id": "entry-1",
+                "content": "Rain is expected on Wednesday.",
+                "tags": [],
+            }),
+        )
+        .await;
+        // The same rule with no content: a tags-only write that sends an empty
+        // list clears the tags and keeps the content.
+        kb_write_response(&service, serde_json::json!({"id": "entry-2", "tags": []})).await;
+
+        let stored = kb_stored(&store);
+        let first = stored
+            .iter()
+            .find(|e| e.id == "entry-1")
+            .expect("entry-1 is in the store");
+        assert!(
+            first.tags.is_empty(),
+            "an empty tag list on a content update clears the tags: {:?}",
+            first.tags
+        );
+        let second = stored
+            .iter()
+            .find(|e| e.id == "entry-2")
+            .expect("entry-2 is in the store");
+        assert!(
+            second.tags.is_empty(),
+            "an empty tag list on a tags-only write clears the tags: {:?}",
+            second.tags
+        );
+        assert_eq!(
+            second.content, "Snow is expected on Friday.",
+            "clearing the tags does not touch the content"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_write_reads_a_null_tags_field_as_absent() {
+        // Several providers encode "I am not setting this field" as an
+        // explicit null. Reading that as an empty list clears the tags of
+        // every entry those writes touch, which is the loss this whole path
+        // exists to stop.
+        let (service, store) = kb_service_with_tag_gate(None);
+        seed_kb_entry(
+            &store,
+            "entry-1",
+            "Rain is expected on Tuesday.",
+            &["memory", "topic:weather"],
+            serde_json::json!({}),
+        );
+
+        kb_write_response(
+            &service,
+            serde_json::json!({
+                "id": "entry-1",
+                "content": "Rain is expected on Wednesday.",
+                "tags": null,
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            kb_stored(&store)[0].tags,
+            vec!["memory".to_string(), "topic:weather".to_string()],
+            "a null tag field means the write said nothing about tags"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_write_refuses_a_tags_field_that_is_not_a_list() {
+        // Nothing validates the tool schema between the model and this code,
+        // so a `tags` of the wrong shape arrives as written. Reading it as an
+        // empty list answers "set this tag" with a wipe, and reports `ok`.
+        let (service, store) = kb_service_with_tag_gate(None);
+        seed_kb_entry(
+            &store,
+            "entry-1",
+            "Rain is expected on Tuesday.",
+            &["memory", "topic:weather"],
+            serde_json::json!({}),
+        );
+
+        let err = service
+            .execute_tool(
+                TOOL_KB_WRITE,
+                serde_json::json!({
+                    "id": "entry-1",
+                    "content": "Rain is expected on Wednesday.",
+                    "tags": "topic:weather",
+                }),
+            )
+            .await
+            .expect_err("a `tags` that is not a list is refused");
+        assert!(
+            err.to_string().contains("`tags` must be a list of strings"),
+            "the error says what shape `tags` takes: {err}"
+        );
+        assert_eq!(
+            kb_stored(&store)[0].tags,
+            vec!["memory".to_string(), "topic:weather".to_string()],
+            "the refused write stored nothing, so the entry is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_write_refuses_a_tag_that_is_not_a_string() {
+        // A tag that arrives as an object is a tag the caller asked to store.
+        // Dropping it silently loses the caller's intent, and dropping the
+        // only one wipes the entry.
+        let (service, store) = kb_service_with_tag_gate(None);
+        seed_kb_entry(
+            &store,
+            "entry-1",
+            "Rain is expected on Tuesday.",
+            &["memory", "topic:weather"],
+            serde_json::json!({}),
+        );
+
+        let err = service
+            .execute_tool(
+                TOOL_KB_WRITE,
+                serde_json::json!({
+                    "id": "entry-1",
+                    "content": "Rain is expected on Wednesday.",
+                    "tags": [{"name": "memory"}],
+                }),
+            )
+            .await
+            .expect_err("a tag that is not a string is refused");
+        assert!(
+            err.to_string()
+                .contains("every tag in `tags` must be a string"),
+            "the error says what a tag is: {err}"
+        );
+        assert_eq!(
+            kb_stored(&store)[0].tags,
+            vec!["memory".to_string(), "topic:weather".to_string()],
+            "the refused write stored nothing, so the entry is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_write_still_drops_a_blank_tag() {
+        // A blank string is not a tag, and trimming it away loses no intent,
+        // so it stays a normalisation rather than joining the refusals above.
+        let (service, store) = kb_service_with_tag_gate(None);
+
+        kb_write_response(
+            &service,
+            serde_json::json!({
+                "content": "Rain is expected on Tuesday.",
+                "tags": ["memory", "   ", ""],
+            }),
+        )
+        .await;
+
+        assert_eq!(kb_stored(&store)[0].tags, vec!["memory".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn kb_write_without_an_id_is_unaffected() {
+        // A create starts from nothing. No row already in the store may reach
+        // it, whatever the store holds.
+        let (service, store) = kb_service_with_tag_gate(None);
+        seed_kb_entry(
+            &store,
+            "entry-1",
+            "Rain is expected on Tuesday.",
+            &["memory", "topic:weather"],
+            serde_json::json!({"confidence": "high"}),
+        );
+
+        let created =
+            kb_write_response(&service, serde_json::json!({"content": "A separate fact."})).await;
+        let new_id = created["entries"][0]["id"]
+            .as_str()
+            .expect("the write reports the entry id")
+            .to_string();
+        assert_ne!(new_id, "entry-1", "a write with no id creates a new entry");
+
+        let stored = kb_stored(&store);
+        assert_eq!(stored.len(), 2, "the create left the existing entry alone");
+        let fresh = stored
+            .iter()
+            .find(|e| e.id == new_id)
+            .expect("the create landed");
+        assert!(
+            fresh.tags.is_empty(),
+            "a create that names no tags carries none: {:?}",
+            fresh.tags
+        );
+        assert_eq!(
+            fresh.metadata,
+            serde_json::json!({}),
+            "a create starts with empty metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_write_with_content_creates_at_a_caller_supplied_id() {
+        // `id` is optional, and supplying one is how a caller makes a write
+        // idempotent under retry: the retry lands on the row the first attempt
+        // created instead of a duplicate. A write that carries content holds
+        // everything a create needs, so an id no row holds is a create at that
+        // id, not an error.
+        let (service, store) = kb_service_with_tag_gate(None);
+
+        let spec = serde_json::json!({
+            "id": "caller-chosen-id",
+            "content": "A fact worth keeping.",
+            "tags": ["memory"],
+        });
+        let first = kb_write_response(&service, spec.clone()).await;
+        assert_eq!(
+            first["entries"][0]["id"], "caller-chosen-id",
+            "the create used the id the caller chose"
+        );
+
+        // The same call again, as a retry would send it.
+        kb_write_response(&service, spec).await;
+
+        let stored = kb_stored(&store);
+        assert_eq!(
+            stored.len(),
+            1,
+            "the retry landed on the row the first write created"
+        );
+        assert_eq!(stored[0].tags, vec!["memory".to_string()]);
+        assert_eq!(stored[0].content, "A fact worth keeping.");
+    }
+
+    #[tokio::test]
+    async fn kb_write_by_id_without_content_needs_an_entry_to_update() {
+        // With no content and no stored row there is nothing to write, so this
+        // stays an error even though a create at a caller-chosen id does not.
+        let (service, _store) = kb_service_with_tag_gate(None);
+
+        let err = service
+            .execute_tool(
+                TOOL_KB_WRITE,
+                serde_json::json!({"id": "no-such-entry", "tags": ["memory"]}),
+            )
+            .await
+            .expect_err("a tags-only write needs an entry to re-tag");
+        assert!(
+            err.to_string().contains("no knowledge entry with id"),
+            "the error names the missing entry: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_write_content_update_by_id_does_not_re_register_the_carried_over_tags() {
+        // A tag the entry already carries is already in the vocabulary.
+        // Offering it again on every content update pays an embedding per tag
+        // per write, and lets the registry rename a stored tag behind the
+        // caller's back on a write that never mentioned it.
+        let (resolve, probe) = recording_tag_gate(&[]);
+        let (service, store) = kb_service_with_tag_gate(Some(resolve));
+        seed_kb_entry(
+            &store,
+            "entry-1",
+            "Rain is expected on Tuesday.",
+            &["memory", "topic:weather"],
+            serde_json::json!({}),
+        );
+
+        kb_write_response(
+            &service,
+            serde_json::json!({
+                "id": "entry-1",
+                "content": "Rain is expected on Wednesday.",
+            }),
+        )
+        .await;
+
+        assert!(
+            probe.lock().expect("probe lock").proposals.is_empty(),
+            "a write that does not mention tags consults the vocabulary for none"
+        );
+        assert_eq!(
+            kb_stored(&store)[0].tags,
+            vec!["memory".to_string(), "topic:weather".to_string()],
+        );
     }
 
     #[tokio::test]
@@ -5512,6 +6085,146 @@ mod tests {
             entries.contains("new_tag_descriptions"),
             "the entries description must say that a top-level \
              new_tag_descriptions is ignored: {entries}"
+        );
+    }
+
+    #[test]
+    fn kb_write_schema_says_a_write_by_id_keeps_what_it_leaves_out() {
+        // The model decides what to send from this text alone. Told only that
+        // `id` updates an entry, it re-sends the tags on every content update
+        // to be safe, and each of those round trips is an unnecessary
+        // vocabulary consultation that can rename a stored tag. Told the rule,
+        // it sends only what changed.
+        let service = BuiltinToolService::new();
+        let def = service
+            .tool_definitions()
+            .into_iter()
+            .find(|t| t.name == TOOL_KB_WRITE)
+            .expect("kb_write tool is advertised");
+
+        let lower = def.description.to_lowercase();
+        // Named, not summarised as "every field". A write does not keep the
+        // entry's provenance, so a description that says "every" is a promise
+        // the code breaks - see
+        // `kb_write_schema_says_a_write_records_the_entry_as_explicit`.
+        assert!(
+            lower.contains("keeps the content, the tags and the stored metadata"),
+            "the description must name what a write by id keeps, field by \
+             field: {}",
+            def.description
+        );
+        assert!(
+            !lower.contains("keeps every field"),
+            "a write does not keep every field - it overwrites the entry's \
+             provenance - so the description must not claim it does: {}",
+            def.description
+        );
+        assert!(
+            lower.contains("empty `tags` list"),
+            "the description must say how to clear the tags, or the model has \
+             no way to: {}",
+            def.description
+        );
+
+        // An id no entry holds is a create at that id, which is what makes a
+        // write repeatable. A model told only "ID for updates" will not retry
+        // with the same id.
+        let id = def.parameters["properties"]["id"]["description"]
+            .as_str()
+            .expect("id carries a description");
+        assert!(
+            id.contains("no entry holds") && id.contains("repeated"),
+            "the id description must say that an unheld id creates, so a write \
+             can be repeated: {id}"
+        );
+    }
+
+    #[test]
+    fn kb_write_schema_says_a_write_records_the_entry_as_explicit() {
+        // `build_write_entry` always sends `source = "explicit"`, and the
+        // upsert only preserves the stored value when the write sends none. So
+        // a write flips a consolidated entry's provenance, and
+        // `builtin_knowledge_base_list` with `source: "consolidation"` stops
+        // returning it. A model that reads "a write keeps what it leaves out"
+        // and then cannot find that entry again has been told something false.
+        let service = BuiltinToolService::new();
+        let def = service
+            .tool_definitions()
+            .into_iter()
+            .find(|t| t.name == TOOL_KB_WRITE)
+            .expect("kb_write tool is advertised");
+
+        let lower = def.description.to_lowercase();
+        assert!(
+            lower.contains("provenance") && lower.contains("'explicit'"),
+            "the description must say that a write records the entry as \
+             explicit: {}",
+            def.description
+        );
+        assert!(
+            lower.contains("builtin_knowledge_base_list"),
+            "the description must say which read that provenance change \
+             affects, or the model cannot tell what it costs: {}",
+            def.description
+        );
+    }
+
+    #[test]
+    fn kb_write_schema_says_a_retired_id_is_refused() {
+        // Consolidation retires an entry overnight while the model still holds
+        // its id, so this is a live outcome, not a corner. Told that an id no
+        // entry holds simply creates, a model reads the refusal as a broken
+        // tool and retries the same call. Told the rule, it drops the id and
+        // the fact is saved.
+        let service = BuiltinToolService::new();
+        let def = service
+            .tool_definitions()
+            .into_iter()
+            .find(|t| t.name == TOOL_KB_WRITE)
+            .expect("kb_write tool is advertised");
+
+        let id = def.parameters["properties"]["id"]["description"]
+            .as_str()
+            .expect("id carries a description")
+            .to_lowercase();
+        assert!(
+            id.contains("retired") && id.contains("refused"),
+            "the id description must say a retired id is refused: {id}"
+        );
+        assert!(
+            id.contains("new entry with no id"),
+            "the id description must say what to do about a refusal, or the \
+             model retries the same call: {id}"
+        );
+    }
+
+    #[test]
+    fn kb_write_schema_warns_against_a_readable_caller_chosen_id() {
+        // An id is a bare key, not scoped to this conversation or this topic.
+        // A model told it may choose one picks a readable name, that name can
+        // already be taken, and the write then fails with nothing stored -
+        // which reads to the model as a broken tool rather than a naming rule
+        // it broke.
+        let service = BuiltinToolService::new();
+        let def = service
+            .tool_definitions()
+            .into_iter()
+            .find(|t| t.name == TOOL_KB_WRITE)
+            .expect("kb_write tool is advertised");
+
+        let id = def.parameters["properties"]["id"]["description"]
+            .as_str()
+            .expect("id carries a description")
+            .to_lowercase();
+        assert!(
+            id.contains("uuid") && id.contains("readable name"),
+            "the id description must say a made-up id is a fresh random one, \
+             never a readable name: {id}"
+        );
+        assert!(
+            id.contains("already be taken") && id.contains("fails"),
+            "the id description must say what a readable name costs, or the \
+             rule reads as arbitrary: {id}"
         );
     }
 
