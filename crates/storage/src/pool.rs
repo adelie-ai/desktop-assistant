@@ -190,6 +190,9 @@ const MIGRATIONS: &[Migration] = &[
     migration!("038_kb_delete_provenance.sql"),
     // Per-conversation override for the tool-provenance gate (#1007).
     migration!("039_conversation_tool_gate.sql"),
+    // #1097: a one-line summary per knowledge entry, so a reader can list many
+    // entries without printing or truncating each whole body.
+    migration!("041_knowledge_base_summary.sql"),
 ];
 
 /// Second half of the advisory-lock key: the schema the migrations write to.

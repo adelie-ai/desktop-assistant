@@ -1095,6 +1095,12 @@ pub struct KnowledgeEntryView {
     pub metadata: serde_json::Value,
     pub created_at: String,
     pub updated_at: String,
+    /// A one-line condensation of what this entry says, for a list row that
+    /// cannot spend the whole `content` on each entry. Absent when no summary
+    /// has been written yet, which is true of every entry stored before the
+    /// field existed - a client renders a truncated `content` in that case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
 }
 
 /// Which knowledge-maintenance pass [`Command::StartKnowledgeMaintenance`]
@@ -4729,6 +4735,41 @@ mod tests {
         });
         let view: ConversationView = serde_json::from_value(old_shaped).unwrap();
         assert!(!view.tool_gate_disabled);
+    }
+
+    #[test]
+    fn an_old_shaped_knowledge_entry_view_without_a_summary_still_parses() {
+        // A payload from a daemon that predates #1097 carries no `summary` key
+        // at all. It must still deserialize, reporting no summary rather than
+        // failing the whole entry.
+        let old_shaped = serde_json::json!({
+            "id": "kb-1",
+            "content": "User prefers dark mode",
+            "tags": ["preference"],
+            "created_at": "2026-01-01 00:00:00",
+            "updated_at": "2026-01-01 00:00:00",
+        });
+        let view: KnowledgeEntryView = serde_json::from_value(old_shaped).unwrap();
+        assert_eq!(view.summary, None);
+    }
+
+    #[test]
+    fn a_knowledge_entry_view_without_a_summary_is_byte_identical_to_the_old_shape() {
+        // An absent summary must not appear on the wire, so a client that has
+        // not been rebuilt sees exactly the payload it saw before.
+        let view = KnowledgeEntryView {
+            id: "kb-1".to_string(),
+            content: "User prefers dark mode".to_string(),
+            tags: vec!["preference".to_string()],
+            metadata: serde_json::json!({}),
+            created_at: "2026-01-01 00:00:00".to_string(),
+            updated_at: "2026-01-01 00:00:00".to_string(),
+            summary: None,
+        };
+
+        let json = serde_json::to_string(&view).unwrap();
+
+        assert!(!json.contains("summary"), "json: {json}");
     }
 
     fn remove_key_recursive(v: &mut serde_json::Value, key: &str) {

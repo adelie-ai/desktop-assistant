@@ -1500,6 +1500,7 @@ fn knowledge_entry_to_view(e: KnowledgeEntry) -> api::KnowledgeEntryView {
         metadata: e.metadata,
         created_at: e.created_at,
         updated_at: e.updated_at,
+        summary: e.summary,
     }
 }
 

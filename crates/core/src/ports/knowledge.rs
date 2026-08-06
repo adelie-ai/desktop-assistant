@@ -124,9 +124,17 @@ pub struct KnowledgeSearchPage {
 }
 
 /// Outbound port for the unified knowledge base (replaces preferences + memory).
+///
+/// Every read here returns whole [`KnowledgeEntry`] values, including the
+/// one-line [`KnowledgeEntry::summary`] a caller uses to list many entries
+/// without spending each whole body.
 pub trait KnowledgeBaseStore: Send + Sync {
     /// Write (upsert) a knowledge entry. If an entry with the same id exists,
     /// its content/tags/metadata are replaced and `updated_at` is bumped.
+    ///
+    /// `source` and `summary` are the exception: `None` in either preserves the
+    /// stored value rather than clearing it, so a caller that knows nothing
+    /// about them cannot wipe one.
     ///
     /// Writes never touch the embedding columns: embedding generation is
     /// decoupled from content writes. New rows land with a NULL embedding and

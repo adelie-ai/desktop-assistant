@@ -1432,6 +1432,9 @@ impl BuiltinToolService {
             created_at: String::new(),
             updated_at: String::new(),
             source: Some("explicit".to_string()),
+            // The write tool takes no summary yet. `None` preserves whatever
+            // the row already holds; it never clears it.
+            summary: None,
         })
     }
 
@@ -1562,6 +1565,7 @@ impl BuiltinToolService {
                 serde_json::json!({
                     "id": entry.id,
                     "content": entry.content,
+                    "summary": entry.summary,
                     "tags": entry.tags,
                     "metadata": entry.metadata,
                     "updated_at": entry.updated_at,
@@ -1827,6 +1831,7 @@ impl BuiltinToolService {
                 serde_json::json!({
                     "id": entry.id,
                     "content": entry.content,
+                    "summary": entry.summary,
                     "tags": entry.tags,
                     "metadata": entry.metadata,
                     "source": entry.source,

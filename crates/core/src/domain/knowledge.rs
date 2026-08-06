@@ -16,6 +16,19 @@ pub struct KnowledgeEntry {
     /// it.
     #[serde(default)]
     pub source: Option<String>,
+    /// A one-line condensation of what this entry says, for a reader that
+    /// shows many entries at once and cannot spend the whole body on each.
+    ///
+    /// `None` means no summary has been written yet, which is true of every
+    /// entry stored before the field existed. It is not a definition of the
+    /// entry's subject the way a tag's description is: it condenses what this
+    /// particular entry says, and is rewritten when the content changes.
+    ///
+    /// On write, `None` preserves any existing value rather than clearing it -
+    /// the same rule [`KnowledgeEntry::source`] follows, so a caller that knows
+    /// nothing about summaries cannot wipe one.
+    #[serde(default)]
+    pub summary: Option<String>,
 }
 
 impl KnowledgeEntry {
@@ -28,6 +41,7 @@ impl KnowledgeEntry {
             created_at: String::new(),
             updated_at: String::new(),
             source: None,
+            summary: None,
         }
     }
 
