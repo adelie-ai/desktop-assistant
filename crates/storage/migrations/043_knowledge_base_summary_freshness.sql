@@ -19,6 +19,15 @@
 ALTER TABLE knowledge_base
     ADD COLUMN IF NOT EXISTS summary_updated_at TIMESTAMPTZ;
 
+-- A summary of '' is the one state that renders while reading as present:
+-- `KnowledgeEntry::display_line` prefers a stored summary over the content
+-- fallback, so such a row shows a blank list row and a blank recall line. Rows
+-- written before the write path learned to clear to NULL could hold one, so
+-- normalize them here rather than stamp them as current below.
+UPDATE knowledge_base
+    SET summary = NULL
+    WHERE summary = '';
+
 UPDATE knowledge_base
     SET summary_updated_at = updated_at
     WHERE summary IS NOT NULL

@@ -145,6 +145,15 @@ const ALLOWED_CROSS_USER_QUERIES: &[AllowedCrossUserQuery] = &[
                     by user_id; the worker installs a per-user \
                     scope before processing each group.",
     },
+    AllowedCrossUserQuery {
+        file: "src/dreaming/summarize.rs",
+        line_hint: 0,
+        rationale: "load_user_ids_needing_summaries: the summary \
+                    backfill's entry point. Returns user ids only - \
+                    no content, no summary - so the worker can \
+                    install a per-user scope; every other statement \
+                    in the file binds user_id.",
+    },
 ];
 
 /// Result of scanning a single SQL fragment.

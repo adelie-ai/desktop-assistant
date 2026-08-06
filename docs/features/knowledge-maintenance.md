@@ -72,6 +72,27 @@ fills them (`crates/storage/src/dreaming/summarize.rs`). Four rules bound it:
    summary costs one line inside a batched prompt while re-attempting an
    embedding costs a metered vector call.
 
+### What the model is shown
+
+Entries are **numbered** in the prompt (`## 1`, `## 2`, ...), never named, and the
+answer refers to them by number. An entry id is free text taken from whoever
+called the write tool and stored as written, with nothing bounding it, so a
+prompt carrying one would let a crafted id spend the whole prompt budget by
+itself or forge the heading that separates the entries - and so put words in a
+neighbouring entry's mouth. Content and tags go through the same one-line rule,
+which bounds them and collapses any newline they carry, so neither can forge a
+heading either. An answer numbered outside the batch is dropped.
+
+### The limit this pass does not solve
+
+A batch fails as a unit: an answer that will not parse costs every entry in that
+batch, not the one that provoked it. Batch composition is stable across cycles,
+so an entry that reliably breaks the answer holds its companions back with it for
+as long as it keeps doing so. Splitting a failed batch is deliberately not done,
+following consolidation: a malformed answer is not a size problem, so re-asking
+with fewer entries only spends calls. The failure log names the ids it left
+behind instead, so the stuck rows are identifiable.
+
 ### Drift, and why `summary IS NULL` is not the worklist
 
 A summary condenses `content`, so an edit to the body leaves the stored line
@@ -84,7 +105,11 @@ touching the summary at all.
 So freshness is tracked the way embeddings already track it. `summary_updated_at`
 (migration 043) records when the line was written, and work is due when the stamp
 is absent or older than `updated_at` - the same shape as
-`embeddings_updated_at < updated_at`. The knowledge write path stamps it
+`embeddings_updated_at < updated_at`. The worklist also reads an empty summary as
+no summary: `''` is the one state that hides from `summary IS NULL` while still
+rendering, because `display_line` prefers a stored summary over the content
+fallback, so such a row would show a blank line for good. The knowledge write
+path stamps it
 alongside the summary in all three of that field's states: a supplied summary
 takes the same transaction time as `updated_at` and so reads as current, a
 cleared summary loses its stamp with its text, and an absent one keeps the stamp

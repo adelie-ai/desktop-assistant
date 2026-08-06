@@ -48,18 +48,27 @@ use tokio_util::sync::CancellationToken;
 // Fakes
 // ---------------------------------------------------------------------------
 
-/// The ids a summary prompt names, in the order it names them. The prompt lists
-/// one `## <id>` heading per entry, the same shape consolidation uses.
-fn ids_in_prompt(prompt: &str) -> Vec<String> {
-    prompt
-        .lines()
-        .filter_map(|l| l.strip_prefix("## "))
-        .map(|id| id.trim().to_string())
+/// The entries a summary prompt describes, as `(number, content)`.
+///
+/// The prompt numbers entries rather than naming them - `## 1`, then a `tags:`
+/// line, then the body on one line - so a test reads an entry back by its
+/// content, exactly as the model must.
+fn entries_in_prompt(prompt: &str) -> Vec<(usize, String)> {
+    let lines: Vec<&str> = prompt.lines().collect();
+    lines
+        .iter()
+        .enumerate()
+        .filter_map(|(i, line)| {
+            let number: usize = line.strip_prefix("## ")?.trim().parse().ok()?;
+            let content = lines.get(i + 2).copied().unwrap_or_default();
+            Some((number, content.to_string()))
+        })
         .collect()
 }
 
-/// A dreaming LLM that answers a summary prompt by applying `line` to each id it
-/// was shown. `line` returning `None` models the model omitting that entry.
+/// A dreaming LLM that answers a summary prompt by applying `line` to each
+/// entry's content, naming each answer by the number the prompt gave it. `line`
+/// returning `None` models the model omitting that entry.
 ///
 /// Every prompt it is asked is recorded, so a test can assert how many calls a
 /// batch of entries cost and what each one contained.
@@ -68,24 +77,23 @@ fn summarising_llm(
     line: impl Fn(&str) -> Option<String> + Send + Sync + 'static,
 ) -> DreamingLlmFn {
     Box::new(move |_system, user| {
-        let ids = ids_in_prompt(&user);
+        let entries = entries_in_prompt(&user);
         prompts
             .lock()
             .expect("prompt log is not poisoned")
             .push(user);
-        let entries: Vec<String> = ids
+        let answers: Vec<String> = entries
             .iter()
-            .filter_map(|id| {
-                line(id).map(|summary| {
+            .filter_map(|(number, content)| {
+                line(content).map(|summary| {
                     format!(
-                        r#"{{"id":{},"summary":{}}}"#,
-                        serde_json::to_string(id).expect("an id serializes"),
+                        r#"{{"entry":{number},"summary":{}}}"#,
                         serde_json::to_string(&summary).expect("a summary serializes"),
                     )
                 })
             })
             .collect();
-        let response = format!(r#"{{"summaries":[{}]}}"#, entries.join(","));
+        let response = format!(r#"{{"summaries":[{}]}}"#, answers.join(","));
         Box::pin(async move { Ok(response) })
     })
 }
@@ -96,9 +104,11 @@ fn recorded(prompts: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
     prompts.lock().expect("prompt log is not poisoned").clone()
 }
 
-/// A dreaming LLM that answers every entry with `"summary of <id>"`.
+/// A dreaming LLM that answers every entry by echoing the body it was shown, so
+/// a test asserts the seeded content back and a line written for the wrong entry
+/// is visible as such.
 fn llm_summarising_everything(prompts: Arc<Mutex<Vec<String>>>) -> DreamingLlmFn {
-    summarising_llm(prompts, |id| Some(format!("summary of {id}")))
+    summarising_llm(prompts, |content| Some(content.to_string()))
 }
 
 /// A dreaming LLM whose every call fails, modelling an unreachable or
@@ -273,7 +283,7 @@ async fn dream_summary_pass_fills_a_null_summary() {
 
     assert_eq!(
         kb_summary(pool, "kb-a").await.as_deref(),
-        Some("summary of kb-a"),
+        Some("The user keeps facet colons in tag names."),
         "an entry with no summary gets the line the model wrote"
     );
 
@@ -316,6 +326,44 @@ async fn dream_summary_pass_leaves_an_existing_summary_alone() {
 }
 
 #[tokio::test]
+async fn dream_summary_pass_reaches_an_entry_whose_summary_is_an_empty_string() {
+    // An empty string is not a summary, and it is the one state that hides from
+    // a `summary IS NULL` worklist while still rendering: `display_line` prefers
+    // a stored summary over the content fallback, so the entry shows a blank row
+    // and a blank recall line, permanently, with nothing able to fix it.
+    //
+    // The write path cannot produce one any more (#1098), but rows written
+    // before that fix could, and nothing stops a future writer or a hand-run
+    // statement.
+    let Some(fx) = support::DbFixture::try_new("dream1099").await else {
+        return;
+    };
+    let pool = &fx.pool;
+
+    sqlx::query(
+        "INSERT INTO knowledge_base (id, user_id, content, tags, summary, summary_updated_at) \
+         VALUES ($1, $2, $3, '{}'::text[], '', NOW())",
+    )
+    .bind("kb-blank")
+    .bind("u1")
+    .bind("A fact whose summary was cleared to an empty string.")
+    .execute(pool)
+    .await
+    .expect("seed a row holding an empty-string summary");
+
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    run_cycle(pool, &llm_summarising_everything(prompts)).await;
+
+    assert_eq!(
+        kb_summary(pool, "kb-blank").await.as_deref(),
+        Some("A fact whose summary was cleared to an empty string."),
+        "an empty-string summary counts as no summary, so the pass reaches it"
+    );
+
+    fx.cleanup().await;
+}
+
+#[tokio::test]
 async fn dream_summary_pass_rewrites_a_summary_older_than_its_content() {
     // The write path preserves a stored summary when an update names none
     // (#1098), which is exactly how a summary comes to describe content that no
@@ -340,7 +388,7 @@ async fn dream_summary_pass_rewrites_a_summary_older_than_its_content() {
 
     assert_eq!(
         kb_summary(pool, "kb-a").await.as_deref(),
-        Some("summary of kb-a"),
+        Some("The user prefers a light theme after all."),
         "a summary older than the content it describes is written again"
     );
 
@@ -398,7 +446,7 @@ async fn dream_summary_pass_discards_a_line_written_for_a_body_that_changed_unde
         let pool = racing_pool.clone();
         Box::pin(async move {
             rewrite_content(&pool, "kb-a", "The user prefers a light theme after all.").await;
-            Ok(r#"{"summaries":[{"id":"kb-a","summary":"Prefers dark themes"}]}"#.to_string())
+            Ok(r#"{"summaries":[{"entry":1,"summary":"Prefers dark themes"}]}"#.to_string())
         })
     });
     run_cycle(pool, &llm).await;
@@ -414,7 +462,7 @@ async fn dream_summary_pass_discards_a_line_written_for_a_body_that_changed_unde
     run_cycle(pool, &llm_summarising_everything(prompts)).await;
     assert_eq!(
         kb_summary(pool, "kb-a").await.as_deref(),
-        Some("summary of kb-a"),
+        Some("The user prefers a light theme after all."),
         "the row stays in the worklist and is summarised against its current body"
     );
 
@@ -552,7 +600,7 @@ async fn dream_summary_pass_asks_for_a_batch_of_entries_in_one_call() {
         calls.len()
     );
     assert!(
-        calls.iter().any(|p| ids_in_prompt(p).len() > 1),
+        calls.iter().any(|p| entries_in_prompt(p).len() > 1),
         "at least one call must carry several entries"
     );
 
@@ -587,8 +635,8 @@ async fn dream_summary_pass_survives_one_row_failing() {
     .await;
 
     let prompts = Arc::new(Mutex::new(Vec::new()));
-    let llm = summarising_llm(prompts, |id| {
-        (id != "kb-bad").then(|| format!("summary of {id}"))
+    let llm = summarising_llm(prompts, |content| {
+        (!content.contains("refuses")).then(|| content.to_string())
     });
     run_cycle(pool, &llm).await;
 
@@ -599,12 +647,12 @@ async fn dream_summary_pass_survives_one_row_failing() {
     );
     assert_eq!(
         kb_summary(pool, "kb-good-1").await.as_deref(),
-        Some("summary of kb-good-1"),
+        Some("A fact the model can summarise."),
         "one failed row does not cost the rows around it"
     );
     assert_eq!(
         kb_summary(pool, "kb-good-2").await.as_deref(),
-        Some("summary of kb-good-2")
+        Some("Another fact the model can summarise.")
     );
 
     fx.cleanup().await;
@@ -633,7 +681,7 @@ async fn dream_summary_pass_retries_next_cycle_a_row_it_could_not_summarise() {
     run_cycle(pool, &llm_summarising_everything(prompts)).await;
     assert_eq!(
         kb_summary(pool, "kb-a").await.as_deref(),
-        Some("summary of kb-a"),
+        Some("A fact worth a line."),
         "the row is offered to the model again on the next cycle"
     );
 
@@ -826,9 +874,9 @@ async fn dream_summary_pass_ignores_a_blank_line_from_the_model() {
 }
 
 #[tokio::test]
-async fn dream_summary_pass_ignores_an_id_it_did_not_ask_about() {
-    // The model answers with ids it was shown. One it was not shown is either a
-    // hallucination or another partition's row.
+async fn dream_summary_pass_ignores_an_entry_number_it_did_not_ask_about() {
+    // The model answers with the numbers it was shown. One past the end of the
+    // batch names nothing, so it must not fall through onto another row.
     let Some(fx) = support::DbFixture::try_new("dream1099").await else {
         return;
     };
@@ -844,12 +892,13 @@ async fn dream_summary_pass_ignores_an_id_it_did_not_ask_about() {
     )
     .await;
 
-    // Answers for the row it was shown, and for one it was not.
+    // Answers for the one entry it was shown, and for a second that does not
+    // exist in the batch.
     let llm: DreamingLlmFn = Box::new(move |_system, _user| {
         Box::pin(async move {
             Ok(r#"{"summaries":[
-                {"id":"kb-a","summary":"a real line"},
-                {"id":"kb-untouched","summary":"an unasked-for line"}
+                {"entry":1,"summary":"a real line"},
+                {"entry":2,"summary":"an unasked-for line"}
             ]}"#
             .to_string())
         })
@@ -863,7 +912,7 @@ async fn dream_summary_pass_ignores_an_id_it_did_not_ask_about() {
     assert_eq!(
         kb_summary(pool, "kb-untouched").await.as_deref(),
         Some("Already has a line"),
-        "an answer for an entry the call did not name is ignored"
+        "an answer numbered past the end of the batch is ignored"
     );
 
     fx.cleanup().await;

@@ -118,6 +118,14 @@ pub const MAX_SUMMARY_PROMPT_CHARS: usize = 20_000;
 /// prompt budget by itself.
 pub const MAX_SUMMARY_SOURCE_CHARS: usize = 2_000;
 
+/// How much of an entry's tag list one summary prompt carries.
+///
+/// Tags are normalized on write but never bounded, in length or in number, so
+/// without this one entry's tag line could spend the whole prompt budget. The
+/// tags are context for the register of the fact, so a bounded list serves that
+/// as well as an unbounded one.
+pub const MAX_SUMMARY_TAGS_CHARS: usize = 200;
+
 /// Safety cap: the fraction of a user's active entries a single holistic run
 /// may prune outright. Merges don't count - their content survives in the
 /// canonical row. Excess prunes are dropped with a warning.
