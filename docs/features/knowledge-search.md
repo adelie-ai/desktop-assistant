@@ -151,6 +151,43 @@ When the embedding backend times out the search falls back to full-text only
 semantic recall. It does not change the response shape: the census runs on both
 branches, so a caller never has to handle a degraded contract.
 
+## What the prompt tells the model to do with them
+
+A field the model is never told to read is a field it does not use, so the
+knowledge-base prompt section states the procedure:
+
+1. Search with a natural-language question and no tags, then filter on a tag
+   from `available_tags`. Never invent one. The standing advice to filter on the
+   narrowest tag carries a condition in its own sentence - only once
+   `available_tags` has shown the tag exists - so the model cannot read it as
+   licence to filter on a guess, whichever line it reaches first.
+2. When no tag fits, sweep with `builtin_knowledge_base_list` and its
+   `next_cursor`, bounded at three pages of fifty.
+3. When the sweep finds the entry, re-tag it, preferring a tag that
+   `available_tags` already reports, and carrying the entry's existing tags
+   forward.
+
+Two of those are worth stating plainly, because both invite a wrong instruction.
+
+**A larger search `limit` does find more entries, and is still the wrong
+retry.** It finds more: `search_hybrid` derives `fetch_limit` as `limit * 2` for
+both retrieval arms and `result_limit` as `limit` for the page, so a bigger
+limit really does surface entries a smaller one truncated away. It is the wrong
+move for a different reason - the model cannot tell how far down the ranking the
+entry sits, so the retry is a guess that costs an embedding round-trip and may
+still miss. A sweep is bounded and it reports what has already been read. The
+prompt gives that reason rather than the tidier falsehood.
+
+**A re-tag replaces the whole tag list.** `build_write_entry` uses the supplied
+`tags` array verbatim, and the upsert is `SET tags = EXCLUDED.tags`. A model
+told only to "add the missing facet" sends one tag and destroys the entry's KIND
+tag and its project scope - so the prompt says the tags sent replace the old
+ones, and to carry the existing ones forward.
+
+Step 3 needs the tag-registry dedup gate on `builtin_knowledge_base_write`.
+Without it, an instruction to add tags splits the vocabulary faster than the
+census can report it.
+
 ## Where things live
 
 | Concern | Location |
@@ -159,3 +196,4 @@ branches, so a caller never has to handle a degraded contract.
 | The census SQL and both search arms | `crates/storage/src/knowledge.rs` |
 | Tool response and schema | `crates/mcp-client/src/builtin.rs` |
 | Census behaviour under a real database | `crates/storage/tests/knowledge_tag_census.rs` |
+| Prompt guidance that consumes these fields | `crates/core/src/prompts/sections/knowledge_base.txt` |

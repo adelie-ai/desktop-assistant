@@ -661,6 +661,145 @@ mod tests {
     }
 
     #[test]
+    fn assembled_prompt_tells_the_model_to_search_in_words_not_keywords() {
+        // The search is hybrid: a vector arm over the entry embeddings and a
+        // full-text arm, fused by RRF. The vector arm reads the whole question,
+        // so keywords starve it, and a guessed keyword only feeds the lexical
+        // arm - the one that already fails when the model does not know the word
+        // the entry used. A style preference the model can weigh against its own
+        // habits is not enough; the reason has to travel with the rule (#1071).
+        let assembled = assemble(&static_sections());
+        assert!(
+            assembled.contains("as you would ask a colleague"),
+            "the KB guidance must tell the model to search in plain words"
+        );
+        assert!(
+            assembled.contains("Do not guess at keywords"),
+            "and forbid guessing keywords"
+        );
+        assert!(
+            assembled.contains("one arm matches meaning"),
+            "and give the reason: the search matches meaning, not only words"
+        );
+    }
+
+    #[test]
+    fn assembled_prompt_directs_the_model_to_available_tags_before_filtering() {
+        // A guessed tag that no entry carries returns nothing, and the model has
+        // no other way to learn the vocabulary. The search response reports the
+        // tags the scope really uses, so the guidance must send the model there
+        // (#1071).
+        let assembled = assemble(&static_sections());
+        assert!(
+            assembled.contains("Start with a natural-language query and no tags"),
+            "the KB guidance must open the search unfiltered"
+        );
+        assert!(
+            assembled.contains("available_tags"),
+            "and name the field that reports the tags the scope really uses"
+        );
+        assert!(
+            assembled.contains("Never guess a tag"),
+            "and forbid guessing a tag"
+        );
+        assert!(
+            assembled.contains("once `available_tags` has shown you the tag exists"),
+            "and the standing advice to filter on the narrowest tag must be \
+             ordered after that, or the model filters on a guess first and never \
+             reaches this procedure"
+        );
+    }
+
+    #[test]
+    fn assembled_prompt_bounds_the_list_fallback_to_three_pages() {
+        // Left vague, the model re-issues search with a bigger `limit`, which
+        // costs an embedding round-trip and returns the same entries re-ranked.
+        // The fallback is a different tool, and it is bounded (#1071).
+        let assembled = assemble(&static_sections());
+        assert!(
+            assembled.contains("read at most 3 pages of 50"),
+            "the list fallback must be bounded in pages AND in page size: the \
+             tool caps `limit` at 500, so three unbounded pages is 1500 entries"
+        );
+        assert!(
+            assembled.contains("only reaches further down the same ranking"),
+            "and the guidance must say what a bigger search `limit` really does"
+        );
+        assert!(
+            !assembled.contains("it does not find more"),
+            "and must not claim a bigger limit finds nothing new: `fetch_limit` \
+             is `limit * 2` and the page is `limit`, so a bigger limit does \
+             reach entries a smaller one excluded"
+        );
+        assert!(
+            assembled.contains("next_cursor"),
+            "and name the cursor the list tool pages with"
+        );
+    }
+
+    #[test]
+    fn assembled_prompt_warns_that_a_retag_replaces_every_tag() {
+        // `build_write_entry` uses the supplied `tags` array verbatim and the
+        // upsert is `SET tags = EXCLUDED.tags`, so a re-tag that sends only the
+        // one missing facet destroys the entry's KIND tag and its project scope.
+        // The guidance tells the model to re-tag after every successful sweep,
+        // which makes this the most-travelled write path in the section (#1071).
+        let assembled = assemble(&static_sections());
+        assert!(
+            assembled.contains("replace the old ones"),
+            "the guidance must say a re-tag replaces the whole tag list"
+        );
+        assert!(
+            assembled.contains("keep the tags the entry already carries"),
+            "and tell the model to carry the existing tags forward"
+        );
+    }
+
+    #[test]
+    fn assembled_prompt_tells_the_model_to_retag_an_entry_it_had_to_sweep_for() {
+        // An entry that only a full sweep found is mis-tagged for how the model
+        // searches. Without this the next search misses it again (#1071).
+        let assembled = assemble(&static_sections());
+        assert!(
+            assembled.contains("re-tag it so the next search finds it"),
+            "the guidance must turn a successful sweep into a repair"
+        );
+        assert!(
+            assembled.contains("Prefer a tag that already appears in `available_tags`"),
+            "and prefer an existing tag over a new one"
+        );
+        assert!(
+            assembled.contains("builtin_knowledge_base_write"),
+            "and name the tool that performs the re-tag"
+        );
+        assert!(
+            assembled.contains("and no `content`"),
+            "and keep the no-content clause: a re-tag that carries `content` \
+             takes the full-update path, which rebuilds metadata from empty"
+        );
+    }
+
+    #[test]
+    fn assembled_prompt_tells_the_model_to_describe_a_new_tag() {
+        // The registry dedups on an embedding of "<name>: <description>", and a
+        // short facet tag carries almost no signal alone. Without a description
+        // the vocabulary splits into near-duplicates (#1071).
+        let assembled = assemble(&static_sections());
+        assert!(
+            assembled.contains("new_tag_descriptions"),
+            "the guidance must name the field that carries a new tag's meaning"
+        );
+        assert!(
+            assembled.contains("one-line description"),
+            "and say how long that description should be"
+        );
+        assert!(
+            assembled.contains("near-duplicates"),
+            "and say what the description prevents"
+        );
+    }
+
+    #[test]
     fn assembled_prompt_advertises_scratchpad_tools() {
         // The scratchpad must be advertised in the always-present system prompt
         // so the model knows the tools exist (#184).
