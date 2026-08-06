@@ -1055,3 +1055,139 @@ async fn tool_search_vector_arm_truncates_to_the_nearest_candidates() {
 
     fx.cleanup().await;
 }
+
+// -- #1107 follow-up: both of `search_tools_scored`'s final `ORDER BY
+// -- <score> DESC` clauses (the empty-embedding FTS-only fallback at line
+// -- ~225, and the hybrid RRF path at line ~322) have the same
+// -- undefined-truncation defect the window-function fix addressed, one
+// -- level out. `tool_definitions.name` is a single-column PRIMARY KEY, so
+// -- it alone is a sufficient deterministic tiebreak -- no second column
+// -- needed, unlike the composite-keyed `skill_index` or the recency-plus-id
+// -- `knowledge_base`/`scratchpads`. Both ties below are directly
+// -- constructible, so both tests are red-to-green reproductions, not pins.
+
+#[tokio::test]
+async fn tool_search_fts_fallback_truncates_to_a_defined_row_when_scores_tie() {
+    // Empty query embedding -> the FTS-only fallback branch (line ~225).
+    // Two tools with IDENTICAL description text tie exactly on
+    // `ts_rank_cd`, and neither carries a provider, so `boosted_score`
+    // equals the raw (tied) score for both. `name ASC` must pick
+    // "aaa_tool" (the lexicographically smaller name) when `limit`
+    // truncates the tied pair down to 1.
+    //
+    // This registration order (not the reverse) is what makes the test a
+    // genuine red-to-green: probed directly, the pre-fix query returns
+    // whichever tool was registered FIRST, and "zzz_tool" is registered
+    // first here so that incidental behavior disagrees with `name ASC`.
+    let Some(fx) = fixture("tool_fts_fallback_tie").await else {
+        eprintln!(
+            "skip: TEST_DATABASE_URL not set; tool_search_fts_fallback_truncates_to_a_defined_row_when_scores_tie"
+        );
+        return;
+    };
+    let store = PgToolRegistryStore::new(fx.pool.clone());
+
+    store
+        .register_tools(
+            vec![tool("zzz_tool", "gronk widget")],
+            "mcp",
+            false,
+            None,
+            vec![None],
+            None,
+        )
+        .await
+        .expect("register zzz_tool");
+    store
+        .register_tools(
+            vec![tool("aaa_tool", "gronk widget")],
+            "mcp",
+            false,
+            None,
+            vec![None],
+            None,
+        )
+        .await
+        .expect("register aaa_tool");
+
+    let names: Vec<String> = store
+        .search_tools("gronk", vec![], 1)
+        .await
+        .expect("search")
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    assert_eq!(
+        names,
+        vec!["aaa_tool"],
+        "with an exact tied ts_rank_cd, the truncation to 1 row must be \
+         decided by name ASC (\"aaa_tool\" < \"zzz_tool\"), not by an \
+         undefined physical row order; got {names:?}"
+    );
+
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn tool_search_hybrid_truncates_to_a_defined_row_when_scores_tie() {
+    // Non-empty query embedding -> the hybrid RRF path (line ~322).
+    // "aaa_tool" is found ONLY by the text arm ("gronk"). "zzz_tool" is
+    // found ONLY by the vector arm (embedded, exact match to the query
+    // vector). Both therefore score exactly `1.0 / (60 + 1)`, and neither
+    // carries a provider, so `boosted_score` equals the tied `rrf_score`
+    // for both. `name ASC` must pick "aaa_tool" when `limit` truncates the
+    // tied pair down to 1.
+    //
+    // This role assignment (not the reverse) is what makes the test a
+    // genuine red-to-green: probed directly, the pre-fix query's `FULL
+    // OUTER JOIN` emits the vector-arm-only row first when scores tie, so
+    // giving the vector-matched role the LARGER name ("zzz_tool") makes
+    // that incidental behavior disagree with `name ASC`.
+    let Some(fx) = fixture("tool_hybrid_tie").await else {
+        eprintln!(
+            "skip: TEST_DATABASE_URL not set; tool_search_hybrid_truncates_to_a_defined_row_when_scores_tie"
+        );
+        return;
+    };
+    let store = PgToolRegistryStore::new(fx.pool.clone());
+
+    store
+        .register_tools(
+            vec![tool("aaa_tool", "the distinctive gronk term appears here")],
+            "mcp",
+            false,
+            None,
+            vec![None],
+            None,
+        )
+        .await
+        .expect("register aaa_tool");
+    store
+        .register_tools(
+            vec![tool("zzz_tool", "unrelated prose that never matches")],
+            "mcp",
+            false,
+            None,
+            vec![embed(1.0, 0.0)],
+            Some("test-model".to_string()),
+        )
+        .await
+        .expect("register zzz_tool");
+
+    let names: Vec<String> = store
+        .search_tools("gronk", vec![1.0, 0.0], 1)
+        .await
+        .expect("search")
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    assert_eq!(
+        names,
+        vec!["aaa_tool"],
+        "with an exact rrf_score tie, the truncation to 1 row must be \
+         decided by name ASC (\"aaa_tool\" < \"zzz_tool\"), not by an \
+         undefined physical row order; got {names:?}"
+    );
+
+    fx.cleanup().await;
+}

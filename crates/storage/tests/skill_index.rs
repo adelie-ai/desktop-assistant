@@ -664,3 +664,76 @@ async fn skill_search_vector_arm_truncates_to_the_nearest_candidates() {
     )
     .await;
 }
+
+// -- #1107 follow-up: `fused`'s `ORDER BY f.score DESC` has the same
+// -- undefined-truncation defect the window-function fix addressed, one
+// -- level out. RRF ties exactly by construction (a row found by ONLY one
+// -- arm at rank 1 scores exactly `1/(60+1)`, whichever arm found it), so a
+// -- score-only `ORDER BY` leaves which of two tied skills the `LIMIT` keeps
+// -- undefined. Unlike the window-function sites, this tie is directly
+// -- constructible, so this is a red-to-green reproduction, not a pin.
+
+#[tokio::test]
+async fn skill_search_truncates_to_a_defined_row_when_fused_scores_tie() {
+    // "zzz-skill" is found ONLY by the text arm (it is the sole row
+    // containing the FTS query term "gronk"). "aaa-skill" is found ONLY by
+    // the vector arm (its embedding exactly matches the query vector). Both
+    // therefore score exactly `1.0 / (60 + 1)` -- an exact IEEE-754 tie, not
+    // an approximate one.
+    //
+    // `skill_index` has no single surrogate id column; its uniqueness is the
+    // composite `(name, owner_key)` (`idx_skill_index_name_owner`), so that
+    // composite -- not a recency column -- is the natural deterministic
+    // tiebreak. Both rows are global (`owner_key` = `''`), so `name` alone
+    // decides: `name ASC` must pick "aaa-skill" (the lexicographically
+    // smaller name) when `limit` truncates the tied pair down to 1.
+    //
+    // This name assignment (not the reverse) is what makes the test a
+    // genuine red-to-green: probed directly, the pre-fix query's
+    // `FULL OUTER JOIN` between `vr` and `tr` emits the text-arm-only row
+    // first when scores tie, regardless of which literal name carries which
+    // role. Naming the text-matched row "zzz-skill" (the lexicographically
+    // LARGER name) makes that incidental behavior disagree with `name ASC`.
+    with_fixture(
+        "skill_search_truncates_to_a_defined_row_when_fused_scores_tie",
+        |fx| async move {
+            let store = PgSkillIndexStore::new(fx.pool.clone());
+
+            seed(
+                &store,
+                vec![
+                    skill(
+                        "zzz-skill",
+                        "the distinctive gronk term appears here",
+                        "h1",
+                        "b1",
+                    ),
+                    skill(
+                        "aaa-skill",
+                        "unrelated prose that never matches",
+                        "h2",
+                        "b2",
+                    ),
+                ],
+            )
+            .await;
+            set_skill_embedding(&fx.pool, "aaa-skill", vec![1.0, 0.0, 0.0]).await;
+            // zzz-skill is left unembedded on purpose.
+
+            let hits = store
+                .search("gronk", vec![1.0, 0.0, 0.0], "test-model", 1)
+                .await
+                .expect("search");
+            let names: Vec<&str> = hits.iter().map(|s| s.name.as_str()).collect();
+            assert_eq!(
+                names,
+                vec!["aaa-skill"],
+                "with an exact fused-score tie, the truncation to 1 row must \
+                 be decided by name ASC (\"aaa-skill\" < \"zzz-skill\"), not \
+                 by an undefined physical row order; got {names:?}"
+            );
+            fx
+        },
+    )
+    .await;
+}
