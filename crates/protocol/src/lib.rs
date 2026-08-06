@@ -1,4 +1,5 @@
-//! Shared, dependency-light protocol/domain enums.
+//! Shared, dependency-light protocol/domain enums, plus the few pure rules
+//! that a domain type and its wire view must answer identically.
 //!
 //! These types were extracted from `desktop-assistant-core` (#377) so that
 //! `api-model` and the shared client cores can depend on them **without**
@@ -10,6 +11,72 @@
 //! Serde representations here are wire-/storage-visible (JSON columns, config
 //! files, the D-Bus int contract). Do not change variant names or `rename_all`
 //! attributes without a migration.
+//!
+//! A rule belongs here when `core` and `api-model` must both apply it and give
+//! the same answer - [`one_line`] is the example. It has to be a pure function
+//! of its arguments, with no domain or wire semantics of its own, or it belongs
+//! in whichever of the two crates owns that meaning.
+
+// ---------------------------------------------------------------------------
+// Display lines
+// ---------------------------------------------------------------------------
+
+/// The longest display line a knowledge entry gets, in characters, including
+/// the truncation marker.
+///
+/// Why a cap: the line is rendered once per entry into a list row or a context
+/// block with a fixed budget, and nothing bounds how long an entry's content
+/// may be. Without this one long entry would spend the whole budget by itself.
+/// It is also the length a written summary is expected to keep, so a stand-in
+/// and a real summary occupy the same space.
+///
+/// It lives here, rather than beside either type, because the domain entry
+/// (`desktop-assistant-core`) and the wire view (`desktop-assistant-api-model`)
+/// must answer the same, and this crate is the only one both can depend on.
+pub const SUMMARY_MAX_CHARS: usize = 200;
+
+/// What ends a line that was cut short, so a partial line never reads as a
+/// complete one.
+const TRUNCATION_MARKER: &str = "...";
+
+/// Reduce `text` to one display line of at most `max_chars` characters.
+///
+/// Runs of whitespace become a single space and the leading and trailing runs
+/// are dropped, so the result is one physical line whatever the source looked
+/// like. A line that had to lose anything ends in `...`, and the marker counts
+/// toward `max_chars`.
+///
+/// Why the collapse comes first: whitespace that is about to disappear must not
+/// spend the budget, or a loosely-formatted body would be cut far shorter than
+/// a dense one saying the same thing.
+///
+/// Why characters and not bytes: a byte-indexed cut can land inside a
+/// multi-byte character, which panics.
+pub fn one_line(text: &str, max_chars: usize) -> String {
+    // `split_whitespace` yields the non-whitespace runs, which collapses every
+    // separator and drops both ends in one pass.
+    let mut collapsed = String::new();
+    for word in text.split_whitespace() {
+        if !collapsed.is_empty() {
+            collapsed.push(' ');
+        }
+        collapsed.push_str(word);
+    }
+
+    if collapsed.chars().count() <= max_chars {
+        return collapsed;
+    }
+
+    let marker_chars = TRUNCATION_MARKER.chars().count();
+    // A budget too small to hold the marker cannot carry it. The budget wins:
+    // a line that overruns it to announce the cut defeats the point of it.
+    if max_chars <= marker_chars {
+        return collapsed.chars().take(max_chars).collect();
+    }
+    let mut out: String = collapsed.chars().take(max_chars - marker_chars).collect();
+    out.push_str(TRUNCATION_MARKER);
+    out
+}
 
 // ---------------------------------------------------------------------------
 // Effort
@@ -398,5 +465,86 @@ mod client_context_tests {
             serde_json::from_str(r#"{"username":"ada","future_field":"x"}"#).unwrap();
         assert_eq!(back.username.as_deref(), Some("ada"));
         assert!(back.real_name.is_none());
+    }
+}
+
+#[cfg(test)]
+mod one_line_tests {
+    use super::{SUMMARY_MAX_CHARS, one_line};
+
+    #[test]
+    fn one_line_leaves_a_short_single_line_untouched() {
+        assert_eq!(
+            one_line("User prefers dark mode", 200),
+            "User prefers dark mode"
+        );
+    }
+
+    #[test]
+    fn one_line_collapses_runs_of_whitespace_to_a_single_space() {
+        // The result is one physical line, so a newline, a tab, and a run of
+        // spaces all become one space. Every caller renders into a
+        // line-oriented block, and each would otherwise re-solve this.
+        assert_eq!(
+            one_line("first line\nsecond\tline\r\n\n   third    line", 200),
+            "first line second line third line"
+        );
+    }
+
+    #[test]
+    fn one_line_drops_leading_and_trailing_whitespace() {
+        assert_eq!(one_line("\n\t  padded  \n ", 200), "padded");
+    }
+
+    #[test]
+    fn one_line_marks_a_cut_line_so_it_reads_as_incomplete() {
+        let line = one_line(&"x".repeat(300), 200);
+        assert!(line.ends_with("..."), "{line}");
+    }
+
+    #[test]
+    fn one_line_never_exceeds_the_limit_including_the_marker() {
+        // The limit is a budget, and the budget counts the marker too.
+        assert_eq!(one_line(&"x".repeat(10_000), 200).chars().count(), 200);
+        assert!(one_line(&"x".repeat(10_000), 10).chars().count() <= 10);
+    }
+
+    #[test]
+    fn one_line_cuts_on_a_character_boundary() {
+        // A byte-indexed cut inside a multi-byte character panics, so the
+        // limit counts characters. Each of these is three bytes.
+        let line = one_line(&"\u{4e16}".repeat(500), 200);
+        assert_eq!(line.chars().count(), 200);
+        assert!(line.starts_with('\u{4e16}'));
+        assert!(line.ends_with("..."));
+    }
+
+    #[test]
+    fn one_line_counts_the_budget_after_collapsing_not_before() {
+        // Whitespace that is about to disappear must not spend the budget, or
+        // a loosely-formatted body would be cut far shorter than a dense one
+        // saying the same thing.
+        let padded = "a".repeat(50) + &" ".repeat(500) + &"b".repeat(50);
+        assert_eq!(one_line(&padded, 200).chars().count(), 101);
+    }
+
+    #[test]
+    fn one_line_honours_a_limit_too_small_for_the_marker() {
+        // The limit wins over the wish to say "there is more": a line that
+        // overruns its budget to announce the cut defeats the budget.
+        assert_eq!(one_line("abcdef", 2), "ab");
+    }
+
+    #[test]
+    fn one_line_of_empty_or_blank_text_is_empty() {
+        assert_eq!(one_line("", 200), "");
+        assert_eq!(one_line("   \n\t ", 200), "");
+    }
+
+    #[test]
+    fn the_shared_cap_is_the_one_every_display_line_uses() {
+        // Named so a change to the cap shows up as this test, not as a silent
+        // widening of every recall block and list row at once.
+        assert_eq!(SUMMARY_MAX_CHARS, 200);
     }
 }

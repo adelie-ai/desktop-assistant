@@ -1432,6 +1432,9 @@ impl BuiltinToolService {
             created_at: String::new(),
             updated_at: String::new(),
             source: Some("explicit".to_string()),
+            // The write tool takes no summary yet. `None` preserves whatever
+            // the row already holds; it never clears it.
+            summary: None,
         })
     }
 
@@ -1562,6 +1565,7 @@ impl BuiltinToolService {
                 serde_json::json!({
                     "id": entry.id,
                     "content": entry.content,
+                    "summary": entry.summary,
                     "tags": entry.tags,
                     "metadata": entry.metadata,
                     "updated_at": entry.updated_at,
@@ -1827,6 +1831,7 @@ impl BuiltinToolService {
                 serde_json::json!({
                     "id": entry.id,
                     "content": entry.content,
+                    "summary": entry.summary,
                     "tags": entry.tags,
                     "metadata": entry.metadata,
                     "source": entry.source,
@@ -5444,6 +5449,99 @@ mod tests {
                 .contains("checked against the tags that already exist"),
             "the tags an entry carries are not what a tag is checked against: {}",
             def.description
+        );
+    }
+
+    // -- knowledge-base reads: the one-line summary (#1097) ------------------
+
+    /// A knowledge-base service whose store answers every list with `entries`.
+    /// The list tool is the second read surface the model sees, so it needs a
+    /// store that returns rows where `kb_service_reporting`'s returns none.
+    fn kb_service_listing(
+        entries: Vec<desktop_assistant_core::domain::KnowledgeEntry>,
+    ) -> BuiltinToolService {
+        use std::sync::Arc;
+
+        let write_fn: KnowledgeWriteFn = Arc::new(|entry| Box::pin(async move { Ok(entry) }));
+        let search_fn: KnowledgeSearchFn = Arc::new(|_q, _e, _m, _t, _x, _l| {
+            Box::pin(async {
+                Ok(KnowledgeSearchPage {
+                    entries: Vec::new(),
+                    scope_size: ScopeSize::None,
+                    available_tags: Vec::new(),
+                })
+            })
+        });
+        let delete_fn: KnowledgeDeleteFn = Arc::new(|_ids| Box::pin(async { Ok(0) }));
+        let list_fn: KnowledgeListFn = Arc::new(move |_q| {
+            let entries = entries.clone();
+            Box::pin(async move {
+                Ok(
+                    desktop_assistant_core::ports::knowledge::KnowledgeListPage {
+                        entries,
+                        next_cursor: None,
+                    },
+                )
+            })
+        });
+        let get_fn: KnowledgeGetFn = Arc::new(|_id| Box::pin(async { Ok(None) }));
+        BuiltinToolService::new()
+            .with_knowledge_base(write_fn, search_fn, delete_fn, list_fn, get_fn)
+    }
+
+    #[tokio::test]
+    async fn kb_search_results_carry_the_summary() {
+        // A search result is what the model reads before it decides whether to
+        // pull the body. Without the summary on that row it can only judge the
+        // entry from its whole content.
+        let mut entry = kb_entry("kb-1", &["preference"]);
+        entry.summary = Some("Prefers dark mode in every editor".to_string());
+        let (service, _probe) = kb_service_reporting(KnowledgeSearchPage {
+            entries: vec![entry],
+            scope_size: ScopeSize::Few,
+            available_tags: Vec::new(),
+        });
+
+        let json = kb_search_response(&service, serde_json::json!({"query": "dark mode"})).await;
+
+        assert_eq!(
+            json["results"][0]["summary"], "Prefers dark mode in every editor",
+            "the search result carries the entry's one-line summary"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_search_reports_a_null_summary_for_an_entry_that_has_none() {
+        // Every entry written before the field existed has no summary. The row
+        // must still report the field, as null, so a caller can tell "no
+        // summary yet" from "this reader dropped it".
+        let (service, _probe) = kb_service_reporting(KnowledgeSearchPage {
+            entries: vec![kb_entry("kb-1", &["preference"])],
+            scope_size: ScopeSize::Few,
+            available_tags: Vec::new(),
+        });
+
+        let json = kb_search_response(&service, serde_json::json!({"query": "dark mode"})).await;
+
+        assert_eq!(json["results"][0]["summary"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn kb_list_carries_the_summary() {
+        let mut entry = kb_entry("kb-1", &["preference"]);
+        entry.summary = Some("Prefers dark mode in every editor".to_string());
+        let service = kb_service_listing(vec![entry]);
+
+        let raw = service
+            .execute_tool(TOOL_KB_LIST, serde_json::json!({"limit": 10}))
+            .await
+            .expect("knowledge base list succeeds");
+        let json: serde_json::Value = serde_json::from_str(&raw).expect("list response is JSON");
+
+        assert_eq!(json["count"], 1);
+        assert_eq!(
+            json["entries"][0]["summary"], "Prefers dark mode in every editor",
+            "the list row carries the entry's one-line summary"
         );
     }
 

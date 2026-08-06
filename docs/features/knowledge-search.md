@@ -12,7 +12,8 @@ The response therefore reports what was searched, not only what was found.
 
 ```json
 {"ok": true,
- "results": [{"id": "...", "content": "...", "tags": ["..."], "metadata": {}, "updated_at": "..."}],
+ "results": [{"id": "...", "content": "...", "summary": "...", "tags": ["..."],
+              "metadata": {}, "updated_at": "..."}],
  "returned": 10,
  "truncated": true,
  "message": "results were truncated; narrow with a more specific `query`, ...",
@@ -22,7 +23,7 @@ The response therefore reports what was searched, not only what was found.
 
 | Field | Meaning |
 | ----- | ------- |
-| `results` | The matched entries, best match first. |
+| `results` | The matched entries, best match first. Each carries a `summary`: one line condensing what that entry says, so a caller can judge a hit without reading the whole `content`. It is `null` for an entry that has none yet, which is every entry stored before the field existed. |
 | `returned` | How many entries are in `results`. Same name `builtin_scratchpad_search` uses. |
 | `truncated` | Present, and `true`, only when the page filled up (`returned` reached `limit`) **and** the scope is larger than the page. A full page under `FEW` carries neither it nor `message`, because `FEW` already means the page holds the whole scope. It always travels with `message`, which says how to narrow. Its absence is the claim that nothing was left behind. |
 | `scope_size` | `NONE`, `FEW`, `MANY`, or `UNKNOWN`. See below. |

@@ -1500,6 +1500,7 @@ fn knowledge_entry_to_view(e: KnowledgeEntry) -> api::KnowledgeEntryView {
         metadata: e.metadata,
         created_at: e.created_at,
         updated_at: e.updated_at,
+        summary: e.summary,
     }
 }
 
@@ -3978,6 +3979,9 @@ mod tests {
         );
     }
 
+    /// The one knowledge id [`FakeKnowledge`] holds an entry for.
+    const FAKE_KNOWLEDGE_ID: &str = "kb-fake";
+
     struct FakeKnowledge;
     impl desktop_assistant_core::ports::inbound::KnowledgeService for FakeKnowledge {
         async fn list_entries(
@@ -3988,8 +3992,17 @@ mod tests {
         ) -> Result<Vec<KnowledgeEntry>, CoreError> {
             Ok(vec![])
         }
-        async fn get_entry(&self, _id: String) -> Result<Option<KnowledgeEntry>, CoreError> {
-            Ok(None)
+        /// Answers only for [`FAKE_KNOWLEDGE_ID`], with every field populated,
+        /// so a read-path test can prove the mapper carries them all. Any
+        /// other id stays "not found".
+        async fn get_entry(&self, id: String) -> Result<Option<KnowledgeEntry>, CoreError> {
+            if id != FAKE_KNOWLEDGE_ID {
+                return Ok(None);
+            }
+            let mut e =
+                KnowledgeEntry::new(id, "User prefers dark mode", vec!["preference".into()]);
+            e.summary = Some("Prefers dark mode in every editor".to_string());
+            Ok(Some(e))
         }
         async fn search_entries(
             &self,
@@ -4029,6 +4042,38 @@ mod tests {
         async fn empty_trash(&self) -> Result<usize, CoreError> {
             Ok(0)
         }
+    }
+
+    #[tokio::test]
+    async fn kb_get_carries_the_summary() {
+        // Reading one entry is what a knowledge browser does when a row is
+        // opened, and what a caller does after a search line looks worth
+        // reading. The wire view must carry the summary the store holds.
+        let h = DefaultAssistantApiHandler::new(
+            Arc::new(FakeAssistant),
+            Arc::new(FakeConversations),
+            Arc::new(FakeSettings),
+            Arc::new(FakeConnections),
+            Arc::new(FakeKnowledge),
+        );
+
+        let res = h
+            .handle_command_for(
+                RequestContext::for_user(UserId::new("alice")),
+                api::Command::GetKnowledgeEntry {
+                    id: FAKE_KNOWLEDGE_ID.to_string(),
+                },
+            )
+            .await
+            .expect("get knowledge entry succeeds");
+
+        let api::CommandResult::KnowledgeEntry(Some(view)) = res else {
+            panic!("expected a KnowledgeEntry result holding an entry");
+        };
+        assert_eq!(
+            view.summary.as_deref(),
+            Some("Prefers dark mode in every editor")
+        );
     }
 
     struct FakeConnections;

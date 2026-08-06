@@ -42,21 +42,26 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
         // own partition because the WHERE filter on the conflict update
         // matches only their row, and the insert path stamps user_id
         // from the current request.
-        // `source` ($6) records provenance. On update a NULL `source` preserves
-        // the existing value (COALESCE) rather than clearing it, so a path that
-        // doesn't care about provenance can't wipe it.
+        // `source` ($6) records provenance and `summary` ($7) the one-line
+        // condensation. On update a NULL in either preserves the existing value
+        // (COALESCE) rather than clearing it, so a path that doesn't care about
+        // provenance, or knows nothing about summaries, can't wipe one. There
+        // is deliberately no way to clear either through this call: absent is
+        // the only meaning NULL carries here.
         let row: KbRow = sqlx::query_as(
             "INSERT INTO knowledge_base \
-                (id, user_id, content, tags, metadata, source) \
-             VALUES ($1, $2, $3, $4, $5, $6) \
+                (id, user_id, content, tags, metadata, source, summary) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) \
              ON CONFLICT (id) DO UPDATE \
                 SET content = EXCLUDED.content, \
                     tags = EXCLUDED.tags, \
                     metadata = EXCLUDED.metadata, \
                     source = COALESCE(EXCLUDED.source, knowledge_base.source), \
+                    summary = COALESCE(EXCLUDED.summary, knowledge_base.summary), \
                     updated_at = NOW() \
                 WHERE knowledge_base.user_id = $2 \
-             RETURNING id, content, tags, metadata, created_at, updated_at, source",
+             RETURNING id, content, tags, metadata, created_at, updated_at, \
+                       source, summary",
         )
         .bind(&entry.id)
         .bind(user_id.as_str())
@@ -64,6 +69,7 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
         .bind(&tags)
         .bind(&entry.metadata)
         .bind(&entry.source)
+        .bind(&entry.summary)
         .fetch_one(&self.pool)
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;
@@ -147,7 +153,7 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
         let limit_i64 = limit as i64;
         let offset_i64 = offset as i64;
         let rows: Vec<KbRow> = sqlx::query_as(
-            "SELECT id, content, tags, metadata, created_at, updated_at, source
+            "SELECT id, content, tags, metadata, created_at, updated_at, source, summary
              FROM knowledge_base
              WHERE user_id = $4
                AND deleted_at IS NULL
@@ -180,7 +186,7 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
     async fn get(&self, id: &str) -> Result<Option<KnowledgeEntry>, CoreError> {
         let user_id = current_user_id();
         let row: Option<KbRow> = sqlx::query_as(
-            "SELECT id, content, tags, metadata, created_at, updated_at, source
+            "SELECT id, content, tags, metadata, created_at, updated_at, source, summary
              FROM knowledge_base \
              WHERE user_id = $1 AND id = $2 AND deleted_at IS NULL",
         )
@@ -332,7 +338,7 @@ impl PgKnowledgeBaseStore {
         // excluded.
         let rows: Vec<KbSearchRow> = sqlx::query_as(
             "WITH chunk_distances AS (
-                SELECT id, content, tags, metadata, created_at, updated_at,
+                SELECT id, content, tags, metadata, created_at, updated_at, summary,
                        MIN(chunk <=> $1) AS min_distance
                 FROM knowledge_base, unnest(embedding) AS chunk
                 WHERE user_id = $6
@@ -345,16 +351,16 @@ impl PgKnowledgeBaseStore {
                        OR (split_part($8, '@', 2) <> ''
                            AND split_part(embedding_model, '@', 2)
                                = split_part($8, '@', 2)))
-                GROUP BY id, content, tags, metadata, created_at, updated_at
+                GROUP BY id, content, tags, metadata, created_at, updated_at, summary
             ),
             vector_ranked AS (
-                SELECT id, content, tags, metadata, created_at, updated_at,
+                SELECT id, content, tags, metadata, created_at, updated_at, summary,
                        ROW_NUMBER() OVER (ORDER BY min_distance) AS rank_v
                 FROM chunk_distances
                 LIMIT $3
             ),
             text_ranked AS (
-                SELECT id, content, tags, metadata, created_at, updated_at,
+                SELECT id, content, tags, metadata, created_at, updated_at, summary,
                        ROW_NUMBER() OVER (ORDER BY ts_rank_cd(tsv, query) DESC) AS rank_t
                 FROM knowledge_base, plainto_tsquery('english', $4) query
                 WHERE user_id = $6
@@ -372,12 +378,13 @@ impl PgKnowledgeBaseStore {
                        COALESCE(v.metadata, t.metadata) AS metadata,
                        COALESCE(v.created_at, t.created_at) AS created_at,
                        COALESCE(v.updated_at, t.updated_at) AS updated_at,
+                       COALESCE(v.summary, t.summary) AS summary,
                        (COALESCE(1.0 / (60 + v.rank_v), 0) +
                         COALESCE(1.0 / (60 + t.rank_t), 0))::FLOAT8 AS rrf_score
                 FROM vector_ranked v
                 FULL OUTER JOIN text_ranked t ON v.id = t.id
             )
-            SELECT id, content, tags, metadata, created_at, updated_at
+            SELECT id, content, tags, metadata, created_at, updated_at, summary
             FROM fused ORDER BY rrf_score DESC LIMIT $5",
         )
         .bind(embedding_vec)
@@ -411,7 +418,7 @@ impl PgKnowledgeBaseStore {
         let result_limit = limit as i64;
         let rows: Vec<KbRow> = sqlx::query_as(
             "WITH q AS (SELECT plainto_tsquery('english', $1) AS query)
-             SELECT id, content, tags, metadata, created_at, updated_at, source
+             SELECT id, content, tags, metadata, created_at, updated_at, source, summary
              FROM knowledge_base
              WHERE user_id = $4
                AND deleted_at IS NULL
@@ -469,7 +476,7 @@ impl PgKnowledgeBaseStore {
         // operator, so the SQL is never assembled from runtime values.
         let sql = match q.order.0 {
             ListOrder::NewestFirst => {
-                "SELECT id, content, tags, metadata, created_at, updated_at, source
+                "SELECT id, content, tags, metadata, created_at, updated_at, source, summary
                  FROM knowledge_base
                  WHERE user_id = $1
                    AND deleted_at IS NULL
@@ -482,7 +489,7 @@ impl PgKnowledgeBaseStore {
                  LIMIT $7"
             }
             ListOrder::OldestFirst => {
-                "SELECT id, content, tags, metadata, created_at, updated_at, source
+                "SELECT id, content, tags, metadata, created_at, updated_at, source, summary
                  FROM knowledge_base
                  WHERE user_id = $1
                    AND deleted_at IS NULL
@@ -568,6 +575,7 @@ struct KbRow {
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
     source: Option<String>,
+    summary: Option<String>,
 }
 
 impl KbRow {
@@ -580,6 +588,7 @@ impl KbRow {
             created_at: self.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
             updated_at: self.updated_at.format("%Y-%m-%d %H:%M:%S").to_string(),
             source: self.source,
+            summary: self.summary,
         }
     }
 }
@@ -600,6 +609,7 @@ struct KbSearchRow {
     metadata: serde_json::Value,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
+    summary: Option<String>,
 }
 
 impl KbSearchRow {
@@ -613,6 +623,9 @@ impl KbSearchRow {
             updated_at: self.updated_at.format("%Y-%m-%d %H:%M:%S").to_string(),
             // Search does not select provenance; the audit/list path does.
             source: None,
+            // Search does select the summary: it is what a caller reads to
+            // decide whether a hit is worth pulling the body for.
+            summary: self.summary,
         }
     }
 }

@@ -1095,6 +1095,28 @@ pub struct KnowledgeEntryView {
     pub metadata: serde_json::Value,
     pub created_at: String,
     pub updated_at: String,
+    /// A one-line condensation of what this entry says, for a list row that
+    /// cannot spend the whole `content` on each entry. Absent when no summary
+    /// has been written yet, which is true of every entry stored before the
+    /// field existed - a client renders a truncated `content` in that case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+
+impl KnowledgeEntryView {
+    /// The one line that stands for this entry in a list row: the stored
+    /// [`summary`](Self::summary) where there is one, otherwise the content.
+    /// One physical line, never longer than [`SUMMARY_MAX_CHARS`] characters,
+    /// and ending in `...` when it was cut short - see
+    /// [`desktop_assistant_protocol::one_line`].
+    ///
+    /// A client renders this rather than writing its own fallback, so every
+    /// surface cuts and marks the line the same way. The daemon's domain type
+    /// answers identically from the same shared rule.
+    pub fn display_line(&self) -> String {
+        let source = self.summary.as_deref().unwrap_or(&self.content);
+        desktop_assistant_protocol::one_line(source, SUMMARY_MAX_CHARS)
+    }
 }
 
 /// Which knowledge-maintenance pass [`Command::StartKnowledgeMaintenance`]
@@ -2040,6 +2062,9 @@ pub struct ModelCapabilitiesView {
 // keep compiling without churn; new code can use either name.
 pub use desktop_assistant_protocol::Effort as EffortLevel;
 pub use desktop_assistant_protocol::PurposeKind as PurposeKindApi;
+/// The cap [`KnowledgeEntryView::display_line`] holds to, re-exported so a
+/// client can name it without depending on `desktop-assistant-protocol`.
+pub use desktop_assistant_protocol::SUMMARY_MAX_CHARS;
 
 // Personality wire types (#226). Re-export the canonical types (now in
 // `desktop-assistant-protocol`, #377) so the settings channel, the daemon
@@ -4729,6 +4754,91 @@ mod tests {
         });
         let view: ConversationView = serde_json::from_value(old_shaped).unwrap();
         assert!(!view.tool_gate_disabled);
+    }
+
+    #[test]
+    fn an_old_shaped_knowledge_entry_view_without_a_summary_still_parses() {
+        // A payload from a daemon that predates #1097 carries no `summary` key
+        // at all. It must still deserialize, reporting no summary rather than
+        // failing the whole entry.
+        let old_shaped = serde_json::json!({
+            "id": "kb-1",
+            "content": "User prefers dark mode",
+            "tags": ["preference"],
+            "created_at": "2026-01-01 00:00:00",
+            "updated_at": "2026-01-01 00:00:00",
+        });
+        let view: KnowledgeEntryView = serde_json::from_value(old_shaped).unwrap();
+        assert_eq!(view.summary, None);
+    }
+
+    #[test]
+    fn a_knowledge_entry_view_without_a_summary_is_byte_identical_to_the_old_shape() {
+        // An absent summary must not appear on the wire, so a client that has
+        // not been rebuilt sees exactly the payload it saw before.
+        let view = KnowledgeEntryView {
+            id: "kb-1".to_string(),
+            content: "User prefers dark mode".to_string(),
+            tags: vec!["preference".to_string()],
+            metadata: serde_json::json!({}),
+            created_at: "2026-01-01 00:00:00".to_string(),
+            updated_at: "2026-01-01 00:00:00".to_string(),
+            summary: None,
+        };
+
+        let json = serde_json::to_string(&view).unwrap();
+
+        assert!(!json.contains("summary"), "json: {json}");
+    }
+
+    /// A view carrying `content` and, optionally, a summary.
+    fn kb_view(content: &str, summary: Option<&str>) -> KnowledgeEntryView {
+        KnowledgeEntryView {
+            id: "kb-1".to_string(),
+            content: content.to_string(),
+            tags: vec![],
+            metadata: serde_json::json!({}),
+            created_at: "2026-01-01 00:00:00".to_string(),
+            updated_at: "2026-01-01 00:00:00".to_string(),
+            summary: summary.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn knowledge_entry_view_display_line_returns_the_stored_summary_when_there_is_one() {
+        let view = kb_view(
+            "A long body a list row should never show in full.",
+            Some("Prefers dark themes"),
+        );
+
+        assert_eq!(view.display_line(), "Prefers dark themes");
+    }
+
+    #[test]
+    fn knowledge_entry_view_display_line_falls_back_to_the_content() {
+        // Nothing writes summaries yet, so the fallback is the common path. A
+        // row that showed nothing for an entry without one would show nothing
+        // for almost every entry.
+        let view = kb_view("User prefers dark mode", None);
+
+        assert_eq!(view.display_line(), "User prefers dark mode");
+    }
+
+    #[test]
+    fn knowledge_entry_view_display_line_is_bounded_and_marked_when_cut() {
+        let view = kb_view(&"x".repeat(10_000), None);
+
+        let line = view.display_line();
+
+        assert_eq!(line.chars().count(), SUMMARY_MAX_CHARS);
+        assert!(line.ends_with("..."));
+    }
+
+    #[test]
+    fn knowledge_entry_view_display_line_is_one_physical_line() {
+        let view = kb_view("First line.\nSecond line.\tThird.", None);
+
+        assert_eq!(view.display_line(), "First line. Second line. Third.");
     }
 
     fn remove_key_recursive(v: &mut serde_json::Value, key: &str) {
