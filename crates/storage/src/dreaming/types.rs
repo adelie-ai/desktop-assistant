@@ -56,9 +56,31 @@ pub const SOFT_DELETE_TTL_DAYS: u32 = 30;
 
 /// Character budget for one holistic-consolidation prompt. A user's active KB
 /// is recomputed in a single LLM call when it fits under this; otherwise it is
-/// sliced into tag-grouped chunks under this budget. ~200k chars ≈ 50k tokens,
-/// comfortably within a strong model's context with room for the response.
-pub const MAX_HOLISTIC_PROMPT_CHARS: usize = 200_000;
+/// sliced into tag-grouped chunks under this budget.
+///
+/// Why so far below the model's context window: the input is not the binding
+/// limit. The model answers with one operation per entry it wants to change,
+/// and two other limits bite long before the context does - the maximum output
+/// tokens the provider will return, and the per-call timeout in the daemon's
+/// maintenance service. A slice of several hundred entries reaches both, and a
+/// response cut off at the output limit cannot be parsed at all.
+///
+/// So this budget is sized from the expected *response*. About 40k chars is
+/// roughly 90 entries of average size, whose operations fit in a normal output
+/// allowance with room to spare. Total prompt volume is unchanged - the same
+/// entries are sent either way, in more calls - so this does not change what
+/// consolidation costs.
+pub const MAX_HOLISTIC_PROMPT_CHARS: usize = 40_000;
+
+/// How many times a consolidation slice may be halved when the model's answer
+/// comes back cut off.
+///
+/// The budget above sizes the ordinary case, but entry sizes vary and a model
+/// can be more verbose than expected, so a slice can still overflow the output
+/// allowance. Halving recovers those without a person having to retune the
+/// budget. The depth is bounded because each level doubles the number of calls:
+/// at 3, one slice costs at most 15 calls before it is declared a real failure.
+pub const MAX_SLICE_SPLIT_DEPTH: usize = 3;
 
 /// Safety cap: the fraction of a user's active entries a single holistic run
 /// may prune outright. Merges don't count - their content survives in the

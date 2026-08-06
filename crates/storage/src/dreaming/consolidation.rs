@@ -25,6 +25,12 @@
 //! tag-grouped chunks under a character budget and each chunk is recomputed
 //! independently — redundancy clusters by tag, so near-duplicates stay in the
 //! same slice. Slicing is logged so coverage is never silently bounded.
+//!
+//! The budget is sized from the answer, not from the model's context window.
+//! One operation comes back per entry the model changes, so a slice of several
+//! hundred entries overruns the output allowance and the answer arrives cut off
+//! mid-array. That is a size fault, not a formatting fault, so it is told apart
+//! from malformed JSON and the slice is halved and recomputed rather than lost.
 
 use std::collections::HashSet;
 
@@ -38,7 +44,8 @@ use super::common::{extract_json_payload, is_total_failure};
 use super::reconcile::{OpBuffer, ProposedOp, SynthesizedMerge, apply_ops};
 use super::types::{
     ConsolidationStats, DreamingLlmFn, KnowledgeChangeFn, MAX_DELETE_FRACTION,
-    MAX_DELETE_REASON_CHARS, MAX_HOLISTIC_PROMPT_CHARS, MAX_REVIEW_GENERATION, SOURCE_EXPLICIT,
+    MAX_DELETE_REASON_CHARS, MAX_HOLISTIC_PROMPT_CHARS, MAX_REVIEW_GENERATION,
+    MAX_SLICE_SPLIT_DEPTH, SOURCE_EXPLICIT,
 };
 use crate::kb_metadata::{KbMetadata, KbScope};
 
@@ -205,22 +212,12 @@ async fn consolidate_user(
             .map(|e| e.id.as_str())
             .collect();
 
-        let response = match llm_fn(build_system_prompt(), build_user_prompt(slice)).await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!("dreaming: consolidation LLM call failed: {e}");
-                failed_slices += 1;
-                last_failure = Some(e);
-                continue;
-            }
-        };
-
-        let ops = match parse_operations(&response) {
+        let ops = match operations_for_slice(llm_fn, slice, cancellation).await {
             Ok(ops) => ops,
             Err(e) => {
-                tracing::warn!("dreaming: could not parse consolidation operations: {e}");
+                tracing::warn!("dreaming: consolidation slice failed: {e}");
                 failed_slices += 1;
-                last_failure = Some(e.to_string());
+                last_failure = Some(e);
                 continue;
             }
         };
@@ -459,8 +456,10 @@ fn slice_entries(entries: Vec<KbEntry>) -> Vec<Vec<KbEntry>> {
     let mut current_chars = 0usize;
 
     for e in entries {
-        let cost = e.content.len()
-            + e.tags.iter().map(|t| t.len() + 2).sum::<usize>()
+        // Counted in characters, because the budget is stated in characters.
+        // `len()` is bytes, which under-fills a slice for any non-ASCII entry.
+        let cost = e.content.chars().count()
+            + e.tags.iter().map(|t| t.chars().count() + 2).sum::<usize>()
             + PER_ENTRY_OVERHEAD;
         if !current.is_empty() && current_chars + cost > MAX_HOLISTIC_PROMPT_CHARS {
             slices.push(std::mem::take(&mut current));
@@ -583,15 +582,130 @@ struct OpsEnvelope {
     operations: Vec<RawOp>,
 }
 
-fn parse_operations(response: &str) -> Result<Vec<RawOp>, CoreError> {
+/// Why a consolidation response could not be turned into operations.
+///
+/// The two cases need opposite responses, which is why they are told apart. A
+/// response that ended early is a size problem: the model stopped at its output
+/// limit, and a smaller slice gets a complete answer. A response that is not
+/// valid JSON is not a size problem, so asking again with fewer entries only
+/// spends calls.
+#[derive(Debug)]
+enum ParseFailure {
+    /// The response ended before the JSON did.
+    Truncated(String),
+    /// The response is not valid JSON, for a reason other than ending early.
+    Malformed(String),
+}
+
+impl std::fmt::Display for ParseFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Truncated(detail) => write!(
+                f,
+                "dreaming: the consolidation answer stopped before the JSON ended, \
+                 which means the model reached its output limit: {detail}"
+            ),
+            Self::Malformed(detail) => write!(f, "dreaming: bad consolidation JSON: {detail}"),
+        }
+    }
+}
+
+fn parse_operations(response: &str) -> Result<Vec<RawOp>, ParseFailure> {
     let payload = extract_json_payload(response);
-    let env: OpsEnvelope = serde_json::from_str(&payload)
-        .map_err(|e| CoreError::Storage(format!("dreaming: bad consolidation JSON: {e}")))?;
-    Ok(env.operations)
+    match serde_json::from_str::<OpsEnvelope>(&payload) {
+        Ok(env) => Ok(env.operations),
+        // `classify` is the structured signal for "the input ended early".
+        // Reading it off the message text would break on any serde_json wording
+        // change.
+        Err(e) if e.classify() == serde_json::error::Category::Eof => {
+            Err(ParseFailure::Truncated(e.to_string()))
+        }
+        Err(e) => Err(ParseFailure::Malformed(e.to_string())),
+    }
+}
+
+/// Recompute one slice, halving it when the model's answer comes back cut off.
+///
+/// A truncated answer means the slice asked for more output than the model
+/// would return, so each half is recomputed instead, to
+/// [`MAX_SLICE_SPLIT_DEPTH`] levels. Any other failure is returned as it is:
+/// repeating a malformed answer with fewer entries only spends calls.
+///
+/// Returns the operations from every part that answered. This is an error only
+/// when no part answered at all, so one failed half never discards the half
+/// that worked - that loss is logged instead, because the entries in the failed
+/// half simply go unreviewed until the next run.
+async fn operations_for_slice(
+    llm_fn: &DreamingLlmFn,
+    slice: &[KbEntry],
+    cancellation: &CancellationToken,
+) -> Result<Vec<RawOp>, String> {
+    let mut ops: Vec<RawOp> = Vec::new();
+    let mut pending: Vec<(&[KbEntry], usize)> = vec![(slice, 0)];
+    let mut answered = 0usize;
+    let mut unreviewed = 0usize;
+    let mut last_failure: Option<String> = None;
+
+    while let Some((chunk, depth)) = pending.pop() {
+        // Each part is its own LLM call, so stop promptly between them.
+        if cancellation.is_cancelled() {
+            break;
+        }
+
+        let failure = match llm_fn(build_system_prompt(), build_user_prompt(chunk)).await {
+            Ok(response) => match parse_operations(&response) {
+                Ok(mut parsed) => {
+                    ops.append(&mut parsed);
+                    answered += 1;
+                    continue;
+                }
+                Err(ParseFailure::Truncated(_))
+                    if depth < MAX_SLICE_SPLIT_DEPTH && chunk.len() > 1 =>
+                {
+                    let (head, tail) = chunk.split_at(chunk.len() / 2);
+                    tracing::debug!(
+                        "dreaming: consolidation answer was cut off for {} entries; \
+                         recomputing as {} + {}",
+                        chunk.len(),
+                        head.len(),
+                        tail.len()
+                    );
+                    // Tail first: this is a stack, and the deletion cap keeps
+                    // the operations it sees first, so the halves must come
+                    // back in entry order.
+                    pending.push((tail, depth + 1));
+                    pending.push((head, depth + 1));
+                    continue;
+                }
+                Err(e) => e.to_string(),
+            },
+            Err(e) => e,
+        };
+
+        unreviewed += chunk.len();
+        last_failure = Some(failure);
+    }
+
+    if answered == 0 {
+        return Err(last_failure
+            .unwrap_or_else(|| "dreaming: consolidation produced no answer".to_string()));
+    }
+
+    if unreviewed > 0 {
+        tracing::warn!(
+            "dreaming: consolidation kept what it recovered, but {unreviewed} entr(ies) of this \
+             slice were not recomputed and stay unchanged until the next run: {}",
+            last_failure.as_deref().unwrap_or("unknown failure")
+        );
+    }
+
+    Ok(ops)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::*;
 
     fn entry(id: &str, content: &str, tags: &[&str]) -> KbEntry {
@@ -679,5 +793,275 @@ mod tests {
         let slices = slice_entries(entries);
         assert_eq!(slices.len(), 1);
         assert_eq!(slices[0].len(), 10);
+    }
+
+    /// A response the model cut off at its output limit, ending mid-string.
+    const TRUNCATED: &str = r#"{"operations": [
+        {"op": "delete", "ids": ["a"], "reason": "trivial"},
+        {"op": "edit", "id": "b", "content": "tigh"#;
+
+    /// A response that is not valid JSON for a reason other than ending early.
+    const MALFORMED: &str = r#"{"operations": [{"op": , "id": "a"}]}"#;
+
+    fn ops_response(ids: &[&str]) -> String {
+        let ops: Vec<String> = ids
+            .iter()
+            .map(|id| format!(r#"{{"op":"delete","ids":["{id}"],"reason":"trivial"}}"#))
+            .collect();
+        format!(r#"{{"operations": [{}]}}"#, ops.join(","))
+    }
+
+    /// How many entries a built user prompt describes.
+    fn entries_in_prompt(prompt: &str) -> usize {
+        prompt.lines().filter(|l| l.starts_with("## ")).count()
+    }
+
+    /// Records every prompt it is asked, and answers by rule.
+    fn recording_llm(
+        calls: Arc<Mutex<Vec<String>>>,
+        answer: impl Fn(usize) -> Result<String, String> + Send + Sync + 'static,
+    ) -> DreamingLlmFn {
+        Box::new(move |_system, user| {
+            let seen = entries_in_prompt(&user);
+            calls.lock().expect("prompt log is not poisoned").push(user);
+            let result = answer(seen);
+            Box::pin(async move { result })
+        })
+    }
+
+    fn slice_of(n: usize) -> Vec<KbEntry> {
+        (0..n)
+            .map(|i| entry(&format!("id{i}"), "some durable content", &["t"]))
+            .collect()
+    }
+
+    #[test]
+    fn truncated_response_reports_truncation_not_malformed_json() {
+        let err = parse_operations(TRUNCATED).expect_err("a cut-off response cannot parse");
+        assert!(
+            matches!(err, ParseFailure::Truncated(_)),
+            "expected a truncation verdict, got: {err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            !message.contains("bad consolidation JSON"),
+            "a truncated response must not be reported as malformed: {message}"
+        );
+    }
+
+    #[test]
+    fn malformed_json_reports_a_parse_error() {
+        let err = parse_operations(MALFORMED).expect_err("invalid JSON cannot parse");
+        assert!(
+            matches!(err, ParseFailure::Malformed(_)),
+            "expected a malformed verdict, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn truncated_slice_is_split_and_retried() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        // Answers only once the slice has been cut down to 2 entries or fewer.
+        let llm = recording_llm(calls.clone(), |seen| {
+            if seen > 2 {
+                Ok(TRUNCATED.to_string())
+            } else {
+                Ok(ops_response(&["a"]))
+            }
+        });
+
+        let ops = operations_for_slice(&llm, &slice_of(4), &CancellationToken::new())
+            .await
+            .expect("splitting recovers the slice");
+
+        assert!(!ops.is_empty(), "the retry must yield the recovered ops");
+        let sizes: Vec<usize> = calls
+            .lock()
+            .expect("prompt log is not poisoned")
+            .iter()
+            .map(|p| entries_in_prompt(p))
+            .collect();
+        assert!(
+            sizes.iter().any(|&n| n <= 2),
+            "expected a retry with a smaller slice, saw sizes {sizes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn split_retry_applies_operations_from_both_halves() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let llm = recording_llm(calls, |seen| {
+            if seen > 2 {
+                Ok(TRUNCATED.to_string())
+            } else {
+                // Each half names the ids it was shown, so a dropped half is visible.
+                Ok(ops_response(&["half"]))
+            }
+        });
+
+        let ops = operations_for_slice(&llm, &slice_of(4), &CancellationToken::new())
+            .await
+            .expect("splitting recovers the slice");
+
+        let deletes = ops
+            .iter()
+            .filter(|o| matches!(o, RawOp::Delete { .. }))
+            .count();
+        assert_eq!(deletes, 2, "both halves' operations must be kept");
+    }
+
+    #[tokio::test]
+    async fn split_retry_keeps_the_slice_in_entry_order() {
+        // The deletion cap truncates the collected operations, so the order the
+        // parts come back in decides which deletes survive the cap. Halves must
+        // stay in entry order.
+        let llm: DreamingLlmFn = Box::new(|_system, user: String| {
+            let seen = entries_in_prompt(&user);
+            let first = user
+                .lines()
+                .find(|l| l.starts_with("## "))
+                .map(|l| l.trim_start_matches("## ").to_string())
+                .unwrap_or_default();
+            let result = if seen > 2 {
+                Ok(TRUNCATED.to_string())
+            } else {
+                Ok(ops_response(&[&first]))
+            };
+            Box::pin(async move { result })
+        });
+
+        let ops = operations_for_slice(&llm, &slice_of(4), &CancellationToken::new())
+            .await
+            .expect("splitting recovers the slice");
+
+        let deleted: Vec<String> = ops
+            .iter()
+            .filter_map(|o| match o {
+                RawOp::Delete { ids, .. } => ids.first().cloned(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            deleted,
+            vec!["id0".to_string(), "id2".to_string()],
+            "the first half must be recomputed before the second"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_json_is_not_retried() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let llm = recording_llm(calls.clone(), |_| Ok(MALFORMED.to_string()));
+
+        operations_for_slice(&llm, &slice_of(8), &CancellationToken::new())
+            .await
+            .expect_err("malformed JSON is a real failure");
+
+        assert_eq!(
+            calls.lock().expect("prompt log is not poisoned").len(),
+            1,
+            "a syntax error is not a size problem, so it must not be split and retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn split_retry_stops_at_the_depth_limit() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let llm = recording_llm(calls.clone(), |_| Ok(TRUNCATED.to_string()));
+
+        operations_for_slice(&llm, &slice_of(64), &CancellationToken::new())
+            .await
+            .expect_err("a slice that never fits is a failure");
+
+        // Bounded by the split depth: 1 + 2 + 4 + ... for MAX_SLICE_SPLIT_DEPTH levels.
+        let made = calls.lock().expect("prompt log is not poisoned").len();
+        let ceiling = (1usize << (MAX_SLICE_SPLIT_DEPTH + 1)) - 1;
+        assert!(
+            made <= ceiling,
+            "expected at most {ceiling} calls at depth {MAX_SLICE_SPLIT_DEPTH}, made {made}"
+        );
+    }
+
+    #[tokio::test]
+    async fn single_entry_slice_that_truncates_fails_cleanly() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let llm = recording_llm(calls.clone(), |_| Ok(TRUNCATED.to_string()));
+
+        operations_for_slice(&llm, &slice_of(1), &CancellationToken::new())
+            .await
+            .expect_err("one entry cannot be split any further");
+
+        assert_eq!(
+            calls.lock().expect("prompt log is not poisoned").len(),
+            1,
+            "a one-entry slice has nothing to split, so it must not retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_half_that_fails_does_not_discard_the_half_that_worked() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        // Three entries split into one and two, so the halves differ in size:
+        // the two-entry half answers and the one-entry half stays broken.
+        let llm = recording_llm(calls, |seen| {
+            if seen > 2 {
+                Ok(TRUNCATED.to_string())
+            } else if seen == 2 {
+                Ok(ops_response(&["kept"]))
+            } else {
+                Err("backend refused".to_string())
+            }
+        });
+
+        let ops = operations_for_slice(&llm, &slice_of(3), &CancellationToken::new())
+            .await
+            .expect("a partial recovery still returns what worked");
+        assert!(
+            !ops.is_empty(),
+            "the half that answered must not be thrown away"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_part_failing_reports_the_slice_as_failed() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let llm = recording_llm(calls, |_| Err("backend unreachable".to_string()));
+
+        operations_for_slice(&llm, &slice_of(4), &CancellationToken::new())
+            .await
+            .expect_err("a slice whose every part failed is a failure");
+    }
+
+    #[test]
+    fn slice_entries_splits_a_reference_sized_kb_into_several_slices() {
+        // The shape that fails in production: 756 entries averaging ~229 chars.
+        let content = "x".repeat(229);
+        let entries: Vec<KbEntry> = (0..756)
+            .map(|i| entry(&format!("id{i}"), &content, &["tag"]))
+            .collect();
+        let slices = slice_entries(entries);
+        assert!(
+            slices.len() > 4,
+            "a knowledge base this size must not be sent as 2 huge prompts, got {} slices",
+            slices.len()
+        );
+        let total: usize = slices.iter().map(|s| s.len()).sum();
+        assert_eq!(total, 756, "no entry may be dropped while slicing");
+    }
+
+    #[test]
+    fn slice_entries_budgets_in_characters_not_bytes() {
+        // Each 'e' with an accent is 2 bytes but 1 character. A budget counted in
+        // bytes splits this set; a budget counted in characters does not.
+        let half_budget = "é".repeat(MAX_HOLISTIC_PROMPT_CHARS / 2 - 500);
+        let entries: Vec<KbEntry> = (0..2)
+            .map(|i| entry(&format!("id{i}"), &half_budget, &[]))
+            .collect();
+        let slices = slice_entries(entries);
+        assert_eq!(
+            slices.len(),
+            1,
+            "two entries of half the character budget fit in one slice"
+        );
     }
 }
