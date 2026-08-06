@@ -4772,6 +4772,56 @@ mod tests {
         assert!(!json.contains("summary"), "json: {json}");
     }
 
+    /// A view carrying `content` and, optionally, a summary.
+    fn kb_view(content: &str, summary: Option<&str>) -> KnowledgeEntryView {
+        KnowledgeEntryView {
+            id: "kb-1".to_string(),
+            content: content.to_string(),
+            tags: vec![],
+            metadata: serde_json::json!({}),
+            created_at: "2026-01-01 00:00:00".to_string(),
+            updated_at: "2026-01-01 00:00:00".to_string(),
+            summary: summary.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn knowledge_entry_view_display_line_returns_the_stored_summary_when_there_is_one() {
+        let view = kb_view(
+            "A long body a list row should never show in full.",
+            Some("Prefers dark themes"),
+        );
+
+        assert_eq!(view.display_line(), "Prefers dark themes");
+    }
+
+    #[test]
+    fn knowledge_entry_view_display_line_falls_back_to_the_content() {
+        // Nothing writes summaries yet, so the fallback is the common path. A
+        // row that showed nothing for an entry without one would show nothing
+        // for almost every entry.
+        let view = kb_view("User prefers dark mode", None);
+
+        assert_eq!(view.display_line(), "User prefers dark mode");
+    }
+
+    #[test]
+    fn knowledge_entry_view_display_line_is_bounded_and_marked_when_cut() {
+        let view = kb_view(&"x".repeat(10_000), None);
+
+        let line = view.display_line();
+
+        assert_eq!(line.chars().count(), SUMMARY_MAX_CHARS);
+        assert!(line.ends_with("..."));
+    }
+
+    #[test]
+    fn knowledge_entry_view_display_line_is_one_physical_line() {
+        let view = kb_view("First line.\nSecond line.\tThird.", None);
+
+        assert_eq!(view.display_line(), "First line. Second line. Third.");
+    }
+
     fn remove_key_recursive(v: &mut serde_json::Value, key: &str) {
         match v {
             serde_json::Value::Object(map) => {

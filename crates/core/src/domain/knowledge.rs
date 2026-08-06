@@ -201,11 +201,29 @@ mod tests {
     }
 
     #[test]
-    fn a_limit_too_small_for_the_marker_still_honours_the_limit() {
-        // The cap is a budget, so it wins over the wish to say "there is
-        // more". `display_line` never reaches this, but the rule belongs with
-        // the function that enforces the cap rather than with its one caller.
-        assert_eq!(truncate_to_chars("abcdef", 2), "ab");
+    fn display_line_collapses_a_multi_line_body_to_one_physical_line() {
+        // The line goes into a line-oriented block, so an embedded newline
+        // would break the block's structure rather than the entry's own row.
+        let entry = KnowledgeEntry::new(
+            "kb-1",
+            "First line of the note.\nSecond line.\t\tThird.",
+            vec![],
+        );
+
+        assert_eq!(
+            entry.display_line(),
+            "First line of the note. Second line. Third."
+        );
+    }
+
+    #[test]
+    fn display_line_collapses_a_multi_line_stored_summary_too() {
+        // Nothing stops a written summary carrying a newline, and it breaks
+        // the block just as badly as a body does.
+        let mut entry = KnowledgeEntry::new("kb-1", "body", vec![]);
+        entry.summary = Some("Prefers dark themes\nin every editor".to_string());
+
+        assert_eq!(entry.display_line(), "Prefers dark themes in every editor");
     }
 
     #[test]
