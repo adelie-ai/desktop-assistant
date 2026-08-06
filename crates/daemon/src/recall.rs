@@ -27,18 +27,11 @@ use std::future::Future;
 use std::sync::Arc;
 
 use desktop_assistant_core::CoreError;
-use desktop_assistant_core::ports::embedding::EmbedFn;
+use desktop_assistant_core::ports::embedding::{EMBED_TIMEOUT, EmbedFn};
 use desktop_assistant_core::ports::recall::{
     RecallCandidates, RecallEntry, RecallRelevance, RecallRequest, RecallSearchFn, RecallTag,
 };
 use desktop_assistant_storage::{PgKnowledgeBaseStore, PgPool};
-
-/// Hard cap on how long the recall embedding may block the start of a turn.
-///
-/// The same five seconds `BuiltinToolService` gives a search query's embedding:
-/// a wedged embedding backend must cost recall its semantic arm, never the
-/// turn's latency budget.
-const EMBED_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How long one whole recall lookup may take before the turn gives up on it.
 ///
