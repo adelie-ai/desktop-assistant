@@ -4117,7 +4117,10 @@ max_context_tokens = 1000000
         .unwrap();
 
         assert_eq!(config.recall.max_entries, Some(12));
-        assert!(config.recall.enabled, "the width says nothing about the switch");
+        assert!(
+            config.recall.enabled,
+            "the width says nothing about the switch"
+        );
 
         let serialized = toml::to_string(&config).unwrap();
         let reparsed: DaemonConfig = toml::from_str(&serialized).unwrap();

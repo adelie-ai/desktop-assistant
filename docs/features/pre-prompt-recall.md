@@ -200,18 +200,39 @@ permanently. The parent still reaches that answer through
 
 **A relevance floor, not a top-k.** Each arm drops a candidate that is not near
 enough, rather than padding the list out to fill the budget. A prompt with
-nothing near it - "thanks", "run the tests" - emits no block at all. The floors
-are cosine-distance ceilings, in `crates/core/src/recall.rs`. They are
-deliberately conservative starting points rather than measured values: a block
-that stays quiet costs nothing, and a block full of unrelated memory can pull the
-model off the ask.
+nothing near it emits no block at all. The floors are cosine-distance ceilings,
+in `crates/core/src/recall.rs`. They are starting points rather than measured
+values, and how much a prompt of no content should reach is #1121's question,
+not this one's.
 
-**A line budget.** Eight entry lines, five scratchpad lines and five tag names.
-Every part is capped - 64 characters of id, 120 of an entry's tags, 200 of
-summary, 64 of a note key, 200 of a note's content, and 240 for the whole tag
-line - so the block cannot exceed about 4800 characters whatever the store and
-the pad hold. Real entries carry a short id and a few tags, and real notes are
-short and distilled, which puts the usual block near 300 tokens.
+**A token budget, and a line budget derived from it.** The whole block is
+allowed 2,560 tokens in the worst case. That is two percent of a
+128,000-token window - the smaller of the two window sizes the models this
+daemon drives usually carry - spent once per turn, on the first round only, on a
+hint the model is told it may ignore.
+
+Every part of every line is capped: 64 characters of id, 120 of an entry's tags,
+200 of summary, 128 of a note key, 200 of a note's content, and 240 for the whole
+tag line. So a worst-case line costs a known number of characters, and the width
+is arithmetic rather than a choice:
+
+| Part | Worst case |
+| --- | --- |
+| One knowledge line | `"\n- " + id + " [" + tags + "] " + summary` = 391 characters |
+| The fixed part | prefix, header, entry hint, five pad lines and their label, the tag line, and both "did not fit" lines = 2,410 characters |
+| The budget | 2,560 tokens at four characters a token = 10,240 characters |
+| **The width** | **(10,240 - 2,410) / 391 = 20 lines** |
+
+Tokens are counted the way the context budget counts them, at four characters
+each. Real entries carry a short id and a few tags, so a real line costs about a
+quarter of the worst case and a usual block lands near a third of the budget;
+the width rests on the bound rather than on the average, because only the bound
+is a promise. `crates/core/src/recall.rs` pins both numbers with a test, so a
+later change to the line format cannot inflate the block in silence.
+
+Five scratchpad lines and five tag names, unchanged. Those arms are not what the
+budget buys: the pad holds one conversation's notes, and the tag arm hands over a
+vocabulary rather than listing one.
 
 **One round.** Every other per-turn block re-renders each round, because each is
 answering "is this still in view?". `[Recall]` answers "what might this prompt be
@@ -221,10 +242,10 @@ or ignored.
 
 ## Saying what did not fit
 
-A model that sees eight entries cannot tell whether the store holds exactly eight
-relevant things or four hundred, and those call for different next moves - accept
-the list, or go search properly. So the block ends with a count of what cleared
-the floor and did not fit.
+A model that sees twenty entries cannot tell whether the store holds exactly
+twenty relevant things or four hundred, and those call for different next moves -
+accept the list, or go search properly. So the block ends with a count of what
+cleared the floor and did not fit.
 
 That count means something only because the floor defines it. "How many matched"
 is not a defined quantity over a hybrid search, where every embedded row scores
@@ -290,24 +311,45 @@ them to it, and runs under `just test-db`.
 ```toml
 [recall]
 enabled = true   # the default
+# max_entries = 20   # absent means the width the token budget pays for
 ```
 
 It also stays off on its own when there is no knowledge store or no embedding
 backend, and the daemon says which of the three reasons applies at startup.
+
+`max_entries` states how many knowledge lines the block may show. State it where
+this deployment's model carries a smaller window than the budget above assumes,
+or where an operator wants a narrower block. The value is held to what the block
+can honestly render - at least one line, and never more than the 50 rows the
+lookup reads, because a block that showed more would count a tail it never saw.
+Both settings are read once, at startup; changing either needs a restart. The
+daemon logs the width it wired.
 
 Turning it off restores exactly the behaviour that preceded the feature: the
 assistant reaches its knowledge base only when it decides to search.
 
 ## Known limits
 
-**The floors are untuned.** Both are conservative starting points chosen to keep
-the block quiet, not values measured against a real store. Widening them is the
-safe direction.
+**The floors are untuned, and the entry floor is loose.** Both were chosen
+rather than measured. The entry floor admits candidates for a prompt that asks
+nothing - an acknowledgement, or "continue" - so the block is not as quiet on a
+low-signal prompt as the floor was meant to make it. #1121 carries the
+admission gate that fixes this. Until it lands, a deployment that wants a
+narrower block sets `max_entries`.
 
-**The scan reads whole rows.** Fifty entries are read to render eight lines,
+**A wider block renders more of what the floor admits.** Twenty lines is the
+right width for an index, and it is also twenty lines of whatever a loose floor
+lets through. The two changes belong together: the width makes recognition
+possible, and the gate above makes the width safe.
+
+**The scan reads whole rows.** Fifty entries are read to render twenty lines,
 because the count of what did not fit has to be a count. The row count is
 bounded; the bytes those rows carry are not, so a store of unusually long entries
-pays more per prompt than a store of one-liners.
+pays more per prompt than a store of one-liners. Measured against a populated
+store, the wide projection costs a small fraction of a query that is already only
+a few milliseconds, so the read is left as one query rather than split into a
+rank pass and a body pass. `metadata` is selected and never read, which is a
+column to drop rather than a query to restructure.
 
 **It fires on every turn, including agent and subagent runs.** Any turn that goes
 through `send_prompt` gets a lookup, so a spawned agent working from a

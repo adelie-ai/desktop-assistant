@@ -24,10 +24,14 @@
 //! ## What bounds it
 //!
 //! - **A relevance floor, not a top-k.** A candidate under the floor is
-//!   dropped rather than padded out to fill the budget, so "thanks" and "run
-//!   the tests" produce no block at all.
-//! - **A line budget.** [`MAX_RECALL_ENTRIES`] entry lines,
-//!   [`MAX_RECALL_NOTES`] note lines and [`MAX_RECALL_TAGS`] tag names.
+//!   dropped rather than padded out to fill the budget, so a prompt with
+//!   nothing near it produces no block at all. How near is near enough is the
+//!   floor's own question, and how well the current floor answers it is #1121's
+//!   (the entry floor admits more than a prompt of no content should reach).
+//! - **A line budget, derived from a token budget.**
+//!   [`RECALL_BLOCK_TOKEN_BUDGET`] pays for [`DEFAULT_MAX_RECALL_ENTRIES`]
+//!   entry lines, [`MAX_RECALL_NOTES`] note lines and [`MAX_RECALL_TAGS`] tag
+//!   names. A deployment may state its own width.
 //! - **Nothing already in view.** A note `[Pinned]` renders in full, a key the
 //!   `[Scratchpad]` index has just listed, a step or finding `[Plan]` has just
 //!   named, and a knowledge entry a pin attaches (#1104) are all dropped here.
@@ -40,8 +44,8 @@
 //!
 //! ## Saying what did not fit
 //!
-//! A model that sees eight entries cannot tell whether the store holds exactly
-//! eight relevant things or four hundred, and those call for different next
+//! A model that sees twenty entries cannot tell whether the store holds exactly
+//! twenty relevant things or four hundred, and those call for different next
 //! moves. So the block reports how many cleared the floor and did not fit.
 //!
 //! That count means something only because the floor defines it. Over a hybrid
@@ -50,19 +54,10 @@
 //! [`RECALL_ENTRY_SCAN_LIMIT`] (and [`RECALL_NOTE_SCAN_LIMIT`]) and no further,
 //! so when a scan fills up the count is a lower bound and says so.
 
+use std::sync::OnceLock;
+
 use crate::ports::recall::{RecallCandidates, RecallEntry, RecallNote};
 use crate::ports::scratchpad::NOTE_KEY_MAX_CHARS;
-
-/// How many knowledge lines the block may show.
-///
-/// Every part of a line is bounded - the id by [`RECALL_ID_MAX_CHARS`], the
-/// tags by [`RECALL_TAGS_MAX_CHARS`], and the summary by
-/// [`crate::domain::knowledge::SUMMARY_MAX_CHARS`] - so the entry half of the
-/// block cannot exceed about 3200 characters however long the entries
-/// themselves are. Real entries carry a short id and a few tags, so the usual
-/// cost is far below that, which is what keeps the whole block near its
-/// 300-token budget.
-pub const MAX_RECALL_ENTRIES: usize = 8;
 
 /// The token budget for the whole `[Recall]` block, worst case.
 ///
@@ -77,24 +72,125 @@ pub const MAX_RECALL_ENTRIES: usize = 8;
 /// [`set_max_recall_entries`].
 pub const RECALL_BLOCK_TOKEN_BUDGET: usize = 2_560;
 
-/// How many knowledge lines the block shows where a deployment states nothing.
-pub const DEFAULT_MAX_RECALL_ENTRIES: usize = MAX_RECALL_ENTRIES;
+/// Characters to a token: the rule the context budget itself counts by
+/// ([`crate::ports::tool_usage::estimate_tokens`]).
+///
+/// Every part of the block is bounded in characters, so the budget is converted
+/// once, here, and the whole derivation below is arithmetic on character
+/// bounds.
+const RECALL_CHARS_PER_TOKEN: usize = 4;
 
-/// How many knowledge lines this deployment's block shows.
+/// [`RECALL_BLOCK_TOKEN_BUDGET`] in the characters the bounds are stated in.
+const RECALL_BLOCK_MAX_CHARS: usize = RECALL_BLOCK_TOKEN_BUDGET * RECALL_CHARS_PER_TOKEN;
+
+/// What `crate::context` puts in front of the body, and the model pays for.
+const RECALL_BLOCK_PREFIX_CHARS: usize = "[Recall] ".len();
+
+/// What one knowledge line costs, worst case.
+///
+/// `"\n- " + id + " [" + tags + "] " + summary`, with the id at
+/// [`RECALL_ID_MAX_CHARS`], the tag list at [`RECALL_TAGS_MAX_CHARS`] and the
+/// summary at [`crate::domain::knowledge::SUMMARY_MAX_CHARS`]. Real entries
+/// carry a short id and a few tags, so a real line costs a quarter of this;
+/// the width rests on the bound rather than on the average, because only the
+/// bound is a promise.
+const RECALL_ENTRY_LINE_MAX_CHARS: usize = 1
+    + 2
+    + RECALL_ID_MAX_CHARS
+    + 2
+    + RECALL_TAGS_MAX_CHARS
+    + 2
+    + crate::domain::knowledge::SUMMARY_MAX_CHARS;
+
+/// What one scratchpad line costs, worst case: `"\n- " + key + ": " + content`,
+/// at [`NOTE_KEY_MAX_CHARS`] and [`RECALL_NOTE_MAX_CHARS`].
+const RECALL_NOTE_LINE_MAX_CHARS: usize = 1 + 2 + NOTE_KEY_MAX_CHARS + 2 + RECALL_NOTE_MAX_CHARS;
+
+/// What one "did not fit" line costs, worst case.
+///
+/// The newline, `"...and "` (7), the digits of any `usize` (20), the hedge
+/// `" or more"` (8), a space, the longer of the two nouns - `"entries"` (7) -
+/// and `" matched less closely."` (22). `dropped_line` is held to it by
+/// `the_did_not_fit_line_stays_inside_the_bound_the_budget_assumes`.
+const RECALL_DROPPED_LINE_MAX_CHARS: usize = 1 + 7 + 20 + 8 + 1 + 7 + 22;
+
+/// What the block costs before its first knowledge line, worst case: the
+/// prefix, the header and its entry hint, the entry arm's "did not fit" line,
+/// the pad label with [`MAX_RECALL_NOTES`] lines and its own "did not fit"
+/// line, and the tag label with a full tag line.
+const RECALL_FIXED_MAX_CHARS: usize = RECALL_BLOCK_PREFIX_CHARS
+    + RECALL_HEADER.len()
+    + 1
+    + RECALL_ENTRY_HINT.len()
+    + RECALL_DROPPED_LINE_MAX_CHARS
+    + 1
+    + RECALL_NOTE_LABEL.len()
+    + MAX_RECALL_NOTES * RECALL_NOTE_LINE_MAX_CHARS
+    + RECALL_DROPPED_LINE_MAX_CHARS
+    + 1
+    + RECALL_TAG_LABEL.len()
+    + 1
+    + RECALL_TAG_LINE_MAX_CHARS;
+
+/// How many knowledge lines the block shows where a deployment states nothing:
+/// what [`RECALL_BLOCK_TOKEN_BUDGET`] pays for once the fixed part is taken.
+///
+/// The width is the quotient, not a chosen number. Eight was the right width
+/// for a block that injected entry bodies; this block injects none, so the
+/// budget buys an index instead of a handful of extracts. Breadth is the point:
+/// a title the model can see but has not opened still says that something
+/// exists, and an entry that never appears cannot be asked for.
+pub const DEFAULT_MAX_RECALL_ENTRIES: usize =
+    (RECALL_BLOCK_MAX_CHARS - RECALL_FIXED_MAX_CHARS) / RECALL_ENTRY_LINE_MAX_CHARS;
+
+/// The width this deployment renders: [`DEFAULT_MAX_RECALL_ENTRIES`] until
+/// [`set_max_recall_entries`] installs another.
 pub fn max_recall_entries() -> usize {
-    DEFAULT_MAX_RECALL_ENTRIES
+    CONFIGURED_MAX_RECALL_ENTRIES
+        .get()
+        .copied()
+        .unwrap_or(DEFAULT_MAX_RECALL_ENTRIES)
 }
 
-/// Install the width a deployment configured, and answer with the width that
+/// Install the width this deployment configured, and answer with the width that
 /// took effect.
+///
+/// Once, at startup, before the first turn. The block is rendered deep inside
+/// context assembly, which carries no configuration of its own, and the width
+/// is one number for the whole daemon rather than one per turn. A later call
+/// keeps the live value and says so: a width that moved under a running turn
+/// would leave that turn's "and N more" count disagreeing with the lines above
+/// it.
 pub fn set_max_recall_entries(width: usize) -> usize {
-    resolve_max_recall_entries(width)
+    let wanted = resolve_max_recall_entries(width);
+    match CONFIGURED_MAX_RECALL_ENTRIES.set(wanted) {
+        Ok(()) => wanted,
+        Err(_) => {
+            let live = max_recall_entries();
+            tracing::warn!(
+                wanted,
+                live,
+                "the recall width is already set for this process; keeping the live value"
+            );
+            live
+        }
+    }
 }
 
 /// Hold a configured width to what the block can honestly render.
-pub fn resolve_max_recall_entries(_width: usize) -> usize {
-    DEFAULT_MAX_RECALL_ENTRIES
+///
+/// At least one line, because a block that showed none of what it found would
+/// report every hit as a hit that did not fit. At most
+/// [`RECALL_ENTRY_SCAN_LIMIT`] lines, because the lookup reads that far and no
+/// further: a wider block would show lines the scan never read, and count a
+/// tail that does not exist.
+pub fn resolve_max_recall_entries(width: usize) -> usize {
+    width.clamp(1, RECALL_ENTRY_SCAN_LIMIT)
 }
+
+/// The width a deployment installed, if it installed one. See
+/// [`set_max_recall_entries`].
+static CONFIGURED_MAX_RECALL_ENTRIES: OnceLock<usize> = OnceLock::new();
 
 /// How much of an entry id a line may spend.
 ///
@@ -126,7 +222,7 @@ pub const MAX_RECALL_TAGS: usize = 5;
 
 /// How many knowledge rows one lookup reads before it stops counting.
 ///
-/// The block shows [`MAX_RECALL_ENTRIES`]; it reads this far so that "and N
+/// The block shows [`max_recall_entries`]; it reads this far so that "and N
 /// more matched less closely" is a count rather than a guess. Bounding it costs
 /// one `LIMIT` rather than a second query, and a scan that fills up makes the
 /// count report itself as a lower bound.
@@ -320,7 +416,7 @@ pub(crate) fn render_recall(surface: &RecallSurface<'_>) -> Option<String> {
 
 /// [`render_recall`] at a stated width, so the width can be varied without
 /// varying the deployment's own setting.
-fn render_recall_with_width(surface: &RecallSurface<'_>, _max_entries: usize) -> Option<String> {
+fn render_recall_with_width(surface: &RecallSurface<'_>, max_entries: usize) -> Option<String> {
     let candidates = surface.candidates;
 
     let above_floor: Vec<&RecallEntry> = candidates
@@ -411,12 +507,12 @@ fn render_recall_with_width(surface: &RecallSurface<'_>, _max_entries: usize) ->
         block.push_str(RECALL_ENTRY_HINT);
     }
 
-    for (hit, line) in showable.iter().take(MAX_RECALL_ENTRIES) {
+    for (hit, line) in showable.iter().take(max_entries) {
         block.push('\n');
         block.push_str(&entry_line(hit, line));
     }
 
-    let dropped = showable.len().saturating_sub(MAX_RECALL_ENTRIES);
+    let dropped = showable.len().saturating_sub(max_entries);
     if let Some(line) = dropped_line(dropped, capped, "entries") {
         block.push('\n');
         block.push_str(&line);
@@ -714,7 +810,7 @@ mod tests {
     /// id, the tag list and the summary all at their bounds.
     fn worst_case_hit(i: usize) -> RecallEntry {
         let mut entry = KnowledgeEntry::new(
-            &format!("{i:0>width$}", width = RECALL_ID_MAX_CHARS),
+            format!("{i:0>width$}", width = RECALL_ID_MAX_CHARS),
             "a body the summary stands in for",
             vec![filler(RECALL_TAGS_MAX_CHARS)],
         );
@@ -813,10 +909,12 @@ mod tests {
     /// appears cannot be asked for, and breadth is what one-line summaries buy.
     #[test]
     fn the_default_recall_width_is_materially_wider_than_eight() {
+        let width = DEFAULT_MAX_RECALL_ENTRIES;
+
         assert!(
-            DEFAULT_MAX_RECALL_ENTRIES >= 16,
+            width >= 16,
             "an index of one-line summaries exists for breadth; \
-             {DEFAULT_MAX_RECALL_ENTRIES} lines is not materially wider than eight"
+             {width} lines is not materially wider than eight"
         );
     }
 
@@ -844,9 +942,12 @@ mod tests {
     /// N more" still counts rows the lookup actually read.
     #[test]
     fn the_recall_scan_limit_stays_at_or_above_the_width() {
+        let width = DEFAULT_MAX_RECALL_ENTRIES;
+        let scan = RECALL_ENTRY_SCAN_LIMIT;
+
         assert!(
-            DEFAULT_MAX_RECALL_ENTRIES <= RECALL_ENTRY_SCAN_LIMIT,
-            "the default width shows lines the scan never read"
+            width <= scan,
+            "the default width of {width} shows lines the {scan}-row scan never read"
         );
         assert_eq!(
             resolve_max_recall_entries(RECALL_ENTRY_SCAN_LIMIT + 10),
