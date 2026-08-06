@@ -10,7 +10,10 @@
 //!   `expand_summary` clearing it via `ON DELETE SET NULL`);
 //! - `archive` opacity (foreign/missing ⇒ `NotFound`, already-archived ⇒ `Ok`);
 //! - `tag_registry` embedding-dedup redirect and deprecation-chain / cycle
-//!   guard;
+//!   guard, plus the gate the knowledge-base write tool puts in front of it
+//!   (a known tag costs no embedding; one tenant never reads or redirects onto
+//!   another's vocabulary; an underscore spelling collapses onto its dash
+//!   spelling; a saturated pool is paid once);
 //! - `tool_registry` upsert / hybrid search / source-scoped unregister;
 //! - JSON→Postgres migration of conversations + knowledge and the empty-table
 //!   probes.
@@ -26,6 +29,7 @@ use desktop_assistant_core::domain::{
     Conversation, ConversationId, KnowledgeEntry, Message, Role, ToolDefinition,
 };
 use desktop_assistant_core::ports::knowledge::KnowledgeBaseStore;
+use desktop_assistant_core::ports::knowledge::ProposedTag;
 use desktop_assistant_core::ports::store::{
     BackgroundTaskRow, BackgroundTaskStatus, BackgroundTaskStore, ConversationStore, TurnRow,
     TurnStateJson, TurnStateStore, TurnStatus,
@@ -33,7 +37,8 @@ use desktop_assistant_core::ports::store::{
 use desktop_assistant_core::ports::tool_registry::ToolRegistryStore;
 use desktop_assistant_storage::embedding_backfill::BackfillEmbedFn;
 use desktop_assistant_storage::tag_registry::{
-    CreateTagOutcome, TagProposal, create_or_match_tag, resolve_active_name,
+    CreateTagOutcome, TagProposal, create_or_match_tag, get_tag, list_active_tags,
+    resolve_active_name, resolve_proposed_tag,
 };
 use desktop_assistant_storage::{
     PgBackgroundTaskStore, PgConversationStore, PgKnowledgeBaseStore, PgToolRegistryStore,
@@ -718,6 +723,448 @@ async fn registry_dedup_still_separates_distinct_facet_tags() {
         },
     )
     .await;
+}
+
+// -- tag_registry: the tool-path gate (#1070) --------------------------------
+
+/// An embedding function that records every text it was asked to embed and
+/// answers with one fixed vector, so a proposal deterministically sits at
+/// cosine distance 0 from anything already stored.
+fn counting_embed_fn(seen: Arc<std::sync::Mutex<Vec<String>>>) -> BackfillEmbedFn {
+    Box::new(move |texts| {
+        let seen = Arc::clone(&seen);
+        Box::pin(async move {
+            seen.lock()
+                .expect("record embed texts")
+                .extend(texts.iter().cloned());
+            Ok(texts.iter().map(|_| vec![1.0f32, 0.0, 0.0]).collect())
+        })
+    })
+}
+
+#[tokio::test]
+async fn kb_write_ignores_a_description_for_a_tag_the_registry_already_holds() {
+    // A tag the registry already holds matches on its name and answers before
+    // any embedding happens, so its description costs nothing and changes
+    // nothing. The write path can therefore send a description for every tag
+    // without paying for the ones already known.
+    //
+    // MUTATION: removing the exact-name short-circuit in `create_or_match_tag`
+    // makes the second proposal embed → RED on the recorded embed texts.
+    with_fixture(
+        "kb_write_ignores_a_description_for_a_tag_the_registry_already_holds",
+        |fx| async move {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let embed_fn = counting_embed_fn(Arc::clone(&seen));
+
+            with_user_id(UserId::new("alice"), async {
+                let first = resolve_proposed_tag(
+                    &fx.pool,
+                    &embed_fn,
+                    "test-model",
+                    &ProposedTag {
+                        name: "topic:weather".into(),
+                        description: Some("Forecasts, rain, and temperature".into()),
+                    },
+                )
+                .await
+                .expect("register the tag");
+                assert_eq!(first, "topic:weather");
+                let after_create = seen.lock().expect("read embed texts").len();
+                assert_eq!(
+                    after_create, 1,
+                    "premise: a genuinely new tag costs one embedding"
+                );
+
+                let second = resolve_proposed_tag(
+                    &fx.pool,
+                    &embed_fn,
+                    "test-model",
+                    &ProposedTag {
+                        name: "topic:weather".into(),
+                        description: Some("Something else entirely".into()),
+                    },
+                )
+                .await
+                .expect("resolve the known tag");
+                assert_eq!(
+                    second, "topic:weather",
+                    "a known tag resolves to itself, whatever description came with it"
+                );
+                assert_eq!(
+                    seen.lock().expect("read embed texts").len(),
+                    after_create,
+                    "a tag the registry already holds must cost no embedding"
+                );
+
+                let stored = get_tag(&fx.pool, "topic:weather")
+                    .await
+                    .expect("read the stored tag")
+                    .expect("the tag is registered");
+                assert_eq!(
+                    stored.description, "Forecasts, rain, and temperature",
+                    "the second description must not overwrite the registered one"
+                );
+            })
+            .await;
+            fx
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn kb_write_resolves_a_tag_a_concurrent_write_registered_first() {
+    // Two writes can propose the same new tag at once - a second client, or a
+    // retried turn. The loser's INSERT hits the `(user_id, name)` primary key.
+    // That is a race the registry won, not a registry that failed: the tag now
+    // exists, so the resolver reads it and answers with it.
+    //
+    // The race is simulated deterministically. The embedding call is the window
+    // between the exact-name check and the INSERT, so registering the row from
+    // inside the embed function puts the row there at exactly the moment a
+    // concurrent write would have.
+    //
+    // MUTATION: dropping the post-INSERT read-back makes the resolver return
+    // the primary-key error, which the write path degrades into "store the tag
+    // as written" - so the returned name check goes RED. Looking the tag back
+    // up under the raw proposed name instead of the normalized one also goes
+    // RED, which is why the proposal below is deliberately not already
+    // normalized.
+    with_fixture(
+        "kb_write_resolves_a_tag_a_concurrent_write_registered_first",
+        |fx| async move {
+            let pool = fx.pool.clone();
+            // No embedding on the row it plants, so the nearest-neighbour search
+            // skips it (`embedding IS NOT NULL`) and the INSERT is still reached.
+            let racing_embed: BackfillEmbedFn = Box::new(move |texts| {
+                let pool = pool.clone();
+                Box::pin(async move {
+                    sqlx::query(
+                        "INSERT INTO tag_registry \
+                            (user_id, name, description, examples, distinguish_from) \
+                         VALUES ($1, 'topic:weather', 'registered by the other write', \
+                                 '[]'::jsonb, '{}') \
+                         ON CONFLICT DO NOTHING",
+                    )
+                    .bind("alice")
+                    .execute(&pool)
+                    .await
+                    .expect("the concurrent write registers the tag");
+                    Ok(texts.iter().map(|_| vec![1.0f32, 0.0, 0.0]).collect())
+                })
+            });
+
+            with_user_id(UserId::new("alice"), async {
+                let name = resolve_proposed_tag(
+                    &fx.pool,
+                    &racing_embed,
+                    "test-model",
+                    &ProposedTag {
+                        // Not already normalized, so the read-back has to
+                        // normalize as the insert did to find the row.
+                        name: "Topic: Weather".into(),
+                        description: Some("Forecasts, rain, and temperature".into()),
+                    },
+                )
+                .await
+                .expect("a lost race is not a failure");
+                assert_eq!(
+                    name, "topic:weather",
+                    "the resolver answers with the tag the winner registered"
+                );
+
+                let stored = list_active_tags(&fx.pool)
+                    .await
+                    .expect("list alice's tags")
+                    .into_iter()
+                    .map(|t| t.name)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    stored,
+                    vec!["topic:weather".to_string()],
+                    "one tag, not two"
+                );
+            })
+            .await;
+            fx
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn kb_write_registers_tags_under_the_calling_user() {
+    // The registry is per-user. A tag proposed by one tenant must never
+    // redirect against another tenant's vocabulary, even when the two are
+    // identical in embedding space.
+    //
+    // MUTATION: dropping the `user_id = $2` predicate from the nearest-neighbour
+    // search in `create_or_match_tag` redirects bob onto alice's tag → RED.
+    with_fixture(
+        "kb_write_registers_tags_under_the_calling_user",
+        |fx| async move {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let embed_fn = counting_embed_fn(Arc::clone(&seen));
+
+            with_user_id(UserId::new("alice"), async {
+                let name = resolve_proposed_tag(
+                    &fx.pool,
+                    &embed_fn,
+                    "test-model",
+                    &ProposedTag {
+                        name: "project:alpha".into(),
+                        description: Some("Alice's first project".into()),
+                    },
+                )
+                .await
+                .expect("alice registers her tag");
+                assert_eq!(name, "project:alpha");
+            })
+            .await;
+
+            with_user_id(UserId::new("bob"), async {
+                // A different name, so the exact-match short-circuit cannot fire,
+                // and an identical embedding, so only the user scope can keep the
+                // two apart.
+                let name = resolve_proposed_tag(
+                    &fx.pool,
+                    &embed_fn,
+                    "test-model",
+                    &ProposedTag {
+                        name: "project:alphas".into(),
+                        description: Some("Bob's own project".into()),
+                    },
+                )
+                .await
+                .expect("bob registers his tag");
+                assert_eq!(
+                    name, "project:alphas",
+                    "bob's tag must not redirect onto alice's vocabulary"
+                );
+
+                let visible = list_active_tags(&fx.pool)
+                    .await
+                    .expect("list bob's tags")
+                    .into_iter()
+                    .map(|t| t.name)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    visible,
+                    vec!["project:alphas".to_string()],
+                    "bob sees only his own tag"
+                );
+            })
+            .await;
+
+            fx
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn kb_write_reads_an_existing_tag_only_within_the_calling_user() {
+    // `get_tag` is on this path twice: the exact-name short-circuit, and the
+    // read-back after a lost race. Both answer with a name the caller then
+    // writes on a knowledge-base row, so a `get_tag` that saw every tenant
+    // would hand bob alice's tag and file bob's entry under it.
+    //
+    // Alice registers `project:alpha`. Bob proposes the same name with his own
+    // description, so only the user scope on the exact-name lookup can keep the
+    // two apart: the names are equal, so no vector distance is involved.
+    //
+    // MUTATION: dropping `user_id = $1` from `get_tag` makes bob's proposal
+    // short-circuit onto alice's row, so bob registers nothing and the row
+    // count and the description both go RED.
+    with_fixture(
+        "kb_write_reads_an_existing_tag_only_within_the_calling_user",
+        |fx| async move {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let embed_fn = counting_embed_fn(Arc::clone(&seen));
+
+            with_user_id(UserId::new("alice"), async {
+                let name = resolve_proposed_tag(
+                    &fx.pool,
+                    &embed_fn,
+                    "test-model",
+                    &ProposedTag {
+                        name: "project:alpha".into(),
+                        description: Some("Alice's first project".into()),
+                    },
+                )
+                .await
+                .expect("alice registers her tag");
+                assert_eq!(name, "project:alpha", "premise: alice holds the name");
+            })
+            .await;
+
+            with_user_id(UserId::new("bob"), async {
+                let name = resolve_proposed_tag(
+                    &fx.pool,
+                    &embed_fn,
+                    "test-model",
+                    &ProposedTag {
+                        name: "project:alpha".into(),
+                        description: Some("Bob's own project".into()),
+                    },
+                )
+                .await
+                .expect("bob registers his own tag of the same name");
+                assert_eq!(name, "project:alpha");
+
+                let stored = get_tag(&fx.pool, "project:alpha")
+                    .await
+                    .expect("read bob's tag")
+                    .expect("bob holds the name too");
+                assert_eq!(
+                    stored.description, "Bob's own project",
+                    "bob's row carries bob's description, not alice's"
+                );
+            })
+            .await;
+
+            let rows: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM tag_registry WHERE name = 'project:alpha'",
+            )
+            .fetch_one(&fx.pool)
+            .await
+            .expect("count the rows for the shared name");
+            assert_eq!(rows, 2, "one row per tenant, not one row shared");
+
+            fx
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn registry_redirects_an_underscore_spelling_onto_its_dash_spelling() {
+    // `normalize_tag` leaves an underscore alone, so `user_preference` and
+    // `user-preference` are two names the table can hold for one concept. They
+    // are also close in embedding space - measured at cosine distance 0.016,
+    // well inside the 0.10 dedup threshold - so the vector search is what has
+    // to collapse them. A guard on the redirect candidate that treats a
+    // dash/underscore difference as suspect would refuse this redirect, fall
+    // through to the insert, and give one concept two rows: the exact failure
+    // #1070 exists to prevent.
+    //
+    // MUTATION: refusing a candidate that differs from the proposal by
+    // punctuation alone registers a second row -> RED on both assertions.
+    with_fixture(
+        "registry_redirects_an_underscore_spelling_onto_its_dash_spelling",
+        |fx| async move {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let embed_fn = counting_embed_fn(Arc::clone(&seen));
+
+            with_user_id(UserId::new("alice"), async {
+                let first = resolve_proposed_tag(
+                    &fx.pool,
+                    &embed_fn,
+                    "test-model",
+                    &ProposedTag {
+                        name: "user-preference".into(),
+                        description: Some("How the user likes things done".into()),
+                    },
+                )
+                .await
+                .expect("register the dash spelling");
+                assert_eq!(first, "user-preference", "premise: the dash spelling is in");
+
+                let second = resolve_proposed_tag(
+                    &fx.pool,
+                    &embed_fn,
+                    "test-model",
+                    &ProposedTag {
+                        name: "user_preference".into(),
+                        description: Some("How the user likes things done".into()),
+                    },
+                )
+                .await
+                .expect("the underscore spelling resolves");
+                assert_eq!(
+                    second, "user-preference",
+                    "the underscore spelling must redirect onto the registered tag"
+                );
+
+                let names = list_active_tags(&fx.pool)
+                    .await
+                    .expect("list alice's tags")
+                    .into_iter()
+                    .map(|t| t.name)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    names,
+                    vec!["user-preference".to_string()],
+                    "one concept, one row"
+                );
+            })
+            .await;
+            fx
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn kb_write_pays_a_saturated_connection_pool_once_not_twice() {
+    // The resolver used to read the tag back on *any* failure, not only on the
+    // primary-key conflict that a read-back can answer. A pool with no free
+    // connection therefore cost two acquire timeouts inside one live turn -
+    // measured at 60.0s against sqlx's 30s default.
+    //
+    // The pool here holds one connection, and the test holds it, so every
+    // acquire waits out the timeout and none of the SQL ever runs. One pass
+    // costs one timeout; the old retry cost two.
+    //
+    // MUTATION: reading the tag back on any error, rather than on the unique
+    // violation beside the insert that raises it, doubles the elapsed time →
+    // RED.
+    let Some(url) = support::test_database_url() else {
+        return;
+    };
+    let acquire_timeout = std::time::Duration::from_millis(300);
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(acquire_timeout)
+        .connect(&url)
+        .await
+        .expect("connect the single-connection pool");
+
+    let held = pool.acquire().await.expect("hold the only connection");
+
+    let embed_fn: BackfillEmbedFn =
+        Box::new(|texts| Box::pin(async move { Ok(texts.iter().map(|_| vec![1.0f32]).collect()) }));
+
+    let started = std::time::Instant::now();
+    let outcome = with_user_id(
+        UserId::new("alice"),
+        resolve_proposed_tag(
+            &pool,
+            &embed_fn,
+            "test-model",
+            &ProposedTag {
+                name: "topic:weather".into(),
+                description: Some("Forecasts, rain, and temperature".into()),
+            },
+        ),
+    )
+    .await;
+    let elapsed = started.elapsed();
+
+    drop(held);
+    pool.close().await;
+
+    assert!(
+        outcome.is_err(),
+        "a pool that never yields a connection is a failure, and the write path \
+         degrades it into storing the tag as written"
+    );
+    assert!(
+        elapsed < acquire_timeout * 2,
+        "one pass through the vocabulary pays one acquire timeout, not two: \
+         {elapsed:?} against a {acquire_timeout:?} timeout"
+    );
 }
 
 // -- tool_registry -----------------------------------------------------------

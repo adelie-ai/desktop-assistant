@@ -53,6 +53,15 @@ use transports::{
     resolve_on_workstation, resolve_uds_socket_path, resolve_ws_login_mode,
 };
 
+/// How long the tag vocabulary waits for one embedding before it gives up and
+/// lets the knowledge-base write store the tag as written.
+///
+/// Why bounded: this call sits inside a live tool call, so a hung embedding
+/// backend would hold up the user's turn. Matching the query-embedding timeout
+/// the built-in tools already apply keeps a stalled backend costing the same
+/// on both paths.
+const TAG_REGISTRY_EMBED_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 async fn shutdown_signal() {
     let ctrl_c = async {
         if let Err(e) = tokio::signal::ctrl_c().await {
@@ -1473,7 +1482,7 @@ async fn main() -> Result<()> {
     // acts on the user's files (#1082).
     let mut builtin_tools =
         BuiltinToolService::new().with_topology(daemon_host_label(), on_workstation);
-    if let Some(embed_fn) = embedding_fn {
+    if let Some(embed_fn) = embedding_fn.clone() {
         tracing::info!(
             "enabling built-in vector search with model={}",
             embedding_model_id
@@ -1481,6 +1490,55 @@ async fn main() -> Result<()> {
         builtin_tools = builtin_tools.with_embedding(embed_fn, embedding_model_id.clone());
     } else {
         tracing::info!("built-in vector search disabled (no embedding backend configured)");
+    }
+
+    // The formal tag vocabulary in front of the knowledge-base write tool
+    // (#1070): a tag the model writes is checked against the tags that already
+    // exist, so a near duplicate is stored under the existing name instead of
+    // fragmenting the vocabulary. It needs both the database that holds the
+    // vocabulary and an embedding backend to recognise a near duplicate; with
+    // either absent the write path keeps its prior behaviour and stores the tag
+    // as written.
+    match (pg_pool.as_ref(), embedding_fn.as_ref()) {
+        (Some(pool), Some(embed_fn)) => {
+            tracing::info!("tag vocabulary enabled for knowledge-base writes");
+            let pool = pool.clone();
+            let embed_fn = Arc::clone(embed_fn);
+            let model = embedding_model_id.clone();
+            builtin_tools = builtin_tools.with_tag_registry(Arc::new(move |proposed| {
+                let pool = pool.clone();
+                let embed_fn = Arc::clone(&embed_fn);
+                let model = model.clone();
+                Box::pin(async move {
+                    let bounded: desktop_assistant_storage::embedding_backfill::BackfillEmbedFn =
+                        Box::new(move |texts| {
+                            let embed_fn = Arc::clone(&embed_fn);
+                            Box::pin(async move {
+                                match tokio::time::timeout(
+                                    TAG_REGISTRY_EMBED_TIMEOUT,
+                                    embed_fn(texts),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(vectors)) => Ok(vectors),
+                                    Ok(Err(e)) => Err(e.to_string()),
+                                    Err(_) => {
+                                        Err("tag vocabulary embedding call timed out".to_string())
+                                    }
+                                }
+                            })
+                        });
+                    desktop_assistant_storage::tag_registry::resolve_proposed_tag(
+                        &pool, &bounded, &model, &proposed,
+                    )
+                    .await
+                })
+            }));
+        }
+        _ => tracing::info!(
+            "tag vocabulary disabled for knowledge-base writes (no database or no \
+             embedding backend); tags are stored as written"
+        ),
     }
 
     if let Some(kb) = &kb_store {

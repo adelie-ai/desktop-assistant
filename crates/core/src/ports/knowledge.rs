@@ -241,6 +241,42 @@ pub type KnowledgeDeleteFn = Arc<
         + Sync,
 >;
 
+/// A tag the knowledge-base write tool proposes, with the one-line description
+/// the model gave for what the tag means.
+///
+/// Why the description travels with the name: a formal tag vocabulary decides
+/// whether two tags are the same concept by comparing embeddings, and a short
+/// facet tag such as `topic:weather` carries almost no signal on its own. The
+/// description is what makes `topic:forecast` recognisable as the same concept.
+///
+/// The description is optional. A model that omits one is not an error - the
+/// vocabulary falls back to the name alone rather than refusing the write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProposedTag {
+    /// The tag as the model wrote it, before any normalisation.
+    pub name: String,
+    /// One line saying what the tag means, when the model supplied one.
+    pub description: Option<String>,
+}
+
+/// Boxed async closure that resolves a proposed tag to the tag name the
+/// knowledge base should actually store.
+///
+/// The answer is the proposed name when the vocabulary accepts it as a new
+/// concept, and an existing tag's name when the vocabulary considers the two
+/// the same concept. Either way the caller stores what comes back, so a near
+/// duplicate never becomes a second tag that no read can match.
+///
+/// Why fallible: resolving a genuinely new tag needs an embedding, and the
+/// embedding backend is optional. An `Err` means the vocabulary could not be
+/// consulted this time, and the caller falls back to storing the tag as
+/// written - never to failing the write.
+pub type KnowledgeTagResolveFn = Arc<
+    dyn Fn(ProposedTag) -> Pin<Box<dyn Future<Output = Result<String, CoreError>> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Boxed async closure for fetching a single entry by id (used by the write
 /// tool to support partial updates that omit `content`).
 pub type KnowledgeGetFn = Arc<

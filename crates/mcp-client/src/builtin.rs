@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 
@@ -12,8 +12,8 @@ use desktop_assistant_core::ports::database::DbQueryFn;
 use desktop_assistant_core::ports::embedding::EmbedFn;
 use desktop_assistant_core::ports::knowledge::{
     AVAILABLE_TAGS_LIMIT, KNOWLEDGE_TAG_CENSUS_SAMPLE, KnowledgeDeleteFn, KnowledgeGetFn,
-    KnowledgeListFn, KnowledgeListQuery, KnowledgeSearchFn, KnowledgeWriteFn, ListOrder,
-    ListOrderOpt, ScopeSize,
+    KnowledgeListFn, KnowledgeListQuery, KnowledgeSearchFn, KnowledgeTagResolveFn,
+    KnowledgeWriteFn, ListOrder, ListOrderOpt, ProposedTag, ScopeSize,
 };
 use desktop_assistant_core::ports::notify::{NotifyFn, NotifyUrgency};
 use desktop_assistant_core::ports::scratchpad::{
@@ -27,8 +27,147 @@ use desktop_assistant_core::ports::tool_registry::{ToolDefinitionFn, ToolSearchF
 use desktop_assistant_core::ports::transport::{
     current_client_context, current_client_label, current_co_location, current_transport_kind,
 };
+use desktop_assistant_core::tag_normalize::normalize_tag;
 
 use crate::executor::McpControlHandle;
+
+/// How long one `builtin_knowledge_base_write` call may spend **inside** the
+/// tag vocabulary, added up across every tag in the call.
+///
+/// Why a budget at all: the caller chooses how many tags one write carries, and
+/// each tag the vocabulary has not seen before costs an embedding. Without a
+/// ceiling the wait a person sits through grows with the tag count, inside a
+/// live turn. Once it is spent the remaining tags are stored as written, which
+/// is the same fallback every other absent-vocabulary state uses.
+///
+/// Why time spent rather than a wall-clock deadline: a write also reads an
+/// existing entry and stores each entry, and neither is a consultation. Against
+/// a deadline a batch of ten entries with slow stores loses the vocabulary on
+/// its last entries with nothing slow about the vocabulary, and the re-tag path
+/// is the most exposed because it reads first.
+///
+/// It gates the start of a consultation, not its end, so one call already in
+/// flight when the budget runs out still finishes. Cutting a consultation off
+/// mid-flight would spend the embedding and then throw the answer away. The
+/// vocabulary's whole share of a write is therefore this plus at most one
+/// [`TAG_RESOLVE_CALL_CEILING`].
+const TAG_RESOLVE_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// How long one consultation of the tag vocabulary may take before the write
+/// gives up on it and stores that tag as written.
+///
+/// Why the whole call and not only its embedding: a consultation reads the
+/// vocabulary, embeds, searches for a near neighbour, and registers. The
+/// embedding is bounded on its own, and the database round trips around it are
+/// bounded by the connection pool's acquire timeout, which is measured in tens
+/// of seconds and is paid once per round trip. A saturated pool therefore held
+/// a live turn far longer than the embedding timeout suggests. This bounds the
+/// consultation as a whole, whatever inside it is slow.
+///
+/// The value leaves the embedding timeout its full 5 seconds and 5 more for the
+/// round trips around it.
+const TAG_RESOLVE_CALL_CEILING: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long one tag description may be, in characters.
+///
+/// Why bounded at all: a description is written once and read forever. It is
+/// stored on the registry row, and `build_extraction_system_prompt` renders
+/// every active tag's description into the dreaming extraction prompt in full.
+/// Nothing deletes a registry row, so an oversized description is a permanent
+/// charge on every later extraction. Before the tool path was gated, dreaming
+/// was the only writer; now every knowledge write is one, so the rate that
+/// surface grows at changes by orders of magnitude.
+///
+/// Why this size: the field is advertised as one line, and
+/// [`desktop_assistant_core::ports::knowledge::AVAILABLE_TAGS_LIMIT`] already
+/// treats 50 tags as the working size of a vocabulary. Fifty descriptions of
+/// 200 characters is about 10 kB of prompt - bounded, and still generous for
+/// one line. A longer description is truncated, never refused: refusing it
+/// would cost the tag its description and drop the dedup back to matching bare
+/// names, which is the weak option #1070 rejected.
+///
+/// Bounding how many tags that prompt renders is the other half of the same
+/// surface, and is #1103.
+const TAG_DESCRIPTION_MAX_CHARS: usize = 200;
+
+/// The tag vocabulary's share of one `builtin_knowledge_base_write` call.
+///
+/// It carries the time already spent consulting, the reason the vocabulary
+/// stopped being consulted once anything has stopped it, and whether any tag
+/// went into the store without a vocabulary answer. Every stopping condition -
+/// no vocabulary wired, a failure, a spent budget - means the same thing for
+/// the rest of the call: store the tags as the caller wrote them.
+///
+/// Why it spans the call rather than one entry: a batch write is one tool call
+/// to the person waiting on it, so a per-entry budget would bound nothing that
+/// they can feel.
+#[derive(Default)]
+struct TagGateBudget {
+    spent: std::time::Duration,
+    stopped: Option<String>,
+    unchecked_tags: usize,
+}
+
+impl TagGateBudget {
+    /// Start the budget for one write call.
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether the vocabulary may still be consulted.
+    fn is_open(&self) -> bool {
+        self.stopped.is_none() && self.spent < TAG_RESOLVE_BUDGET
+    }
+
+    /// Charge one finished consultation against the budget.
+    fn charge(&mut self, elapsed: std::time::Duration) {
+        self.spent = self.spent.saturating_add(elapsed);
+    }
+
+    /// Record that `count` tags were stored without a vocabulary answer.
+    fn unchecked(&mut self, count: usize) {
+        self.unchecked_tags += count;
+    }
+
+    /// Stop consulting the vocabulary for the rest of this call, keeping the
+    /// first reason. A later reason is a consequence of the first, so it would
+    /// only bury it.
+    fn stop(&mut self, reason: impl Into<String>) {
+        if self.stopped.is_none() {
+            self.stopped = Some(reason.into());
+        }
+    }
+
+    /// The value of the write response's `tag_check` field, or `None` when the
+    /// field is left out because the vocabulary answered for every tag.
+    ///
+    /// Why the caller is told at all: a degraded write stores whatever the
+    /// model wrote, so its response would otherwise be byte-identical to a
+    /// checked one. The model would then read its own drift back as accepted
+    /// vocabulary, which is the failure the vocabulary exists to prevent. This
+    /// mirrors `builtin_knowledge_base_search` reporting `scope_size` as
+    /// `UNKNOWN` when its census did not run: across both tools, not measured
+    /// never reads as measured.
+    fn tag_check(&self) -> Option<&'static str> {
+        (self.unchecked_tags > 0).then_some(TAG_CHECK_UNKNOWN)
+    }
+
+    /// Say once, for the whole call, that the tags were stored as written.
+    fn report(&self) {
+        if let Some(reason) = &self.stopped {
+            tracing::warn!(
+                reason = %reason,
+                unchecked_tags = self.unchecked_tags,
+                "the tag vocabulary was not consulted for the rest of this write; \
+                 those tags are stored as written"
+            );
+        }
+    }
+}
+
+/// The one value the write response's `tag_check` field takes: at least one tag
+/// on this write went to the store without the vocabulary answering for it.
+const TAG_CHECK_UNKNOWN: &str = "UNKNOWN";
 
 /// Machine label used until the daemon supplies its own hostname, so a search
 /// result is coherent in tests and in a build that never called
@@ -170,6 +309,7 @@ pub struct BuiltinToolService {
     kb_delete_fn: Option<KnowledgeDeleteFn>,
     kb_list_fn: Option<KnowledgeListFn>,
     kb_get_fn: Option<KnowledgeGetFn>,
+    kb_tag_resolve_fn: Option<KnowledgeTagResolveFn>,
     tool_search_fn: Option<ToolSearchFn>,
     #[allow(dead_code)]
     tool_definition_fn: Option<ToolDefinitionFn>,
@@ -211,6 +351,7 @@ impl BuiltinToolService {
             kb_delete_fn: None,
             kb_list_fn: None,
             kb_get_fn: None,
+            kb_tag_resolve_fn: None,
             tool_search_fn: None,
             tool_definition_fn: None,
             db_query_fn: None,
@@ -292,6 +433,19 @@ impl BuiltinToolService {
         self.kb_delete_fn = Some(delete_fn);
         self.kb_list_fn = Some(list_fn);
         self.kb_get_fn = Some(get_fn);
+        self
+    }
+
+    /// Put the formal tag vocabulary in front of the knowledge-base write path,
+    /// so a tag the model writes is checked against the tags that already exist
+    /// before it is stored.
+    ///
+    /// Why capability-gated: the vocabulary lives in the database and needs an
+    /// embedding backend to recognise a near duplicate. Without this the write
+    /// path keeps its prior behaviour and stores the tag as written, which is a
+    /// weaker knowledge base rather than a broken one.
+    pub fn with_tag_registry(mut self, resolve_fn: KnowledgeTagResolveFn) -> Self {
+        self.kb_tag_resolve_fn = Some(resolve_fn);
         self
     }
 
@@ -404,7 +558,16 @@ impl BuiltinToolService {
                  this information is useful) and the information itself. Provide either a single \
                  entry (top-level `content`/`tags`/`id`) or a batch via `entries`. To update only \
                  the tags of an existing entry, pass its `id` and omit `content` — the existing \
-                 content is preserved.",
+                 content is preserved. Tags are checked against the tag vocabulary, which holds \
+                 the tags registered so far and grows as tags are written; it starts empty, so \
+                 early writes have little to match against. A tag that means the same as one \
+                 already registered is stored under the registered name, so the response \
+                 reports the tags actually stored, which may differ from the ones you sent. \
+                 Describe any tag you believe is new in `new_tag_descriptions` — that \
+                 description is what the check compares. When the response carries \
+                 `tag_check: \"UNKNOWN\"`, at least one tag on that write was stored without \
+                 being checked, so treat those tags as your own wording and not as established \
+                 vocabulary.",
                 serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -420,13 +583,18 @@ impl BuiltinToolService {
                             "items": {"type": "string"},
                             "description": "Two-level tags. Give a coarse KIND ('preference', 'memory', or 'instruction') PLUS at least one SPECIFIC facet: 'project:<name>', 'tool:<name>', 'topic:<subject>', or 'person:<name>'. Prefer specific over generic. Good: ['instruction', 'project:adelie-ai', 'topic:deploy']. Too generic: ['instruction']."
                         },
+                        "new_tag_descriptions": {
+                            "type": "object",
+                            "additionalProperties": {"type": "string"},
+                            "description": "Optional map from a tag in `tags` to a one-line description of what that tag means, e.g. {'topic:embeddings': 'Vector embedding generation, models, and backfill'}. Needed only for a tag you believe is new: it is what decides whether your tag means the same as one already in use. A tag already in use ignores its entry here. Omitting a description never fails the write, it only makes the check weaker. Keep it to one line: a description longer than 200 characters is truncated to 200, never rejected."
+                        },
                         "id": {
                             "type": "string",
                             "description": "Optional ID for updates. Omit to create a new entry."
                         },
                         "entries": {
                             "type": "array",
-                            "description": "Batch form: a list of {content?, tags?, id?} objects. When present, the top-level content/tags/id are ignored.",
+                            "description": "Batch form: a list of {content?, tags?, id?, new_tag_descriptions?} objects. When present, every top-level field is ignored — content, tags, id and new_tag_descriptions alike — so describe each entry's new tags inside that entry.",
                             "items": {
                                 "type": "object",
                                 "properties": {
@@ -435,6 +603,11 @@ impl BuiltinToolService {
                                         "type": "array",
                                         "items": {"type": "string"},
                                         "description": "Two-level tags: a coarse KIND ('preference'/'memory'/'instruction') PLUS at least one SPECIFIC facet ('project:<name>', 'tool:<name>', 'topic:<subject>', 'person:<name>'). Prefer specific over generic."
+                                    },
+                                    "new_tag_descriptions": {
+                                        "type": "object",
+                                        "additionalProperties": {"type": "string"},
+                                        "description": "Per-entry map from a tag in this entry's `tags` to a one-line description of what it means. Needed only for a tag you believe is new. A description longer than 200 characters is truncated to 200, never rejected."
                                     },
                                     "id": {"type": "string"}
                                 }
@@ -1122,27 +1295,62 @@ impl BuiltinToolService {
         };
 
         let mut saved_out = Vec::with_capacity(specs.len());
+        // One budget for the whole call, so a batch cannot spend it per entry.
+        let mut tag_budget = TagGateBudget::new();
+        // A spec that fails ends the call, but the budget still reports what it
+        // did first: an entry that failed for its own reason is exactly when an
+        // operator wants to know the vocabulary had already stopped answering.
+        let mut failure: Option<CoreError> = None;
         for spec in &specs {
-            let entry = self.build_write_entry(spec).await?;
+            let entry = match self.build_write_entry(spec, &mut tag_budget).await {
+                Ok(entry) => entry,
+                Err(e) => {
+                    failure = Some(e);
+                    break;
+                }
+            };
             // Embedding generation is decoupled from the write: the entry lands
             // immediately (NULL embedding on create, stale embedding left in
             // place on update) and the background embedding-backfill task
             // generates the vector within its next pass. The row is
             // keyword-searchable (FTS) right away; semantic recall follows.
-            let saved = write_fn(entry).await?;
+            let saved = match write_fn(entry).await {
+                Ok(saved) => saved,
+                Err(e) => {
+                    failure = Some(e);
+                    break;
+                }
+            };
             saved_out.push(serde_json::json!({
                 "id": saved.id,
+                // The tags actually stored, which the vocabulary check may have
+                // redirected away from the ones the caller sent. Reporting them
+                // stops the model believing an entry carries a tag it does not,
+                // and then searching for that tag and finding nothing.
+                "tags": saved.tags,
                 "created_at": saved.created_at,
                 "updated_at": saved.updated_at,
             }));
         }
+        tag_budget.report();
+        if let Some(e) = failure {
+            return Err(e);
+        }
 
-        Ok(serde_json::json!({
+        let mut response = serde_json::json!({
             "ok": true,
             "count": saved_out.len(),
             "entries": saved_out,
-        })
-        .to_string())
+        });
+        // Present only when a tag went to the store without the vocabulary
+        // answering for it, so a checked write and a degraded one never read
+        // the same. See `TagGateBudget::tag_check`.
+        if let Some(check) = tag_budget.tag_check()
+            && let Some(obj) = response.as_object_mut()
+        {
+            obj.insert("tag_check".to_string(), serde_json::json!(check));
+        }
+        Ok(response.to_string())
     }
 
     /// Build a [`KnowledgeEntry`] from one write spec. When `content` is
@@ -1153,6 +1361,7 @@ impl BuiltinToolService {
     async fn build_write_entry(
         &self,
         spec: &serde_json::Value,
+        tag_budget: &mut TagGateBudget,
     ) -> Result<desktop_assistant_core::domain::KnowledgeEntry, CoreError> {
         use desktop_assistant_core::domain::KnowledgeEntry;
 
@@ -1186,8 +1395,11 @@ impl BuiltinToolService {
             .ok_or_else(|| {
                 CoreError::ToolExecution("knowledge_base write requires content".into())
             })?;
+        // Tags the caller supplied go through the formal vocabulary; tags
+        // carried over from the existing entry are already in it, so a
+        // content-only update re-registers nothing.
         let tags = if tags_present {
-            tags
+            self.resolve_tags(tags, spec, tag_budget).await
         } else {
             existing
                 .as_ref()
@@ -1221,6 +1433,85 @@ impl BuiltinToolService {
             updated_at: String::new(),
             source: Some("explicit".to_string()),
         })
+    }
+
+    /// Put every tag the caller supplied through the formal tag vocabulary and
+    /// return the names to store.
+    ///
+    /// Each tag is offered with its entry from the spec's
+    /// `new_tag_descriptions` map, which is what lets the vocabulary tell one
+    /// short facet tag from another. A tag the vocabulary already holds matches
+    /// on its name and costs no embedding, so sending a description for every
+    /// tag is free.
+    ///
+    /// A description is matched to its tag on the normalized name, on both
+    /// sides. The model writes what reads well - `"Topic: Embeddings"` in one
+    /// field and `"topic:embeddings"` in the other - and the vocabulary keys on
+    /// the normalized name, so matching the two raw strings drops the
+    /// description. A tag that loses its description embeds as its bare name,
+    /// which carries almost no signal, so the check that this whole path exists
+    /// for would mostly not fire.
+    ///
+    /// Why nothing here can fail the write: the vocabulary is optional. It is
+    /// absent when no database or embedding backend is wired, and it can fail
+    /// per call when the embedding backend is unreachable. Both degrade to the
+    /// prior behaviour - store the tag as the caller wrote it.
+    ///
+    /// Two things stop the vocabulary being consulted again for the rest of the
+    /// write call: its first failure, and a spent [`TagGateBudget`]. A
+    /// vocabulary that just failed will not answer the next tag either, and
+    /// asking it again pays the whole ceiling for nothing. The caller reports
+    /// both once for the call, not once per tag.
+    ///
+    /// One consultation is bounded by [`TAG_RESOLVE_CALL_CEILING`], and only
+    /// the time inside it is charged against the budget, so a slow store or a
+    /// slow read elsewhere in the write never spends the vocabulary's share.
+    async fn resolve_tags(
+        &self,
+        tags: Vec<String>,
+        spec: &serde_json::Value,
+        budget: &mut TagGateBudget,
+    ) -> Vec<String> {
+        let Some(resolve_fn) = self.kb_tag_resolve_fn.as_ref() else {
+            // No vocabulary is wired, so no tag on this write was checked
+            // against one. The caller says so rather than answering as though
+            // it had been.
+            budget.unchecked(tags.len());
+            return tags;
+        };
+        let descriptions = normalized_tag_descriptions(spec);
+
+        let mut resolved = Vec::with_capacity(tags.len());
+        for tag in tags {
+            if !budget.is_open() {
+                budget.stop("the tag vocabulary budget for this write was spent");
+                budget.unchecked(1);
+                resolved.push(tag);
+                continue;
+            }
+            let description = descriptions.get(&normalize_tag(&tag)).cloned();
+            let proposed = ProposedTag {
+                name: tag.clone(),
+                description,
+            };
+            let started = tokio::time::Instant::now();
+            let answer = tokio::time::timeout(TAG_RESOLVE_CALL_CEILING, resolve_fn(proposed)).await;
+            budget.charge(started.elapsed());
+            match answer {
+                Ok(Ok(name)) => resolved.push(name),
+                Ok(Err(e)) => {
+                    budget.stop(e.to_string());
+                    budget.unchecked(1);
+                    resolved.push(tag);
+                }
+                Err(_) => {
+                    budget.stop("the tag vocabulary did not answer within its per-tag ceiling");
+                    budget.unchecked(1);
+                    resolved.push(tag);
+                }
+            }
+        }
+        resolved
     }
 
     async fn kb_search(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
@@ -2205,6 +2496,67 @@ fn optional_string_array(args: &serde_json::Value, key: &str) -> Vec<String> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default()
+}
+
+/// Read one write spec's `new_tag_descriptions` map, keyed by the normalized
+/// tag name.
+///
+/// Why normalized: the tag vocabulary keys on the normalized name, and the
+/// model writes each field in whatever shape reads well - `"Topic: Embeddings"`
+/// as the description key beside `"topic:embeddings"` in `tags`, or the
+/// reverse. Matching the two raw strings drops the description in both
+/// directions, and a tag with no description embeds as its bare name.
+///
+/// Each description is capped at [`TAG_DESCRIPTION_MAX_CHARS`]. It is truncated
+/// rather than refused, because refusing it would cost the tag its description
+/// and drop the check back to matching bare names.
+///
+/// Where two keys normalize together, one of them wins. Which one is
+/// deterministic but arbitrary: this workspace does not enable `serde_json`'s
+/// `preserve_order`, so a `Value::Object` iterates in byte order rather than in
+/// the order the model wrote its keys. Two keys for one tag is a malformed
+/// argument, not a case worth a rule.
+fn normalized_tag_descriptions(spec: &serde_json::Value) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let Some(map) = spec
+        .get("new_tag_descriptions")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return out;
+    };
+    for (name, value) in map {
+        let Some(description) = value
+            .as_str()
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+            .map(cap_tag_description)
+        else {
+            continue;
+        };
+        let key = normalize_tag(name);
+        if key.is_empty() {
+            continue;
+        }
+        out.entry(key).or_insert(description);
+    }
+    out
+}
+
+/// Cut one tag description down to [`TAG_DESCRIPTION_MAX_CHARS`] characters.
+///
+/// Counted in characters, not bytes, so the cut always lands on a character
+/// boundary and a description in any script gets the same allowance. Trailing
+/// whitespace left by the cut goes, so the stored text never ends mid-space.
+fn cap_tag_description(description: &str) -> String {
+    if description.chars().count() <= TAG_DESCRIPTION_MAX_CHARS {
+        return description.to_string();
+    }
+    description
+        .chars()
+        .take(TAG_DESCRIPTION_MAX_CHARS)
+        .collect::<String>()
+        .trim_end()
+        .to_string()
 }
 
 fn optional_string_array_nonempty(args: &serde_json::Value, key: &str) -> Option<Vec<String>> {
@@ -4192,6 +4544,907 @@ mod tests {
             serde_json::json!(["preference", "topic:weather"])
         );
         assert_eq!(json["returned"], 1);
+    }
+
+    // --- The tag-registry gate on tool-path writes (#1070) -----------------
+
+    /// What one call of the tag-registry gate saw and answered with.
+    #[derive(Debug, Clone)]
+    struct TagProbe {
+        /// Every tag the write path proposed, in the order it proposed them.
+        proposals: Vec<ProposedTag>,
+    }
+
+    /// A knowledge-base service whose store keeps its entries in memory, with
+    /// an optional tag-registry gate in front of the write path.
+    ///
+    /// The probe records the proposals the gate received, so a test can tell
+    /// "the gate was consulted and answered" from "the tag was stored as the
+    /// model wrote it".
+    fn kb_service_with_tag_gate(
+        resolve: Option<KnowledgeTagResolveFn>,
+    ) -> (
+        BuiltinToolService,
+        std::sync::Arc<std::sync::Mutex<Vec<desktop_assistant_core::domain::KnowledgeEntry>>>,
+    ) {
+        kb_service_with_slow_store(resolve, std::time::Duration::ZERO)
+    }
+
+    /// The same service, with each store write taking `store_delay`.
+    ///
+    /// Storing an entry is not a consultation of the tag vocabulary, so a slow
+    /// store must not spend the vocabulary's share of the write. A test drives
+    /// that with a paused clock rather than a real wait.
+    fn kb_service_with_slow_store(
+        resolve: Option<KnowledgeTagResolveFn>,
+        store_delay: std::time::Duration,
+    ) -> (
+        BuiltinToolService,
+        std::sync::Arc<std::sync::Mutex<Vec<desktop_assistant_core::domain::KnowledgeEntry>>>,
+    ) {
+        use desktop_assistant_core::domain::KnowledgeEntry;
+        use std::sync::{Arc, Mutex};
+
+        let store: Arc<Mutex<Vec<KnowledgeEntry>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let write_store = Arc::clone(&store);
+        let write_fn: KnowledgeWriteFn = Arc::new(move |mut entry| {
+            let s = Arc::clone(&write_store);
+            Box::pin(async move {
+                if !store_delay.is_zero() {
+                    tokio::time::sleep(store_delay).await;
+                }
+                entry.created_at = "2026-01-01".to_string();
+                entry.updated_at = "2026-01-01".to_string();
+                let mut g = s.lock().expect("write store lock");
+                g.retain(|e| e.id != entry.id);
+                g.push(entry.clone());
+                Ok(entry)
+            })
+        });
+        let search_fn: KnowledgeSearchFn = Arc::new(|_q, _emb, _model, _tags, _exclude, _limit| {
+            Box::pin(async {
+                Ok(KnowledgeSearchPage {
+                    entries: Vec::new(),
+                    scope_size: ScopeSize::None,
+                    available_tags: Vec::new(),
+                })
+            })
+        });
+        let delete_fn: KnowledgeDeleteFn = Arc::new(|_ids| Box::pin(async { Ok(0) }));
+        let list_fn: KnowledgeListFn = Arc::new(|_q| {
+            Box::pin(async {
+                Ok(
+                    desktop_assistant_core::ports::knowledge::KnowledgeListPage {
+                        entries: Vec::new(),
+                        next_cursor: None,
+                    },
+                )
+            })
+        });
+        let get_store = Arc::clone(&store);
+        let get_fn: KnowledgeGetFn = Arc::new(move |id| {
+            let s = Arc::clone(&get_store);
+            Box::pin(async move {
+                Ok(s.lock()
+                    .expect("get store lock")
+                    .iter()
+                    .find(|e| e.id == id)
+                    .cloned())
+            })
+        });
+
+        let mut service = BuiltinToolService::new()
+            .with_knowledge_base(write_fn, search_fn, delete_fn, list_fn, get_fn);
+        if let Some(resolve) = resolve {
+            service = service.with_tag_registry(resolve);
+        }
+        (service, store)
+    }
+
+    /// A tag-registry gate that answers from a fixed proposed-name -> stored-name
+    /// table, and records every proposal it saw. A name absent from the table is
+    /// returned unchanged, which is what the registry does for a genuinely new
+    /// tag it just created.
+    fn recording_tag_gate(
+        redirects: &[(&str, &str)],
+    ) -> (
+        KnowledgeTagResolveFn,
+        std::sync::Arc<std::sync::Mutex<TagProbe>>,
+    ) {
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+
+        let table: HashMap<String, String> = redirects
+            .iter()
+            .map(|(from, to)| ((*from).to_string(), (*to).to_string()))
+            .collect();
+        let probe = Arc::new(Mutex::new(TagProbe {
+            proposals: Vec::new(),
+        }));
+        let probe_for_fn = Arc::clone(&probe);
+        let resolve: KnowledgeTagResolveFn = Arc::new(move |proposed: ProposedTag| {
+            let table = table.clone();
+            let probe = Arc::clone(&probe_for_fn);
+            Box::pin(async move {
+                let resolved = table
+                    .get(&proposed.name)
+                    .cloned()
+                    .unwrap_or_else(|| proposed.name.clone());
+                probe.lock().expect("probe lock").proposals.push(proposed);
+                Ok(resolved)
+            })
+        });
+        (resolve, probe)
+    }
+
+    /// Run `builtin_knowledge_base_write` and parse its response.
+    async fn kb_write_response(
+        service: &BuiltinToolService,
+        arguments: serde_json::Value,
+    ) -> serde_json::Value {
+        let raw = service
+            .execute_tool(TOOL_KB_WRITE, arguments)
+            .await
+            .expect("knowledge base write succeeds");
+        serde_json::from_str(&raw).expect("write response is JSON")
+    }
+
+    #[tokio::test]
+    async fn kb_write_redirects_a_near_duplicate_tag_to_the_existing_tag() {
+        // The vocabulary fragments when `topic:forecast` lands beside
+        // `topic:weather`: reads filter by exact array overlap, so the two
+        // never match each other. The registry already knows they are the same
+        // concept, so the entry must carry the tag the registry chose.
+        let (resolve, probe) = recording_tag_gate(&[("topic:forecast", "topic:weather")]);
+        let (service, store) = kb_service_with_tag_gate(Some(resolve));
+
+        let json = kb_write_response(
+            &service,
+            serde_json::json!({
+                "content": "Rain is expected on Tuesday.",
+                "tags": ["memory", "topic:forecast"],
+            }),
+        )
+        .await;
+
+        assert_eq!(json["ok"], true);
+        let stored = store.lock().expect("store lock");
+        assert_eq!(stored.len(), 1, "one entry was written");
+        assert_eq!(
+            stored[0].tags,
+            vec!["memory".to_string(), "topic:weather".to_string()],
+            "the near-duplicate must be stored under the existing tag"
+        );
+        assert_eq!(
+            probe
+                .lock()
+                .expect("probe lock")
+                .proposals
+                .iter()
+                .map(|p| p.name.clone())
+                .collect::<Vec<_>>(),
+            vec!["memory".to_string(), "topic:forecast".to_string()],
+            "every tag on the write goes through the registry, not just the new one"
+        );
+        assert_eq!(
+            json["entries"][0]["tags"],
+            serde_json::json!(["memory", "topic:weather"]),
+            "the response reports the tags actually stored, so the model does not \
+             believe the entry carries a tag it does not"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_write_stores_a_genuinely_new_tag_and_registers_it_with_its_description() {
+        // A short facet tag carries almost no signal on its own, so the dedup
+        // needs the model's one-line description of what the tag means. It
+        // arrives in `new_tag_descriptions`, keyed by tag name.
+        let (resolve, probe) = recording_tag_gate(&[]);
+        let (service, store) = kb_service_with_tag_gate(Some(resolve));
+
+        kb_write_response(
+            &service,
+            serde_json::json!({
+                "content": "Embeddings are backfilled by the maintenance task.",
+                "tags": ["topic:embeddings"],
+                "new_tag_descriptions": {
+                    "topic:embeddings": "Vector embedding generation, models, and backfill",
+                },
+            }),
+        )
+        .await;
+
+        let proposals = probe.lock().expect("probe lock").proposals.clone();
+        assert_eq!(proposals.len(), 1, "one tag was proposed");
+        assert_eq!(proposals[0].name, "topic:embeddings");
+        assert_eq!(
+            proposals[0].description.as_deref(),
+            Some("Vector embedding generation, models, and backfill"),
+            "the description must reach the registry, or the dedup has nothing to compare"
+        );
+        assert_eq!(
+            store.lock().expect("store lock")[0].tags,
+            vec!["topic:embeddings".to_string()],
+            "a tag with no near duplicate is stored as proposed"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_write_matches_a_description_to_its_tag_on_the_normalised_name() {
+        // The model writes each field in whatever shape reads well, and the two
+        // fields drift apart in both directions: a pretty description key
+        // beside a normalised tag, and a normalised key beside a pretty tag.
+        // The vocabulary keys on the normalised name, so a raw string match
+        // drops the description and the tag embeds as its bare name - the weak
+        // option #1070 rejected.
+        let (resolve, probe) = recording_tag_gate(&[]);
+        let (service, _store) = kb_service_with_tag_gate(Some(resolve));
+
+        kb_write_response(
+            &service,
+            serde_json::json!({
+                "content": "Embeddings are backfilled by the maintenance task.",
+                "tags": ["topic:embeddings", "Topic: Deploy"],
+                "new_tag_descriptions": {
+                    // Pretty key, normalised tag.
+                    "Topic: Embeddings": "Vector embedding generation, models, and backfill",
+                    // Normalised key, pretty tag.
+                    "topic:deploy": "Releases, rollouts, and the justfile recipes",
+                },
+            }),
+        )
+        .await;
+
+        let proposals = probe.lock().expect("probe lock").proposals.clone();
+        let described: Vec<(String, Option<String>)> = proposals
+            .iter()
+            .map(|p| (p.name.clone(), p.description.clone()))
+            .collect();
+        assert_eq!(
+            described,
+            vec![
+                (
+                    "topic:embeddings".to_string(),
+                    Some("Vector embedding generation, models, and backfill".to_string())
+                ),
+                (
+                    "Topic: Deploy".to_string(),
+                    Some("Releases, rollouts, and the justfile recipes".to_string())
+                ),
+            ],
+            "a description reaches its tag whichever side arrived normalised"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_write_caps_a_tag_description_at_the_tool_boundary() {
+        // A description is written once and read forever: it lands on a registry
+        // row that nothing deletes, and the dreaming extraction prompt renders
+        // every active tag's description in full. Every knowledge write is now a
+        // writer of that surface, so an uncapped description is a permanent
+        // charge on every later extraction.
+        //
+        // It is truncated, never refused. Refusing it would cost the tag its
+        // description and drop the check back to matching bare names.
+        let (resolve, probe) = recording_tag_gate(&[]);
+        let (service, _store) = kb_service_with_tag_gate(Some(resolve));
+
+        let long = "x".repeat(TAG_DESCRIPTION_MAX_CHARS * 3);
+        let json = kb_write_response(
+            &service,
+            serde_json::json!({
+                "content": "Embeddings are backfilled by the maintenance task.",
+                "tags": ["topic:embeddings"],
+                "new_tag_descriptions": {"topic:embeddings": long},
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            json["ok"], true,
+            "an over-long description never fails a write"
+        );
+        let proposals = probe.lock().expect("probe lock").proposals.clone();
+        let description = proposals[0]
+            .description
+            .as_deref()
+            .expect("the tag keeps a description rather than losing it");
+        assert_eq!(
+            description.chars().count(),
+            TAG_DESCRIPTION_MAX_CHARS,
+            "the description reaching the vocabulary is capped"
+        );
+    }
+
+    #[test]
+    fn tag_description_cap_cuts_on_a_character_boundary() {
+        // Counted in characters, not bytes, so a description in any script gets
+        // the same allowance and the cut can never split one character.
+        let multibyte = "\u{e6f8}".repeat(TAG_DESCRIPTION_MAX_CHARS + 10);
+        let capped = cap_tag_description(&multibyte);
+        assert_eq!(capped.chars().count(), TAG_DESCRIPTION_MAX_CHARS);
+
+        // A description inside the cap is untouched, trailing space and all -
+        // the caller already trimmed it.
+        assert_eq!(cap_tag_description("short one"), "short one");
+
+        // Whitespace exposed by the cut goes, so the text never ends mid-space.
+        let padded = format!("{}   tail", "y".repeat(TAG_DESCRIPTION_MAX_CHARS - 2));
+        assert_eq!(
+            cap_tag_description(&padded),
+            "y".repeat(TAG_DESCRIPTION_MAX_CHARS - 2)
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_write_registers_a_new_tag_that_arrived_without_a_description() {
+        // A missing description is not an error. The write must never fail
+        // because the model omitted one, and the tag still goes through the
+        // registry - the registry falls back to the name alone as its embed
+        // text.
+        let (resolve, probe) = recording_tag_gate(&[]);
+        let (service, store) = kb_service_with_tag_gate(Some(resolve));
+
+        let json = kb_write_response(
+            &service,
+            serde_json::json!({
+                "content": "The deploy runs from the justfile.",
+                "tags": ["topic:deploy"],
+            }),
+        )
+        .await;
+
+        assert_eq!(json["ok"], true, "the write succeeds without a description");
+        let proposals = probe.lock().expect("probe lock").proposals.clone();
+        assert_eq!(proposals.len(), 1, "the tag still reached the registry");
+        assert_eq!(proposals[0].name, "topic:deploy");
+        assert_eq!(
+            proposals[0].description, None,
+            "no description was supplied, and the gate is told so rather than \
+             being handed an empty string"
+        );
+        assert_eq!(
+            store.lock().expect("store lock")[0].tags,
+            vec!["topic:deploy".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_write_ignores_a_description_for_a_tag_the_registry_already_holds() {
+        // A description for a tag the registry already holds changes nothing:
+        // the registry matches on the name and answers with the stored tag. The
+        // write path must not treat the description as an instruction to
+        // re-describe or to create a second tag.
+        let (resolve, probe) = recording_tag_gate(&[("topic:weather", "topic:weather")]);
+        let (service, store) = kb_service_with_tag_gate(Some(resolve));
+
+        kb_write_response(
+            &service,
+            serde_json::json!({
+                "content": "It rained on Tuesday.",
+                "tags": ["topic:weather"],
+                "new_tag_descriptions": {
+                    "topic:weather": "Something else entirely",
+                },
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            store.lock().expect("store lock")[0].tags,
+            vec!["topic:weather".to_string()],
+            "the stored tag is the one the registry answered with"
+        );
+        assert_eq!(
+            probe.lock().expect("probe lock").proposals.len(),
+            1,
+            "one proposal, not one per description"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_write_keeps_the_normalised_tag_when_the_embedding_backend_is_unavailable() {
+        // The registry needs an embedding to find a near duplicate. When the
+        // embedding backend is down the gate fails, and the prior behaviour -
+        // store the tag as written - is the fallback. A write must never fail
+        // because an optional backend is absent.
+        use std::sync::Arc;
+
+        let resolve: KnowledgeTagResolveFn = Arc::new(|_proposed: ProposedTag| {
+            Box::pin(async {
+                Err(CoreError::Storage(
+                    "tag_registry: embed returned no vectors".to_string(),
+                ))
+            })
+        });
+        let (service, store) = kb_service_with_tag_gate(Some(resolve));
+
+        let json = kb_write_response(
+            &service,
+            serde_json::json!({
+                "content": "Rain is expected on Tuesday.",
+                "tags": ["memory", "topic:forecast"],
+            }),
+        )
+        .await;
+
+        assert_eq!(json["ok"], true, "the write succeeds");
+        let stored = store.lock().expect("store lock");
+        assert_eq!(stored.len(), 1, "the entry landed");
+        assert_eq!(
+            stored[0].tags,
+            vec!["memory".to_string(), "topic:forecast".to_string()],
+            "the entry keeps the tags the model wrote"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_retag_by_id_goes_through_the_registry() {
+        // Re-tagging an entry the model found is the path that adds tags most
+        // often, so an ungated one defeats the whole gate. It carries an `id`
+        // and `tags` with no `content`.
+        let (resolve, probe) = recording_tag_gate(&[("topic:forecast", "topic:weather")]);
+        let (service, store) = kb_service_with_tag_gate(Some(resolve));
+
+        // Seed an entry through the write path, then re-tag it by id.
+        let created = kb_write_response(
+            &service,
+            serde_json::json!({"content": "Rain is expected on Tuesday.", "tags": ["memory"]}),
+        )
+        .await;
+        let id = created["entries"][0]["id"]
+            .as_str()
+            .expect("the write reports the entry id")
+            .to_string();
+
+        kb_write_response(
+            &service,
+            serde_json::json!({"id": id, "tags": ["memory", "topic:forecast"]}),
+        )
+        .await;
+
+        let stored = store.lock().expect("store lock");
+        assert_eq!(stored.len(), 1, "the re-tag updated the entry in place");
+        assert_eq!(
+            stored[0].content, "Rain is expected on Tuesday.",
+            "premise: the content is preserved, so this is the tags-only path"
+        );
+        assert_eq!(
+            stored[0].tags,
+            vec!["memory".to_string(), "topic:weather".to_string()],
+            "the re-tag path is gated too"
+        );
+        assert!(
+            probe
+                .lock()
+                .expect("probe lock")
+                .proposals
+                .iter()
+                .any(|p| p.name == "topic:forecast"),
+            "the re-tagged tag reached the registry"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_write_stops_consulting_the_tag_vocabulary_after_it_fails_once() {
+        // A failure means the vocabulary cannot answer. Asking it again for
+        // every remaining tag buys nothing and pays the embedding timeout each
+        // time, so one write with many tags would add minutes to a live turn.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_fn = Arc::clone(&calls);
+        let resolve: KnowledgeTagResolveFn = Arc::new(move |_proposed: ProposedTag| {
+            let calls = Arc::clone(&calls_for_fn);
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(CoreError::Storage(
+                    "embedding backend unreachable".to_string(),
+                ))
+            })
+        });
+        let (service, store) = kb_service_with_tag_gate(Some(resolve));
+
+        kb_write_response(
+            &service,
+            serde_json::json!({
+                "entries": [
+                    {"content": "one", "tags": ["memory", "topic:a", "topic:b"]},
+                    {"content": "two", "tags": ["topic:c", "topic:d"]},
+                ],
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the vocabulary is asked once, then left alone for the rest of the call - \
+             across entries, not just within one"
+        );
+        let stored = store.lock().expect("store lock");
+        assert_eq!(stored.len(), 2, "both entries landed");
+        assert_eq!(
+            stored[0].tags,
+            vec![
+                "memory".to_string(),
+                "topic:a".to_string(),
+                "topic:b".to_string()
+            ],
+            "every tag is stored as written"
+        );
+        assert_eq!(
+            stored[1].tags,
+            vec!["topic:c".to_string(), "topic:d".to_string()]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn kb_write_stops_consulting_the_tag_vocabulary_when_the_write_budget_is_spent() {
+        // A vocabulary that answers, but slowly, is not an error, so nothing
+        // else stops it. One write carries as many tags as the model chose to
+        // send, so without a budget the added wait grows with the tag count
+        // inside a live turn.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Each answer costs well over half the budget, so the third tag finds
+        // the budget spent.
+        let per_call = TAG_RESOLVE_BUDGET.mul_f32(0.6);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_fn = Arc::clone(&calls);
+        let resolve: KnowledgeTagResolveFn = Arc::new(move |proposed: ProposedTag| {
+            let calls = Arc::clone(&calls_for_fn);
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(per_call).await;
+                Ok(format!("resolved:{}", proposed.name))
+            })
+        });
+        let (service, store) = kb_service_with_tag_gate(Some(resolve));
+
+        kb_write_response(
+            &service,
+            serde_json::json!({
+                "content": "slow",
+                "tags": ["topic:a", "topic:b", "topic:c"],
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the budget stops the third consultation"
+        );
+        assert_eq!(
+            store.lock().expect("store lock")[0].tags,
+            vec![
+                "resolved:topic:a".to_string(),
+                "resolved:topic:b".to_string(),
+                "topic:c".to_string(),
+            ],
+            "tags resolved before the budget ran out keep their answers; the rest \
+             are stored as written"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn kb_write_bounds_one_tag_consultation_and_stores_that_tag_as_written() {
+        // One consultation reads the vocabulary, embeds, searches for a near
+        // neighbour, and registers. Bounding only the embedding leaves the
+        // database round trips around it bounded by the connection pool's
+        // acquire timeout, which is tens of seconds each. The whole
+        // consultation is bounded instead, so a live turn cannot be held by
+        // whatever inside it is slow.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_fn = Arc::clone(&calls);
+        let resolve: KnowledgeTagResolveFn = Arc::new(move |_proposed: ProposedTag| {
+            let calls = Arc::clone(&calls_for_fn);
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                // Far longer than any ceiling: a vocabulary that never answers.
+                tokio::time::sleep(TAG_RESOLVE_CALL_CEILING * 100).await;
+                Ok("never reached".to_string())
+            })
+        });
+        let (service, store) = kb_service_with_tag_gate(Some(resolve));
+
+        let started = tokio::time::Instant::now();
+        let json = kb_write_response(
+            &service,
+            serde_json::json!({
+                "content": "hung",
+                "tags": ["topic:a", "topic:b"],
+            }),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(json["ok"], true, "the write still succeeds");
+        assert_eq!(
+            elapsed, TAG_RESOLVE_CALL_CEILING,
+            "the write waits exactly one ceiling, not the vocabulary's own pace"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a vocabulary that did not answer is not asked again for this write"
+        );
+        assert_eq!(
+            store.lock().expect("store lock")[0].tags,
+            vec!["topic:a".to_string(), "topic:b".to_string()],
+            "both tags are stored as the model wrote them"
+        );
+        assert_eq!(
+            json["tag_check"], TAG_CHECK_UNKNOWN,
+            "a write whose tags went unchecked says so"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn kb_write_charges_the_tag_budget_only_for_time_spent_in_the_vocabulary() {
+        // Storing an entry is not a consultation. Against a wall-clock deadline
+        // a batch with slow stores loses the vocabulary on its last entries
+        // with nothing slow about the vocabulary at all - the model's later
+        // tags then go unchecked for a reason the vocabulary did not cause.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Three stores at 60% of the budget each: 180% of the budget spent
+        // outside the vocabulary, which answers instantly.
+        let store_delay = TAG_RESOLVE_BUDGET.mul_f32(0.6);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_fn = Arc::clone(&calls);
+        let resolve: KnowledgeTagResolveFn = Arc::new(move |proposed: ProposedTag| {
+            let calls = Arc::clone(&calls_for_fn);
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(format!("resolved:{}", proposed.name))
+            })
+        });
+        let (service, store) = kb_service_with_slow_store(Some(resolve), store_delay);
+
+        let json = kb_write_response(
+            &service,
+            serde_json::json!({
+                "entries": [
+                    {"content": "one", "tags": ["topic:a"]},
+                    {"content": "two", "tags": ["topic:b"]},
+                    {"content": "three", "tags": ["topic:c"]},
+                ],
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "every tag is still checked: the slow stores are not the vocabulary's spend"
+        );
+        let stored = store.lock().expect("store lock");
+        assert_eq!(
+            stored
+                .iter()
+                .flat_map(|e| e.tags.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                "resolved:topic:a".to_string(),
+                "resolved:topic:b".to_string(),
+                "resolved:topic:c".to_string(),
+            ],
+            "every entry carries the vocabulary's answer"
+        );
+        assert!(
+            json.get("tag_check").is_none(),
+            "nothing was left unchecked, so the write reports no degradation: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_write_reports_that_a_tag_was_stored_without_being_checked() {
+        // A degraded write stores whatever the model wrote. Answering with a
+        // response byte-identical to a checked write lets the model read its
+        // own drift back as established vocabulary, which is the failure the
+        // vocabulary exists to prevent.
+        use std::sync::Arc;
+
+        let resolve: KnowledgeTagResolveFn = Arc::new(|_proposed: ProposedTag| {
+            Box::pin(async {
+                Err(CoreError::Storage(
+                    "tag_registry: embed returned no vectors".to_string(),
+                ))
+            })
+        });
+        let (service, _store) = kb_service_with_tag_gate(Some(resolve));
+
+        let json = kb_write_response(
+            &service,
+            serde_json::json!({"content": "Rain on Tuesday.", "tags": ["topic:forecast"]}),
+        )
+        .await;
+
+        assert_eq!(json["ok"], true, "the write still succeeds");
+        assert_eq!(
+            json["tag_check"], TAG_CHECK_UNKNOWN,
+            "not measured must never read as measured: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_write_reports_unchecked_tags_when_no_vocabulary_is_wired() {
+        // With no database or no embedding backend the gate is not wired at
+        // all, so no tag on the write was checked. That is the same claim as a
+        // vocabulary that failed, and it reads the same way.
+        let (service, _store) = kb_service_with_tag_gate(None);
+
+        let json = kb_write_response(
+            &service,
+            serde_json::json!({"content": "Rain on Tuesday.", "tags": ["topic:forecast"]}),
+        )
+        .await;
+
+        assert_eq!(
+            json["tag_check"], TAG_CHECK_UNKNOWN,
+            "an unwired vocabulary checked nothing, and says so: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_write_omits_the_tag_check_when_the_vocabulary_answered_for_every_tag() {
+        // The field is absent on the ordinary path, so its presence carries the
+        // whole signal and a checked write costs no extra bytes.
+        let (resolve, _probe) = recording_tag_gate(&[]);
+        let (service, _store) = kb_service_with_tag_gate(Some(resolve));
+
+        let json = kb_write_response(
+            &service,
+            serde_json::json!({"content": "Rain on Tuesday.", "tags": ["topic:forecast"]}),
+        )
+        .await;
+
+        assert!(
+            json.get("tag_check").is_none(),
+            "every tag was checked, so nothing is reported: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_write_without_tags_reports_nothing_about_the_vocabulary() {
+        // A write that carries no tags has nothing to check, so an unwired
+        // vocabulary is not a degradation of it.
+        let (service, _store) = kb_service_with_tag_gate(None);
+
+        let json =
+            kb_write_response(&service, serde_json::json!({"content": "Rain on Tuesday."})).await;
+
+        assert!(
+            json.get("tag_check").is_none(),
+            "no tags, nothing unchecked: {json}"
+        );
+    }
+
+    #[test]
+    fn kb_write_schema_advertises_new_tag_descriptions() {
+        // A schema that promises what the code does not honour is a false
+        // contract, and so is code that honours what the schema never
+        // advertised: the model cannot supply a field it was never told about.
+        let service = BuiltinToolService::new();
+        let def = service
+            .tool_definitions()
+            .into_iter()
+            .find(|t| t.name == TOOL_KB_WRITE)
+            .expect("kb_write tool is advertised");
+        let props = &def.parameters["properties"];
+
+        let single = &props["new_tag_descriptions"];
+        assert_eq!(
+            single["type"], "object",
+            "new_tag_descriptions is a map from tag name to description: {single}"
+        );
+        assert_eq!(
+            single["additionalProperties"]["type"], "string",
+            "each value is a one-line description: {single}"
+        );
+        assert!(
+            single["description"]
+                .as_str()
+                .is_some_and(|d| !d.is_empty()),
+            "the field carries a description of its own: {single}"
+        );
+        // A schema that promises what the code does not honour is a false
+        // contract, and so is one that stays silent about a constraint the code
+        // applies. The cap is enforced, so it is advertised.
+        assert!(
+            single["description"]
+                .as_str()
+                .is_some_and(|d| d.contains(&TAG_DESCRIPTION_MAX_CHARS.to_string())
+                    && d.contains("truncated")),
+            "the field must advertise the length cap it enforces: {single}"
+        );
+
+        // The batch form is held to the same shape. A model that batches its
+        // writes reads only this half of the schema.
+        let batch = &props["entries"]["items"]["properties"]["new_tag_descriptions"];
+        assert_eq!(
+            batch["type"], "object",
+            "the batch form advertises the field too, or a batched write cannot \
+             describe its new tags: {batch}"
+        );
+        assert_eq!(
+            batch["additionalProperties"]["type"], "string",
+            "each batch value is a one-line description: {batch}"
+        );
+        assert!(
+            batch["description"].as_str().is_some_and(|d| !d.is_empty()),
+            "the batch field carries a description of its own: {batch}"
+        );
+
+        // The batch form ignores every top-level field, this one included. A
+        // description sent at the top level beside `entries` is dropped in
+        // silence, so the list of what `entries` ignores has to name it.
+        let entries = props["entries"]["description"]
+            .as_str()
+            .expect("entries carries a description");
+        assert!(
+            entries.contains("new_tag_descriptions"),
+            "the entries description must say that a top-level \
+             new_tag_descriptions is ignored: {entries}"
+        );
+    }
+
+    #[test]
+    fn kb_write_schema_describes_the_degraded_write_report() {
+        // The model can only act on `tag_check` if it was told the field
+        // exists and what it means. A response field the schema never mentions
+        // is one the model reads as noise.
+        let service = BuiltinToolService::new();
+        let def = service
+            .tool_definitions()
+            .into_iter()
+            .find(|t| t.name == TOOL_KB_WRITE)
+            .expect("kb_write tool is advertised");
+
+        assert!(
+            def.description.contains("tag_check")
+                && def.description.contains(TAG_CHECK_UNKNOWN)
+                && def.description.contains("without"),
+            "the tool description must name the field, its value, and what it means: {}",
+            def.description
+        );
+    }
+
+    #[test]
+    fn kb_write_schema_states_what_the_tag_check_compares_against() {
+        // The vocabulary is the registry's own list of registered tags, which
+        // starts empty and grows as tags are written; nothing seeds it from
+        // the tags entries already carry (#1094). Advertising it as a check
+        // "against the tags that already exist" promises a check that a
+        // default install cannot perform.
+        let service = BuiltinToolService::new();
+        let def = service
+            .tool_definitions()
+            .into_iter()
+            .find(|t| t.name == TOOL_KB_WRITE)
+            .expect("kb_write tool is advertised");
+
+        assert!(
+            def.description.contains("vocabulary") && def.description.contains("starts empty"),
+            "the description must say what the check compares against, and that it \
+             starts empty: {}",
+            def.description
+        );
+        assert!(
+            !def.description
+                .contains("checked against the tags that already exist"),
+            "the tags an entry carries are not what a tag is checked against: {}",
+            def.description
+        );
     }
 
     #[tokio::test]

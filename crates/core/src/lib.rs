@@ -13,6 +13,7 @@ pub mod sanitize;
 pub mod service;
 pub mod skill_catalog;
 pub mod system_id;
+pub mod tag_normalize;
 pub mod tool_provenance;
 pub mod tools;
 
