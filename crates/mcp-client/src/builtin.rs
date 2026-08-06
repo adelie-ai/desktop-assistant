@@ -2104,8 +2104,6 @@ impl BuiltinToolService {
         let mut content_cut = false;
         for id in &ids {
             let Some(entry) = found.get(id) else { continue };
-            let item = kb_get_row(entry, &entry.content, false);
-            let size = item.to_string().len();
             if items.is_empty() {
                 // The first row always travels, so it is the one that has to be
                 // made to fit: leaving it out would make a long entry
@@ -2116,6 +2114,8 @@ impl BuiltinToolService {
                 items.push(row);
                 continue;
             }
+            let item = kb_get_row(entry, &entry.content, false);
+            let size = item.to_string().len();
             if bytes + size > RESPONSE_BYTE_BUDGET {
                 // A later row waits for its own call rather than being cut. It
                 // is whole somewhere, and the caller still holds its id.
@@ -2894,8 +2894,8 @@ fn kb_get_row(entry: &KnowledgeEntry, content: &str, content_truncated: bool) ->
     row
 }
 
-/// One `builtin_knowledge_base_get` row, cut to `budget` bytes if it has to be.
-/// Answers the row and whether the content was cut.
+/// One `builtin_knowledge_base_get` row, its `content` cut to bring the row
+/// within `budget` bytes. Answers the row and whether the content was cut.
 ///
 /// Why cutting is needed at all: nothing on the knowledge write path bounds an
 /// entry's length, unlike a scratchpad note, which `MAX_NOTE_BYTES` holds under
@@ -2904,25 +2904,47 @@ fn kb_get_row(entry: &KnowledgeEntry, content: &str, content_truncated: bool) ->
 /// which lands mid-JSON and hands the model a row it cannot parse. A row cut
 /// here stays valid JSON and says it was cut.
 ///
-/// Why the search rather than one subtraction: JSON escaping means a character
-/// count does not convert to a byte count, so the allowance is halved until the
-/// row fits. It converges in a few steps and terminates at an empty content,
-/// which is the floor - a row whose other fields alone overrun the budget still
-/// travels, because the alternative is an entry no call can ever read.
+/// **`content` is the only field this cuts, so the budget is not a guarantee
+/// about the whole row.** An entry whose tags or metadata alone overrun it
+/// still travels whole, because those fields have no write-side cap either and
+/// dropping them would change what the entry means. Bounding a knowledge entry
+/// belongs on the write path, where one cap would hold every read; until then
+/// this closes the reachable half, since `content` is the field a model writes
+/// and the one that grows.
+///
+/// Why a search rather than arithmetic: JSON escaping means a character count
+/// does not convert to a byte count, so each candidate has to be measured. The
+/// search keeps the largest number of characters that fits, so an entry a
+/// little over the budget loses a little of its tail rather than half of it.
+/// It cuts on `char` boundaries, so the content is always valid UTF-8.
 fn kb_get_row_within(entry: &KnowledgeEntry, budget: usize) -> (serde_json::Value, bool) {
     let whole = kb_get_row(entry, &entry.content, false);
     if whole.to_string().len() <= budget {
         return (whole, false);
     }
-    let mut allowance = entry.content.chars().count();
-    loop {
-        allowance /= 2;
-        let cut: String = entry.content.chars().take(allowance).collect();
-        let row = kb_get_row(entry, &cut, true);
-        if allowance == 0 || row.to_string().len() <= budget {
-            return (row, true);
+
+    // `hi` never fits (the row above is the same content and smaller, having no
+    // marker), and `lo` fits unless even an empty content overruns - the
+    // metadata case above, where `lo` stays 0 and the row travels anyway.
+    // Each step strictly narrows the interval, so this ends in O(log n).
+    let total = entry.content.chars().count();
+    let (mut lo, mut hi) = (0usize, total);
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        let candidate: String = entry.content.chars().take(mid).collect();
+        if kb_get_row(entry, &candidate, true).to_string().len() <= budget {
+            lo = mid;
+        } else {
+            hi = mid;
         }
     }
+
+    // An entry with no content to cut is not a cut entry, whatever else made
+    // the row too large. Claiming otherwise would tell the model it holds the
+    // start of something when it holds all there was.
+    let cut = lo < total;
+    let content: String = entry.content.chars().take(lo).collect();
+    (kb_get_row(entry, &content, cut), cut)
 }
 
 fn optional_string(args: &serde_json::Value, key: &str) -> Option<String> {
@@ -7519,11 +7541,10 @@ mod tests {
             "the content must actually be cut, got {} of {original} bytes",
             carried.len()
         );
+        // The budget bounds the row, so measure the row: the array around it
+        // belongs to the envelope.
         assert!(
-            serde_json::to_string(&json["entries"])
-                .expect("entries serialize")
-                .len()
-                <= RESPONSE_BYTE_BUDGET,
+            serde_json::to_string(row).expect("row serializes").len() <= RESPONSE_BYTE_BUDGET,
             "the cut row must fit the response budget"
         );
         assert_eq!(json["truncated"], true, "{json}");
@@ -7532,6 +7553,58 @@ mod tests {
                 .as_str()
                 .is_some_and(|m| m.contains("content_truncated")),
             "the message must name the marker the model has to look for: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_get_keeps_as_much_of_a_long_entry_as_fits() {
+        // A cut is a loss, so it has to be the smallest one that works. An
+        // entry a little over the budget must lose a little of its tail, not
+        // an arbitrary fraction of itself.
+        let mut entry = kb_full_entry("kb-long");
+        entry.content = "z".repeat(RESPONSE_BYTE_BUDGET + 200);
+        let (service, _probe) = kb_service_holding(vec![entry]);
+
+        let json = kb_get_response(&service, serde_json::json!({"ids": ["kb-long"]})).await;
+
+        let carried = json["entries"][0]["content"]
+            .as_str()
+            .expect("content is a string")
+            .len();
+        assert_eq!(json["entries"][0]["content_truncated"], true);
+        assert!(
+            carried > RESPONSE_BYTE_BUDGET - 1024,
+            "a row 200 bytes over the budget must keep nearly all of its \
+             content, kept {carried} of {}",
+            RESPONSE_BYTE_BUDGET + 200
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_get_does_not_claim_a_cut_it_did_not_make() {
+        // An entry can overrun the budget through metadata alone, which no
+        // write path bounds and this read does not cut. Its content is
+        // delivered whole, so the row must not say it is a prefix: a model told
+        // it holds the start of something would go looking for a rest that
+        // does not exist.
+        let mut entry = kb_full_entry("kb-fat-metadata");
+        entry.content = String::new();
+        entry.metadata = serde_json::json!({"blob": "m".repeat(RESPONSE_BYTE_BUDGET * 2)});
+        let (service, _probe) = kb_service_holding(vec![entry]);
+
+        let json = kb_get_response(&service, serde_json::json!({"ids": ["kb-fat-metadata"]})).await;
+
+        assert_eq!(json["returned"], 1, "the entry still travels: {json}");
+        assert_eq!(json["entries"][0]["content"], "");
+        assert_eq!(
+            json["entries"][0]["content_truncated"],
+            serde_json::Value::Null,
+            "content that was never cut must carry no cut marker"
+        );
+        assert_eq!(
+            json["truncated"],
+            serde_json::Value::Null,
+            "and the response must not claim a truncation it did not make"
         );
     }
 

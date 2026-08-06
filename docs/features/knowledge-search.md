@@ -303,6 +303,15 @@ through whole would hand it to the generic 256 KiB tool-result cap
 later row is never cut - it waits for its own call, and the caller still holds
 its id.
 
+**The budget is not a guarantee about the whole row, and the gap is worth
+stating.** Only `content` is cut. An entry whose `tags` or `metadata` alone
+overrun the budget still travels whole and still reaches the generic 256 KiB
+cap - the client-facing `CreateKnowledgeEntry` accepts any `metadata` value, and
+neither the column nor the write path bounds it. Cutting those fields would
+change what the entry means, so this read does not. The real fix is a size cap
+on the write path, where one bound would hold all four reads; `content` is cut
+here because it is the field a model writes and the one that grows.
+
 ## Where things live
 
 | Concern | Location |
