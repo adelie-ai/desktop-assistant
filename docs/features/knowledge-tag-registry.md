@@ -98,13 +98,12 @@ gate exists to prevent, arriving through the gate itself.
 Both paths that set tags:
 
 - creating an entry (`content` plus `tags`);
-- re-tagging an existing entry (`id` plus `tags`, no `content`).
+- re-tagging an existing entry (`id` plus `tags`, with or without `content`).
 
-An update that carries no `tags` field registers nothing, because there is
-nothing to register. Note that a content update by `id` does not carry the
-stored entry's tags forward either - it clears them, along with the entry's
-metadata. That is a pre-existing defect of the write path rather than anything
-this gate does, and it is #1093.
+A write that carries no `tags` field registers nothing, because there is nothing
+to register. It keeps the tags the stored entry already carries, and those tags
+are already in the vocabulary, so a content update by `id` consults it for
+nothing and costs no embedding.
 
 ## Cost
 

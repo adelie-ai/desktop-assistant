@@ -556,9 +556,11 @@ impl BuiltinToolService {
                  instructions, project context, or any durable information the user wants remembered. \
                  Content should be self-contained prose that describes both the context (when/why \
                  this information is useful) and the information itself. Provide either a single \
-                 entry (top-level `content`/`tags`/`id`) or a batch via `entries`. To update only \
-                 the tags of an existing entry, pass its `id` and omit `content` — the existing \
-                 content is preserved. Tags are checked against the tag vocabulary, which holds \
+                 entry (top-level `content`/`tags`/`id`) or a batch via `entries`. A write that \
+                 gives the `id` of an existing entry keeps every field it leaves out, so send \
+                 only what changes: `id` plus `content` rewrites the text and keeps the tags, \
+                 and `id` plus `tags` re-tags the entry and keeps the text. To clear the tags, \
+                 send an empty `tags` list. Tags are checked against the tag vocabulary, which holds \
                  the tags registered so far and grows as tags are written; it starts empty, so \
                  early writes have little to match against. A tag that means the same as one \
                  already registered is stored under the registered name, so the response \
@@ -590,7 +592,12 @@ impl BuiltinToolService {
                         },
                         "id": {
                             "type": "string",
-                            "description": "Optional ID for updates. Omit to create a new entry."
+                            "description": "Optional ID. Omit to create a new entry with a generated \
+                                            id. Give the id of an existing entry to update it, and \
+                                            the fields you leave out keep the values that entry \
+                                            already holds. An id no entry holds creates the entry \
+                                            at that id, so a write that carries `content` can be \
+                                            repeated safely."
                         },
                         "entries": {
                             "type": "array",
@@ -1353,11 +1360,22 @@ impl BuiltinToolService {
         Ok(response.to_string())
     }
 
-    /// Build a [`KnowledgeEntry`] from one write spec. When `content` is
-    /// omitted and an `id` is given, the existing entry is fetched and its
-    /// content (and, if `tags` is also omitted, its tags) are preserved — a
-    /// tags-only / re-tag / promote-to-explicit update. Tool-authored writes
-    /// always carry `source = "explicit"`.
+    /// Build a [`KnowledgeEntry`] from one write spec.
+    ///
+    /// One rule governs every optional field: a field the write does not
+    /// mention keeps the value the stored entry holds, and a field the write
+    /// does mention takes what the write gave, including an empty value, which
+    /// clears the field. So `tags` absent preserves the entry's tags, and
+    /// `"tags": []` clears them. A write with no `id`, or with an `id` no entry
+    /// holds, has nothing to fall back to, so every field it omits starts
+    /// empty.
+    ///
+    /// A field is therefore read out of the spec as "the caller supplied this"
+    /// or "the caller said nothing", and resolved against
+    /// [`Self::existing_entry`] in one line. A new field joins by doing the
+    /// same, without restating the rule.
+    ///
+    /// Tool-authored writes always carry `source = "explicit"`.
     async fn build_write_entry(
         &self,
         spec: &serde_json::Value,
@@ -1367,45 +1385,38 @@ impl BuiltinToolService {
 
         let content_opt = optional_string(spec, "content");
         let id_opt = optional_string(spec, "id");
-        let tags_present = spec.get("tags").is_some();
-        let tags = optional_string_array(spec, "tags");
+        // `Some` exactly when the spec named `tags`, so a present-but-empty
+        // list stays distinct from an absent one.
+        let supplied_tags = spec
+            .get("tags")
+            .map(|_| optional_string_array(spec, "tags"));
 
-        // Partial update: no content, but an id to look up.
-        let existing = if content_opt.is_none() {
-            let id = id_opt.clone().ok_or_else(|| {
-                CoreError::ToolExecution(
-                    "knowledge_base write requires `content`, or an `id` of an existing entry to \
-                     update its tags"
-                        .to_string(),
-                )
-            })?;
-            let get_fn = self.kb_get_fn.as_ref().ok_or_else(|| {
-                CoreError::ToolExecution("knowledge base not configured".to_string())
-            })?;
-            Some(get_fn(id.clone()).await?.ok_or_else(|| {
-                CoreError::ToolExecution(format!("no knowledge entry with id {id}"))
-            })?)
-        } else {
-            None
-        };
+        let existing = self
+            .existing_entry(id_opt.as_deref(), content_opt.is_some())
+            .await?;
 
         let id = id_opt.unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
+        // `existing_entry` already refused the one case this cannot resolve —
+        // no content and nothing stored — so this guard only keeps the failure
+        // legible if that ever stops holding.
         let content = content_opt
             .or_else(|| existing.as_ref().map(|e| e.content.clone()))
             .ok_or_else(|| {
                 CoreError::ToolExecution("knowledge_base write requires content".into())
             })?;
         // Tags the caller supplied go through the formal vocabulary; tags
-        // carried over from the existing entry are already in it, so a
-        // content-only update re-registers nothing.
-        let tags = if tags_present {
-            self.resolve_tags(tags, spec, tag_budget).await
-        } else {
-            existing
-                .as_ref()
-                .map(|e| e.tags.clone())
-                .unwrap_or_default()
+        // carried over from the stored entry are already in it, so a write that
+        // does not mention tags re-registers nothing.
+        let supplied_tags = match supplied_tags {
+            Some(supplied) => Some(self.resolve_tags(supplied, spec, tag_budget).await),
+            None => None,
         };
+        let tags = supplied_tags
+            .or_else(|| existing.as_ref().map(|e| e.tags.clone()))
+            .unwrap_or_default();
+        // `metadata` has no argument of its own, so a write only ever carries
+        // the stored value forward. Its empty value is an object, not JSON
+        // null, because the provenance stamp below writes into it.
         let mut metadata = existing
             .as_ref()
             .map(|e| e.metadata.clone())
@@ -1436,6 +1447,53 @@ impl BuiltinToolService {
             // the row already holds; it never clears it.
             summary: None,
         })
+    }
+
+    /// Load the entry a write falls back to for the fields it does not mention,
+    /// or `None` when the write starts from nothing.
+    ///
+    /// `id` is what the write named, and `has_content` says whether the write
+    /// carries content of its own. Together they decide the three cases:
+    ///
+    /// - No `id`. A create, so there is nothing to fall back to. Without
+    ///   content there is also nothing to store, which is an error.
+    /// - An `id` an entry holds. An update, and that entry is the fallback.
+    /// - An `id` no entry holds. A create at an id the caller chose, which is
+    ///   how a caller makes a write idempotent under retry: the retry lands on
+    ///   the row the first attempt created instead of a duplicate. This is an
+    ///   error only without content, because then the write carries nothing to
+    ///   create the entry from.
+    ///
+    /// The lookup runs for every write that names an `id`, not only for one
+    /// without content. A content update that skipped it had no fallback, so it
+    /// stored the entry with no tags and no metadata (#1093).
+    async fn existing_entry(
+        &self,
+        id: Option<&str>,
+        has_content: bool,
+    ) -> Result<Option<desktop_assistant_core::domain::KnowledgeEntry>, CoreError> {
+        let Some(id) = id else {
+            return if has_content {
+                Ok(None)
+            } else {
+                Err(CoreError::ToolExecution(
+                    "knowledge_base write requires `content`, or an `id` of an existing entry to \
+                     update its tags"
+                        .to_string(),
+                ))
+            };
+        };
+        let get_fn = self
+            .kb_get_fn
+            .as_ref()
+            .ok_or_else(|| CoreError::ToolExecution("knowledge base not configured".to_string()))?;
+        let found = get_fn(id.to_string()).await?;
+        if found.is_none() && !has_content {
+            return Err(CoreError::ToolExecution(format!(
+                "no knowledge entry with id {id}"
+            )));
+        }
+        Ok(found)
     }
 
     /// Put every tag the caller supplied through the formal tag vocabulary and
@@ -5714,6 +5772,47 @@ mod tests {
             entries.contains("new_tag_descriptions"),
             "the entries description must say that a top-level \
              new_tag_descriptions is ignored: {entries}"
+        );
+    }
+
+    #[test]
+    fn kb_write_schema_says_a_write_by_id_keeps_what_it_leaves_out() {
+        // The model decides what to send from this text alone. Told only that
+        // `id` updates an entry, it re-sends the tags on every content update
+        // to be safe, and each of those round trips is an unnecessary
+        // vocabulary consultation that can rename a stored tag. Told the rule,
+        // it sends only what changed.
+        let service = BuiltinToolService::new();
+        let def = service
+            .tool_definitions()
+            .into_iter()
+            .find(|t| t.name == TOOL_KB_WRITE)
+            .expect("kb_write tool is advertised");
+
+        let lower = def.description.to_lowercase();
+        assert!(
+            lower.contains("keeps every field it leaves out"),
+            "the description must state that a write by id preserves what it \
+             does not mention: {}",
+            def.description
+        );
+        assert!(
+            lower.contains("empty `tags` list"),
+            "the description must say how to clear the tags, or the model has \
+             no way to: {}",
+            def.description
+        );
+
+        // An id no entry holds is a create at that id, which is what makes a
+        // write repeatable. A model told only "ID for updates" will not retry
+        // with the same id.
+        let id = def.parameters["properties"]["id"]["description"]
+            .as_str()
+            .expect("id carries a description");
+        assert!(
+            id.contains("no entry holds") && id.contains("repeated"),
+            "the id description must say that an unheld id creates, so a write \
+             can be repeated: {id}"
         );
     }
 
