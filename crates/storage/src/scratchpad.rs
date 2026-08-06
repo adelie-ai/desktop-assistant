@@ -20,12 +20,16 @@
 //!   scratchpad arm of the `[Recall]` block (#1101). They answer a different
 //!   question from `search` - "what is near this whole user sentence", not
 //!   "find what I asked for" - so they rank differently, and neither replaces
-//!   the other.
+//!   the other. Both read the **free-form** notes only, which is the set
+//!   `desktop_assistant_core::planning::freeform_note_keys` defines.
 
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::ScratchpadNote;
+use desktop_assistant_core::planning::{OUTCOME_KEY_PREFIX, OUTCOME_NOTE_TYPE};
 use desktop_assistant_core::ports::auth::current_user_id;
-use desktop_assistant_core::ports::scratchpad::{NewScratchpadNote, ScratchpadStore};
+use desktop_assistant_core::ports::scratchpad::{
+    NewScratchpadNote, SCRATCHPAD_GOAL_KEY, ScratchpadStore,
+};
 use desktop_assistant_core::ports::scratchpad_scope::{
     current_ancestors, current_owner_todo, current_visible_before,
 };
@@ -517,6 +521,21 @@ impl ScratchpadStore for PgScratchpadStore {
 /// Neither read is on [`ScratchpadStore`], for the same reason
 /// `PgKnowledgeBaseStore::nearest_by_embedding` is not on its trait: they serve
 /// one caller with one ranking need, and the port is what the tools use.
+///
+/// ## Both read the free-form notes only
+///
+/// "Free-form" is the same set the `[Scratchpad]` index advertises - the
+/// `desktop_assistant_core::planning::freeform_note_keys` carve-out: `note`-typed,
+/// and neither the reserved `goal` key nor an `outcome:<step>` key. The three it
+/// leaves out are rendered by `[Current task]` and `[Plan]` on every round, and
+/// the goal note is by construction the pad row nearest a prompt about the
+/// current task - so an arm without the carve-out would spend its first line
+/// restating the task the prompt already carries.
+///
+/// The carve-out is applied in SQL rather than after the read, so an excluded
+/// row never occupies a slot in the scan the block's "and N more" count is
+/// measured against. The values are bound from the core constants that define
+/// them, so the rule has one source even though it is expressed twice.
 impl PgScratchpadStore {
     /// The conversation's notes nearest a query embedding, with the cosine
     /// distance that put them there, nearest first.
@@ -531,6 +550,8 @@ impl PgScratchpadStore {
     /// predicate, plus the caller's `owner_todo` read snapshot - the same three
     /// bounds every other read here carries. Row-level security is a backstop
     /// the table owner bypasses, so the predicates are the guard.
+    ///
+    /// Free-form notes only, as the impl block above states.
     ///
     /// `embedding_model` identifies the model that produced `query_embedding`,
     /// and only rows embedded by that model take part, matched on the digest
@@ -561,6 +582,8 @@ impl PgScratchpadStore {
              WHERE user_id = $2 AND conversation_id = $3
                AND ($4::text IS NULL OR (owner_todo = $5 OR owner_todo LIKE $5 || '.%'
                     OR (id COLLATE \"C\" < $4 AND owner_todo = ANY($6::text[]))))
+               AND note_type = $9 AND note_key <> $10
+               AND note_key NOT LIKE $11 || '%'
                AND embedding IS NOT NULL
                AND embedding_model IS NOT NULL
                AND (embedding_model = $7
@@ -569,7 +592,7 @@ impl PgScratchpadStore {
                             = split_part($7, '@', 2)))
              GROUP BY id, conversation_id, owner_todo, note_key, content, note_type,
                       seq, done, pinned, knowledge_entry_id, created_at, updated_at
-             ORDER BY distance
+             ORDER BY distance, id DESC
              LIMIT $8",
         )
         .bind(Vector::from(query_embedding))
@@ -580,6 +603,9 @@ impl PgScratchpadStore {
         .bind(ancestors)
         .bind(embedding_model)
         .bind(limit as i64)
+        .bind(OUTCOME_NOTE_TYPE)
+        .bind(SCRATCHPAD_GOAL_KEY)
+        .bind(OUTCOME_KEY_PREFIX)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;
@@ -612,7 +638,8 @@ impl PgScratchpadStore {
     /// lexemes at all yields a NULL query, which matches no row.
     ///
     /// Carries the same `user_id` / `conversation_id` / `owner_todo` scope as
-    /// every other read here.
+    /// every other read here, and the same free-form carve-out as
+    /// [`Self::nearest_by_embedding`].
     pub async fn search_text_any_term(
         &self,
         conversation_id: &str,
@@ -634,6 +661,8 @@ impl PgScratchpadStore {
                AND tsv @@ q.query
                AND ($4::text IS NULL OR (owner_todo = $5 OR owner_todo LIKE $5 || '.%'
                     OR (id COLLATE \"C\" < $4 AND owner_todo = ANY($6::text[]))))
+               AND note_type = $8 AND note_key <> $9
+               AND note_key NOT LIKE $10 || '%'
              ORDER BY ts_rank_cd(tsv, q.query) DESC, updated_at DESC, id DESC
              LIMIT $7",
         )
@@ -644,6 +673,9 @@ impl PgScratchpadStore {
         .bind(me)
         .bind(ancestors)
         .bind(limit as i64)
+        .bind(OUTCOME_NOTE_TYPE)
+        .bind(SCRATCHPAD_GOAL_KEY)
+        .bind(OUTCOME_KEY_PREFIX)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;

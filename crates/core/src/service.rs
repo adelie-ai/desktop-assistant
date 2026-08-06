@@ -1944,9 +1944,11 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 .render_scratchpad_surfaces(conversation_id, current_step.as_deref())
                 .await;
 
-            // What this round's other blocks already show, handed to the recall
-            // render so it never offers the same memory twice (#1101).
-            let recall = recall.as_ref().map(|found| {
+            // The turn's candidates, plus what this round's other blocks already
+            // show, so the recall render never offers the same memory twice
+            // (#1101). Rebuilt each round because the pad read above is: a note
+            // pinned or written mid-turn changes what is in view.
+            let recall_surface = recall.as_ref().map(|found| {
                 crate::recall::RecallSurface::new(
                     &found.candidates,
                     found.entry_scan_limit,
@@ -1975,7 +1977,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                     scratchpad_index: surfaces.scratchpad_index.as_deref(),
                     working_state: surfaces.working_state,
                     pinned: surfaces.pinned.as_deref(),
-                    recall,
+                    recall: recall_surface,
                     tool_rounds_since_anchor,
                 },
                 target_window,

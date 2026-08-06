@@ -128,27 +128,29 @@ async fn lookup(
                 request.note_limit,
             ),
         );
-        return Ok(RecallCandidates {
-            entries: entries?
-                .into_iter()
-                .map(|entry| RecallEntry {
-                    entry,
-                    relevance: RecallRelevance::LexicalMatch,
-                })
-                .collect(),
-            notes: notes_or_none(notes.map(|found| {
+        return combine(
+            entries.map(|found| {
+                found
+                    .into_iter()
+                    .map(|entry| RecallEntry {
+                        entry,
+                        relevance: RecallRelevance::LexicalMatch,
+                    })
+                    .collect()
+            }),
+            Ok(Vec::new()),
+            notes.map(|found| {
                 found
                     .into_iter()
                     .map(|note| to_recall_note(note, RecallRelevance::LexicalMatch))
                     .collect()
-            })),
-            tags: Vec::new(),
-        });
+            }),
+        );
     };
 
     // Every arm shares the one vector, and none depends on another. `join!`
-    // rather than `try_join!` so the scratchpad arm's own failure can be
-    // absorbed below instead of cancelling the two that did answer.
+    // rather than `try_join!` so `combine` can absorb the scratchpad arm's own
+    // failure instead of one arm's error cancelling the two that did answer.
     let (entries, tags, notes) = tokio::join!(
         kb_store.nearest_by_embedding(vector.clone(), embedding_model, request.entry_limit),
         desktop_assistant_storage::tag_registry::nearest_tags(
@@ -165,27 +167,57 @@ async fn lookup(
         ),
     );
 
-    Ok(RecallCandidates {
-        entries: entries?
-            .into_iter()
-            .map(|(entry, distance)| RecallEntry {
-                entry,
-                relevance: RecallRelevance::Distance(distance),
-            })
-            .collect(),
-        notes: notes_or_none(notes.map(|found| {
+    combine(
+        entries.map(|found| {
+            found
+                .into_iter()
+                .map(|(entry, distance)| RecallEntry {
+                    entry,
+                    relevance: RecallRelevance::Distance(distance),
+                })
+                .collect()
+        }),
+        tags.map(|found| {
+            found
+                .into_iter()
+                .map(|(name, distance)| RecallTag {
+                    name,
+                    relevance: RecallRelevance::Distance(distance),
+                })
+                .collect()
+        }),
+        notes.map(|found| {
             found
                 .into_iter()
                 .map(|(note, distance)| to_recall_note(note, RecallRelevance::Distance(distance)))
                 .collect()
-        })),
-        tags: tags?
-            .into_iter()
-            .map(|(name, distance)| RecallTag {
-                name,
-                relevance: RecallRelevance::Distance(distance),
-            })
-            .collect(),
+        }),
+    )
+}
+
+/// Fold the three arms' answers into one candidate set.
+///
+/// Pure, and separate from [`lookup`], so what each arm's failure costs is
+/// provable without a database - which is the only way to hold the asymmetry
+/// below to anything.
+///
+/// The scratchpad arm's error is absorbed and the other two propagate. A
+/// knowledge arm that cannot read is the block's whole point failing, and the
+/// caller drops the block and runs the turn anyway; losing the pad lines is the
+/// smaller loss, so it is taken rather than passed on.
+///
+/// The absorbed arm resolves first, so its failure is logged even on the turn
+/// where another arm's error is about to end the lookup.
+fn combine(
+    entries: Result<Vec<RecallEntry>, CoreError>,
+    tags: Result<Vec<RecallTag>, CoreError>,
+    notes: Result<Vec<RecallNote>, CoreError>,
+) -> Result<RecallCandidates, CoreError> {
+    let notes = notes_or_none(notes);
+    Ok(RecallCandidates {
+        entries: entries?,
+        notes,
+        tags: tags?,
     })
 }
 
@@ -340,33 +372,75 @@ mod tests {
         assert_eq!(answer.tags.len(), 1);
     }
 
+    fn an_entry() -> RecallEntry {
+        RecallEntry {
+            entry: desktop_assistant_core::domain::KnowledgeEntry::new("kb-1", "body", vec![]),
+            relevance: RecallRelevance::Distance(0.12),
+        }
+    }
+
+    fn a_tag() -> RecallTag {
+        RecallTag {
+            name: "topic:mine".into(),
+            relevance: RecallRelevance::Distance(0.12),
+        }
+    }
+
+    fn a_note() -> RecallNote {
+        RecallNote {
+            key: "deploy-window".into(),
+            content: "Fridays after 18:00".into(),
+            pinned: false,
+            relevance: RecallRelevance::Distance(0.12),
+        }
+    }
+
     /// Acceptance (#1101): the scratchpad arm reads a different table from the
     /// other two, so it fails on its own. When it does it costs its own lines
     /// and nothing else - the knowledge and tag arms still render, and the turn
     /// never sees the error.
     #[test]
     fn recall_block_survives_the_scratchpad_arm_failing() {
-        let notes = notes_or_none(Err(CoreError::Storage("the pad read failed".into())));
+        let candidates = combine(
+            Ok(vec![an_entry()]),
+            Ok(vec![a_tag()]),
+            Err(CoreError::Storage("the pad read failed".into())),
+        )
+        .expect("a failed pad read must not fail the lookup");
 
+        assert_eq!(
+            candidates.entries.len(),
+            1,
+            "the knowledge arm still renders"
+        );
+        assert_eq!(candidates.tags.len(), 1, "and so does the tag arm");
         assert!(
-            notes.is_empty(),
-            "a failed arm contributes nothing, rather than failing the lookup"
+            candidates.notes.is_empty(),
+            "the failed arm contributes none"
         );
     }
 
     #[test]
     fn the_scratchpad_arm_passes_its_rows_through_when_it_answers() {
-        let found = vec![RecallNote {
-            key: "deploy-window".into(),
-            content: "Fridays after 18:00".into(),
-            pinned: false,
-            relevance: RecallRelevance::Distance(0.12),
-        }];
+        let candidates = combine(Ok(vec![]), Ok(vec![]), Ok(vec![a_note()]))
+            .expect("an arm that answers is not a failure");
 
-        let notes = notes_or_none(Ok(found));
+        assert_eq!(candidates.notes.len(), 1);
+        assert_eq!(candidates.notes[0].key, "deploy-window");
+    }
 
-        assert_eq!(notes.len(), 1);
-        assert_eq!(notes[0].key, "deploy-window");
+    /// The asymmetry, stated as a test so it cannot be levelled by accident.
+    /// The knowledge arm is the block's whole point, so its error ends the
+    /// lookup and the caller drops the block.
+    #[test]
+    fn a_failing_knowledge_arm_ends_the_lookup() {
+        let answer = combine(
+            Err(CoreError::Storage("the store is down".into())),
+            Ok(vec![a_tag()]),
+            Ok(vec![a_note()]),
+        );
+
+        assert!(answer.is_err());
     }
 
     #[tokio::test]

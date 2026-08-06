@@ -126,6 +126,15 @@ The arm reads **this conversation's pad only**. The pad is per-conversation by
 design; reaching across conversations is a different feature with its own
 privacy question.
 
+It also reads the **free-form notes only** - the same set the index advertises
+(`planning::freeform_note_keys`): `note`-typed, and neither the reserved `goal`
+key nor an `outcome:<step>` key. Those three are rendered by `[Current task]`
+and `[Plan]` on every round, and the goal note is by construction the pad row
+nearest a prompt about the current task, so an arm without the carve-out would
+spend its first line restating the task the prompt already carries. The
+carve-out is applied in the query rather than after it, so an excluded row never
+occupies a slot in the scan the "and N more" count is measured against.
+
 ## Nothing already in view
 
 A second look at the same pad would otherwise pay twice for one memory, so the
@@ -146,6 +155,26 @@ silent, no key is dropped for it - which is the case the arm exists for. The two
 
 A dropped candidate is not counted in the "matched less closely" line either.
 That line promises the model something it has not been given.
+
+## Nothing stamped as external content
+
+A subagent's final answer is mirrored onto the session pad, and when that child
+had read outside the trust boundary the note is stamped with
+`EXTERNAL_CONTENT_MARKER`. `builtin_scratchpad_search` is classified
+`Declared(ExternalContentMarker)` exactly so that reading such a note back
+taints the turn and closes the tool gate.
+
+This block has no tool call in it, so no `observe_result` runs and nothing would
+close. The scratchpad arm therefore **drops a stamped note outright**. Without
+that, possibly-injected text would land in a system message, ahead of the user
+prompt, with the Egress, Mutate and Execution tiers all still open - and with no
+model choice and no attacker step needed, on every turn where the note happened
+to rank near the prompt.
+
+Dropping rather than tainting, because the note lives on the pad indefinitely:
+closing the gate whenever it ranked near would degrade the conversation
+permanently. The parent still reaches that answer through
+`get_subagent_status`, which taints correctly.
 
 ## What bounds the cost
 
@@ -271,6 +300,13 @@ that pins did not fit, so the model is not left believing the fact is absent.
 
 **Cancellation waits on the lookup.** A turn cancelled while the lookup is in
 flight still waits for it, bounded by the ten-second whole-lookup ceiling.
+
+**The scratchpad arm scans the whole pad, every turn.** The vector query unnests
+each note's chunks and groups on the row, so no vector index applies and the
+`LIMIT` bites after the aggregate. One conversation's rows bound it, and a pad
+only grows, so an old conversation pays more per prompt than a new one. This
+shape previously ran only when the model called `builtin_scratchpad_search`. Not
+measured.
 
 ## Where the code is
 
