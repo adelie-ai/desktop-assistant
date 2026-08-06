@@ -400,12 +400,27 @@ impl ScratchpadStore for PgScratchpadStore {
             return Ok(0);
         }
         let user_id = current_user_id();
-        // Confined to the caller's own namespace, exactly as `set_pinned` is.
-        // A subagent's read spans its ancestors, so an unconfined repair would
-        // let a subagent round clear the parent's pin - and the one line that
-        // says a pin was released would render into the SUBAGENT's block, where
-        // the parent never sees it. Confining it means whoever owns the pin is
-        // the one told, on its own next round.
+        // Confined to the caller's own SUBTREE, which is not what `set_pinned`
+        // and `delete_many` do - they confine to the caller's own namespace
+        // exactly. Two failures bound this, one on each side.
+        //
+        // Reaching too far: a subagent round must never clear a pin in an
+        // ancestor's namespace. Its read spans its ancestors, so an unconfined
+        // repair let it release the parent's pin, and the line saying so
+        // rendered into the subagent's block where the parent never sees it.
+        //
+        // Reaching too little: the top-level read is namespace-blind, so a
+        // top-level round sees a subagent's note. Confining the repair to the
+        // caller's own namespace alone left that note stuck for the life of the
+        // conversation - a dead attachment, a slot of the pin cap consumed, a
+        // knowledge read spent every round, and no verb the model could use to
+        // clear it, because `set_pinned` and `delete_many` are confined too.
+        //
+        // Own-subtree is the rule that fits both: the root namespace repairs
+        // anything, matching its namespace-blind read, and a subagent repairs
+        // itself and its descendants but never an ancestor or a sibling. The
+        // repair only ever touches rows this round has just read and just named
+        // to the model, so no round clears something it did not report.
         let me = current_namespace();
         //
         // The pin goes with the attachment. A note whose entry has gone renders
@@ -421,8 +436,9 @@ impl ScratchpadStore for PgScratchpadStore {
         // actually repaired and makes a second call a true no-op.
         let result = sqlx::query(
             "UPDATE scratchpads SET knowledge_entry_id = NULL, pinned = FALSE \
-             WHERE user_id = $1 AND conversation_id = $2 AND owner_todo = $3 \
-               AND id = ANY($4) AND knowledge_entry_id IS NOT NULL",
+             WHERE user_id = $1 AND conversation_id = $2 AND id = ANY($4) \
+               AND ($3 = '' OR owner_todo = $3 OR owner_todo LIKE $3 || '.%') \
+               AND knowledge_entry_id IS NOT NULL",
         )
         .bind(user_id.as_str())
         .bind(conversation_id)

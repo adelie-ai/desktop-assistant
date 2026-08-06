@@ -351,13 +351,25 @@ pub trait ScratchpadStore: Send + Sync {
     /// alone could name a row in a different namespace. `conversation_id`
     /// still travels, so the repair cannot reach outside the pad it read.
     ///
-    /// Namespace-confined by `owner_todo`, exactly as [`Self::set_pinned`] and
-    /// [`Self::delete_many`] are. A subagent's read spans its ancestors, so an
-    /// unconfined repair would let a subagent round clear the parent's pin, and
-    /// the one line saying a pin was released would render into the subagent's
-    /// block where the parent never sees it. Confined, the owner is the one
-    /// told, on its own next round. Scoped by the task-local `UserId` too,
-    /// which is the tenant guard.
+    /// Confined to the caller's own `owner_todo` **subtree**, which is wider
+    /// than [`Self::set_pinned`] and [`Self::delete_many`] (own namespace only)
+    /// and narrower than [`Self::list`] (namespace-blind at the top level).
+    /// Both extremes fail:
+    ///
+    /// - Unconfined, a subagent round releases a pin in an ancestor's
+    ///   namespace, and the line saying so renders into the subagent's block
+    ///   where the parent never sees it.
+    /// - Own-namespace-only, a note the top-level read can see but not repair
+    ///   keeps a dead attachment for the life of the conversation, holds a slot
+    ///   of the pin cap, and costs a knowledge read every round - and the model
+    ///   cannot clear it either, because the pin and delete verbs are confined
+    ///   the same way.
+    ///
+    /// Own-subtree fits both: the root namespace repairs anything, matching its
+    /// namespace-blind read, and a subagent repairs itself and its descendants
+    /// but never an ancestor or a sibling.
+    ///
+    /// Scoped by the task-local `UserId`, which is the tenant guard.
     ///
     /// Idempotent: a second call over the same ids changes nothing and
     /// returns 0.

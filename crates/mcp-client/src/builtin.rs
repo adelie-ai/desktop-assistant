@@ -894,7 +894,7 @@ impl BuiltinToolService {
                                     "type": {"type": "string", "description": "Category, e.g. \"todo\"/\"note\"/\"other\". Defaults to \"note\". Used for filtering/grouping; same-type notes sort by `sequence`."},
                                     "sequence": {"type": "integer", "description": "Optional ordering hint within the type (ascending). Use for ordered todos."},
                                     "done": {"type": "boolean", "description": "Whether this note (e.g. a todo) is checked off. Defaults to false."},
-                                    "knowledge_entry_id": {"type": "string", "description": "Attach a knowledge-base entry (its id from builtin_knowledge_base_search/get). Pinning the note then shows the entry's live content under [Pinned]. Omit to keep whatever is already attached; a wrong id is refused."}
+                                    "knowledge_entry_id": {"type": "string", "description": "Attach a knowledge-base entry (its id from builtin_knowledge_base_search). Pinning the note then shows the entry's live content under [Pinned]. Omit to keep whatever is already attached; a wrong id is refused."}
                                 },
                                 "required": ["key", "content"]
                             },
@@ -2234,11 +2234,14 @@ impl BuiltinToolService {
             if let Some(existing) = accepted.iter_mut().find(|n| n.key == note.key) {
                 // Last write wins on everything the later note states, but an
                 // attachment it does not state is inherited rather than
-                // dropped: `None` means "leave it alone" everywhere else, and a
-                // second note for the same key must not mean something
-                // different. Otherwise the model attaches an entry, rewrites
-                // the same key in the same call, and is told the write
-                // succeeded with nothing attached.
+                // dropped, because that is what the storage upsert does with an
+                // absent id (`COALESCE(EXCLUDED.knowledge_entry_id, ...)`), and
+                // a second note for the same key must not mean something
+                // different from a second call. Otherwise the model attaches an
+                // entry, rewrites the same key in the same call, and is told
+                // the write succeeded with nothing attached. Only the
+                // attachment reads an absent value this way: `seq` and the rest
+                // are replaced by the later note whether it states them or not.
                 let carried = existing.knowledge_entry_id.take();
                 *existing = note;
                 existing.knowledge_entry_id = existing.knowledge_entry_id.take().or(carried);

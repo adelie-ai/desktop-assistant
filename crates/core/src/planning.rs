@@ -554,8 +554,9 @@ fn attached_entry<'a>(
 /// ([`PINNED_ENTRY_MAX_CHARS`](crate::ports::scratchpad::PINNED_ENTRY_MAX_CHARS)),
 /// because a note is capped at
 /// [`MAX_NOTE_BYTES`](crate::ports::scratchpad::MAX_NOTE_BYTES) and an entry is
-/// not. The id travels with it so the model can read the whole entry with
-/// `builtin_knowledge_base_get` when the bounded form is not enough.
+/// not. The id travels with it so the model can find the whole entry with
+/// `builtin_knowledge_base_search` when the bounded form is not enough - there
+/// is no by-id read tool, so the id is for recognition, not for a lookup.
 fn pinned_chunk(note: &RawNote<'_>, entry: Option<&str>) -> String {
     let mut chunk = format!("- {}:", note.key);
     if !note.content.is_empty() {
@@ -580,7 +581,7 @@ fn pinned_chunk(note: &RawNote<'_>, entry: Option<&str>) -> String {
             // otherwise render as a blank line.
             None => chunk.push_str(
                 " could not be read this round; \
-                                    builtin_knowledge_base_get it if you need it now",
+                 builtin_knowledge_base_search for it if you need it now",
             ),
         }
     }
@@ -1491,13 +1492,23 @@ mod tests {
             let notes = vec![raw_pinned("penguins", &emoji)];
             let out = render_pinned(&notes, None, budget)
                 .expect("something is pinned, so a block is owed");
-            // Reaching here at all is the assertion: a byte-indexed cut inside
-            // a 4-byte character panics, and `truncate_on_char_boundary` is
-            // what stops it. The rendered text is a prefix of what was asked
-            // for, so no character is ever half-written.
+            // Reaching here at all is half the assertion: a byte-indexed cut
+            // inside a 4-byte character panics, and `truncate_on_char_boundary`
+            // is what stops it. The other half is that whatever survived the
+            // cut is whole penguins and never a severed one, which a
+            // byte-boundary cut inside the run would break.
+            let rendered = out
+                .lines()
+                .find(|l| l.starts_with("- penguins:"))
+                .map(|l| {
+                    l.trim_start_matches("- penguins:")
+                        .trim_end_matches("… (truncated)")
+                })
+                .unwrap_or("");
             assert!(
-                out.starts_with("Notes you pinned"),
-                "the block header must survive every budget: {out}"
+                rendered.trim().chars().all(|c| c == '🐧'),
+                "the cut must land between characters, never inside one \
+                 (budget {budget}): {rendered:?}"
             );
             // Whatever the budget, the pin is never silently dropped: either its
             // content is shown, or the block says it could not be.

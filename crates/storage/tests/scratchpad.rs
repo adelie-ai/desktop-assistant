@@ -1380,7 +1380,7 @@ async fn releasing_a_reference_stays_within_the_subagent_namespace() {
                         .expect("child release")
                 })
                 .await;
-                assert_eq!(released, 0, "a subagent must not repair the parent's row");
+                assert_eq!(released, 0, "a subagent must not repair an ancestor's row");
 
                 let notes = pad.list("c1", None, 50).await.expect("list");
                 assert_eq!(notes[0].knowledge_entry_id.as_deref(), Some("kb-1"));
@@ -1393,6 +1393,63 @@ async fn releasing_a_reference_stays_within_the_subagent_namespace() {
                     1,
                     "the owner repairs its own"
                 );
+            })
+            .await;
+            fx
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_top_level_round_repairs_a_subagent_notes_dangling_attachment() {
+    // The top-level read is namespace-blind, so a top-level round SEES a
+    // subagent's pinned note. If it could not also repair it, that note would
+    // keep a dead attachment for the life of the conversation, hold a slot of
+    // the pin cap, and cost a knowledge read every round - and the model could
+    // not clear it either, because the pin and delete verbs are confined to the
+    // caller's own namespace. So the repair reaches the caller's own subtree,
+    // and the root's subtree is the whole pad.
+    with_fixture(
+        "a_top_level_round_repairs_a_subagent_notes_dangling_attachment",
+        |fx| async move {
+            let convs = PgConversationStore::new(fx.pool.clone());
+            let pad = PgScratchpadStore::new(fx.pool.clone());
+            with_user_id(UserId::new("alice"), async {
+                convs.create(make_conversation("c1")).await.expect("conv");
+                write_entry(&fx.pool, "kb-1", "the durable fact").await;
+
+                let child_note_id = with_subagent_scope(sub_scope("1", "", &[]), async {
+                    let saved = pad
+                        .write("c1", &[note_attaching("api-contract", "child", "kb-1")])
+                        .await
+                        .expect("child attach");
+                    pad.set_pinned("c1", &["api-contract".to_string()], true)
+                        .await
+                        .expect("child pin");
+                    saved[0].id.clone()
+                })
+                .await;
+
+                // The top level sees it (namespace-blind read) and repairs it.
+                assert!(
+                    pad.list("c1", None, 50)
+                        .await
+                        .expect("top-level list")
+                        .iter()
+                        .any(|n| n.owner_todo == "1" && n.pinned),
+                    "precondition: the top level sees the subagent's pinned note"
+                );
+                assert_eq!(
+                    pad.release_knowledge_references("c1", std::slice::from_ref(&child_note_id))
+                        .await
+                        .expect("top-level release"),
+                    1,
+                    "the root subtree is the whole pad, so nothing is left stuck"
+                );
+                let notes = pad.list("c1", None, 50).await.expect("list");
+                assert_eq!(notes[0].knowledge_entry_id, None);
+                assert!(!notes[0].pinned, "and the slot of the pin cap is freed");
             })
             .await;
             fx
