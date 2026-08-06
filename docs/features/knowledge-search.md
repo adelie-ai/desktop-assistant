@@ -243,6 +243,75 @@ Step 3 needs the tag-registry dedup gate on `builtin_knowledge_base_write`.
 Without it, an instruction to add tags splits the vocabulary faster than the
 census can report it.
 
+## Reading an entry by id
+
+Search cannot answer an id. It matches an entry's **content**, so an id finds an
+entry only when that entry happens to mention it, and `builtin_knowledge_base_list`
+filters by tag and source but never by id. `builtin_knowledge_base_get` is the
+read that answers one:
+
+```json
+{"ok": true,
+ "entries": [{"id": "...", "content": "...", "summary": "...", "tags": ["..."],
+              "metadata": {}, "source": "explicit",
+              "created_at": "...", "updated_at": "..."}],
+ "returned": 1,
+ "not_found": ["..."],
+ "truncated": true,
+ "message": "not every id was answered; ask for at most 64 ids at a time, ..."}
+```
+
+A row whose content had to be cut carries one extra field:
+
+```json
+{"id": "...", "content": "the start of a very long entry", "content_truncated": true,
+ "summary": "...", "tags": ["..."], "metadata": {}, "source": "...",
+ "created_at": "...", "updated_at": "..."}
+```
+
+It takes a batch (`ids`, or `id` for one), because the `[Recall]` block offers
+several candidates and the model often wants two or three of them. Entries come
+back in the order the ids were asked for, and a repeated id is read once.
+
+Three rules matter more than the shape.
+
+**A miss is a normal outcome.** An id that does not resolve is named in
+`not_found` and the rest of the batch still returns. A stale reference is a
+reference worth dropping, not an error (base rule 8.2).
+
+**Every miss reads the same.** The store scopes the read by `user_id` and hides
+retired rows, so another user's id, a retired id, and an id that never existed
+are one case. The response says nothing about which, and carries no per-id
+reason at all. Row-level security is a non-FORCE backstop that the table owner
+bypasses, so the `user_id` predicate in `get_many` is the real guard;
+`crates/storage/tests/knowledge_get_many.rs` holds it against a real database.
+
+**Every bound reports itself.** At most 64 ids per call
+(`KNOWLEDGE_GET_MAX_IDS`), and the response carries the same byte budget the
+scratchpad read uses, so a batch of long entries cannot spend the whole context.
+Any bound that bites sets `truncated` and a `message`. An id in neither `entries`
+nor `not_found` was left out by the budget, not lost.
+
+The third bound is the one the scratchpad read does not need. A note is capped at
+`MAX_NOTE_BYTES` on write, so a single note always fits the response budget; a
+knowledge entry has no write-side length cap at all. So the first row of a
+response is not admitted on trust: an entry that alone overruns the budget
+arrives with its `content` cut and `content_truncated: true` on the row. Leaving
+it out instead would make a long entry unreadable by any call, and letting it
+through whole would hand it to the generic 256 KiB tool-result cap
+(`crates/core/src/context/mod.rs`), which cuts raw bytes and lands mid-JSON. A
+later row is never cut - it waits for its own call, and the caller still holds
+its id.
+
+**The budget is not a guarantee about the whole row, and the gap is worth
+stating.** Only `content` is cut. An entry whose `tags` or `metadata` alone
+overrun the budget still travels whole and still reaches the generic 256 KiB
+cap - the client-facing `CreateKnowledgeEntry` accepts any `metadata` value, and
+neither the column nor the write path bounds it. Cutting those fields would
+change what the entry means, so this read does not. The real fix is a size cap
+on the write path, where one bound would hold all four reads; `content` is cut
+here because it is the field a model writes and the one that grows.
+
 ## Where things live
 
 | Concern | Location |
@@ -252,4 +321,5 @@ census can report it.
 | Tool response and schema | `crates/mcp-client/src/builtin.rs` |
 | Census behaviour under a real database | `crates/storage/tests/knowledge_tag_census.rs` |
 | The summary's write rules under a real database | `crates/storage/tests/knowledge_summary.rs` |
+| Batch read by id, scoping and retirement | `crates/storage/tests/knowledge_get_many.rs` |
 | Prompt guidance that consumes these fields | `crates/core/src/prompts/sections/knowledge_base.txt` |

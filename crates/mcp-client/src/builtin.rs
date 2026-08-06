@@ -4,16 +4,18 @@ use std::path::PathBuf;
 
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::clock::NowSnapshot;
-use desktop_assistant_core::domain::{Role, SUMMARY_MAX_CHARS, ToolDefinition, ToolRunner};
+use desktop_assistant_core::domain::{
+    KnowledgeEntry, Role, SUMMARY_MAX_CHARS, ToolDefinition, ToolRunner,
+};
 use desktop_assistant_core::ports::client_tools::current_client_tools;
 use desktop_assistant_core::ports::conversation_ctx::current_conversation_id;
 use desktop_assistant_core::ports::conversation_search::ConversationSearchFn;
 use desktop_assistant_core::ports::database::DbQueryFn;
 use desktop_assistant_core::ports::embedding::{EMBED_TIMEOUT, EmbedFn};
 use desktop_assistant_core::ports::knowledge::{
-    AVAILABLE_TAGS_LIMIT, KNOWLEDGE_TAG_CENSUS_SAMPLE, KnowledgeDeleteFn, KnowledgeGetFn,
-    KnowledgeListFn, KnowledgeListQuery, KnowledgeSearchFn, KnowledgeTagResolveFn,
-    KnowledgeWriteFn, ListOrder, ListOrderOpt, ProposedTag, ScopeSize,
+    AVAILABLE_TAGS_LIMIT, KNOWLEDGE_GET_MAX_IDS, KNOWLEDGE_TAG_CENSUS_SAMPLE, KnowledgeDeleteFn,
+    KnowledgeGetFn, KnowledgeGetManyFn, KnowledgeListFn, KnowledgeListQuery, KnowledgeSearchFn,
+    KnowledgeTagResolveFn, KnowledgeWriteFn, ListOrder, ListOrderOpt, ProposedTag, ScopeSize,
 };
 use desktop_assistant_core::ports::notify::{NotifyFn, NotifyUrgency};
 use desktop_assistant_core::ports::scratchpad::{
@@ -298,6 +300,7 @@ const KB_SEARCH_MAX_LIMIT: u64 = 500;
 
 const TOOL_KB_DELETE: &str = "builtin_knowledge_base_delete";
 const TOOL_KB_LIST: &str = "builtin_knowledge_base_list";
+const TOOL_KB_GET: &str = "builtin_knowledge_base_get";
 const TOOL_SEARCH: &str = "builtin_tool_search";
 const TOOL_NOTIFY: &str = "builtin_notify";
 const TOOL_SYS_PROPS: &str = "builtin_sys_props";
@@ -341,6 +344,7 @@ pub struct BuiltinToolService {
     kb_delete_fn: Option<KnowledgeDeleteFn>,
     kb_list_fn: Option<KnowledgeListFn>,
     kb_get_fn: Option<KnowledgeGetFn>,
+    kb_get_many_fn: Option<KnowledgeGetManyFn>,
     kb_tag_resolve_fn: Option<KnowledgeTagResolveFn>,
     tool_search_fn: Option<ToolSearchFn>,
     #[allow(dead_code)]
@@ -383,6 +387,7 @@ impl BuiltinToolService {
             kb_delete_fn: None,
             kb_list_fn: None,
             kb_get_fn: None,
+            kb_get_many_fn: None,
             kb_tag_resolve_fn: None,
             tool_search_fn: None,
             tool_definition_fn: None,
@@ -465,6 +470,22 @@ impl BuiltinToolService {
         self.kb_delete_fn = Some(delete_fn);
         self.kb_list_fn = Some(list_fn);
         self.kb_get_fn = Some(get_fn);
+        self
+    }
+
+    /// Wire the batch read behind `builtin_knowledge_base_get`.
+    ///
+    /// Additive and separate from [`Self::with_knowledge_base`], which mirrors
+    /// how `AssistantService` wires the same closure for the `[Pinned]` block:
+    /// an embedder that predates the get tool keeps compiling, and the tool
+    /// then answers "knowledge base not configured" the way every other
+    /// unwired knowledge tool does.
+    ///
+    /// Why this and not repeated [`KnowledgeGetFn`] calls: the tool resolves a
+    /// whole batch of ids, and one statement for the batch keeps the read cost
+    /// flat in the number of ids.
+    pub fn with_knowledge_get_many(mut self, get_many_fn: KnowledgeGetManyFn) -> Self {
+        self.kb_get_many_fn = Some(get_many_fn);
         self
     }
 
@@ -727,6 +748,44 @@ impl BuiltinToolService {
                         }
                     },
                     "required": ["query"]
+                }),
+            ),
+            ToolDefinition::new(
+                TOOL_KB_GET,
+                format!(
+                    "Read knowledge base entries by id - how you act on an id you already \
+                     hold. Ids come from the `[Recall]` block at the top of a turn, when one \
+                     is present, and from the `id` on any {TOOL_KB_SEARCH} or {TOOL_KB_LIST} \
+                     result. Ask for up to {KNOWLEDGE_GET_MAX_IDS} ids in one call and each \
+                     entry comes back whole: content, summary, tags, metadata, source and \
+                     timestamps. Use this rather than searching for the id itself - search \
+                     matches an entry's TEXT, so an id finds an entry only when that entry \
+                     happens to mention it. An id that names no entry you can read is listed \
+                     in `not_found` and the rest of the batch still returns, so a stale \
+                     reference costs you nothing; treat it as a reference worth dropping, not \
+                     as an error. Ids past the cap are dropped, and a response too large to \
+                     carry every entry drops entries as well; either way the response reports \
+                     `truncated` and you ask for the rest in a smaller batch. One entry can \
+                     be too long to deliver whole even on its own: that entry arrives marked \
+                     `content_truncated`, and its `content` is the start of the entry rather \
+                     than the entry, so do not act on it as if it were complete."
+                ),
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": format!(
+                                "Ids of the entries to read, at most {KNOWLEDGE_GET_MAX_IDS} \
+                                 per call."
+                            )
+                        },
+                        "id": {
+                            "type": "string",
+                            "description": "Single-entry convenience: read one id. Combined with `ids` when both are given."
+                        }
+                    }
                 }),
             ),
             ToolDefinition::new(
@@ -1199,6 +1258,7 @@ impl BuiltinToolService {
         TOOL_KB_SEARCH,
         TOOL_KB_DELETE,
         TOOL_KB_LIST,
+        TOOL_KB_GET,
         TOOL_SEARCH,
         TOOL_NOTIFY,
         TOOL_SYS_PROPS,
@@ -1220,7 +1280,9 @@ impl BuiltinToolService {
     /// on that fallback.
     pub fn provider_group(tool_name: &str) -> Option<&'static str> {
         match tool_name {
-            TOOL_KB_WRITE | TOOL_KB_SEARCH | TOOL_KB_DELETE | TOOL_KB_LIST => Some("knowledge"),
+            TOOL_KB_WRITE | TOOL_KB_SEARCH | TOOL_KB_DELETE | TOOL_KB_LIST | TOOL_KB_GET => {
+                Some("knowledge")
+            }
             TOOL_SCRATCHPAD_WRITE
             | TOOL_SCRATCHPAD_SEARCH
             | TOOL_SCRATCHPAD_DELETE
@@ -1257,6 +1319,7 @@ impl BuiltinToolService {
             TOOL_KB_SEARCH => self.kb_search(arguments).await,
             TOOL_KB_DELETE => self.kb_delete(arguments).await,
             TOOL_KB_LIST => self.kb_list(arguments).await,
+            TOOL_KB_GET => self.kb_get(arguments).await,
             TOOL_SEARCH => self.tool_search(arguments).await,
             TOOL_NOTIFY => self.notify(arguments).await,
             TOOL_SYS_PROPS => Ok(self.sys_props()),
@@ -1983,6 +2046,126 @@ impl BuiltinToolService {
         .to_string())
     }
 
+    /// Read knowledge entries by id (`builtin_knowledge_base_get`).
+    ///
+    /// The read the `[Recall]` block depends on: that block offers ids and no
+    /// content, so an id has to be worth something on its own. Neither search
+    /// (which matches an entry's text) nor list (which has no id filter) can
+    /// answer one.
+    ///
+    /// Two rules shape the response. An id that does not resolve is a normal
+    /// outcome, not a failure, so it is named in `not_found` while the rest of
+    /// the batch returns. And every way an id fails to resolve gives the same
+    /// answer: the store scopes the read by `user_id` and hides retired rows,
+    /// so another user's id, a retired id and an id that never existed are one
+    /// case here, described one way. Nothing in the response says which.
+    async fn kb_get(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
+        let get_many = self
+            .kb_get_many_fn
+            .as_ref()
+            .ok_or_else(|| CoreError::ToolExecution("knowledge base not configured".to_string()))?;
+
+        // Accept either a single `id` or a list of `ids`, the shapes
+        // `builtin_knowledge_base_delete` already accepts.
+        let mut ids = optional_string_array(&arguments, "ids");
+        if let Some(id) = optional_string(&arguments, "id") {
+            ids.push(id);
+        }
+        // A model assembling ids from a `[Recall]` block and a search result
+        // can name the same entry twice. That is one read and one row.
+        let mut seen = HashSet::new();
+        ids.retain(|id| seen.insert(id.clone()));
+        if ids.is_empty() {
+            return Err(CoreError::ToolExecution(
+                "knowledge_base get requires `id` or `ids`".to_string(),
+            ));
+        }
+        let mut cap_truncated = false;
+        if ids.len() > KNOWLEDGE_GET_MAX_IDS {
+            cap_truncated = true;
+            ids.truncate(KNOWLEDGE_GET_MAX_IDS);
+        }
+
+        let found: HashMap<String, KnowledgeEntry> = get_many(ids.clone())
+            .await?
+            .into_iter()
+            .map(|entry| (entry.id.clone(), entry))
+            .collect();
+
+        // Report every miss before spending the byte budget, so a stale
+        // reference is always named even when the entries that did resolve fill
+        // the response.
+        let not_found: Vec<&String> = ids.iter().filter(|id| !found.contains_key(*id)).collect();
+
+        // Enforce the response byte budget so one read cannot blow out context.
+        let mut items: Vec<serde_json::Value> = Vec::new();
+        let mut bytes = 0usize;
+        let mut budget_truncated = false;
+        let mut content_cut = false;
+        for id in &ids {
+            let Some(entry) = found.get(id) else { continue };
+            if items.is_empty() {
+                // The first row always travels, so it is the one that has to be
+                // made to fit: leaving it out would make a long entry
+                // unreadable by any means.
+                let (row, cut) = kb_get_row_within(entry, RESPONSE_BYTE_BUDGET);
+                content_cut = cut;
+                bytes += row.to_string().len();
+                items.push(row);
+                continue;
+            }
+            let item = kb_get_row(entry, &entry.content, false);
+            let size = item.to_string().len();
+            if bytes + size > RESPONSE_BYTE_BUDGET {
+                // A later row waits for its own call rather than being cut. It
+                // is whole somewhere, and the caller still holds its id.
+                budget_truncated = true;
+                break;
+            }
+            bytes += size;
+            items.push(item);
+        }
+
+        tracing::info!(
+            asked = ids.len(),
+            returned = items.len(),
+            missing = not_found.len(),
+            "knowledge base get"
+        );
+
+        let mut response = serde_json::json!({
+            "ok": true,
+            "entries": items,
+            "returned": items.len(),
+            "not_found": not_found,
+        });
+        // One flag for both ways a response falls short of what was asked, and
+        // a message that names whichever applies. They are separate failures:
+        // an id left out is answerable by asking again, and a cut row is not.
+        let mut message = String::new();
+        if cap_truncated || budget_truncated {
+            message.push_str(&format!(
+                "not every id was answered; ask for at most {KNOWLEDGE_GET_MAX_IDS} ids at a \
+                 time, and fewer when the entries are long. An id in neither `entries` nor \
+                 `not_found` was left out here, not lost - ask for it again."
+            ));
+        }
+        if content_cut {
+            if !message.is_empty() {
+                message.push(' ');
+            }
+            message.push_str(
+                "An entry marked `content_truncated` is too long to deliver whole: you hold \
+                 the start of it, not the entry, so do not treat it as complete.",
+            );
+        }
+        if !message.is_empty() {
+            response["truncated"] = serde_json::Value::Bool(true);
+            response["message"] = serde_json::json!(message);
+        }
+        Ok(response.to_string())
+    }
+
     async fn notify(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
         let notify_fn = self.notify_fn.as_ref().ok_or_else(|| {
             CoreError::ToolExecution("desktop notifications are not available".to_string())
@@ -2686,6 +2869,82 @@ fn required_string(args: &serde_json::Value, key: &str) -> Result<String, CoreEr
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| CoreError::ToolExecution(format!("missing required string argument: {key}")))
+}
+
+/// One `builtin_knowledge_base_get` row, carrying `content` in place of the
+/// entry's own. `content_truncated` marks a row whose content is a prefix.
+///
+/// The marker is only ever set, never cleared: a caller reading a row without
+/// it holds the whole entry, which is the claim every other read of this store
+/// makes too.
+fn kb_get_row(entry: &KnowledgeEntry, content: &str, content_truncated: bool) -> serde_json::Value {
+    let mut row = serde_json::json!({
+        "id": entry.id,
+        "content": content,
+        "summary": entry.summary,
+        "tags": entry.tags,
+        "metadata": entry.metadata,
+        "source": entry.source,
+        "created_at": entry.created_at,
+        "updated_at": entry.updated_at,
+    });
+    if content_truncated {
+        row["content_truncated"] = serde_json::Value::Bool(true);
+    }
+    row
+}
+
+/// One `builtin_knowledge_base_get` row, its `content` cut to bring the row
+/// within `budget` bytes. Answers the row and whether the content was cut.
+///
+/// Why cutting is needed at all: nothing on the knowledge write path bounds an
+/// entry's length, unlike a scratchpad note, which `MAX_NOTE_BYTES` holds under
+/// the response budget by construction. So one ordinary read can produce a row
+/// of any size, and the generic tool-result cap downstream cuts raw bytes -
+/// which lands mid-JSON and hands the model a row it cannot parse. A row cut
+/// here stays valid JSON and says it was cut.
+///
+/// **`content` is the only field this cuts, so the budget is not a guarantee
+/// about the whole row.** An entry whose tags or metadata alone overrun it
+/// still travels whole, because those fields have no write-side cap either and
+/// dropping them would change what the entry means. Bounding a knowledge entry
+/// belongs on the write path, where one cap would hold every read; until then
+/// this closes the reachable half, since `content` is the field a model writes
+/// and the one that grows.
+///
+/// Why a search rather than arithmetic: JSON escaping means a character count
+/// does not convert to a byte count, so each candidate has to be measured. The
+/// search keeps the largest number of characters that fits, so an entry a
+/// little over the budget loses a little of its tail rather than half of it.
+/// It cuts on `char` boundaries, so the content is always valid UTF-8.
+fn kb_get_row_within(entry: &KnowledgeEntry, budget: usize) -> (serde_json::Value, bool) {
+    let whole = kb_get_row(entry, &entry.content, false);
+    if whole.to_string().len() <= budget {
+        return (whole, false);
+    }
+
+    // `hi` never fits (the row above is the same content and smaller, having no
+    // marker), and `lo` fits unless even an empty content overruns - the
+    // metadata case above, where `lo` stays 0 and the row travels anyway.
+    // Each step strictly narrows the interval, so this ends in O(log n).
+    let total = entry.content.chars().count();
+    let (mut lo, mut hi) = (0usize, total);
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        let candidate: String = entry.content.chars().take(mid).collect();
+        if kb_get_row(entry, &candidate, true).to_string().len() <= budget {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+
+    // An entry with no content to cut is not a cut entry, whatever else made
+    // the row too large. Claiming otherwise would tell the model it holds the
+    // start of something when it holds all there was.
+    let cut = lo < total;
+    let content: String = entry.content.chars().take(lo).collect();
+    (kb_get_row(entry, &content, cut), cut)
 }
 
 fn optional_string(args: &serde_json::Value, key: &str) -> Option<String> {
@@ -7024,6 +7283,417 @@ mod tests {
         );
     }
 
+    // -- knowledge-base reads: entries by id (#1120) -------------------------
+
+    /// Every id batch one `builtin_knowledge_base_get` call handed the store.
+    type KbGetProbe = std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>;
+
+    /// A knowledge-base service whose batch read answers out of `entries`, plus
+    /// a probe holding the id batches it was asked for.
+    ///
+    /// The fake resolves an id only when `entries` holds it. That is what the
+    /// store does for an id that never existed, for one that was retired, and
+    /// for one that belongs to another user alike, so a test written against
+    /// this fake cannot tell those three apart - and neither can the model.
+    fn kb_service_holding(
+        entries: Vec<desktop_assistant_core::domain::KnowledgeEntry>,
+    ) -> (BuiltinToolService, KbGetProbe) {
+        use std::sync::{Arc, Mutex};
+
+        let probe: KbGetProbe = Arc::new(Mutex::new(Vec::new()));
+        let probe_for_fn = Arc::clone(&probe);
+        let get_many_fn: KnowledgeGetManyFn = Arc::new(move |ids: Vec<String>| {
+            let entries = entries.clone();
+            let probe = Arc::clone(&probe_for_fn);
+            Box::pin(async move {
+                probe.lock().expect("probe lock").push(ids.clone());
+                Ok(entries
+                    .into_iter()
+                    .filter(|e| ids.contains(&e.id))
+                    .collect())
+            })
+        });
+        (
+            BuiltinToolService::new().with_knowledge_get_many(get_many_fn),
+            probe,
+        )
+    }
+
+    /// An entry with distinguishable content, so a test can prove the whole row
+    /// travelled and not just its id.
+    fn kb_full_entry(id: &str) -> desktop_assistant_core::domain::KnowledgeEntry {
+        let mut entry = desktop_assistant_core::domain::KnowledgeEntry::new(
+            id,
+            format!("the durable fact behind {id}"),
+            vec!["memory".to_string(), format!("topic:{id}")],
+        );
+        entry.summary = Some(format!("one line about {id}"));
+        entry.metadata = serde_json::json!({"confidence": "high"});
+        entry.source = Some("explicit".to_string());
+        entry.created_at = "2026-01-01".to_string();
+        entry.updated_at = "2026-01-02".to_string();
+        entry
+    }
+
+    /// Run `builtin_knowledge_base_get` and parse its response.
+    async fn kb_get_response(
+        service: &BuiltinToolService,
+        arguments: serde_json::Value,
+    ) -> serde_json::Value {
+        let raw = service
+            .execute_tool(TOOL_KB_GET, arguments)
+            .await
+            .expect("knowledge base get succeeds");
+        serde_json::from_str(&raw).expect("get response is JSON")
+    }
+
+    #[tokio::test]
+    async fn kb_get_returns_a_full_entry_by_id() {
+        // The point of the tool: an id the model already holds becomes the
+        // entry's text. Search cannot do this - it matches an entry's content,
+        // so a UUID finds the entry only when the entry mentions it.
+        let (service, _probe) = kb_service_holding(vec![kb_full_entry("kb-1")]);
+
+        let json = kb_get_response(&service, serde_json::json!({"ids": ["kb-1"]})).await;
+
+        assert_eq!(json["ok"], true, "{json}");
+        assert_eq!(json["returned"], 1);
+        let entry = &json["entries"][0];
+        assert_eq!(entry["id"], "kb-1");
+        assert_eq!(entry["content"], "the durable fact behind kb-1");
+        assert_eq!(entry["summary"], "one line about kb-1");
+        assert_eq!(entry["tags"], serde_json::json!(["memory", "topic:kb-1"]));
+        assert_eq!(entry["metadata"], serde_json::json!({"confidence": "high"}));
+        assert_eq!(entry["source"], "explicit");
+        assert_eq!(entry["created_at"], "2026-01-01");
+        assert_eq!(entry["updated_at"], "2026-01-02");
+        assert_eq!(
+            json["not_found"],
+            serde_json::json!([]),
+            "an id that resolved must not also be reported as missing"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_get_resolves_several_ids_in_one_call() {
+        // A recall block offers several candidates and the model often wants
+        // two or three of them. One round for three entries beats three rounds,
+        // so the store must see one batch, not one call per id.
+        let (service, probe) = kb_service_holding(vec![
+            kb_full_entry("kb-1"),
+            kb_full_entry("kb-2"),
+            kb_full_entry("kb-3"),
+        ]);
+
+        let json = kb_get_response(
+            &service,
+            serde_json::json!({"ids": ["kb-3", "kb-1", "kb-2"]}),
+        )
+        .await;
+
+        assert_eq!(json["returned"], 3, "{json}");
+        let ids: Vec<&str> = json["entries"]
+            .as_array()
+            .expect("entries is an array")
+            .iter()
+            .map(|e| e["id"].as_str().expect("id is a string"))
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["kb-3", "kb-1", "kb-2"],
+            "the entries come back in the order the ids were asked for"
+        );
+        let batches = probe.lock().expect("probe lock").clone();
+        assert_eq!(
+            batches.len(),
+            1,
+            "three ids must cost one read, not three: {batches:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_get_reports_a_missing_id_without_failing_the_batch() {
+        // An id that no longer resolves is a normal outcome (AGENTS.md 8.2):
+        // the reference is stale, which the model must be told, while every
+        // other entry it asked for still comes back.
+        let (service, _probe) = kb_service_holding(vec![kb_full_entry("kb-1")]);
+
+        let json = kb_get_response(
+            &service,
+            serde_json::json!({"ids": ["kb-1", "kb-gone", "kb-also-gone"]}),
+        )
+        .await;
+
+        assert_eq!(json["ok"], true, "a miss must not fail the call: {json}");
+        assert_eq!(json["returned"], 1);
+        assert_eq!(json["entries"][0]["id"], "kb-1");
+        assert_eq!(
+            json["not_found"],
+            serde_json::json!(["kb-gone", "kb-also-gone"]),
+            "every id that did not resolve is named, in the order asked for"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_get_gives_one_reason_for_every_miss() {
+        // A cross-tenant id must be indistinguishable from one that never
+        // existed, so the response carries no per-id reason at all - one list,
+        // and one wording that covers every way an id fails to resolve.
+        let (service, _probe) = kb_service_holding(vec![]);
+
+        let json = kb_get_response(&service, serde_json::json!({"ids": ["kb-a", "kb-b"]})).await;
+
+        assert_eq!(json["not_found"], serde_json::json!(["kb-a", "kb-b"]));
+        assert_eq!(json["returned"], 0);
+        let text = json.to_string();
+        for leak in ["another", "other user", "tenant", "retired", "deleted at"] {
+            assert!(
+                !text.to_lowercase().contains(leak),
+                "the response must not say why an id missed, found {leak:?} in {text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn kb_get_caps_the_batch_size() {
+        // The response travels to the model, so one call cannot be allowed to
+        // name an unbounded number of entries. Ids past the cap are dropped and
+        // the drop is reported, never silent.
+        let held: Vec<_> = (0..KNOWLEDGE_GET_MAX_IDS + 5)
+            .map(|i| kb_full_entry(&format!("kb-{i}")))
+            .collect();
+        let asked: Vec<String> = (0..KNOWLEDGE_GET_MAX_IDS + 5)
+            .map(|i| format!("kb-{i}"))
+            .collect();
+        let (service, probe) = kb_service_holding(held);
+
+        let json = kb_get_response(&service, serde_json::json!({"ids": asked})).await;
+
+        let batches = probe.lock().expect("probe lock").clone();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(
+            batches[0].len(),
+            KNOWLEDGE_GET_MAX_IDS,
+            "the store must never be asked for more ids than the cap allows"
+        );
+        assert_eq!(
+            json["truncated"], true,
+            "dropping ids must be reported, not silent: {json}"
+        );
+        assert!(
+            json["message"].as_str().is_some_and(|m| !m.is_empty()),
+            "a truncated response says what to do about it: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_get_bounds_the_response_bytes() {
+        // The batch cap bounds the number of entries, not their size. A handful
+        // of large entries would otherwise spend the model's whole context in
+        // one tool result.
+        let big = "y".repeat(MAX_NOTE_BYTES);
+        let held: Vec<_> = (0..(RESPONSE_BYTE_BUDGET / MAX_NOTE_BYTES) + 3)
+            .map(|i| {
+                let mut entry = kb_full_entry(&format!("kb-{i}"));
+                entry.content = big.clone();
+                entry
+            })
+            .collect();
+        let asked: Vec<String> = held.iter().map(|e| e.id.clone()).collect();
+        let count = asked.len();
+        let (service, _probe) = kb_service_holding(held);
+
+        let json = kb_get_response(&service, serde_json::json!({"ids": asked})).await;
+
+        let returned = json["returned"].as_u64().expect("returned is a number") as usize;
+        assert!(
+            returned < count,
+            "the response budget must drop entries once it is spent, got all {count}"
+        );
+        assert!(returned >= 1, "at least one entry always travels: {json}");
+        assert_eq!(json["truncated"], true, "{json}");
+    }
+
+    #[tokio::test]
+    async fn kb_get_cuts_an_entry_that_alone_overruns_the_response() {
+        // Nothing on the knowledge write path bounds an entry's length, unlike
+        // a scratchpad note. So "always emit at least one row" would emit a row
+        // of any size at all, and the generic tool-result cap downstream cuts
+        // raw bytes - landing mid-JSON and handing the model a row it cannot
+        // parse. The row travels cut instead, and says it was cut: a prefix
+        // taken for the whole entry is a fact acted on in half.
+        let mut entry = kb_full_entry("kb-huge");
+        entry.content = "z".repeat(RESPONSE_BYTE_BUDGET * 3);
+        let original = entry.content.len();
+        let (service, _probe) = kb_service_holding(vec![entry]);
+
+        let json = kb_get_response(&service, serde_json::json!({"ids": ["kb-huge"]})).await;
+
+        assert_eq!(json["returned"], 1, "the entry still travels: {json}");
+        let row = &json["entries"][0];
+        assert_eq!(
+            row["content_truncated"], true,
+            "a cut row must say it is a prefix, not the whole entry"
+        );
+        let carried = row["content"].as_str().expect("content is a string");
+        assert!(
+            carried.len() < original,
+            "the content must actually be cut, got {} of {original} bytes",
+            carried.len()
+        );
+        // The budget bounds the row, so measure the row: the array around it
+        // belongs to the envelope.
+        assert!(
+            serde_json::to_string(row).expect("row serializes").len() <= RESPONSE_BYTE_BUDGET,
+            "the cut row must fit the response budget"
+        );
+        assert_eq!(json["truncated"], true, "{json}");
+        assert!(
+            json["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("content_truncated")),
+            "the message must name the marker the model has to look for: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_get_keeps_as_much_of_a_long_entry_as_fits() {
+        // A cut is a loss, so it has to be the smallest one that works. An
+        // entry a little over the budget must lose a little of its tail, not
+        // an arbitrary fraction of itself.
+        let mut entry = kb_full_entry("kb-long");
+        entry.content = "z".repeat(RESPONSE_BYTE_BUDGET + 200);
+        let (service, _probe) = kb_service_holding(vec![entry]);
+
+        let json = kb_get_response(&service, serde_json::json!({"ids": ["kb-long"]})).await;
+
+        let carried = json["entries"][0]["content"]
+            .as_str()
+            .expect("content is a string")
+            .len();
+        assert_eq!(json["entries"][0]["content_truncated"], true);
+        assert!(
+            carried > RESPONSE_BYTE_BUDGET - 1024,
+            "a row 200 bytes over the budget must keep nearly all of its \
+             content, kept {carried} of {}",
+            RESPONSE_BYTE_BUDGET + 200
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_get_does_not_claim_a_cut_it_did_not_make() {
+        // An entry can overrun the budget through metadata alone, which no
+        // write path bounds and this read does not cut. Its content is
+        // delivered whole, so the row must not say it is a prefix: a model told
+        // it holds the start of something would go looking for a rest that
+        // does not exist.
+        let mut entry = kb_full_entry("kb-fat-metadata");
+        entry.content = String::new();
+        entry.metadata = serde_json::json!({"blob": "m".repeat(RESPONSE_BYTE_BUDGET * 2)});
+        let (service, _probe) = kb_service_holding(vec![entry]);
+
+        let json = kb_get_response(&service, serde_json::json!({"ids": ["kb-fat-metadata"]})).await;
+
+        assert_eq!(json["returned"], 1, "the entry still travels: {json}");
+        assert_eq!(json["entries"][0]["content"], "");
+        assert_eq!(
+            json["entries"][0]["content_truncated"],
+            serde_json::Value::Null,
+            "content that was never cut must carry no cut marker"
+        );
+        assert_eq!(
+            json["truncated"],
+            serde_json::Value::Null,
+            "and the response must not claim a truncation it did not make"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_get_reads_a_single_id_from_the_id_field() {
+        // The delete tool accepts `id` as well as `ids`, and a model that has
+        // one id reaches for the singular field. Accept both rather than
+        // refusing a call that is unambiguous.
+        let (service, _probe) = kb_service_holding(vec![kb_full_entry("kb-1")]);
+
+        let json = kb_get_response(&service, serde_json::json!({"id": "kb-1"})).await;
+
+        assert_eq!(json["returned"], 1, "{json}");
+        assert_eq!(json["entries"][0]["id"], "kb-1");
+    }
+
+    #[tokio::test]
+    async fn kb_get_asks_for_a_repeated_id_once() {
+        // A model assembling ids from a recall block and a search result can
+        // name the same entry twice. That is one read and one row, not two.
+        let (service, probe) = kb_service_holding(vec![kb_full_entry("kb-1")]);
+
+        let json = kb_get_response(
+            &service,
+            serde_json::json!({"ids": ["kb-1", "kb-1"], "id": "kb-1"}),
+        )
+        .await;
+
+        assert_eq!(json["returned"], 1, "{json}");
+        let batches = probe.lock().expect("probe lock").clone();
+        assert_eq!(batches, vec![vec!["kb-1".to_string()]]);
+    }
+
+    #[tokio::test]
+    async fn kb_get_without_an_id_is_refused() {
+        // A call that names nothing is a malformed request, not an empty
+        // result, so it fails the way the delete tool's does.
+        let (service, _probe) = kb_service_holding(vec![kb_full_entry("kb-1")]);
+
+        let err = service
+            .execute_tool(TOOL_KB_GET, serde_json::json!({}))
+            .await
+            .expect_err("a call naming no id is refused");
+
+        assert!(
+            err.to_string().contains("`id` or `ids`"),
+            "the refusal names the arguments the caller should have sent: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_get_says_the_knowledge_base_is_not_configured() {
+        // Advertised unconditionally, like its three siblings, so an unwired
+        // knowledge base must answer the same way they do.
+        let service = BuiltinToolService::new();
+
+        let err = service
+            .execute_tool(TOOL_KB_GET, serde_json::json!({"ids": ["kb-1"]}))
+            .await
+            .expect_err("an unwired knowledge base cannot answer");
+
+        assert!(
+            err.to_string().contains("knowledge base not configured"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn kb_get_schema_says_where_ids_come_from() {
+        // An id is only actionable if the model knows where to find one. The
+        // schema names both sources, and says search cannot stand in for it.
+        let def = fully_wired_service()
+            .tool_definitions()
+            .into_iter()
+            .find(|d| d.name == TOOL_KB_GET)
+            .expect("builtin_knowledge_base_get is advertised");
+        let text = format!("{} {}", def.description, def.parameters);
+        for source in ["[Recall]", TOOL_KB_SEARCH, TOOL_KB_LIST] {
+            assert!(
+                text.contains(source),
+                "the schema must name {source} as a place ids come from: {text}"
+            );
+        }
+        assert!(
+            text.contains(&KNOWLEDGE_GET_MAX_IDS.to_string()),
+            "the schema must advertise the batch cap it enforces: {text}"
+        );
+    }
+
     #[tokio::test]
     async fn tool_search_with_closure() {
         use desktop_assistant_core::domain::ToolDefinition;
@@ -7688,6 +8358,7 @@ mod tests {
             })
         });
         let kb_get: KnowledgeGetFn = Arc::new(|_id| Box::pin(async { Ok(None) }));
+        let kb_get_many: KnowledgeGetManyFn = Arc::new(|_ids| Box::pin(async { Ok(Vec::new()) }));
         let tool_search: ToolSearchFn =
             Arc::new(|_query, _emb, _limit| Box::pin(async { Ok(Vec::new()) }));
         let tool_def: ToolDefinitionFn = Arc::new(|_name| Box::pin(async { Ok(None) }));
@@ -7708,6 +8379,7 @@ mod tests {
             .0
             .with_embedding(embed_fn, "test-embed-model".to_string())
             .with_knowledge_base(kb_write, kb_search, kb_delete, kb_list, kb_get)
+            .with_knowledge_get_many(kb_get_many)
             .with_tool_registry(tool_search, tool_def)
             .with_database(db_query)
             .with_conversation_search(conv_search)

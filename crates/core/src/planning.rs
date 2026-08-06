@@ -554,9 +554,8 @@ fn attached_entry<'a>(
 /// ([`PINNED_ENTRY_MAX_CHARS`](crate::ports::scratchpad::PINNED_ENTRY_MAX_CHARS)),
 /// because a note is capped at
 /// [`MAX_NOTE_BYTES`](crate::ports::scratchpad::MAX_NOTE_BYTES) and an entry is
-/// not. The id travels with it so the model can find the whole entry with
-/// `builtin_knowledge_base_search` when the bounded form is not enough - there
-/// is no by-id read tool, so the id is for recognition, not for a lookup.
+/// not. The id travels with it so the model can read the whole entry with
+/// `builtin_knowledge_base_get` when the bounded form is not enough.
 fn pinned_chunk(note: &RawNote<'_>, entry: Option<&str>) -> String {
     let mut chunk = format!("- {}:", note.key);
     if !note.content.is_empty() {
@@ -581,7 +580,7 @@ fn pinned_chunk(note: &RawNote<'_>, entry: Option<&str>) -> String {
             // otherwise render as a blank line.
             None => chunk.push_str(
                 " could not be read this round; \
-                 builtin_knowledge_base_search for it if you need it now",
+                 builtin_knowledge_base_get it if you need it now",
             ),
         }
     }

@@ -401,6 +401,7 @@ pub const CLASSIFIED_SOURCES: &[ClassifiedSource] = &[
             tool("builtin_knowledge_base_search", Read, Trusted),
             tool("builtin_knowledge_base_delete", Mutate, Trusted),
             tool("builtin_knowledge_base_list", Read, Trusted),
+            tool("builtin_knowledge_base_get", Read, Trusted),
             tool("builtin_tool_search", Read, Trusted),
             tool("builtin_notify", Present, Trusted),
             tool("builtin_sys_props", Read, Trusted),
@@ -1216,6 +1217,7 @@ mod tests {
         // claiming it is harmless.
         ("builtin_knowledge_base_search", Read, Trusted),
         ("builtin_knowledge_base_list", Read, Trusted),
+        ("builtin_knowledge_base_get", Read, Trusted),
         ("builtin_tool_search", Read, Trusted),
         ("builtin_notify", Present, Trusted),
         ("builtin_sys_props", Read, Trusted),
