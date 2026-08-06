@@ -34,32 +34,53 @@ The response therefore reports what was searched, not only what was found.
 `builtin_knowledge_base_write` takes a `summary` argument, in the single form and
 inside each object of the batch `entries` form. The model writes it, one line,
 saying what the entry says rather than naming its topic — because that line is
-what the entry is later offered back as, and a topic label tells a reader nothing
-it can act on.
+what stands in for the entry wherever entries are listed rather than read, and a
+topic label tells a reader nothing it can act on.
 
-The argument follows the same three-state rule every other optional field on that
-path follows:
+The argument follows the same rule `tags` follows:
 
 | The write sends | What happens |
 | --- | --- |
 | nothing, or `null` | The stored summary is kept. A create then stores none. |
-| a string | It is stored, cut to 200 characters and collapsed to one physical line. |
-| an empty string | The stored summary is cleared, and the entry reads back with no summary again. |
-| anything else | The write is refused, and nothing is stored. |
+| a string | Collapsed to one physical line, then cut to `SUMMARY_MAX_CHARS` (200) and stored. |
+| an empty string, or one that is only whitespace | The stored summary is cleared, and the entry reads back with no summary again. |
+| anything else | The write is refused. |
+
+The collapse comes before the cut, so a loosely-formatted line is not cut far
+shorter than a dense one saying the same thing — the rule and its reason live in
+`desktop_assistant_protocol::one_line`. Whitespace-only counts as empty for the
+same reason: the line is normalized first, and what is empty after that is empty.
 
 Two boundaries hold, and both are deliberate:
 
 - **A write with no summary is not refused.** Refusing it would lose the fact to
-  gain a one-liner, which is the wrong trade for a memory store. An entry with no
-  summary is a gap the maintenance pass closes, and every read path reports it
-  honestly as `null` in the meantime.
+  gain a one-liner, which is the wrong trade for a memory store. Every read path
+  reports the missing summary honestly as `null`, and a reader listing that entry
+  falls back to the start of its content.
 - **An over-long summary is cut, not refused.** A model that answers "one line"
   with a paragraph loses the tail of the line, never the write.
 
-Cleared means absent, not empty: the store maps an empty summary to `NULL`. An
-empty string would be a third state nothing wants — a render site would print a
-blank row instead of falling back to the content, and the maintenance pass finds
-its work with `WHERE summary IS NULL`.
+The write response reports the summary actually stored, next to the tags it
+reports for the same reason: the boundary rewrites both, and a caller that cannot
+see the stored value believes the entry carries what it sent.
+
+"The write is refused" is per entry, not per call. A batch whose third entry is
+malformed has already stored the first two, and the error carries none of their
+ids — the shape #1113 tracks, which this argument gives one more way to reach and
+does not otherwise change.
+
+Cleared means absent, not empty: the store maps an empty summary to `NULL`, on
+both halves of the upsert. An empty string would be a third state nothing wants —
+a render site would print a blank row instead of falling back to the content, and
+a maintenance pass looking for entries to summarize selects `WHERE summary IS
+NULL`.
+
+Two consumers of the field are designed and not yet built: the pass that writes
+the summaries of entries stored before the argument existed (#1099), and the
+`[Recall]` block that offers candidate entries to the model before its first move
+(#1100). Until they land, a summary is read by the knowledge tools and by each
+client's knowledge browser, and nothing fills one in that the model did not
+write.
 
 ## Scope, not match count
 

@@ -258,20 +258,29 @@ const TOOL_KB_WRITE: &str = "builtin_knowledge_base_write";
 ///
 /// It says what the line is *for* rather than only what it is. A model told
 /// "a summary" writes a topic label, and a list of topic labels tells a later
-/// reader nothing it can act on. Told that this line is what the entry is
-/// offered back as, it writes the fact.
+/// reader nothing it can act on. Told what the line will be offered back as,
+/// it writes the fact.
+///
+/// The purpose is written in the future tense on purpose: the block that offers
+/// candidate entries back is a later piece of work, and a schema that describes
+/// it as already running tells the model something it can falsify on its next
+/// search. What the line does *today* - stand in for the entry wherever many
+/// entries are listed at once - is stated as present fact beside it.
 fn summary_arg_description() -> String {
     format!(
         "One line saying what this entry says, written as a statement rather than as a topic \
-         label. This line is how the entry is offered back to you later, as a candidate you \
-         decide whether to open, so it has to carry the fact on its own: 'The user wants tag \
-         names to keep the facet colon' is useful, 'tag naming' is not. Write one for every \
-         entry. \
-         Line breaks become spaces, and a summary longer than {SUMMARY_MAX_CHARS} characters is \
-         cut to {SUMMARY_MAX_CHARS}, never rejected - a long one costs you the tail of the line, \
-         not the write. Leaving it out never fails the write either; the entry simply has no \
-         short form until a maintenance pass writes one. On a write that gives an `id`, leaving \
-         it out keeps the stored summary, and sending an empty string clears it."
+         label. It stands in for the entry wherever entries are listed rather than read, and it \
+         is the line this entry will be offered back to you as, a candidate you decide whether \
+         to open - so it has to carry the fact on its own: 'The user wants tag names to keep the \
+         facet colon' is useful, 'tag naming' is not. Write one for every entry. Line breaks and \
+         runs of spaces collapse to one space, and what is then longer than \
+         {SUMMARY_MAX_CHARS} characters is cut to {SUMMARY_MAX_CHARS}, never rejected - a long \
+         one costs you the tail of the line, not the write. Leaving it out never fails the write \
+         either; the entry then has no line of its own, and a reader listing it falls back to \
+         the start of your `content`. On a write that gives an `id`, leaving it out keeps the \
+         stored summary, and sending an empty or whitespace-only string clears it. The response \
+         reports the summary actually stored, which is the cut line rather than the one you \
+         sent when you sent a long one."
     )
 }
 
@@ -1386,6 +1395,12 @@ impl BuiltinToolService {
                 // stops the model believing an entry carries a tag it does not,
                 // and then searching for that tag and finding nothing.
                 "tags": saved.tags,
+                // The summary actually stored, for the same reason: the write
+                // path collapses the supplied line and cuts it at
+                // `SUMMARY_MAX_CHARS`, and an empty one clears the field
+                // outright. Without this the model cannot see that the line it
+                // sent is not the line the entry now carries.
+                "summary": saved.summary,
                 "created_at": saved.created_at,
                 "updated_at": saved.updated_at,
             }));
@@ -6797,6 +6812,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn kb_write_reports_the_summary_it_actually_stored() {
+        // The same reason the response reports the stored tags: this boundary
+        // rewrites what the caller sent - it collapses the line and cuts it at
+        // the cap. A model that cannot see the stored value believes the entry
+        // carries the paragraph it wrote.
+        use desktop_assistant_core::domain::SUMMARY_MAX_CHARS;
+
+        let (service, _store) = kb_service_with_tag_gate(None);
+
+        let response = kb_write_response(
+            &service,
+            serde_json::json!({
+                "content": "A fact worth keeping.",
+                "summary": "y".repeat(SUMMARY_MAX_CHARS * 2),
+            }),
+        )
+        .await;
+
+        let reported = response["entries"][0]["summary"]
+            .as_str()
+            .expect("the response reports the stored summary");
+        assert_eq!(
+            reported.chars().count(),
+            SUMMARY_MAX_CHARS,
+            "the response shows the cut line, not the one that was sent: {reported}"
+        );
+
+        // An entry that has none reports it as null, so "no summary" and "the
+        // response dropped the field" cannot be confused.
+        let bare =
+            kb_write_response(&service, serde_json::json!({"content": "A separate fact."})).await;
+        assert_eq!(
+            bare["entries"][0]["summary"],
+            serde_json::Value::Null,
+            "an entry with no summary reports null rather than omitting the field"
+        );
+    }
+
+    #[tokio::test]
     async fn kb_write_treats_a_whitespace_only_summary_as_a_clear() {
         // One rule, applied in one order: collapse to a line first, then read
         // absent / present / empty. A summary of nothing but whitespace
@@ -6896,10 +6950,23 @@ mod tests {
              that it cuts rather than refuses: {text}"
         );
         // Absent and present-and-empty do different things, and only the
-        // schema can tell the model which is which.
+        // schema can tell the model which is which. A line of nothing but
+        // whitespace clears too, so a description that says only "empty
+        // string" invites a model to wipe a summary while believing it set
+        // one.
         assert!(
-            text.contains("empty"),
-            "the description must say how to clear a summary: {text}"
+            text.contains("empty or whitespace-only string clears it"),
+            "the description must say how to clear a summary, and that a blank \
+             line does it too: {text}"
+        );
+        // The block that offers candidate entries back is a later piece of
+        // work. Describing it as already running tells the model something it
+        // can falsify on its next search, so the purpose is written as what
+        // the line WILL be offered back as.
+        assert!(
+            text.contains("will be offered back"),
+            "the candidate list is not built yet, so the description must not \
+             describe it in the present tense: {text}"
         );
 
         // The batch form is held to the same shape. A model that batches its
