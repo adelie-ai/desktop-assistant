@@ -1,6 +1,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::CoreError;
 
@@ -22,6 +23,13 @@ pub trait EmbeddingClient: Send + Sync {
     /// server for the model digest so that a re-pulled model is detected.
     async fn model_identifier(&self) -> Result<String, CoreError>;
 }
+
+/// Hard cap on how long an embedding call may block a real-time request. A
+/// slow or wedged embedding backend (for example a stuck Ollama) must not hang
+/// the turn: on timeout the caller proceeds without a vector, so a semantic
+/// search falls back to full text, and a write persists unembedded for the
+/// background backfill to fill in later.
+pub const EMBED_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Boxed async embedding function for passing embedding capability through
 /// non-generic boundaries. Created from a concrete `EmbeddingClient` impl

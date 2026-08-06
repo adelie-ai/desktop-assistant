@@ -94,7 +94,7 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
         let exclude_tags = normalize_tag_filter(exclude_tags);
 
         // No query embedding (e.g. the embedding backend timed out — see
-        // `EMBED_TIMEOUT` in mcp-client): the hybrid query's vector branch
+        // `EMBED_TIMEOUT` in core's embedding port): the hybrid query's vector branch
         // (`chunk <=> $1`) would error on a 0-dimension vector, so fall back to
         // the full-text-only path. The fallback reports the same fields, so a
         // missing embedding backend degrades recall and nothing else.

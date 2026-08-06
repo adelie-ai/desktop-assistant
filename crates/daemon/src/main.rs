@@ -1715,12 +1715,32 @@ async fn main() -> Result<()> {
         // reading the per-turn / per-command `current_user_id()`. The SAME
         // closures back both the builtin tools (Adele's writes) and the API
         // handler (client writes), so a change from either path emits once.
+        //
+        // That single funnel is also why the write closure embeds (#717): the
+        // builtin tool, the plan-step notes `begin_step`/`complete_step` record,
+        // and a client's own write all pass through here, so no writer has to
+        // remember to do it. Inline rather than only in the background backfill,
+        // because the case that matters for a pad is the agent looking for what
+        // it wrote moments ago — exactly the window the backfill's cadence
+        // leaves open. `embed_notes` is bounded by `EMBED_TIMEOUT`, so a wedged
+        // backend leaves the notes unembedded and the write still lands.
         let sp_w = Arc::clone(&sp_store);
         let reg_w = Arc::clone(&background_task_registry);
+        let sp_embed = embedding_fn
+            .clone()
+            .map(|embed| (embed, embedding_model_id.clone()));
         let write_fn: ScratchpadWriteFn = Arc::new(move |conv: String, notes| {
             let store = Arc::clone(&sp_w);
             let reg = Arc::clone(&reg_w);
+            let embedding = sp_embed.clone();
             Box::pin(async move {
+                let mut notes = notes;
+                if let Some((embed, model)) = &embedding {
+                    desktop_assistant_core::ports::scratchpad::embed_notes(
+                        embed, model, &mut notes,
+                    )
+                    .await;
+                }
                 let saved = store.write(&conv, &notes).await?;
                 reg.notify_scratchpad_changed(&current_user_id(), conv);
                 Ok(saved)
@@ -1740,15 +1760,28 @@ async fn main() -> Result<()> {
         });
 
         let sp_s = Arc::clone(&sp_store);
-        let search_fn: ScratchpadSearchFn =
-            Arc::new(move |conv, query, note_type: Option<String>, limit| {
+        let search_fn: ScratchpadSearchFn = Arc::new(
+            move |conv,
+                  query,
+                  query_embedding: Vec<f32>,
+                  embedding_model: String,
+                  note_type: Option<String>,
+                  limit| {
                 let store = Arc::clone(&sp_s);
                 Box::pin(async move {
                     store
-                        .search(&conv, &query, note_type.as_deref(), limit)
+                        .search(
+                            &conv,
+                            &query,
+                            query_embedding,
+                            &embedding_model,
+                            note_type.as_deref(),
+                            limit,
+                        )
                         .await
                 })
-            });
+            },
+        );
 
         let sp_d = Arc::clone(&sp_store);
         let reg_d = Arc::clone(&background_task_registry);
@@ -2084,6 +2117,19 @@ async fn main() -> Result<()> {
                     Ok(n) if n > 0 => tracing::info!("backfilled {n} tag embedding(s)"),
                     Ok(_) => tracing::debug!("no tag embeddings to backfill"),
                     Err(e) => tracing::warn!("tag embedding backfill failed: {e}"),
+                }
+
+                // The scratchpad write path embeds a note as it is written, so
+                // this pass exists for the notes it could not embed and for the
+                // ones a model change cleared (#717).
+                match desktop_assistant_storage::embedding_backfill::backfill_scratchpad_embeddings(
+                    &pool, &embed_fn, &model,
+                )
+                .await
+                {
+                    Ok(n) if n > 0 => tracing::info!("backfilled {n} scratchpad embedding(s)"),
+                    Ok(_) => tracing::debug!("no scratchpad embeddings to backfill"),
+                    Err(e) => tracing::warn!("scratchpad embedding backfill failed: {e}"),
                 }
 
                 tokio::select! {

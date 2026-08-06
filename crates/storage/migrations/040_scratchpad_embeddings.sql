@@ -1,0 +1,32 @@
+-- Issue #717: give the scratchpad a vector, so the agent can find its own note
+-- again by meaning and not only by wording.
+--
+-- The pad is the agent's short-term working memory: it writes a distilled
+-- finding, then searches for it later in the same task or a later one. A
+-- full-text search returns that note only when the search happens to reuse the
+-- same words, and the pad exists because the agent re-summarizes as it goes.
+--
+-- Shape matches `knowledge_base`, `tool_definitions` and `skill_index`:
+-- `embedding` is `vector[]`, one vector per content chunk, and
+-- `embedding_model` records which model produced them. A note is usually one
+-- chunk, but `MAX_NOTE_BYTES` is 8 KiB against an 800-character chunk, so the
+-- array is what keeps a long note fully covered.
+--
+-- Written on the write path (`ScratchpadStore::write`) rather than only by the
+-- background backfill, because the case that matters is the agent looking for
+-- what it wrote moments ago. NULL is the normal degraded state -- a slow or
+-- wedged embedding backend leaves the vector out and the row lands anyway, for
+-- `backfill_scratchpad_embeddings` to fill in. A NULL-embedding row stays
+-- reachable through the full-text arm meanwhile.
+--
+-- Row level security needs nothing here: migration 029 already enabled it on
+-- `scratchpads`, and its policy is on `user_id`, which these columns do not
+-- change.
+--
+-- The migration runner (pool.rs) applies each migration at most once, tracked
+-- in the `schema_migrations` ledger, but every statement here MUST still be
+-- idempotent: a database migrated before that ledger existed replays the whole
+-- set once on its first boot under it.
+
+ALTER TABLE scratchpads ADD COLUMN IF NOT EXISTS embedding vector[];
+ALTER TABLE scratchpads ADD COLUMN IF NOT EXISTS embedding_model TEXT;

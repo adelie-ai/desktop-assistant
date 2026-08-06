@@ -2627,6 +2627,9 @@ where
                         note_type,
                         sequence,
                         done,
+                        // Filled in by the write closure, the one place every
+                        // scratchpad write passes through (#717).
+                        embedding: None,
                     }],
                 )
                 .await

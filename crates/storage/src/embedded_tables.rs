@@ -31,4 +31,27 @@ pub const EMBEDDED_TABLES: &[&str] = &[
     "tool_definitions",
     "skill_index",
     "tag_registry",
+    "scratchpads",
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::EMBEDDED_TABLES;
+
+    /// Acceptance (#717): the scratchpad holds vectors, so it must take part in
+    /// the embedding lifecycle. Without the declaration the stale sweep never
+    /// clears its vectors, and after a model change every scratchpad search
+    /// compares mismatched dimensions -- which pgvector answers with an error,
+    /// not a miss.
+    ///
+    /// The schema-derived companion in `tests/embedded_table_registry.rs` needs
+    /// a database; this one runs in the ordinary gate.
+    #[test]
+    fn scratchpads_appears_in_embedded_tables() {
+        assert!(
+            EMBEDDED_TABLES.contains(&"scratchpads"),
+            "scratchpads holds an embedding column but is absent from EMBEDDED_TABLES, \
+             so the lifecycle sweeps skip it: {EMBEDDED_TABLES:?}"
+        );
+    }
+}

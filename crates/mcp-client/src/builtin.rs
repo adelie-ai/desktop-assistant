@@ -9,7 +9,7 @@ use desktop_assistant_core::ports::client_tools::current_client_tools;
 use desktop_assistant_core::ports::conversation_ctx::current_conversation_id;
 use desktop_assistant_core::ports::conversation_search::ConversationSearchFn;
 use desktop_assistant_core::ports::database::DbQueryFn;
-use desktop_assistant_core::ports::embedding::EmbedFn;
+use desktop_assistant_core::ports::embedding::{EMBED_TIMEOUT, EmbedFn};
 use desktop_assistant_core::ports::knowledge::{
     AVAILABLE_TAGS_LIMIT, KNOWLEDGE_TAG_CENSUS_SAMPLE, KnowledgeDeleteFn, KnowledgeGetFn,
     KnowledgeListFn, KnowledgeListQuery, KnowledgeSearchFn, KnowledgeTagResolveFn,
@@ -281,13 +281,6 @@ const TOOL_SKILL_GET: &str = "builtin_skill_get";
 /// [`BuiltinToolService::skill_get`]'s call site reads as intent, not a
 /// magic string.
 const SKILL_GET_OWN_SCOPE: &str = "self";
-
-/// Hard cap on how long an embedding call may block a real-time request. A
-/// slow/wedged embedding backend (e.g. a stuck Ollama) must not hang the turn:
-/// on timeout we return no embedding, so semantic search falls back to FTS and
-/// KB writes persist without an embedding for the background dreaming/backfill
-/// cycle to fill in later.
-const EMBED_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The active embedding backend: the function that turns a query into a vector,
 /// together with the identifier of the model behind it.
@@ -894,17 +887,18 @@ impl BuiltinToolService {
             ToolDefinition::new(
                 TOOL_SCRATCHPAD_SEARCH,
                 "Read this conversation's scratchpad. Omit `query` and `keys` to list all notes \
-                 (ordered by type, then `sequence`); pass `query` for a full-text search over \
-                 note keys and content; pass `keys` to fetch specific notes. Pass `type` to \
-                 restrict a list/search to one category, e.g. `type: \"todo\"` for just your \
-                 plan. Each returned note includes its `type`, `sequence`, and `done`. \
-                 `max_results` is required. Results are bounded — if the response is truncated \
-                 you'll get `truncated: true` and should narrow with a `query`, a `type`, or a \
-                 smaller key set.",
+                 (ordered by type, then `sequence`); pass `query` to search note keys and \
+                 content by meaning as well as by wording, so a note is findable even when you \
+                 have since rephrased what it says; pass `keys` to fetch specific notes. Pass \
+                 `type` to restrict a list/search to one category, e.g. `type: \"todo\"` for \
+                 just your plan. Each returned note includes its `type`, `sequence`, and \
+                 `done`. `max_results` is required. Results are bounded — if the response is \
+                 truncated you'll get `truncated: true` and should narrow with a `query`, a \
+                 `type`, or a smaller key set.",
                 serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "query": {"type": "string", "description": "Full-text query over note keys + content. Omit to list all notes."},
+                        "query": {"type": "string", "description": "Search note keys + content. Matches on meaning as well as on exact words, so describing what you are looking for works as well as quoting it. Omit to list all notes."},
                         "keys": {
                             "type": "array",
                             "items": {"type": "string"},
@@ -2237,7 +2231,22 @@ impl BuiltinToolService {
                 let search = self.scratchpad_search_fn.as_ref().ok_or_else(|| {
                     CoreError::ToolExecution("scratchpad not configured".to_string())
                 })?;
-                search(conversation_id, query, note_type, limit).await?
+                // The pad is the agent's own working memory, and it
+                // re-summarizes as it goes -- so the words it searches with are
+                // often not the words it wrote. Embed the query so the store's
+                // vector arm can run; an empty vector (no backend, or one that
+                // stalled inside `EMBED_TIMEOUT`) reads as "full text only"
+                // (#717).
+                let (query_embedding, embedding_model) = self.embed_query(&query).await;
+                search(
+                    conversation_id,
+                    query,
+                    query_embedding,
+                    embedding_model,
+                    note_type,
+                    limit,
+                )
+                .await?
             } else {
                 let list = self.scratchpad_list_fn.as_ref().ok_or_else(|| {
                     CoreError::ToolExecution("scratchpad not configured".to_string())
@@ -2601,6 +2610,9 @@ fn parse_new_note(obj: &serde_json::Value) -> Option<NewScratchpadNote> {
         note_type,
         sequence,
         done,
+        // Filled in by the write closure, the one place every scratchpad write
+        // passes through (#717).
+        embedding: None,
     })
 }
 
@@ -2919,6 +2931,18 @@ mod tests {
         BuiltinToolService,
         Arc<std::sync::Mutex<Vec<ScratchpadNote>>>,
     ) {
+        scratchpad_service_with_search(None)
+    }
+
+    /// As [`scratchpad_service`], but with `search` standing in for the
+    /// in-memory substring search, so a test can observe exactly what the tool
+    /// hands the store.
+    fn scratchpad_service_with_search(
+        search: Option<ScratchpadSearchFn>,
+    ) -> (
+        BuiltinToolService,
+        Arc<std::sync::Mutex<Vec<ScratchpadNote>>>,
+    ) {
         use std::pin::Pin;
         let store: Arc<std::sync::Mutex<Vec<ScratchpadNote>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -3012,24 +3036,31 @@ mod tests {
         );
 
         let s = Arc::clone(&store);
-        let search_fn: ScratchpadSearchFn = Arc::new(
-            move |conv: String, query: String, note_type: Option<String>, limit: usize| {
-                let store = Arc::clone(&s);
-                Box::pin(async move {
-                    let guard = store.lock().unwrap();
-                    Ok(guard
-                        .iter()
-                        .filter(|n| {
-                            n.conversation_id == conv
-                                && (n.content.contains(&query) || n.key.contains(&query))
-                                && note_type.as_deref().is_none_or(|t| n.note_type == t)
-                        })
-                        .take(limit)
-                        .cloned()
-                        .collect())
-                })
-            },
-        );
+        let search_fn: ScratchpadSearchFn = search.unwrap_or_else(|| {
+            Arc::new(
+                move |conv: String,
+                      query: String,
+                      _query_embedding: Vec<f32>,
+                      _embedding_model: String,
+                      note_type: Option<String>,
+                      limit: usize| {
+                    let store = Arc::clone(&s);
+                    Box::pin(async move {
+                        let guard = store.lock().unwrap();
+                        Ok(guard
+                            .iter()
+                            .filter(|n| {
+                                n.conversation_id == conv
+                                    && (n.content.contains(&query) || n.key.contains(&query))
+                                    && note_type.as_deref().is_none_or(|t| n.note_type == t)
+                            })
+                            .take(limit)
+                            .cloned()
+                            .collect())
+                    })
+                },
+            )
+        });
 
         let d = Arc::clone(&store);
         let delete_many_fn: ScratchpadDeleteManyFn =
@@ -3628,6 +3659,87 @@ mod tests {
             assert_eq!(results["results"][0]["key"], "t1");
         })
         .await;
+    }
+
+    /// Somewhere to record the `(query vector, model)` pair the search tool
+    /// hands the store.
+    type QueryRecorder = Arc<std::sync::Mutex<Option<(Vec<f32>, String)>>>;
+
+    fn query_recorder() -> QueryRecorder {
+        Arc::new(std::sync::Mutex::new(None))
+    }
+
+    /// A scratchpad search that records what it was handed and returns nothing.
+    fn recording_search(recorder: &QueryRecorder) -> ScratchpadSearchFn {
+        let recorder = Arc::clone(recorder);
+        Arc::new(
+            move |_conv: String,
+                  _query: String,
+                  embedding: Vec<f32>,
+                  model: String,
+                  _note_type: Option<String>,
+                  _limit: usize| {
+                let recorder = Arc::clone(&recorder);
+                Box::pin(async move {
+                    *recorder.lock().unwrap() = Some((embedding, model));
+                    Ok(Vec::new())
+                })
+            },
+        )
+    }
+
+    /// Acceptance (#717): the tool embeds the query and hands the vector to the
+    /// store together with the model that produced it. Without the pair the
+    /// store's vector arm can never run, and a vector paired with the wrong
+    /// model name searches rows of another dimension -- which pgvector answers
+    /// with an error, not a miss.
+    #[tokio::test]
+    async fn scratchpad_search_passes_the_query_embedding_and_its_model_to_the_store() {
+        let seen = query_recorder();
+        let embed: EmbedFn = Arc::new(|_| Box::pin(async { Ok(vec![vec![0.5_f32, 0.25]]) }));
+
+        let (base, _store) = scratchpad_service_with_search(Some(recording_search(&seen)));
+        let service = base.with_embedding(embed, "nomic-embed-text@abc".to_string());
+
+        with_conversation_id(ConversationId::from("c1"), async {
+            service
+                .execute_tool(
+                    TOOL_SCRATCHPAD_SEARCH,
+                    serde_json::json!({"query": "stay hydrated", "max_results": 10}),
+                )
+                .await
+                .unwrap();
+        })
+        .await;
+
+        let recorded = seen.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            Some((vec![0.5_f32, 0.25], "nomic-embed-text@abc".to_string())),
+            "the query vector and its model must both reach the store"
+        );
+    }
+
+    /// With no embedding backend the tool still searches, handing over an empty
+    /// vector -- the store reads that as "take the full-text path".
+    #[tokio::test]
+    async fn scratchpad_search_without_an_embedding_backend_passes_an_empty_vector() {
+        let seen = query_recorder();
+        let (service, _store) = scratchpad_service_with_search(Some(recording_search(&seen)));
+
+        with_conversation_id(ConversationId::from("c1"), async {
+            service
+                .execute_tool(
+                    TOOL_SCRATCHPAD_SEARCH,
+                    serde_json::json!({"query": "deploy", "max_results": 10}),
+                )
+                .await
+                .unwrap();
+        })
+        .await;
+
+        let recorded = seen.lock().unwrap().clone();
+        assert_eq!(recorded, Some((Vec::new(), String::new())));
     }
 
     #[tokio::test]

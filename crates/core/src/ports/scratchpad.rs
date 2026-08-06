@@ -3,24 +3,49 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::CoreError;
+use crate::chunking::{CHUNK_MAX_CHARS, CHUNK_OVERLAP, chunk_text};
 use crate::domain::{DEFAULT_NOTE_TYPE, ScratchpadNote};
+use crate::ports::embedding::{EMBED_TIMEOUT, EmbedFn};
+
+/// One note's vectors and the model that produced them (#717).
+///
+/// One type rather than two loose fields because a search scopes its vector arm
+/// to the model that produced the stored vector. A vector paired with another
+/// model's name is compared against rows of another dimension, which pgvector
+/// answers with an error rather than a miss -- so the two may only ever be set,
+/// carried and replaced together.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NoteEmbedding {
+    /// One vector per content chunk, in chunk order. A note is usually a single
+    /// chunk; [`MAX_NOTE_BYTES`] is what makes more than one possible.
+    pub chunks: Vec<Vec<f32>>,
+    /// Identifier of the model that produced `chunks`.
+    pub model: String,
+}
 
 /// A note to upsert into the scratchpad. Carries the structured fields that
 /// don't fit a bare `(key, content)` pair: a free-text `note_type`
-/// (default `note`), an optional `sequence` (sorted within a type), and a
-/// `done` flag. Construct via [`NewScratchpadNote::new`] and the field
-/// setters, or as a struct literal.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// (default `note`), an optional `sequence` (sorted within a type), a
+/// `done` flag, and the note's own vector when the writer embedded it inline.
+/// Construct via [`NewScratchpadNote::new`] and the field setters, or as a
+/// struct literal.
+#[derive(Debug, Clone, PartialEq)]
 pub struct NewScratchpadNote {
     pub key: String,
     pub content: String,
     pub note_type: String,
     pub sequence: Option<i32>,
     pub done: bool,
+    /// The note's vector, when the writer embedded it before the write (see
+    /// [`embed_notes`]). `None` stores the note unembedded and leaves it for
+    /// the background backfill, which is the normal degraded state when no
+    /// embedding backend is configured or the backend stalled.
+    pub embedding: Option<NoteEmbedding>,
 }
 
 impl NewScratchpadNote {
-    /// A `note`-typed, unsequenced, not-done upsert for `key` / `content`.
+    /// A `note`-typed, unsequenced, not-done, unembedded upsert for
+    /// `key` / `content`.
     pub fn new(key: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
             key: key.into(),
@@ -28,6 +53,91 @@ impl NewScratchpadNote {
             note_type: DEFAULT_NOTE_TYPE.to_string(),
             sequence: None,
             done: false,
+            embedding: None,
+        }
+    }
+
+    /// The text embedded for this note: its key and its content.
+    ///
+    /// The key is part of it because the table's `tsv` covers
+    /// `note_key || ' ' || content`, and because a key like `outcome-1.2` is
+    /// often the most compact statement of what the note is about. Both the
+    /// inline path here and `backfill_scratchpad_embeddings` build this same
+    /// string -- a vector produced from a different one is not comparable with
+    /// the vectors it would be ranked against.
+    pub fn embed_text(&self) -> String {
+        format!("{} {}", self.key, self.content)
+    }
+}
+
+/// Embed a batch of notes in place, so a note written now is semantically
+/// findable now (#717).
+///
+/// The background backfill runs on a several-minute cadence, and the case that
+/// matters for a scratchpad is the agent looking for what it wrote moments ago
+/// -- exactly the window that cadence leaves open. So the write path embeds,
+/// and the backfill is the safety net rather than the only path.
+///
+/// Bounded by [`EMBED_TIMEOUT`]: a wedged backend must not hang the turn. On a
+/// timeout, an error, or an answer that does not carry one vector per chunk,
+/// every note is left unembedded and the write still lands. Those rows carry a
+/// NULL vector, stay reachable through the full-text arm, and are picked up by
+/// the next backfill pass.
+///
+/// All-or-nothing on purpose: a short answer from the embedder would otherwise
+/// be zipped chunk-to-note out of step, pairing a note with another note's
+/// vector. A wrong vector is worse than no vector, because nothing later
+/// detects it.
+pub async fn embed_notes(embed: &EmbedFn, model: &str, notes: &mut [NewScratchpadNote]) {
+    if notes.is_empty() {
+        return;
+    }
+
+    // Chunk every note, remembering which note each chunk belongs to, so one
+    // backend round trip covers the whole batch.
+    let mut owners: Vec<usize> = Vec::new();
+    let mut texts: Vec<String> = Vec::new();
+    for (index, note) in notes.iter().enumerate() {
+        for chunk in chunk_text(&note.embed_text(), CHUNK_MAX_CHARS, CHUNK_OVERLAP) {
+            owners.push(index);
+            texts.push(chunk);
+        }
+    }
+
+    let expected = texts.len();
+    let vectors = match tokio::time::timeout(EMBED_TIMEOUT, embed(texts)).await {
+        Ok(Ok(vectors)) if vectors.len() == expected => vectors,
+        Ok(Ok(vectors)) => {
+            tracing::warn!(
+                returned = vectors.len(),
+                expected,
+                "embedder answered with the wrong number of vectors; \
+                 writing the notes unembedded for the backfill"
+            );
+            return;
+        }
+        Ok(Err(e)) => {
+            tracing::warn!("failed to embed scratchpad notes: {e}");
+            return;
+        }
+        Err(_) => {
+            tracing::warn!(
+                timeout = ?EMBED_TIMEOUT,
+                "embedding scratchpad notes timed out; writing them unembedded for the backfill"
+            );
+            return;
+        }
+    };
+
+    for note in notes.iter_mut() {
+        note.embedding = Some(NoteEmbedding {
+            chunks: Vec::new(),
+            model: model.to_string(),
+        });
+    }
+    for (index, vector) in owners.into_iter().zip(vectors) {
+        if let Some(embedding) = notes[index].embedding.as_mut() {
+            embedding.chunks.push(vector);
         }
     }
 }
@@ -152,13 +262,25 @@ pub trait ScratchpadStore: Send + Sync {
         limit: usize,
     ) -> impl Future<Output = Result<Vec<ScratchpadNote>, CoreError>> + Send;
 
-    /// Full-text search over a conversation's notes (key + content), ranked,
+    /// Hybrid search over a conversation's notes (key + content), ranked,
     /// capped at `limit`. When `note_type` is `Some`, results are restricted
     /// to that type.
+    ///
+    /// `query_embedding` is the query embedded by `embedding_model`, as
+    /// [`embed_notes`] embeds the notes themselves. An empty vector means the
+    /// caller had no embedding backend, or its backend stalled; the search then
+    /// takes the full-text path alone.
+    ///
+    /// The vector arm only reads rows stamped with `embedding_model`, because a
+    /// vector of another dimension raises rather than missing. The full-text arm
+    /// is never model-scoped, so changing the embedding model costs recall
+    /// quality and not all recall.
     fn search(
         &self,
         conversation_id: &str,
         query: &str,
+        query_embedding: Vec<f32>,
+        embedding_model: &str,
         note_type: Option<&str>,
         limit: usize,
     ) -> impl Future<Output = Result<Vec<ScratchpadNote>, CoreError>> + Send;
@@ -238,11 +360,17 @@ pub type ScratchpadListFn = Arc<
         + Sync,
 >;
 
-/// Boxed async closure for full-text searching notes (optionally filtered by
-/// `note_type`).
+/// Boxed async closure for hybrid (vector + full-text) searching of notes.
+///
+/// Args: `(conversation_id, query, query_embedding, embedding_model,
+/// note_type, limit)`. The query vector and the model that produced it travel
+/// together for the reason [`NoteEmbedding`] gives. An empty vector takes the
+/// full-text path alone.
 pub type ScratchpadSearchFn = Arc<
     dyn Fn(
             String,
+            String,
+            Vec<f32>,
             String,
             Option<String>,
             usize,
@@ -287,9 +415,129 @@ pub type ScratchpadDeleteSubtreeFn = Arc<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ports::embedding::EmbedFn;
 
     fn keys(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    const MODEL: &str = "nomic-embed-text@1111111111111111111111111111111111111111";
+
+    /// An embedding backend that records every text it is handed and answers
+    /// each with `vector`.
+    fn recording_embed(seen: Arc<std::sync::Mutex<Vec<String>>>, vector: Vec<f32>) -> EmbedFn {
+        Arc::new(move |texts: Vec<String>| {
+            let seen = Arc::clone(&seen);
+            let vector = vector.clone();
+            Box::pin(async move {
+                let n = texts.len();
+                seen.lock().expect("record texts").extend(texts);
+                Ok(vec![vector; n])
+            })
+        })
+    }
+
+    /// Acceptance (#717): a wedged embedding backend must not block the write.
+    /// A stuck backend is the case `EMBED_TIMEOUT` exists for -- the note has to
+    /// land, unembedded, for the background backfill to pick up.
+    #[tokio::test(start_paused = true)]
+    async fn a_wedged_embedding_backend_does_not_block_the_write() {
+        let embed: EmbedFn = Arc::new(|_| {
+            Box::pin(async {
+                // Never answers, as a stuck Ollama does not.
+                std::future::pending::<()>().await;
+                unreachable!("pending never resolves")
+            })
+        });
+        let mut notes = vec![NewScratchpadNote::new(
+            "finding",
+            "the pool leaks connections under load",
+        )];
+
+        embed_notes(&embed, MODEL, &mut notes).await;
+
+        assert!(
+            notes[0].embedding.is_none(),
+            "a wedged backend must leave the note unembedded so the write still lands"
+        );
+    }
+
+    /// A backend that fails outright degrades the same way a wedged one does.
+    #[tokio::test]
+    async fn a_failing_embedding_backend_leaves_the_note_unembedded() {
+        let embed: EmbedFn =
+            Arc::new(|_| Box::pin(async { Err(CoreError::Storage("backend down".into())) }));
+        let mut notes = vec![NewScratchpadNote::new("finding", "the pool leaks")];
+
+        embed_notes(&embed, MODEL, &mut notes).await;
+
+        assert!(notes[0].embedding.is_none());
+    }
+
+    /// The vector and the model that produced it travel together, so a note can
+    /// never be stamped with a model that did not embed it.
+    #[tokio::test]
+    async fn embed_notes_stamps_each_note_with_the_model_that_produced_its_vector() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let embed = recording_embed(Arc::clone(&seen), vec![0.25, 0.5, 0.75]);
+        let mut notes = vec![
+            NewScratchpadNote::new("a", "alpha"),
+            NewScratchpadNote::new("b", "bravo"),
+        ];
+
+        embed_notes(&embed, MODEL, &mut notes).await;
+
+        for note in &notes {
+            let embedding = note
+                .embedding
+                .as_ref()
+                .unwrap_or_else(|| panic!("note {} must carry a vector", note.key));
+            assert_eq!(embedding.model, MODEL);
+            assert_eq!(embedding.chunks, vec![vec![0.25, 0.5, 0.75]]);
+        }
+    }
+
+    /// The inline embed and the background backfill must embed the same text,
+    /// or a note embedded by one is not comparable with a query matched against
+    /// the other. The text is `key + content`, matching the table's `tsv`.
+    #[tokio::test]
+    async fn embed_notes_embeds_the_key_together_with_the_content() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let embed = recording_embed(Arc::clone(&seen), vec![1.0]);
+        let mut notes = vec![NewScratchpadNote::new("deploy", "ship it on Friday")];
+
+        embed_notes(&embed, MODEL, &mut notes).await;
+
+        let texts = seen.lock().expect("read recorded texts").clone();
+        assert_eq!(texts, vec!["deploy ship it on Friday".to_string()]);
+    }
+
+    /// An embedder that returns fewer vectors than it was given chunks has
+    /// broken its contract. Zipping a short answer would pair a note with
+    /// another note's vector, which is worse than not embedding at all.
+    #[tokio::test]
+    async fn a_short_answer_from_the_embedder_leaves_every_note_unembedded() {
+        let embed: EmbedFn = Arc::new(|_| Box::pin(async { Ok(vec![vec![1.0_f32, 0.0]]) }));
+        let mut notes = vec![
+            NewScratchpadNote::new("a", "alpha"),
+            NewScratchpadNote::new("b", "bravo"),
+        ];
+
+        embed_notes(&embed, MODEL, &mut notes).await;
+
+        assert!(notes.iter().all(|n| n.embedding.is_none()));
+    }
+
+    /// An empty batch never reaches the backend.
+    #[tokio::test]
+    async fn embed_notes_does_not_call_the_backend_for_an_empty_batch() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let embed = recording_embed(Arc::clone(&seen), vec![1.0]);
+        let mut notes: Vec<NewScratchpadNote> = Vec::new();
+
+        embed_notes(&embed, MODEL, &mut notes).await;
+
+        assert!(seen.lock().expect("read recorded texts").is_empty());
     }
 
     #[test]
@@ -387,6 +635,8 @@ mod tests {
             &self,
             _conversation_id: &str,
             _query: &str,
+            _query_embedding: Vec<f32>,
+            _embedding_model: &str,
             _note_type: Option<&str>,
             _limit: usize,
         ) -> Result<Vec<ScratchpadNote>, CoreError> {
