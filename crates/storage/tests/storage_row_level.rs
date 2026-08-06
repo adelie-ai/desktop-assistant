@@ -11,8 +11,9 @@
 //! - `archive` opacity (foreign/missing ⇒ `NotFound`, already-archived ⇒ `Ok`);
 //! - `tag_registry` embedding-dedup redirect and deprecation-chain / cycle
 //!   guard, plus the gate the knowledge-base write tool puts in front of it
-//!   (a known tag costs no embedding; one tenant never redirects onto
-//!   another's vocabulary);
+//!   (a known tag costs no embedding; one tenant never reads or redirects onto
+//!   another's vocabulary; a mangled name captures no redirect; a saturated
+//!   pool is paid once);
 //! - `tool_registry` upsert / hybrid search / source-scoped unregister;
 //! - JSON→Postgres migration of conversations + knowledge and the empty-table
 //!   probes.
@@ -824,11 +825,12 @@ async fn kb_write_resolves_a_tag_a_concurrent_write_registered_first() {
     // inside the embed function puts the row there at exactly the moment a
     // concurrent write would have.
     //
-    // MUTATION: dropping the post-INSERT re-read makes the resolver return the
-    // primary-key error, which the write path degrades into "store the tag as
-    // written" - so the returned name check goes RED. Looking the tag back up
-    // under the raw proposed name instead of the normalized one also goes RED,
-    // which is why the proposal below is deliberately not already normalized.
+    // MUTATION: dropping the post-INSERT read-back makes the resolver return
+    // the primary-key error, which the write path degrades into "store the tag
+    // as written" - so the returned name check goes RED. Looking the tag back
+    // up under the raw proposed name instead of the normalized one also goes
+    // RED, which is why the proposal below is deliberately not already
+    // normalized.
     with_fixture(
         "kb_write_resolves_a_tag_a_concurrent_write_registered_first",
         |fx| async move {
@@ -959,6 +961,211 @@ async fn kb_write_registers_tags_under_the_calling_user() {
         },
     )
     .await;
+}
+
+#[tokio::test]
+async fn kb_write_reads_an_existing_tag_only_within_the_calling_user() {
+    // `get_tag` is on this path twice: the exact-name short-circuit, and the
+    // read-back after a lost race. Both answer with a name the caller then
+    // writes on a knowledge-base row, so a `get_tag` that saw every tenant
+    // would hand bob alice's tag and file bob's entry under it.
+    //
+    // Alice registers `project:alpha`. Bob proposes the same name with his own
+    // description, so only the user scope on the exact-name lookup can keep the
+    // two apart: the names are equal, so no vector distance is involved.
+    //
+    // MUTATION: dropping `user_id = $1` from `get_tag` makes bob's proposal
+    // short-circuit onto alice's row, so bob registers nothing and the row
+    // count and the description both go RED.
+    with_fixture(
+        "kb_write_reads_an_existing_tag_only_within_the_calling_user",
+        |fx| async move {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let embed_fn = counting_embed_fn(Arc::clone(&seen));
+
+            with_user_id(UserId::new("alice"), async {
+                let name = resolve_proposed_tag(
+                    &fx.pool,
+                    &embed_fn,
+                    "test-model",
+                    &ProposedTag {
+                        name: "project:alpha".into(),
+                        description: Some("Alice's first project".into()),
+                    },
+                )
+                .await
+                .expect("alice registers her tag");
+                assert_eq!(name, "project:alpha", "premise: alice holds the name");
+            })
+            .await;
+
+            with_user_id(UserId::new("bob"), async {
+                let name = resolve_proposed_tag(
+                    &fx.pool,
+                    &embed_fn,
+                    "test-model",
+                    &ProposedTag {
+                        name: "project:alpha".into(),
+                        description: Some("Bob's own project".into()),
+                    },
+                )
+                .await
+                .expect("bob registers his own tag of the same name");
+                assert_eq!(name, "project:alpha");
+
+                let stored = get_tag(&fx.pool, "project:alpha")
+                    .await
+                    .expect("read bob's tag")
+                    .expect("bob holds the name too");
+                assert_eq!(
+                    stored.description, "Bob's own project",
+                    "bob's row carries bob's description, not alice's"
+                );
+            })
+            .await;
+
+            let rows: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM tag_registry WHERE name = 'project:alpha'",
+            )
+            .fetch_one(&fx.pool)
+            .await
+            .expect("count the rows for the shared name");
+            assert_eq!(rows, 2, "one row per tenant, not one row shared");
+
+            fx
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn registry_refuses_to_redirect_onto_a_mangled_registry_name() {
+    // Registry rows written before the two paths shared a normalizer carry a
+    // mangled name (`projectadelie-ai` for `project:adelie-ai`). Such a row
+    // misses the exact-name lookup, but it is a close vector neighbour of the
+    // correct name. Redirecting onto it would store the mangled tag on the
+    // entry, and every later search filtered on the correct tag would miss
+    // that entry. Repairing those rows is #1089; here they stay inert.
+    //
+    // Note the mangled name is itself in normalized form - the current
+    // normalizer leaves `projectadelie-ai` untouched - so recognizing it takes
+    // the legacy rule that wrote it, not a normalized-form check.
+    //
+    // MUTATION: dropping the mangled-key arm of `redirect_refusal` answers with
+    // `projectadelie-ai` → RED.
+    with_fixture(
+        "registry_refuses_to_redirect_onto_a_mangled_registry_name",
+        |fx| async move {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let embed_fn = counting_embed_fn(Arc::clone(&seen));
+
+            with_user_id(UserId::new("alice"), async {
+                // The mangled row, embedded by the same model and with the same
+                // vector every proposal gets, so it sits at distance 0 and is
+                // the nearest neighbour by construction.
+                sqlx::query(
+                    "INSERT INTO tag_registry \
+                        (user_id, name, description, examples, distinguish_from, \
+                         embedding, embedding_model) \
+                     VALUES ($1, 'projectadelie-ai', 'The mangled pre-#1069 row', \
+                             '[]'::jsonb, '{}', $2, 'test-model')",
+                )
+                .bind("alice")
+                .bind(pgvector::Vector::from(vec![1.0f32, 0.0, 0.0]))
+                .execute(&fx.pool)
+                .await
+                .expect("plant the mangled row");
+
+                let name = resolve_proposed_tag(
+                    &fx.pool,
+                    &embed_fn,
+                    "test-model",
+                    &ProposedTag {
+                        name: "project:adelie-ai".into(),
+                        description: Some("The assistant and its clients".into()),
+                    },
+                )
+                .await
+                .expect("the proposal succeeds");
+                assert_eq!(
+                    name, "project:adelie-ai",
+                    "a name no knowledge-base row can carry must not capture the redirect"
+                );
+
+                let stored = get_tag(&fx.pool, "project:adelie-ai")
+                    .await
+                    .expect("read the registered tag");
+                assert!(
+                    stored.is_some(),
+                    "the correctly-named tag is registered beside the mangled row"
+                );
+            })
+            .await;
+            fx
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn kb_write_pays_a_saturated_connection_pool_once_not_twice() {
+    // The resolver used to read the tag back on *any* failure, not only on the
+    // primary-key conflict that a read-back can answer. A pool with no free
+    // connection therefore cost two acquire timeouts inside one live turn -
+    // measured at 60.0s against sqlx's 30s default.
+    //
+    // The pool here holds one connection, and the test holds it, so every
+    // acquire waits out the timeout and none of the SQL ever runs. One pass
+    // costs one timeout; the old retry cost two.
+    //
+    // MUTATION: reading the tag back on any error, rather than on the unique
+    // violation beside the insert that raises it, doubles the elapsed time →
+    // RED.
+    let Some(url) = support::test_database_url() else {
+        return;
+    };
+    let acquire_timeout = std::time::Duration::from_millis(300);
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(acquire_timeout)
+        .connect(&url)
+        .await
+        .expect("connect the single-connection pool");
+
+    let held = pool.acquire().await.expect("hold the only connection");
+
+    let embed_fn: BackfillEmbedFn =
+        Box::new(|texts| Box::pin(async move { Ok(texts.iter().map(|_| vec![1.0f32]).collect()) }));
+
+    let started = std::time::Instant::now();
+    let outcome = with_user_id(
+        UserId::new("alice"),
+        resolve_proposed_tag(
+            &pool,
+            &embed_fn,
+            "test-model",
+            &ProposedTag {
+                name: "topic:weather".into(),
+                description: Some("Forecasts, rain, and temperature".into()),
+            },
+        ),
+    )
+    .await;
+    let elapsed = started.elapsed();
+
+    drop(held);
+    pool.close().await;
+
+    assert!(
+        outcome.is_err(),
+        "a pool that never yields a connection is a failure, and the write path \
+         degrades it into storing the tag as written"
+    );
+    assert!(
+        elapsed < acquire_timeout * 2,
+        "one pass through the vocabulary pays one acquire timeout, not two: \
+         {elapsed:?} against a {acquire_timeout:?} timeout"
+    );
 }
 
 // -- tool_registry -----------------------------------------------------------

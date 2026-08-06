@@ -22,16 +22,16 @@ pub mod tool_usage;
 pub mod turn_state;
 
 pub use desktop_assistant_auth_jwt::{DEFAULT_USER_ID, UserId};
-/// The one tag normalizer, re-exported at the path storage callers already
-/// use. It lives in `core` because the knowledge-base write tool has to apply
-/// the same rule to match a caller's tag description against the tag it
-/// describes, and that tool cannot depend on a storage adapter.
-pub use desktop_assistant_core::tag_normalize;
 /// Re-export the request-scoped user-id task-local API so storage call
 /// sites can resolve `current_user_id()` without depending directly on
 /// `desktop_assistant_core::ports::auth`. The actual storage adapters
 /// in this crate use this helper at SQL composition time (issue #105).
 pub use desktop_assistant_core::ports::auth::{current_user_id, with_user_id};
+/// The one tag normalizer, re-exported at the path storage callers already
+/// use. It lives in `core` because the knowledge-base write tool has to apply
+/// the same rule to match a caller's tag description against the tag it
+/// describes, and that tool cannot depend on a storage adapter.
+pub use desktop_assistant_core::tag_normalize;
 
 pub use background_tasks::PgBackgroundTaskStore;
 pub use context_window_observations::PgLearnedWindowStore;
