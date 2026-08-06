@@ -1,5 +1,19 @@
 use serde::{Deserialize, Serialize};
 
+/// The longest line [`KnowledgeEntry::display_line`] returns, in characters,
+/// including the truncation marker.
+///
+/// Why a cap at all: the line is rendered once per candidate entry into a
+/// context block with a fixed token budget, and nothing bounds how long an
+/// entry's content may be. Without this one long entry would spend the whole
+/// budget by itself. It is also the length a written summary is expected to
+/// keep, so a stand-in and a real summary occupy the same space.
+pub const SUMMARY_MAX_CHARS: usize = 200;
+
+/// What ends a line that was cut short, so a partial line never reads as a
+/// complete one.
+const TRUNCATION_MARKER: &str = "...";
+
 /// A unified knowledge base entry, replacing separate preferences and memory stores.
 /// Each entry is prose content with tags and optional metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,6 +64,54 @@ impl KnowledgeEntry {
         self.source = Some(source.into());
         self
     }
+
+    /// The one line that stands for this entry in a list: the stored
+    /// [`summary`](Self::summary) where there is one, otherwise a prefix of
+    /// the content. Never longer than [`SUMMARY_MAX_CHARS`] characters, and
+    /// ends in `...` when it was cut short.
+    ///
+    /// Every render site calls this - a client's knowledge browser, and the
+    /// recall block that offers candidate entries to the model - so the
+    /// fallback is decided once instead of once per caller.
+    ///
+    /// Why the fallback lives here and not in the read queries: a
+    /// `COALESCE(summary, content)` in SQL would make every read report a
+    /// summary for an entry that has none. The maintenance pass that fills the
+    /// field finds its work with `WHERE summary IS NULL`, and a list row that
+    /// wants to render a stand-in differently from a written summary needs the
+    /// same distinction. Both survive only while the read paths stay honest.
+    ///
+    /// The cap covers a stored summary as well as a fallback body. Nothing in
+    /// the schema bounds either, and the budget this protects counts what is
+    /// rendered, not where it came from.
+    pub fn display_line(&self) -> String {
+        let source = match self.summary.as_deref() {
+            Some(summary) => summary,
+            None => self.content.as_str(),
+        };
+        truncate_to_chars(source, SUMMARY_MAX_CHARS)
+    }
+}
+
+/// Cut `text` to at most `max_chars` characters, appending
+/// [`TRUNCATION_MARKER`] when anything was removed. The marker counts toward
+/// the limit, so the result never exceeds it.
+///
+/// Counting characters rather than bytes is what keeps a multi-byte character
+/// whole: a byte-indexed slice that lands inside one panics.
+fn truncate_to_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let marker_chars = TRUNCATION_MARKER.chars().count();
+    // A limit too small to hold the marker cannot carry it. The limit wins:
+    // a line that overruns its budget to say it was cut defeats the cap.
+    if max_chars <= marker_chars {
+        return text.chars().take(max_chars).collect();
+    }
+    let mut out: String = text.chars().take(max_chars - marker_chars).collect();
+    out.push_str(TRUNCATION_MARKER);
+    out
 }
 
 #[cfg(test)]
@@ -136,6 +198,14 @@ mod tests {
         assert!(line.chars().count() <= SUMMARY_MAX_CHARS);
         assert!(line.starts_with('\u{4e16}'));
         assert!(line.ends_with("..."));
+    }
+
+    #[test]
+    fn a_limit_too_small_for_the_marker_still_honours_the_limit() {
+        // The cap is a budget, so it wins over the wish to say "there is
+        // more". `display_line` never reaches this, but the rule belongs with
+        // the function that enforces the cap rather than with its one caller.
+        assert_eq!(truncate_to_chars("abcdef", 2), "ab");
     }
 
     #[test]
