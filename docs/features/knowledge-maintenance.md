@@ -1,6 +1,6 @@
 # Knowledge maintenance (the "dream cycle") + live panel sync
 
-The knowledge base is maintained by four background passes. Historically they
+The knowledge base is maintained by five background passes. Historically they
 ran only on daemon timers; they can now also be **triggered on demand** from the
 knowledge panels in every GUI (GTK, TUI, KDE KCM), and the panels **update live**
 as entries change. This page documents the passes, the trash lifecycle, the
@@ -8,13 +8,14 @@ on-demand trigger path, the event-broadcast chain that drives live refresh, the
 concurrency model, and the cancellation story — so none of it has to be
 re-derived from the code.
 
-## The four passes
+## The five passes
 
 All live in `crates/storage/src/dreaming/` + `crates/storage/src/embedding_backfill.rs`:
 
 | Pass | Entry point | What it does | Cadence |
 | ---- | ----------- | ------------ | ------- |
 | **Extraction** | `run_dreaming_scan` | Scans conversations past their watermark, asks an LLM to extract durable facts, writes them (+ archival of long-quiet conversations). | frequent (hourly) |
+| **Summary backfill** | `run_dreaming_scan` | Writes the one-line `summary` for entries that have none, and rewrites one whose body changed after it was written. Batched, capped per cycle, and never touches `content`. | frequent (hourly) |
 | **Consolidation** | `run_consolidation_scan` | Loads a user's whole active KB and recomputes it holistically (prune / merge / tighten) with a stronger model, applied transactionally with soft-delete and bounded by the rules below. | slow (daily) |
 | **Embedding recompute** | `backfill_knowledge_embeddings` | Re-embeds rows. The periodic backfill only touches NULL/stale/model-mismatched rows; the **force** path (`invalidate_all_knowledge_embeddings` → backfill) re-embeds everything. | periodic + on-demand |
 | **Trash sweep** | `sweep_expired_trash` | Frees soft-deleted entries past their retention window. No LLM, no embeddings — a single indexed DELETE per user. | frequent (hourly) |
@@ -44,6 +45,87 @@ matching instead of vanishing; and a stamp whose digest matches the current
 model is treated as the same model even when the name is spelled differently, so
 a cosmetic rename costs nothing (see `crates/storage/tests/embedding_fingerprint.rs`
 and `crates/storage/tests/search_embedding_model_scope.rs`).
+
+## What the summary backfill may and may not do
+
+An entry's `summary` is the one line it is offered back as - in a knowledge
+panel row, and in the `[Recall]` block that puts candidate memory in front of
+the model before it acts. The column is nullable and unenforced at the write
+boundary, because refusing a write that omits a summary would lose the fact, so
+most rows carry none and read back as a cut-down prefix of their body. This pass
+fills them (`crates/storage/src/dreaming/summarize.rs`). Four rules bound it:
+
+1. **The body is never rewritten.** The write statement names `summary` and its
+   freshness stamp and nothing else. #694 is the standing concern that the store
+   is becoming model-rewritten prose rather than accumulated evidence, and a
+   summarising pass that edits the body is exactly that failure.
+2. **A cycle takes at most `MAX_SUMMARIES_PER_CYCLE` (200) rows**, shared evenly
+   across the users that have work, so one large backlog cannot starve a small
+   one. It is a backfill, not a deadline: the leftover is logged and taken next
+   cycle.
+3. **Entries are asked about in batches** of up to `MAX_SUMMARY_BATCH_ROWS` (20),
+   also bounded by a per-prompt character budget. One call per row is the
+   expensive way to spend a backfill of hundreds of rows.
+4. **A row that fails keeps no summary** and is in the worklist again next cycle.
+   Nothing is stamped on failure - deliberately unlike the embedding backfill,
+   which stamps a failed row to stop a tight retry loop, because re-attempting a
+   summary costs one line inside a batched prompt while re-attempting an
+   embedding costs a metered vector call.
+
+### What the model is shown
+
+Entries are **numbered** in the prompt (`## 1`, `## 2`, ...), never named, and the
+answer refers to them by number. An entry id is free text taken from whoever
+called the write tool and stored as written, with nothing bounding it, so a
+prompt carrying one would let a crafted id spend the whole prompt budget by
+itself or forge the heading that separates the entries - and so put words in a
+neighbouring entry's mouth. Content and tags go through the same one-line rule,
+which bounds them and collapses any newline they carry, so neither can forge a
+heading either. An answer numbered outside the batch is dropped.
+
+### The limit this pass does not solve
+
+A batch fails as a unit: an answer that will not parse costs every entry in that
+batch, not the one that provoked it. Batch composition is stable across cycles,
+so an entry that reliably breaks the answer holds its companions back with it for
+as long as it keeps doing so. Splitting a failed batch is deliberately not done,
+following consolidation: a malformed answer is not a size problem, so re-asking
+with fewer entries only spends calls. The failure log names the ids it left
+behind instead, so the stuck rows are identifiable.
+
+### Drift, and why `summary IS NULL` is not the worklist
+
+A summary condenses `content`, so an edit to the body leaves the stored line
+describing something the entry no longer says - and a confidently wrong line is
+worse than none, because a reader believes it and never opens the entry. Two
+normal paths produce that state: the knowledge write path preserves a stored
+summary when an update names none, and consolidation rewrites content without
+touching the summary at all.
+
+So freshness is tracked the way embeddings already track it. `summary_updated_at`
+(migration 043) records when the line was written, and work is due when the stamp
+is absent or older than `updated_at` - the same shape as
+`embeddings_updated_at < updated_at`. The worklist also reads an empty summary as
+no summary: `''` is the one state that hides from `summary IS NULL` while still
+rendering, because `display_line` prefers a stored summary over the content
+fallback, so such a row would show a blank line for good. The knowledge write
+path stamps it
+alongside the summary in all three of that field's states: a supplied summary
+takes the same transaction time as `updated_at` and so reads as current, a
+cleared summary loses its stamp with its text, and an absent one keeps the stamp
+it had, which is what makes a content-only update surface as drift.
+
+The pass writes `summary` and `summary_updated_at` only. It leaves `updated_at`
+alone on purpose: bumping it would mark the row's embedding stale and send the
+whole backfilled store back through the embedding backfill for a change that
+never touched the embedded text.
+
+`updated_at` is instead a **precondition** on the write. The pass reads a row,
+spends a model call, then writes, and a content write can land in that window -
+which would store a line describing the body the pass read while the freshness
+stamp declared it current, so nothing would ever revisit it. Matching the body's
+modified time makes the write a no-op in that case; the line is discarded and the
+row stays in the worklist for the next cycle.
 
 ## What consolidation may and may not do
 

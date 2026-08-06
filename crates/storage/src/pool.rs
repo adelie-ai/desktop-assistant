@@ -199,6 +199,9 @@ const MIGRATIONS: &[Migration] = &[
     // #1104: a scratchpad note can attach a knowledge entry, so pinning that
     // note keeps the entry's live content in view instead of a stale copy.
     migration!("042_scratchpad_knowledge_entry.sql"),
+    // #1099: when a knowledge entry's summary was last written, so the dream
+    // cycle can find the entries whose body changed after their summary did.
+    migration!("043_knowledge_base_summary_freshness.sql"),
 ];
 
 /// Second half of the advisory-lock key: the schema the migrations write to.

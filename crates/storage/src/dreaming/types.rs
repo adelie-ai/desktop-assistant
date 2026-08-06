@@ -82,6 +82,50 @@ pub const MAX_HOLISTIC_PROMPT_CHARS: usize = 40_000;
 /// at 3, one slice costs at most 15 calls before it is declared a real failure.
 pub const MAX_SLICE_SPLIT_DEPTH: usize = 3;
 
+/// Upper bound on the knowledge entries one dream cycle may summarise.
+///
+/// The pass is a backfill, not a deadline. The reference instance carried 722
+/// live entries with no summary at all, and a single unbounded pass over a store
+/// that size is a large, unattended spend on a model that may be metered. At
+/// this cap and the default hourly cycle a backlog that size drains in an
+/// afternoon, and what is left over is simply taken next time.
+///
+/// The budget is shared across the users that have work, so total spend per
+/// cycle is bounded by this number whatever the tenancy, and one user's large
+/// backlog cannot starve another's small one.
+pub const MAX_SUMMARIES_PER_CYCLE: usize = 200;
+
+/// Knowledge entries described in one summary prompt.
+///
+/// Sized from the answer, the way [`MAX_HOLISTIC_PROMPT_CHARS`] is: the model
+/// returns one bounded line per entry, so a batch of this size answers well
+/// inside an ordinary output allowance. Batching at all is the point - one call
+/// per row is the expensive way to spend a backfill of hundreds of rows.
+pub const MAX_SUMMARY_BATCH_ROWS: usize = 20;
+
+/// Character budget for one summary prompt.
+///
+/// The row cap sizes the answer and this sizes the question, because nothing
+/// bounds how long an entry's content is. A batch closes at whichever limit it
+/// reaches first.
+pub const MAX_SUMMARY_PROMPT_CHARS: usize = 20_000;
+
+/// How much of an entry's content one summary prompt carries.
+///
+/// A summary states what the entry says, and an entry says it at the start: a
+/// long body is long because it elaborates, not because the subject arrives
+/// late. Bounding the excerpt keeps one outsized entry from spending the whole
+/// prompt budget by itself.
+pub const MAX_SUMMARY_SOURCE_CHARS: usize = 2_000;
+
+/// How much of an entry's tag list one summary prompt carries.
+///
+/// Tags are normalized on write but never bounded, in length or in number, so
+/// without this one entry's tag line could spend the whole prompt budget. The
+/// tags are context for the register of the fact, so a bounded list serves that
+/// as well as an unbounded one.
+pub const MAX_SUMMARY_TAGS_CHARS: usize = 200;
+
 /// Safety cap: the fraction of a user's active entries a single holistic run
 /// may prune outright. Merges don't count - their content survives in the
 /// canonical row. Excess prunes are dropped with a warning.

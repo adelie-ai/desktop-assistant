@@ -70,10 +70,20 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
         // would show a blank line rather than falling back to the content, and
         // a pass that fills the field for entries with none (#1099) finds its
         // work with `WHERE summary IS NULL`, so it would never reach one.
+        //
+        // `summary_updated_at` follows the summary through all three states, so
+        // the dream cycle can tell a current summary from one that describes
+        // content the entry no longer holds. A supplied summary is stamped
+        // `NOW()`, the same transaction time `updated_at` takes, so it reads as
+        // current and the pass leaves it alone; a cleared one loses its stamp
+        // with its text; and an absent one keeps the stamp it had, which is
+        // what makes an update that says nothing about the summary show up as
+        // drift on the next pass.
         let row: Option<KbRow> = sqlx::query_as(
             "INSERT INTO knowledge_base \
-                (id, user_id, content, tags, metadata, source, summary) \
-             VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, '')) \
+                (id, user_id, content, tags, metadata, source, summary, summary_updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, ''), \
+                     CASE WHEN NULLIF($7, '') IS NULL THEN NULL ELSE NOW() END) \
              ON CONFLICT (id) DO UPDATE \
                 SET content = EXCLUDED.content, \
                     tags = EXCLUDED.tags, \
@@ -83,6 +93,10 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
                         WHEN $7 IS NULL THEN knowledge_base.summary \
                         WHEN $7 = '' THEN NULL \
                         ELSE $7 END, \
+                    summary_updated_at = CASE \
+                        WHEN $7 IS NULL THEN knowledge_base.summary_updated_at \
+                        WHEN $7 = '' THEN NULL \
+                        ELSE NOW() END, \
                     updated_at = NOW() \
                 WHERE knowledge_base.user_id = $2 \
                   AND knowledge_base.deleted_at IS NULL \
