@@ -202,6 +202,71 @@ async fn a_note_is_found_by_a_semantically_similar_query_sharing_no_words() {
     fx.cleanup().await;
 }
 
+/// The vector arm over-fetches `limit * 2` candidates to feed the fusion, and
+/// that truncation must keep the NEAREST candidates, not an arbitrary subset.
+///
+/// Truncating without an order is silent: the arm still returns rows, the
+/// fusion still ranks them, and the caller gets a plausible page that simply
+/// omits the best matches. Semantic recall is the half of this search the whole
+/// feature exists for, so a candidate set chosen by physical row order defeats
+/// it without erroring.
+///
+/// Twelve notes at monotonically increasing distance, a query with no lexical
+/// match so only the vector arm contributes, and a limit of three -- so six
+/// candidates are fetched from twelve and the three nearest must survive both
+/// truncations.
+#[tokio::test]
+async fn the_vector_arm_truncates_to_the_nearest_candidates_not_an_arbitrary_subset() {
+    let Some(fx) = fixture("sp717l").await else {
+        return;
+    };
+    let convs = PgConversationStore::new(fx.pool.clone());
+    let pad = PgScratchpadStore::new(fx.pool.clone());
+
+    with_user_id(UserId::new(USER), async {
+        convs.create(make_conversation("c1")).await.expect("conv");
+        // Note `i` sits at cosine distance increasing in `i` from the query
+        // vector [1, 0]: 1 - 1/sqrt(1 + (0.05i)^2). So `n00` is nearest and
+        // `n11` furthest, with no ties.
+        for i in 0..12 {
+            write_embedded(
+                &pad,
+                "c1",
+                &format!("n{i:02}"),
+                "a distilled finding with no query words in it",
+                vec![1.0, i as f32 * 0.05],
+                &current_model(),
+            )
+            .await;
+        }
+
+        let hits = pad
+            .search(
+                "c1",
+                // Matches no token, so `text_ranked` is empty and every
+                // returned row came through the vector arm.
+                "zzqqxx",
+                vec![1.0, 0.0],
+                &current_model(),
+                None,
+                3,
+            )
+            .await
+            .expect("hybrid search");
+
+        let keys: Vec<String> = hits.iter().map(|n| n.key.clone()).collect();
+        assert_eq!(
+            keys,
+            vec!["n00".to_string(), "n01".to_string(), "n02".to_string()],
+            "the three nearest notes must survive truncation, in distance order; \
+             a different set means the vector arm truncated an unordered candidate list"
+        );
+    })
+    .await;
+
+    fx.cleanup().await;
+}
+
 /// Acceptance: the full-text arm still returns exact-token matches, and it is
 /// NOT model-scoped. A note whose vector was produced by a superseded model is
 /// invisible to the vector arm, and must still be findable lexically --
