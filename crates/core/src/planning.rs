@@ -490,15 +490,36 @@ pub(crate) fn freeform_note_keys<'a>(notes: &[RawNote<'a>]) -> Vec<&'a str> {
         .collect()
 }
 
+/// The free-form keys in the order the index names them: sorted and
+/// deduplicated.
+fn unique_sorted<'a>(keys: &[&'a str]) -> Vec<&'a str> {
+    let mut out: Vec<&str> = keys.to_vec();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// The keys the `[Scratchpad]` index actually names, cut at `max_items`.
+///
+/// Why it is separate from the rendering: `[Recall]` needs the same list
+/// (#1101). A key the index has just named is in view, so the recall block
+/// drops it instead of paying for the same note twice - and deriving that list
+/// by parsing the rendered sentence would tie one block's wording to another
+/// block's correctness. Both go through [`unique_sorted`], so the list and the
+/// sentence can never disagree about which keys were named.
+pub(crate) fn listed_scratchpad_keys<'a>(keys: &[&'a str], max_items: usize) -> Vec<&'a str> {
+    let mut listed = unique_sorted(keys);
+    listed.truncate(max_items);
+    listed
+}
+
 /// Render the per-round `[Scratchpad]` index: a sorted, capped list of the
 /// free-form note keys, so a note the model stashed earlier survives windowing
 /// and compaction as *recognition* (it can `builtin_scratchpad_search` for the
 /// key) even after the message that wrote it is gone (#340). Keys only — no
 /// content previews. Returns `None` when there are no keys to advertise.
 pub(crate) fn render_scratchpad_index(keys: &[&str], max_items: usize) -> Option<String> {
-    let mut sorted: Vec<&str> = keys.to_vec();
-    sorted.sort_unstable();
-    sorted.dedup();
+    let sorted = unique_sorted(keys);
     if sorted.is_empty() {
         return None;
     }

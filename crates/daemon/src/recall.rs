@@ -1,20 +1,26 @@
-//! Adapter behind the pre-prompt recall port (#1100).
+//! Adapter behind the pre-prompt recall port (#1100, #1101).
 //!
-//! One user prompt, one embedding, two indexes. The knowledge base answers with
-//! the entries nearest the prompt and how near each is; the tag registry
-//! answers with the names of the tags nearest it, read from vectors the
-//! near-duplicate check already built. The core decides what clears its
-//! relevance floor and how the `[Recall]` block reads.
+//! One user prompt, one embedding, three indexes. The knowledge base answers
+//! with the entries nearest the prompt and how near each is; this
+//! conversation's scratchpad answers the same way about its own notes; the tag
+//! registry answers with the names of the tags nearest the prompt, read from
+//! vectors the near-duplicate check already built. The core decides what clears
+//! its relevance floor and how the `[Recall]` block reads.
 //!
 //! ## Recall never fails a turn
 //!
 //! The embedding call is bounded by [`EMBED_TIMEOUT`], the same ceiling the
 //! knowledge-base search tool already applies. On timeout, or on an embedding
-//! error, the knowledge arm degrades to full-text search (the precedent is
-//! #195) and the tag arm goes quiet, because the registry carries no full-text
-//! index to fall back to. A degradation is logged once, here, rather than once
-//! per arm. If the degraded read fails as well, the error travels to the caller,
-//! which drops the block and runs the turn.
+//! error, the knowledge and scratchpad arms degrade to full-text search (the
+//! precedent is #195) and the tag arm goes quiet, because the registry carries
+//! no full-text index to fall back to. A degradation is logged once, here,
+//! rather than once per arm.
+//!
+//! An arm that fails outright is a narrower loss than a lookup that fails. The
+//! scratchpad arm reads a different table from the other two, so it can fail on
+//! its own, and when it does it costs its own lines and nothing else - see
+//! [`notes_or_none`]. If a degraded read fails as well, the error travels to the
+//! caller, which drops the block and runs the turn.
 //!
 //! The whole lookup carries a second ceiling, [`RECALL_CALL_CEILING`], because
 //! the embedding timeout bounds only the embedding: the database round trips
@@ -27,11 +33,13 @@ use std::future::Future;
 use std::sync::Arc;
 
 use desktop_assistant_core::CoreError;
+use desktop_assistant_core::domain::ScratchpadNote;
 use desktop_assistant_core::ports::embedding::{EMBED_TIMEOUT, EmbedFn};
 use desktop_assistant_core::ports::recall::{
-    RecallCandidates, RecallEntry, RecallRelevance, RecallRequest, RecallSearchFn, RecallTag,
+    RecallCandidates, RecallEntry, RecallNote, RecallRelevance, RecallRequest, RecallSearchFn,
+    RecallTag,
 };
-use desktop_assistant_storage::{PgKnowledgeBaseStore, PgPool};
+use desktop_assistant_storage::{PgKnowledgeBaseStore, PgPool, PgScratchpadStore};
 
 /// How long one whole recall lookup may take before the turn gives up on it.
 ///
@@ -56,13 +64,26 @@ pub fn build_recall_search(
     embed: EmbedFn,
     embedding_model: String,
 ) -> RecallSearchFn {
+    // The pad adapter is a handle on the same pool, built once here rather than
+    // threaded in: nothing else in the daemon holds one, and the two reads
+    // behind the scratchpad arm are inherent to it.
+    let pad = Arc::new(PgScratchpadStore::new(pool.clone()));
     Arc::new(move |request: RecallRequest| {
         let kb_store = Arc::clone(&kb_store);
+        let pad = Arc::clone(&pad);
         let pool = pool.clone();
         let embed = Arc::clone(&embed);
         let embedding_model = embedding_model.clone();
         Box::pin(async move {
-            within_ceiling(lookup(&kb_store, &pool, &embed, &embedding_model, request)).await
+            within_ceiling(lookup(
+                &kb_store,
+                &pad,
+                &pool,
+                &embed,
+                &embedding_model,
+                request,
+            ))
+            .await
         })
     })
 }
@@ -83,55 +104,82 @@ async fn within_ceiling(
     }
 }
 
-/// One lookup: embed once, then ask both indexes.
+/// One lookup: embed once, then ask every index.
 async fn lookup(
     kb_store: &PgKnowledgeBaseStore,
+    pad: &PgScratchpadStore,
     pool: &PgPool,
     embed: &EmbedFn,
     embedding_model: &str,
     request: RecallRequest,
 ) -> Result<RecallCandidates, CoreError> {
     let Some(vector) = embed_prompt(embed, &request.prompt).await else {
-        // Degraded: full-text for the entries, silence for the tags.
+        // Degraded: full-text for the entries and the notes, silence for the
+        // tags.
         //
-        // `search_text_any_term`, not the trait's `search_text`: that one joins
-        // the query's lexemes with AND, which asks a whole user sentence to
-        // appear in one entry and answers almost nothing.
-        let entries = kb_store
-            .search_text_any_term(&request.prompt, request.entry_limit)
-            .await?
-            .into_iter()
-            .map(|entry| RecallEntry {
-                entry,
-                relevance: RecallRelevance::LexicalMatch,
-            })
-            .collect();
+        // `search_text_any_term` on both, not the trait's `search_text`: that
+        // one joins the query's lexemes with AND, which asks a whole user
+        // sentence to appear in one row and answers almost nothing.
+        let (entries, notes) = tokio::join!(
+            kb_store.search_text_any_term(&request.prompt, request.entry_limit),
+            pad.search_text_any_term(
+                &request.conversation_id,
+                &request.prompt,
+                request.note_limit,
+            ),
+        );
         return Ok(RecallCandidates {
-            entries,
+            entries: entries?
+                .into_iter()
+                .map(|entry| RecallEntry {
+                    entry,
+                    relevance: RecallRelevance::LexicalMatch,
+                })
+                .collect(),
+            notes: notes_or_none(notes.map(|found| {
+                found
+                    .into_iter()
+                    .map(|note| to_recall_note(note, RecallRelevance::LexicalMatch))
+                    .collect()
+            })),
             tags: Vec::new(),
         });
     };
 
-    // Both arms share the one vector, and neither depends on the other.
-    let (entries, tags) = tokio::try_join!(
+    // Every arm shares the one vector, and none depends on another. `join!`
+    // rather than `try_join!` so the scratchpad arm's own failure can be
+    // absorbed below instead of cancelling the two that did answer.
+    let (entries, tags, notes) = tokio::join!(
         kb_store.nearest_by_embedding(vector.clone(), embedding_model, request.entry_limit),
         desktop_assistant_storage::tag_registry::nearest_tags(
             pool,
-            vector,
+            vector.clone(),
             embedding_model,
             request.tag_limit,
         ),
-    )?;
+        pad.nearest_by_embedding(
+            &request.conversation_id,
+            vector,
+            embedding_model,
+            request.note_limit,
+        ),
+    );
 
     Ok(RecallCandidates {
-        entries: entries
+        entries: entries?
             .into_iter()
             .map(|(entry, distance)| RecallEntry {
                 entry,
                 relevance: RecallRelevance::Distance(distance),
             })
             .collect(),
-        tags: tags
+        notes: notes_or_none(notes.map(|found| {
+            found
+                .into_iter()
+                .map(|(note, distance)| to_recall_note(note, RecallRelevance::Distance(distance)))
+                .collect()
+        })),
+        tags: tags?
             .into_iter()
             .map(|(name, distance)| RecallTag {
                 name,
@@ -139,6 +187,43 @@ async fn lookup(
             })
             .collect(),
     })
+}
+
+/// One stored note as a recall candidate.
+///
+/// The key, the content and the pin travel; nothing is rendered here. How much
+/// of a note a line may spend, and whether a pinned note belongs in the block at
+/// all, are the core's decisions.
+fn to_recall_note(note: ScratchpadNote, relevance: RecallRelevance) -> RecallNote {
+    RecallNote {
+        key: note.key,
+        content: note.content,
+        pinned: note.pinned,
+        relevance,
+    }
+}
+
+/// The scratchpad arm's rows, or none.
+///
+/// The arm reads a different table from the other two, so it fails on its own -
+/// and when it does it must cost its own lines and nothing else. The knowledge
+/// and tag arms still render, and the turn never sees the error.
+///
+/// This is deliberately narrower than the treatment the other two arms get: a
+/// knowledge arm that cannot read is the block's whole point failing, so that
+/// error travels to the caller, which drops the block and runs the turn anyway.
+/// Losing the pad lines is a smaller loss than losing the block.
+fn notes_or_none(found: Result<Vec<RecallNote>, CoreError>) -> Vec<RecallNote> {
+    match found {
+        Ok(notes) => notes,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "recall: the scratchpad arm failed; the other arms still render"
+            );
+            Vec::new()
+        }
+    }
 }
 
 /// Embed the prompt, bounded by [`EMBED_TIMEOUT`]. `None` means the arms

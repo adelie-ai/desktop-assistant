@@ -1,10 +1,11 @@
-//! Pre-prompt recall port (#1100): the lookup behind the `[Recall]` block.
+//! Pre-prompt recall port (#1100, #1101): the lookup behind the `[Recall]`
+//! block.
 //!
-//! When a user prompt lands, the daemon embeds it once and asks two indexes
-//! that share that embedding space - the knowledge base and the tag registry -
-//! what is near it. The answer travels back through this port as candidates,
-//! and [`crate::recall`] decides which of them clear the relevance floor and
-//! how they render.
+//! When a user prompt lands, the daemon embeds it once and asks three indexes
+//! that share that embedding space - the knowledge base, this conversation's
+//! scratchpad, and the tag registry - what is near it. The answer travels back
+//! through this port as candidates, and [`crate::recall`] decides which of them
+//! clear the relevance floor and how they render.
 //!
 //! ## Why the floor is not applied here
 //!
@@ -19,9 +20,11 @@
 //! - **Best match first.** Both lists arrive ordered, nearest first. The core
 //!   never reorders them: it cannot compare a cosine distance with a lexical
 //!   match, and it does not have to, because one lookup uses one mode.
-//! - **One user.** Row-level security is a backstop the table owner bypasses,
-//!   so every query behind this port carries its own `WHERE user_id`
-//!   predicate.
+//! - **One user, and one conversation's pad.** Row-level security is a backstop
+//!   the table owner bypasses, so every query behind this port carries its own
+//!   `WHERE user_id` predicate. The scratchpad arm carries a `conversation_id`
+//!   predicate beside it: the pad is per-conversation by design, and reaching
+//!   across conversations is a different feature with its own privacy question.
 //! - **No failure reaches the turn.** An adapter that cannot answer returns an
 //!   error, and the caller drops the block and proceeds.
 
@@ -78,6 +81,26 @@ pub struct RecallEntry {
     pub relevance: RecallRelevance,
 }
 
+/// One scratchpad note offered as a recall candidate (#1101).
+///
+/// The note itself travels, not a pre-rendered line, because how much of a note
+/// a line may spend and what counts as a note already in view are the core's
+/// decisions - see [`crate::recall`].
+#[derive(Debug, Clone)]
+pub struct RecallNote {
+    /// The note's key, as the model wrote it. Nothing between the write tool
+    /// and here bounds its length or its characters.
+    pub key: String,
+    /// The note's content, up to
+    /// [`MAX_NOTE_BYTES`](crate::ports::scratchpad::MAX_NOTE_BYTES).
+    pub content: String,
+    /// Whether the note is pinned, so `[Pinned]` already carries its whole
+    /// content this turn. The flag travels rather than the adapter filtering on
+    /// it, because "already in view" is one rule and it is applied in one place.
+    pub pinned: bool,
+    pub relevance: RecallRelevance,
+}
+
 /// One tag name offered as a recall candidate.
 ///
 /// The name alone: the point of the tag arm is a working vocabulary for the
@@ -91,15 +114,20 @@ pub struct RecallTag {
 
 /// What one recall lookup asks for.
 ///
-/// Both limits are ceilings on rows *read*, not on rows shown. The block
+/// Every limit is a ceiling on rows *read*, not on rows shown. The block
 /// renders far fewer, and reads further so that "and N more matched less
 /// closely" is a number rather than a guess.
 #[derive(Debug, Clone)]
 pub struct RecallRequest {
-    /// The user prompt, embedded once and asked of both indexes.
+    /// The user prompt, embedded once and asked of every index.
     pub prompt: String,
+    /// The conversation whose scratchpad the note arm reads. The pad is
+    /// per-conversation, so this is a scope and not a hint.
+    pub conversation_id: String,
     /// Ceiling on knowledge rows read.
     pub entry_limit: usize,
+    /// Ceiling on scratchpad rows read.
+    pub note_limit: usize,
     /// Ceiling on tag rows read.
     pub tag_limit: usize,
 }
@@ -107,10 +135,13 @@ pub struct RecallRequest {
 /// What one recall lookup found, each list nearest-first.
 ///
 /// Empty lists are an ordinary answer: a prompt with nothing near it is the
-/// case the relevance floor exists to keep quiet.
+/// case the relevance floor exists to keep quiet. So is one arm empty and the
+/// others full - an arm that could not answer contributes nothing and the rest
+/// of the block still renders.
 #[derive(Debug, Clone, Default)]
 pub struct RecallCandidates {
     pub entries: Vec<RecallEntry>,
+    pub notes: Vec<RecallNote>,
     pub tags: Vec<RecallTag>,
 }
 

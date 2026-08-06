@@ -200,12 +200,17 @@ pub(crate) struct TurnAnchors<'a> {
     /// (#1104). Ungated — unlike `scratchpad_index`, it renders every turn
     /// whenever anything is pinned.
     pub pinned: Option<&'a str>,
-    /// Rendered `[Recall]` block (#1100): candidate memory the user's prompt
-    /// may be about, found by a semantic lookup the model did not have to ask
-    /// for. Rendered on the **first round of a turn only** - see
-    /// [`surfaced_blocks`] - so it is produced once per turn and simply carried
-    /// through the later rounds.
-    pub recall: Option<&'a str>,
+    /// Candidate memory for the `[Recall]` block (#1100, #1101): what the
+    /// user's prompt may be about, found by a semantic lookup the model did not
+    /// have to ask for.
+    ///
+    /// Candidates rather than a rendered block, because two of the rules that
+    /// decide what may appear in it are settled here and not by the producer:
+    /// the block renders on the **first round of a turn only**, and it must not
+    /// repeat a scratchpad key the `[Scratchpad]` index has just listed - and
+    /// whether that index speaks depends on the window this assembly chose.
+    /// The lookup still runs once per turn; only the rendering is here.
+    pub recall: Option<crate::recall::RecallSurface<'a>>,
     /// Counts behind the always-on `[Working state]` nudge (#598), carried as
     /// counts rather than a rendered line so the block can drop whichever half
     /// a fuller block covers on this particular turn.
@@ -933,7 +938,9 @@ fn system_block(
 ///   "is this still in view?". This one answers "what might this prompt be
 ///   about?", which the user prompt asks once, so repeating it across twenty
 ///   tool rounds would spend thousands of tokens on an answer the model has
-///   already taken or ignored.
+///   already taken or ignored. It also yields to the two blocks above: a memory
+///   `[Pinned]` or `[Scratchpad]` already shows is dropped from it rather than
+///   paid for twice (#1101).
 fn surfaced_blocks(
     anchors: &TurnAnchors,
     ambient: &AmbientContext,
@@ -1043,11 +1050,25 @@ fn surfaced_blocks(
     // follows: it is the least authoritative block here - a hint about what the
     // prompt may be about, which the model is told to ignore where it does not
     // fit. The first-round gate is what bounds its cost.
-    if let Some(recall) = anchors
-        .recall
-        .filter(|r| !r.is_empty() && anchors.tool_rounds_since_anchor == 0)
+    //
+    // The index's own decision, just taken above, feeds the render: when
+    // `[Scratchpad]` has listed the pad's keys, recall drops the ones it named
+    // (#1101), and when the index is silent - the case the scratchpad arm
+    // exists for - it drops nothing.
+    if anchors.tool_rounds_since_anchor == 0
+        && let Some(surface) = anchors.recall
     {
-        blocks.push(Message::new(Role::System, format!("[Recall] {recall}")));
+        let surface = crate::recall::RecallSurface {
+            indexed_keys: if scratchpad_index.is_some() {
+                surface.indexed_keys
+            } else {
+                &[]
+            },
+            ..surface
+        };
+        if let Some(recall) = crate::recall::render_recall(&surface) {
+            blocks.push(Message::new(Role::System, format!("[Recall] {recall}")));
+        }
     }
 
     blocks

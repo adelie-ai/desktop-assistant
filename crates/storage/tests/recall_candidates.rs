@@ -691,11 +691,25 @@ async fn recall_block_scratchpad_arm_stays_within_the_current_conversation() {
     let pad = PgScratchpadStore::new(fx.pool.clone());
 
     with_user_id(UserId::new(USER), async {
-        convs.create(make_conversation("c1")).await.expect("conv c1");
-        convs.create(make_conversation("c2")).await.expect("conv c2");
+        convs
+            .create(make_conversation("c1"))
+            .await
+            .expect("conv c1");
+        convs
+            .create(make_conversation("c2"))
+            .await
+            .expect("conv c2");
         // The other conversation's note is a perfect match for the query
         // vector, so anything but an explicit scope would rank it first.
-        seed_note(&pad, "c2", "theirs", "another task's finding", axis(0), MODEL).await;
+        seed_note(
+            &pad,
+            "c2",
+            "theirs",
+            "another task's finding",
+            axis(0),
+            MODEL,
+        )
+        .await;
         seed_note(&pad, "c1", "mine", "this task's finding", axis(1), MODEL).await;
 
         let hits = pad
@@ -904,11 +918,20 @@ async fn the_degraded_scratchpad_arm_stays_within_the_current_conversation() {
     let pad = PgScratchpadStore::new(fx.pool.clone());
 
     with_user_id(UserId::new(USER), async {
-        convs.create(make_conversation("c1")).await.expect("conv c1");
-        convs.create(make_conversation("c2")).await.expect("conv c2");
+        convs
+            .create(make_conversation("c1"))
+            .await
+            .expect("conv c1");
+        convs
+            .create(make_conversation("c2"))
+            .await
+            .expect("conv c2");
         pad.write(
             "c2",
-            &[NewScratchpadNote::new("theirs", "the deploy runs on Fridays")],
+            &[NewScratchpadNote::new(
+                "theirs",
+                "the deploy runs on Fridays",
+            )],
         )
         .await
         .expect("write note");
