@@ -384,6 +384,16 @@ impl PgKnowledgeBaseStore {
         // returns rows and the fusion still ranks them, so the caller gets a
         // plausible page that quietly omits the best matches. Removing either
         // one costs nothing at the time and breaks recall later.
+        //
+        // The final `ORDER BY rrf_score DESC, updated_at DESC, id DESC` is the
+        // same defect one level out, and just as load-bearing: RRF ties
+        // exactly by construction (a row found by only one arm at rank 1
+        // scores exactly `1/(60+1)`, whichever arm found it), so `rrf_score`
+        // alone would leave the final `LIMIT` truncation undefined between
+        // tied rows. `updated_at` breaks most ties in a content-relevant way
+        // (prefer the more recently touched entry); `id` is the last resort
+        // because it is the only column guaranteed unique, so the order is
+        // always total. Mirrors `scratchpad.rs`'s `search_hybrid`.
         let fetch_limit = (limit * 2) as i64;
         let result_limit = limit as i64;
 
@@ -454,7 +464,7 @@ impl PgKnowledgeBaseStore {
                 FULL OUTER JOIN text_ranked t ON v.id = t.id
             )
             SELECT id, content, tags, metadata, created_at, updated_at, summary
-            FROM fused ORDER BY rrf_score DESC LIMIT $5",
+            FROM fused ORDER BY rrf_score DESC, updated_at DESC, id DESC LIMIT $5",
         )
         .bind(embedding_vec)
         .bind(tags)

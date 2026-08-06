@@ -201,6 +201,14 @@ impl PgToolRegistryStore {
             // consume a real-tool result slot, while `matched_providers` still
             // scores the provider rows so the boost works. The final
             // `WHERE name NOT LIKE 'provider:%'` remains as guard #2.
+            //
+            // `ORDER BY boosted_score DESC, name ASC` (#1107 follow-up): two
+            // tools can tie exactly on `ts_rank_cd` (equal relevance, equal or
+            // absent provider boost), which leaves a bare `boosted_score`
+            // order undefined between them. `name` is `tool_definitions`'
+            // single-column PRIMARY KEY, so it alone makes the order total --
+            // no second column needed, unlike the composite-keyed
+            // `skill_index` or the recency-plus-id `knowledge_base`.
             let rows: Vec<ToolSearchRow> = sqlx::query_as(
                 "WITH real_ranked AS (
                     SELECT name, description, parameters, provider,
@@ -222,7 +230,7 @@ impl PgToolRegistryStore {
                 SELECT name, description, parameters, boosted_score AS rrf_score
                 FROM boosted
                 WHERE name NOT LIKE 'provider:%'
-                ORDER BY boosted_score DESC LIMIT $3",
+                ORDER BY boosted_score DESC, name ASC LIMIT $3",
             )
             .bind(query)
             .bind(PROVIDER_BOOST_WEIGHT)
@@ -253,6 +261,14 @@ impl PgToolRegistryStore {
         // plausible page that quietly omits the best matches.
         // `provider_vector_ranked` below carries no `LIMIT` at all, so it is
         // not subject to this defect.
+        //
+        // The final `ORDER BY boosted_score DESC, name ASC` is the same
+        // defect one level out: RRF ties exactly by construction (a row found
+        // by only one arm at rank 1 scores exactly `1/(60+1)`, whichever arm
+        // found it), so `boosted_score` alone would leave the final `LIMIT`
+        // truncation undefined between tied tools. `name` is
+        // `tool_definitions`' single-column PRIMARY KEY, so it alone makes
+        // the order total.
         let rows: Vec<ToolSearchRow> = sqlx::query_as(
             "WITH real_chunk_distances AS (
                 SELECT name, description, parameters, provider,
@@ -319,7 +335,7 @@ impl PgToolRegistryStore {
             SELECT name, description, parameters, boosted_score AS rrf_score
             FROM boosted
             WHERE name NOT LIKE 'provider:%'
-            ORDER BY boosted_score DESC LIMIT $4",
+            ORDER BY boosted_score DESC, name ASC LIMIT $4",
         )
         .bind(embedding_vec)
         .bind(fetch_limit)

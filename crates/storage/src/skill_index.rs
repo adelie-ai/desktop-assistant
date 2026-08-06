@@ -144,6 +144,18 @@ impl PgSkillIndexStore {
         // undefined set: the arm still returns rows and the fusion still ranks
         // them, so the caller gets a plausible page that quietly omits the
         // best matches.
+        //
+        // The final `ORDER BY f.score DESC, s.name ASC, s.owner_key ASC` is
+        // the same defect one level out: RRF ties exactly by construction (a
+        // row found by only one arm at rank 1 scores exactly `1/(60+1)`,
+        // whichever arm found it), so `f.score` alone would leave the final
+        // `LIMIT` truncation undefined between tied skills. This table has no
+        // single surrogate id column -- its uniqueness is the composite
+        // `(name, owner_key)` (`idx_skill_index_name_owner`) -- so that
+        // composite, not a recency column, is the natural total-order
+        // tiebreak; a skill's catalog `indexed_at` reflects when the last
+        // reconcile scan touched it, not the search-relevant recency
+        // `updated_at`/`id` give the other three tables.
         let rows: Vec<SkillRow> = sqlx::query_as(
             "WITH scope AS ( \
                  SELECT * FROM skill_index \
@@ -183,7 +195,7 @@ impl PgSkillIndexStore {
                     s.content_hash, s.trust_tier, s.source, s.tags, s.attachments, s.body, \
                     s.metadata, s.present_on_disk, s.last_seen_at \
              FROM fused f JOIN scope s ON s.name = f.name AND s.owner_key = f.owner_key \
-             ORDER BY f.score DESC LIMIT $5",
+             ORDER BY f.score DESC, s.name ASC, s.owner_key ASC LIMIT $5",
         )
         .bind(user.as_str())
         .bind(Vector::from(query_embedding))
