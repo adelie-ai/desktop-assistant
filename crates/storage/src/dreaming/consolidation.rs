@@ -592,6 +592,8 @@ fn parse_operations(response: &str) -> Result<Vec<RawOp>, CoreError> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::*;
 
     fn entry(id: &str, content: &str, tags: &[&str]) -> KbEntry {
@@ -679,5 +681,236 @@ mod tests {
         let slices = slice_entries(entries);
         assert_eq!(slices.len(), 1);
         assert_eq!(slices[0].len(), 10);
+    }
+
+    /// A response the model cut off at its output limit, ending mid-string.
+    const TRUNCATED: &str = r#"{"operations": [
+        {"op": "delete", "ids": ["a"], "reason": "trivial"},
+        {"op": "edit", "id": "b", "content": "tigh"#;
+
+    /// A response that is not valid JSON for a reason other than ending early.
+    const MALFORMED: &str = r#"{"operations": [{"op": , "id": "a"}]}"#;
+
+    fn ops_response(ids: &[&str]) -> String {
+        let ops: Vec<String> = ids
+            .iter()
+            .map(|id| format!(r#"{{"op":"delete","ids":["{id}"],"reason":"trivial"}}"#))
+            .collect();
+        format!(r#"{{"operations": [{}]}}"#, ops.join(","))
+    }
+
+    /// How many entries a built user prompt describes.
+    fn entries_in_prompt(prompt: &str) -> usize {
+        prompt.lines().filter(|l| l.starts_with("## ")).count()
+    }
+
+    /// Records every prompt it is asked, and answers by rule.
+    fn recording_llm(
+        calls: Arc<Mutex<Vec<String>>>,
+        answer: impl Fn(usize) -> Result<String, String> + Send + Sync + 'static,
+    ) -> DreamingLlmFn {
+        Box::new(move |_system, user| {
+            let seen = entries_in_prompt(&user);
+            calls.lock().expect("prompt log is not poisoned").push(user);
+            let result = answer(seen);
+            Box::pin(async move { result })
+        })
+    }
+
+    fn slice_of(n: usize) -> Vec<KbEntry> {
+        (0..n)
+            .map(|i| entry(&format!("id{i}"), "some durable content", &["t"]))
+            .collect()
+    }
+
+    #[test]
+    fn truncated_response_reports_truncation_not_malformed_json() {
+        let err = parse_operations(TRUNCATED).expect_err("a cut-off response cannot parse");
+        assert!(
+            matches!(err, ParseFailure::Truncated(_)),
+            "expected a truncation verdict, got: {err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            !message.contains("bad consolidation JSON"),
+            "a truncated response must not be reported as malformed: {message}"
+        );
+    }
+
+    #[test]
+    fn malformed_json_reports_a_parse_error() {
+        let err = parse_operations(MALFORMED).expect_err("invalid JSON cannot parse");
+        assert!(
+            matches!(err, ParseFailure::Malformed(_)),
+            "expected a malformed verdict, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn truncated_slice_is_split_and_retried() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        // Answers only once the slice has been cut down to 2 entries or fewer.
+        let llm = recording_llm(calls.clone(), |seen| {
+            if seen > 2 {
+                Ok(TRUNCATED.to_string())
+            } else {
+                Ok(ops_response(&["a"]))
+            }
+        });
+
+        let ops = operations_for_slice(&llm, &slice_of(4), &CancellationToken::new())
+            .await
+            .expect("splitting recovers the slice");
+
+        assert!(!ops.is_empty(), "the retry must yield the recovered ops");
+        let sizes: Vec<usize> = calls
+            .lock()
+            .expect("prompt log is not poisoned")
+            .iter()
+            .map(|p| entries_in_prompt(p))
+            .collect();
+        assert!(
+            sizes.iter().any(|&n| n <= 2),
+            "expected a retry with a smaller slice, saw sizes {sizes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn split_retry_applies_operations_from_both_halves() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let llm = recording_llm(calls, |seen| {
+            if seen > 2 {
+                Ok(TRUNCATED.to_string())
+            } else {
+                // Each half names the ids it was shown, so a dropped half is visible.
+                Ok(ops_response(&["half"]))
+            }
+        });
+
+        let ops = operations_for_slice(&llm, &slice_of(4), &CancellationToken::new())
+            .await
+            .expect("splitting recovers the slice");
+
+        let deletes = ops
+            .iter()
+            .filter(|o| matches!(o, RawOp::Delete { .. }))
+            .count();
+        assert_eq!(deletes, 2, "both halves' operations must be kept");
+    }
+
+    #[tokio::test]
+    async fn malformed_json_is_not_retried() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let llm = recording_llm(calls.clone(), |_| Ok(MALFORMED.to_string()));
+
+        operations_for_slice(&llm, &slice_of(8), &CancellationToken::new())
+            .await
+            .expect_err("malformed JSON is a real failure");
+
+        assert_eq!(
+            calls.lock().expect("prompt log is not poisoned").len(),
+            1,
+            "a syntax error is not a size problem, so it must not be split and retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn split_retry_stops_at_the_depth_limit() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let llm = recording_llm(calls.clone(), |_| Ok(TRUNCATED.to_string()));
+
+        operations_for_slice(&llm, &slice_of(64), &CancellationToken::new())
+            .await
+            .expect_err("a slice that never fits is a failure");
+
+        // Bounded by the split depth: 1 + 2 + 4 + ... for MAX_SLICE_SPLIT_DEPTH levels.
+        let made = calls.lock().expect("prompt log is not poisoned").len();
+        let ceiling = (1usize << (MAX_SLICE_SPLIT_DEPTH + 1)) - 1;
+        assert!(
+            made <= ceiling,
+            "expected at most {ceiling} calls at depth {MAX_SLICE_SPLIT_DEPTH}, made {made}"
+        );
+    }
+
+    #[tokio::test]
+    async fn single_entry_slice_that_truncates_fails_cleanly() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let llm = recording_llm(calls.clone(), |_| Ok(TRUNCATED.to_string()));
+
+        operations_for_slice(&llm, &slice_of(1), &CancellationToken::new())
+            .await
+            .expect_err("one entry cannot be split any further");
+
+        assert_eq!(
+            calls.lock().expect("prompt log is not poisoned").len(),
+            1,
+            "a one-entry slice has nothing to split, so it must not retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_half_that_fails_does_not_discard_the_half_that_worked() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        // The full slice truncates; afterwards one half answers and one stays broken.
+        let llm = recording_llm(calls, |seen| {
+            if seen > 2 {
+                Ok(TRUNCATED.to_string())
+            } else if seen == 2 {
+                Ok(ops_response(&["kept"]))
+            } else {
+                Err("backend refused".to_string())
+            }
+        });
+
+        let ops = operations_for_slice(&llm, &slice_of(4), &CancellationToken::new())
+            .await
+            .expect("a partial recovery still returns what worked");
+        assert!(
+            !ops.is_empty(),
+            "the half that answered must not be thrown away"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_part_failing_reports_the_slice_as_failed() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let llm = recording_llm(calls, |_| Err("backend unreachable".to_string()));
+
+        operations_for_slice(&llm, &slice_of(4), &CancellationToken::new())
+            .await
+            .expect_err("a slice whose every part failed is a failure");
+    }
+
+    #[test]
+    fn slice_entries_splits_a_reference_sized_kb_into_several_slices() {
+        // The shape that fails in production: 756 entries averaging ~229 chars.
+        let content = "x".repeat(229);
+        let entries: Vec<KbEntry> = (0..756)
+            .map(|i| entry(&format!("id{i}"), &content, &["tag"]))
+            .collect();
+        let slices = slice_entries(entries);
+        assert!(
+            slices.len() > 4,
+            "a knowledge base this size must not be sent as 2 huge prompts, got {} slices",
+            slices.len()
+        );
+        let total: usize = slices.iter().map(|s| s.len()).sum();
+        assert_eq!(total, 756, "no entry may be dropped while slicing");
+    }
+
+    #[test]
+    fn slice_entries_budgets_in_characters_not_bytes() {
+        // Each 'e' with an accent is 2 bytes but 1 character. A budget counted in
+        // bytes splits this set; a budget counted in characters does not.
+        let half_budget = "é".repeat(MAX_HOLISTIC_PROMPT_CHARS / 2 - 500);
+        let entries: Vec<KbEntry> = (0..2)
+            .map(|i| entry(&format!("id{i}"), &half_budget, &[]))
+            .collect();
+        let slices = slice_entries(entries);
+        assert_eq!(
+            slices.len(),
+            1,
+            "two entries of half the character budget fit in one slice"
+        );
     }
 }
