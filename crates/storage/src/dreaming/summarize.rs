@@ -40,6 +40,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
+use chrono::{DateTime, Utc};
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::SUMMARY_MAX_CHARS;
 use desktop_assistant_core::ports::auth::{UserId, current_user_id, with_user_id};
@@ -59,6 +60,9 @@ struct SummaryTarget {
     id: String,
     content: String,
     tags: Vec<String>,
+    /// The body's last-modified time as this pass read it. Carried so the write
+    /// can refuse a line that was written for a body the row no longer holds.
+    read_at: DateTime<Utc>,
 }
 
 /// What one summary pass did, and what it left behind.
@@ -176,19 +180,22 @@ async fn summarize_one_user(
         }
         match summaries_for_batch(llm_fn, batch).await {
             Ok(lines) => {
-                for (id, summary) in lines {
-                    match write_summary(pool, &id, &summary).await {
+                for (target, summary) in lines {
+                    match write_summary(pool, target, &summary).await {
                         Ok(true) => written += 1,
-                        // The row went away, or was retired, between the read
-                        // and the write. Not a failure: the next pass will not
-                        // select it either.
+                        // The row was retired, or its body changed, between the
+                        // read and the write. Not a failure: the line describes
+                        // a body that is gone, and the row is still in the
+                        // worklist for the next cycle.
                         Ok(false) => tracing::debug!(
-                            "dreaming: knowledge entry {id} was no longer writable; \
-                             its summary was not stored"
+                            "dreaming: knowledge entry {} moved on before its summary \
+                             landed; the line was discarded",
+                            target.id
                         ),
-                        Err(e) => {
-                            tracing::warn!("dreaming: storing summary for {id} failed: {e}")
-                        }
+                        Err(e) => tracing::warn!(
+                            "dreaming: storing summary for {} failed: {e}",
+                            target.id
+                        ),
                     }
                 }
             }
@@ -222,10 +229,10 @@ async fn summarize_one_user(
 /// bounded by [`SUMMARY_MAX_CHARS`], because nothing bounds what the model
 /// returns and the line is rendered into a list row and a context block with a
 /// fixed budget.
-async fn summaries_for_batch(
+async fn summaries_for_batch<'a>(
     llm_fn: &DreamingLlmFn,
-    batch: &[SummaryTarget],
-) -> Result<Vec<(String, String)>, String> {
+    batch: &'a [SummaryTarget],
+) -> Result<Vec<(&'a SummaryTarget, String)>, String> {
     let response = llm_fn(build_system_prompt(), build_user_prompt(batch)).await?;
     let asked: BTreeSet<&str> = batch.iter().map(|t| t.id.as_str()).collect();
     let parsed = parse_summaries(&response)?;
@@ -251,7 +258,7 @@ async fn summaries_for_batch(
     // of the batch rather than an arbitrary subset.
     Ok(batch
         .iter()
-        .filter_map(|t| lines.remove(&t.id).map(|line| (t.id.clone(), line)))
+        .filter_map(|t| lines.remove(&t.id).map(|line| (t, line)))
         .collect())
 }
 
@@ -397,8 +404,9 @@ async fn load_entries_needing_a_summary(
     limit: usize,
 ) -> Result<Vec<SummaryTarget>, CoreError> {
     let user_id = current_user_id();
-    let rows: Vec<(String, String, Vec<String>)> = sqlx::query_as(
-        "SELECT id, content, tags FROM knowledge_base \
+    type Row = (String, String, Vec<String>, DateTime<Utc>);
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT id, content, tags, updated_at FROM knowledge_base \
          WHERE user_id = $1 AND deleted_at IS NULL \
            AND (summary IS NULL \
              OR summary_updated_at IS NULL \
@@ -414,7 +422,12 @@ async fn load_entries_needing_a_summary(
 
     Ok(rows
         .into_iter()
-        .map(|(id, content, tags)| SummaryTarget { id, content, tags })
+        .map(|(id, content, tags, read_at)| SummaryTarget {
+            id,
+            content,
+            tags,
+            read_at,
+        })
         .collect())
 }
 
@@ -443,16 +456,28 @@ async fn count_entries_needing_a_summary(pool: &PgPool) -> Result<usize, CoreErr
 /// deliberately left alone: bumping it would mark the row's embedding stale and
 /// send the whole backfilled store back through the embedding backfill for a
 /// change that never touched the embedded text.
-async fn write_summary(pool: &PgPool, id: &str, summary: &str) -> Result<bool, CoreError> {
+///
+/// `updated_at` is instead a precondition. The pass reads a row, spends a model
+/// call, then writes, and a content write can land in that window - so the line
+/// would describe the body the pass read while the freshness stamp declared it
+/// current, and nothing would revisit it. Matching the body's modified time
+/// makes the write a no-op in that case, and the row stays in the worklist.
+async fn write_summary(
+    pool: &PgPool,
+    target: &SummaryTarget,
+    summary: &str,
+) -> Result<bool, CoreError> {
     let user_id = current_user_id();
     let result = sqlx::query(
         "UPDATE knowledge_base \
          SET summary = $1, summary_updated_at = NOW() \
-         WHERE user_id = $2 AND id = $3 AND deleted_at IS NULL",
+         WHERE user_id = $2 AND id = $3 AND deleted_at IS NULL \
+           AND updated_at = $4",
     )
     .bind(summary)
     .bind(user_id.as_str())
-    .bind(id)
+    .bind(&target.id)
+    .bind(target.read_at)
     .execute(pool)
     .await
     .map_err(|e| CoreError::Storage(format!("dreaming: summary update failed: {e}")))?;
@@ -468,6 +493,7 @@ mod tests {
             id: id.to_string(),
             content: content.to_string(),
             tags: tags.iter().map(|t| t.to_string()).collect(),
+            read_at: DateTime::UNIX_EPOCH,
         }
     }
 
@@ -513,7 +539,11 @@ mod tests {
         let lines = summaries_for_batch(&llm, &batch)
             .await
             .expect("the batch answered");
-        assert_eq!(lines, vec![("asked".to_string(), "kept".to_string())]);
+        let kept: Vec<(&str, &str)> = lines
+            .iter()
+            .map(|(t, line)| (t.id.as_str(), line.as_str()))
+            .collect();
+        assert_eq!(kept, vec![("asked", "kept")]);
     }
 
     #[tokio::test]

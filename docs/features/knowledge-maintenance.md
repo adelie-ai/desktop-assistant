@@ -95,6 +95,13 @@ alone on purpose: bumping it would mark the row's embedding stale and send the
 whole backfilled store back through the embedding backfill for a change that
 never touched the embedded text.
 
+`updated_at` is instead a **precondition** on the write. The pass reads a row,
+spends a model call, then writes, and a content write can land in that window -
+which would store a line describing the body the pass read while the freshness
+stamp declared it current, so nothing would ever revisit it. Matching the body's
+modified time makes the write a no-op in that case; the line is discarded and the
+row stays in the worklist for the next cycle.
+
 ## What consolidation may and may not do
 
 The model sees the whole active store and returns a plan. The plan is not applied

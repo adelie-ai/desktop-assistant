@@ -379,6 +379,48 @@ async fn dream_summary_pass_never_changes_content() {
     fx.cleanup().await;
 }
 
+#[tokio::test]
+async fn dream_summary_pass_discards_a_line_written_for_a_body_that_changed_under_it() {
+    // The pass reads a row, spends seconds asking the model, then writes. A
+    // content write that lands in that window leaves a line describing the body
+    // the pass read and not the body the row now holds - and the freshness stamp
+    // would declare that line current, so nothing would ever revisit it.
+    let Some(fx) = support::DbFixture::try_new("dream1099").await else {
+        return;
+    };
+    let pool = &fx.pool;
+
+    seed_kb(pool, "u1", "kb-a", "The user prefers a dark theme.").await;
+
+    // Answers only after rewriting the body, which is the interleave itself.
+    let racing_pool = pool.clone();
+    let llm: DreamingLlmFn = Box::new(move |_system, _user| {
+        let pool = racing_pool.clone();
+        Box::pin(async move {
+            rewrite_content(&pool, "kb-a", "The user prefers a light theme after all.").await;
+            Ok(r#"{"summaries":[{"id":"kb-a","summary":"Prefers dark themes"}]}"#.to_string())
+        })
+    });
+    run_cycle(pool, &llm).await;
+
+    assert_eq!(
+        kb_summary(pool, "kb-a").await,
+        None,
+        "a line written for a body that has since changed is discarded, not stored"
+    );
+
+    // And the row is still work, so the next cycle summarises the body it holds.
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    run_cycle(pool, &llm_summarising_everything(prompts)).await;
+    assert_eq!(
+        kb_summary(pool, "kb-a").await.as_deref(),
+        Some("summary of kb-a"),
+        "the row stays in the worklist and is summarised against its current body"
+    );
+
+    fx.cleanup().await;
+}
+
 // ---------------------------------------------------------------------------
 // Bounded per cycle.
 // ---------------------------------------------------------------------------
