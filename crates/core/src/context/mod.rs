@@ -14,9 +14,10 @@
 //!   tool results → summarise-and-shrink) before the dispatch loop retries.
 //!   Every rung rewrites message content; none removes a message, because the
 //!   list it works on is the one the turn persists.
-//! - **Summarisation** (`generate_context_summary`): Asks the LLM for a
-//!   bullet-point summary of dropped messages and merges it with any
-//!   existing rolling summary, so windowed-out history is not lost.
+//! - **Summarisation** (`generate_context_summary`, `compact_into_summary`):
+//!   Asks the LLM for a bullet-point summary of dropped messages and merges it
+//!   with any existing rolling summary, so windowed-out history is not lost.
+//!   The compaction marker moves only when a summary was actually produced.
 //!
 //! Constants exposed here are tuning knobs read by the dispatch loop in
 //! `service.rs` to mirror this module's defaults (e.g., the floor on
@@ -1325,14 +1326,60 @@ pub(crate) fn compaction_range(conv: &Conversation, max_messages: usize) -> Opti
     None
 }
 
-/// Ask the LLM to produce a bullet-point summary of dropped messages, merged
-/// with any existing summary. Falls back to the existing summary on failure.
-pub(crate) async fn generate_context_summary<L: LlmClient>(
-    existing_summary: &str,
-    messages: &[Message],
-    llm: &L,
-) -> String {
-    // Build a transcript of User/Assistant messages only; skip Tool/System.
+/// Maximum bytes of one assistant message carried into the summariser's
+/// transcript.
+const SUMMARY_ASSISTANT_BYTES: usize = 2000;
+
+/// Maximum bytes of one tool result carried into the summariser's transcript.
+///
+/// Tool output is the bulk of a long agentic range. A summary records what a
+/// call produced, so the head of the payload is enough; carrying results whole
+/// would cost more prompt than the range they came from.
+const SUMMARY_TOOL_RESULT_BYTES: usize = 600;
+
+/// Maximum bytes of one tool call's arguments carried into the transcript.
+const SUMMARY_TOOL_ARGS_BYTES: usize = 200;
+
+/// What [`generate_context_summary`] made of a range of dropped messages.
+///
+/// The caller advances `compacted_through` only for [`SummaryOutcome::Summarised`].
+/// A range that produced no summary stays in front of [`compaction_range`], so a
+/// later turn tries it again instead of dropping it from both the window and the
+/// rolling summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SummaryOutcome {
+    /// A new rolling summary that folds the range in.
+    Summarised(String),
+    /// The range held no user prose, no assistant prose, no tool call and no
+    /// tool result, so there is nothing a summary can carry.
+    NothingToSummarise,
+    /// The summariser call failed, or it returned no text.
+    Failed,
+}
+
+/// Append `text` to `out`, cut to `max_bytes` on a char boundary, and mark the
+/// cut so the summariser knows it read a head and not the whole value.
+fn push_truncated(out: &mut String, text: &str, max_bytes: usize) {
+    if text.len() > max_bytes {
+        // Char-boundary-safe cut: a naive byte slice panics when the cut lands
+        // inside a multibyte character (DA-2).
+        out.push_str(&planning::truncate_on_char_boundary(text, max_bytes));
+        out.push_str("...[truncated]");
+    } else {
+        out.push_str(text);
+    }
+}
+
+/// Render a message range as the transcript the summariser reads.
+///
+/// Every role that carries work is represented. A long agentic range is mostly
+/// tool calls and tool results, and a transcript of prose alone leaves such a
+/// range empty - the summariser then has nothing to fold in, and the range
+/// drops out of the model's view with no record of what it did. Tool payloads
+/// are cut to a head, because the summary records what a call produced rather
+/// than reproducing it. `Role::System` messages are skipped: they are the
+/// assembler's own re-surfaced blocks, not conversation.
+fn summary_transcript(messages: &[Message]) -> String {
     let mut transcript = String::new();
     for msg in messages {
         match msg.role {
@@ -1341,24 +1388,52 @@ pub(crate) async fn generate_context_summary<L: LlmClient>(
                 transcript.push_str(&msg.content);
                 transcript.push('\n');
             }
-            Role::Assistant if !msg.content.is_empty() => {
-                transcript.push_str("Assistant: ");
-                if msg.content.len() > 2000 {
-                    // Char-boundary-safe cut: a naive byte slice panics when
-                    // byte 2000 lands inside a multibyte character (DA-2).
-                    transcript.push_str(&planning::truncate_on_char_boundary(&msg.content, 2000));
-                    transcript.push_str("...[truncated]");
-                } else {
-                    transcript.push_str(&msg.content);
+            Role::Assistant => {
+                if !msg.content.is_empty() {
+                    transcript.push_str("Assistant: ");
+                    push_truncated(&mut transcript, &msg.content, SUMMARY_ASSISTANT_BYTES);
+                    transcript.push('\n');
                 }
+                if !msg.tool_calls.is_empty() {
+                    transcript.push_str("Assistant called: ");
+                    for (i, call) in msg.tool_calls.iter().enumerate() {
+                        if i > 0 {
+                            transcript.push_str(", ");
+                        }
+                        transcript.push_str(&call.name);
+                        transcript.push('(');
+                        push_truncated(&mut transcript, &call.arguments, SUMMARY_TOOL_ARGS_BYTES);
+                        transcript.push(')');
+                    }
+                    transcript.push('\n');
+                }
+            }
+            Role::Tool if !msg.content.is_empty() => {
+                transcript.push_str("Tool result: ");
+                push_truncated(&mut transcript, &msg.content, SUMMARY_TOOL_RESULT_BYTES);
                 transcript.push('\n');
             }
             _ => {}
         }
     }
+    transcript
+}
 
+/// Fold a message range into the rolling summary, and report whether the fold
+/// succeeded.
+///
+/// The caller uses the outcome to decide whether the range is safe to leave
+/// behind. Returning the existing summary for a failed call would read as
+/// success and let the caller mark the range compacted, which drops it from
+/// both the prompt window and the summary for good.
+pub(crate) async fn generate_context_summary<L: LlmClient>(
+    existing_summary: &str,
+    messages: &[Message],
+    llm: &L,
+) -> SummaryOutcome {
+    let transcript = summary_transcript(messages);
     if transcript.is_empty() {
-        return existing_summary.to_string();
+        return SummaryOutcome::NothingToSummarise;
     }
 
     let mut prompt = String::new();
@@ -1393,14 +1468,55 @@ pub(crate) async fn generate_context_summary<L: LlmClient>(
         )
         .await
     {
-        Ok(response) if !response.text.trim().is_empty() => response.text.trim().to_string(),
+        Ok(response) if !response.text.trim().is_empty() => {
+            SummaryOutcome::Summarised(response.text.trim().to_string())
+        }
         Ok(_) => {
             tracing::warn!("context summary generation returned empty");
-            existing_summary.to_string()
+            SummaryOutcome::Failed
         }
         Err(e) => {
             tracing::warn!("context summary generation failed: {e}");
-            existing_summary.to_string()
+            SummaryOutcome::Failed
+        }
+    }
+}
+
+/// Fold the conversation's next compaction range into its rolling summary, and
+/// advance `compacted_through` only when the fold succeeded. Reports whether
+/// the marker moved.
+///
+/// `compaction_range` only ever returns ranges that start at
+/// `compacted_through`, so a range the marker steps over is never revisited.
+/// Holding the marker back when no summary was produced keeps that range in
+/// front of the next turn, which retries it over a range that has since grown.
+/// The cost of holding back is one wider range later; the cost of advancing is
+/// history that no prompt and no summary carries.
+pub(crate) async fn compact_into_summary<L: LlmClient>(
+    conv: &mut Conversation,
+    max_messages: usize,
+    llm: &L,
+) -> bool {
+    let Some((from, to)) = compaction_range(conv, max_messages) else {
+        return false;
+    };
+    match generate_context_summary(&conv.context_summary, &conv.messages[from..to], llm).await {
+        SummaryOutcome::Summarised(summary) => {
+            conv.context_summary = summary;
+            conv.compacted_through = to;
+            true
+        }
+        SummaryOutcome::NothingToSummarise => {
+            tracing::debug!(from, to, "compaction range held nothing to summarise");
+            false
+        }
+        SummaryOutcome::Failed => {
+            tracing::warn!(
+                from,
+                to,
+                "context summary failed; the range stays uncompacted and is retried"
+            );
+            false
         }
     }
 }
@@ -1467,16 +1583,9 @@ pub(crate) async fn recover_from_overflow<L: LlmClient>(
     if new_window < *target_window {
         *target_window = new_window;
     }
-    if let Some((from, to)) = compaction_range(conv, *target_window) {
-        let summary =
-            generate_context_summary(&conv.context_summary, &conv.messages[from..to], task_llm)
-                .await;
-        conv.context_summary = summary;
-        conv.compacted_through = to;
+    if compact_into_summary(conv, *target_window, task_llm).await {
         tracing::warn!(
             new_window = *target_window,
-            from,
-            to,
             "context overflow — summarised and shrank window (step 3)"
         );
     } else {
@@ -4069,18 +4178,40 @@ mod tests {
         ];
         let llm = MockLlm::new(vec!["- Discussed Rust and lifetimes"]);
         let result = generate_context_summary("", &messages, &llm).await;
-        assert_eq!(result, "- Discussed Rust and lifetimes");
+        assert_eq!(
+            result,
+            SummaryOutcome::Summarised("- Discussed Rust and lifetimes".to_string())
+        );
     }
 
     #[tokio::test]
-    async fn generate_context_summary_falls_back_on_failure() {
+    async fn generate_context_summary_reports_failure_rather_than_the_old_summary() {
         let messages = vec![
             Message::new(Role::User, "Hello"),
             Message::new(Role::Assistant, "Hi"),
         ];
         let llm = FailingLlm;
         let result = generate_context_summary("existing summary", &messages, &llm).await;
-        assert_eq!(result, "existing summary");
+        assert_eq!(
+            result,
+            SummaryOutcome::Failed,
+            "a failed summariser must not look like a successful one"
+        );
+    }
+
+    #[tokio::test]
+    async fn generate_context_summary_reports_failure_on_empty_llm_text() {
+        let messages = vec![Message::new(Role::User, "Hello")];
+        let llm = MockLlm::new(vec!["   "]);
+        let result = generate_context_summary("existing summary", &messages, &llm).await;
+        assert_eq!(result, SummaryOutcome::Failed);
+    }
+
+    #[tokio::test]
+    async fn generate_context_summary_reports_nothing_to_summarise_for_an_empty_range() {
+        let llm = MockLlm::new(vec!["should not be called"]);
+        let result = generate_context_summary("old summary", &[], &llm).await;
+        assert_eq!(result, SummaryOutcome::NothingToSummarise);
     }
 
     #[tokio::test]
@@ -4097,18 +4228,184 @@ mod tests {
         let messages = vec![Message::new(Role::Assistant, content)];
         let llm = MockLlm::new(vec!["summary of long message"]);
         let result = generate_context_summary("", &messages, &llm).await;
-        assert_eq!(result, "summary of long message");
+        assert_eq!(
+            result,
+            SummaryOutcome::Summarised("summary of long message".to_string())
+        );
+    }
+
+    /// #751: a range of tool work is the normal shape of a long agentic
+    /// stretch. It must reach the summariser, not fall through as a no-op.
+    #[tokio::test]
+    async fn a_tool_only_range_is_summarised_rather_than_skipped() {
+        let messages = vec![
+            Message::assistant_with_tool_calls(vec![ToolCall::new(
+                "c1",
+                "read_file",
+                r#"{"path":"/tmp/notes"}"#,
+            )]),
+            Message::tool_result("c1", "the file said something important"),
+        ];
+        let llm = MockLlm::new(vec!["- read /tmp/notes"]);
+        let result = generate_context_summary("old summary", &messages, &llm).await;
+        assert_eq!(
+            result,
+            SummaryOutcome::Summarised("- read /tmp/notes".to_string())
+        );
+    }
+
+    /// #751: the summariser must be able to say what ran, so the transcript
+    /// carries the tool names, the arguments and the results.
+    #[tokio::test]
+    async fn the_summariser_transcript_carries_tool_names_arguments_and_results() {
+        use std::sync::{Arc, Mutex};
+        struct CapturingLlm {
+            seen: Arc<Mutex<Option<Vec<Message>>>>,
+        }
+        #[async_trait::async_trait]
+        impl LlmClient for CapturingLlm {
+            async fn stream_completion(
+                &self,
+                messages: Vec<Message>,
+                _tools: &[ToolDefinition],
+                _reasoning: ReasoningConfig,
+                _on_chunk: ChunkCallback,
+            ) -> Result<LlmResponse, CoreError> {
+                *self.seen.lock().unwrap() = Some(messages);
+                Ok(LlmResponse::text("Active task: stub.\n- a"))
+            }
+        }
+        let seen = Arc::new(Mutex::new(None));
+        let llm = CapturingLlm {
+            seen: Arc::clone(&seen),
+        };
+        let messages = vec![
+            Message::assistant_with_tool_calls(vec![ToolCall::new(
+                "c1",
+                "read_file",
+                r#"{"path":"/tmp/notes"}"#,
+            )]),
+            Message::tool_result("c1", "the file said something important"),
+        ];
+        let _ = generate_context_summary("", &messages, &llm).await;
+
+        let captured = seen.lock().unwrap().clone().expect("summariser was called");
+        let user = captured
+            .iter()
+            .find(|m| m.role == Role::User)
+            .expect("summariser sends a user message");
+        assert!(
+            user.content.contains("read_file"),
+            "the transcript must name the tool, got {:?}",
+            user.content
+        );
+        assert!(
+            user.content.contains("/tmp/notes"),
+            "the transcript must carry the call arguments, got {:?}",
+            user.content
+        );
+        assert!(
+            user.content.contains("the file said something important"),
+            "the transcript must carry the tool result, got {:?}",
+            user.content
+        );
+    }
+
+    /// A single tool result can be hundreds of kilobytes. The transcript takes
+    /// a head of it, so one result cannot outweigh the range it belongs to.
+    #[tokio::test]
+    async fn the_summariser_transcript_cuts_an_oversized_tool_result() {
+        let huge = "z".repeat(50_000);
+        let messages = vec![Message::tool_result("c1", huge.clone())];
+        let transcript = summary_transcript(&messages);
+        assert!(
+            transcript.len() < SUMMARY_TOOL_RESULT_BYTES + 100,
+            "the transcript must carry a head, not the whole result, got {} bytes",
+            transcript.len()
+        );
+        assert!(transcript.contains("...[truncated]"));
+    }
+
+    /// A range of only system blocks carries no conversation.
+    #[test]
+    fn a_system_only_range_has_nothing_to_summarise() {
+        let messages = vec![Message::new(Role::System, "[Now] Tuesday")];
+        assert!(summary_transcript(&messages).is_empty());
+    }
+
+    // --- compact_into_summary: the marker moves only on success (#751) ---
+
+    /// A conversation long enough for `compaction_range` to return a range,
+    /// whose dropped head is ordinary user/assistant prose.
+    fn conv_ready_for_compaction() -> Conversation {
+        let mut conv = Conversation::new("c1", "t");
+        for i in 0..(MAX_CONTEXT_MESSAGES * 2) {
+            conv.messages
+                .push(Message::new(Role::User, format!("prompt {i}")));
+            conv.messages
+                .push(Message::new(Role::Assistant, format!("reply {i}")));
+        }
+        conv
     }
 
     #[tokio::test]
-    async fn generate_context_summary_returns_existing_for_tool_only_messages() {
-        let messages = vec![
-            Message::assistant_with_tool_calls(vec![ToolCall::new("c1", "tool_a", "{}")]),
-            Message::tool_result("c1", "result"),
-        ];
-        let llm = MockLlm::new(vec!["should not be called"]);
-        let result = generate_context_summary("old summary", &messages, &llm).await;
-        assert_eq!(result, "old summary");
+    async fn a_failed_summariser_does_not_advance_the_compaction_marker() {
+        let mut conv = conv_ready_for_compaction();
+        let before = conv.compacted_through;
+        let compacted = compact_into_summary(&mut conv, MAX_CONTEXT_MESSAGES, &FailingLlm).await;
+
+        assert!(!compacted, "a failed summariser did not compact anything");
+        assert_eq!(
+            conv.compacted_through, before,
+            "the marker must stay put so the range is summarised on a later turn"
+        );
+        assert_eq!(
+            conv.context_summary, "",
+            "a failed summariser must not rewrite the rolling summary"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_summariser_response_does_not_advance_the_compaction_marker() {
+        let mut conv = conv_ready_for_compaction();
+        conv.context_summary = "earlier summary".to_string();
+        let llm = MockLlm::new(vec!["   "]);
+        let compacted = compact_into_summary(&mut conv, MAX_CONTEXT_MESSAGES, &llm).await;
+
+        assert!(!compacted);
+        assert_eq!(conv.compacted_through, 0);
+        assert_eq!(conv.context_summary, "earlier summary");
+    }
+
+    #[tokio::test]
+    async fn a_range_the_summariser_declined_is_offered_again_on_the_next_turn() {
+        // The failure is transient. The second attempt must still see the
+        // range the first one could not summarise.
+        let mut conv = conv_ready_for_compaction();
+        let expected = compaction_range(&conv, MAX_CONTEXT_MESSAGES).expect("a range to compact");
+        assert!(!compact_into_summary(&mut conv, MAX_CONTEXT_MESSAGES, &FailingLlm).await);
+
+        let retry = compaction_range(&conv, MAX_CONTEXT_MESSAGES).expect("the range is still due");
+        assert_eq!(
+            retry, expected,
+            "the same range must be offered again after a failed summary"
+        );
+
+        let llm = MockLlm::new(vec!["- the recovered summary"]);
+        assert!(compact_into_summary(&mut conv, MAX_CONTEXT_MESSAGES, &llm).await);
+        assert_eq!(conv.context_summary, "- the recovered summary");
+        assert_eq!(conv.compacted_through, expected.1);
+    }
+
+    #[tokio::test]
+    async fn a_successful_summary_advances_the_compaction_marker() {
+        let mut conv = conv_ready_for_compaction();
+        let (_, to) = compaction_range(&conv, MAX_CONTEXT_MESSAGES).expect("a range to compact");
+        let llm = MockLlm::new(vec!["- what happened earlier"]);
+
+        assert!(compact_into_summary(&mut conv, MAX_CONTEXT_MESSAGES, &llm).await);
+        assert_eq!(conv.compacted_through, to);
+        assert_eq!(conv.context_summary, "- what happened earlier");
     }
 
     #[tokio::test]

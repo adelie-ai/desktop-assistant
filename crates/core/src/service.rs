@@ -2,8 +2,7 @@ use crate::CoreError;
 use crate::context::{
     COMPACTION_TOKEN_RATIO, ConversationView, DEFAULT_MAX_TOOL_RESULT_BYTES, MAX_CONTEXT_MESSAGES,
     MAX_OVERFLOW_RETRIES, MIN_CONTEXT_MESSAGES, ToolContext, ToolLocalityContext, TurnAnchors,
-    assemble_turn_within_budget, cap_tool_result, compaction_range, generate_context_summary,
-    recover_from_overflow,
+    assemble_turn_within_budget, cap_tool_result, compact_into_summary, recover_from_overflow,
 };
 use crate::domain::{
     Conversation, ConversationId, ConversationSummary, Message, Role, ToolCall, ToolDefinition,
@@ -1541,16 +1540,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         // None of these fail loudly. The turn just gets more expensive and
         // less capable. Run such work inside the current task, or carry the
         // task-locals across the boundary by hand.
-        if let Some((from, to)) = compaction_range(&conv, target_window) {
-            let summary = generate_context_summary(
-                &conv.context_summary,
-                &conv.messages[from..to],
-                self.task_llm(),
-            )
-            .await;
-            conv.context_summary = summary;
-            conv.compacted_through = to;
-        }
+        compact_into_summary(&mut conv, target_window, self.task_llm()).await;
 
         // Dynamic tool discovery: start with core tools, activate more via tool_search.
         //
@@ -2178,16 +2168,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                             "context pressure — shrinking window and compacting"
                         );
                         target_window = new_window;
-                        if let Some((from, to)) = compaction_range(&conv, target_window) {
-                            let summary = generate_context_summary(
-                                &conv.context_summary,
-                                &conv.messages[from..to],
-                                self.task_llm(),
-                            )
-                            .await;
-                            conv.context_summary = summary;
-                            conv.compacted_through = to;
-                        }
+                        compact_into_summary(&mut conv, target_window, self.task_llm()).await;
                         compaction_active = true;
                     } else {
                         tracing::debug!(
