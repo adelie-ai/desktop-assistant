@@ -6797,6 +6797,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn kb_write_treats_a_whitespace_only_summary_as_a_clear() {
+        // One rule, applied in one order: collapse to a line first, then read
+        // absent / present / empty. A summary of nothing but whitespace
+        // collapses to empty, so it clears - it does not quietly become
+        // "preserve", which would need a second rule and leave the model no
+        // way to tell which one it had triggered.
+        //
+        // Safe to decide this way round because a summary is a convenience
+        // line, not the fact: the entry's content is untouched, and the
+        // maintenance pass writes a new summary for an entry that has none.
+        let (service, store) = kb_service_with_tag_gate(None);
+        seed_kb_entry(
+            &store,
+            "entry-1",
+            "Rain is expected on Tuesday.",
+            &["memory"],
+            serde_json::json!({}),
+        );
+        seed_kb_summary(&store, "entry-1", "Rain is coming this week");
+
+        kb_write_response(
+            &service,
+            serde_json::json!({"id": "entry-1", "summary": " \n\t "}),
+        )
+        .await;
+
+        let stored = kb_stored(&store);
+        assert_eq!(stored[0].summary.as_deref(), Some(""));
+        assert_eq!(
+            stored[0].content, "Rain is expected on Tuesday.",
+            "the fact itself is untouched"
+        );
+    }
+
+    #[tokio::test]
     async fn kb_write_batch_entry_carries_its_own_summary() {
         // The batch form ignores every top-level field, so a model that
         // batches its writes must be able to summarise each entry inside it.
