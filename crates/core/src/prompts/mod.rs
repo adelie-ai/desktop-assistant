@@ -661,6 +661,86 @@ mod tests {
     }
 
     #[test]
+    fn assembled_prompt_directs_the_model_to_available_tags_before_filtering() {
+        // A guessed tag that no entry carries returns nothing, and the model has
+        // no other way to learn the vocabulary. The search response reports the
+        // tags the scope really uses, so the guidance must send the model there
+        // (#1071).
+        let assembled = assemble(&static_sections());
+        assert!(
+            assembled.contains("Start with a natural-language query and no tags"),
+            "the KB guidance must open the search unfiltered"
+        );
+        assert!(
+            assembled.contains("available_tags"),
+            "and name the field that reports the tags the scope really uses"
+        );
+        assert!(
+            assembled.contains("Never guess a tag"),
+            "and forbid guessing a tag"
+        );
+    }
+
+    #[test]
+    fn assembled_prompt_bounds_the_list_fallback_to_three_pages() {
+        // Left vague, the model re-issues search with a bigger `limit`, which
+        // costs an embedding round-trip and returns the same entries re-ranked.
+        // The fallback is a different tool, and it is bounded (#1071).
+        let assembled = assemble(&static_sections());
+        assert!(
+            assembled.contains("read at most 3 pages"),
+            "the list fallback must be bounded to three pages"
+        );
+        assert!(
+            assembled.contains("Raising `limit` on search does not help"),
+            "and the guidance must say a bigger limit finds nothing new"
+        );
+        assert!(
+            assembled.contains("next_cursor"),
+            "and name the cursor the list tool pages with"
+        );
+    }
+
+    #[test]
+    fn assembled_prompt_tells_the_model_to_retag_an_entry_it_had_to_sweep_for() {
+        // An entry that only a full sweep found is mis-tagged for how the model
+        // searches. Without this the next search misses it again (#1071).
+        let assembled = assemble(&static_sections());
+        assert!(
+            assembled.contains("re-tag it so the next search finds it"),
+            "the guidance must turn a successful sweep into a repair"
+        );
+        assert!(
+            assembled.contains("Prefer a tag that already appears in `available_tags`"),
+            "and prefer an existing tag over a new one"
+        );
+        assert!(
+            assembled.contains("builtin_knowledge_base_write"),
+            "and name the tool that performs the re-tag"
+        );
+    }
+
+    #[test]
+    fn assembled_prompt_tells_the_model_to_describe_a_new_tag() {
+        // The registry dedups on an embedding of "<name>: <description>", and a
+        // short facet tag carries almost no signal alone. Without a description
+        // the vocabulary splits into near-duplicates (#1071).
+        let assembled = assemble(&static_sections());
+        assert!(
+            assembled.contains("new_tag_descriptions"),
+            "the guidance must name the field that carries a new tag's meaning"
+        );
+        assert!(
+            assembled.contains("one-line description"),
+            "and say how long that description should be"
+        );
+        assert!(
+            assembled.contains("near-duplicates"),
+            "and say what the description prevents"
+        );
+    }
+
+    #[test]
     fn assembled_prompt_advertises_scratchpad_tools() {
         // The scratchpad must be advertised in the always-present system prompt
         // so the model knows the tools exist (#184).
