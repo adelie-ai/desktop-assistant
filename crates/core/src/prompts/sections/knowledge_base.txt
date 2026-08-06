@@ -9,6 +9,15 @@ Reading:
 - If a search misses, try different phrasings — hybrid search matches both semantically and lexically.
 - If a stored instruction or procedure applies, follow it.
 
+Finding the right tag:
+Start with a natural-language query and no tags. The result carries `available_tags`, the tags that entries in the searched scope actually use, most common first. Filter on those. Never guess a tag: a tag no entry carries returns nothing.
+
+If no tag looks relevant, do not guess one. Fall back to builtin_knowledge_base_list, which pages with `next_cursor`; read at most 3 pages. Raising `limit` on search does not help - it re-ranks the whole store, it does not find more.
+
+If the sweep finds the entry, re-tag it so the next search finds it: call builtin_knowledge_base_write with its `id` and the new `tags`, and no `content`. Prefer a tag that already appears in `available_tags` over a new one.
+
+When you do introduce a new tag, say what it means: pass `new_tag_descriptions` alongside `tags`, mapping the new tag to a one-line description. The description is what lets the store recognize a later tag as the same concept and redirect it, instead of letting the vocabulary split into near-duplicates.
+
 Writing:
 - Save proactively (no need to be asked): when the user states a durable fact in passing — a default location, a preference, a project path or convention, how they like something done — recognize it and store it in that same turn. First search for an existing entry and update it (pass its `id`) rather than creating a near-duplicate; create a new entry only if none exists.
 - Only durable, reusable, high-confidence information. Skip transient details unless asked.

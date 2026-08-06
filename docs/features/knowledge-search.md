@@ -150,6 +150,24 @@ When the embedding backend times out the search falls back to full-text only
 semantic recall. It does not change the response shape: the census runs on both
 branches, so a caller never has to handle a degraded contract.
 
+## What the prompt tells the model to do with them
+
+A field the model is never told to read is a field it does not use, so the
+knowledge-base prompt section states the procedure:
+
+1. Search with a natural-language query and no tags, then filter on a tag from
+   `available_tags`. Never invent one.
+2. When no tag fits, sweep with `builtin_knowledge_base_list` and its
+   `next_cursor`, up to three pages. A larger `limit` on search is named as the
+   wrong move, because it re-ranks the whole store rather than reaching further
+   into it.
+3. When the sweep finds the entry, re-tag it, preferring a tag that
+   `available_tags` already reports.
+
+Step 3 needs the tag-registry dedup gate on `builtin_knowledge_base_write`.
+Without it, an instruction to add tags splits the vocabulary faster than the
+census can report it.
+
 ## Where things live
 
 | Concern | Location |
@@ -158,3 +176,4 @@ branches, so a caller never has to handle a degraded contract.
 | The census SQL and both search arms | `crates/storage/src/knowledge.rs` |
 | Tool response and schema | `crates/mcp-client/src/builtin.rs` |
 | Census behaviour under a real database | `crates/storage/tests/knowledge_tag_census.rs` |
+| Prompt guidance that consumes these fields | `crates/core/src/prompts/sections/knowledge_base.txt` |
