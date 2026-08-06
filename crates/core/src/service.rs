@@ -6275,10 +6275,43 @@ mod tests {
                         entry,
                         relevance: RecallRelevance::Distance(0.12),
                     }],
-                    tags: vec![],
+                    ..RecallCandidates::default()
                 })
             })
         })
+    }
+
+    /// A recall lookup that answers with one near scratchpad note.
+    fn recall_note_hit() -> crate::ports::recall::RecallSearchFn {
+        use crate::ports::recall::{RecallCandidates, RecallNote, RecallRelevance};
+        Arc::new(move |_request| {
+            Box::pin(async move {
+                Ok(RecallCandidates {
+                    notes: vec![RecallNote {
+                        key: "deploy-window".to_string(),
+                        content: "Fridays after 18:00, never before".to_string(),
+                        pinned: false,
+                        relevance: RecallRelevance::Distance(0.12),
+                    }],
+                    ..RecallCandidates::default()
+                })
+            })
+        })
+    }
+
+    /// A recall lookup that records every request it is handed.
+    fn recording_recall() -> (
+        crate::ports::recall::RecallSearchFn,
+        Arc<Mutex<Vec<crate::ports::recall::RecallRequest>>>,
+    ) {
+        let seen: Arc<Mutex<Vec<crate::ports::recall::RecallRequest>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let lookup: crate::ports::recall::RecallSearchFn = Arc::new(move |request| {
+            recorder.lock().unwrap().push(request);
+            Box::pin(async move { Ok(crate::ports::recall::RecallCandidates::default()) })
+        });
+        (lookup, seen)
     }
 
     /// Run one turn against a capturing LLM and return every message list it
@@ -6478,6 +6511,61 @@ mod tests {
         assert!(
             recall_block(&captured.lock().unwrap()).is_none(),
             "a failed lookup emits no block"
+        );
+    }
+
+    // --- The scratchpad arm (#1101) -----------------------------------------
+
+    /// Acceptance (#1101): the pad is per-conversation by design, so the lookup
+    /// names the conversation it is running in. Reaching across conversations
+    /// would put another task's working notes in front of the model as this
+    /// task's own.
+    #[tokio::test]
+    async fn recall_block_scratchpad_arm_stays_within_the_current_conversation() {
+        let (lookup, seen) = recording_recall();
+        let handler =
+            ConversationHandler::new(MockStore::new(), MockLlm::new(vec!["ok"]), id_gen())
+                .with_recall_search(lookup);
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+
+        handler
+            .send_prompt(
+                &conv.id,
+                "when can we deploy?".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await
+            .unwrap();
+
+        let requests = seen.lock().unwrap();
+        assert_eq!(requests.len(), 1, "one lookup per turn");
+        assert_eq!(
+            requests[0].conversation_id, conv.id.0,
+            "the lookup must name this conversation's own pad"
+        );
+        assert_eq!(
+            requests[0].note_limit,
+            crate::recall::RECALL_NOTE_SCAN_LIMIT,
+            "the note arm reads to the ceiling the block's count is measured against"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_scratchpad_note_near_the_prompt_reaches_the_model() {
+        let rounds = capture_rounds("when can we deploy?", |h| {
+            h.with_recall_search(recall_note_hit())
+        })
+        .await;
+
+        let block = recall_block(&rounds).expect("a near note must surface");
+        assert!(block.contains("deploy-window"), "{block}");
+        assert!(
+            block.contains("Fridays after 18:00, never before"),
+            "{block}"
         );
     }
 

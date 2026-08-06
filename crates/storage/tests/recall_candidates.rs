@@ -1,9 +1,9 @@
-//! The two reads behind the `[Recall]` block (issue #1100).
+//! The reads behind the `[Recall]` block (issues #1100 and #1101).
 //!
-//! `PgKnowledgeBaseStore::nearest_by_embedding` and
-//! `tag_registry::nearest_tags` are what a turn asks before the model's first
-//! move. Both are new query surfaces over personal data, so the suite pins the
-//! three properties the block's correctness rests on.
+//! `PgKnowledgeBaseStore::nearest_by_embedding`, `tag_registry::nearest_tags`
+//! and `PgScratchpadStore::nearest_by_embedding` are what a turn asks before
+//! the model's first move. All are new query surfaces over personal data, so
+//! the suite pins the properties the block's correctness rests on.
 //!
 //! 1. **One user's rows and no other's.** Row-level security is a non-FORCE
 //!    backstop the table owner bypasses, so the `WHERE user_id` predicate in
@@ -20,6 +20,9 @@
 //!    embedding is available. It has to match on *any* of a whole user
 //!    sentence's terms, because a fallback that answers nothing is not a
 //!    fallback.
+//! 5. **One conversation's pad and no other's** (#1101). The scratchpad is
+//!    per-conversation by design, so both scratchpad reads carry a
+//!    `conversation_id` predicate beside the `user_id` one.
 //!
 //! ## Running locally
 //!
@@ -31,10 +34,16 @@
 
 mod support;
 
-use desktop_assistant_core::domain::KnowledgeEntry;
+use desktop_assistant_core::domain::{Conversation, KnowledgeEntry, Message, Role};
 use desktop_assistant_core::ports::knowledge::KnowledgeBaseStore;
+use desktop_assistant_core::ports::scratchpad::{
+    NewScratchpadNote, NoteEmbedding, ScratchpadStore,
+};
+use desktop_assistant_core::ports::store::ConversationStore;
 use desktop_assistant_storage::tag_registry::nearest_tags;
-use desktop_assistant_storage::{PgKnowledgeBaseStore, PgPool, UserId, with_user_id};
+use desktop_assistant_storage::{
+    PgConversationStore, PgKnowledgeBaseStore, PgPool, PgScratchpadStore, UserId, with_user_id,
+};
 use pgvector::Vector;
 
 const USER: &str = "recall-user";
@@ -635,6 +644,314 @@ async fn any_term_search_stops_at_its_limit() {
             .await
             .expect("the read succeeds");
         assert_eq!(hits.len(), 3);
+    })
+    .await;
+
+    fx.cleanup().await;
+}
+
+// -- the scratchpad arm (#1101) ----------------------------------------------
+
+/// A conversation row, so the pad's foreign key resolves.
+fn make_conversation(id: &str) -> Conversation {
+    let mut conv = Conversation::new(id, "recall scratchpad test");
+    conv.created_at = "2026-08-06 00:00:00".to_string();
+    conv.updated_at = "2026-08-06 00:00:00".to_string();
+    conv.messages.push(Message::new(Role::User, "hello"));
+    conv
+}
+
+/// Write one note already carrying `chunk` under `model`, exactly as an
+/// inline-embedded write does.
+async fn seed_note(
+    pad: &PgScratchpadStore,
+    conversation_id: &str,
+    key: &str,
+    content: &str,
+    chunk: Vec<f32>,
+    model: &str,
+) {
+    let mut note = NewScratchpadNote::new(key, content);
+    note.embedding = Some(NoteEmbedding {
+        chunks: vec![chunk],
+        model: model.to_string(),
+    });
+    pad.write(conversation_id, &[note])
+        .await
+        .expect("write embedded note");
+}
+
+/// Acceptance (#1101): the pad is per-conversation by design. A read that
+/// reached across conversations would put another task's working notes in front
+/// of the model as this task's own.
+#[tokio::test]
+async fn recall_block_scratchpad_arm_stays_within_the_current_conversation() {
+    let Some(fx) = fixture().await else { return };
+    let convs = PgConversationStore::new(fx.pool.clone());
+    let pad = PgScratchpadStore::new(fx.pool.clone());
+
+    with_user_id(UserId::new(USER), async {
+        convs.create(make_conversation("c1")).await.expect("conv c1");
+        convs.create(make_conversation("c2")).await.expect("conv c2");
+        // The other conversation's note is a perfect match for the query
+        // vector, so anything but an explicit scope would rank it first.
+        seed_note(&pad, "c2", "theirs", "another task's finding", axis(0), MODEL).await;
+        seed_note(&pad, "c1", "mine", "this task's finding", axis(1), MODEL).await;
+
+        let hits = pad
+            .nearest_by_embedding("c1", axis(0), MODEL, 10)
+            .await
+            .expect("the read succeeds");
+
+        let keys: Vec<&str> = hits.iter().map(|(n, _)| n.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["mine"],
+            "recall must never offer another conversation's pad"
+        );
+    })
+    .await;
+
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn nearest_notes_never_cross_the_user_boundary() {
+    let Some(fx) = fixture().await else { return };
+    let convs = PgConversationStore::new(fx.pool.clone());
+    let pad = PgScratchpadStore::new(fx.pool.clone());
+
+    with_user_id(UserId::new(OTHER_USER), async {
+        convs
+            .create(make_conversation("shared"))
+            .await
+            .expect("their conv");
+        seed_note(&pad, "shared", "theirs", "their secret", axis(0), MODEL).await;
+    })
+    .await;
+    with_user_id(UserId::new(USER), async {
+        convs
+            .create(make_conversation("mine"))
+            .await
+            .expect("my conv");
+        seed_note(&pad, "mine", "mine", "my own note", axis(1), MODEL).await;
+
+        let hits = pad
+            .nearest_by_embedding("shared", axis(0), MODEL, 10)
+            .await
+            .expect("the read succeeds");
+
+        assert!(
+            hits.is_empty(),
+            "another tenant's pad must be invisible even by its own conversation id"
+        );
+    })
+    .await;
+
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn nearest_notes_come_back_nearest_first_with_their_distance() {
+    let Some(fx) = fixture().await else { return };
+    let convs = PgConversationStore::new(fx.pool.clone());
+    let pad = PgScratchpadStore::new(fx.pool.clone());
+
+    with_user_id(UserId::new(USER), async {
+        convs.create(make_conversation("c1")).await.expect("conv");
+        seed_note(&pad, "c1", "near", "the near one", axis(0), MODEL).await;
+        seed_note(&pad, "c1", "far", "the far one", axis(1), MODEL).await;
+
+        let hits = pad
+            .nearest_by_embedding("c1", axis(0), MODEL, 10)
+            .await
+            .expect("the read succeeds");
+
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].0.key, "near", "nearest first");
+        assert!(
+            hits[0].1 < 1e-6,
+            "a vector against itself is at distance 0, got {}",
+            hits[0].1
+        );
+        assert!(
+            (hits[1].1 - 1.0).abs() < 1e-6,
+            "orthogonal vectors are at cosine distance 1, got {}",
+            hits[1].1
+        );
+    })
+    .await;
+
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn nearest_notes_ignore_a_note_embedded_by_another_model() {
+    let Some(fx) = fixture().await else { return };
+    let convs = PgConversationStore::new(fx.pool.clone());
+    let pad = PgScratchpadStore::new(fx.pool.clone());
+
+    with_user_id(UserId::new(USER), async {
+        convs.create(make_conversation("c1")).await.expect("conv");
+        // Four dimensions against the query's three: comparing them raises
+        // rather than missing, so the scope predicate must keep the row out.
+        seed_note(
+            &pad,
+            "c1",
+            "other-model",
+            "embedded by something else",
+            vec![1.0, 0.0, 0.0, 0.0],
+            OTHER_MODEL,
+        )
+        .await;
+        seed_note(&pad, "c1", "mine", "embedded by this one", axis(0), MODEL).await;
+
+        let hits = pad
+            .nearest_by_embedding("c1", axis(0), MODEL, 10)
+            .await
+            .expect("a row of another dimension must be skipped, not raise");
+
+        let keys: Vec<&str> = hits.iter().map(|(n, _)| n.key.as_str()).collect();
+        assert_eq!(keys, vec!["mine"]);
+    })
+    .await;
+
+    fx.cleanup().await;
+}
+
+/// The block drops a pinned note, because `[Pinned]` already carries its whole
+/// content. That decision is the core's, so the flag has to survive the read.
+#[tokio::test]
+async fn nearest_notes_report_whether_a_note_is_pinned() {
+    let Some(fx) = fixture().await else { return };
+    let convs = PgConversationStore::new(fx.pool.clone());
+    let pad = PgScratchpadStore::new(fx.pool.clone());
+
+    with_user_id(UserId::new(USER), async {
+        convs.create(make_conversation("c1")).await.expect("conv");
+        seed_note(&pad, "c1", "pinned-one", "in view already", axis(0), MODEL).await;
+        seed_note(&pad, "c1", "loose-one", "nowhere else", axis(0), MODEL).await;
+        pad.set_pinned("c1", &["pinned-one".to_string()], true)
+            .await
+            .expect("pin one note");
+
+        let hits = pad
+            .nearest_by_embedding("c1", axis(0), MODEL, 10)
+            .await
+            .expect("the read succeeds");
+
+        let pinned: Vec<(&str, bool)> = hits
+            .iter()
+            .map(|(n, _)| (n.key.as_str(), n.pinned))
+            .collect();
+        assert!(pinned.contains(&("pinned-one", true)), "{pinned:?}");
+        assert!(pinned.contains(&("loose-one", false)), "{pinned:?}");
+    })
+    .await;
+
+    fx.cleanup().await;
+}
+
+/// The degraded arm has to match on *any* of a whole user sentence's terms.
+/// `plainto_tsquery` joins every lexeme with AND, which answers almost nothing
+/// for a sentence - a fallback that answers nothing is not a fallback (#1100).
+#[tokio::test]
+async fn the_degraded_scratchpad_arm_matches_any_term_of_a_whole_sentence() {
+    let Some(fx) = fixture().await else { return };
+    let convs = PgConversationStore::new(fx.pool.clone());
+    let pad = PgScratchpadStore::new(fx.pool.clone());
+
+    with_user_id(UserId::new(USER), async {
+        convs.create(make_conversation("c1")).await.expect("conv");
+        pad.write(
+            "c1",
+            &[NewScratchpadNote::new(
+                "deploy-window",
+                "the deploy runs on Fridays",
+            )],
+        )
+        .await
+        .expect("write note");
+
+        // Precondition: the AND-joined query the ordinary search builds finds
+        // nothing, because the note never says "when" or "next".
+        let anded = pad
+            .search("c1", "when is the next deploy?", Vec::new(), "", None, 10)
+            .await
+            .expect("the ordinary search succeeds");
+        assert!(
+            anded.is_empty(),
+            "precondition: an AND-joined sentence must not match this note"
+        );
+
+        let hits = pad
+            .search_text_any_term("c1", "when is the next deploy?", 10)
+            .await
+            .expect("the read succeeds");
+
+        let keys: Vec<&str> = hits.iter().map(|n| n.key.as_str()).collect();
+        assert_eq!(keys, vec!["deploy-window"]);
+    })
+    .await;
+
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn the_degraded_scratchpad_arm_stays_within_the_current_conversation() {
+    let Some(fx) = fixture().await else { return };
+    let convs = PgConversationStore::new(fx.pool.clone());
+    let pad = PgScratchpadStore::new(fx.pool.clone());
+
+    with_user_id(UserId::new(USER), async {
+        convs.create(make_conversation("c1")).await.expect("conv c1");
+        convs.create(make_conversation("c2")).await.expect("conv c2");
+        pad.write(
+            "c2",
+            &[NewScratchpadNote::new("theirs", "the deploy runs on Fridays")],
+        )
+        .await
+        .expect("write note");
+        pad.write(
+            "c1",
+            &[NewScratchpadNote::new("mine", "the deploy runs on Fridays")],
+        )
+        .await
+        .expect("write note");
+
+        let hits = pad
+            .search_text_any_term("c1", "when is the next deploy?", 10)
+            .await
+            .expect("the read succeeds");
+
+        let keys: Vec<&str> = hits.iter().map(|n| n.key.as_str()).collect();
+        assert_eq!(keys, vec!["mine"]);
+    })
+    .await;
+
+    fx.cleanup().await;
+}
+
+/// A prompt of nothing but stop words reduces to no lexemes at all. The query
+/// is then NULL, which must match no row rather than every row.
+#[tokio::test]
+async fn the_degraded_scratchpad_arm_matches_nothing_for_a_prompt_of_stop_words() {
+    let Some(fx) = fixture().await else { return };
+    let convs = PgConversationStore::new(fx.pool.clone());
+    let pad = PgScratchpadStore::new(fx.pool.clone());
+
+    with_user_id(UserId::new(USER), async {
+        convs.create(make_conversation("c1")).await.expect("conv");
+        pad.write("c1", &[NewScratchpadNote::new("mine", "a real finding")])
+            .await
+            .expect("write note");
+
+        let hits = pad
+            .search_text_any_term("c1", "the and of", 10)
+            .await
+            .expect("the read succeeds");
+
+        assert!(hits.is_empty(), "a query with no lexemes matches nothing");
     })
     .await;
 

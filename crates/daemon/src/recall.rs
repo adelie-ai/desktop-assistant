@@ -255,6 +255,35 @@ mod tests {
         assert_eq!(answer.tags.len(), 1);
     }
 
+    /// Acceptance (#1101): the scratchpad arm reads a different table from the
+    /// other two, so it fails on its own. When it does it costs its own lines
+    /// and nothing else - the knowledge and tag arms still render, and the turn
+    /// never sees the error.
+    #[test]
+    fn recall_block_survives_the_scratchpad_arm_failing() {
+        let notes = notes_or_none(Err(CoreError::Storage("the pad read failed".into())));
+
+        assert!(
+            notes.is_empty(),
+            "a failed arm contributes nothing, rather than failing the lookup"
+        );
+    }
+
+    #[test]
+    fn the_scratchpad_arm_passes_its_rows_through_when_it_answers() {
+        let found = vec![RecallNote {
+            key: "deploy-window".into(),
+            content: "Fridays after 18:00".into(),
+            pinned: false,
+            relevance: RecallRelevance::Distance(0.12),
+        }];
+
+        let notes = notes_or_none(Ok(found));
+
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].key, "deploy-window");
+    }
+
     #[tokio::test]
     async fn a_backend_that_answers_with_no_vector_degrades() {
         // An empty batch, and an empty vector, are both "no embedding". Passing
