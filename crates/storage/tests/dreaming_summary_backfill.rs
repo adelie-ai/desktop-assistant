@@ -35,10 +35,12 @@ mod support;
 
 use std::sync::{Arc, Mutex};
 
-use desktop_assistant_core::domain::SUMMARY_MAX_CHARS;
+use desktop_assistant_core::domain::{KnowledgeEntry, SUMMARY_MAX_CHARS};
+use desktop_assistant_core::ports::knowledge::KnowledgeBaseStore;
 use desktop_assistant_storage::dreaming::{
     BackfillEmbedFn, DreamingLlmFn, MAX_SUMMARIES_PER_CYCLE, run_dreaming_scan,
 };
+use desktop_assistant_storage::{PgKnowledgeBaseStore, UserId, with_user_id};
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 
@@ -191,13 +193,20 @@ async fn seed_kb_soft_deleted(pool: &PgPool, user_id: &str, id: &str, content: &
 /// Seed `count` unsummarised rows in one statement, so the cap test can build a
 /// backlog larger than one cycle may take without paying a round trip per row.
 async fn seed_many(pool: &PgPool, user_id: &str, count: i32) {
+    seed_many_for(pool, user_id, "bulk", count).await;
+}
+
+/// [`seed_many`] with an id prefix, so two users' backlogs do not collide on
+/// the globally-unique entry id.
+async fn seed_many_for(pool: &PgPool, user_id: &str, prefix: &str, count: i32) {
     sqlx::query(
         "INSERT INTO knowledge_base (id, user_id, content, tags) \
-         SELECT 'kb-bulk-' || g, $1, 'A durable fact numbered ' || g, '{}'::text[] \
+         SELECT $3 || '-' || g, $1, 'A durable fact numbered ' || g, '{}'::text[] \
          FROM generate_series(1, $2) g",
     )
     .bind(user_id)
     .bind(count)
+    .bind(prefix)
     .execute(pool)
     .await
     .expect("seed a backlog of unsummarised rows");
@@ -400,6 +409,73 @@ async fn dream_summary_pass_caps_the_rows_it_takes_per_cycle() {
         kb_summarised_count(pool, "u1").await,
         backlog as i64,
         "the rows left behind are summarised on the following cycle"
+    );
+
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn dream_summary_pass_shares_the_cycle_budget_across_users() {
+    // The cap bounds one cycle's whole spend, so it has to be shared. Letting
+    // the first user drain it would starve every user behind them, every cycle,
+    // for as long as their backlog lasted.
+    let Some(fx) = support::DbFixture::try_new("dream1099").await else {
+        return;
+    };
+    let pool = &fx.pool;
+
+    // Each backlog is larger than half the budget, so an unshared cap is
+    // visible: the first user would take its share and most of the second's.
+    let each = MAX_SUMMARIES_PER_CYCLE as i32 * 3 / 4;
+    seed_many_for(pool, "u1", "a", each).await;
+    seed_many_for(pool, "u2", "b", each).await;
+
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    run_cycle(pool, &llm_summarising_everything(prompts)).await;
+
+    let first = kb_summarised_count(pool, "u1").await;
+    let second = kb_summarised_count(pool, "u2").await;
+    assert_eq!(
+        first, second,
+        "both users get an equal share of one cycle's budget, not first-come"
+    );
+    assert!(
+        first + second <= MAX_SUMMARIES_PER_CYCLE as i64,
+        "the cap bounds the cycle across every user, got {first} + {second}"
+    );
+
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn dream_summary_pass_leaves_a_summary_supplied_through_the_store_alone() {
+    // A caller that writes a summary through the knowledge store - the tool
+    // path, or a live turn - has said what the line should be. The pass must
+    // read that as current and not immediately paraphrase it.
+    let Some(fx) = support::DbFixture::try_new("dream1099").await else {
+        return;
+    };
+    let pool = &fx.pool;
+    let store = PgKnowledgeBaseStore::new(pool.clone());
+
+    with_user_id(UserId::new("u1"), async {
+        let mut entry = KnowledgeEntry::new(
+            "kb-supplied",
+            "The user keeps facet colons in tag names.",
+            vec!["preference".into()],
+        );
+        entry.summary = Some("Keeps facet colons in tag names".to_string());
+        store.write(entry).await.expect("write succeeds");
+    })
+    .await;
+
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    run_cycle(pool, &llm_summarising_everything(prompts)).await;
+
+    assert_eq!(
+        kb_summary(pool, "kb-supplied").await.as_deref(),
+        Some("Keeps facet colons in tag names"),
+        "a summary a caller supplied is current, not work for the pass"
     );
 
     fx.cleanup().await;

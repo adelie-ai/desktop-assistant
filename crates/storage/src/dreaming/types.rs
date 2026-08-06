@@ -95,6 +95,29 @@ pub const MAX_SLICE_SPLIT_DEPTH: usize = 3;
 /// backlog cannot starve another's small one.
 pub const MAX_SUMMARIES_PER_CYCLE: usize = 200;
 
+/// Knowledge entries described in one summary prompt.
+///
+/// Sized from the answer, the way [`MAX_HOLISTIC_PROMPT_CHARS`] is: the model
+/// returns one bounded line per entry, so a batch of this size answers well
+/// inside an ordinary output allowance. Batching at all is the point - one call
+/// per row is the expensive way to spend a backfill of hundreds of rows.
+pub const MAX_SUMMARY_BATCH_ROWS: usize = 20;
+
+/// Character budget for one summary prompt.
+///
+/// The row cap sizes the answer and this sizes the question, because nothing
+/// bounds how long an entry's content is. A batch closes at whichever limit it
+/// reaches first.
+pub const MAX_SUMMARY_PROMPT_CHARS: usize = 20_000;
+
+/// How much of an entry's content one summary prompt carries.
+///
+/// A summary states what the entry says, and an entry says it at the start: a
+/// long body is long because it elaborates, not because the subject arrives
+/// late. Bounding the excerpt keeps one outsized entry from spending the whole
+/// prompt budget by itself.
+pub const MAX_SUMMARY_SOURCE_CHARS: usize = 2_000;
+
 /// Safety cap: the fraction of a user's active entries a single holistic run
 /// may prune outright. Merges don't count - their content survives in the
 /// canonical row. Excess prunes are dropped with a warning.

@@ -1647,6 +1647,7 @@ dependencies = [
  "desktop-assistant-auth-jwt",
  "desktop-assistant-core",
  "desktop-assistant-mcp-client",
+ "desktop-assistant-protocol",
  "pgvector",
  "serde",
  "serde_json",

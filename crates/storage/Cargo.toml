@@ -8,6 +8,11 @@ license = "AGPL-3.0-or-later"
 async-trait.workspace = true
 desktop-assistant-auth-jwt.workspace = true
 desktop-assistant-core.workspace = true
+# `one_line`, the shared rule for reducing text to one bounded display line.
+# The dream cycle's summary pass applies it to what the model returns, so a
+# written summary and the stand-in a reader falls back to occupy one line of the
+# same length.
+desktop-assistant-protocol.workspace = true
 sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "macros", "json", "chrono", "uuid"] }
 # AST-based SQL validation/rewriting for the LLM-exposed
 # `execute_database_query` tool (#141). PostgreSQL dialect, used to:

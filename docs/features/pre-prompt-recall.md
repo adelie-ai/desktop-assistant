@@ -26,9 +26,11 @@ Each entry line carries the entry id, the entry's tags, and the one line that
 stands for it. That line is `KnowledgeEntry::display_line()`: the stored
 `summary` where there is one, and otherwise a whitespace-collapsed prefix of
 `content` capped at 200 characters. An entry with no summary is **not** skipped -
-until the dream cycle has filled the column in, almost every entry has none, so a
-block that skipped them would show nothing. An entry whose line comes out empty
-is skipped, because it would spend a line of the budget to say nothing.
+the dream cycle's summary backfill fills the column a bounded number of rows per
+cycle (see `docs/features/knowledge-maintenance.md`), so a store that has just
+gained the column, or an entry written moments ago, still has none, and a block
+that skipped them would show nothing. An entry whose line comes out empty is
+skipped, because it would spend a line of the budget to say nothing.
 
 Tag names are listed nearest first, not alphabetically.
 
