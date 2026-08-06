@@ -1,4 +1,5 @@
-//! Shared, dependency-light protocol/domain enums.
+//! Shared, dependency-light protocol/domain enums, plus the few pure rules
+//! that a domain type and its wire view must answer identically.
 //!
 //! These types were extracted from `desktop-assistant-core` (#377) so that
 //! `api-model` and the shared client cores can depend on them **without**
@@ -10,6 +11,72 @@
 //! Serde representations here are wire-/storage-visible (JSON columns, config
 //! files, the D-Bus int contract). Do not change variant names or `rename_all`
 //! attributes without a migration.
+//!
+//! A rule belongs here when `core` and `api-model` must both apply it and give
+//! the same answer - [`one_line`] is the example. It has to be a pure function
+//! of its arguments, with no domain or wire semantics of its own, or it belongs
+//! in whichever of the two crates owns that meaning.
+
+// ---------------------------------------------------------------------------
+// Display lines
+// ---------------------------------------------------------------------------
+
+/// The longest display line a knowledge entry gets, in characters, including
+/// the truncation marker.
+///
+/// Why a cap: the line is rendered once per entry into a list row or a context
+/// block with a fixed budget, and nothing bounds how long an entry's content
+/// may be. Without this one long entry would spend the whole budget by itself.
+/// It is also the length a written summary is expected to keep, so a stand-in
+/// and a real summary occupy the same space.
+///
+/// It lives here, rather than beside either type, because the domain entry
+/// (`desktop-assistant-core`) and the wire view (`desktop-assistant-api-model`)
+/// must answer the same, and this crate is the only one both can depend on.
+pub const SUMMARY_MAX_CHARS: usize = 200;
+
+/// What ends a line that was cut short, so a partial line never reads as a
+/// complete one.
+const TRUNCATION_MARKER: &str = "...";
+
+/// Reduce `text` to one display line of at most `max_chars` characters.
+///
+/// Runs of whitespace become a single space and the leading and trailing runs
+/// are dropped, so the result is one physical line whatever the source looked
+/// like. A line that had to lose anything ends in `...`, and the marker counts
+/// toward `max_chars`.
+///
+/// Why the collapse comes first: whitespace that is about to disappear must not
+/// spend the budget, or a loosely-formatted body would be cut far shorter than
+/// a dense one saying the same thing.
+///
+/// Why characters and not bytes: a byte-indexed cut can land inside a
+/// multi-byte character, which panics.
+pub fn one_line(text: &str, max_chars: usize) -> String {
+    // `split_whitespace` yields the non-whitespace runs, which collapses every
+    // separator and drops both ends in one pass.
+    let mut collapsed = String::new();
+    for word in text.split_whitespace() {
+        if !collapsed.is_empty() {
+            collapsed.push(' ');
+        }
+        collapsed.push_str(word);
+    }
+
+    if collapsed.chars().count() <= max_chars {
+        return collapsed;
+    }
+
+    let marker_chars = TRUNCATION_MARKER.chars().count();
+    // A budget too small to hold the marker cannot carry it. The budget wins:
+    // a line that overruns it to announce the cut defeats the point of it.
+    if max_chars <= marker_chars {
+        return collapsed.chars().take(max_chars).collect();
+    }
+    let mut out: String = collapsed.chars().take(max_chars - marker_chars).collect();
+    out.push_str(TRUNCATION_MARKER);
+    out
+}
 
 // ---------------------------------------------------------------------------
 // Effort
@@ -407,7 +474,10 @@ mod one_line_tests {
 
     #[test]
     fn one_line_leaves_a_short_single_line_untouched() {
-        assert_eq!(one_line("User prefers dark mode", 200), "User prefers dark mode");
+        assert_eq!(
+            one_line("User prefers dark mode", 200),
+            "User prefers dark mode"
+        );
     }
 
     #[test]

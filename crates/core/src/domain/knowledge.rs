@@ -1,18 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-/// The longest line [`KnowledgeEntry::display_line`] returns, in characters,
-/// including the truncation marker.
-///
-/// Why a cap at all: the line is rendered once per candidate entry into a
-/// context block with a fixed token budget, and nothing bounds how long an
-/// entry's content may be. Without this one long entry would spend the whole
-/// budget by itself. It is also the length a written summary is expected to
-/// keep, so a stand-in and a real summary occupy the same space.
-pub const SUMMARY_MAX_CHARS: usize = 200;
-
-/// What ends a line that was cut short, so a partial line never reads as a
-/// complete one.
-const TRUNCATION_MARKER: &str = "...";
+pub use desktop_assistant_protocol::SUMMARY_MAX_CHARS;
 
 /// A unified knowledge base entry, replacing separate preferences and memory stores.
 /// Each entry is prose content with tags and optional metadata.
@@ -66,13 +54,16 @@ impl KnowledgeEntry {
     }
 
     /// The one line that stands for this entry in a list: the stored
-    /// [`summary`](Self::summary) where there is one, otherwise a prefix of
-    /// the content. Never longer than [`SUMMARY_MAX_CHARS`] characters, and
-    /// ends in `...` when it was cut short.
+    /// [`summary`](Self::summary) where there is one, otherwise the content.
+    /// One physical line, never longer than [`SUMMARY_MAX_CHARS`] characters,
+    /// and ending in `...` when it was cut short - see
+    /// [`desktop_assistant_protocol::one_line`].
     ///
     /// Every render site calls this - a client's knowledge browser, and the
     /// recall block that offers candidate entries to the model - so the
     /// fallback is decided once instead of once per caller.
+    /// `desktop_assistant_api_model::KnowledgeEntryView` carries the same
+    /// method for callers that hold the wire type instead.
     ///
     /// Why the fallback lives here and not in the read queries: a
     /// `COALESCE(summary, content)` in SQL would make every read report a
@@ -85,33 +76,9 @@ impl KnowledgeEntry {
     /// the schema bounds either, and the budget this protects counts what is
     /// rendered, not where it came from.
     pub fn display_line(&self) -> String {
-        let source = match self.summary.as_deref() {
-            Some(summary) => summary,
-            None => self.content.as_str(),
-        };
-        truncate_to_chars(source, SUMMARY_MAX_CHARS)
+        let source = self.summary.as_deref().unwrap_or(&self.content);
+        desktop_assistant_protocol::one_line(source, SUMMARY_MAX_CHARS)
     }
-}
-
-/// Cut `text` to at most `max_chars` characters, appending
-/// [`TRUNCATION_MARKER`] when anything was removed. The marker counts toward
-/// the limit, so the result never exceeds it.
-///
-/// Counting characters rather than bytes is what keeps a multi-byte character
-/// whole: a byte-indexed slice that lands inside one panics.
-fn truncate_to_chars(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-    let marker_chars = TRUNCATION_MARKER.chars().count();
-    // A limit too small to hold the marker cannot carry it. The limit wins:
-    // a line that overruns its budget to say it was cut defeats the cap.
-    if max_chars <= marker_chars {
-        return text.chars().take(max_chars).collect();
-    }
-    let mut out: String = text.chars().take(max_chars - marker_chars).collect();
-    out.push_str(TRUNCATION_MARKER);
-    out
 }
 
 #[cfg(test)]

@@ -1103,6 +1103,22 @@ pub struct KnowledgeEntryView {
     pub summary: Option<String>,
 }
 
+impl KnowledgeEntryView {
+    /// The one line that stands for this entry in a list row: the stored
+    /// [`summary`](Self::summary) where there is one, otherwise the content.
+    /// One physical line, never longer than [`SUMMARY_MAX_CHARS`] characters,
+    /// and ending in `...` when it was cut short - see
+    /// [`desktop_assistant_protocol::one_line`].
+    ///
+    /// A client renders this rather than writing its own fallback, so every
+    /// surface cuts and marks the line the same way. The daemon's domain type
+    /// answers identically from the same shared rule.
+    pub fn display_line(&self) -> String {
+        let source = self.summary.as_deref().unwrap_or(&self.content);
+        desktop_assistant_protocol::one_line(source, SUMMARY_MAX_CHARS)
+    }
+}
+
 /// Which knowledge-maintenance pass [`Command::StartKnowledgeMaintenance`]
 /// should run. These mirror the daemon's background passes so a manual trigger
 /// shares the same implementation (and per-op mutual exclusion) as the timers.
@@ -2046,6 +2062,9 @@ pub struct ModelCapabilitiesView {
 // keep compiling without churn; new code can use either name.
 pub use desktop_assistant_protocol::Effort as EffortLevel;
 pub use desktop_assistant_protocol::PurposeKind as PurposeKindApi;
+/// The cap [`KnowledgeEntryView::display_line`] holds to, re-exported so a
+/// client can name it without depending on `desktop-assistant-protocol`.
+pub use desktop_assistant_protocol::SUMMARY_MAX_CHARS;
 
 // Personality wire types (#226). Re-export the canonical types (now in
 // `desktop-assistant-protocol`, #377) so the settings channel, the daemon
