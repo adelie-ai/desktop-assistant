@@ -1,8 +1,9 @@
 use crate::CoreError;
 use crate::context::{
-    COMPACTION_TOKEN_RATIO, ConversationView, DEFAULT_MAX_TOOL_RESULT_BYTES, MAX_CONTEXT_MESSAGES,
-    MAX_OVERFLOW_RETRIES, MIN_CONTEXT_MESSAGES, ToolContext, ToolLocalityContext, TurnAnchors,
-    assemble_turn_within_budget, cap_tool_result, compact_into_summary, recover_from_overflow,
+    COMPACTION_TOKEN_RATIO, ContextProjection, ConversationView, DEFAULT_MAX_TOOL_RESULT_BYTES,
+    MAX_CONTEXT_MESSAGES, MAX_OVERFLOW_RETRIES, MIN_CONTEXT_MESSAGES, ToolContext,
+    ToolLocalityContext, TurnAnchors, assemble_turn_within_budget, cap_tool_result,
+    compact_into_summary, recover_from_overflow,
 };
 use crate::domain::{
     Conversation, ConversationId, ConversationSummary, Message, Role, ToolCall, ToolDefinition,
@@ -817,9 +818,11 @@ impl<S, L, T> ConversationHandler<S, L, T> {
     /// is withheld in a tainted turn. Without that, `complete_step` is an
     /// unguarded durable write of model-supplied text into a note that every
     /// later turn re-reads as a system message.
+    #[allow(clippy::too_many_arguments)]
     async fn handle_step_control(
         &self,
-        conv: &mut Conversation,
+        conv: &Conversation,
+        projection: &mut ContextProjection,
         stack: &mut StepStack,
         call: &ToolCall,
         args: &serde_json::Value,
@@ -957,14 +960,19 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             tracing::warn!(step = %frame.key, error = %e, "failed to record step completion notes");
         }
 
-        // Evict the step's raw tool results, leaving a pointer to the outcome
-        // note. This is what stops the per-round `msg_chars` growth (#239).
+        // Drop the step's raw tool results from the turn's view, leaving a
+        // pointer to the outcome note. This is what stops the per-round
+        // `msg_chars` growth (#239). The pointer goes in the projection, so
+        // the conversation's stored transcript keeps the raw output whether or
+        // not the note write above succeeded and whether or not the model
+        // supplied an outcome.
         let (evicted, freed) =
-            planning::evict_tool_results(&mut conv.messages, frame.watermark, &note_keys);
+            planning::evict_tool_results(&conv.messages, projection, frame.watermark, &note_keys);
         tracing::info!(
             step = %frame.key,
             evicted_results = evicted,
             freed_bytes = freed,
+            projected_messages = projection.replaced_count(),
             abandoned,
             "completed step — compacted scope to scratchpad"
         );
@@ -1508,6 +1516,14 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         // provider reports input-token usage above COMPACTION_TOKEN_RATIO.
         let mut target_window = MAX_CONTEXT_MESSAGES;
 
+        // What this turn reads in place of stored content, where the two
+        // differ. Overflow recovery and step completion both shrink the prompt
+        // by replacing tool results; they record the replacement here, so
+        // `conv.messages` - the transcript this turn persists - keeps the raw
+        // output. The projection is turn-scoped and is dropped when the turn
+        // ends.
+        let mut projection = ContextProjection::default();
+
         // Count of in-turn ContextOverflow recoveries. Bounded so a
         // persistently-oversized request doesn't loop indefinitely.
         let mut overflow_retries: u32 = 0;
@@ -1980,6 +1996,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                     recall: recall_surface,
                     tool_rounds_since_anchor,
                 },
+                &projection,
                 target_window,
                 current_context_budget(),
                 &estimate,
@@ -2077,6 +2094,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                     );
                     recover_from_overflow(
                         &mut conv,
+                        &mut projection,
                         prompt_tokens,
                         max_tokens,
                         &mut target_window,
@@ -2084,9 +2102,9 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                         &estimate,
                     )
                     .await;
-                    // Overflow recovery rewrites the message log the step
-                    // stack's absolute watermarks point into. Drop the frames so
-                    // no later complete_step evicts a range recovery has already
+                    // Overflow recovery has already dropped part of the range
+                    // the step stack's watermarks point into. Drop the frames
+                    // so no later complete_step re-evicts what recovery
                     // compacted — the plan todos persist on the scratchpad
                     // regardless.
                     step_stack.clear();
@@ -2338,7 +2356,8 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                     }
                     let ack = self
                         .handle_step_control(
-                            &mut conv,
+                            &conv,
+                            &mut projection,
                             &mut step_stack,
                             tool_call,
                             &arguments,
@@ -2777,6 +2796,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                     recall: None,
                     tool_rounds_since_anchor: u32::MAX,
                 },
+                &projection,
                 target_window,
                 current_context_budget(),
                 &estimate,
@@ -3497,13 +3517,23 @@ mod tests {
         /// Responses to return in sequence. Each call to stream_completion
         /// pops the first response.
         responses: Mutex<Vec<LlmResponse>>,
+        /// Every prompt the handler assembled, in order.
+        seen: Arc<Mutex<Vec<Vec<Message>>>>,
     }
 
     impl ToolCallingLlm {
         fn new(responses: Vec<LlmResponse>) -> Self {
             Self {
                 responses: Mutex::new(responses),
+                seen: Arc::new(Mutex::new(Vec::new())),
             }
+        }
+
+        /// Handle on the recorded prompts, taken before the handler takes
+        /// ownership. Lets a test read what the model saw, which is a
+        /// different question from what the turn stored.
+        fn prompts(&self) -> Arc<Mutex<Vec<Vec<Message>>>> {
+            Arc::clone(&self.seen)
         }
     }
 
@@ -3511,11 +3541,12 @@ mod tests {
     impl LlmClient for ToolCallingLlm {
         async fn stream_completion(
             &self,
-            _messages: Vec<Message>,
+            messages: Vec<Message>,
             _tools: &[ToolDefinition],
             _reasoning: ReasoningConfig,
             mut on_chunk: ChunkCallback,
         ) -> Result<LlmResponse, CoreError> {
+            self.seen.lock().unwrap().push(messages);
             let response = {
                 let mut responses = self.responses.lock().unwrap();
                 if responses.is_empty() {
@@ -3529,6 +3560,28 @@ mod tests {
             }
             Ok(response)
         }
+    }
+
+    /// The body the model read for `call_id`, from the most recent prompt that
+    /// carried it. Context management shapes the prompt and leaves the stored
+    /// transcript alone, so this is the only place its effect is visible.
+    ///
+    /// The search runs backwards over every recorded prompt because a turn also
+    /// makes side calls that carry no history at all - title generation, the
+    /// rolling summariser - and the last call is often one of those.
+    fn last_prompt_result(prompts: &Arc<Mutex<Vec<Vec<Message>>>>, call_id: &str) -> String {
+        let recorded = prompts.lock().unwrap();
+        recorded
+            .iter()
+            .rev()
+            .find_map(|prompt| {
+                prompt
+                    .iter()
+                    .find(|m| m.tool_call_id.as_deref() == Some(call_id))
+            })
+            .unwrap_or_else(|| panic!("no prompt carried a result for {call_id}"))
+            .content
+            .clone()
     }
 
     /// Mock tool executor that returns predictable results.
@@ -5679,9 +5732,11 @@ mod tests {
         ];
 
         let (write, list, sp) = in_memory_scratchpad();
+        let llm = ToolCallingLlm::new(responses);
+        let prompts = llm.prompts();
         let handler = ConversationHandler::with_tools(
             MockStore::new(),
-            ToolCallingLlm::new(responses),
+            llm,
             MockToolExecutor::new(tools, tool_results),
             id_gen(),
         )
@@ -5698,25 +5753,30 @@ mod tests {
             .unwrap();
         assert_eq!(result, "All done — it'll be warm with rain Tuesday.");
 
-        // The big tool result must have been compacted in place: still a Tool
-        // message bound to its call, but the payload is gone and replaced by a
-        // pointer naming the tool and the outcome note.
+        // The model reads a pointer naming the tool and the outcome note.
+        let read_by_model = last_prompt_result(&prompts, "t1");
+        assert!(
+            read_by_model.starts_with("<compacted to scratchpad"),
+            "the model should read a pointer, got: {read_by_model}"
+        );
+        assert!(read_by_model.contains("weather_forecast"));
+        assert!(read_by_model.contains("outcome:1"));
+        assert!(
+            !read_by_model.contains("DATADATA"),
+            "the raw payload must be gone from working context"
+        );
+
+        // #798: the stored transcript keeps the raw output. Still a Tool
+        // message bound to its call, and still every byte the tool returned.
         let updated = handler.get_conversation(&conv.id).await.unwrap();
         let big_result = updated
             .messages
             .iter()
             .find(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some("t1"))
             .expect("the weather tool result message must still exist");
-        assert!(
-            big_result.content.starts_with("<compacted to scratchpad"),
-            "raw result should be replaced by a pointer, got: {}",
-            big_result.content
-        );
-        assert!(big_result.content.contains("weather_forecast"));
-        assert!(big_result.content.contains("outcome:1"));
-        assert!(
-            !big_result.content.contains("DATADATA"),
-            "the raw payload must be gone from working context"
+        assert_eq!(
+            big_result.content, big,
+            "the stored transcript must keep what the tool returned"
         );
 
         // The scratchpad holds the done todo + the distilled outcome note.
@@ -8553,11 +8613,8 @@ mod tests {
         use std::sync::atomic::AtomicU64;
 
         let call_count = Arc::new(AtomicU32::new(0));
-        let llm = OverflowThenSucceedLlm {
-            remaining_overflows: Mutex::new(1),
-            call_count: Arc::clone(&call_count),
-            ok_text: "ok".into(),
-        };
+        let llm = OverflowThenSucceedLlm::new(1, Arc::clone(&call_count), "ok");
+        let prompts = llm.prompts();
         let counter = Arc::new(AtomicU64::new(0));
         let handler = ConversationHandler::new(
             MockStore::new(),
@@ -8618,26 +8675,30 @@ mod tests {
             .await
             .unwrap();
 
-        let after = handler.get_conversation(&conv.id).await.unwrap();
-        let ascii_after = after
-            .messages
-            .iter()
-            .find(|m| m.tool_call_id.as_deref() == Some("ascii"))
-            .expect("ascii result preserved");
-        let emoji_after = after
-            .messages
-            .iter()
-            .find(|m| m.tool_call_id.as_deref() == Some("emoji"))
-            .expect("emoji result preserved");
+        let ascii_read = last_prompt_result(&prompts, "ascii");
         assert!(
-            ascii_after.content.starts_with("<tool output omitted"),
-            "token-estimate picker should target the ASCII result, got: {:?}",
-            ascii_after.content
+            ascii_read.starts_with("<tool output omitted"),
+            "token-estimate picker should target the ASCII result, got: {ascii_read:?}"
         );
         assert_eq!(
-            emoji_after.content, emoji_payload,
-            "emoji result must be preserved verbatim — fewer estimated tokens"
+            last_prompt_result(&prompts, "emoji"),
+            emoji_payload,
+            "emoji result must stay in view verbatim — fewer estimated tokens"
         );
+
+        // #798: neither result leaves the stored transcript.
+        let after = handler.get_conversation(&conv.id).await.unwrap();
+        let stored = |id: &str| {
+            after
+                .messages
+                .iter()
+                .find(|m| m.tool_call_id.as_deref() == Some(id))
+                .expect("result preserved")
+                .content
+                .clone()
+        };
+        assert_eq!(stored("ascii"), ascii_payload);
+        assert_eq!(stored("emoji"), emoji_payload);
     }
 
     // --- Token-pressure compaction tests ---
@@ -8960,17 +9021,38 @@ mod tests {
         remaining_overflows: Mutex<u32>,
         call_count: Arc<AtomicU32>,
         ok_text: String,
+        /// Every prompt the handler assembled, in order.
+        seen: Arc<Mutex<Vec<Vec<Message>>>>,
+    }
+
+    impl OverflowThenSucceedLlm {
+        fn new(overflows: u32, call_count: Arc<AtomicU32>, ok_text: &str) -> Self {
+            Self {
+                remaining_overflows: Mutex::new(overflows),
+                call_count,
+                ok_text: ok_text.to_string(),
+                seen: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        /// Handle on the recorded prompts, taken before the handler takes
+        /// ownership. Recovery changes what the model reads, not what the
+        /// conversation stores, so a test has to read the prompt to see it.
+        fn prompts(&self) -> Arc<Mutex<Vec<Vec<Message>>>> {
+            Arc::clone(&self.seen)
+        }
     }
 
     #[async_trait::async_trait]
     impl LlmClient for OverflowThenSucceedLlm {
         async fn stream_completion(
             &self,
-            _messages: Vec<Message>,
+            messages: Vec<Message>,
             _tools: &[ToolDefinition],
             _reasoning: ReasoningConfig,
             mut on_chunk: ChunkCallback,
         ) -> Result<LlmResponse, CoreError> {
+            self.seen.lock().unwrap().push(messages);
             self.call_count.fetch_add(1, Ordering::Relaxed);
             let mut remaining = self.remaining_overflows.lock().unwrap();
             if *remaining > 0 {
@@ -8996,11 +9078,8 @@ mod tests {
         use std::sync::atomic::AtomicU64;
 
         let call_count = Arc::new(AtomicU32::new(0));
-        let llm = OverflowThenSucceedLlm {
-            remaining_overflows: Mutex::new(1),
-            call_count: Arc::clone(&call_count),
-            ok_text: "all done".into(),
-        };
+        let llm = OverflowThenSucceedLlm::new(1, Arc::clone(&call_count), "all done");
+        let prompts = llm.prompts();
         let counter = Arc::new(AtomicU64::new(0));
         let handler = ConversationHandler::new(
             MockStore::new(),
@@ -9065,35 +9144,33 @@ mod tests {
             "expected one overflow + one retry"
         );
 
-        let after = handler.get_conversation(&conv.id).await.unwrap();
-        let small = after
-            .messages
-            .iter()
-            .find(|m| m.tool_call_id.as_deref() == Some("c1"))
-            .expect("small tool result present");
-        assert_eq!(small.content, "ok", "small tool result must be untouched");
-        let medium = after
-            .messages
-            .iter()
-            .find(|m| m.tool_call_id.as_deref() == Some("c2"))
-            .expect("medium tool result present");
         assert_eq!(
-            medium.content, medium_content,
-            "below-threshold tool result must be untouched"
+            last_prompt_result(&prompts, "c1"),
+            "ok",
+            "small tool result must stay in view"
         );
+        assert_eq!(
+            last_prompt_result(&prompts, "c2"),
+            medium_content,
+            "below-threshold tool result must stay in view"
+        );
+        let big_read = last_prompt_result(&prompts, "c3");
+        assert!(
+            big_read.starts_with("<tool output omitted"),
+            "expected truncation notice, got: {big_read:?}"
+        );
+        assert!(big_read.contains(&format!("{} bytes", big_content.len())));
+
+        // #798: the truncation notice shapes the prompt, not the record.
+        let after = handler.get_conversation(&conv.id).await.unwrap();
         let big = after
             .messages
             .iter()
             .find(|m| m.tool_call_id.as_deref() == Some("c3"))
             .expect("big tool result present");
-        assert!(
-            big.content.starts_with("<tool output omitted"),
-            "expected truncation notice, got: {:?}",
-            big.content
-        );
-        assert!(
-            big.content
-                .contains(&format!("{} bytes", big_content.len()))
+        assert_eq!(
+            big.content, big_content,
+            "the stored transcript must keep the whole tool result"
         );
     }
 
@@ -9106,11 +9183,8 @@ mod tests {
         use std::sync::atomic::AtomicU64;
 
         let call_count = Arc::new(AtomicU32::new(0));
-        let llm = OverflowThenSucceedLlm {
-            remaining_overflows: Mutex::new(1),
-            call_count: Arc::clone(&call_count),
-            ok_text: "ok".into(),
-        };
+        let llm = OverflowThenSucceedLlm::new(1, Arc::clone(&call_count), "ok");
+        let prompts = llm.prompts();
         let counter = Arc::new(AtomicU64::new(0));
         let handler = ConversationHandler::new(
             MockStore::new(),
@@ -9151,16 +9225,18 @@ mod tests {
             .unwrap();
         assert_eq!(result, "ok");
 
+        // The most recent group stays in view.
+        assert_eq!(last_prompt_result(&prompts, "c4"), result_body);
+        // The oldest group's result is compacted in the prompt.
+        let oldest_read = last_prompt_result(&prompts, "c1");
+        assert!(
+            oldest_read.contains(&format!("{} bytes", result_body.len())),
+            "the compacted result must say what left the round, got {oldest_read:?}"
+        );
+
         let after = handler.get_conversation(&conv.id).await.unwrap();
-        // The most recent group must remain intact.
-        let recent = after
-            .messages
-            .iter()
-            .find(|m| m.tool_call_id.as_deref() == Some("c4"))
-            .expect("the most recent tool group must survive");
-        assert_eq!(recent.content, result_body);
-        // The oldest group is compacted, not deleted: the call and its
-        // arguments are still there, and so is a result row with a notice.
+        // The call and its arguments are still there, and so is the whole
+        // result row (#798): the notice never reaches the record.
         let oldest_call = after
             .messages
             .iter()
@@ -9172,12 +9248,9 @@ mod tests {
             .iter()
             .find(|m| m.tool_call_id.as_deref() == Some("c1"))
             .expect("the oldest tool result row must survive in the transcript");
-        assert!(
-            oldest_result
-                .content
-                .contains(&format!("{} bytes", result_body.len())),
-            "the compacted result must say what was dropped, got {:?}",
-            oldest_result.content
+        assert_eq!(
+            oldest_result.content, result_body,
+            "the stored transcript must keep the oldest result whole"
         );
         assert!(
             after.messages.len() > before,
@@ -11444,11 +11517,10 @@ mod tests {
     }
 
     /// `step_stack.clear()` after overflow recovery (issue #240 / #441): a
-    /// `begin_step` then an in-turn ContextOverflow recovery (which rewrites the
-    /// message log beneath the frame's absolute watermark) must drop the step
-    /// frames, so a later `complete_step` finds NO active step and does not
-    /// evict via a stale watermark. Without the `clear()`, `complete_step` would
-    /// pop the frame and act on the now-invalid watermark.
+    /// `begin_step` then an in-turn ContextOverflow recovery (which compacts
+    /// the round's view of the range beneath the frame's watermark) must drop
+    /// the step frames, so a later `complete_step` finds NO active step and
+    /// does not evict a range recovery has already compacted.
     #[tokio::test]
     async fn overflow_recovery_invalidates_step_watermarks() {
         // A scripted LLM that can inject a ContextOverflow on a chosen call.

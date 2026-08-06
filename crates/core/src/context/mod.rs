@@ -12,8 +12,9 @@
 //!   turn with [`crate::CoreError::ContextOverflow`], runs a structured
 //!   recovery ladder (truncate the largest tool result → compact the oldest
 //!   tool results → summarise-and-shrink) before the dispatch loop retries.
-//!   Every rung rewrites message content; none removes a message, because the
-//!   list it works on is the one the turn persists.
+//!   The rungs that replace message content write to the round's
+//!   `ContextProjection`, so the stored transcript keeps every message and
+//!   every byte.
 //! - **Summarisation** (`generate_context_summary`, `compact_into_summary`):
 //!   Asks the LLM for a bullet-point summary of dropped messages and merges it
 //!   with any existing rolling summary, so windowed-out history is not lost.
@@ -22,6 +23,10 @@
 //! Constants exposed here are tuning knobs read by the dispatch loop in
 //! `service.rs` to mirror this module's defaults (e.g., the floor on
 //! window size, the compaction-token-pressure threshold).
+
+mod projection;
+
+pub(crate) use projection::ContextProjection;
 
 use crate::domain::{
     Conversation, Message, MessageSummary, Role, ToolDefinition, ToolLocality, ToolNamespace,
@@ -279,6 +284,7 @@ pub(crate) fn assemble_turn_within_budget(
     conversation: &ConversationView,
     tools: &ToolContext,
     anchors: &TurnAnchors,
+    projection: &ContextProjection,
     max_messages: usize,
     budget: Option<ContextBudget>,
     estimate: &dyn Fn(&str) -> u64,
@@ -298,6 +304,7 @@ pub(crate) fn assemble_turn_within_budget(
             tools,
             anchors,
             &ambient,
+            projection,
             max,
             budget,
             estimate,
@@ -621,6 +628,7 @@ fn assemble_for_test(
         conversation,
         tools,
         anchors,
+        &ContextProjection::default(),
         MAX_CONTEXT_MESSAGES,
         budget,
         estimate,
@@ -813,11 +821,13 @@ fn assemble_system_instruction(
     prompts::assemble(&sections)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn assemble_turn(
     conversation: &ConversationView,
     tools: &ToolContext,
     anchors: &TurnAnchors,
     ambient: &AmbientContext,
+    projection: &ContextProjection,
     max_messages: usize,
     budget: Option<ContextBudget>,
     estimate: &dyn Fn(&str) -> u64,
@@ -858,6 +868,7 @@ fn assemble_turn(
         start,
         conversation.summaries,
         &active_summary_ids,
+        projection,
     ));
     messages
 }
@@ -1081,16 +1092,22 @@ fn surfaced_blocks(
 }
 
 /// Expand the windowed message slice into final history: live messages pass
-/// through untouched, while each run of summary-collapsed messages is replaced
-/// by a single `[Summary of messages X–Y]` marker injected at the first
-/// collapsed message of the run. The absolute ordinal range is recovered from
-/// the tagged positions (offset by `start`), falling back to a range-less label
-/// when no tagged message is visible in the window.
+/// through with the round's projected content, while each run of
+/// summary-collapsed messages is replaced by a single `[Summary of messages
+/// X–Y]` marker injected at the first collapsed message of the run. The
+/// absolute ordinal range is recovered from the tagged positions (offset by
+/// `start`), falling back to a range-less label when no tagged message is
+/// visible in the window.
+///
+/// This is the one place the projection is read. Every message here is cloned
+/// on its way into the prompt, so reading a replacement costs nothing that the
+/// clone did not already cost, and the stored message is never touched.
 fn expand_history(
     windowed: &[Message],
     start: usize,
     summaries: &[MessageSummary],
     active_summary_ids: &std::collections::HashSet<&str>,
+    projection: &ContextProjection,
 ) -> Vec<Message> {
     let mut out = Vec::with_capacity(windowed.len());
     let mut injected_summaries: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -1127,16 +1144,23 @@ fn expand_history(
             continue;
         }
 
-        out.push(msg.clone());
+        let mut projected = msg.clone();
+        if projection.is_replaced(msg) {
+            projected.content = projection.content(msg).to_string();
+        }
+        out.push(projected);
     }
 
     out
 }
 
-/// Locate the largest `Role::Tool` message whose `content` length (bytes)
-/// is at least `min_bytes`. Returns `None` if no tool message clears the
-/// threshold — small tool results aren't worth truncating because the
+/// Locate the largest `Role::Tool` message the round still reads in full,
+/// measured at or above `min_tokens`. Returns `None` when no tool message
+/// clears the threshold — a small result is not worth truncating, because the
 /// truncation notice may be larger than the original.
+///
+/// The size measured is what the round reads, not what is stored, so a result
+/// the projection already replaced can never be picked a second time.
 ///
 /// Why estimated tokens (not bytes): non-ASCII payloads (CJK, emoji,
 /// JSON-with-deep-escapes, base64) have wildly different byte-vs-token
@@ -1146,6 +1170,7 @@ fn expand_history(
 /// the LLM pays in.
 fn find_largest_tool_result_above(
     messages: &[Message],
+    projection: &ContextProjection,
     min_tokens: u64,
     estimate: &dyn Fn(&str) -> u64,
 ) -> Option<usize> {
@@ -1156,7 +1181,7 @@ fn find_largest_tool_result_above(
             if m.role != Role::Tool {
                 return None;
             }
-            let tokens = estimate(&m.content);
+            let tokens = estimate(projection.content(m));
             if tokens >= min_tokens {
                 Some((i, tokens))
             } else {
@@ -1167,15 +1192,18 @@ fn find_largest_tool_result_above(
         .map(|(i, _)| i)
 }
 
-/// Text left in place of a tool result that overflow recovery dropped.
+/// Text the turn reads in place of a tool result that overflow recovery
+/// compacted.
 ///
 /// The prefix is deliberately distinct from
-/// [`planning::COMPACTION_POINTER_PREFIX`]: that one promises the content was
-/// distilled into a scratchpad note and can be looked up. This one promises
-/// nothing of the sort — the output is gone and the tool has to be re-run.
+/// [`planning::COMPACTION_POINTER_PREFIX`]: that one names a scratchpad note
+/// the model can search. This one names none, so a re-run is the model's only
+/// way back to the output. The output itself is not lost - the conversation's
+/// stored transcript still holds it - but nothing carries it back into the
+/// turn on its own.
 fn overflow_compaction_notice(original_bytes: usize) -> String {
     format!(
-        "<earlier tool output omitted: {original_bytes} bytes were dropped to fit the \
+        "<earlier tool output omitted: {original_bytes} bytes are out of view to fit the \
          model's context window. The call above and its arguments are unchanged; \
          re-run the tool if you need this output again.>"
     )
@@ -1190,25 +1218,24 @@ struct CompactionResult {
     freed_bytes: usize,
 }
 
-/// Shrink the oldest assistant(tool_calls)+tool_result groups by replacing
-/// their RESULTS with [`overflow_compaction_notice`], keeping every message.
+/// Shrink the oldest assistant(tool_calls)+tool_result groups by reading their
+/// RESULTS as [`overflow_compaction_notice`] for the rest of the turn.
 ///
-/// Why replace rather than remove: this list is the live `conv`, and the turn
-/// writes it back at the end — a positional diff that UPDATEs each ordinal and
-/// deletes the tail. Draining groups here therefore deleted them from the
-/// user's stored transcript, with no summary, no marker and no way back
-/// (#733). Replacing content frees the same prompt tokens while the record of
-/// what ran, with what arguments, stays where the user left it. The message
-/// count is unchanged, so the caller's `compacted_through` boundary still
-/// points at the same message and needs no adjustment.
+/// The replacement goes in the round's projection, so the prompt loses the
+/// bulk and the stored transcript keeps it. The message count is unchanged, so
+/// the caller's `compacted_through` boundary still points at the same message
+/// and needs no adjustment.
 ///
 /// Only results at or above [`planning::COMPACTION_MIN_EVICT_BYTES`] are worth
 /// replacing; below that the notice can be larger than what it replaces. The
-/// most recent group is never touched, and a group whose results are all
-/// already compacted contributes nothing — so repeated recoveries walk
+/// most recent group is never touched, and a group whose results the round
+/// already reads as a notice contributes nothing — so repeated recoveries walk
 /// backwards through history and then hand off to the next rung instead of
 /// spinning on the same messages.
-fn compact_oldest_tool_groups(messages: &mut [Message]) -> CompactionResult {
+fn compact_oldest_tool_groups(
+    messages: &[Message],
+    projection: &mut ContextProjection,
+) -> CompactionResult {
     // Ranges of (assistant-with-tool-calls, tool_result, ..., tool_result)
     // that still hold something worth compacting, oldest first.
     let mut groups: Vec<std::ops::Range<usize>> = Vec::new();
@@ -1220,7 +1247,10 @@ fn compact_oldest_tool_groups(messages: &mut [Message]) -> CompactionResult {
             while i < messages.len() && messages[i].role == Role::Tool {
                 i += 1;
             }
-            if messages[start..i].iter().any(is_worth_compacting) {
+            if messages[start..i]
+                .iter()
+                .any(|m| is_worth_compacting(m, projection))
+            {
                 groups.push(start..i);
             }
         } else {
@@ -1238,33 +1268,30 @@ fn compact_oldest_tool_groups(messages: &mut [Message]) -> CompactionResult {
     let compact_count = groups.len() / 2;
     let mut result = CompactionResult::default();
     for range in groups.into_iter().take(compact_count) {
-        for msg in &mut messages[range] {
-            if !is_worth_compacting(msg) {
+        for msg in &messages[range] {
+            if !is_worth_compacting(msg, projection) {
                 continue;
             }
-            let notice = overflow_compaction_notice(msg.content.len());
+            let current = projection.content(msg).len();
+            let notice = overflow_compaction_notice(current);
             // Never trade a result for something bigger, whatever the floor
             // above happens to be set to.
-            let Some(freed) = msg
-                .content
-                .len()
-                .checked_sub(notice.len())
-                .filter(|f| *f > 0)
-            else {
+            let Some(freed) = current.checked_sub(notice.len()).filter(|f| *f > 0) else {
                 continue;
             };
             result.freed_bytes += freed;
             result.compacted += 1;
-            msg.content = notice;
+            projection.replace(msg, notice);
         }
     }
 
     result
 }
 
-/// A tool result big enough that replacing it with a notice frees space.
-fn is_worth_compacting(msg: &Message) -> bool {
-    msg.role == Role::Tool && msg.content.len() >= planning::COMPACTION_MIN_EVICT_BYTES
+/// A tool result the round still reads in full, and big enough that reading a
+/// notice instead frees space.
+fn is_worth_compacting(msg: &Message, projection: &ContextProjection) -> bool {
+    msg.role == Role::Tool && projection.content(msg).len() >= planning::COMPACTION_MIN_EVICT_BYTES
 }
 
 /// Compute the window-start index, snapped forward to a `Role::User` boundary.
@@ -1524,21 +1551,24 @@ pub(crate) async fn compact_into_summary<L: LlmClient>(
 /// Recover from a `ContextOverflow` error by reducing prompt size.
 ///
 /// The ladder runs steps in order until one frees space:
-///   1. Truncate the largest tool result with a chunking notice (preserves
-///      the tool_call/result pair so the model sees what it tried).
-///   2. If no tool result is large enough to be worth truncating, shrink the
-///      oldest tool-pair groups in place via [`compact_oldest_tool_groups`].
-///   3. If nothing is worth compacting, summarise-and-shrink the active window
-///      (delegates to the same logic that path A uses on the success branch).
+///   1. Read the largest tool result as a chunking notice (the tool_call and
+///      result pair stays, so the model still sees what it tried).
+///   2. When no tool result is large enough to be worth truncating, read the
+///      oldest tool groups' results as notices via [`compact_oldest_tool_groups`].
+///   3. When nothing is worth compacting, summarise and shrink the active
+///      window (the same logic the token-pressure path uses).
 ///
-/// Why this order: step 1 is the cleanest because it preserves history;
-/// step 3 is the last resort. No step deletes a message — the caller writes
-/// this same `conv` back at the end of the turn, so a removal here would be a
-/// removal from the user's stored transcript. The retry counter in
+/// Why this order: step 1 is the cleanest because it costs the least history;
+/// step 3 is the last resort.
+///
+/// Steps 1 and 2 write to the round's projection, not to `conv.messages`. The
+/// caller writes that list to storage at the end of the turn, so a rewrite here
+/// would be a rewrite of the user's stored transcript. The retry counter in
 /// `send_prompt` bounds total attempts across all steps so a
-/// persistently-oversized request can't loop indefinitely.
+/// persistently-oversized request cannot loop indefinitely.
 pub(crate) async fn recover_from_overflow<L: LlmClient>(
     conv: &mut Conversation,
+    projection: &mut ContextProjection,
     prompt_tokens: Option<u64>,
     max_tokens: Option<u64>,
     target_window: &mut usize,
@@ -1547,11 +1577,12 @@ pub(crate) async fn recover_from_overflow<L: LlmClient>(
 ) {
     // Step 1: largest tool result, if it's >= MIN_TRUNCATION_TOKENS.
     if let Some(idx) =
-        find_largest_tool_result_above(&conv.messages, MIN_TRUNCATION_TOKENS, estimate)
+        find_largest_tool_result_above(&conv.messages, projection, MIN_TRUNCATION_TOKENS, estimate)
     {
-        let original_bytes = conv.messages[idx].content.len();
-        conv.messages[idx].content =
-            overflow_truncation_notice(original_bytes, prompt_tokens, max_tokens);
+        let msg = &conv.messages[idx];
+        let original_bytes = projection.content(msg).len();
+        let notice = overflow_truncation_notice(original_bytes, prompt_tokens, max_tokens);
+        projection.replace(msg, notice);
         tracing::warn!(
             tool_result_index = idx,
             original_bytes,
@@ -1562,11 +1593,9 @@ pub(crate) async fn recover_from_overflow<L: LlmClient>(
         return;
     }
 
-    // Step 2: shrink the oldest tool results in place. No message is removed,
-    // so `compacted_through` still points at the same message and the stored
-    // transcript keeps every row (#733). If nothing was worth compacting the
-    // step frees nothing and recovery falls through to step 3.
-    let compacted = compact_oldest_tool_groups(&mut conv.messages);
+    // Step 2: read the oldest tool results as notices. If nothing was worth
+    // compacting the step frees nothing and recovery falls through to step 3.
+    let compacted = compact_oldest_tool_groups(&conv.messages, projection);
     if compacted.freed_bytes > 0 {
         tracing::warn!(
             compacted = compacted.compacted,
@@ -2083,7 +2112,7 @@ mod tests {
         }
     }
 
-    // --- Overflow recovery rung 2: compact in place, never delete (#733) ---
+    // --- Overflow recovery: shrink the round, never the record (#733, #798) ---
 
     /// A tool result big enough to be worth replacing with a notice, but below
     /// the rung-1 truncation floor (`MIN_TRUNCATION_TOKENS`) so rung 1 declines
@@ -2110,9 +2139,14 @@ mod tests {
         conv
     }
 
-    async fn run_recovery(conv: &mut Conversation, target_window: &mut usize) {
+    async fn run_recovery(
+        conv: &mut Conversation,
+        projection: &mut ContextProjection,
+        target_window: &mut usize,
+    ) {
         recover_from_overflow(
             conv,
+            projection,
             Some(100_000),
             Some(8_000),
             target_window,
@@ -2122,12 +2156,80 @@ mod tests {
         .await;
     }
 
+    /// One recovery attempt on a fresh projection.
+    async fn recover_once(conv: &mut Conversation, target_window: &mut usize) -> ContextProjection {
+        let mut projection = ContextProjection::default();
+        run_recovery(conv, &mut projection, target_window).await;
+        projection
+    }
+
+    /// What the round reads for the result of `call_id`.
+    fn projected_result<'a>(
+        conv: &'a Conversation,
+        projection: &'a ContextProjection,
+        call_id: &str,
+    ) -> &'a str {
+        let msg = conv
+            .messages
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some(call_id))
+            .expect("the result row");
+        projection.content(msg)
+    }
+
+    /// #798: the stored transcript is the observation layer. Recovery shrinks
+    /// the round, and the record it shrinks from is left as it was.
+    #[tokio::test]
+    async fn overflow_recovery_leaves_the_stored_transcript_byte_for_byte() {
+        let mut conv = conv_with_tool_groups(4);
+        let before = conv.messages.clone();
+        let mut target_window = MAX_CONTEXT_MESSAGES;
+        let projection = recover_once(&mut conv, &mut target_window).await;
+
+        assert_eq!(
+            conv.messages, before,
+            "recovery must not write to the stored transcript"
+        );
+        assert!(
+            projection.replaced_count() > 0,
+            "recovery must still have freed something from the round"
+        );
+    }
+
+    /// #798: a truncation notice is what the model reads, not what is stored.
+    #[tokio::test]
+    async fn overflow_recovery_rung1_keeps_the_stored_result_whole() {
+        // One result over the rung-1 truncation floor, so rung 1 takes it.
+        let mut conv = conv_with_tool_groups(2);
+        let big = "b".repeat(8192);
+        conv.messages
+            .push(Message::assistant_with_tool_calls(vec![ToolCall::new(
+                "c9",
+                "read_file",
+                "{}",
+            )]));
+        conv.messages.push(Message::tool_result("c9", &big));
+        let mut target_window = MAX_CONTEXT_MESSAGES;
+        let projection = recover_once(&mut conv, &mut target_window).await;
+
+        assert!(
+            projected_result(&conv, &projection, "c9").contains("exceeded the model's"),
+            "the round must read the truncation notice"
+        );
+        let stored = conv
+            .messages
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("c9"))
+            .expect("the result row");
+        assert_eq!(stored.content, big, "the stored result must be untouched");
+    }
+
     #[tokio::test]
     async fn overflow_recovery_rung2_keeps_every_message_row() {
         let mut conv = conv_with_tool_groups(4);
         let before = conv.messages.len();
         let mut target_window = MAX_CONTEXT_MESSAGES;
-        run_recovery(&mut conv, &mut target_window).await;
+        let _ = recover_once(&mut conv, &mut target_window).await;
 
         assert_eq!(
             conv.messages.len(),
@@ -2150,26 +2252,20 @@ mod tests {
         let mut conv = conv_with_tool_groups(4);
         let original_bytes = mid_sized_result('r').len();
         let mut target_window = MAX_CONTEXT_MESSAGES;
-        run_recovery(&mut conv, &mut target_window).await;
+        let projection = recover_once(&mut conv, &mut target_window).await;
 
-        let oldest = conv
-            .messages
-            .iter()
-            .find(|m| m.tool_call_id.as_deref() == Some("c1"))
-            .expect("oldest result row");
+        let oldest = projected_result(&conv, &projection, "c1");
         assert!(
-            oldest.content.contains(&format!("{original_bytes} bytes")),
-            "the notice must say how much was dropped, got {:?}",
-            oldest.content
+            oldest.contains(&format!("{original_bytes} bytes")),
+            "the notice must say how much left the round, got {oldest:?}"
         );
         assert!(
-            !oldest.content.contains(&mid_sized_result('r')),
-            "the bulk must actually be gone"
+            !oldest.contains(&mid_sized_result('r')),
+            "the bulk must actually leave the round"
         );
-        assert_eq!(oldest.role, Role::Tool, "the role must be preserved");
         assert!(
-            oldest.content.len() < original_bytes,
-            "the notice must be smaller than what it replaced"
+            oldest.len() < original_bytes,
+            "the notice must be smaller than what it stands for"
         );
     }
 
@@ -2177,7 +2273,7 @@ mod tests {
     async fn overflow_recovery_rung2_preserves_the_tool_call_audit_trail() {
         let mut conv = conv_with_tool_groups(4);
         let mut target_window = MAX_CONTEXT_MESSAGES;
-        run_recovery(&mut conv, &mut target_window).await;
+        let _ = recover_once(&mut conv, &mut target_window).await;
 
         let call = conv
             .messages
@@ -2196,17 +2292,12 @@ mod tests {
     async fn overflow_recovery_rung2_keeps_the_most_recent_tool_result_intact() {
         let mut conv = conv_with_tool_groups(4);
         let mut target_window = MAX_CONTEXT_MESSAGES;
-        run_recovery(&mut conv, &mut target_window).await;
+        let projection = recover_once(&mut conv, &mut target_window).await;
 
-        let newest = conv
-            .messages
-            .iter()
-            .find(|m| m.tool_call_id.as_deref() == Some("c4"))
-            .expect("newest result row");
         assert_eq!(
-            newest.content,
+            projected_result(&conv, &projection, "c4"),
             mid_sized_result('r'),
-            "the most recent tool interaction must stay intact"
+            "the most recent tool interaction must stay in view"
         );
     }
 
@@ -2217,7 +2308,7 @@ mod tests {
         let mut conv = conv_with_tool_groups(4);
         conv.compacted_through = 4;
         let mut target_window = MAX_CONTEXT_MESSAGES;
-        run_recovery(&mut conv, &mut target_window).await;
+        let _ = recover_once(&mut conv, &mut target_window).await;
 
         assert_eq!(
             conv.compacted_through, 4,
@@ -2228,24 +2319,13 @@ mod tests {
     #[tokio::test]
     async fn overflow_recovery_rung2_does_not_recompact_an_already_compacted_result() {
         let mut conv = conv_with_tool_groups(4);
+        let mut projection = ContextProjection::default();
         let mut target_window = MAX_CONTEXT_MESSAGES;
-        run_recovery(&mut conv, &mut target_window).await;
-        let after_first = conv
-            .messages
-            .iter()
-            .find(|m| m.tool_call_id.as_deref() == Some("c1"))
-            .expect("oldest result row")
-            .content
-            .clone();
+        run_recovery(&mut conv, &mut projection, &mut target_window).await;
+        let after_first = projected_result(&conv, &projection, "c1").to_string();
 
-        run_recovery(&mut conv, &mut target_window).await;
-        let after_second = conv
-            .messages
-            .iter()
-            .find(|m| m.tool_call_id.as_deref() == Some("c1"))
-            .expect("oldest result row")
-            .content
-            .clone();
+        run_recovery(&mut conv, &mut projection, &mut target_window).await;
+        let after_second = projected_result(&conv, &projection, "c1").to_string();
         assert_eq!(
             after_first, after_second,
             "a notice must never be compacted a second time"
@@ -2272,11 +2352,14 @@ mod tests {
             conv.messages
                 .push(Message::tool_result(format!("c{n}"), "ok"));
         }
-        let before = conv.messages.clone();
         let mut target_window = MAX_CONTEXT_MESSAGES;
-        run_recovery(&mut conv, &mut target_window).await;
+        let projection = recover_once(&mut conv, &mut target_window).await;
 
-        assert_eq!(conv.messages, before, "tiny results must be left alone");
+        assert_eq!(
+            projection.replaced_count(),
+            0,
+            "tiny results must be left alone"
+        );
         assert!(
             target_window < MAX_CONTEXT_MESSAGES,
             "recovery must escalate to rung 3 when rung 2 declines"
@@ -2290,8 +2373,9 @@ mod tests {
         let mut conv = conv_with_tool_groups(1);
         let before = conv.messages.clone();
         let mut target_window = MAX_CONTEXT_MESSAGES;
-        run_recovery(&mut conv, &mut target_window).await;
+        let projection = recover_once(&mut conv, &mut target_window).await;
 
+        assert_eq!(projection.replaced_count(), 0);
         assert_eq!(
             conv.messages, before,
             "the only tool group must survive untouched"
@@ -2310,7 +2394,7 @@ mod tests {
             )]));
         let before = conv.messages.len();
         let mut target_window = MAX_CONTEXT_MESSAGES;
-        run_recovery(&mut conv, &mut target_window).await;
+        let _ = recover_once(&mut conv, &mut target_window).await;
 
         assert_eq!(conv.messages.len(), before);
         assert!(
@@ -2331,9 +2415,61 @@ mod tests {
         ];
         let before = conv.messages.clone();
         let mut target_window = MAX_CONTEXT_MESSAGES;
-        run_recovery(&mut conv, &mut target_window).await;
+        let projection = recover_once(&mut conv, &mut target_window).await;
 
+        assert_eq!(projection.replaced_count(), 0);
         assert_eq!(conv.messages, before);
+    }
+
+    /// #798: the projection is what the prompt is built from, so a replacement
+    /// must reach the assembled messages and nothing else.
+    #[test]
+    fn the_assembled_prompt_carries_the_projected_content() {
+        let conv = conv_with_tool_groups(2);
+        let mut projection = ContextProjection::default();
+        let target = conv
+            .messages
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("c1"))
+            .expect("the result row");
+        projection.replace(target, "<a short notice>".to_string());
+
+        let assembled = assemble_turn_within_budget(
+            &ConversationView {
+                messages: &conv.messages,
+                summaries: &[],
+                context_summary: "",
+            },
+            &ToolContext::default(),
+            &TurnAnchors::default(),
+            &projection,
+            MAX_CONTEXT_MESSAGES,
+            None,
+            &default_estimate,
+        );
+
+        let tool_bodies: Vec<&str> = assembled
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .map(|m| m.content.as_str())
+            .collect();
+        assert!(
+            tool_bodies.contains(&"<a short notice>"),
+            "the prompt must carry the projected content, got {tool_bodies:?}"
+        );
+        assert!(
+            !tool_bodies.iter().any(|b| *b == mid_sized_result('r')) || tool_bodies.len() > 1,
+            "only the projected result changes"
+        );
+        assert_eq!(
+            conv.messages
+                .iter()
+                .find(|m| m.tool_call_id.as_deref() == Some("c1"))
+                .expect("the result row")
+                .content,
+            mid_sized_result('r'),
+            "assembly must not write back to the transcript"
+        );
     }
 
     // --- Window/compaction tests ---

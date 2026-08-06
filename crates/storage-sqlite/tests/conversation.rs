@@ -382,8 +382,8 @@ async fn user_message_without_key_loads_as_none() {
 
 /// Mirror of the Postgres `shifted_user_key_travels_with_its_message`: `update`
 /// reconciles by ordinal SLOT, so a keyed user row that shifts down one ordinal
-/// (an earlier message removed, the overflow-trim shape) must keep its own key
-/// and strand none on the row that takes over its old slot.
+/// (an earlier message removed) must keep its own key and strand none on the
+/// row that takes over its old slot.
 #[tokio::test]
 async fn shifted_user_key_travels_with_its_message() {
     let s = store().await;
@@ -416,6 +416,86 @@ async fn shifted_user_key_travels_with_its_message() {
         got.messages[2].idempotency_key, None,
         "the row now occupying the user row's old slot carries no stray key"
     );
+}
+
+/// #798: `messages.id` is the message's identity, its ordering key and the
+/// client's resume cursor, and `uuidv7_ts(id)` reads its creation time. A
+/// mid-history insert shifts every later message into the next slot, so each
+/// shifted row must take its own id with it rather than inherit the id of the
+/// message that used to sit there.
+#[tokio::test]
+async fn a_shifted_message_keeps_its_own_id() {
+    let s = store().await;
+    let mut conv = conv_with("c1", "T", "2026-01-01 00:00:00", 0);
+    for n in 0..4 {
+        conv.messages
+            .push(Message::new(Role::Assistant, format!("a{n}")));
+    }
+    let ids_by_content: Vec<(String, String)> = conv
+        .messages
+        .iter()
+        .map(|m| (m.content.clone(), m.id.clone()))
+        .collect();
+    s.create(conv.clone()).await.expect("create");
+
+    // A mid-history insert, the shape `close_unanswered_tool_calls` produces.
+    conv.messages
+        .insert(1, Message::new(Role::Assistant, "inserted"));
+    s.update(conv.clone()).await.expect("update");
+
+    let got = s.get(&ConversationId::from("c1")).await.expect("get");
+    assert_eq!(got.messages.len(), 5);
+    for (content, id) in &ids_by_content {
+        let stored = got
+            .messages
+            .iter()
+            .find(|m| m.content == *content)
+            .unwrap_or_else(|| panic!("{content} must still be stored"));
+        assert_eq!(
+            stored.id, *id,
+            "{content} must keep the id it was created with"
+        );
+    }
+    let inserted = got
+        .messages
+        .iter()
+        .find(|m| m.content == "inserted")
+        .expect("the inserted message must be stored");
+    assert_eq!(
+        inserted.id, conv.messages[1].id,
+        "the inserted message must keep its own id"
+    );
+}
+
+/// #798: the same contract under a mid-history removal, where the shift runs
+/// the other way.
+#[tokio::test]
+async fn a_message_shifted_by_a_removal_keeps_its_own_id() {
+    let s = store().await;
+    let mut conv = conv_with("c1", "T", "2026-01-01 00:00:00", 0);
+    for n in 0..4 {
+        conv.messages
+            .push(Message::new(Role::Assistant, format!("a{n}")));
+    }
+    let survivor_ids: Vec<(String, String)> = conv.messages[1..]
+        .iter()
+        .map(|m| (m.content.clone(), m.id.clone()))
+        .collect();
+    s.create(conv.clone()).await.expect("create");
+
+    conv.messages.remove(0);
+    s.update(conv).await.expect("update");
+
+    let got = s.get(&ConversationId::from("c1")).await.expect("get");
+    assert_eq!(got.messages.len(), 3);
+    for (content, id) in &survivor_ids {
+        let stored = got
+            .messages
+            .iter()
+            .find(|m| m.content == *content)
+            .unwrap_or_else(|| panic!("{content} must still be stored"));
+        assert_eq!(stored.id, *id, "{content} must keep its own id");
+    }
 }
 
 /// The review's save -> get -> save guard: re-saving an unchanged keyed
