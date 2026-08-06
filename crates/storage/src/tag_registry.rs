@@ -158,9 +158,9 @@ pub async fn resolve_active_name(pool: &PgPool, name: &str) -> Result<Option<Str
 /// 3. Otherwise insert and return `Created`, or redirect to the tag a
 ///    concurrent proposal of the same name registered first.
 ///
-/// A near neighbour whose name no knowledge-base row can carry is passed over
-/// rather than redirected onto — see `redirect_refusal` for which names those
-/// are and why answering with one costs the entry every later search.
+/// `redirect_refusal` guards step 2 against answering with a name the write
+/// path could never produce. It is an invariant assertion that no name the
+/// table can hold trips; it does not filter damaged rows, which #1089 repairs.
 pub async fn create_or_match_tag(
     pool: &PgPool,
     embed_fn: &BackfillEmbedFn,
@@ -218,8 +218,10 @@ pub async fn create_or_match_tag(
         && distance < TAG_DEDUP_DISTANCE_THRESHOLD
     {
         // A redirect answers with a name the caller then writes on a
-        // knowledge-base row, so the name has to be one a row can carry.
-        if let Some(reason) = redirect_refusal(&normalized, &name) {
+        // knowledge-base row, so the name has to be one a row can carry. No
+        // name the table can hold trips this; it fails loudly instead of
+        // silently if one ever does.
+        if let Some(reason) = redirect_refusal(&name) {
             tracing::warn!(
                 candidate = %name,
                 proposed = %normalized,
@@ -304,56 +306,26 @@ pub async fn create_or_match_tag(
 /// Why a vector near neighbour must not capture a redirect, or `None` when it
 /// may.
 ///
-/// A redirect answers with a name the caller writes on a knowledge-base row,
-/// so an unusable name here costs the entry every later search filtered on the
-/// correct tag. Two names are unusable.
+/// A redirect answers with a name the caller writes on a knowledge-base row, so
+/// a name the write path could never produce would hide that entry from every
+/// search filtered on the correct tag.
 ///
-/// A name that is not in normalized form is one no knowledge-base row can
-/// carry, because the write path normalizes every tag it stores.
+/// This is an invariant assertion, not a live filter. Every name the table can
+/// hold is already a fixed point of the normalizer: `create_or_match_tag` has
+/// normalized before inserting since the registry's first commit, and the only
+/// other writer touches the `embedding` columns. So on real data this never
+/// fires, and it is here to fail loudly rather than silently if a future writer
+/// inserts a raw name.
 ///
-/// A name that is the proposal's own pre-#1069 mangling is the harder one, and
-/// the reason this is a function rather than one comparison. Before the
-/// registry and the knowledge base shared a normalizer, the registry stripped
-/// the `facet:value` colon and every other punctuation mark, so
-/// `project:adelie-ai` was registered as `projectadelie-ai`. Those rows are
-/// still there. Each misses the exact-name lookup, and each is a near neighbour
-/// of the correct name in embedding space, so it is exactly the candidate this
-/// redirect would pick. Note that such a name is itself in normalized form -
-/// the current normalizer changes nothing about `projectadelie-ai` - so the
-/// first rule does not reach it.
-///
-/// The test is narrow on purpose: the candidate must be byte-identical to the
-/// legacy mangling of *this* proposal, and different from the proposal itself.
-/// A genuinely distinct near duplicate never matches that, so ordinary dedup is
-/// untouched. Repairing the rows is #1089; until then they stay inert, which is
-/// what the feature doc claims of them.
-fn redirect_refusal(proposed_normalized: &str, candidate: &str) -> Option<&'static str> {
-    if candidate != normalize_tag_name(candidate) {
-        return Some("the name is not in normalized form, so no knowledge-base row can carry it");
-    }
-    if candidate != proposed_normalized
-        && candidate == legacy_normalize_tag_name(proposed_normalized)
-    {
-        return Some("the name is this proposal's own pre-#1069 mangled key");
-    }
-    None
-}
-
-/// The tag-name rule the registry used before #1069 gave it the knowledge
-/// base's normalizer: lowercase, spaces and underscores to dashes, every other
-/// non-alphanumeric character removed, then edge dashes trimmed.
-///
-/// It is kept only to recognize the keys it wrote, which are still in the
-/// table. Nothing normalizes with it. It goes when #1089 repairs those rows.
-fn legacy_normalize_tag_name(raw: &str) -> String {
-    raw.trim()
-        .to_lowercase()
-        .replace([' ', '_'], "-")
-        .chars()
-        .filter(|c| c.is_alphanumeric() || *c == '-')
-        .collect::<String>()
-        .trim_matches('-')
-        .to_string()
+/// In particular it does **not** recognize a pre-#1069 mangled key. The old
+/// registry normalizer lowercased and stripped punctuation, so the keys it
+/// wrote - `projectadelie-ai`, `project-adelie-ai` - are themselves in
+/// normalized form and pass this check. A damaged row can still win the
+/// nearest-neighbour search; #1089 repairs those rows, and it is the right
+/// place for the check that needs knowledge-base evidence to make it.
+fn redirect_refusal(candidate: &str) -> Option<&'static str> {
+    (candidate != normalize_tag_name(candidate))
+        .then_some("the name is not in normalized form, so no knowledge-base row can carry it")
 }
 
 /// Build the text a tag is embedded from, given its normalized name and its
@@ -555,51 +527,48 @@ mod tests {
     }
 
     #[test]
-    fn registry_refuses_a_redirect_onto_this_proposals_own_mangled_key() {
-        // The pre-#1069 registry stripped the facet colon, so `project:adelie-ai`
-        // was registered as `projectadelie-ai`. That row is a near neighbour of
-        // the correct name, so it is what the vector search returns, and
-        // answering with it would file the entry under a tag no search for
-        // `project:adelie-ai` can match.
-        assert_eq!(
-            redirect_refusal("project:adelie-ai", "projectadelie-ai"),
-            Some("the name is this proposal's own pre-#1069 mangled key")
-        );
-        assert_eq!(
-            redirect_refusal("topic:deploy", "topicdeploy"),
-            Some("the name is this proposal's own pre-#1069 mangled key")
-        );
-        // The mangled key is itself in normalized form, so the normalized-form
-        // rule alone would let it through. This is the premise of the rule
-        // above, not a restatement of it.
-        assert_eq!(
-            normalize_tag_name("projectadelie-ai"),
-            "projectadelie-ai",
-            "premise: the current normalizer leaves a mangled key untouched"
-        );
-    }
-
-    #[test]
     fn registry_still_redirects_a_genuine_near_duplicate() {
         // The refusal must not reach ordinary dedup, which is what the whole
-        // vocabulary is for.
-        assert_eq!(redirect_refusal("topic:forecast", "topic:weather"), None);
-        assert_eq!(redirect_refusal("preferences", "preference"), None);
-        assert_eq!(
-            redirect_refusal("project:adelie-ai", "project:adelie"),
-            None
-        );
-        // A proposal with no punctuation mangles to itself, so nothing is
-        // refused for a plain tag.
-        assert_eq!(redirect_refusal("memory", "memory"), None);
+        // vocabulary is for. Every name here is one the table can hold, so
+        // every one passes.
+        for candidate in [
+            "topic:weather",
+            "preference",
+            "project:adelie",
+            "memory",
+            // Underscore and dash spellings of one concept. `normalize_tag`
+            // leaves an underscore alone, so both are names the table holds and
+            // both must stay eligible: a rule that refused either would split
+            // one concept across two rows, which is the failure #1070 exists to
+            // prevent.
+            "user_preference",
+            "user-preference",
+            "adele_gtk",
+            "adele-gtk",
+            // A pre-#1069 mangled key is itself in normalized form, so this
+            // guard passes it. Recognizing a damaged row needs knowledge-base
+            // evidence and belongs to #1089.
+            "projectadelie-ai",
+            "project-adelie-ai",
+        ] {
+            assert_eq!(
+                redirect_refusal(candidate),
+                None,
+                "{candidate:?} is a name the registry can hold, so it may be redirected onto"
+            );
+        }
     }
 
     #[test]
     fn registry_refuses_a_redirect_onto_a_name_no_row_can_carry() {
-        // The write path normalizes every tag it stores, so a registry name
-        // that is not in normalized form names nothing on disk.
+        // An invariant assertion, not a live filter. `"Topic: Deploy"` is a
+        // value the table cannot hold - `create_or_match_tag` has normalized
+        // before inserting since the registry's first commit - so this arm
+        // cannot fire on real data. It is here so that a future writer which
+        // inserts a raw name fails loudly rather than quietly filing an entry
+        // under a tag no search can match.
         assert_eq!(
-            redirect_refusal("topic:deploy", "Topic: Deploy"),
+            redirect_refusal("Topic: Deploy"),
             Some("the name is not in normalized form, so no knowledge-base row can carry it")
         );
     }

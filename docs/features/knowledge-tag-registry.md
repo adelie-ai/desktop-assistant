@@ -163,14 +163,22 @@ plus at most one consultation ceiling: 25 seconds.
 
 ## What it does not do
 
-It does not repair tags already stored. Registry rows written before the
-normaliser was shared between the two paths carry mangled names
-(`projectadelie-ai` for `project:adelie-ai`). Such a row misses the exact-name
-lookup, and it is also refused as a redirect target - it is a close neighbour of
-the correct name in embedding space, so without that refusal it would capture
-the redirect and file the entry under a name no search for the correct tag can
-match. A correctly-named row is created beside it. Repairing those rows is
-#1089.
+It does not repair the registry rows written before the normaliser was shared
+between the two paths. Those rows carry mangled names - `projectadelie-ai` or
+`project-adelie-ai`, depending on the raw string the model used at the time, for
+what is now `project:adelie-ai`.
+
+Nothing here guards against one. A mangled row misses the exact-name lookup, so
+a correctly-named row is created beside it, but it is a close neighbour of the
+correct name in embedding space, so it can still win the nearest-neighbour
+search and capture a redirect. There is no cheap test that tells a mangled key
+from a legitimate one: every one of them is in normalised form, so comparing a
+candidate against the normaliser passes them all, and the rule that would catch
+them - refusing a candidate that no knowledge-base row carries - needs an
+evidence query that does not belong on the write path under this budget.
+
+Repairing those rows is #1089, which already needs that evidence query, and it
+is what closes this.
 
 It does not rename tags on existing entries. A redirect applies to the write in
 front of it.

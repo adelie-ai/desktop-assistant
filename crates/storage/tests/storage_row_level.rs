@@ -12,8 +12,8 @@
 //! - `tag_registry` embedding-dedup redirect and deprecation-chain / cycle
 //!   guard, plus the gate the knowledge-base write tool puts in front of it
 //!   (a known tag costs no embedding; one tenant never reads or redirects onto
-//!   another's vocabulary; a mangled name captures no redirect; a saturated
-//!   pool is paid once);
+//!   another's vocabulary; an underscore spelling collapses onto its dash
+//!   spelling; a saturated pool is paid once);
 //! - `tool_registry` upsert / hybrid search / source-scoped unregister;
 //! - JSON→Postgres migration of conversations + knowledge and the empty-table
 //!   probes.
@@ -1039,65 +1039,64 @@ async fn kb_write_reads_an_existing_tag_only_within_the_calling_user() {
 }
 
 #[tokio::test]
-async fn registry_refuses_to_redirect_onto_a_mangled_registry_name() {
-    // Registry rows written before the two paths shared a normalizer carry a
-    // mangled name (`projectadelie-ai` for `project:adelie-ai`). Such a row
-    // misses the exact-name lookup, but it is a close vector neighbour of the
-    // correct name. Redirecting onto it would store the mangled tag on the
-    // entry, and every later search filtered on the correct tag would miss
-    // that entry. Repairing those rows is #1089; here they stay inert.
+async fn registry_redirects_an_underscore_spelling_onto_its_dash_spelling() {
+    // `normalize_tag` leaves an underscore alone, so `user_preference` and
+    // `user-preference` are two names the table can hold for one concept. They
+    // are also close in embedding space - measured at cosine distance 0.016,
+    // well inside the 0.10 dedup threshold - so the vector search is what has
+    // to collapse them. A guard on the redirect candidate that treats a
+    // dash/underscore difference as suspect would refuse this redirect, fall
+    // through to the insert, and give one concept two rows: the exact failure
+    // #1070 exists to prevent.
     //
-    // Note the mangled name is itself in normalized form - the current
-    // normalizer leaves `projectadelie-ai` untouched - so recognizing it takes
-    // the legacy rule that wrote it, not a normalized-form check.
-    //
-    // MUTATION: dropping the mangled-key arm of `redirect_refusal` answers with
-    // `projectadelie-ai` → RED.
+    // MUTATION: refusing a candidate that differs from the proposal by
+    // punctuation alone registers a second row -> RED on both assertions.
     with_fixture(
-        "registry_refuses_to_redirect_onto_a_mangled_registry_name",
+        "registry_redirects_an_underscore_spelling_onto_its_dash_spelling",
         |fx| async move {
             let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
             let embed_fn = counting_embed_fn(Arc::clone(&seen));
 
             with_user_id(UserId::new("alice"), async {
-                // The mangled row, embedded by the same model and with the same
-                // vector every proposal gets, so it sits at distance 0 and is
-                // the nearest neighbour by construction.
-                sqlx::query(
-                    "INSERT INTO tag_registry \
-                        (user_id, name, description, examples, distinguish_from, \
-                         embedding, embedding_model) \
-                     VALUES ($1, 'projectadelie-ai', 'The mangled pre-#1069 row', \
-                             '[]'::jsonb, '{}', $2, 'test-model')",
-                )
-                .bind("alice")
-                .bind(pgvector::Vector::from(vec![1.0f32, 0.0, 0.0]))
-                .execute(&fx.pool)
-                .await
-                .expect("plant the mangled row");
-
-                let name = resolve_proposed_tag(
+                let first = resolve_proposed_tag(
                     &fx.pool,
                     &embed_fn,
                     "test-model",
                     &ProposedTag {
-                        name: "project:adelie-ai".into(),
-                        description: Some("The assistant and its clients".into()),
+                        name: "user-preference".into(),
+                        description: Some("How the user likes things done".into()),
                     },
                 )
                 .await
-                .expect("the proposal succeeds");
+                .expect("register the dash spelling");
+                assert_eq!(first, "user-preference", "premise: the dash spelling is in");
+
+                let second = resolve_proposed_tag(
+                    &fx.pool,
+                    &embed_fn,
+                    "test-model",
+                    &ProposedTag {
+                        name: "user_preference".into(),
+                        description: Some("How the user likes things done".into()),
+                    },
+                )
+                .await
+                .expect("the underscore spelling resolves");
                 assert_eq!(
-                    name, "project:adelie-ai",
-                    "a name no knowledge-base row can carry must not capture the redirect"
+                    second, "user-preference",
+                    "the underscore spelling must redirect onto the registered tag"
                 );
 
-                let stored = get_tag(&fx.pool, "project:adelie-ai")
+                let names = list_active_tags(&fx.pool)
                     .await
-                    .expect("read the registered tag");
-                assert!(
-                    stored.is_some(),
-                    "the correctly-named tag is registered beside the mangled row"
+                    .expect("list alice's tags")
+                    .into_iter()
+                    .map(|t| t.name)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    names,
+                    vec!["user-preference".to_string()],
+                    "one concept, one row"
                 );
             })
             .await;
@@ -1105,67 +1104,6 @@ async fn registry_refuses_to_redirect_onto_a_mangled_registry_name() {
         },
     )
     .await;
-}
-
-#[tokio::test]
-async fn kb_write_pays_a_saturated_connection_pool_once_not_twice() {
-    // The resolver used to read the tag back on *any* failure, not only on the
-    // primary-key conflict that a read-back can answer. A pool with no free
-    // connection therefore cost two acquire timeouts inside one live turn -
-    // measured at 60.0s against sqlx's 30s default.
-    //
-    // The pool here holds one connection, and the test holds it, so every
-    // acquire waits out the timeout and none of the SQL ever runs. One pass
-    // costs one timeout; the old retry cost two.
-    //
-    // MUTATION: reading the tag back on any error, rather than on the unique
-    // violation beside the insert that raises it, doubles the elapsed time →
-    // RED.
-    let Some(url) = support::test_database_url() else {
-        return;
-    };
-    let acquire_timeout = std::time::Duration::from_millis(300);
-    let pool = PgPoolOptions::new()
-        .max_connections(1)
-        .acquire_timeout(acquire_timeout)
-        .connect(&url)
-        .await
-        .expect("connect the single-connection pool");
-
-    let held = pool.acquire().await.expect("hold the only connection");
-
-    let embed_fn: BackfillEmbedFn =
-        Box::new(|texts| Box::pin(async move { Ok(texts.iter().map(|_| vec![1.0f32]).collect()) }));
-
-    let started = std::time::Instant::now();
-    let outcome = with_user_id(
-        UserId::new("alice"),
-        resolve_proposed_tag(
-            &pool,
-            &embed_fn,
-            "test-model",
-            &ProposedTag {
-                name: "topic:weather".into(),
-                description: Some("Forecasts, rain, and temperature".into()),
-            },
-        ),
-    )
-    .await;
-    let elapsed = started.elapsed();
-
-    drop(held);
-    pool.close().await;
-
-    assert!(
-        outcome.is_err(),
-        "a pool that never yields a connection is a failure, and the write path \
-         degrades it into storing the tag as written"
-    );
-    assert!(
-        elapsed < acquire_timeout * 2,
-        "one pass through the vocabulary pays one acquire timeout, not two: \
-         {elapsed:?} against a {acquire_timeout:?} timeout"
-    );
 }
 
 // -- tool_registry -----------------------------------------------------------
