@@ -238,10 +238,19 @@ configured width is a safety cap on the worst case rather than the mechanism.
 the nearest rows, so their spread is the near tail's and not the store's, and
 normalizing inside a truncated set inflates every score.
 `PgKnowledgeBaseStore::embedding_distance_dispersion` measures the median and the
-median absolute deviation over every row the search could reach. Both are
-properties of the store's geometry rather than of one query and barely move
-between turns, so the adapter holds one estimate per user and embedding model and
-measures again a quarter of an hour later.
+median absolute deviation over every row the search could reach.
+
+**Measured against this turn's own prompt, every turn.** Both statistics are
+distances *from one query* to every row, so a held pair would grade this prompt's
+candidates by the geometry the last prompt saw. The margin between a prompt with
+a cue and one without is about 0.4 deviations, a few hundredths of cosine
+distance, and a prompt unlike the store - a pasted document against a store of
+short facts - moves the median further than that; a held estimate would then
+admit an acknowledgement for as long as it stood. The measurement is one narrow
+pass over the rows the arm is already scanning and it runs beside that arm, so
+exactness costs a concurrent read rather than a turn. It carries its own
+four-second ceiling, well inside the whole lookup's ten, because the block does
+not need it.
 
 Before a source can measure its own, the block reads it by a stated estimate,
 which is deliberately narrow. A measurement is refused, and the estimate stands,
@@ -413,11 +422,24 @@ comparable rows has no measurable geometry, so the block reads it by a fixed
 median and spread until it has one. Those two numbers are the one place a
 distance is still stated by hand.
 
-**The pad is read by the stated estimate too.** One conversation's scratchpad
-rarely holds enough rows for a median absolute deviation over it to be a
-measurement rather than noise, and the pad read is already the block's most
-expensive query, so no second pass measures it. #1146 covers measuring it where
-a pad is large enough to state its own.
+**The pad is read by the stated estimate too, and its admission tightened.** One
+conversation's scratchpad rarely holds enough rows for a median absolute
+deviation over it to be a measurement rather than noise, and the pad read is
+already the block's most expensive query, so no second pass measures it. The
+estimate is the knowledge store's, and a note embeds `"<key> <content>"`, which
+is terser than an entry's body - so the two are not the same distribution. In
+cosine terms the pad now admits a note about a third nearer than it did. The
+direction is quiet rather than loud, which is the safe one, but it is a change
+and not a measurement. #1146 covers measuring the pad where it is large enough
+to state its own.
+
+**The dispersion pass is a second scan of the same rows.** It is narrow - one
+distance per row and no content - and it runs beside the arm rather than before
+it, so it costs a concurrent read rather than turn latency. It is still a second
+sequential scan per turn, and #859 is what makes the first one structural past
+roughly ten thousand entries. Holding the measurement between turns is the
+obvious saving and it is deliberately not taken: the statistic is a function of
+the prompt, so a held one grades the wrong geometry.
 
 **The scan reads whole rows.** Fifty entries are read to render a handful of
 lines, because the count of what did not fit has to be a count. The row count is

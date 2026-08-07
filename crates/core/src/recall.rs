@@ -625,23 +625,27 @@ fn render_recall_with_width(
 /// front of the model, so its tags did not light up.
 ///
 /// Ranked by how many of those entries carry each name, and names of equal
-/// weight keep the order the entries arrived in - which is nearest first. A
-/// linear scan rather than a map: at most [`BUDGETED_MAX_RECALL_ENTRIES`]
-/// entries take part, each with a few tags, and a scan of that keeps the order
-/// deterministic without sorting on a hash.
+/// weight keep the order the entries arrived in - which is nearest first.
+///
+/// An ordered map rather than a hash one, and the tie broken on where a name
+/// was first seen, so the line is the same line every time. Nothing bounds how
+/// many tags an entry holds, so the count of names is the count of tags on the
+/// entries shown: a map keeps that linear in the names rather than quadratic.
 fn carried_tags<'a>(shown: &[&(&'a RecallEntry, String)]) -> Vec<&'a str> {
-    let mut counted: Vec<(&str, usize)> = Vec::new();
-    for (hit, _) in shown {
-        for name in &hit.entry.tags {
-            match counted.iter_mut().find(|(seen, _)| *seen == name.as_str()) {
-                Some((_, carried)) => *carried += 1,
-                None => counted.push((name.as_str(), 1)),
-            }
-        }
+    // name -> (how many entries carry it, where it was first seen).
+    let mut counted: std::collections::BTreeMap<&str, (usize, usize)> =
+        std::collections::BTreeMap::new();
+    for (seen, name) in shown
+        .iter()
+        .flat_map(|(hit, _)| hit.entry.tags.iter())
+        .enumerate()
+    {
+        let carried = counted.entry(name.as_str()).or_insert((0, seen));
+        carried.0 += 1;
     }
-    // A stable sort, so equal counts keep their first-seen order.
-    counted.sort_by_key(|(_, carried)| std::cmp::Reverse(*carried));
-    counted
+    let mut ranked: Vec<(&str, (usize, usize))> = counted.into_iter().collect();
+    ranked.sort_by_key(|(_, (carried, first_seen))| (std::cmp::Reverse(*carried), *first_seen));
+    ranked
         .into_iter()
         .take(MAX_RECALL_TAGS)
         .map(|(name, _)| name)
@@ -663,8 +667,8 @@ fn contains(values: &[String], wanted: &str) -> bool {
 ///
 /// A name is never cut. Half a tag name is a tag no row carries, and the model
 /// is being handed this list precisely so it can search on one - so a name that
-/// does not fit is left out instead. Empty when the first name alone is too
-/// long, which is the honest answer for a vocabulary this block cannot show.
+/// does not fit is left out and the next one is tried. Empty when no name fits
+/// at all, which is the honest answer for a vocabulary this block cannot show.
 ///
 /// Bytes rather than characters, because a name may be in any script and the
 /// block's budget is stated in bytes. This is the one part of a line that
@@ -688,7 +692,7 @@ fn tag_list(names: &[&str], max_bytes: usize) -> String {
         }
         let separator = if out.is_empty() { 0 } else { 2 };
         if out.len() + separator + name.len() > max_bytes {
-            break;
+            continue;
         }
         if !out.is_empty() {
             out.push_str(", ");
@@ -966,6 +970,10 @@ mod tests {
     /// What a prompt of no content reached: an acknowledgement, a "thanks", a
     /// "continue". Its nearest candidate is the strongest such a prompt
     /// produced.
+    ///
+    /// These scores are the measurement, taken as the corpus's input. What the
+    /// tests below establish is what the bar does with them, not that an
+    /// acknowledgement scores this on any particular store.
     const NO_CUE: &[f64] = &[6.4, 6.1, 5.7, 5.2, 4.9];
 
     /// A prompt that brushes what the store holds without naming it.
@@ -1558,11 +1566,15 @@ mod tests {
     /// unstated policy about width.
     #[test]
     fn the_safety_cap_equals_the_width_the_token_budget_pays_for() {
+        // The floor is the width the block's documentation states. The
+        // arithmetic runs on the length of the block's own fixed text, so a
+        // longer header or label narrows the index by a whole line, and that
+        // fails here rather than in a deployment.
         let budgeted = BUDGETED_MAX_RECALL_ENTRIES;
         assert!(
-            budgeted >= 16,
+            budgeted >= 20,
             "an index of one-line summaries exists for breadth; the budget pays for {budgeted} \
-             lines, which is not materially wider than the eight a block of extracts could afford"
+             lines, and the fixed part of the block is what took the rest"
         );
 
         assert_eq!(
@@ -2422,6 +2434,26 @@ mod tests {
             "a cut tag name would end in a marker: {block}"
         );
         assert!(!block.contains("zzz"), "{block}");
+    }
+
+    #[test]
+    fn a_tag_name_that_does_not_fit_does_not_suppress_the_ones_after_it() {
+        // The list is ranked, so the name that does not fit can be the first
+        // one. Stopping there would cost the model the whole vocabulary over
+        // one oversized name.
+        let candidates = RecallCandidates {
+            entries: vec![hit(
+                "kb-1",
+                "a fact",
+                &[&"z".repeat(1_000), "topic:fits"],
+                0.10,
+            )],
+            ..RecallCandidates::default()
+        };
+
+        let block = render(&candidates).expect("a block");
+
+        assert_eq!(tag_names(&block), vec!["topic:fits"], "{block}");
     }
 
     #[test]

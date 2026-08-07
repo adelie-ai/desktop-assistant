@@ -9,8 +9,9 @@
 //!
 //! A cosine distance means nothing on its own, so the core reads each candidate
 //! against the spread of the source it came from. This adapter measures that
-//! spread - see [`DispersionCache`] - because only the store can say what its
-//! own geometry is.
+//! spread - see [`entry_dispersion`] - because only the store can say what its
+//! own geometry is, and it measures it against the same prompt the candidates
+//! were ranked by.
 //!
 //! ## Recall never fails a turn
 //!
@@ -21,10 +22,11 @@
 //! against one. A degradation is logged once, here, rather than once per arm.
 //!
 //! An arm that fails outright is a narrower loss than a lookup that fails. The
-//! scratchpad arm reads a different table from the other two, so it can fail on
-//! its own, and when it does it costs its own lines and nothing else - see
-//! [`notes_or_none`]. If a degraded read fails as well, the error travels to the
-//! caller, which drops the block and runs the turn.
+//! scratchpad arm reads a different table from the knowledge arm, so it can fail
+//! on its own, and when it does it costs its own lines and nothing else - see
+//! [`notes_or_none`]. The measurement carries its own ceiling for the same
+//! reason. If a degraded read fails as well, the error travels to the caller,
+//! which drops the block and runs the turn.
 //!
 //! The whole lookup carries a second ceiling, [`RECALL_CALL_CEILING`], because
 //! the embedding timeout bounds only the embedding: the database round trips
@@ -33,10 +35,9 @@
 //! a saturated pool would otherwise hold each turn far longer than the embedding
 //! timeout suggests.
 
-use std::collections::HashMap;
 use std::future::Future;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::ScratchpadNote;
@@ -45,7 +46,7 @@ use desktop_assistant_core::ports::recall::{
     RecallCandidates, RecallDispersion, RecallEntry, RecallNote, RecallRelevance, RecallRequest,
     RecallSearchFn,
 };
-use desktop_assistant_storage::{PgKnowledgeBaseStore, PgPool, PgScratchpadStore, current_user_id};
+use desktop_assistant_storage::{PgKnowledgeBaseStore, PgPool, PgScratchpadStore};
 
 /// How long one whole recall lookup may take before the turn gives up on it.
 ///
@@ -74,120 +75,86 @@ pub fn build_recall_search(
     // threaded in: nothing else in the daemon holds one, and the two reads
     // behind the scratchpad arm are inherent to it.
     let pad = Arc::new(PgScratchpadStore::new(pool.clone()));
-    let dispersion = Arc::new(DispersionCache::new(DISPERSION_REFRESH));
     Arc::new(move |request: RecallRequest| {
         let kb_store = Arc::clone(&kb_store);
         let pad = Arc::clone(&pad);
         let embed = Arc::clone(&embed);
-        let dispersion = Arc::clone(&dispersion);
         let embedding_model = embedding_model.clone();
         Box::pin(async move {
-            within_ceiling(lookup(
-                &kb_store,
-                &pad,
-                &embed,
-                &dispersion,
-                &embedding_model,
-                request,
-            ))
-            .await
+            within_ceiling(lookup(&kb_store, &pad, &embed, &embedding_model, request)).await
         })
     })
 }
 
-/// How long one source's measured dispersion stands before it is measured
-/// again.
+/// How long the dispersion measurement may take before the block gives up on
+/// it.
 ///
-/// The median and the median absolute deviation of a store's distances are
-/// properties of its geometry rather than of one query, and a store gains
-/// entries slowly, so they barely move between turns. Measuring them once a
-/// quarter of an hour keeps the estimate current and keeps the extra pass off
-/// the turn that follows it.
-const DISPERSION_REFRESH: Duration = Duration::from_secs(15 * 60);
+/// Its own ceiling, well inside [`RECALL_CALL_CEILING`], because this read is
+/// the least important of the three: without it the block reads the source by a
+/// stated estimate, and with it late the whole lookup would exceed the ceiling
+/// and the caller would drop the block. The unit is worth losing; the block is
+/// not.
+const DISPERSION_CALL_CEILING: Duration = Duration::from_secs(4);
 
-/// What one source's distances look like, per user and embedding model, held so
-/// the measurement runs now and then rather than every turn.
+/// The knowledge source's dispersion, measured against this turn's own prompt
+/// vector.
 ///
-/// Keyed by both, because both change the distribution: one user's rows are the
-/// only rows their queries reach, and a vector from another model is not
-/// comparable at all. The key space is therefore users times models, which is
-/// small and bounded by the deployment.
+/// **Measured every lookup, and not held between them.** The median and the
+/// median absolute deviation are statistics of the distances *from one query* to
+/// every row, so a held pair grades this prompt's candidates by the geometry the
+/// last prompt saw. The margin the bar rests on is about 0.4 deviations, which
+/// is a few hundredths of cosine distance, and a prompt unlike the store - a
+/// pasted document against a store of short facts - moves the median further
+/// than that. A held estimate would then admit an acknowledgement for as long as
+/// it stood, which is the failure the bar exists to remove.
 ///
-/// An absent measurement is cached as well as a present one. A store too small
-/// to measure would otherwise pay for the pass on every turn and answer `None`
-/// each time.
-struct DispersionCache {
-    stands_for: Duration,
-    measured: Mutex<HashMap<(String, String), Measured>>,
-}
-
-/// One held measurement, and when it was taken.
-struct Measured {
-    at: Instant,
-    value: Option<RecallDispersion>,
-}
-
-impl DispersionCache {
-    fn new(stands_for: Duration) -> Self {
-        Self {
-            stands_for,
-            measured: Mutex::new(HashMap::new()),
-        }
-    }
-
-    /// What is held for this key, or `None` where nothing is held or what is
-    /// held is older than [`Self::stands_for`].
-    fn fresh(&self, key: &(String, String)) -> Option<Option<RecallDispersion>> {
-        let held = self.measured.lock().ok()?;
-        let entry = held.get(key)?;
-        (entry.at.elapsed() < self.stands_for).then_some(entry.value)
-    }
-
-    /// Hold what was just measured.
-    fn hold(&self, key: (String, String), value: Option<RecallDispersion>) {
-        if let Ok(mut held) = self.measured.lock() {
-            held.insert(
-                key,
-                Measured {
-                    at: Instant::now(),
-                    value,
-                },
-            );
-        }
-    }
-}
-
-/// The knowledge source's dispersion: what is held, or a fresh measurement.
+/// The measurement costs one narrow pass over the rows the arm is already
+/// scanning, and it runs beside that arm rather than before it, so exactness
+/// costs a concurrent read rather than a turn.
 ///
-/// A measurement that fails costs the block its unit and nothing else - the core
-/// falls back to a stated estimate - so the error is logged and absorbed rather
-/// than ending the lookup. It is not held either, so the next turn tries again.
+/// **A measurement that fails, or that runs long, costs the block its unit and
+/// nothing else.** The core then reads the source by a stated estimate. That is
+/// what [`DISPERSION_CALL_CEILING`] is for: this read runs beside the two the
+/// block cannot do without, and a slow one must not spend the whole-lookup
+/// ceiling those two are waiting on.
 async fn entry_dispersion(
     kb_store: &PgKnowledgeBaseStore,
-    cache: &DispersionCache,
     vector: Vec<f32>,
     embedding_model: &str,
 ) -> Option<RecallDispersion> {
-    let key = (
-        current_user_id().as_str().to_string(),
-        embedding_model.to_string(),
-    );
-    if let Some(held) = cache.fresh(&key) {
-        return held;
-    }
-    match kb_store
-        .embedding_distance_dispersion(vector, embedding_model)
-        .await
-    {
-        Ok(measured) => {
-            cache.hold(key, measured);
-            measured
+    let measured = tokio::time::timeout(
+        DISPERSION_CALL_CEILING,
+        kb_store.embedding_distance_dispersion(vector, embedding_model),
+    )
+    .await;
+    match measured {
+        Ok(Ok(Some(dispersion))) => {
+            tracing::debug!(
+                ?dispersion,
+                "recall: the knowledge store stated its own dispersion"
+            );
+            Some(dispersion)
         }
-        Err(e) => {
+        Ok(Ok(None)) => {
+            tracing::debug!(
+                "recall: the knowledge store states no dispersion yet; the block reads it by \
+                 its stated estimate"
+            );
+            None
+        }
+        Ok(Err(e)) => {
             tracing::warn!(
                 error = %e,
                 "recall: the knowledge store's dispersion could not be measured; the block \
-                 falls back to its stated estimate"
+                 reads it by its stated estimate"
+            );
+            None
+        }
+        Err(_) => {
+            tracing::warn!(
+                ceiling = ?DISPERSION_CALL_CEILING,
+                "recall: measuring the knowledge store's dispersion exceeded its ceiling; the \
+                 block reads it by its stated estimate"
             );
             None
         }
@@ -215,7 +182,6 @@ async fn lookup(
     kb_store: &PgKnowledgeBaseStore,
     pad: &PgScratchpadStore,
     embed: &EmbedFn,
-    dispersion: &DispersionCache,
     embedding_model: &str,
     request: RecallRequest,
 ) -> Result<RecallCandidates, CoreError> {
@@ -283,7 +249,7 @@ async fn lookup(
                 .map(|(note, distance)| to_recall_note(note, RecallRelevance::Distance(distance)))
                 .collect())
         },
-        entry_dispersion(kb_store, dispersion, vector_for_dispersion, embedding_model),
+        entry_dispersion(kb_store, vector_for_dispersion, embedding_model),
     )
     .await
 }
@@ -609,59 +575,18 @@ mod tests {
         );
     }
 
-    // --- The dispersion cache (#1121) ---------------------------------------
+    // --- The dispersion measurement (#1121) ---------------------------------
 
-    fn a_key() -> (String, String) {
-        ("a-user".to_string(), "a-model".to_string())
-    }
-
+    /// The measurement's own ceiling must sit well inside the whole lookup's,
+    /// or a slow measurement takes the block down with it - and the block does
+    /// not need it, because a source that states no dispersion is read by a
+    /// stated estimate.
     #[test]
-    fn a_held_measurement_stands_until_it_is_stale() {
-        let cache = DispersionCache::new(Duration::from_secs(600));
-
-        assert_eq!(cache.fresh(&a_key()), None, "nothing is held yet");
-
-        cache.hold(a_key(), Some(a_dispersion()));
-        assert_eq!(cache.fresh(&a_key()), Some(Some(a_dispersion())));
-    }
-
-    #[test]
-    fn a_measurement_older_than_its_life_is_measured_again() {
-        let cache = DispersionCache::new(Duration::ZERO);
-        cache.hold(a_key(), Some(a_dispersion()));
-
-        assert_eq!(
-            cache.fresh(&a_key()),
-            None,
-            "a stale estimate must not stand in for a fresh measurement"
-        );
-    }
-
-    #[test]
-    fn a_store_too_small_to_measure_is_held_as_such() {
-        // Otherwise a small store pays for the pass on every turn and answers
-        // the same "cannot measure" each time.
-        let cache = DispersionCache::new(Duration::from_secs(600));
-        cache.hold(a_key(), None);
-
-        assert_eq!(cache.fresh(&a_key()), Some(None));
-    }
-
-    #[test]
-    fn one_users_measurement_is_never_read_for_another() {
-        // The rows a query reaches are one user's, so the distribution is too.
-        // The embedding model is in the key for a harder reason still: a vector
-        // from another model is not comparable at all.
-        let cache = DispersionCache::new(Duration::from_secs(600));
-        cache.hold(a_key(), Some(a_dispersion()));
-
-        assert_eq!(
-            cache.fresh(&("another-user".to_string(), "a-model".to_string())),
-            None
-        );
-        assert_eq!(
-            cache.fresh(&("a-user".to_string(), "another-model".to_string())),
-            None
+    fn the_measurement_cannot_be_what_spends_the_whole_lookups_ceiling() {
+        assert!(
+            DISPERSION_CALL_CEILING * 2 < RECALL_CALL_CEILING,
+            "the dispersion pass may take {DISPERSION_CALL_CEILING:?} of the \
+             {RECALL_CALL_CEILING:?} the whole lookup has"
         );
     }
 
