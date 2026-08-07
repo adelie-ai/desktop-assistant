@@ -244,17 +244,43 @@ A_i = semantic + reinforcement
 
 `semantic` is the same dimensionless deviation count the bar reads - never a raw
 distance, so a source added later joins on the same scale without refitting
-anything. `reinforcement` is what the use log knows (`docs/features/knowledge-use-log.md`),
-read as `use_lift * ln(1 + S)` and carrying `S`'s sign, where `S` is the ACT-R
-base-level sum over the entry's opens and marks. Three consequences:
+anything. `reinforcement` is what the use log knows
+(`docs/features/knowledge-use-log.md`), read as
+`use_lift * ln(1 + S / S_ref)` and carrying `S`'s sign, where `S` is the ACT-R
+base-level sum over the entry's opens and marks and `S_ref` is the sum one use a
+day old produces.
+
+**Dividing by a reference use is what makes the term dimensionless**, and it is
+the same property the semantic half gets from reading a distance against its
+source's own spread. Every term of a base-level sum is an age raised to a
+negative power, so the whole sum scales with whatever unit the ages are counted
+in - the same history is about three hundred times larger stated in days than in
+seconds. Adding one straight to a deviation count would let that choice decide
+how much the use log is worth. The ratio cancels it, and leaves one number to
+argue about: `use_lift`.
+
+Four consequences:
 
 - **An entry nothing has used contributes nothing**, so a store with no history
   renders exactly the block it rendered before this existed. The sort is stable,
   so distance breaks every tie.
-- **Doubling the accumulated use buys at most `use_lift * ln 2`**, however large
-  the count already is. That is the cap the use log asks for, as a property of
-  the function rather than a clamp, and it is why a heavily marked entry cannot
-  outrank a strong semantic match.
+- **One use a day old is worth `use_lift * ln 2`**, which at the shipped
+  `use_lift` of 0.5 is about a third of a deviation - enough to settle a
+  near-tie, since adjacent rows of a real store sit a few tenths apart.
+- **Doubling the accumulated sum buys at most `use_lift * ln 2`**, however large
+  that sum already is. That is the cap the use log asks for, as a property of
+  the function rather than a clamp: it is what stops the retrieve-mark-retrieve
+  loop compounding. It is a statement about the sum and not about the number of
+  uses - one more use raises the sum by over a factor of two when it is far more
+  recent than everything before it, and that is recency, which this score is
+  meant to carry.
+- **The whole term stays under about three deviations** over any history a store
+  produces, because it is a logarithm. On the measured corpus the weakest
+  candidate the bar admits sits about 4.6 deviations below the strongest, so use
+  cannot take the top line from the best semantic match - which is the caution
+  the use log raised. It can and does carry an entry a long way up the block:
+  ten opens inside the last half hour are worth about two and a half deviations.
+  That is the design working, not a leak in it.
 - **A standing negative mark subtracts**, so an entry that was opened and found
   wrong ends below one nobody has ever opened.
 
@@ -272,7 +298,12 @@ gave it, and one lookup uses one mode, so the two kinds are never in one list.
 scan has answered, so it is one batched read after it, bounded at half a second.
 A read that fails or overruns leaves every candidate on its semantic signal
 alone - which is how they all ranked before the log existed - and says so once in
-the journal.
+the journal. It states the same half second to the database as its own
+`statement_timeout`, for the reason the recall scan does: giving up here has to
+stop the backend working, or a slow database accumulates abandoned reads at the
+rate turns arrive. One debug line per lookup also states how many of the candidates the
+log had anything to say about, so an operator can tell whether reinforcement is
+deciding anything at all.
 
 **Measured over the source, never over the candidates.** The lookup shows only
 the nearest rows, so their spread is the near tail's and not the store's, and
@@ -522,7 +553,20 @@ arm drops the attachments the turn *resolved*, which is a superset of what
 that pins did not fit, so the model is not left believing the fact is absent.
 
 **Cancellation waits on the lookup.** A turn cancelled while the lookup is in
-flight still waits for it, bounded by the ten-second whole-lookup ceiling.
+flight still waits for it, bounded by the ten-second whole-lookup ceiling. The
+use-log read added half a second to what that ceiling has to cover, so the slack
+it keeps for what nothing bounds - pool acquisition above all - is now half a
+second rather than one.
+
+**The use log is read on every turn, including the ones with no cue.** The bar is
+the core's decision and the read is the adapter's, so the adapter cannot know
+that nothing will clear. On a prompt that surfaces nothing, two primary-key
+lookups over at most fifty ids are made and every row is discarded.
+
+**No client can write a person's mark.** The use log has no wire surface, and the
+only mark any code path writes is the model's. So `person_mark`, the largest
+coefficient the score carries, is unreachable today, and a person has no way to
+say "this entry was useful" or to ask why a line is at the top.
 
 **The scratchpad arm scans the whole pad, every turn.** The vector query unnests
 each note's chunks and groups on the row, so no vector index applies and the

@@ -184,10 +184,12 @@ Three properties follow from that shape:
   old use and an old mark both fade.
 - **A negative mark lowers the score.** It subtracts rather than failing to add,
   so an entry that was opened and then found wrong ends below one never opened.
-- **No rich-get-richer.** The logarithm means doubling the uses adds a constant.
-  Marks raise ranking, ranking decides retrieval, and retrieval is a
+- **No rich-get-richer.** The logarithm means doubling the accumulated sum adds
+  a constant. Marks raise ranking, ranking decides retrieval, and retrieval is a
   precondition for being marked - so the growth has to be sub-linear or that
-  loop compounds.
+  loop compounds. The bound is on the sum, not on the count of events: one use
+  far more recent than everything before it more than doubles the sum, and the
+  score follows, which is recency rather than the loop.
 
 The coefficients live in `UseScoreWeights`, and their defaults are declared
 starting points rather than measured values. They are a struct rather than

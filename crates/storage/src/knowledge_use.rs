@@ -30,6 +30,18 @@ use desktop_assistant_core::ports::knowledge_use::{
 };
 use sqlx::PgPool;
 
+/// How long the two reads behind [`KnowledgeUseLog::records`] may run before the
+/// database stops them.
+///
+/// A ceiling the caller keeps is not a ceiling the database keeps. Both reads
+/// are primary-key lookups over at most one recall scan's worth of ids, so this
+/// is generous by orders of magnitude; what it buys is that a database slow
+/// enough for the caller to give up does not go on working on a read nobody is
+/// waiting for. The caller on the pre-prompt recall path abandons at half a
+/// second, and recall runs before every turn.
+pub const USE_LOG_READ_STATEMENT_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(500);
+
 /// The knowledge use log, backed by Postgres.
 pub struct PgKnowledgeUseLog {
     pool: PgPool,
@@ -334,6 +346,27 @@ impl KnowledgeUseLog for PgKnowledgeUseLog {
         }
         let user_id = current_user_id();
 
+        // Both reads in one transaction, for one reason: `SET LOCAL` is scoped
+        // to a transaction, and it is what makes the ceiling the caller keeps a
+        // ceiling the database keeps too. This read sits on the pre-prompt
+        // recall path, whose caller gives up after
+        // `USE_LOG_READ_CEILING` - and abandoning a future stops the daemon
+        // waiting while leaving the backend working. Recall runs before every
+        // turn, so a database slow enough to exceed the caller's ceiling would
+        // otherwise accumulate abandoned reads at the rate turns arrive. Same
+        // rule, and the same reason, as
+        // `PgKnowledgeBaseStore::nearest_by_embedding`.
+        let mut read = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
+        sqlx::query("SELECT set_config('statement_timeout', $1, true)")
+            .bind(USE_LOG_READ_STATEMENT_TIMEOUT.as_millis().to_string())
+            .execute(&mut *read)
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
+
         let stats: Vec<StatsRow> = sqlx::query_as(
             "SELECT entry_id, offered_count, opened_count, marked_count, first_seen_at, \
                     last_offered_at, recent_uses \
@@ -342,7 +375,7 @@ impl KnowledgeUseLog for PgKnowledgeUseLog {
         )
         .bind(user_id.as_str())
         .bind(&ids)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *read)
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;
 
@@ -353,9 +386,13 @@ impl KnowledgeUseLog for PgKnowledgeUseLog {
         )
         .bind(user_id.as_str())
         .bind(&ids)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *read)
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;
+
+        read.commit()
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
 
         Ok(stats
             .into_iter()

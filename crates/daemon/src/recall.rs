@@ -17,11 +17,12 @@
 //! ## What the use log adds, and what it costs
 //!
 //! A candidate the store measured also carries what the use log knows about it
-//! (#698), which is the reinforcement half of its activation score (#1123). The
-//! ids only exist once the scan has answered, so this is one batched read after
-//! it rather than a third arm beside it - see [`use_records`], which bounds it
-//! and degrades to nothing. A lexical candidate carries no record, because
-//! nothing ranks it by activation.
+//! (#698), which is the reinforcement half of its activation score (#1123). It
+//! is one batched read after the scan rather than a join inside it, so that a
+//! slow or broken log costs the order of the lines and not the lines - see
+//! [`use_records`], which bounds it and degrades to nothing, and the comment at
+//! the call site for what that placement costs. A lexical candidate carries no
+//! record, because nothing ranks it by activation.
 //!
 //! ## Recall never fails a turn
 //!
@@ -80,9 +81,20 @@ const RECALL_CALL_CEILING: std::time::Duration = std::time::Duration::from_secs(
 /// it and every candidate ranks on its semantic signal alone, which is how they
 /// ranked before the log existed - see [`use_records`].
 ///
+/// The read states the same figure to the database as its own
+/// `statement_timeout`
+/// ([`USE_LOG_READ_STATEMENT_TIMEOUT`](desktop_assistant_storage::USE_LOG_READ_STATEMENT_TIMEOUT)),
+/// so giving up here also stops the backend working;
+/// `the_use_log_read_gives_up_no_later_than_the_database_does` holds the two
+/// together.
+///
 /// It fits inside what [`RECALL_CALL_CEILING`] has left after the embedding and
 /// the scan, and `the_three_reads_together_stay_inside_the_lookups_ceiling`
-/// holds the four constants to that.
+/// holds the four constants to that. It halves the slack that ceiling keeps for
+/// what none of the three bounds - pool acquisition above all, which
+/// `RECALL_SCAN_STATEMENT_TIMEOUT` excludes because it is a server-side
+/// statement timeout. Half a second of slack is thin, and the lookup ceiling is
+/// what gives up first if it runs out, which costs the block and never the turn.
 const USE_LOG_READ_CEILING: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Build the recall lookup the conversation handler calls once per turn.
@@ -195,15 +207,37 @@ async fn lookup(
             let found = kb_store
                 .nearest_by_embedding(vector, embedding_model, request.entry_limit)
                 .await?;
-            // The use log is read after the scan rather than beside it: only
-            // the scan knows which ids to ask about. It is one batched read of
-            // at most one scan's worth of rows, by primary key.
+            // One batched read after the scan, of at most one scan's worth of
+            // ids, by primary key on both tables.
+            //
+            // The alternative was a join inside the scan's own statement, which
+            // the ids are reachable from and which would cost no extra round
+            // trip. This shape was chosen anyway, for two reasons. The log is a
+            // separate adapter behind a separate port, and folding its two
+            // tables into the recall scan would put a fourth job in a statement
+            // whose whole documented virtue is that it does three in one pass.
+            // And a joined read cannot degrade on its own: a slow or broken use
+            // log would cost the block, where this costs only the order - see
+            // `use_records`. The price is one round trip per turn, paid on every
+            // turn including the many where the bar admits nothing and every
+            // record read is discarded.
             let ids: Vec<String> = found.entries.iter().map(|(e, _)| e.id.clone()).collect();
             let mut records = if ids.is_empty() {
                 std::collections::HashMap::new()
             } else {
                 use_records(uses.records(ids)).await
             };
+            // How much of the block's order the use log actually decided. An
+            // operator meeting a block that looks different, or one that looks
+            // exactly as it always did, cannot otherwise tell whether
+            // reinforcement is in force - the same reason
+            // `how_the_distances_are_read` exists. Two counts, and nothing of
+            // what any entry holds: this runs on every turn.
+            tracing::debug!(
+                candidates = found.entries.len(),
+                with_use_record = records.len(),
+                "recall: how many candidates the use log had something to say about"
+            );
             Ok((
                 found
                     .entries
@@ -399,7 +433,9 @@ async fn embed_prompt(embed: &EmbedFn, prompt: &str) -> Option<Vec<f32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use desktop_assistant_storage::RECALL_SCAN_STATEMENT_TIMEOUT;
+    use desktop_assistant_storage::{
+        RECALL_SCAN_STATEMENT_TIMEOUT, USE_LOG_READ_STATEMENT_TIMEOUT,
+    };
 
     /// An embedding backend that answers with `answer`, after `delay`.
     fn backend(answer: Result<Vec<Vec<f32>>, CoreError>, delay: std::time::Duration) -> EmbedFn {
@@ -636,6 +672,18 @@ mod tests {
     /// their sum. Three constants in three crates, and nothing but this says
     /// they add up: raising either of the first two is what would break it, and
     /// neither sits beside this ceiling.
+    /// The caller must not give up before the database does, or the backend
+    /// goes on working on a read nobody is waiting for - the same rule the
+    /// recall scan follows, and recall runs before every turn.
+    #[test]
+    fn the_use_log_read_gives_up_no_later_than_the_database_does() {
+        assert!(
+            USE_LOG_READ_CEILING >= USE_LOG_READ_STATEMENT_TIMEOUT,
+            "the caller gives up at {USE_LOG_READ_CEILING:?} and the database only at \
+             {USE_LOG_READ_STATEMENT_TIMEOUT:?}, so an abandoned read keeps a backend busy"
+        );
+    }
+
     #[test]
     fn the_three_reads_together_stay_inside_the_lookups_ceiling() {
         let worst = EMBED_TIMEOUT + RECALL_SCAN_STATEMENT_TIMEOUT + USE_LOG_READ_CEILING;

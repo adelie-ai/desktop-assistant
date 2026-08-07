@@ -621,8 +621,8 @@ struct ScratchpadSurfaces {
 /// What this turn's one recall lookup produced, and how far it was asked to
 /// read (#1100, #1101).
 ///
-/// The ceilings travel with the answer because the block's "and N more ... did
-/// not fit" line is a lower bound exactly when a scan filled up. A count that
+/// The ceilings travel with the answer because the block's "and N more ... also
+/// matched" line is a lower bound exactly when a scan filled up. A count that
 /// reports itself as exact when the scan actually filled is the one dishonesty
 /// the block must not commit, so the request's limits and the render's are the
 /// same values rather than two constants that happen to agree.
@@ -630,10 +630,10 @@ struct RecallLookup {
     candidates: crate::ports::recall::RecallCandidates,
     entry_scan_limit: usize,
     note_scan_limit: usize,
-    /// When the lookup ran, and so the instant every use record it carries is a
-    /// statement about (#1123). Captured once here rather than read again at
-    /// render time, because the block renders on every round of the turn and a
-    /// candidate must not shift rank between two rounds that read one lookup.
+    /// When the lookup answered, and so the instant every use record it carries
+    /// is a statement about (#1123). Captured once here rather than read again
+    /// at render time, because the block renders on every round of the turn and
+    /// a candidate must not shift rank between two rounds that read one lookup.
     looked_up_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -1390,13 +1390,15 @@ impl<S, L, T> ConversationHandler<S, L, T> {
         };
         let entry_scan_limit = request.entry_limit;
         let note_scan_limit = request.note_limit;
-        let looked_up_at = chrono::Utc::now();
         match lookup(request).await {
+            // Read after the lookup, not before it: the lookup may spend its
+            // whole ceiling, and what the use records are a statement about is
+            // the moment they were read.
             Ok(candidates) => Some(RecallLookup {
                 candidates,
                 entry_scan_limit,
                 note_scan_limit,
-                looked_up_at,
+                looked_up_at: chrono::Utc::now(),
             }),
             Err(e) => {
                 tracing::warn!(error = %e, "pre-prompt recall lookup failed; continuing without it");

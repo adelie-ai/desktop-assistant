@@ -31,6 +31,11 @@
 //!   candidate under the bar is dropped rather than padded out to fill the
 //!   budget, so a prompt with no cue produces no block at all, and a prompt with
 //!   a strong cue produces an index.
+//! - **One activation score decides the order.** The bar says which candidates
+//!   are offered; [`crate::domain::activation`] says in what order, over the
+//!   semantic signal the bar already read and what the use log knows about each
+//!   entry. An entry nothing has used contributes nothing of its own, so a store
+//!   with no history renders the block its distances alone would have rendered.
 //! - **A line budget, derived from a token budget.**
 //!   [`RECALL_BLOCK_TOKEN_BUDGET`] pays for [`BUDGETED_MAX_RECALL_ENTRIES`]
 //!   entry lines, [`MAX_RECALL_NOTES`] note lines and [`MAX_RECALL_TAGS`] tag
@@ -123,10 +128,10 @@ const RECALL_NOTE_LINE_MAX_BYTES: usize = 2 + NOTE_KEY_MAX_CHARS + 2 + RECALL_NO
 ///
 /// The newline, `"...and "` (7), the digits of any `usize` (20), the hedge
 /// `" or more"` (8), a space, the longer of the two nouns - `"entries"` (7) -
-/// and `" were also relevant."` (20). Every part is ASCII, so the figure is
+/// and `" also matched."` (14). Every part is ASCII, so the figure is
 /// bytes as well as characters. `dropped_line` is held to it by
 /// `the_did_not_fit_line_stays_inside_the_bound_the_budget_assumes`.
-const RECALL_DROPPED_LINE_MAX_BYTES: usize = 1 + 7 + 20 + 8 + 1 + 7 + 20;
+const RECALL_DROPPED_LINE_MAX_BYTES: usize = 1 + 7 + 20 + 8 + 1 + 7 + 14;
 
 /// What the block costs before its first knowledge line, worst case: the
 /// prefix, the header and its entry hint, the entry arm's "did not fit" line,
@@ -253,7 +258,7 @@ pub const MAX_RECALL_TAGS: usize = 5;
 /// How many knowledge rows one lookup reads before it stops counting.
 ///
 /// The block shows [`max_recall_entries`]; it reads this far so that "and N
-/// more were also relevant" is a count rather than a guess. Bounding it costs
+/// more also matched" is a count rather than a guess. Bounding it costs
 /// one `LIMIT` rather than a second query, and a scan that fills up makes the
 /// count report itself as a lower bound.
 pub const RECALL_ENTRY_SCAN_LIMIT: usize = 50;
@@ -441,10 +446,14 @@ impl<'a> RecallSurface<'a> {
 ///
 /// The arms render in order of how far the material is from the turn: the
 /// durable knowledge base, then this conversation's own pad, then the
-/// vocabulary those entries carry. Every candidate list is taken in the order it
-/// arrives - nearest first - and is never reordered: a cosine distance and a
-/// lexical match are not comparable, and one lookup only ever produces one of
-/// the two.
+/// vocabulary those entries carry.
+///
+/// Every candidate list arrives nearest-first, and the bar reads it in that
+/// order. The knowledge arm is then reordered by activation, over the
+/// candidates the bar admitted and never over the two kinds together - a cosine
+/// distance and a lexical match are not comparable, and one lookup only ever
+/// produces one of them. See [`rank_by_activation`]. The pad arm is not
+/// reordered: no use log records a note.
 pub(crate) fn render_recall(surface: &RecallSurface<'_>) -> Option<RenderedRecall> {
     render_recall_with_width(surface, max_recall_entries())
 }
@@ -504,7 +513,7 @@ fn render_recall_with_width(
     // read might have activated above one that renders, so on a capped scan the
     // lines are the best of what was read rather than the best that exists -
     // which is what the hedge already says, and why the line below no longer
-    // claims the remainder "matched less closely".
+    // says the remainder "matched less closely".
     let capped = candidates.entries.len() >= surface.entry_scan_limit
         && above_bar.len() == candidates.entries.len();
 
@@ -529,7 +538,7 @@ fn render_recall_with_width(
     //   and the id is the caller's, so the entry is dropped rather than the
     //   bound relaxed - see #1136 for bounding the id where it is written.
     //
-    // All three drop rather than count, because "were also relevant" promises
+    // All three drop rather than count, because "also matched" promises
     // the reader something it has not already been given.
     let showable: Vec<(&RecallEntry, String)> = above_bar
         .iter()
@@ -662,17 +671,31 @@ fn rank_by_activation(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Vec<(&RecallEntry, String)> {
     let weights = ActivationWeights::default();
-    let Some(scores) = showable
+    let scored: Vec<Option<f64>> = showable
         .iter()
         .map(|(hit, _)| {
             hit.relevance
                 .semantic_signal(dispersion)
                 .map(|semantic| activation(semantic, hit.use_record.as_ref(), now, &weights))
         })
-        .collect::<Option<Vec<f64>>>()
-    else {
+        .collect();
+    let with_signal = scored.iter().filter(|score| score.is_some()).count();
+    if with_signal < scored.len() {
+        // A set of all lexical candidates is the ordinary degraded lookup and
+        // says nothing new. A *mixed* set means an adapter fused two modes into
+        // one list, which no adapter does today and which silently turns this
+        // ranking off - so it is worth a line rather than a shrug.
+        if with_signal > 0 {
+            tracing::debug!(
+                candidates = scored.len(),
+                with_semantic_signal = with_signal,
+                "recall: a mixed candidate set carries no one order, so activation ranking is \
+                 off for this block"
+            );
+        }
         return showable;
-    };
+    }
+    let scores: Vec<f64> = scored.into_iter().flatten().collect();
 
     let mut ranked: Vec<(f64, (&RecallEntry, String))> = scores.into_iter().zip(showable).collect();
     // `total_cmp` rather than `partial_cmp`, so the comparator is a total order
@@ -700,7 +723,8 @@ fn rank_by_activation(
 /// front of the model, so its tags did not light up.
 ///
 /// Ranked by how many of those entries carry each name, and names of equal
-/// weight keep the order the entries arrived in - which is nearest first.
+/// weight keep the order the entries rendered in - which is the block's own
+/// ranking, best first.
 ///
 /// **Entries, not occurrences.** A name an entry happens to list twice describes
 /// one entry, and counting it twice would rank it above a name two entries
@@ -914,13 +938,22 @@ fn note_line(note: &RecallNote) -> Option<String> {
 /// `noun` names what was dropped, because each arm counts its own and a block
 /// that said "entries" under the pad lines would misreport where the rest is.
 ///
-/// **"Also relevant", not "matched less closely" (#1123).** The count has always
-/// been the number that cleared the bar and did not fit, and "relevant" is what
-/// the bar names. Distance decided the order as well, until activation began
-/// ranking the entry arm - so now an entry that did not fit may have matched
-/// more closely than one that did, and the pad arm, which activation does not
-/// rank, would be described one way and the entry arm another. One wording that
-/// is true of both, and of a capped scan, is the honest answer.
+/// **"Also matched", not "matched less closely" (#1123).** Two things the line
+/// must not say, and one it must.
+///
+/// It must not rank. Distance decided the order until activation began ranking
+/// the entry arm, so an entry that did not fit may now have matched more closely
+/// than one that did - and the pad arm, which activation does not rank, would
+/// then be described one way and the entry arm another.
+///
+/// It must not assert. The standing guidance beside this block tells the model
+/// that nothing in it is asserted to be true, current, or relevant, so a line
+/// calling the remainder relevant would contradict the block it closes.
+///
+/// What is left is the fact the count is made of: these rows matched the prompt
+/// closely enough to clear the bar, and there was no room for them. That is true
+/// of both arms, and of a capped scan, where the count is a lower bound over the
+/// rows the scan did read.
 fn dropped_line(dropped: usize, capped: bool, noun: &str) -> Option<String> {
     if dropped == 0 {
         return None;
@@ -930,7 +963,7 @@ fn dropped_line(dropped: usize, capped: bool, noun: &str) -> Option<String> {
     } else {
         format!("{dropped} more")
     };
-    Some(format!("...and {quantity} {noun} were also relevant."))
+    Some(format!("...and {quantity} {noun} also matched."))
 }
 
 #[cfg(test)]
@@ -2247,7 +2280,7 @@ mod tests {
         let block = render(&candidates).expect("a block");
 
         assert!(
-            block.contains("...and 4 more entries were also relevant."),
+            block.contains("...and 4 more entries also matched."),
             "{block}"
         );
     }
@@ -2265,9 +2298,7 @@ mod tests {
 
         let dropped = RECALL_ENTRY_SCAN_LIMIT - DEFAULT_MAX_RECALL_ENTRIES;
         assert!(
-            block.contains(&format!(
-                "...and {dropped} or more entries were also relevant."
-            )),
+            block.contains(&format!("...and {dropped} or more entries also matched.")),
             "a capped count must read as a lower bound: {block}"
         );
     }
@@ -2291,7 +2322,7 @@ mod tests {
         let block = render(&candidates).expect("a block");
 
         assert!(
-            block.contains("...and 3 more entries were also relevant."),
+            block.contains("...and 3 more entries also matched."),
             "{block}"
         );
         assert!(
@@ -2331,7 +2362,7 @@ mod tests {
         let block = render(&candidates).expect("a block");
 
         assert!(
-            block.contains("...and 4 more entries were also relevant."),
+            block.contains("...and 4 more entries also matched."),
             "{block}"
         );
     }
@@ -2476,7 +2507,7 @@ mod tests {
             "the bar admits on distance; activation only orders what it admitted: {block}"
         );
         assert!(
-            block.contains("...and 4 more entries were also relevant."),
+            block.contains("...and 4 more entries also matched."),
             "{block}"
         );
     }
@@ -2513,9 +2544,7 @@ mod tests {
         let dropped = RECALL_ENTRY_SCAN_LIMIT - DEFAULT_MAX_RECALL_ENTRIES;
         let block = render(&filled).expect("a block");
         assert!(
-            block.contains(&format!(
-                "...and {dropped} or more entries were also relevant."
-            )),
+            block.contains(&format!("...and {dropped} or more entries also matched.")),
             "a filled scan is a lower bound however the lines are ordered: {block}"
         );
 
@@ -2533,7 +2562,7 @@ mod tests {
         };
         let block = render(&read_past_the_bar).expect("a block");
         assert!(
-            block.contains("...and 3 more entries were also relevant."),
+            block.contains("...and 3 more entries also matched."),
             "{block}"
         );
         assert!(
@@ -2967,9 +2996,7 @@ mod tests {
 
         let dropped = RECALL_ENTRY_SCAN_LIMIT - 1 - DEFAULT_MAX_RECALL_ENTRIES;
         assert!(
-            block.contains(&format!(
-                "...and {dropped} more entries were also relevant."
-            )),
+            block.contains(&format!("...and {dropped} more entries also matched.")),
             "{block}"
         );
         assert!(!block.contains("or more"), "{block}");
@@ -3282,7 +3309,7 @@ mod tests {
         let block = render(&candidates).expect("a block");
 
         assert!(
-            block.contains("...and 3 more notes were also relevant."),
+            block.contains("...and 3 more notes also matched."),
             "{block}"
         );
     }
@@ -3298,9 +3325,7 @@ mod tests {
 
         let dropped = RECALL_NOTE_SCAN_LIMIT - MAX_RECALL_NOTES;
         assert!(
-            block.contains(&format!(
-                "...and {dropped} or more notes were also relevant."
-            )),
+            block.contains(&format!("...and {dropped} or more notes also matched.")),
             "a capped count must read as a lower bound: {block}"
         );
     }
@@ -3336,7 +3361,7 @@ mod tests {
         let block = render(&candidates).expect("a block");
 
         assert!(
-            block.contains("...and 2 more notes were also relevant."),
+            block.contains("...and 2 more notes also matched."),
             "{block}"
         );
     }
@@ -3356,7 +3381,7 @@ mod tests {
         let block = render(&candidates).expect("a block");
 
         assert!(
-            block.contains("or more notes were also relevant"),
+            block.contains("or more notes also matched"),
             "a filled scan reports a lower bound whatever else dropped a row: {block}"
         );
     }

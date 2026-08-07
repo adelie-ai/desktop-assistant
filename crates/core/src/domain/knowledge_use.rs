@@ -243,7 +243,12 @@ impl Default for UseScoreWeights {
 
 impl UseScoreWeights {
     /// The decay exponent, held inside the range the formula is defined over.
-    fn safe_decay(&self) -> f64 {
+    ///
+    /// Public because anything reading [`KnowledgeUseRecord::use_sum`] has to
+    /// use the same exponent the sum was computed with - see
+    /// [`crate::domain::activation::ActivationWeights::reference_sum`], which
+    /// states a reference sum at this exponent.
+    pub fn safe_decay(&self) -> f64 {
         self.decay.clamp(0.01, 0.99)
     }
 
@@ -352,10 +357,11 @@ impl KnowledgeUseRecord {
     ///
     /// The sum rather than its logarithm, because the retrieval score composes
     /// it with a term of its own and the two have to be joined before either is
-    /// compressed - see [`crate::domain::activation::reinforcement`]. It is zero
-    /// for an entry nothing has used and negative for one whose only record is a
-    /// standing negative mark; both are real states and neither is floored here,
-    /// so a caller can tell them apart.
+    /// compressed - see [`crate::domain::activation`].
+    ///
+    /// It is zero for an entry nothing has used and negative for one whose only
+    /// record is a standing negative mark; both are real states and neither is
+    /// floored here, so a caller can tell them apart.
     pub fn use_sum(&self, now: DateTime<Utc>, weights: &UseScoreWeights) -> f64 {
         let d = weights.safe_decay();
 

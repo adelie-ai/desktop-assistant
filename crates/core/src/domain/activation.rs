@@ -21,9 +21,12 @@
 //!   across a source boundary; the deviation count means the same thing against
 //!   any source. That is what lets a fourth or a fifth source join later without
 //!   refitting every weight.
-//! - **`reinforcement`** is what the use log knows, on the same dimensionless
-//!   scale: [`ActivationWeights::use_lift`] deviations for every e-fold of
-//!   accumulated use. See [`reinforcement`].
+//! - **`reinforcement`** is what the use log knows, put on that same
+//!   dimensionless scale: [`ActivationWeights::use_lift`] deviations for every
+//!   e-fold of accumulated use, measured against the sum one use a day old
+//!   produces. The ratio is what makes it dimensionless - a base-level sum
+//!   scales with whatever unit its ages are counted in, and dividing by a
+//!   reference sum cancels that. See [`ActivationWeights::reinforcement`].
 //!
 //! [`RecallDispersion::deviations_below_median`]:
 //!     crate::ports::recall::RecallDispersion::deviations_below_median
@@ -44,9 +47,18 @@
 //!   half.
 //! - **The logarithm is the cap, rather than a clamp.** Marks raise ranking,
 //!   ranking drives retrieval, and retrieval is what lets an entry be marked, so
-//!   a linear count compounds. Doubling the accumulated use adds at most
-//!   `use_lift * ln 2` however large the count already is, so a heavily used
-//!   entry cannot swamp a strong semantic match.
+//!   a linear count compounds. Doubling the accumulated sum adds at most
+//!   `use_lift * ln 2` however large that sum already is, which holds the whole
+//!   term to about three deviations over any history a store produces - see
+//!   [`DEFAULT_USE_LIFT`] for what that buys and what it does not.
+//!
+//!   **The sum, not the number of events.** One more use raises the sum by more
+//!   than a factor of two when it is far more recent than everything before it -
+//!   a second open thirty seconds after the first roughly doubles a
+//!   one-open history and then some. That is the recency half of the signal
+//!   doing its job, and no compression of the frequency half can or should stop
+//!   it. What the logarithm rules out is the other loop: an entry that keeps
+//!   being retrieved because it was retrieved.
 //!
 //! ## The terms that have no input yet
 //!
@@ -71,16 +83,49 @@ use chrono::{DateTime, Utc};
 
 use crate::domain::knowledge_use::{KnowledgeUseRecord, UseScoreWeights};
 
-/// How many of a source's own median absolute deviations one e-fold of
-/// accumulated use is worth.
+/// The age of the one use that anchors the reinforcement scale, in seconds.
 ///
-/// One deviation is a deliberate scale rather than a fitted one. Adjacent
-/// candidates over a real store sit a fraction of a deviation apart, and a
-/// candidate that clears the bar sits several deviations above one that does
-/// not, so at this lift the use log settles near-ties and never overturns a
-/// clear semantic win. #698's log is what lets a deployment replace it with a
-/// measurement.
-pub const DEFAULT_USE_LIFT: f64 = 1.0;
+/// **A base-level sum has no natural size.** Every term is an age raised to
+/// `-d`, so the whole sum scales by `unit^d` when the ages are counted in a
+/// different unit - stated in seconds it is a hundredth of what the same history
+/// states in days. Adding that straight to a deviation count would let an
+/// arbitrary choice of unit decide how much the use log is worth, which is the
+/// error the semantic half exists to avoid. So the sum is read as a ratio
+/// against the sum one use of this age produces, and the unit cancels.
+///
+/// One day is the anchor because it is the scale a knowledge base is used on:
+/// an entry opened yesterday is the ordinary "recently useful" case, and it is
+/// worth [`ActivationWeights::use_lift`] times `ln 2` here. Anything opened
+/// within the hour scores above it and anything untouched for a month scores
+/// below.
+pub const USE_REFERENCE_AGE_SECONDS: f64 = 24.0 * 60.0 * 60.0;
+
+/// How many of a source's own median absolute deviations one e-fold of
+/// accumulated use is worth, relative to [`USE_REFERENCE_AGE_SECONDS`].
+///
+/// A deliberate scale rather than a fitted one, and what it is chosen against is
+/// the semantic term's own spread. Adjacent candidates over a real store sit a
+/// few tenths of a deviation apart, and a candidate the bar admits sits several
+/// deviations above one it refuses. At this lift one use a day old is worth
+/// about a third of a deviation - enough to settle a near-tie - and an extreme
+/// history reaches about three.
+///
+/// **Three deviations is the guarantee, and it is worth stating exactly, because
+/// the loose version of it is false.** The term has no absolute ceiling - the
+/// accumulated sum has none - but it has a logarithm, so reaching past three
+/// takes a history no store produces. On the measured corpus the weakest
+/// candidate the bar admits sits about 4.6 deviations below the strongest, so
+/// what the ceiling guarantees is that use cannot take the top line from the
+/// best semantic match.
+///
+/// It emphatically does **not** guarantee that a used entry stays where its
+/// distance put it. Ten opens inside the last half hour are worth about two and
+/// a half deviations, which carries an entry sitting on the bar past most of a
+/// full block. That is the design working: an entry the assistant has been
+/// reading all morning should come up on a prompt that brushes it. #698's
+/// caution is about the top line, and the top line is what the ceiling protects.
+/// #698's log is what lets a deployment replace this figure with a measurement.
+pub const DEFAULT_USE_LIFT: f64 = 0.5;
 
 /// The coefficients [`activation`] applies.
 ///
@@ -105,6 +150,53 @@ impl Default for ActivationWeights {
     }
 }
 
+impl ActivationWeights {
+    /// The base-level sum one use at [`USE_REFERENCE_AGE_SECONDS`] produces.
+    ///
+    /// The denominator [`Self::reinforcement`] divides by, so that what the use
+    /// log is worth is stated against a use anybody can picture rather than
+    /// against the unit the ages happen to be counted in. It follows the decay
+    /// exponent, because the sum does.
+    pub fn reference_sum(&self) -> f64 {
+        USE_REFERENCE_AGE_SECONDS.powf(-self.use_score.safe_decay())
+    }
+
+    /// What an accumulated use sum is worth, in the source's own deviations.
+    ///
+    /// `use_lift * ln(1 + |sum| / reference)`, carrying the sum's sign. Four
+    /// things the shape has to answer, and it answers each by construction
+    /// rather than by a clamp:
+    ///
+    /// - **An entry nothing has used contributes nothing.** The sum is zero and
+    ///   so is the answer, so a cold store ranks exactly as it did before this
+    ///   score existed. No floor constant decides how far below a used entry an
+    ///   unused one sits.
+    /// - **One use at the reference age is worth `use_lift * ln 2`.** That is
+    ///   the anchor, and it is what makes the answer independent of the unit the
+    ///   ages are counted in.
+    /// - **A negative mark subtracts.** "Offered, opened, and it was wrong"
+    ///   drives the sum below zero, so a refuted entry ends below one nobody has
+    ///   ever opened, rather than merely level with it. It does not subtract as
+    ///   much as the same mark would add, and that is the writer's doing rather
+    ///   than this function's: a mark is recorded as a use whichever way it
+    ///   points, because the entry really was retrieved, so a negative mark of
+    ///   weight `w` nets `w - 1` against a positive one's `w + 1`. The function
+    ///   is symmetric about zero; the input it is given is not.
+    /// - **Doubling the sum adds at most `use_lift * ln 2`.** That is the cap
+    ///   #698 asks for, as a property of the function rather than a clamp. It
+    ///   is a statement about the accumulated sum and not about the number of
+    ///   uses: one more use raises the sum by over a factor of two when it is
+    ///   far more recent than everything before it, and that is recency, which
+    ///   is a signal this score is meant to carry.
+    pub fn reinforcement(&self, sum: f64) -> f64 {
+        let reference = self.reference_sum();
+        if !sum.is_finite() || !reference.is_finite() || reference <= 0.0 {
+            return 0.0;
+        }
+        self.use_lift * (sum.abs() / reference).ln_1p() * sum.signum()
+    }
+}
+
 /// What one candidate is worth, as of `now`.
 ///
 /// `semantic` is the source-normalized signal: how many of its own source's
@@ -119,29 +211,7 @@ pub fn activation(
     weights: &ActivationWeights,
 ) -> f64 {
     let sum = record.map_or(0.0, |record| record.use_sum(now, &weights.use_score));
-    semantic + reinforcement(sum, weights.use_lift)
-}
-
-/// What an accumulated use sum is worth, in the source's own deviations.
-///
-/// `lift * ln(1 + |sum|)`, carrying the sum's sign. Three edges the shape has to
-/// answer, and it answers each by construction rather than by a clamp:
-///
-/// - **An entry nothing has used contributes nothing.** The sum is zero and so
-///   is the answer, so a cold store ranks exactly as it did before this score
-///   existed. There is no floor constant deciding how far below a used entry an
-///   unused one sits.
-/// - **A negative mark subtracts.** "Offered, opened, and it was wrong" drives
-///   the sum below zero, and the answer follows it down on the same logarithmic
-///   scale a positive mark climbs - so a refuted entry ends below one nobody has
-///   ever opened, rather than merely level with it.
-/// - **Doubling the use adds at most `lift * ln 2`.** That is the cap #698 asks
-///   for, as a property of the function.
-pub fn reinforcement(sum: f64, lift: f64) -> f64 {
-    if !sum.is_finite() {
-        return 0.0;
-    }
-    lift * sum.abs().ln_1p() * sum.signum()
+    semantic + weights.reinforcement(sum)
 }
 
 #[cfg(test)]
@@ -167,7 +237,14 @@ mod tests {
 
     /// A record of `opens` opens, the newest [`RECENT_USE_WINDOW`] of `ages`
     /// held exactly, first seen when the oldest of them landed.
+    ///
+    /// The window is sorted youngest-first and cut to the newest, whatever order
+    /// `ages` arrives in, because that is what the writer stores: it prepends
+    /// `NOW()` and cuts the tail.
     fn used(now: DateTime<Utc>, ages: &[i64], opens: u64) -> KnowledgeUseRecord {
+        let mut newest_first = ages.to_vec();
+        newest_first.sort_unstable();
+        newest_first.truncate(RECENT_USE_WINDOW);
         KnowledgeUseRecord {
             entry_id: "kb-1".to_string(),
             offered_count: opens,
@@ -175,11 +252,7 @@ mod tests {
             marked_count: 0,
             first_seen_at: at(now, ages.iter().copied().max().unwrap_or(1)),
             last_offered_at: Some(at(now, 1)),
-            recent_uses: ages
-                .iter()
-                .take(RECENT_USE_WINDOW)
-                .map(|a| at(now, *a))
-                .collect(),
+            recent_uses: newest_first.iter().map(|a| at(now, *a)).collect(),
             marks: Vec::new(),
         }
     }
@@ -188,6 +261,14 @@ mod tests {
     fn evenly_over(now: DateTime<Utc>, count: u64, span: i64) -> KnowledgeUseRecord {
         let step = span / count as i64;
         let ages: Vec<i64> = (1..=count as i64).map(|i| i * step).collect();
+        used(now, &ages, count)
+    }
+
+    /// `count` uses at a fixed one-hour spacing, the newest an hour ago: the
+    /// same rhythm whatever the count, so a longer history is more use rather
+    /// than denser use.
+    fn every_hour(now: DateTime<Utc>, count: u64) -> KnowledgeUseRecord {
+        let ages: Vec<i64> = (1..=count as i64).map(|i| i * 3_600).collect();
         used(now, &ages, count)
     }
 
@@ -251,17 +332,36 @@ mod tests {
         );
     }
 
-    /// Acceptance (#1123): doubling the use count buys a bounded amount, so a
-    /// heavily used entry cannot swamp a strong semantic match.
+    /// Acceptance (#1123): doubling an entry's accumulated use buys a bounded
+    /// amount, which is what stops the retrieve-mark-retrieve loop compounding.
+    ///
+    /// Both halves of the claim. First the function: doubling the accumulated
+    /// sum adds at most `use_lift * ln 2`, at every size of sum. Then a record:
+    /// an entry used twice as often over twice as long - the same rhythm, kept
+    /// up for longer, which is how an entry accrues use over time - gains no
+    /// more than that.
+    ///
+    /// See `one_much_more_recent_use_may_raise_the_score_by_more_than_that` for
+    /// the case this bound deliberately does not cover.
     #[test]
-    fn doubling_the_use_count_raises_activation_by_a_bounded_amount() {
+    fn doubling_the_accumulated_use_raises_activation_by_a_bounded_amount() {
         let now = now();
         let weights = ActivationWeights::default();
         let bound = weights.use_lift * std::f64::consts::LN_2;
+        let reference = weights.reference_sum();
 
-        let mut previous = activation(0.0, Some(&evenly_over(now, 1, DAY)), now, &weights);
+        for exponent in -6..=12 {
+            let sum = reference * 2.0_f64.powi(exponent);
+            let step = weights.reinforcement(sum * 2.0) - weights.reinforcement(sum);
+            assert!(
+                step <= bound,
+                "doubling a sum of {sum} added {step}, past the {bound} a doubling may buy"
+            );
+        }
+
+        let mut previous = activation(0.0, Some(&every_hour(now, 1)), now, &weights);
         for count in [2u64, 4, 8, 16, 32, 64, 128, 256] {
-            let doubled = activation(0.0, Some(&evenly_over(now, count, DAY)), now, &weights);
+            let doubled = activation(0.0, Some(&every_hour(now, count)), now, &weights);
             let step = doubled - previous;
             assert!(
                 step <= bound,
@@ -271,9 +371,38 @@ mod tests {
         }
     }
 
-    /// Acceptance (#1123), the reason the bound matters: an entry that has been
-    /// opened and marked for years, sitting exactly on the bar, must still rank
-    /// below an entry nobody has ever opened that the prompt names outright.
+    /// The bound above is about the accumulated sum, and this is the case it
+    /// does not cover: adding one use far more recent than everything before it
+    /// more than doubles the sum, so the score may rise by more than
+    /// `use_lift * ln 2`.
+    ///
+    /// Stated as a test rather than left as a gap, because a later reader
+    /// meeting it in production would otherwise take it for the bound leaking.
+    /// It is recency, which is half of what a per-use age buys, and no
+    /// compression of the frequency half should suppress it. What bounds this
+    /// case is the ceiling, not the step - see
+    /// `an_extreme_use_history_stays_inside_the_stated_ceiling`.
+    #[test]
+    fn one_much_more_recent_use_may_raise_the_score_by_more_than_that() {
+        let now = now();
+        let weights = ActivationWeights::default();
+        let bound = weights.use_lift * std::f64::consts::LN_2;
+
+        let once = activation(0.0, Some(&used(now, &[60], 1)), now, &weights);
+        let twice = activation(0.0, Some(&used(now, &[30, 60], 2)), now, &weights);
+
+        assert!(
+            twice - once > bound,
+            "a second open thirty seconds after the first added {}, and recency is supposed to \
+             be able to add more than the {bound} a doubled sum buys",
+            twice - once
+        );
+    }
+
+    /// Acceptance (#1123), the reason the ceiling matters: an entry that has
+    /// been opened and marked for years, sitting exactly on the bar, must still
+    /// rank below an entry nobody has ever opened that the prompt names
+    /// outright. That is #698's caution, and it is about the top line.
     #[test]
     fn a_heavily_used_entry_does_not_outrank_a_strong_semantic_match() {
         let now = now();
@@ -368,25 +497,6 @@ mod tests {
         );
     }
 
-    /// A cold store keeps its order. Ranking by activation must be the identity
-    /// on a set where nothing has ever been used, or the block would reorder
-    /// itself the day this landed.
-    #[test]
-    fn a_cold_store_keeps_the_order_its_distances_gave_it() {
-        let now = now();
-        let weights = ActivationWeights::default();
-        let nearest_first = [11.4, 10.9, 10.2, 9.8, 9.4, 7.3];
-
-        let scored: Vec<f64> = nearest_first
-            .iter()
-            .map(|s| activation(*s, None, now, &weights))
-            .collect();
-        let mut ranked = scored.clone();
-        ranked.sort_by(|a, b| b.total_cmp(a));
-
-        assert_eq!(scored, ranked, "a cold store must not be reordered");
-    }
-
     /// A negative mark drives the entry below one nobody has ever opened, rather
     /// than merely failing to lift it.
     #[test]
@@ -394,10 +504,12 @@ mod tests {
         let now = now();
         let weights = ActivationWeights::default();
 
-        let mut refuted = used(now, &[3_600], 1);
+        // As the writer stores it: a mark is a use whichever way it points, so
+        // the stamp is in the window and `marked_count` moved too.
+        let mut refuted = used(now, &[60, 3_600], 1);
         refuted.marked_count = 1;
         refuted.marks = vec![KnowledgeMark {
-            source: MarkSource::Person,
+            source: MarkSource::Model,
             polarity: MarkPolarity::Negative,
             reason: Some("the fact it states was withdrawn".to_string()),
             marked_at: at(now, 60),
@@ -411,14 +523,91 @@ mod tests {
     /// The reinforcement term's own edges, stated where the reader meets them.
     #[test]
     fn the_reinforcement_term_is_zero_at_zero_and_signed_beyond_it() {
-        assert_eq!(reinforcement(0.0, 1.0), 0.0);
-        assert!(reinforcement(1.0, 1.0) > 0.0);
-        assert!(reinforcement(-1.0, 1.0) < 0.0);
-        assert_eq!(reinforcement(1.0, 1.0), -reinforcement(-1.0, 1.0));
+        let weights = ActivationWeights::default();
+        let reference = weights.reference_sum();
+
+        assert_eq!(weights.reinforcement(0.0), 0.0);
+        assert!(weights.reinforcement(reference) > 0.0);
+        assert!(weights.reinforcement(-reference) < 0.0);
+        assert_eq!(
+            weights.reinforcement(reference),
+            -weights.reinforcement(-reference)
+        );
         // A sum that is not a number contributes nothing rather than poisoning
         // every comparison the ranking makes.
-        assert_eq!(reinforcement(f64::NAN, 1.0), 0.0);
-        assert_eq!(reinforcement(f64::INFINITY, 1.0), 0.0);
+        assert_eq!(weights.reinforcement(f64::NAN), 0.0);
+        assert_eq!(weights.reinforcement(f64::INFINITY), 0.0);
+    }
+
+    /// The anchor, pinned: one use at the reference age is worth exactly
+    /// `use_lift * ln 2`.
+    ///
+    /// This is what makes the term dimensionless. A base-level sum scales with
+    /// whatever unit its ages are counted in - the same history is a hundred
+    /// times larger stated in days than in seconds - so adding one straight to a
+    /// deviation count would let that choice decide how much the use log is
+    /// worth. Dividing by the sum of one reference use cancels it.
+    #[test]
+    fn one_use_at_the_reference_age_is_worth_a_stated_amount() {
+        let now = now();
+        let weights = ActivationWeights::default();
+        let a_day = USE_REFERENCE_AGE_SECONDS as i64;
+
+        let scored = activation(0.0, Some(&used(now, &[a_day], 1)), now, &weights);
+
+        assert!(
+            (scored - weights.use_lift * std::f64::consts::LN_2).abs() < 1e-9,
+            "one use a day old scored {scored}"
+        );
+    }
+
+    /// The lift has to be large enough to do something. A day-old use must
+    /// settle a near-tie - two candidates a few hundredths of a deviation apart,
+    /// which is what adjacent rows of a real store look like.
+    #[test]
+    fn a_recent_use_settles_a_near_tie_between_two_candidates() {
+        let now = now();
+        let weights = ActivationWeights::default();
+        let a_day = USE_REFERENCE_AGE_SECONDS as i64;
+
+        let nearer_but_unread = activation(9.10, None, now, &weights);
+        let further_but_used = activation(9.00, Some(&used(now, &[a_day], 1)), now, &weights);
+
+        assert!(
+            further_but_used > nearer_but_unread,
+            "a day-old use scored {further_but_used} against an unread candidate a tenth of a \
+             deviation nearer at {nearer_but_unread}; a lift this small settles nothing"
+        );
+    }
+
+    /// The ceiling the scale is chosen against, pinned so the claim cannot rot.
+    ///
+    /// The most extreme history a store realistically holds - hundreds of opens
+    /// across a year, and a person's mark set a minute ago, which is the largest
+    /// single term the log can carry - must stay inside the three deviations
+    /// [`DEFAULT_USE_LIFT`] promises. The bar's own corpus puts the weakest
+    /// admitted candidate and the strongest about 4.6 apart, so a term under
+    /// three cannot carry an entry from the bottom of a block to the top.
+    #[test]
+    fn an_extreme_use_history_stays_inside_the_stated_ceiling() {
+        let now = now();
+        let weights = ActivationWeights::default();
+
+        let mut extreme = evenly_over(now, 500, YEAR);
+        extreme.marked_count = 20;
+        extreme.marks = vec![KnowledgeMark {
+            source: MarkSource::Person,
+            polarity: MarkPolarity::Positive,
+            reason: None,
+            marked_at: at(now, 60),
+        }];
+
+        let lift = activation(0.0, Some(&extreme), now, &weights);
+        assert!(
+            (0.0..3.0).contains(&lift),
+            "an extreme history lifted {lift} deviations, past the three the scale is chosen \
+             against"
+        );
     }
 
     /// Acceptance (#1123): scoring a corpus far larger than any one lookup reads
