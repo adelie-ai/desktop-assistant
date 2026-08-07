@@ -126,7 +126,23 @@ Who may write the columns is deliberately narrow:
   on both branches, so an amend of an approved skill drops the approval the old
   body earned. Forcing it in the store rather than in the caller is what makes
   that atomic: there is no window in which new content wears an old approval.
-- **`set_approval` is the explicit flip**, in either direction.
+- **`set_approval` is the explicit flip**, in either direction. Nothing calls it
+  yet, so a self-authored skill stays unapproved until an approve surface exists.
+
+### What "not approved" actually withholds
+
+The column would be decoration if nothing read it, so the read path enforces it:
+
+- `builtin_skill_search` omits unapproved skills, and reports how many it held
+  back. Filtered before the result limit, so an unapproved row can never
+  displace an approved one from the results.
+- `builtin_skill_get` refuses an unapproved skill by name, returning
+  `ok: false`, `awaiting_approval: true`, and **no body**. The body is what gets
+  followed. The refusal names the reason rather than pretending the skill does
+  not exist, so the model does not simply ask again.
+
+Both descriptions advertised to the model say so, because a schema that promises
+what the code does not honour is a false contract.
 
 ## Skills Adele writes for herself
 
@@ -144,8 +160,9 @@ train the model to ignore it.
 
 | Rule | What it keeps out |
 | ---- | ----------------- |
+| The plan read from the scratchpad did not hit its page cap | A plan that may be missing its later steps. The store returns `note`-typed rows before `todo`-typed ones, so a full page cuts the END of the plan, and a skill that stops halfway is worse than no skill. |
 | At least 3 steps that finished **and** recorded an outcome | A question answered (no plan at all), a single file written (one step), a pair of acts with no shape between them (two steps), and any step whose finding was never written down |
-| The turn did not read a skill (`builtin_skill_get`) before it planned | Re-saving a skill the turn just followed, which is how a library fills with near-duplicates. Searching the library is not following one |
+| **This turn** did not read a skill (`builtin_skill_get`) before it planned | Re-saving a skill the turn just followed, which is how a library fills with near-duplicates. Searching the library is not following one, and a lookup in an earlier turn is not this plan following a skill |
 | No more than a third of the plan abandoned | A plan that records a search rather than a method |
 | The turn did not ingest external content (#741) | A turn whose own wording is withheld, and which therefore recorded no procedure |
 
@@ -154,9 +171,18 @@ it just did generalises, and that judgement is the whole value. Declining is
 doing nothing.
 
 **Dedup happens before the offer.** The catalog is searched with the plan's own
-goals, and any match is named in the offer with `mode_hint: "amend"`. At the
-write, a request to add a skill whose name is already taken is refused outright
-and told to amend instead - never satisfied with a second row.
+goals, and any match is named in the offer. At the write, a request to add a
+skill whose name is already taken is refused outright - never satisfied with a
+second row. A lookup the catalog cannot answer refuses too: the write upserts on
+`(name, owner)`, so reading a failed lookup as "the name is free" would replace
+an existing skill and drop its approval.
+
+**Amending is limited to the assistant's own unadopted drafts** - not approved,
+not on disk, and written by the promotion or extraction path. Amending swaps the
+body, relabels the provenance as self-authored, marks the row absent from disk
+and drops the approval, so aiming it at a skill a person placed, approved, or
+installed would destroy their work. The offer's `mode_hint` follows the same
+rule, so the model is never steered into a refusal.
 
 **Accepting** calls `promote_plan_to_skill {name, description, mode?, tags?,
 summary?}`. The body is rendered from the plan's steps and outcomes; the model
@@ -182,10 +208,12 @@ provider group:
 - `builtin_skill_search {query, kind?, limit?}` — embeds the query and
   hybrid-searches the catalog (full-text only when no embedding is available),
   optionally filtering by kind. Returns name, description, kind, trust tier,
-  disk path, attachment list, and `present_on_disk`.
+  disk path, attachment list, and `present_on_disk`. Unapproved skills are
+  omitted; a `note` reports how many were held back.
 - `builtin_skill_get {name}` — the full body plus metadata for one skill. Returns the
   caller's own user-scoped copy if one exists, otherwise the global one; there is no
-  argument to address another user's copy (#911).
+  argument to address another user's copy (#911). An unapproved skill returns
+  `ok: false` with `awaiting_approval: true` and no body.
 - `promote_plan_to_skill {name, description, mode?, tags?, summary?}` — keeps the
   finished plan as an unapproved skill. A **core-loop** tool, like
   `begin_step`/`complete_step`: the plan and the turn's messages belong to the
