@@ -106,7 +106,9 @@ impl ToolUsageStore for PgToolUsageStore {
                                  ELSE octet_length(r.content) END) AS result_bytes, \
                         MAX(CASE WHEN r.content LIKE $3 THEN 0 \
                                  ELSE octet_length(r.content) END) AS max_result_bytes, \
-                        COUNT(*) FILTER (WHERE r.content LIKE $3) AS evicted_results \
+                        COUNT(*) FILTER (WHERE r.content LIKE $3 \
+                                            OR COALESCE(array_length(r.distilled_into, 1), 0) > 0) \
+                            AS evicted_results \
                  FROM calls c \
                  JOIN messages r \
                    ON r.user_id = $1 AND r.conversation_id = $2 \

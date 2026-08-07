@@ -1701,10 +1701,6 @@ pub(crate) async fn compact_preflight_shrink<L: LlmClient>(
     requested_window: usize,
     llm: &L,
 ) -> bool {
-    let _ = (&*conv, window_from, requested_window, llm);
-    if true {
-        return false;
-    }
     if window_from <= window_start(&conv.messages, requested_window) {
         return false;
     }
@@ -5138,7 +5134,9 @@ mod tests {
         let shrunk_start = window_start(&conv.messages, MIN_CONTEXT_MESSAGES);
 
         let llm = CountingSummariser::default();
-        assert!(compact_preflight_shrink(&mut conv, shrunk_start, MAX_CONTEXT_MESSAGES, &llm).await);
+        assert!(
+            compact_preflight_shrink(&mut conv, shrunk_start, MAX_CONTEXT_MESSAGES, &llm).await
+        );
         assert_eq!(
             conv.compacted_through, shrunk_start,
             "the marker may only step over a range the summary describes"
@@ -5164,7 +5162,10 @@ mod tests {
         let folded =
             compact_preflight_shrink(&mut conv, requested_start, MAX_CONTEXT_MESSAGES, &llm).await;
 
-        assert!(!folded, "no shrink happened, so there is nothing extra to fold");
+        assert!(
+            !folded,
+            "no shrink happened, so there is nothing extra to fold"
+        );
         assert_eq!(conv.compacted_through, before);
         assert_eq!(
             llm.longest_prompt(),

@@ -1066,13 +1066,12 @@ impl<S, L, T> ConversationHandler<S, L, T> {
         // the conversation's stored transcript keeps the raw output whether or
         // not the note write above succeeded and whether or not the model
         // supplied an outcome.
-        let (evicted, freed) =
-            planning::evict_tool_results(
-                &mut conv.messages,
-                projection,
-                frame.watermark,
-                &note_keys,
-            );
+        let (evicted, freed) = planning::evict_tool_results(
+            &mut conv.messages,
+            projection,
+            frame.watermark,
+            &note_keys,
+        );
         tracing::info!(
             step = %frame.key,
             evicted_results = evicted,

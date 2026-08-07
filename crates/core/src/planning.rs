@@ -333,7 +333,9 @@ pub(crate) fn evict_tool_results(
         let pointer = compaction_pointer(tool_name, note_keys);
         freed += current.len().saturating_sub(pointer.len());
         evicted += 1;
-        // not yet recorded
+        if !note_keys.is_empty() {
+            m.distilled_into = note_keys.to_vec();
+        }
         projection.replace(m, pointer);
     }
     (evicted, freed)
@@ -361,10 +363,6 @@ pub(crate) fn carry_evictions(
     live_note_keys: &std::collections::HashSet<String>,
 ) -> (usize, usize) {
     let names = tool_names_by_call_id(messages);
-    let _ = (&names, &live_note_keys, &mut *projection);
-    if true {
-        return (0, 0);
-    }
 
     let mut carried = 0usize;
     let mut saved = 0usize;
@@ -1209,8 +1207,12 @@ mod tests {
         ];
         let before = messages.clone();
         let mut projection = ContextProjection::default();
-        let (evicted, _) =
-            evict_tool_results(&mut messages, &mut projection, 0, &["outcome:1".to_string()]);
+        let (evicted, _) = evict_tool_results(
+            &mut messages,
+            &mut projection,
+            0,
+            &["outcome:1".to_string()],
+        );
 
         assert_eq!(evicted, 1, "the result still leaves the turn's view");
         assert_eq!(
@@ -1233,7 +1235,12 @@ mod tests {
             tool_msg("c1", &big),
         ];
         let mut projection = ContextProjection::default();
-        evict_tool_results(&mut messages, &mut projection, 0, &["outcome:1".to_string()]);
+        evict_tool_results(
+            &mut messages,
+            &mut projection,
+            0,
+            &["outcome:1".to_string()],
+        );
 
         assert_eq!(
             messages[1].distilled_into,

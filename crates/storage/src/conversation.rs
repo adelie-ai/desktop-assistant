@@ -799,7 +799,6 @@ struct ExistingMsgRow {
     tool_calls: Option<serde_json::Value>,
     tool_call_id: Option<String>,
     summary_id: Option<String>,
-    #[allow(dead_code)]
     distilled_into: Option<Vec<String>>,
 }
 
@@ -829,5 +828,6 @@ impl ExistingMsgRow {
             && self.tool_call_id == msg.tool_call_id
             && self.summary_id == msg.summary_id
             && self.tool_calls == tool_calls_json(msg)
+            && self.distilled_into == distilled_into_column(msg)
     }
 }
