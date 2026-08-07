@@ -58,6 +58,16 @@ can already read whole. That is the exact profile of the cleanest prune
 candidate, so the strongest endorsement the system holds would read as evidence
 to delete.
 
+The same argument settles an entry whose id the line cannot carry whole. An id
+is stored as the write tool's caller wrote it, and a line can spend only
+`RECALL_ID_MAX_CHARS` characters of one; a read matches an id exactly, so a cut
+id resolves to nothing. Before the use log that was a failed fetch the model
+could recover from by searching. With the log it is worse, because the offer is
+recorded whether or not the fetch can succeed - so the entry would take an offer
+every turn it ranked near the prompt and could never take an open. The block
+therefore drops such an entry rather than showing an id no read resolves, and a
+further entry takes the slot. Bounding the id where it is written is #1136.
+
 The block renders on a turn's first round only, so the offer is recorded there
 and nowhere else. An empty list recorded on a later round would take down the
 offers the turn had just made.
@@ -211,8 +221,12 @@ ranking, which is the failure this substrate exists to prevent. The one
 exception to running off the path is the mark, which the caller asked for.
 
 Running off the path costs one guarantee worth stating: a spawned write may
-still be in flight when the tool returns. In practice an offer is recorded when
-the lookup answers and taken up a model round trip later, which is seconds.
+still be in flight when the tool returns. In practice an offer is recorded
+before the turn's LLM call and taken up after the model has answered, so a full
+round trip separates them. Under a saturated pool an open could in principle
+reach the database before the offer it belongs to, and would then find nothing
+standing and be dropped. It errs toward undercounting, which is the safe
+direction for a signal that decides what gets retired.
 
 A turn whose block showed nothing records an offer of no entries, because a
 recall offer replaces the conversation's standing offers and an empty one is
