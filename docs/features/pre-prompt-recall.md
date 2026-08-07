@@ -263,9 +263,9 @@ rather than a choice:
 | Part | Worst case |
 | --- | --- |
 | One knowledge line | `"\n- " + id + " [" + tags + "] " + summary` = 391 bytes |
-| The fixed part | prefix, header, entry hint, five pad lines and their label, the tag line, and both "did not fit" lines = 2,410 bytes |
+| The fixed part | prefix, header, entry hint, five pad lines and their label, the tag line, and both "did not fit" lines = 2,417 bytes |
 | The budget | 2,560 tokens at four bytes a token = 10,240 bytes |
-| **The width the budget buys** | **(10,240 - 2,410) / 391 = 20 lines** |
+| **The width the budget buys** | **(10,240 - 2,417) / 391 = 20 lines** |
 
 **The shipped width is the width the budget pays for.** The bar decides how many
 lines render, which leaves this number protecting the token budget and nothing
@@ -429,7 +429,7 @@ rank pass and a body pass.
 
 **It fires on every turn, including agent and subagent runs.** Any turn that goes
 through `send_prompt` gets a lookup, so a spawned agent working from a
-machine-written brief pays one embedding and three reads as well.
+machine-written brief pays one embedding and two reads as well.
 
 **A pin the `[Pinned]` byte budget cut short is still suppressed.** The knowledge
 arm drops the attachments the turn *resolved*, which is a superset of what

@@ -180,9 +180,10 @@ pub struct DaemonConfig {
 /// assistant's memory before the model sees it.
 ///
 /// On by default. The lookup costs one embedding and two indexed reads per
-/// turn, and the block it produces stays silent unless something stands out
-/// from the store - but it does fire on every prompt, so an operator who does
-/// not want that spend has one switch for it.
+/// turn, plus a pass over the store's own distances every quarter of an hour,
+/// and the block it produces stays silent unless something stands out from the
+/// store - but it does fire on every prompt, so an operator who does not want
+/// that spend has one switch for it.
 ///
 /// Turning it off restores exactly the behaviour that preceded the feature: the
 /// assistant reaches its knowledge base only when it decides to search.
