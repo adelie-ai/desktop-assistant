@@ -228,8 +228,9 @@ computed; it is the width that was already in place. The block's width is also
 the number of unrelated memories a prompt of no content puts in front of the
 model, and the relevance floor admits such a prompt today, so widening the block
 before the floor has an admission gate would multiply the noise case rather than
-the recall case. #1121 lands the gate and raises the default to the budgeted
-width with it. A deployment that wants the wider index now sets `max_entries`.
+the recall case. #1121 grades the width from the prompt's own signal, which
+leaves this number as a safety cap and sets it to the budgeted width. A
+deployment that wants the wider index now sets `max_entries`.
 
 **Bytes, not characters, and the difference matters.** The token estimate the
 context budget uses is `bytes / 4`, and a character is one to four bytes.
@@ -337,8 +338,8 @@ It also stays off on its own when there is no knowledge store or no embedding
 backend, and the daemon says which of the three reasons applies at startup.
 
 `max_entries` states how many knowledge lines the block may show. Set it to 20
-to take the index the budget pays for before #1121 raises the default, or lower
-it on a model with a small context window. The value is held to what the block
+to take the index the budget pays for before #1121 raises the cap, or lower it
+on a model with a small context window. The value is held to what the block
 can honestly render - at least one line, and never more than the 50 rows the
 lookup reads, because a block that showed more would count a tail it never saw.
 
@@ -361,8 +362,9 @@ admission gate that fixes this.
 **The block is narrower than its budget pays for, and the floor is why.** The
 width is also the number of unrelated memories a low-signal prompt renders, so
 the wider index waits on the gate above. The two belong together: the width
-makes recognition possible, and the gate makes the width safe. #1121 raises the
-default; `max_entries` takes it now.
+makes recognition possible, and the gate makes the width safe. #1121 grades the
+width and raises this number to the budgeted one, where it becomes a cap rather
+than the mechanism; `max_entries` takes the wider index now.
 
 **The scan reads whole rows.** Fifty entries are read to render a handful of
 lines, because the count of what did not fit has to be a count. The row count is

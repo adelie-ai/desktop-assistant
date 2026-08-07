@@ -167,10 +167,14 @@ pub const BUDGETED_MAX_RECALL_ENTRIES: usize =
 /// of lines is also the number of unrelated memories such a prompt puts in
 /// front of the model. Widening the block before that floor has an admission
 /// gate would multiply the noise case rather than the recall case, and a
-/// deployment would meet the regression before anyone measured it. #1121 lands
-/// the gate and raises this to [`BUDGETED_MAX_RECALL_ENTRIES`] with it.
+/// deployment would meet the regression before anyone measured it.
 ///
-/// A deployment that wants the index now sets its own width - see
+/// #1121 grades the width from the prompt's own signal, which turns this
+/// constant into a safety cap rather than the mechanism, and sets it to
+/// [`BUDGETED_MAX_RECALL_ENTRIES`]: a cap exists to protect the token budget, so
+/// the budget's own figure is the value it wants.
+///
+/// A deployment that wants the wider index now sets it - see
 /// [`set_max_recall_entries`].
 pub const DEFAULT_MAX_RECALL_ENTRIES: usize = 8;
 
@@ -1027,9 +1031,10 @@ mod tests {
     /// afford, and the shipped default is held at eight until #1121 gates what
     /// the relevance floor admits.
     ///
-    /// The second assertion is the deferral, written down. #1121 raises the
-    /// default to [`BUDGETED_MAX_RECALL_ENTRIES`] and edits this test to say so,
-    /// which is the point: the flip is a deliberate act, not a drift.
+    /// The second assertion is the deferral, written down. #1121 grades the
+    /// width, leaves this constant as a safety cap, sets it to
+    /// [`BUDGETED_MAX_RECALL_ENTRIES`], and edits this test to say so. That is
+    /// the point: the flip is a deliberate act, not a drift.
     #[test]
     fn the_budget_pays_for_a_width_materially_wider_than_the_default_that_ships() {
         let budgeted = BUDGETED_MAX_RECALL_ENTRIES;
