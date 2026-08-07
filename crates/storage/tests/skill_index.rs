@@ -21,6 +21,7 @@ use desktop_assistant_core::ports::skill_index::{SkillIndexStore, conformance};
 use desktop_assistant_core::skill_catalog::reconcile_scan;
 use desktop_assistant_storage::embedding_backfill::{BackfillEmbedFn, backfill_skill_embeddings};
 use desktop_assistant_storage::{PgSkillIndexStore, run_migrations};
+use pgvector::Vector;
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use uuid::Uuid;
@@ -584,5 +585,155 @@ async fn get_scoping_matches_search_and_list() {
         .await;
         fx
     })
+    .await;
+}
+
+// -- #1107 sweep: `search_hybrid`'s vector arm (`vr`) had the same
+// -- `ROW_NUMBER() OVER (ORDER BY dist) ... LIMIT $4` shape as the knowledge
+// -- base's vector arm, with no statement-level `ORDER BY` before the `LIMIT`.
+// -- `tr` (the text arm) already carries `ORDER BY ts_rank_cd(...) DESC`
+// -- before its own `LIMIT` and needed no change.
+
+/// Stamp a `vector[]` embedding onto a global skill by name (mirrors
+/// [`set_embedding`] in `knowledge_hybrid_and_pagination.rs`).
+async fn set_skill_embedding(pool: &PgPool, name: &str, chunk: Vec<f32>) {
+    let vecs: Vec<Vector> = vec![Vector::from(chunk)];
+    sqlx::query(
+        "UPDATE skill_index SET embedding = $1::vector[], embedding_model = 'test-model' \
+         WHERE name = $2 AND owner_key = ''",
+    )
+    .bind(&vecs)
+    .bind(name)
+    .execute(pool)
+    .await
+    .expect("stamp skill embedding");
+}
+
+#[tokio::test]
+async fn skill_search_vector_arm_truncates_to_the_nearest_candidates() {
+    // Contract PIN, not a red-to-green reproduction -- same reasoning as
+    // `vector_arm_truncates_to_the_nearest_candidates_not_an_arbitrary_subset`
+    // in `knowledge_hybrid_and_pagination.rs`: `vr.rank_v` feeds `fused.score`,
+    // which the outer `ORDER BY f.score DESC` reads, so the planner cannot
+    // eliminate the window and today's plan preserves distance order into the
+    // `LIMIT`. This test guards the property, not a live defect.
+    //
+    // The FTS query term ("zzznomatchzzz") matches no seeded skill, so `tr` is
+    // empty and `fused` reduces to `vr` alone -- isolating the vector arm.
+    with_fixture(
+        "skill_search_vector_arm_truncates_to_the_nearest_candidates",
+        |fx| async move {
+            let store = PgSkillIndexStore::new(fx.pool.clone());
+
+            // 20 skills -- more than fetch_limit (limit=6 -> fetch_limit=12).
+            let skills: Vec<IndexedSkill> = (0..20u32)
+                .map(|i| {
+                    skill(
+                        &format!("skill{i:02}"),
+                        &format!("generic filler capability {i}"),
+                        &format!("hash{i:02}"),
+                        "filler body",
+                    )
+                })
+                .collect();
+            seed(&store, skills).await;
+
+            // Embeddings at strictly increasing cosine distance from [1,0,0]:
+            // skill00 is nearest, skill19 is farthest.
+            for i in 0..20u32 {
+                let f = i as f32 * 0.01;
+                set_skill_embedding(&fx.pool, &format!("skill{i:02}"), vec![1.0 - f, f, 0.0]).await;
+            }
+
+            let hits = store
+                .search("zzznomatchzzz", vec![1.0, 0.0, 0.0], "test-model", 6)
+                .await
+                .expect("search");
+            let names: Vec<&str> = hits.iter().map(|s| s.name.as_str()).collect();
+            assert_eq!(
+                names,
+                vec![
+                    "skill00", "skill01", "skill02", "skill03", "skill04", "skill05"
+                ],
+                "the vector arm's contribution must be exactly the 6 nearest \
+                 skills, nearest first, out of 20 candidates and a \
+                 fetch_limit of 12; got {names:?}"
+            );
+            fx
+        },
+    )
+    .await;
+}
+
+// -- #1107 follow-up: `fused`'s `ORDER BY f.score DESC` has the same
+// -- undefined-truncation defect the window-function fix addressed, one
+// -- level out. RRF ties exactly by construction (a row found by ONLY one
+// -- arm at rank 1 scores exactly `1/(60+1)`, whichever arm found it), so a
+// -- score-only `ORDER BY` leaves which of two tied skills the `LIMIT` keeps
+// -- undefined. Unlike the window-function sites, this tie is directly
+// -- constructible, so this is a red-to-green reproduction, not a pin.
+
+#[tokio::test]
+async fn skill_search_truncates_to_a_defined_row_when_fused_scores_tie() {
+    // "zzz-skill" is found ONLY by the text arm (it is the sole row
+    // containing the FTS query term "gronk"). "aaa-skill" is found ONLY by
+    // the vector arm (its embedding exactly matches the query vector). Both
+    // therefore score exactly `1.0 / (60 + 1)` -- an exact IEEE-754 tie, not
+    // an approximate one.
+    //
+    // `skill_index` has no single surrogate id column; its uniqueness is the
+    // composite `(name, owner_key)` (`idx_skill_index_name_owner`), so that
+    // composite -- not a recency column -- is the natural deterministic
+    // tiebreak. Both rows are global (`owner_key` = `''`), so `name` alone
+    // decides: `name ASC` must pick "aaa-skill" (the lexicographically
+    // smaller name) when `limit` truncates the tied pair down to 1.
+    //
+    // This name assignment (not the reverse) is what makes the test a
+    // genuine red-to-green: probed directly, the pre-fix query's
+    // `FULL OUTER JOIN` between `vr` and `tr` emits the text-arm-only row
+    // first when scores tie, regardless of which literal name carries which
+    // role. Naming the text-matched row "zzz-skill" (the lexicographically
+    // LARGER name) makes that incidental behavior disagree with `name ASC`.
+    with_fixture(
+        "skill_search_truncates_to_a_defined_row_when_fused_scores_tie",
+        |fx| async move {
+            let store = PgSkillIndexStore::new(fx.pool.clone());
+
+            seed(
+                &store,
+                vec![
+                    skill(
+                        "zzz-skill",
+                        "the distinctive gronk term appears here",
+                        "h1",
+                        "b1",
+                    ),
+                    skill(
+                        "aaa-skill",
+                        "unrelated prose that never matches",
+                        "h2",
+                        "b2",
+                    ),
+                ],
+            )
+            .await;
+            set_skill_embedding(&fx.pool, "aaa-skill", vec![1.0, 0.0, 0.0]).await;
+            // zzz-skill is left unembedded on purpose.
+
+            let hits = store
+                .search("gronk", vec![1.0, 0.0, 0.0], "test-model", 1)
+                .await
+                .expect("search");
+            let names: Vec<&str> = hits.iter().map(|s| s.name.as_str()).collect();
+            assert_eq!(
+                names,
+                vec!["aaa-skill"],
+                "with an exact fused-score tie, the truncation to 1 row must \
+                 be decided by name ASC (\"aaa-skill\" < \"zzz-skill\"), not \
+                 by an undefined physical row order; got {names:?}"
+            );
+            fx
+        },
+    )
     .await;
 }

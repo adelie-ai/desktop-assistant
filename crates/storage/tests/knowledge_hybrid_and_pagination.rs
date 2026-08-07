@@ -151,6 +151,18 @@ async fn set_created_at(pool: &PgPool, id: &str, ts: chrono::DateTime<chrono::Ut
         .expect("set created_at");
 }
 
+/// Force a row's `updated_at` so a fused-score tie also ties on the
+/// `search_hybrid` ORDER BY's second column, leaving `id` as the only
+/// remaining tiebreaker (#1107 follow-up).
+async fn set_updated_at(pool: &PgPool, id: &str, ts: chrono::DateTime<chrono::Utc>) {
+    sqlx::query("UPDATE knowledge_base SET updated_at = $1 WHERE id = $2")
+        .bind(ts)
+        .bind(id)
+        .execute(pool)
+        .await
+        .expect("set updated_at");
+}
+
 fn ts(secs: i64) -> chrono::DateTime<chrono::Utc> {
     chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0).expect("valid timestamp")
 }
@@ -901,6 +913,232 @@ async fn knowledge_read_filters_are_case_insensitive_and_symmetric() {
             assert!(
                 exc_ids.contains(&"kb-other") && !exc_ids.contains(&"kb-instr"),
                 "list_page exclude filter must drop kb-instr, keep kb-other; got {exc_ids:?}"
+            );
+            fx
+        },
+    )
+    .await;
+}
+
+// -- #1107: the vector and text arms of `search_hybrid` must truncate to a
+// -- DEFINED set (the nearest / highest-ranked candidates), not an arbitrary
+// -- subset of the same size. `ROW_NUMBER() OVER (ORDER BY ...)` orders the
+// -- window computation, not the statement's output; a `LIMIT` with no
+// -- statement-level `ORDER BY` truncates a set the SQL standard never
+// -- promises an order for.
+//
+// Both tests below seed more rows than `fetch_limit` (`limit * 2`), so the
+// `LIMIT` in each CTE has something to actually cut.
+
+#[tokio::test]
+async fn vector_arm_truncates_to_the_nearest_candidates_not_an_arbitrary_subset() {
+    // Contract PIN, not a red-to-green reproduction -- said plainly, per
+    // #1107: this test passes both BEFORE and AFTER the `ORDER BY min_distance`
+    // fix on PostgreSQL 17 today.
+    //
+    // Why it cannot be made to fail against the current query: `rank_v` feeds
+    // `fused.rrf_score`, which the outer `ORDER BY rrf_score DESC` reads. A
+    // column a later node reads is never eliminated, so the planner keeps
+    // `Limit -> WindowAgg -> Sort(min_distance)` for `vector_ranked` -- proven
+    // by `EXPLAIN (ANALYZE, VERBOSE)` against this exact scenario (20 rows,
+    // `fetch_limit` 12): the candidate set IS the nearest 12, in rank order.
+    // That plan shape is a property of how the result is consumed today, not
+    // a guarantee the query states -- which is the whole defect. This test
+    // guards the property going forward: it goes red the moment a refactor
+    // stops reading `rank_v` downstream (or the planner changes), because at
+    // that point the truncation reverts to a genuinely arbitrary subset.
+    //
+    // The FTS query term ("zzznomatchzzz") matches none of the seeded content,
+    // so `text_ranked` is empty and `fused` reduces to `vector_ranked` alone --
+    // isolating the vector arm from the fusion.
+    with_fixture(
+        "vector_arm_truncates_to_the_nearest_candidates_not_an_arbitrary_subset",
+        |fx| async move {
+            let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+
+            // 20 rows -- more than fetch_limit (limit=6 -> fetch_limit=12).
+            with_user_id(UserId::new("alice"), async {
+                for i in 0..20u32 {
+                    store
+                        .write(KnowledgeEntry::new(
+                            format!("row{i:02}"),
+                            format!("distinct filler content row {i}"),
+                            vec![],
+                        ))
+                        .await
+                        .unwrap_or_else(|e| panic!("write row{i:02}: {e}"));
+                }
+            })
+            .await;
+
+            // Embeddings at strictly increasing cosine distance from [1,0,0]:
+            // row00 is nearest, row19 is farthest.
+            for i in 0..20u32 {
+                let f = i as f32 * 0.01;
+                set_embedding(&fx.pool, &format!("row{i:02}"), vec![vec![1.0 - f, f, 0.0]]).await;
+            }
+
+            let hits = with_user_id(UserId::new("alice"), async {
+                store
+                    .search("zzznomatchzzz", vec![1.0, 0.0, 0.0], MODEL, None, None, 6)
+                    .await
+            })
+            .await
+            .expect("search")
+            .entries;
+            let ids: Vec<&str> = hits.iter().map(|e| e.id.as_str()).collect();
+            assert_eq!(
+                ids,
+                vec!["row00", "row01", "row02", "row03", "row04", "row05"],
+                "the vector arm's contribution must be exactly the 6 nearest \
+                 rows, nearest first, out of 20 candidates and a fetch_limit \
+                 of 12; got {ids:?}"
+            );
+            fx
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn text_arm_truncates_to_the_highest_ranked() {
+    // The lexical arm's `ORDER BY ts_rank_cd(...) DESC` already sits before its
+    // `LIMIT` in `text_ranked` -- this test pins that property rather than
+    // proving a fix, matching #1107's acceptance criterion for the lexical arm.
+    //
+    // No row carries an embedding, so `chunk_distances` (which requires
+    // `embedding IS NOT NULL`) is empty and `fused` reduces to `text_ranked`
+    // alone -- isolating the text arm from the fusion.
+    //
+    // Each row's content repeats "wobble" a different number of times, at a
+    // constant total word count, so `ts_rank_cd` (term-frequency weighted)
+    // ranks row00 highest and row19 lowest, strictly monotonically.
+    with_fixture(
+        "text_arm_truncates_to_the_highest_ranked",
+        |fx| async move {
+            let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+
+            // 20 rows -- more than fetch_limit (limit=6 -> fetch_limit=12).
+            with_user_id(UserId::new("alice"), async {
+                for i in 0..20u32 {
+                    let content = format!(
+                        "{}{}",
+                        "wobble ".repeat((20 - i) as usize),
+                        "pad ".repeat(i as usize)
+                    );
+                    store
+                        .write(KnowledgeEntry::new(format!("row{i:02}"), content, vec![]))
+                        .await
+                        .unwrap_or_else(|e| panic!("write row{i:02}: {e}"));
+                }
+            })
+            .await;
+
+            // A non-empty query_embedding routes through search_hybrid rather
+            // than the FTS-only fallback, even though no row is embedded.
+            let hits = with_user_id(UserId::new("alice"), async {
+                store
+                    .search("wobble", vec![1.0, 0.0, 0.0], MODEL, None, None, 6)
+                    .await
+            })
+            .await
+            .expect("search")
+            .entries;
+            let ids: Vec<&str> = hits.iter().map(|e| e.id.as_str()).collect();
+            assert_eq!(
+                ids,
+                vec!["row00", "row01", "row02", "row03", "row04", "row05"],
+                "the text arm's contribution must be exactly the 6 \
+                 highest-ranked rows, highest first, out of 20 candidates and \
+                 a fetch_limit of 12; got {ids:?}"
+            );
+            fx
+        },
+    )
+    .await;
+}
+
+// -- #1107 follow-up: RRF generates exact ties by construction (a row found
+// -- ONLY by one arm at rank 1 scores exactly `1/(60+1)`, whichever arm found
+// -- it), so `fused`'s `ORDER BY rrf_score DESC` alone leaves the truncation
+// -- undefined the same way a bare window `LIMIT` does. Unlike the
+// -- window-function sites, a tie here is directly constructible, so this
+// -- test is a real red-to-green reproduction, not a pin.
+
+#[tokio::test]
+async fn fused_search_truncates_to_a_defined_row_when_rrf_scores_tie() {
+    // "tie-a" is found ONLY by the text arm (it is the sole row containing
+    // the FTS query term "gronk", so it is rank_t = 1; it carries no
+    // embedding, so `chunk_distances` -- which requires `embedding IS NOT
+    // NULL` -- excludes it). "tie-b" is found ONLY by the vector arm (its
+    // embedding exactly matches the query vector, so min_distance = 0 and it
+    // is the sole, rank-1 member of `vector_ranked`; its content never
+    // matches the FTS query term).
+    //
+    // Both therefore score exactly `1.0 / (60 + 1)`: one term is the literal
+    // computation, the other is `COALESCE(..., 0)`. Same IEEE-754 formula,
+    // same operands -- an exact tie, not an approximate one.
+    //
+    // Both rows' `updated_at` is forced equal, so the second ORDER BY column
+    // also ties, leaving `id DESC` as the only column that can still decide
+    // the winner. "tie-b" > "tie-a" lexicographically, so `id DESC` must pick
+    // "tie-b" when `limit` truncates the tied pair down to 1.
+    //
+    // This assignment (not the reverse) is what makes the test a genuine
+    // red-to-green: probed directly, the pre-fix query's `FULL OUTER JOIN`
+    // consistently emits the text-arm-only row before the vector-arm-only row
+    // when their scores tie, regardless of which literal id carries which
+    // role. Naming the text-matched row "tie-a" (the lexicographically
+    // SMALLER id) makes that incidental behavior disagree with `id DESC`,
+    // so the assertion below fails before this PR's tiebreak and passes
+    // after it.
+    with_fixture(
+        "fused_search_truncates_to_a_defined_row_when_rrf_scores_tie",
+        |fx| async move {
+            let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+
+            with_user_id(UserId::new("alice"), async {
+                store
+                    .write(KnowledgeEntry::new(
+                        "tie-a",
+                        "the distinctive gronk term appears in this content",
+                        vec![],
+                    ))
+                    .await
+                    .expect("write tie-a");
+                store
+                    .write(KnowledgeEntry::new(
+                        "tie-b",
+                        "unrelated prose that never matches the query text",
+                        vec![],
+                    ))
+                    .await
+                    .expect("write tie-b");
+            })
+            .await;
+            set_embedding(&fx.pool, "tie-b", vec![vec![1.0, 0.0, 0.0]]).await;
+            // tie-a is left unembedded on purpose.
+
+            let same_instant = ts(9_000);
+            set_updated_at(&fx.pool, "tie-a", same_instant).await;
+            set_updated_at(&fx.pool, "tie-b", same_instant).await;
+
+            let hits = with_user_id(UserId::new("alice"), async {
+                store
+                    .search("gronk", vec![1.0, 0.0, 0.0], MODEL, None, None, 1)
+                    .await
+            })
+            .await
+            .expect("search")
+            .entries;
+            let ids: Vec<&str> = hits.iter().map(|e| e.id.as_str()).collect();
+            assert_eq!(
+                ids,
+                vec!["tie-b"],
+                "with an exact rrf_score tie and an equal updated_at, the \
+                 truncation to 1 row must be decided by id DESC (\"tie-b\" > \
+                 \"tie-a\"), not by an undefined physical row order; got \
+                 {ids:?}"
             );
             fx
         },
