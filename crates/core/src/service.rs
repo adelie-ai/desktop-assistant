@@ -3,7 +3,7 @@ use crate::context::{
     COMPACTION_TOKEN_RATIO, ContextProjection, ConversationView, DEFAULT_MAX_TOOL_RESULT_BYTES,
     MAX_CONTEXT_MESSAGES, MAX_OVERFLOW_RETRIES, MIN_CONTEXT_MESSAGES, RecoveryOutcome, ToolContext,
     ToolLocalityContext, TurnAnchors, assemble_turn_within_budget, cap_tool_result,
-    compact_into_summary, recover_from_overflow,
+    compact_into_summary, compact_preflight_shrink, recover_from_overflow, window_start,
 };
 use crate::domain::{
     Conversation, ConversationId, ConversationSummary, Message, Role, ToolCall, ToolDefinition,
@@ -470,12 +470,13 @@ pub struct ConversationHandler<S, L, T = NoopToolExecutor> {
     /// the tool set has one hash at a time, and a hash change just means the next
     /// miss recomputes under the same guard.
     categorize_lock: tokio::sync::Mutex<()>,
-    /// Optional reader for the reserved scratchpad `goal` note. When set, the
-    /// dispatch loop reads it each round and prefers it over the verbatim
-    /// user prompt as the task anchor, so a model-maintained goal survives
-    /// windowing/compaction. `None` (the default) preserves the prior
-    /// verbatim-prompt-only anchor behaviour.
-    scratchpad_goal_read: Option<ScratchpadGetManyFn>,
+    /// Optional reader for scratchpad notes by key. Two turn paths use it: the
+    /// dispatch loop reads the reserved `goal` note each round and prefers it
+    /// over the verbatim user prompt as the task anchor, and turn entry reads
+    /// the notes earlier turns distilled tool results into, to decide which
+    /// evictions it may carry (#1144). `None` (the default) leaves the anchor
+    /// on the verbatim prompt and every stored result read in full.
+    scratchpad_get_many: Option<ScratchpadGetManyFn>,
     /// Optional writer for scratchpad notes. When set, the planning tools
     /// (`begin_step`/`complete_step`, #240) are advertised each turn and the
     /// dispatch loop uses this to record plan todos + distilled step outcomes.
@@ -567,7 +568,7 @@ impl<S, L> ConversationHandler<S, L, NoopToolExecutor> {
             id_generator,
             namespace_cache: std::sync::Mutex::new(None),
             categorize_lock: tokio::sync::Mutex::new(()),
-            scratchpad_goal_read: None,
+            scratchpad_get_many: None,
             scratchpad_write: None,
             scratchpad_list: None,
             scratchpad_delete_subtree: None,
@@ -662,7 +663,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             id_generator,
             namespace_cache: std::sync::Mutex::new(None),
             categorize_lock: tokio::sync::Mutex::new(()),
-            scratchpad_goal_read: None,
+            scratchpad_get_many: None,
             scratchpad_write: None,
             scratchpad_list: None,
             scratchpad_delete_subtree: None,
@@ -707,13 +708,21 @@ impl<S, L, T> ConversationHandler<S, L, T> {
         self
     }
 
-    /// Wire a reader for the reserved scratchpad `goal` note. The dispatch
-    /// loop reads it once per tool round (a bounded single-key fetch) and,
-    /// when present, surfaces it as the conversation's task anchor in
-    /// preference to the verbatim user prompt — so a model-maintained,
-    /// evolving goal keeps showing up even after history is compacted away.
-    pub fn with_scratchpad_goal(mut self, goal_read: ScratchpadGetManyFn) -> Self {
-        self.scratchpad_goal_read = Some(goal_read);
+    /// Wire a reader for scratchpad notes by key. Two turn paths use it, and
+    /// both are bounded fetches:
+    ///
+    /// - once per tool round, the reserved `goal` note, surfaced as the
+    ///   conversation's task anchor in preference to the verbatim user prompt,
+    ///   so a model-maintained, evolving goal keeps showing up even after
+    ///   history is compacted away;
+    /// - once at turn entry, the notes earlier turns distilled tool results
+    ///   into, so a result already distilled reads as a pointer again instead
+    ///   of costing its whole payload a second time (#1144).
+    ///
+    /// Without it the anchor stays the verbatim prompt and every stored result
+    /// is read in full.
+    pub fn with_scratchpad_get_many(mut self, get_many: ScratchpadGetManyFn) -> Self {
+        self.scratchpad_get_many = Some(get_many);
         self
     }
 
@@ -826,6 +835,69 @@ impl<S, L, T> ConversationHandler<S, L, T> {
         self.turn_locks.lock().unwrap().len()
     }
 
+    /// Seed a fresh turn's projection from the eviction decisions earlier turns
+    /// recorded on the message rows (#1144).
+    ///
+    /// A completed step drops its raw tool results from the model's view and
+    /// names the scratchpad note it distilled them into on each row. Without
+    /// this the saving would end with the turn that made it: the next turn
+    /// loads the stored output and pays for the whole payload again, on every
+    /// turn until windowing carries it out of view.
+    ///
+    /// The pointer is rebuilt, never stored, so `conv.messages` keeps every byte
+    /// the tool returned - and it is rebuilt only for notes the scratchpad still
+    /// holds. Three cases fall back to the stored output, which is always safe
+    /// because it is the real thing:
+    ///
+    /// - no row carries a decision (the common case, and it costs no read),
+    /// - no scratchpad reader is wired,
+    /// - the read failed, or the note is no longer there.
+    ///
+    /// Only the rows the prompt can reach are considered, so the read stays a
+    /// single bounded fetch however long the conversation is. A row before the
+    /// widest window this turn can assemble is in no prompt, so a pointer for
+    /// it would save nothing.
+    async fn carry_recorded_evictions(
+        &self,
+        conversation_id: &ConversationId,
+        conv: &Conversation,
+        projection: &mut ContextProjection,
+    ) {
+        let from = window_start(&conv.messages, MAX_CONTEXT_MESSAGES);
+        let in_view = &conv.messages[from..];
+        let keys = planning::distilled_note_keys(in_view);
+        if keys.is_empty() {
+            return;
+        }
+        let Some(read) = &self.scratchpad_get_many else {
+            return;
+        };
+        let wanted = keys.len();
+        let notes = match read(conversation_id.0.clone(), keys, wanted).await {
+            Ok(notes) => notes,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "could not read the notes an earlier turn distilled results into; \
+                     this turn reads the stored output instead"
+                );
+                return;
+            }
+        };
+        let live: std::collections::HashSet<String> =
+            notes.into_iter().map(|note| note.key).collect();
+        let (carried, saved) = planning::carry_evictions(in_view, projection, &live);
+        if carried > 0 {
+            tracing::info!(
+                carried,
+                saved_bytes = saved,
+                notes_asked = wanted,
+                notes_found = live.len(),
+                "carried earlier turns' tool-result evictions into this turn"
+            );
+        }
+    }
+
     /// Handle a `begin_step` / `complete_step` control call (#240).
     ///
     /// These are core-loop tools, not tool-executor tools: only the dispatch
@@ -849,7 +921,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
     #[allow(clippy::too_many_arguments)]
     async fn handle_step_control(
         &self,
-        conv: &Conversation,
+        conv: &mut Conversation,
         projection: &mut ContextProjection,
         stack: &mut StepStack,
         call: &ToolCall,
@@ -995,7 +1067,12 @@ impl<S, L, T> ConversationHandler<S, L, T> {
         // not the note write above succeeded and whether or not the model
         // supplied an outcome.
         let (evicted, freed) =
-            planning::evict_tool_results(&conv.messages, projection, frame.watermark, &note_keys);
+            planning::evict_tool_results(
+                &mut conv.messages,
+                projection,
+                frame.watermark,
+                &note_keys,
+            );
         tracing::info!(
             step = %frame.key,
             evicted_results = evicted,
@@ -1549,7 +1626,14 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         // `conv.messages` - the transcript this turn persists - keeps the raw
         // output. The projection is turn-scoped and is dropped when the turn
         // ends.
+        //
+        // Turn-scoped is why it is seeded rather than started empty. The
+        // decisions earlier turns recorded on the rows are read back here, so a
+        // result already distilled into a note reads as a pointer from this
+        // turn's first round instead of costing its whole payload again.
         let mut projection = ContextProjection::default();
+        self.carry_recorded_evictions(conversation_id, &conv, &mut projection)
+            .await;
 
         // Count of in-turn ContextOverflow recoveries. Bounded so a
         // persistently-oversized request doesn't loop indefinitely.
@@ -1958,7 +2042,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
             // a model-maintained goal then keeps showing up even after history
             // is windowed/compacted away. Reading per round means a goal the
             // model wrote mid-turn surfaces on the next round.
-            let goal = match &self.scratchpad_goal_read {
+            let goal = match &self.scratchpad_get_many {
                 Some(read) => read(
                     conversation_id.0.clone(),
                     vec![SCRATCHPAD_GOAL_KEY.to_string()],
@@ -1971,7 +2055,10 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 .filter(|content| !content.trim().is_empty()),
                 None => None,
             };
-            let anchor = goal.as_deref().or(conv.active_task.as_deref());
+            // Owned, because the assembly below runs from a closure that
+            // takes the conversation as an argument - the fold between the two
+            // passes needs it mutably.
+            let anchor: Option<String> = goal.clone().or_else(|| conv.active_task.clone());
 
             // Re-read the pad and render its surfaces for this round: the open
             // plan as a compact tree (#240), the free-form note-key index
@@ -2003,31 +2090,58 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
             // The estimator borrows `&self.llm` so the closure is built
             // each iteration; constructing it is cheap (no allocation).
             let estimate = |text: &str| self.llm.estimate_tokens(text);
-            let assembled = assemble_turn_within_budget(
-                &ConversationView {
-                    messages: &conv.messages,
-                    summaries: &conv.summaries,
-                    context_summary: &conv.context_summary,
-                },
-                &ToolContext {
-                    tool_defs: &tool_defs,
-                    deferred_namespaces: deferred_ns,
-                    locality: Some(&tool_locality),
-                },
-                &TurnAnchors {
-                    active_task: anchor,
-                    plan: surfaces.plan.as_deref(),
-                    scratchpad_index: surfaces.scratchpad_index.as_deref(),
-                    working_state: surfaces.working_state,
-                    pinned: surfaces.pinned.as_deref(),
-                    recall: recall_surface,
-                    tool_rounds_since_anchor,
-                },
-                &projection,
-                target_window,
-                current_context_budget(),
-                &estimate,
-            );
+            let tool_ctx = ToolContext {
+                tool_defs: &tool_defs,
+                deferred_namespaces: deferred_ns,
+                locality: Some(&tool_locality),
+            };
+            let anchors = TurnAnchors {
+                active_task: anchor.as_deref(),
+                plan: surfaces.plan.as_deref(),
+                scratchpad_index: surfaces.scratchpad_index.as_deref(),
+                working_state: surfaces.working_state,
+                pinned: surfaces.pinned.as_deref(),
+                recall: recall_surface,
+                tool_rounds_since_anchor,
+            };
+            // Assembly is a pure function of its inputs, and this round may run
+            // it twice, so it takes the conversation as an argument rather than
+            // capturing it - the fold between the two passes needs it mutably.
+            // `assembly_window` is a copy of `target_window` for the same
+            // reason: overflow recovery shrinks that one later in the round.
+            let assembly_window = target_window;
+            let assemble = |conv: &Conversation| {
+                assemble_turn_within_budget(
+                    &ConversationView {
+                        messages: &conv.messages,
+                        summaries: &conv.summaries,
+                        context_summary: &conv.context_summary,
+                    },
+                    &tool_ctx,
+                    &anchors,
+                    &projection,
+                    assembly_window,
+                    current_context_budget(),
+                    &estimate,
+                )
+            };
+            let mut assembled = assemble(&conv);
+            // The pre-flight budget check inside assembly can narrow the window
+            // past what this loop asked for, and turn-entry compaction ran
+            // against the wider one. Whatever sits between the two window
+            // starts is then in neither the prompt nor the rolling summary, so
+            // fold it in and assemble again before the call. A no-op on a turn
+            // the check did not shrink, which is the normal case.
+            if compact_preflight_shrink(
+                &mut conv,
+                assembled.window_from,
+                assembly_window,
+                self.task_llm(),
+            )
+            .await
+            {
+                assembled = assemble(&conv);
+            }
             // Where the assembled prompt starts. Overflow recovery needs it,
             // because the pre-flight budget check inside assembly can narrow
             // the window past `target_window` and nothing else here would know.
@@ -2427,7 +2541,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                     }
                     let ack = self
                         .handle_step_control(
-                            &conv,
+                            &mut conv,
                             &mut projection,
                             &mut step_stack,
                             tool_call,
@@ -2818,7 +2932,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
 
         // Recompute the light task anchors so the wind-down prompt carries the
         // same [Current task]/[Plan] context the loop rounds did.
-        let goal = match &self.scratchpad_goal_read {
+        let goal = match &self.scratchpad_get_many {
             Some(read) => read(
                 conversation_id.0.clone(),
                 vec![SCRATCHPAD_GOAL_KEY.to_string()],
@@ -5862,6 +5976,190 @@ mod tests {
         // third-party read and this turn therefore ingested outside content
         // (#741). The step structure is recorded; the model's wording is not.
         assert_eq!(outcome.content, WITHHELD_STEP_TEXT);
+    }
+
+    /// A `ScratchpadGetManyFn` reading the same map [`in_memory_scratchpad`]
+    /// writes to, so a test can wire the note reader the carry consults and
+    /// delete a note between turns.
+    fn scratchpad_get_many_over(
+        store: Arc<Mutex<HashMap<String, crate::domain::ScratchpadNote>>>,
+    ) -> ScratchpadGetManyFn {
+        Arc::new(move |_conv: String, keys: Vec<String>, _limit: usize| {
+            let store = Arc::clone(&store);
+            Box::pin(async move {
+                let map = store.lock().unwrap();
+                Ok(keys.iter().filter_map(|k| map.get(k).cloned()).collect())
+            })
+        })
+    }
+
+    /// The three LLM answers a turn needs to run one step over one big tool
+    /// result: begin, call the tool, complete and answer.
+    fn one_step_turn_responses(answer: &str) -> Vec<LlmResponse> {
+        vec![
+            LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new(
+                    "b1",
+                    "begin_step",
+                    r#"{"goal":"get the forecast"}"#,
+                )],
+            ),
+            LlmResponse::with_tool_calls("", vec![ToolCall::new("t1", "weather_forecast", "{}")]),
+            LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new(
+                    "c1",
+                    "complete_step",
+                    r#"{"outcome":"7-day: highs low-80s, rain Tue"}"#,
+                )],
+            ),
+            LlmResponse::text(answer),
+        ]
+    }
+
+    /// #1144 acceptance: a conversation whose step completed on an earlier turn
+    /// assembles the pointer, not the raw result, while the message is still in
+    /// the window - and the stored transcript still holds every byte. Both
+    /// halves in one run, because the whole point is that one does not cost the
+    /// other (#798).
+    #[tokio::test]
+    async fn a_later_turn_reads_the_pointer_while_storage_keeps_the_raw_output() {
+        let big = "DATA".repeat(2000); // ~8 KB, well above the eviction threshold
+        let tools = vec![ToolDefinition::new(
+            "weather_forecast",
+            "Get a forecast",
+            serde_json::json!({"type": "object"}),
+        )];
+        let mut tool_results = HashMap::new();
+        tool_results.insert("weather_forecast".to_string(), big.clone());
+
+        let mut responses = one_step_turn_responses("Warm, with rain Tuesday.");
+        responses.push(LlmResponse::text("Still warm."));
+
+        let (write, list, sp) = in_memory_scratchpad();
+        let llm = ToolCallingLlm::new(responses);
+        let prompts = llm.prompts();
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            llm,
+            MockToolExecutor::new(tools, tool_results),
+            id_gen(),
+        )
+        .with_scratchpad_write(write)
+        .with_scratchpad_list(list)
+        .with_scratchpad_get_many(scratchpad_get_many_over(Arc::clone(&sp)));
+
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "weather?".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+
+        // A second turn, which loads the conversation back from storage and
+        // starts with an empty projection of its own.
+        handler
+            .send_prompt(
+                &conv.id,
+                "and tomorrow?".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await
+            .unwrap();
+
+        let read_by_model = last_prompt_result(&prompts, "t1");
+        assert!(
+            read_by_model.starts_with("<compacted to scratchpad"),
+            "a later turn must still read the pointer, got: {read_by_model}"
+        );
+        assert!(
+            read_by_model.contains("outcome:1"),
+            "the rebuilt pointer names the note: {read_by_model}"
+        );
+        assert!(
+            !read_by_model.contains("DATADATA"),
+            "the payload must not come back into working context on a later turn"
+        );
+
+        let stored = handler.get_conversation(&conv.id).await.unwrap();
+        let result = stored
+            .messages
+            .iter()
+            .find(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some("t1"))
+            .expect("the tool result message must still exist");
+        assert_eq!(
+            result.content, big,
+            "the stored transcript must keep what the tool returned"
+        );
+        assert_eq!(
+            result.distilled_into,
+            vec!["outcome:1".to_string()],
+            "the row carries the decision that rebuilt the pointer"
+        );
+    }
+
+    /// #798's failure mode must not return through the marker. A best-effort
+    /// note write followed by an unconditional eviction is how raw output was
+    /// lost; a decision whose note is gone falls back to the stored output.
+    #[tokio::test]
+    async fn a_later_turn_reads_the_raw_output_when_the_distilling_note_is_gone() {
+        let big = "DATA".repeat(2000);
+        let tools = vec![ToolDefinition::new(
+            "weather_forecast",
+            "Get a forecast",
+            serde_json::json!({"type": "object"}),
+        )];
+        let mut tool_results = HashMap::new();
+        tool_results.insert("weather_forecast".to_string(), big.clone());
+
+        let mut responses = one_step_turn_responses("Warm, with rain Tuesday.");
+        responses.push(LlmResponse::text("Still warm."));
+
+        let (write, list, sp) = in_memory_scratchpad();
+        let llm = ToolCallingLlm::new(responses);
+        let prompts = llm.prompts();
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            llm,
+            MockToolExecutor::new(tools, tool_results),
+            id_gen(),
+        )
+        .with_scratchpad_write(write)
+        .with_scratchpad_list(list)
+        .with_scratchpad_get_many(scratchpad_get_many_over(Arc::clone(&sp)));
+
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "weather?".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+
+        // The distilled trace goes away between turns - a user cleared the pad,
+        // or the model deleted the note.
+        sp.lock().unwrap().remove("outcome:1");
+
+        handler
+            .send_prompt(
+                &conv.id,
+                "and tomorrow?".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await
+            .unwrap();
+
+        let read_by_model = last_prompt_result(&prompts, "t1");
+        assert_eq!(
+            read_by_model, big,
+            "with no note left to point at, the turn must read the stored output"
+        );
     }
 
     // #287 slice 6: the hard-coded complete_step cascade + its lifecycle gate.
@@ -10585,7 +10883,7 @@ mod tests {
             NoopToolExecutor,
             Box::new(|| "conv-goal-1".to_string()),
         )
-        .with_scratchpad_goal(goal_reader("Ship the scratchpad, then promote learnings"));
+        .with_scratchpad_get_many(goal_reader("Ship the scratchpad, then promote learnings"));
 
         let conv = handler
             .create_conversation("t".into(), vec![])
@@ -10629,7 +10927,7 @@ mod tests {
             NoopToolExecutor,
             Box::new(|| "conv-goal-2".to_string()),
         )
-        .with_scratchpad_goal(empty_reader);
+        .with_scratchpad_get_many(empty_reader);
 
         let conv = handler
             .create_conversation("t".into(), vec![])

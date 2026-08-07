@@ -44,21 +44,29 @@ pub struct ToolUsage {
     /// signal you want, not 0.
     pub call_count: u32,
     /// Result bytes still resident in the conversation.
+    ///
+    /// Resident in the conversation, not in the prompt: a result an evicted
+    /// step carries a pointer for is still stored whole, and still counted
+    /// whole here. The two numbers differ on purpose - this view reports what
+    /// the conversation holds, and the pointer reports what the model reads.
     pub result_bytes: u64,
     /// Largest single resident result. Separates a steady trickle from one
     /// enormous dump — the case `result_bytes` alone hides.
     pub max_result_bytes: u64,
-    /// Stored results whose content is a compaction pointer rather than the
-    /// tool's own output.
+    /// Stored results the model reads as a compaction pointer rather than as
+    /// the tool's own output.
     ///
-    /// Step completion and overflow recovery both drop results from the
-    /// model's view, and both now do it in the turn's context projection, so
-    /// the stored transcript keeps the output and this count stays at zero.
-    /// A non-zero count therefore reads history: a conversation compacted by
-    /// an earlier version, whose original result size is not recoverable
-    /// because the pointer recorded nothing about what it displaced. For those
-    /// rows `result_bytes` is what the tool costs now, and this count is the
-    /// honest marker that it once cost more.
+    /// Counts both shapes an eviction has taken. A completed step records the
+    /// decision on the row (`Message::distilled_into`) and leaves the output
+    /// alone, so a later turn rebuilds the pointer while the transcript keeps
+    /// every byte; those rows are counted here and their bytes still count
+    /// toward `result_bytes`.
+    ///
+    /// The other shape reads history: a conversation compacted by a version
+    /// that overwrote the row, whose content IS the pointer. Its original size
+    /// is not recoverable, because the pointer recorded nothing about what it
+    /// displaced, so `result_bytes` is what the tool costs now and this count
+    /// is the honest marker that it once cost more.
     pub evicted_results: u32,
     /// Message ordinal of the first / last call, so a caller can jump straight
     /// to where a tool entered the conversation and line usage up against the

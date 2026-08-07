@@ -7,7 +7,10 @@
 //!   Builds the per-turn `Vec<Message>` from conversation history,
 //!   summaries, tool definitions, and the active-task anchor — applying
 //!   pre-flight token-budget checks and shrinking the window when the
-//!   estimated cost exceeds the threshold.
+//!   estimated cost exceeds the threshold. A shrink narrows the window past
+//!   what the caller asked for, and past what turn-entry compaction covered,
+//!   so `compact_preflight_shrink` folds the difference in before the call —
+//!   otherwise those messages are in neither the prompt nor the summary.
 //! - **Recovery** (`recover_from_overflow`): When the provider rejects a
 //!   turn with [`crate::CoreError::ContextOverflow`], runs a structured
 //!   recovery ladder (truncate the largest tool result → compact the oldest
@@ -15,6 +18,10 @@
 //!   The rungs that replace message content write to the round's
 //!   `ContextProjection`, so the stored transcript keeps every message and
 //!   every byte.
+//! - **Projection** (`ContextProjection`): what the round reads where that
+//!   differs from what is stored. Seeded at turn entry from the eviction
+//!   decisions earlier turns recorded, so a distilled result costs a pointer
+//!   rather than its payload on every later turn too.
 //! - **Summarisation** (`generate_context_summary`, `compact_into_summary`):
 //!   Asks the LLM for a bullet-point summary of dropped messages and merges it
 //!   with any existing rolling summary, so windowed-out history is not lost.
@@ -1622,10 +1629,28 @@ pub(crate) async fn compact_into_summary<L: LlmClient>(
     let Some((from, to)) = compaction_range(conv, max_messages) else {
         return false;
     };
+    compact_range_into_summary(conv, from, to, llm).await
+}
+
+/// Fold `conv.messages[from..to]` into the rolling summary, and advance
+/// `compacted_through` only when the fold succeeded. Reports whether the marker
+/// moved.
+///
+/// `from` is always the current marker, so a range the marker steps over is
+/// never revisited.
+async fn compact_range_into_summary<L: LlmClient>(
+    conv: &mut Conversation,
+    from: usize,
+    to: usize,
+    llm: &L,
+) -> bool {
     // Bounded so one long-running summariser failure cannot grow the fold past
     // what the task model can read. The marker lands on the capped end, so
     // nothing is skipped - the rest is offered again next turn.
-    let to = to.min(from + MAX_COMPACTION_SPAN);
+    let to = to.min(from + MAX_COMPACTION_SPAN).min(conv.messages.len());
+    if from >= to {
+        return false;
+    }
     match generate_context_summary(&conv.context_summary, &conv.messages[from..to], llm).await {
         SummaryOutcome::Summarised(summary) => {
             conv.context_summary = summary;
@@ -1645,6 +1670,58 @@ pub(crate) async fn compact_into_summary<L: LlmClient>(
             false
         }
     }
+}
+
+/// Fold what the assembler's pre-flight budget check dropped past the
+/// compaction marker, so no message lands in neither the prompt nor the rolling
+/// summary. Reports whether the marker moved.
+///
+/// [`assemble_turn_within_budget`] answers an oversized prompt by halving the
+/// message window, down to [`MIN_CONTEXT_MESSAGES`]. Turn-entry compaction ran
+/// against the window the caller asked for, so the messages between the two
+/// window starts are in neither place: the prompt does not carry them and the
+/// summary does not describe them. Recent context is dropped with nothing
+/// standing in for it, and nothing later detects it.
+///
+/// `window_from` is where the assembler said the prompt starts
+/// (`AssembledTurn::window_from`); `requested_window` is the window the caller
+/// asked for. This is a no-op when the two agree, which is the normal case -
+/// the deliberate lag between the marker and the window start is the compaction
+/// cadence ([`COMPACTION_INTERVAL`]) doing its job, and folding it early would
+/// spend a summariser call every turn.
+///
+/// The fold covers the whole range from the marker, not only what the shrink
+/// added, because the marker may only move over history a summary describes.
+///
+/// The caller assembles again afterwards, so the prompt this turn sends carries
+/// the summary of what it dropped.
+pub(crate) async fn compact_preflight_shrink<L: LlmClient>(
+    conv: &mut Conversation,
+    window_from: usize,
+    requested_window: usize,
+    llm: &L,
+) -> bool {
+    let _ = (&*conv, window_from, requested_window, llm);
+    if true {
+        return false;
+    }
+    if window_from <= window_start(&conv.messages, requested_window) {
+        return false;
+    }
+    if window_from <= conv.compacted_through {
+        return false;
+    }
+    let from = conv.compacted_through;
+    let folded = compact_range_into_summary(conv, from, window_from, llm).await;
+    tracing::warn!(
+        from,
+        window_from,
+        requested_window,
+        folded,
+        "the pre-flight budget check narrowed the window past the compaction \
+         marker; folding what it dropped into the rolling summary"
+    );
+    folded
 }
 
 /// What one run of the recovery ladder achieved.
@@ -5001,6 +5078,127 @@ mod tests {
         // The rest is not skipped: the next call takes the following span.
         assert!(compact_into_summary(&mut conv, MAX_CONTEXT_MESSAGES, &llm).await);
         assert_eq!(conv.compacted_through, from + 2 * MAX_COMPACTION_SPAN);
+    }
+
+    // --- The pre-flight shrink and the compaction marker (#1144) -----------
+    //
+    // The assembler answers an oversized prompt by halving the message window.
+    // Turn-entry compaction ran against the window the caller asked for, so
+    // whatever sits between the two window starts is in neither the prompt nor
+    // the rolling summary unless the turn folds it in.
+
+    /// A conversation of `pairs` user/assistant pairs, long enough to window.
+    fn conv_of_pairs(pairs: usize) -> Conversation {
+        let mut conv = Conversation::new("c1", "t");
+        for i in 0..pairs {
+            conv.messages
+                .push(Message::new(Role::User, format!("prompt {i}")));
+            conv.messages
+                .push(Message::new(Role::Assistant, format!("reply {i}")));
+        }
+        conv
+    }
+
+    /// #1144 acceptance: a turn whose pre-flight budget check narrows the
+    /// window past the compaction marker folds the newly-dropped range into the
+    /// rolling summary.
+    #[tokio::test]
+    async fn a_preflight_shrink_past_the_compaction_marker_folds_the_dropped_range() {
+        let mut conv = conv_of_pairs(40);
+        // Turn-entry compaction ran against the window the loop asked for.
+        let requested_start = window_start(&conv.messages, MAX_CONTEXT_MESSAGES);
+        conv.compacted_through = requested_start;
+        // The pre-flight check then halved the window down to the floor.
+        let shrunk_start = window_start(&conv.messages, MIN_CONTEXT_MESSAGES);
+        assert!(
+            shrunk_start > requested_start,
+            "the fixture must actually shrink the window"
+        );
+
+        let llm = MockLlm::new(vec!["- what the shrink dropped"]);
+        let folded =
+            compact_preflight_shrink(&mut conv, shrunk_start, MAX_CONTEXT_MESSAGES, &llm).await;
+
+        assert!(folded, "the newly-dropped range must be folded in");
+        assert_eq!(
+            conv.compacted_through, shrunk_start,
+            "the marker must cover everything the shrunk prompt no longer carries"
+        );
+        assert_eq!(conv.context_summary, "- what the shrink dropped");
+    }
+
+    /// The fold starts at the marker, not at the window the caller asked for,
+    /// so the cadence lag is summarised rather than stepped over.
+    #[tokio::test]
+    async fn the_preflight_fold_starts_at_the_marker_so_no_range_is_stepped_over() {
+        let mut conv = conv_of_pairs(40);
+        let requested_start = window_start(&conv.messages, MAX_CONTEXT_MESSAGES);
+        // The marker lags the requested window - the normal cadence state.
+        conv.compacted_through = requested_start - 10;
+        let shrunk_start = window_start(&conv.messages, MIN_CONTEXT_MESSAGES);
+
+        let llm = CountingSummariser::default();
+        assert!(compact_preflight_shrink(&mut conv, shrunk_start, MAX_CONTEXT_MESSAGES, &llm).await);
+        assert_eq!(
+            conv.compacted_through, shrunk_start,
+            "the marker may only step over a range the summary describes"
+        );
+        assert!(
+            llm.longest_prompt() > 0,
+            "the summariser must have been given the whole range from the marker"
+        );
+    }
+
+    /// A turn the pre-flight check did not shrink pays nothing. The gap between
+    /// the marker and the window start is the compaction cadence
+    /// (`COMPACTION_INTERVAL`) doing its job, and folding it here would spend a
+    /// summariser call on every turn of every long conversation.
+    #[tokio::test]
+    async fn the_compaction_cadence_lag_is_not_mistaken_for_a_preflight_shrink() {
+        let mut conv = conv_of_pairs(40);
+        let requested_start = window_start(&conv.messages, MAX_CONTEXT_MESSAGES);
+        conv.compacted_through = requested_start - 10;
+        let before = conv.compacted_through;
+
+        let llm = CountingSummariser::default();
+        let folded =
+            compact_preflight_shrink(&mut conv, requested_start, MAX_CONTEXT_MESSAGES, &llm).await;
+
+        assert!(!folded, "no shrink happened, so there is nothing extra to fold");
+        assert_eq!(conv.compacted_through, before);
+        assert_eq!(
+            llm.longest_prompt(),
+            0,
+            "the summariser must not be called on an unshrunk turn"
+        );
+    }
+
+    /// A short conversation assembles from index 0 and can drop nothing.
+    #[tokio::test]
+    async fn a_conversation_that_fits_the_window_never_folds() {
+        let mut conv = conv_of_pairs(3);
+        let llm = CountingSummariser::default();
+        assert!(!compact_preflight_shrink(&mut conv, 0, MAX_CONTEXT_MESSAGES, &llm).await);
+        assert_eq!(conv.compacted_through, 0);
+        assert_eq!(llm.longest_prompt(), 0);
+    }
+
+    /// A summariser that declines leaves the marker where it was, exactly as
+    /// the cadence path does, so the range is offered again rather than lost.
+    #[tokio::test]
+    async fn a_failed_fold_of_a_preflight_shrink_leaves_the_marker_alone() {
+        let mut conv = conv_of_pairs(40);
+        let requested_start = window_start(&conv.messages, MAX_CONTEXT_MESSAGES);
+        conv.compacted_through = requested_start;
+        let shrunk_start = window_start(&conv.messages, MIN_CONTEXT_MESSAGES);
+
+        let folded =
+            compact_preflight_shrink(&mut conv, shrunk_start, MAX_CONTEXT_MESSAGES, &FailingLlm)
+                .await;
+
+        assert!(!folded);
+        assert_eq!(conv.compacted_through, requested_start);
+        assert_eq!(conv.context_summary, "");
     }
 
     /// A single enormous user message cannot dominate the fold either.

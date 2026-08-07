@@ -1,0 +1,16 @@
+-- #1144: record a completed step's tool-result eviction DECISION on the message
+-- row, so the saving lasts past the turn that made it.
+--
+-- The column names the scratchpad notes the result was distilled into. It never
+-- holds the replacement text: `content` keeps every byte the tool returned, and
+-- the turn rebuilds the pointer from these keys into its own projection. That is
+-- what separates this from the pre-#798 behaviour, which overwrote the stored
+-- output and destroyed the observation layer the knowledge base reads.
+--
+-- An array rather than one key, because a step may distil a result into more
+-- than one note and a pointer that names fewer notes than the eviction used is
+-- a pointer that lies. NULL and the empty array both mean "no decision
+-- recorded", which is every row a step has not evicted.
+--
+-- Nullable, forward-only, and idempotent.
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS distilled_into TEXT[];

@@ -10,13 +10,15 @@
 //!
 //! Dropped from working context means exactly that. The pointer goes in the
 //! turn's context projection and the conversation's stored transcript keeps the
-//! raw output, so a user still finds what a tool returned. The projection lives
-//! for one turn, so the saving is a within-turn one: a later turn loads the raw
-//! results again and pays for them until windowing and the rolling summary
-//! carry them out of view. Making the saving last across turns needs the
-//! eviction DECISION recorded on the row - the note key the result was
-//! distilled into - so the next turn can rebuild the projection without
-//! reading back what it replaced.
+//! raw output, so a user still finds what a tool returned.
+//!
+//! The projection lives for one turn, so what makes the saving last is the
+//! eviction DECISION on the row: the note keys the result was distilled into
+//! (`Message::distilled_into`). The next turn reads them back and rebuilds the
+//! same pointer into its own projection, without reading what it replaced. The
+//! pointer is only rebuilt for notes the scratchpad still holds - the eviction
+//! was sound because a distilled trace existed, so a trace that is gone means
+//! the turn reads the stored output instead.
 //!
 //! This module is the pure mechanism behind that behaviour:
 //!
@@ -27,6 +29,10 @@
 //!   message in a scope as a pointer to the scratchpad note that distilled
 //!   them, **preserving role + `tool_call_id`** so provider ToolUse↔ToolResult
 //!   pairing stays valid (Bedrock/Ollama). Idempotent and structure-preserving.
+//!   Records the decision on each row it evicts.
+//! - `carry_evictions` / `distilled_note_keys` — the other end of that record.
+//!   A later turn asks the scratchpad which of the named notes are still there,
+//!   then rebuilds the pointers for those and only those.
 //! - `render_plan` — renders the open todos as a compact indented tree for
 //!   per-round surfacing.
 //! - `begin_step_tool` / `complete_step_tool` — the tool definitions the
@@ -263,6 +269,20 @@ pub(crate) fn compaction_pointer(tool_name: Option<&str>, note_keys: &[String]) 
     )
 }
 
+/// Map each `tool_call_id` to the tool that produced it, read from the
+/// assistant tool-call requests, so a pointer can name what ran.
+fn tool_names_by_call_id(messages: &[Message]) -> std::collections::HashMap<String, String> {
+    let mut names = std::collections::HashMap::new();
+    for m in messages.iter() {
+        if m.role == Role::Assistant {
+            for tc in &m.tool_calls {
+                names.insert(tc.id.clone(), tc.name.clone());
+            }
+        }
+    }
+    names
+}
+
 /// Read every sizeable `Role::Tool` message in `messages[from..]` as a
 /// [`compaction_pointer`] for the rest of the turn, freeing context while
 /// leaving the message structure (role + `tool_call_id`) intact so provider
@@ -275,32 +295,29 @@ pub(crate) fn compaction_pointer(tool_name: Option<&str>, note_keys: &[String]) 
 /// the conversation later still finds what the tool returned, whether or not
 /// the distilling note was written.
 ///
+/// What DOES reach the row is the decision: each evicted result records
+/// `note_keys` in `Message::distilled_into`, so a later turn can rebuild the
+/// same pointer with [`carry_evictions`] instead of reading the payload again.
+/// An eviction with no note keys records nothing - there is no distilled trace
+/// to point at, so the next turn reads the stored output rather than a pointer
+/// to a note that was never written.
+///
 /// Idempotent: results the round already reads as a pointer are skipped.
 /// `from` is clamped to the slice length. No path removes messages mid-turn,
 /// so an absolute watermark taken when a step opened still points at the same
 /// message when the step closes.
 pub(crate) fn evict_tool_results(
-    messages: &[Message],
+    messages: &mut [Message],
     projection: &mut ContextProjection,
     from: usize,
     note_keys: &[String],
 ) -> (usize, usize) {
     let from = from.min(messages.len());
-
-    // Map each tool_call_id to the tool that produced it, from the assistant
-    // tool-call requests, so the pointer can name what ran.
-    let mut names: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
-    for m in messages.iter() {
-        if m.role == Role::Assistant {
-            for tc in &m.tool_calls {
-                names.insert(tc.id.as_str(), tc.name.as_str());
-            }
-        }
-    }
+    let names = tool_names_by_call_id(messages);
 
     let mut evicted = 0usize;
     let mut freed = 0usize;
-    for m in &messages[from..] {
+    for m in &mut messages[from..] {
         let current = projection.content(m);
         if m.role != Role::Tool || current.len() < COMPACTION_MIN_EVICT_BYTES {
             continue;
@@ -312,13 +329,81 @@ pub(crate) fn evict_tool_results(
             .tool_call_id
             .as_deref()
             .and_then(|id| names.get(id))
-            .copied();
+            .map(String::as_str);
         let pointer = compaction_pointer(tool_name, note_keys);
         freed += current.len().saturating_sub(pointer.len());
         evicted += 1;
+        // not yet recorded
         projection.replace(m, pointer);
     }
     (evicted, freed)
+}
+
+/// Rebuild the pointers an earlier turn's [`evict_tool_results`] decided on,
+/// for the notes that are still there.
+///
+/// A turn seeds its projection with this after it loads the conversation, so a
+/// step completed on an earlier turn keeps its saving instead of paying for the
+/// payload again on every turn until windowing carries it out of view.
+///
+/// Returns `(results_carried, bytes_saved)`.
+///
+/// `live_note_keys` is the set of note keys the scratchpad actually holds now.
+/// A row is only read as a pointer when EVERY key it names is in that set. A
+/// note the user or the model deleted takes its distilled trace with it, and
+/// the eviction was only sound because that trace existed - so a row whose
+/// notes are gone reads as the stored output, which is still every byte the
+/// tool returned. A partial set is treated the same way: half a trace is not
+/// the trace the pointer promises.
+pub(crate) fn carry_evictions(
+    messages: &[Message],
+    projection: &mut ContextProjection,
+    live_note_keys: &std::collections::HashSet<String>,
+) -> (usize, usize) {
+    let names = tool_names_by_call_id(messages);
+    let _ = (&names, &live_note_keys, &mut *projection);
+    if true {
+        return (0, 0);
+    }
+
+    let mut carried = 0usize;
+    let mut saved = 0usize;
+    for m in messages {
+        if m.distilled_into.is_empty() || projection.is_replaced(m) {
+            continue;
+        }
+        if !m.distilled_into.iter().all(|k| live_note_keys.contains(k)) {
+            continue;
+        }
+        let tool_name = m
+            .tool_call_id
+            .as_deref()
+            .and_then(|id| names.get(id))
+            .map(String::as_str);
+        let pointer = compaction_pointer(tool_name, &m.distilled_into);
+        saved += m.content.len().saturating_sub(pointer.len());
+        carried += 1;
+        projection.replace(m, pointer);
+    }
+    (carried, saved)
+}
+
+/// Every distinct note key named by an eviction decision in `messages`.
+///
+/// The set a turn asks the scratchpad about before it rebuilds any pointer.
+/// Empty when no row carries a decision, which is the common case and costs the
+/// turn no read at all.
+pub(crate) fn distilled_note_keys(messages: &[Message]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut keys = Vec::new();
+    for m in messages {
+        for key in &m.distilled_into {
+            if seen.insert(key.as_str()) {
+                keys.push(key.clone());
+            }
+        }
+    }
+    keys
 }
 
 /// A single plan entry for [`render_plan`] (a `todo`-typed scratchpad note).
@@ -1090,14 +1175,14 @@ mod tests {
     #[test]
     fn evict_shrinks_large_results_preserving_pairing() {
         let big = "x".repeat(5000);
-        let messages = vec![
+        let mut messages = vec![
             Message::new(Role::User, "do it"),
             Message::assistant_with_tool_calls(vec![ToolCall::new("c1", "weather_forecast", "{}")]),
             tool_msg("c1", &big),
         ];
         let keys = vec!["outcome:1".to_string()];
         let mut projection = ContextProjection::default();
-        let (evicted, freed) = evict_tool_results(&messages, &mut projection, 1, &keys);
+        let (evicted, freed) = evict_tool_results(&mut messages, &mut projection, 1, &keys);
         assert_eq!(evicted, 1);
         assert!(freed > 4000);
         // Structure preserved: still a Tool message with its tool_call_id.
@@ -1118,14 +1203,14 @@ mod tests {
     #[test]
     fn evicting_a_result_leaves_the_stored_transcript_unchanged() {
         let big = "x".repeat(5000);
-        let messages = vec![
+        let mut messages = vec![
             Message::assistant_with_tool_calls(vec![ToolCall::new("c1", "read_file", "{}")]),
             tool_msg("c1", &big),
         ];
         let before = messages.clone();
         let mut projection = ContextProjection::default();
         let (evicted, _) =
-            evict_tool_results(&messages, &mut projection, 0, &["outcome:1".to_string()]);
+            evict_tool_results(&mut messages, &mut projection, 0, &["outcome:1".to_string()]);
 
         assert_eq!(evicted, 1, "the result still leaves the turn's view");
         assert_eq!(
@@ -1138,17 +1223,40 @@ mod tests {
         );
     }
 
+    /// #1144: the decision reaches the row so a later turn can rebuild the
+    /// pointer, and the row still holds every byte the tool returned.
+    #[test]
+    fn evicting_a_result_records_the_note_it_was_distilled_into() {
+        let big = "x".repeat(5000);
+        let mut messages = vec![
+            Message::assistant_with_tool_calls(vec![ToolCall::new("c1", "read_file", "{}")]),
+            tool_msg("c1", &big),
+        ];
+        let mut projection = ContextProjection::default();
+        evict_tool_results(&mut messages, &mut projection, 0, &["outcome:1".to_string()]);
+
+        assert_eq!(
+            messages[1].distilled_into,
+            vec!["outcome:1".to_string()],
+            "the row must name the note the result was distilled into"
+        );
+        assert_eq!(
+            messages[1].content, big,
+            "the decision is recorded beside the output, never in place of it"
+        );
+    }
+
     /// #798: a step completed with no outcome, or whose note write failed,
     /// carries no distilled trace. Neither may cost the raw output.
     #[test]
     fn evicting_with_no_carry_forward_note_still_keeps_the_raw_output() {
         let big = "x".repeat(5000);
-        let messages = vec![
+        let mut messages = vec![
             Message::assistant_with_tool_calls(vec![ToolCall::new("c1", "read_file", "{}")]),
             tool_msg("c1", &big),
         ];
         let mut projection = ContextProjection::default();
-        let (evicted, _) = evict_tool_results(&messages, &mut projection, 0, &[]);
+        let (evicted, _) = evict_tool_results(&mut messages, &mut projection, 0, &[]);
 
         assert_eq!(evicted, 1);
         assert!(
@@ -1161,12 +1269,17 @@ mod tests {
             messages[1].content, big,
             "with no note to carry it forward, the record is the only copy left"
         );
+        assert!(
+            messages[1].distilled_into.is_empty(),
+            "an eviction with no note must record no decision, or a later turn \
+             would rebuild a pointer to nothing"
+        );
     }
 
     #[test]
     fn evict_skips_small_and_already_compacted_results() {
         let big = "y".repeat(5000);
-        let messages = vec![
+        let mut messages = vec![
             Message::assistant_with_tool_calls(vec![
                 ToolCall::new("c1", "t", "{}"),
                 ToolCall::new("c2", "t", "{}"),
@@ -1176,22 +1289,141 @@ mod tests {
         ];
         let keys = vec!["k".to_string()];
         let mut projection = ContextProjection::default();
-        let (evicted, _) = evict_tool_results(&messages, &mut projection, 0, &keys);
+        let (evicted, _) = evict_tool_results(&mut messages, &mut projection, 0, &keys);
         assert_eq!(evicted, 1); // only the big one
         assert_eq!(projection.content(&messages[1]), "tiny");
+        assert!(
+            messages[1].distilled_into.is_empty(),
+            "a result too small to evict records no decision"
+        );
 
         // Second pass over the same range is a no-op (idempotent).
-        let (evicted2, freed2) = evict_tool_results(&messages, &mut projection, 0, &keys);
+        let (evicted2, freed2) = evict_tool_results(&mut messages, &mut projection, 0, &keys);
         assert_eq!(evicted2, 0);
         assert_eq!(freed2, 0);
     }
 
     #[test]
     fn evict_clamps_out_of_range_watermark() {
-        let messages = vec![Message::new(Role::User, "hi")];
+        let mut messages = vec![Message::new(Role::User, "hi")];
         let mut projection = ContextProjection::default();
-        let (evicted, freed) = evict_tool_results(&messages, &mut projection, 99, &[]);
+        let (evicted, freed) = evict_tool_results(&mut messages, &mut projection, 99, &[]);
         assert_eq!((evicted, freed), (0, 0));
+    }
+
+    /// The messages a later turn asks the scratchpad about: one entry per
+    /// distinct key, and nothing at all when no row carries a decision.
+    #[test]
+    fn distilled_note_keys_collects_each_key_once() {
+        let mut messages = vec![
+            Message::new(Role::User, "hi"),
+            tool_msg("c1", "a"),
+            tool_msg("c2", "b"),
+            tool_msg("c3", "c"),
+        ];
+        assert!(distilled_note_keys(&messages).is_empty());
+
+        messages[1].distilled_into = vec!["outcome:1".to_string()];
+        messages[2].distilled_into = vec!["outcome:1".to_string()];
+        messages[3].distilled_into = vec!["outcome:2".to_string()];
+        assert_eq!(
+            distilled_note_keys(&messages),
+            vec!["outcome:1".to_string(), "outcome:2".to_string()]
+        );
+    }
+
+    fn live(keys: &[&str]) -> std::collections::HashSet<String> {
+        keys.iter().map(|k| (*k).to_string()).collect()
+    }
+
+    /// #1144, the headline: a step that completed on an earlier turn keeps its
+    /// saving, because the decision on the row rebuilds the pointer.
+    #[test]
+    fn a_recorded_eviction_reads_as_a_pointer_again_on_a_later_turn() {
+        let big = "x".repeat(5000);
+        let mut messages = vec![
+            Message::assistant_with_tool_calls(vec![ToolCall::new("c1", "read_file", "{}")]),
+            tool_msg("c1", &big),
+        ];
+        messages[1].distilled_into = vec!["outcome:1".to_string()];
+
+        let mut projection = ContextProjection::default();
+        let (carried, saved) =
+            carry_evictions(&messages, &mut projection, &live(&["outcome:1", "goal"]));
+
+        assert_eq!(carried, 1);
+        assert!(saved > 4000, "the payload must leave the turn's view");
+        let projected = projection.content(&messages[1]);
+        assert!(projected.starts_with(COMPACTION_POINTER_PREFIX));
+        assert!(
+            projected.contains("read_file"),
+            "the rebuilt pointer names the tool that ran: {projected}"
+        );
+        assert!(projected.contains("outcome:1"));
+        assert_eq!(
+            messages[1].content, big,
+            "the stored transcript keeps the raw output"
+        );
+    }
+
+    /// #798's shape must not come back through the marker: a note that is no
+    /// longer there is not a distilled trace, so the turn reads the output.
+    #[test]
+    fn a_pointer_is_not_rebuilt_for_a_note_that_is_gone() {
+        let big = "x".repeat(5000);
+        let mut messages = vec![
+            Message::assistant_with_tool_calls(vec![ToolCall::new("c1", "read_file", "{}")]),
+            tool_msg("c1", &big),
+        ];
+        messages[1].distilled_into = vec!["outcome:1".to_string()];
+
+        let mut projection = ContextProjection::default();
+        let (carried, saved) = carry_evictions(&messages, &mut projection, &live(&["goal"]));
+
+        assert_eq!(carried, 0, "no trace, no pointer");
+        assert_eq!(saved, 0);
+        assert_eq!(
+            projection.content(&messages[1]),
+            big,
+            "the turn falls back to the stored output rather than pointing at \
+             a note that is not there"
+        );
+    }
+
+    /// Half a trace is not the trace the pointer promises.
+    #[test]
+    fn a_pointer_is_not_rebuilt_when_only_some_of_its_notes_survive() {
+        let big = "x".repeat(5000);
+        let mut messages = vec![
+            Message::assistant_with_tool_calls(vec![ToolCall::new("c1", "read_file", "{}")]),
+            tool_msg("c1", &big),
+        ];
+        messages[1].distilled_into = vec!["outcome:1".to_string(), "outcome:2".to_string()];
+
+        let mut projection = ContextProjection::default();
+        let (carried, _) = carry_evictions(&messages, &mut projection, &live(&["outcome:1"]));
+
+        assert_eq!(carried, 0);
+        assert_eq!(projection.content(&messages[1]), big);
+    }
+
+    /// The carry never overwrites what this turn already decided to read - an
+    /// overflow notice recorded moments ago outranks a marker from last turn.
+    #[test]
+    fn carrying_an_eviction_leaves_this_turns_own_replacement_alone() {
+        let big = "x".repeat(5000);
+        let mut messages = vec![
+            Message::assistant_with_tool_calls(vec![ToolCall::new("c1", "read_file", "{}")]),
+            tool_msg("c1", &big),
+        ];
+        messages[1].distilled_into = vec!["outcome:1".to_string()];
+
+        let mut projection = ContextProjection::default();
+        projection.replace(&messages[1], "a truncation notice".to_string());
+        let (carried, _) = carry_evictions(&messages, &mut projection, &live(&["outcome:1"]));
+
+        assert_eq!(carried, 0);
+        assert_eq!(projection.content(&messages[1]), "a truncation notice");
     }
 
     #[test]

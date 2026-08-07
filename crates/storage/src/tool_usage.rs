@@ -58,15 +58,20 @@ impl ToolUsageRow {
 impl ToolUsageStore for PgToolUsageStore {
     async fn tool_usage(&self, conversation_id: &str) -> Result<Vec<ToolUsage>, CoreError> {
         let user_id = current_user_id();
-        // `evicted` is matched on the pointer's stable PREFIX, which is a
-        // deliberate constant shared with the compaction code rather than a
-        // literal duplicated here — so a reworded pointer can't silently stop
-        // being recognised and quietly zero the eviction column.
+        // Two things count as evicted, and they are different shapes.
         //
-        // Compaction shapes the turn's view and leaves the stored transcript
-        // alone, so nothing writes a pointer to a row now. What this matches is
-        // history: conversations compacted by an earlier version, whose result
-        // rows still hold a pointer instead of the tool's output.
+        // `distilled_into` is the marker a completed step records now (#1144):
+        // the row keeps the tool's output and every turn reads a pointer built
+        // from the named notes. The bytes are still there, so they still count
+        // toward `result_bytes` - what the model reads is smaller, what the
+        // conversation holds is not.
+        //
+        // The `LIKE` arm reads history: conversations compacted by a version
+        // that overwrote the row, whose content IS a pointer. Those bytes are
+        // the pointer's, and the original size is unrecoverable, so they count
+        // as zero. It matches on the pointer's stable PREFIX, a constant shared
+        // with the compaction code rather than a literal duplicated here, so a
+        // reworded pointer cannot silently stop being recognised.
         let evicted_like = format!("{COMPACTION_POINTER_PREFIX}%");
         let rows: Vec<ToolUsageRow> = sqlx::query_as(
             // Calls and results are aggregated SEPARATELY and then joined, so a

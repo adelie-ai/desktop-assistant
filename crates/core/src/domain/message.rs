@@ -75,6 +75,23 @@ pub struct Message {
     /// no update churn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
+    /// The scratchpad notes this tool result was distilled into when a
+    /// completed step dropped it from the model's view (#1144).
+    ///
+    /// The eviction DECISION, not the replacement content. A turn that loads
+    /// this conversation rebuilds the pointer from these keys
+    /// (`crate::planning::compaction_pointer`) into its own projection, so the
+    /// saving lasts past the turn that made it while `content` keeps every byte
+    /// the tool returned. Empty on every row that no step has evicted, and on a
+    /// step that completed with no carry-forward note - with no distilled trace
+    /// to point at, the next turn reads the stored output.
+    ///
+    /// Deliberately excluded from [`PartialEq`]/[`Eq`], like `id` and
+    /// `idempotency_key`: it is metadata about how a turn reads the message,
+    /// not the message. The storage diff compares it separately, because the
+    /// decision has to reach the row.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub distilled_into: Vec<String>,
 }
 
 impl Message {
@@ -87,6 +104,7 @@ impl Message {
             tool_call_id: None,
             summary_id: None,
             idempotency_key: None,
+            distilled_into: Vec::new(),
         }
     }
 
@@ -100,6 +118,7 @@ impl Message {
             tool_call_id: None,
             summary_id: None,
             idempotency_key: None,
+            distilled_into: Vec::new(),
         }
     }
 
@@ -113,17 +132,20 @@ impl Message {
             tool_call_id: Some(tool_call_id.into()),
             summary_id: None,
             idempotency_key: None,
+            distilled_into: Vec::new(),
         }
     }
 }
 
-/// Equality compares message *content*, deliberately excluding `id` AND
-/// `idempotency_key`: a fresh monotonic id is minted on every construction, and
-/// the idempotency key is carried-through metadata (not content), so two
-/// `Message::new` calls with the same content must still compare equal for the
-/// storage structural diff (`ExistingMsgRow::matches`) and the many
-/// value-comparison tests. Excluding the key also keeps a re-diff on load equal,
-/// so surfacing the persisted key causes no update churn.
+/// Equality compares message *content*, deliberately excluding `id`,
+/// `idempotency_key` AND `distilled_into`: a fresh monotonic id is minted on
+/// every construction, and the other two are carried-through metadata (not
+/// content), so two `Message::new` calls with the same content must still
+/// compare equal for the many value-comparison tests. Excluding them also keeps
+/// a re-diff on load equal, so surfacing a persisted key causes no update
+/// churn. The storage structural diff (`ExistingMsgRow::matches`) compares more
+/// than this - it has to see a changed id or a newly-recorded eviction
+/// decision - so it is not built on this impl.
 impl PartialEq for Message {
     fn eq(&self, other: &Self) -> bool {
         self.role == other.role
