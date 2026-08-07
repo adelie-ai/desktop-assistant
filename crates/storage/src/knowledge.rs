@@ -639,14 +639,16 @@ impl PgKnowledgeBaseStore {
     /// **This is what makes the `[Recall]` bar dimensionless.** A cosine
     /// distance means nothing on its own, so the block reads a candidate as how
     /// far it sits below the store's own middling row, counted in the store's
-    /// own spread. Both statistics are properties of the store's geometry rather
-    /// than of one query, so a caller measures them now and then rather than
-    /// every turn - see the recall adapter, which holds one estimate per user
-    /// and embedding model.
+    /// own spread.
     ///
     /// Measured over **every** row the search could reach, not over the nearest
     /// ones: the near rows are the part a cued prompt moves, so their spread is
     /// not the store's and normalizing inside it would inflate every score.
+    ///
+    /// Both statistics are distances from **one** query, so a caller grades a
+    /// prompt's candidates by the answer this call gives for that same prompt.
+    /// An answer held from an earlier query describes the geometry that query
+    /// saw, which is a different one.
     ///
     /// `None` where the store holds no row this query can be compared with. The
     /// caller then falls back to a stated estimate. Same scope and same model
