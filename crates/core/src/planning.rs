@@ -399,7 +399,14 @@ pub(crate) fn carry_evictions(
             .and_then(|id| names.get(id))
             .map(String::as_str);
         let pointer = compaction_pointer(tool_name, &m.distilled_into);
-        saved += m.content.len().saturating_sub(pointer.len());
+        // A pointer longer than what it replaces makes the prompt bigger, which
+        // is the one thing this may not do. Reachable at the small end: the
+        // eviction threshold is [`COMPACTION_MIN_EVICT_BYTES`] and a pointer
+        // naming several long keys can pass it.
+        if pointer.len() >= m.content.len() {
+            continue;
+        }
+        saved += m.content.len() - pointer.len();
         carried += 1;
         projection.replace(m, pointer);
     }
@@ -1477,6 +1484,40 @@ mod tests {
 
         assert_eq!(carried, 0);
         assert_eq!(projection.content(&messages[1]), big);
+    }
+
+    /// The whole point is a smaller prompt, so a pointer that is not smaller is
+    /// not worth reading. Reachable at the small end, where a pointer naming
+    /// several long note keys can outgrow a result that only just cleared the
+    /// eviction threshold.
+    #[test]
+    fn a_pointer_no_smaller_than_the_result_is_not_worth_carrying() {
+        let long_keys: Vec<String> = (0..4)
+            .map(|i| format!("{OUTCOME_KEY_PREFIX}{}", "k".repeat(120 + i)))
+            .collect();
+        let modest = "x".repeat(COMPACTION_MIN_EVICT_BYTES + 1);
+        let mut messages = vec![
+            Message::assistant_with_tool_calls(vec![ToolCall::new("c1", "read_file", "{}")]),
+            tool_msg("c1", &modest),
+        ];
+        messages[1].distilled_into = long_keys.clone();
+
+        let live: std::collections::HashSet<String> = long_keys.iter().cloned().collect();
+        assert!(
+            compaction_pointer(Some("read_file"), &long_keys).len() > modest.len(),
+            "the fixture must build a pointer bigger than the result"
+        );
+
+        let mut projection = ContextProjection::default();
+        let (carried, saved) = carry_evictions(&messages, &mut projection, &live);
+
+        assert_eq!(carried, 0);
+        assert_eq!(saved, 0);
+        assert_eq!(
+            projection.content(&messages[1]),
+            modest,
+            "the turn keeps reading the result, because the pointer costs more"
+        );
     }
 
     /// The carry never overwrites what this turn already decided to read - an
