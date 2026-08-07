@@ -3837,6 +3837,16 @@ where
     // spawned-future invariant (#205/#206) so an extra scope layer can't overflow
     // the 2 MB worker stack.
     let dispatched = with_task_observer(task_ctx.clone(), dispatched);
+    // The correlation id the client already sees. It is stamped on every event
+    // this turn streams, so putting it where the core loop can read it makes
+    // one value paste from a client's own event stream into the daemon's log
+    // and into a trace backend. Installed here rather than in the transport
+    // dispatcher because this is inside the spawned turn body, and a
+    // `task_local` does not cross a `tokio::spawn`.
+    let dispatched = desktop_assistant_core::ports::turn_telemetry::with_request_id(
+        request_id.clone(),
+        dispatched,
+    );
     let outcome = Box::pin(dispatched).await;
 
     if let Err(e) = forwarder.await {

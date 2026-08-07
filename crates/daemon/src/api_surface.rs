@@ -1088,6 +1088,11 @@ struct ResolvedTurn {
     /// line reports what runs rather than a separately-derived guess. `None`
     /// when deferring to the static primary.
     chosen: Option<(String, String)>,
+    /// The connector kind behind the chosen connection - `anthropic`,
+    /// `ollama`, and so on. `Some` exactly when `chosen` is. This is the
+    /// `provider` axis of the turn's spans and metrics, and it is read from
+    /// the same resolution the dispatch uses so the two cannot disagree.
+    connector: Option<String>,
 }
 
 pub struct RoutingConversationHandler<S, Inner>
@@ -1280,6 +1285,7 @@ where
         let mut model_override = None;
         let mut reasoning = ReasoningConfig::default();
         let mut chosen = None;
+        let mut connector = None;
 
         if let Some(sel) = effective {
             let id = ConnectionId::new(sel.connection_id.clone()).map_err(|e| {
@@ -1301,6 +1307,7 @@ where
                     active_client = Some(client);
                     model_override = Some(sel.model_id.clone());
                     chosen = Some((sel.connection_id.clone(), sel.model_id.clone()));
+                    connector = Some(connector_type.clone());
                 }
                 None if user_driven.is_some() => {
                     // The user explicitly picked this connection — fail loudly
@@ -1355,6 +1362,7 @@ where
             reasoning,
             budget,
             chosen,
+            connector,
         })
     }
 }
@@ -1713,9 +1721,21 @@ where
             reasoning,
             budget,
             chosen,
+            connector,
         } = self
             .resolve_turn(user_driven_selection.as_ref(), effective_selection.as_ref())
             .await?;
+
+        // Where this turn dispatches, for its spans and its metrics. Every
+        // field is `None` when routing fell through to the statically
+        // configured primary client, because the daemon genuinely does not
+        // know which connection or model that is; the core loop reports that
+        // state as `unset` rather than guessing.
+        let route = desktop_assistant_core::ports::turn_telemetry::TurnRoute {
+            connection_id: chosen.as_ref().map(|(c, _)| c.clone()),
+            provider: connector,
+            model: chosen.as_ref().map(|(_, m)| m.clone()),
+        };
 
         // The turn's tool-discovery mode is NOT logged here, deliberately.
         // `active_client` is the raw registry client, and the turn asks the
@@ -1802,6 +1822,11 @@ where
             // `[Now]` system message for this turn. Request-scoped, never
             // persisted; see `NOW_CONTEXT`.
             let dispatch = desktop_assistant_core::ports::llm::with_now_context(now_line, dispatch);
+            // Installed outside the routing wrap below so it holds for the
+            // whole turn, including the fall-through arm where no concrete
+            // connection resolved and the route reads `unset` on every axis.
+            let dispatch =
+                desktop_assistant_core::ports::turn_telemetry::with_turn_route(route, dispatch);
             let dispatch = with_reasoning_config(reasoning, dispatch);
             let dispatch = with_context_budget(budget, dispatch);
             let dispatch =
