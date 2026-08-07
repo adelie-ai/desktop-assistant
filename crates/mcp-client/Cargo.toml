@@ -20,6 +20,17 @@ thiserror.workspace = true
 toml = "1"
 chrono = { workspace = true, features = ["serde"] }
 uuid = { version = "1", features = ["v7"] }
+# Unicode general categories, for the one question `std` cannot answer: is this
+# character a display hazard? A spawned server's stderr is quoted back in a
+# failure message that a log reader, the settings panel and the web SPA all
+# render, so the categories that reorder or break the line around them - Cf
+# (bidi overrides, zero-width marks) and Zl/Zp (U+2028/U+2029, which neither
+# `serde_json` nor an HTML renderer treats as ordinary text) - have to go.
+# `char::is_control` covers Cc only, and a hand-written list of the other
+# ranges is a table that silently ages out of date with each Unicode release.
+# Already in the lockfile via `stringprep`; no dependencies of its own, and
+# `general-category` is the only feature compiled.
+unicode-properties = { version = "0.1.4", default-features = false, features = ["general-category"] }
 # Remote streamable-HTTP transport + OAuth — behind the default `http` feature.
 # Stdio-only consumers (the client-side MCP host in `client-common`) build with
 # `default-features = false` and never compile any of these, so they don't pull

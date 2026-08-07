@@ -69,6 +69,25 @@ arrives here verbatim. So a log line carries `CoreError::kind()`, which names
 the variant and nothing else, and the message goes to DEBUG beside the tool
 result.
 
+**A spawned MCP server's stderr is buffered, never streamed to the log.** The
+stdio transport keeps the last few lines of each server's stderr in memory so
+that a server which dies during the handshake can say why (see
+[MCP services](mcp-services.md#startup-behaviour)). No line is logged as it
+arrives, at any level: stderr is a server's whole unfiltered output rather than
+a chosen field, and a server is free to print a credential or a piece of the
+user's own content into it.
+
+The tail reaches one place, and only when a connection actually fails: the text
+of the error, which the executor then logs at ERROR beside the server's name.
+That is a deliberate, bounded exposure, taken because the alternative is an
+operator who can see only an exit code and has to attach to the process to
+learn anything more. It is bounded twice over - a failed connect, and 10 lines
+plus an unterminated final fragment, of at most 512 bytes each - and scrubbed
+of the characters that would let a server rewrite the log line it lands in.
+`server_stderr_is_buffered_and_never_logged` in
+`crates/mcp-client/tests/stderr_diagnostics.rs` holds the streaming half of
+that line.
+
 Two things follow.
 
 **`RUST_LOG=debug` means conversation content reaches the journal, and reaches

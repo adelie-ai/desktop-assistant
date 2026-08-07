@@ -466,7 +466,43 @@ When the daemon starts:
 3. `tools/list`, `resources/list`, and `prompts/list` are fetched from each server.
 4. A routing table is built mapping tool names → server index.
 
-If a server fails to start, a warning is logged and the daemon continues without that server's tools. No server failure is fatal to the daemon. If the server process exits before completing the handshake — for example because it needed an environment variable that is not on the [pass-through allowlist](#environment-variables) — the logged error names the exit status, so a missing dependency or missing configuration is diagnosable from the log line instead of reading as a generic protocol failure.
+If a server fails to start, a warning is logged and the daemon continues without that server's tools. No server failure is fatal to the daemon.
+
+If the server process exits before completing the handshake, the logged error names the exit status **and quotes what the server last wrote to stderr**, so a rejected command line, a missing file, or a refused credential is diagnosable from the log line instead of reading as a generic protocol failure:
+
+```
+MCP server exited with status 2 before completing the handshake; it last wrote this to stderr: error: the following required arguments were not provided: --config <CONFIG>
+```
+
+A server does not have to exit to fail, and the other three shapes carry the same clause. A server that stops answering is reported as a timeout, so a hang — the startup failure that is hardest to read, because nothing exited and nothing was refused — still names its cause:
+
+```
+MCP request 'initialize' timed out after 30s of silence; it last wrote this to stderr: fatal: cannot open database
+```
+
+A server that abandons its stdout but keeps running has no exit status to name, and reports what it said instead:
+
+```
+MCP server closed stdout; it last wrote this to stderr: fatal: no write access to the state directory
+```
+
+A server that has already gone when the daemon next writes to it fails on the write, because the read end of its stdin pipe is closed. The error keeps its I/O class and gains the same account, so which side of the exchange noticed first is not something a reader has to work out:
+
+```
+I/O error communicating with MCP server: Broken pipe (os error 32); MCP server exited with status 4 before completing the handshake; it last wrote this to stderr: fatal: lost its database connection
+```
+
+The quoted tail is bounded: the last 10 completed lines, plus an unterminated final fragment where the server left one, each capped at 512 bytes and marked with `...` where it was cut, joined with ` | ` onto one line. The fragment matters because a server killed part-way through a write, or one that prints its complaint without a trailing newline, puts its most useful line there and never terminates it. Lines beyond that are discarded as they arrive, so a server that floods stderr cannot enlarge the message. Characters that would re-shape the line the message lands in are replaced with spaces before it is quoted — the C0/C1 controls, the Unicode format characters (bidi overrides, zero-width marks) and U+2028/U+2029, which a JSON field and an HTML renderer both treat as a line break. The text is a server-chosen remote string, and a renderer must still escape it for its own medium.
+
+A server's stderr appears **only** in this failure message. It is never streamed to the log as it arrives, at any level, because it is the server's own unfiltered output and can carry a credential or a fragment of user content — see [Logging](logging.md#what-may-appear-at-each-level).
+
+Where the server exits without writing anything, there is no evidence to quote, and the message instead suggests the most common silent cause — an environment variable the server needed that is not on the [pass-through allowlist](#environment-variables) and not in its own `env`:
+
+```
+MCP server exited with status 7 before completing the handshake and wrote nothing to stderr; if it needs an environment variable, set it in this server's own `env` config (see docs/mcp-services.md#environment-variables) rather than relying on it being inherited
+```
+
+The same message reaches the settings/KCM panel's per-server detail field, so an operator sees it without reading the log.
 
 ## Verifying Loaded Tools
 
