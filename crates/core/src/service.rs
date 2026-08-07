@@ -1274,6 +1274,19 @@ impl<S, L, T> ConversationHandler<S, L, T> {
         let Ok(notes) = list(conversation_id.0.clone(), None, limit).await else {
             return Vec::new();
         };
+        // A full page means the read may have stopped before the whole plan,
+        // and the store orders `note`-typed rows ahead of `todo`-typed ones, so
+        // what gets cut is the END of the plan. A skill that stops halfway is
+        // worse than no skill, so a truncated read yields no plan at all rather
+        // than a procedure missing its last steps.
+        if notes.len() >= limit {
+            tracing::debug!(
+                notes = notes.len(),
+                limit,
+                "scratchpad read hit its cap; not offering a possibly-truncated plan"
+            );
+            return Vec::new();
+        }
         let view: Vec<skill_promotion::PlanNote<'_>> = notes
             .iter()
             .map(|n| skill_promotion::PlanNote {
@@ -1408,11 +1421,31 @@ impl<S, L, T> ConversationHandler<S, L, T> {
         // The caller's own scope, never the host-global one: a skill the
         // assistant wrote for one person is not a fact about the machine.
         let owner = current_user_id();
-        let existing = match &self.skill_get {
-            Some(get) => get(req.name.clone(), Some(owner.as_str().to_string()))
-                .await
-                .unwrap_or(None),
-            None => None,
+        // Fail CLOSED on an unanswerable lookup. The write below upserts on
+        // `(name, owner)`, so reading a failed lookup as "the name is free"
+        // would replace an existing skill's body and drop its approval -- a
+        // person's reviewed skill destroyed by a transient database error.
+        let Some(get) = &self.skill_get else {
+            return serde_json::json!({
+                "ok": false,
+                "error": "the skill catalog cannot be read, so a duplicate name cannot be \
+                          ruled out",
+            })
+            .to_string();
+        };
+        let existing = match get(req.name.clone(), Some(owner.as_str().to_string())).await {
+            Ok(found) => found,
+            Err(e) => {
+                tracing::warn!(skill = %req.name, error = %e, "skill name lookup failed");
+                return serde_json::json!({
+                    "ok": false,
+                    "error": format!(
+                        "could not check whether a skill named {:?} already exists: {e}",
+                        req.name
+                    ),
+                })
+                .to_string();
+            }
         };
         if let skill_promotion::PromotionAct::Refuse(why) =
             skill_promotion::decide(&req, existing.as_ref())
@@ -6956,6 +6989,77 @@ mod tests {
         );
     }
 
+    /// A plan read that hit the scratchpad's page cap may be missing its last
+    /// steps, because the store returns `note`-typed rows before `todo`-typed
+    /// ones. A skill that stops halfway is worse than no skill, so the offer is
+    /// withheld rather than built from a plan that might be short.
+    #[tokio::test]
+    async fn a_truncated_scratchpad_read_offers_nothing() {
+        let mut responses = Vec::new();
+        responses.extend(plan_step_calls(1, "read the failing job", "it times out"));
+        responses.extend(plan_step_calls(2, "raise the timeout", "it now passes"));
+        responses.extend(plan_step_calls(3, "record the new value", "written down"));
+        responses.push(LlmResponse::text("Done."));
+
+        let (write, _list, sp) = in_memory_scratchpad();
+        // A lister that always returns a full page, as a real store does when
+        // the conversation holds more notes than the read asks for.
+        let padded: ScratchpadListFn = Arc::new(move |_conv, _note_type, limit: usize| {
+            let sp = Arc::clone(&sp);
+            Box::pin(async move {
+                use crate::domain::ScratchpadNote;
+                let mut out: Vec<ScratchpadNote> = sp.lock().unwrap().values().cloned().collect();
+                let mut filler = 0usize;
+                while out.len() < limit {
+                    filler += 1;
+                    out.push(ScratchpadNote::new(
+                        format!("filler-{filler}"),
+                        "conv",
+                        format!("filler-{filler}"),
+                        "chatter",
+                    ));
+                }
+                out.truncate(limit);
+                Ok(out)
+            })
+        });
+
+        let (search, get, skill_write, written) = in_memory_skill_catalog(Vec::new());
+        let llm = ToolCallingLlm::new(responses);
+        let prompts = llm.prompts();
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            llm,
+            MockToolExecutor::new(Vec::new(), HashMap::new()),
+            id_gen(),
+        )
+        .with_scratchpad_write(write)
+        .with_scratchpad_list(padded)
+        .with_skill_promotion(search, get, skill_write);
+
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(
+                &conv.id,
+                "fix the job".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await
+            .unwrap();
+
+        let ack: serde_json::Value =
+            serde_json::from_str(&last_prompt_result(&prompts, "c3")).expect("the ack is JSON");
+        assert!(
+            ack["skill_offer"].is_null(),
+            "a plan that may be short must not be offered: {ack}"
+        );
+        assert!(written.lock().unwrap().is_empty());
+    }
+
     /// Acceptance: a plan that was started from an existing skill produces no
     /// offer.
     #[tokio::test]
@@ -7252,6 +7356,71 @@ mod tests {
         let offer: serde_json::Value =
             serde_json::from_str(&last_prompt_result(&prompts, "c3")).expect("the ack is JSON");
         assert_eq!(offer["skill_offer"]["mode_hint"], "amend");
+    }
+
+    /// A failed name lookup must NOT read as "the name is free". `write_authored`
+    /// upserts on `(name, owner)`, so creating over a name that is really taken
+    /// would replace the existing skill's body and drop its approval - which is
+    /// how a person's reviewed skill gets destroyed by a transient database
+    /// error.
+    #[tokio::test]
+    async fn a_failed_name_lookup_declines_rather_than_writing_over_it() {
+        let mut responses = Vec::new();
+        responses.extend(plan_step_calls(1, "read the failing job", "it times out"));
+        responses.extend(plan_step_calls(2, "raise the timeout", "it now passes"));
+        responses.extend(plan_step_calls(3, "record the new value", "written down"));
+        responses.push(LlmResponse::with_tool_calls(
+            "",
+            vec![ToolCall::new(
+                "p1",
+                "promote_plan_to_skill",
+                r#"{"name":"raise-a-job-timeout","description":"Use when a job times out."}"#,
+            )],
+        ));
+        responses.push(LlmResponse::text("Held off."));
+
+        let (write, list, _sp) = in_memory_scratchpad();
+        let (search, _get, skill_write, written) = in_memory_skill_catalog(Vec::new());
+        let failing_get: crate::ports::skill_index::SkillGetFn = Arc::new(|_name, _owner| {
+            Box::pin(async { Err(CoreError::Storage("the database is down".into())) })
+        });
+
+        let llm = ToolCallingLlm::new(responses);
+        let prompts = llm.prompts();
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            llm,
+            MockToolExecutor::new(Vec::new(), HashMap::new()),
+            id_gen(),
+        )
+        .with_scratchpad_write(write)
+        .with_scratchpad_list(list)
+        .with_skill_promotion(search, failing_get, skill_write);
+
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(
+                &conv.id,
+                "fix the job".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await
+            .unwrap();
+
+        let ack: serde_json::Value =
+            serde_json::from_str(&last_prompt_result(&prompts, "p1")).expect("the ack is JSON");
+        assert_eq!(
+            ack["ok"], false,
+            "an unanswerable lookup must not write: {ack}"
+        );
+        assert!(
+            written.lock().unwrap().is_empty(),
+            "nothing may be written while the catalog cannot say whether the name is taken"
+        );
     }
 
     /// A plan that never cleared the bar cannot be kept by calling the tool

@@ -246,8 +246,15 @@ fn read_outcome(raw: Option<&str>) -> (bool, Option<String>) {
 }
 
 /// A dotted key as numbers, so `1.10` sorts after `1.2` rather than before it.
+///
+/// `is_step_key` has already proved every part is ASCII digits, so the only way
+/// a part fails to parse is overflow. Such a key sorts LAST rather than first:
+/// it did not come from the step stack, and putting an unexplained key at the
+/// head of a rendered procedure would read as its first instruction.
 fn dotted(key: &str) -> Vec<u64> {
-    key.split('.').map(|p| p.parse().unwrap_or(0)).collect()
+    key.split('.')
+        .map(|p| p.parse().unwrap_or(u64::MAX))
+        .collect()
 }
 
 /// Whether the turn read an existing skill before it planned.
@@ -343,14 +350,34 @@ pub fn render_skill_md(name: &str, description: &str, tags: &[String], body: &st
     )
 }
 
-/// Quote a value as a YAML double-quoted scalar.
+/// Quote a value as a single-line YAML double-quoted scalar.
 ///
 /// Always quoted, never conditionally: a description is free text the model
 /// wrote, and a leading `#`, a `:` or a `-` in it would otherwise change what
 /// the document means.
+///
+/// Control characters are escaped rather than emitted, which is the part that
+/// matters for safety as well as fidelity. A raw newline inside a quoted scalar
+/// is folded to a space by YAML, so the text would come back changed; and a
+/// description carrying a line that is exactly `---` would end the frontmatter
+/// early, so the rest of it would be read as the skill's body. Escaping keeps
+/// the scalar on one line, which makes both impossible.
 fn yaml_string(value: &str) -> String {
-    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
-    format!("\"{escaped}\"")
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// The offer appended to a `complete_step` acknowledgement when a finished plan
@@ -1206,6 +1233,95 @@ mod dedup_tests {
         assert!(
             why.contains("new"),
             "the refusal names the useful act: {why}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod yaml_tests {
+    use super::*;
+    use crate::domain::skill::parse_skill_md;
+
+    /// The model writes the description, so it is arbitrary text. Every shape
+    /// it can take must survive the round trip, or a skill lands in the catalog
+    /// with a description nothing can read back.
+    #[test]
+    fn every_awkward_description_round_trips() {
+        for description in [
+            "Use when: a thing #happens",
+            "Two\nlines",
+            "A \"quoted\" phrase",
+            "A back\\slash",
+            "A line that ends the frontmatter:\n---\nand more",
+            "- looks like a list item",
+            "{braces} and [brackets]",
+            "Tab\there",
+            "trailing spaces   ",
+            "*emphasis* and &anchor and *alias",
+            "100%",
+        ] {
+            let md = render_skill_md("x", description, &[], "body");
+            let parsed = parse_skill_md(&md)
+                .unwrap_or_else(|e| panic!("{description:?} broke the frontmatter: {e}"));
+            assert_eq!(
+                parsed.frontmatter.description, description,
+                "{description:?} did not survive the round trip"
+            );
+        }
+    }
+
+    #[test]
+    fn an_awkward_tag_round_trips() {
+        let tags = vec![
+            "a: b".to_string(),
+            "\"quoted\"".to_string(),
+            "c\\d".to_string(),
+        ];
+        let md = render_skill_md("x", "d", &tags, "body");
+        let parsed = parse_skill_md(&md).expect("parses");
+        assert_eq!(parsed.frontmatter.tags, tags);
+    }
+
+    /// A plan whose every step was abandoned cannot reach the renderer through
+    /// `assess`, but the renderer must still produce a well-formed document
+    /// rather than something `detect_kind` reads as a plain playbook.
+    #[test]
+    fn a_body_with_no_working_steps_is_still_a_workflow() {
+        let plan = PromotablePlan { steps: Vec::new() };
+        let body = render_skill_body("t", None, &plan);
+        assert_eq!(
+            crate::domain::skill::detect_kind(&body),
+            crate::domain::SkillKind::Workflow
+        );
+        assert!(parse_skill_md(&render_skill_md("x", "d", &[], &body)).is_ok());
+    }
+
+    /// A step key the store could hold that is not the shape the stack mints.
+    #[test]
+    fn an_absurd_step_key_does_not_panic_the_sort() {
+        let notes = [
+            PlanNote {
+                key: "99999999999999999999",
+                content: "huge",
+                note_type: STEP_NOTE_TYPE,
+                done: true,
+            },
+            PlanNote {
+                key: "1",
+                content: "one",
+                note_type: STEP_NOTE_TYPE,
+                done: true,
+            },
+        ];
+        let steps = plan_from_notes(&notes);
+        assert_eq!(
+            steps.len(),
+            2,
+            "an unparseable number sorts, it does not panic"
+        );
+        assert_eq!(
+            steps[0].key, "1",
+            "and the overflowing key sorts as zero-or-last, not randomly"
         );
     }
 }
