@@ -28,6 +28,7 @@ use super::common::{
     load_new_transcript, update_watermark,
 };
 use super::types::{BackfillEmbedFn, DreamingLlmFn, KnowledgeChangeFn};
+use crate::dreaming::skills;
 use crate::kb_metadata::{KbMetadata, KbScope};
 use crate::tag_registry::{self, CreateTagOutcome, TagProposal, TagRecord, normalize_tag_name};
 
@@ -169,6 +170,19 @@ async fn process_one_conversation_for_extraction(
     };
 
     let proposals = parse_extraction_response(&response);
+    // A method found in the transcript is routed to the skill catalog as an
+    // unapproved candidate rather than filed as a fact (#1155). Best-effort:
+    // a failure here must not cost the facts this conversation also produced.
+    match parse_skills_from(&response) {
+        skills if skills.is_empty() => {}
+        skills => match skills::write_extracted_skills(pool, &skills).await {
+            Ok(n) if n > 0 => {
+                tracing::info!("dreaming: extracted {n} method(s) as unapproved skill candidate(s)")
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!("dreaming: extracted skill write failed: {e}"),
+        },
+    }
 
     let mut written = 0usize;
     for proposal in proposals {
@@ -199,6 +213,19 @@ struct ExtractedFactProposal {
     tags: Vec<String>,
     new_tags: Vec<TagProposal>,
     scope: Option<KbScope>,
+}
+
+/// The `skills` arm of the same response `parse_extraction_response` reads
+/// (#1155). Split out rather than folded in, because the two arms have
+/// different shapes and different destinations; a malformed one must not cost
+/// the other.
+fn parse_skills_from(response: &str) -> Vec<skills::ExtractedSkill> {
+    let json_str = extract_json_payload(response.trim());
+    match serde_json::from_str::<serde_json::Value>(&json_str) {
+        Ok(root) => skills::parse_extracted_skills(&root),
+        // Already warned about by the fact arm; nothing to add.
+        Err(_) => Vec::new(),
+    }
 }
 
 fn parse_extraction_response(response: &str) -> Vec<ExtractedFactProposal> {
@@ -450,8 +477,14 @@ fn build_extraction_system_prompt(registry: &[TagRecord]) -> String {
         \"adelie-ai\"}` or `{\"tool\": \"vscode\"}`. Use `null` ONLY when \
         the fact is genuinely universal (e.g. a user preference that holds \
         regardless of project).\n\
-        \n\
-        ## Tag registry\n\
+        \n",
+    );
+    // Methods go to the skill catalog, not the fact list (#1155). Stated before
+    // the tag registry, because the first question is WHICH store this belongs
+    // in and the tags only matter once the answer is "a fact".
+    prompt.push_str(skills::SKILL_ROUTING_PROMPT);
+    prompt.push_str(
+        "## Tag registry\n\
         \n",
     );
 
@@ -493,7 +526,8 @@ fn build_extraction_system_prompt(registry: &[TagRecord]) -> String {
         ]\n}\n\
         ```\n\
         \n\
-        If there are no facts worth extracting, return `{\"facts\": []}`.",
+        If there are no facts worth extracting, return `{\"facts\": []}`. A \
+        response may carry both arrays: `{\"facts\": [...], \"skills\": [...]}`.",
     );
 
     prompt

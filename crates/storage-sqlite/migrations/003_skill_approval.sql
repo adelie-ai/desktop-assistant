@@ -1,0 +1,13 @@
+-- The approval axis (#1155): `approved_at`/`approved_by` on `skill_index`,
+-- orthogonal to `trust_tier`. `trust_tier` records provenance (where a skill
+-- came from); these two columns record consent (whether a person said it may
+-- be followed). Stored the same way `last_seen_at` already is: TEXT holding
+-- an RFC 3339 timestamp, decoded by `skill_index.rs`'s `parse_ts`.
+--
+-- SQLite's `ALTER TABLE` has no `ADD COLUMN IF NOT EXISTS`, and plain SQL has
+-- no conditional DDL (a trigger body cannot run `ALTER TABLE` either), so
+-- adding the two columns -- and the one-time backfill that goes with them --
+-- is a guarded step in `pool.rs` (`ensure_skill_approval_columns`), run
+-- immediately before this file. This file only carries what pure SQL can
+-- already express idempotently: the supporting index.
+CREATE INDEX IF NOT EXISTS idx_skill_index_approved_at ON skill_index (approved_at);

@@ -26,6 +26,7 @@ mod common;
 mod consolidation;
 mod extraction;
 mod reconcile;
+mod skills;
 mod summarize;
 mod trash;
 mod types;

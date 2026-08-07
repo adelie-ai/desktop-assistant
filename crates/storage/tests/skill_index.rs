@@ -126,6 +126,8 @@ fn skill(name: &str, description: &str, hash: &str, body: &str) -> IndexedSkill 
         metadata: serde_json::json!({"author": "test"}),
         present_on_disk: true,
         last_seen_at: None,
+        approved_at: None,
+        approved_by: None,
     }
 }
 
@@ -148,6 +150,8 @@ fn owned_skill(name: &str, owner: &str, description: &str, hash: &str, body: &st
         metadata: serde_json::json!({"author": "test"}),
         present_on_disk: true,
         last_seen_at: None,
+        approved_at: None,
+        approved_by: None,
     }
 }
 
@@ -200,6 +204,11 @@ conformance_tests!(
     upsert_ignores_caller_supplied_presence,
     get_is_scope_addressed,
     set_presence_tolerates_unknown_and_empty,
+    authored_skill_is_unapproved_until_approved,
+    upsert_preserves_approval_across_a_rescan,
+    a_scanned_skill_arrives_approved,
+    amending_an_approved_skill_withdraws_its_approval,
+    set_approval_tolerates_unknown_and_empty,
 );
 
 #[tokio::test]
@@ -234,6 +243,66 @@ async fn reindex_preserves_embedding_when_hash_unchanged_and_nulls_it_on_change(
         seed(&store, vec![skill("a", "desc", "hash-2", "body")]).await;
         let model: Option<String> =
             sqlx::query_scalar("SELECT embedding_model FROM skill_index WHERE name = 'a'")
+                .fetch_one(&fx.pool)
+                .await
+                .unwrap();
+        assert_eq!(model, None, "changed hash nulls embedding for re-embed");
+        fx
+    })
+    .await;
+}
+
+/// The `write_authored` path (#1155) has the same embedding-retention rule as
+/// a scan's `upsert`, and the in-memory reference implementation cannot prove
+/// it -- it carries no embedding column at all.
+#[tokio::test]
+async fn write_authored_preserves_embedding_when_hash_unchanged_and_nulls_it_on_change() {
+    with_fixture("write_authored_preserves_embedding", |fx| async move {
+        let store = PgSkillIndexStore::new(fx.pool.clone());
+        let first = conformance::authored_skill("promoted", None, "## Steps\n1. do it\n");
+        store
+            .write_authored(&first, conformance::first_scan_at())
+            .await
+            .expect("write_authored");
+
+        // Simulate the backfill having embedded the row.
+        sqlx::query(
+            "UPDATE skill_index SET embedding = ARRAY['[1,2,3]']::vector[], \
+             embedding_model = 'm1' WHERE name = 'promoted' AND owner_key = ''",
+        )
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+
+        // Amend with the SAME hash (authored_skill's default is stable per
+        // name): embedding is preserved.
+        let revised_prose =
+            conformance::authored_skill("promoted", None, "## Steps\n1. do it, revised prose\n");
+        store
+            .write_authored(&revised_prose, conformance::later())
+            .await
+            .expect("write_authored amend, same hash");
+        let model: Option<String> =
+            sqlx::query_scalar("SELECT embedding_model FROM skill_index WHERE name = 'promoted'")
+                .fetch_one(&fx.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            model.as_deref(),
+            Some("m1"),
+            "unchanged hash keeps embedding"
+        );
+
+        // Amend with a CHANGED hash: embedding is nulled for re-embedding.
+        let mut new_content =
+            conformance::authored_skill("promoted", None, "## Steps\n1. something new\n");
+        new_content.content_hash = "hash-revised".to_string();
+        store
+            .write_authored(&new_content, conformance::later())
+            .await
+            .expect("write_authored amend, changed hash");
+        let model: Option<String> =
+            sqlx::query_scalar("SELECT embedding_model FROM skill_index WHERE name = 'promoted'")
                 .fetch_one(&fx.pool)
                 .await
                 .unwrap();

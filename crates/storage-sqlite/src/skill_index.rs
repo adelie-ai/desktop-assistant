@@ -14,6 +14,14 @@
 //!
 //! `last_seen_at` is stored as RFC 3339 text: this crate's `sqlx` build has no
 //! `chrono` feature, so the conversion is explicit rather than implicit.
+//! `approved_at` follows the same convention.
+//!
+//! Approval (#1155) is a third column pair (`approved_at`/`approved_by`),
+//! orthogonal to `trust_tier`'s provenance: [`upsert_row`](Self::upsert_row)
+//! honours it on insert and preserves it on update, while
+//! [`write_authored_row`](Self::write_authored_row) forces it cleared on both
+//! branches. See [`SkillIndexStore::upsert`] and
+//! [`SkillIndexStore::write_authored`] for why.
 //!
 //! Host-global like the Postgres table: no `user_id`/RLS; `owner_user_id` is
 //! NULL for a global skill. All SQL is static with bound parameters — the FTS
@@ -23,7 +31,9 @@ use async_trait::async_trait;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use desktop_assistant_core::CoreError;
-use desktop_assistant_core::domain::{IndexedSkill, Locality, SkillKind, SkillScope, TrustTier};
+use desktop_assistant_core::domain::{
+    IndexedSkill, Locality, SkillApproval, SkillKind, SkillScope, TrustTier,
+};
 use desktop_assistant_core::ports::auth::current_user_id;
 use desktop_assistant_core::ports::skill_index::SkillIndexStore;
 use sqlx::SqlitePool;
@@ -46,6 +56,13 @@ impl SqliteSkillIndexStore {
     /// `seen_at` stamps `last_seen_at` and marks the row present: presence is
     /// index state derived from the scan that produced `skill`, never read off
     /// the argument.
+    ///
+    /// Approval (`approved_at`/`approved_by`) is honoured on insert -- a
+    /// first-seen scan is how a skill records "a person put this file in a
+    /// skill root" (#1155) -- but the `ON CONFLICT` `SET` list below
+    /// deliberately omits both columns, so an update leaves the stored
+    /// approval exactly where it was. A rescan re-reads a file; it does not
+    /// re-decide whether a person consented to it.
     async fn upsert_row(
         conn: &mut sqlx::SqliteConnection,
         skill: &IndexedSkill,
@@ -55,8 +72,8 @@ impl SqliteSkillIndexStore {
             "INSERT INTO skill_index \
                 (name, owner_user_id, description, kind, disk_path, locality, content_hash, \
                  trust_tier, source, tags, attachments, body, metadata, present_on_disk, \
-                 last_seen_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?) \
+                 last_seen_at, approved_at, approved_by) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?) \
              ON CONFLICT (name, owner_key) DO UPDATE SET \
                 description = excluded.description, \
                 kind = excluded.kind, \
@@ -86,7 +103,76 @@ impl SqliteSkillIndexStore {
         .bind(serde_json::to_string(&skill.attachments).unwrap_or_else(|_| "[]".into()))
         .bind(&skill.body)
         .bind(serde_json::to_string(&skill.metadata).unwrap_or_else(|_| "{}".into()))
-        .bind(seen_at.to_rfc3339_opts(SecondsFormat::Secs, true))
+        .bind(to_text(seen_at))
+        .bind(skill.approved_at.map(to_text))
+        .bind(&skill.approved_by)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| CoreError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Insert or update a skill the assistant authored from a completed plan
+    /// (#1155), keyed on `(name, owner_key)` like [`Self::upsert_row`].
+    ///
+    /// Both branches force `present_on_disk = 0`, `approved_at = NULL` and
+    /// `approved_by = NULL`: nothing was read off disk, and unattended
+    /// authoring records no consent, so the row cannot wear either claim
+    /// whatever the caller's argument says (see
+    /// [`SkillIndexStore::write_authored`]'s doc for why that has to be
+    /// forced here rather than trusted from the caller). `last_seen_at` is
+    /// deliberately absent from the `ON CONFLICT` `SET` list, so an amend
+    /// leaves it exactly as the last scan (if any) left it -- nothing here was
+    /// scanned, so there is nothing to mark freshly seen.
+    ///
+    /// `authored_at` stamps `indexed_at` on both branches, in place of the
+    /// wall clock, mirroring how [`Self::upsert_row`]'s `seen_at` stamps
+    /// `last_seen_at`: the instant is injected so a caller's write is
+    /// deterministic under test, per `desktop_assistant_core::clock`'s
+    /// convention.
+    async fn write_authored_row(
+        conn: &mut sqlx::SqliteConnection,
+        skill: &IndexedSkill,
+        authored_at: DateTime<Utc>,
+    ) -> Result<(), CoreError> {
+        sqlx::query(
+            "INSERT INTO skill_index \
+                (name, owner_user_id, description, kind, disk_path, locality, content_hash, \
+                 trust_tier, source, tags, attachments, body, metadata, present_on_disk, \
+                 last_seen_at, approved_at, approved_by, indexed_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, NULL, NULL, ?) \
+             ON CONFLICT (name, owner_key) DO UPDATE SET \
+                description = excluded.description, \
+                kind = excluded.kind, \
+                disk_path = excluded.disk_path, \
+                locality = excluded.locality, \
+                content_hash = excluded.content_hash, \
+                trust_tier = excluded.trust_tier, \
+                source = excluded.source, \
+                tags = excluded.tags, \
+                attachments = excluded.attachments, \
+                body = excluded.body, \
+                metadata = excluded.metadata, \
+                present_on_disk = 0, \
+                approved_at = NULL, \
+                approved_by = NULL, \
+                indexed_at = excluded.indexed_at",
+        )
+        .bind(&skill.name)
+        .bind(&skill.owner_user_id)
+        .bind(&skill.description)
+        .bind(skill.kind.as_str())
+        .bind(&skill.disk_path)
+        .bind(skill.locality.as_str())
+        .bind(&skill.content_hash)
+        .bind(skill.trust_tier.as_str())
+        .bind(&skill.source)
+        .bind(serde_json::to_string(&skill.tags).unwrap_or_else(|_| "[]".into()))
+        .bind(serde_json::to_string(&skill.attachments).unwrap_or_else(|_| "[]".into()))
+        .bind(&skill.body)
+        .bind(serde_json::to_string(&skill.metadata).unwrap_or_else(|_| "{}".into()))
+        .bind(skill.last_seen_at.map(to_text))
+        .bind(to_text(authored_at))
         .execute(&mut *conn)
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;
@@ -94,43 +180,58 @@ impl SqliteSkillIndexStore {
     }
 }
 
-/// A `skill_index` row decoded as a positional tuple (SQLite adapters map into
-/// tuples then a free function, rather than `FromRow`).
-type SkillTuple = (
-    String,         // name
-    Option<String>, // owner_user_id
-    String,         // description
-    String,         // kind
-    String,         // disk_path
-    String,         // locality
-    String,         // content_hash
-    String,         // trust_tier
-    Option<String>, // source
-    String,         // tags (JSON text)
-    String,         // attachments (JSON text)
-    String,         // body
-    String,         // metadata (JSON text)
-    i64,            // present_on_disk (0/1)
-    Option<String>, // last_seen_at (RFC 3339 text)
-);
+/// Encode a UTC instant the same way `last_seen_at`/`approved_at` are stored:
+/// RFC 3339 text, seconds precision.
+fn to_text(dt: DateTime<Utc>) -> String {
+    dt.to_rfc3339_opts(SecondsFormat::Secs, true)
+}
 
-fn row_from_tuple(t: SkillTuple) -> IndexedSkill {
-    IndexedSkill {
-        name: t.0,
-        owner_user_id: t.1,
-        description: t.2,
-        kind: SkillKind::from_db(&t.3),
-        disk_path: t.4,
-        locality: Locality::from_db(&t.5),
-        content_hash: t.6,
-        trust_tier: TrustTier::from_db(&t.7),
-        source: t.8,
-        tags: json_to_string_vec(&t.9),
-        attachments: json_to_string_vec(&t.10),
-        body: t.11,
-        metadata: serde_json::from_str(&t.12).unwrap_or(serde_json::Value::Null),
-        present_on_disk: t.13 != 0,
-        last_seen_at: t.14.as_deref().and_then(parse_ts),
+/// A `skill_index` row, decoded via `#[derive(sqlx::FromRow)]` (matching
+/// `conversation.rs` elsewhere in this crate) rather than the positional
+/// tuple this file used before #1155: sqlx's tuple `FromRow` impl tops out at
+/// 16 elements, and the two approval columns push this row to 17.
+#[derive(sqlx::FromRow)]
+struct SkillRow {
+    name: String,
+    owner_user_id: Option<String>,
+    description: String,
+    kind: String,
+    disk_path: String,
+    locality: String,
+    content_hash: String,
+    trust_tier: String,
+    source: Option<String>,
+    tags: String,        // JSON text
+    attachments: String, // JSON text
+    body: String,
+    metadata: String,             // JSON text
+    present_on_disk: i64,         // 0/1
+    last_seen_at: Option<String>, // RFC 3339 text
+    approved_at: Option<String>,  // RFC 3339 text
+    approved_by: Option<String>,
+}
+
+impl SkillRow {
+    fn into_domain(self) -> IndexedSkill {
+        IndexedSkill {
+            name: self.name,
+            owner_user_id: self.owner_user_id,
+            description: self.description,
+            kind: SkillKind::from_db(&self.kind),
+            disk_path: self.disk_path,
+            locality: Locality::from_db(&self.locality),
+            content_hash: self.content_hash,
+            trust_tier: TrustTier::from_db(&self.trust_tier),
+            source: self.source,
+            tags: json_to_string_vec(&self.tags),
+            attachments: json_to_string_vec(&self.attachments),
+            body: self.body,
+            metadata: serde_json::from_str(&self.metadata).unwrap_or(serde_json::Value::Null),
+            present_on_disk: self.present_on_disk != 0,
+            last_seen_at: self.last_seen_at.as_deref().and_then(parse_ts),
+            approved_at: self.approved_at.as_deref().and_then(parse_ts),
+            approved_by: self.approved_by,
+        }
     }
 }
 
@@ -180,22 +281,35 @@ impl SkillIndexStore for SqliteSkillIndexStore {
         Self::upsert_row(&mut conn, skill, seen_at).await
     }
 
+    async fn write_authored(
+        &self,
+        skill: &IndexedSkill,
+        authored_at: DateTime<Utc>,
+    ) -> Result<(), CoreError> {
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
+        Self::write_authored_row(&mut conn, skill, authored_at).await
+    }
+
     async fn list_scope(&self, scope: &SkillScope) -> Result<Vec<IndexedSkill>, CoreError> {
         // Unfiltered by the calling user by design: the reconcile pass runs at
         // startup with no request scope and must see the whole partition it is
         // about to update. `owner_key` is the generated NULL -> '' mirror, so one
         // bound parameter addresses either scope.
-        let rows: Vec<SkillTuple> = sqlx::query_as(
+        let rows: Vec<SkillRow> = sqlx::query_as(
             "SELECT name, owner_user_id, description, kind, disk_path, locality, content_hash, \
                     trust_tier, source, tags, attachments, body, metadata, present_on_disk, \
-                    last_seen_at \
+                    last_seen_at, approved_at, approved_by \
              FROM skill_index WHERE owner_key = ? ORDER BY name",
         )
         .bind(scope.owner().unwrap_or(""))
         .fetch_all(&self.pool)
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;
-        Ok(rows.into_iter().map(row_from_tuple).collect())
+        Ok(rows.into_iter().map(SkillRow::into_domain).collect())
     }
 
     async fn set_presence(
@@ -227,6 +341,37 @@ impl SkillIndexStore for SqliteSkillIndexStore {
         Ok(())
     }
 
+    async fn set_approval(
+        &self,
+        scope: &SkillScope,
+        names: &[String],
+        approval: Option<SkillApproval>,
+    ) -> Result<(), CoreError> {
+        if names.is_empty() {
+            return Ok(());
+        }
+        // Mirrors `set_presence` exactly in shape: names go through a JSON
+        // array and `json_each` -- still one bound parameter, no SQL built
+        // from input. Names absent from the scope match nothing, and nothing
+        // else on the row is touched.
+        let names_json =
+            serde_json::to_string(names).map_err(|e| CoreError::Storage(e.to_string()))?;
+        let approved_at = approval.as_ref().map(|a| to_text(a.at));
+        let approved_by = approval.as_ref().and_then(|a| a.by.clone());
+        sqlx::query(
+            "UPDATE skill_index SET approved_at = ?, approved_by = ? \
+             WHERE owner_key = ? AND name IN (SELECT value FROM json_each(?))",
+        )
+        .bind(approved_at)
+        .bind(approved_by)
+        .bind(scope.owner().unwrap_or(""))
+        .bind(names_json)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CoreError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
     async fn search(
         &self,
         query: &str,
@@ -240,10 +385,10 @@ impl SkillIndexStore for SqliteSkillIndexStore {
             return Ok(Vec::new());
         };
         let user = current_user_id();
-        let rows: Vec<SkillTuple> = sqlx::query_as(
+        let rows: Vec<SkillRow> = sqlx::query_as(
             "SELECT s.name, s.owner_user_id, s.description, s.kind, s.disk_path, s.locality, \
                     s.content_hash, s.trust_tier, s.source, s.tags, s.attachments, s.body, \
-                    s.metadata, s.present_on_disk, s.last_seen_at \
+                    s.metadata, s.present_on_disk, s.last_seen_at, s.approved_at, s.approved_by \
              FROM skill_index s JOIN skill_index_fts f ON f.rowid = s.id \
              WHERE skill_index_fts MATCH ? \
                AND (s.owner_user_id IS NULL OR s.owner_user_id = ?) \
@@ -256,7 +401,7 @@ impl SkillIndexStore for SqliteSkillIndexStore {
         .fetch_all(&self.pool)
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;
-        Ok(rows.into_iter().map(row_from_tuple).collect())
+        Ok(rows.into_iter().map(SkillRow::into_domain).collect())
     }
 
     async fn get(
@@ -273,10 +418,10 @@ impl SkillIndexStore for SqliteSkillIndexStore {
         // than that user's skill.
         let user = current_user_id();
         let owner_key = owner.map(|_| user.as_str());
-        let row: Option<SkillTuple> = sqlx::query_as(
+        let row: Option<SkillRow> = sqlx::query_as(
             "SELECT name, owner_user_id, description, kind, disk_path, locality, content_hash, \
                     trust_tier, source, tags, attachments, body, metadata, present_on_disk, \
-                    last_seen_at \
+                    last_seen_at, approved_at, approved_by \
              FROM skill_index WHERE name = ? AND owner_key = ifnull(?, '')",
         )
         .bind(name)
@@ -284,17 +429,17 @@ impl SkillIndexStore for SqliteSkillIndexStore {
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;
-        Ok(row.map(row_from_tuple))
+        Ok(row.map(SkillRow::into_domain))
     }
 
     async fn list(&self, limit: Option<u32>) -> Result<Vec<IndexedSkill>, CoreError> {
         let user = current_user_id();
         // SQLite treats LIMIT -1 as "no limit".
         let lim = limit.map(i64::from).unwrap_or(-1);
-        let rows: Vec<SkillTuple> = sqlx::query_as(
+        let rows: Vec<SkillRow> = sqlx::query_as(
             "SELECT name, owner_user_id, description, kind, disk_path, locality, content_hash, \
                     trust_tier, source, tags, attachments, body, metadata, present_on_disk, \
-                    last_seen_at \
+                    last_seen_at, approved_at, approved_by \
              FROM skill_index \
              WHERE owner_user_id IS NULL OR owner_user_id = ? \
              ORDER BY indexed_at DESC, id DESC LIMIT ?",
@@ -304,6 +449,6 @@ impl SkillIndexStore for SqliteSkillIndexStore {
         .fetch_all(&self.pool)
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;
-        Ok(rows.into_iter().map(row_from_tuple).collect())
+        Ok(rows.into_iter().map(SkillRow::into_domain).collect())
     }
 }

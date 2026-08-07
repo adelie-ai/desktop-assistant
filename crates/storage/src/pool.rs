@@ -211,6 +211,11 @@ const MIGRATIONS: &[Migration] = &[
     // replacement - `content` still holds every byte the tool returned - so a
     // later turn rebuilds the pointer instead of reading the payload again.
     migration!("045_message_distilled_into.sql"),
+    // #1155: the approval axis -- whether a person has consented to a skill,
+    // separate from `trust_tier`'s provenance. Existing rows backfill to
+    // `indexed_at`, since every skill already in the catalog arrived by a
+    // person putting a file in a skill root.
+    migration!("046_skill_approval.sql"),
 ];
 
 /// Second half of the advisory-lock key: the schema the migrations write to.

@@ -6,11 +6,13 @@ use crate::context::{
     cap_tool_result, compact_into_summary, compact_preflight_shrink, recover_from_overflow,
     window_start,
 };
+use crate::domain::skill::{detect_kind, skill_content_hash};
 use crate::domain::{
-    Conversation, ConversationId, ConversationSummary, Message, Role, ToolCall, ToolDefinition,
-    ToolNamespace,
+    Conversation, ConversationId, ConversationSummary, IndexedSkill, Locality, Message, Role,
+    ToolCall, ToolDefinition, ToolNamespace, TrustTier,
 };
 use crate::planning::{self, StepStack};
+use crate::ports::auth::current_user_id;
 use crate::ports::client_tools::current_client_tools;
 use crate::ports::conversation_ctx::with_conversation_id;
 use crate::ports::inbound::ConversationService;
@@ -30,6 +32,7 @@ use crate::ports::scratchpad_scope::{
     SPAWN_SUBAGENT_TOOL, SubagentScope, current_ancestors, current_owner_todo,
     current_scratchpad_scope, with_pending_child_scope,
 };
+use crate::ports::skill_index::{SkillGetFn, SkillSearchFn, SkillWriteAuthoredFn};
 use crate::ports::store::ConversationStore;
 use crate::ports::tool_observer::{ToolEvent, notify_tool_event};
 use crate::ports::tools::ToolExecutor;
@@ -39,6 +42,7 @@ use crate::ports::turn_capability::{
 };
 use crate::ports::turn_interactivity::{TurnInteractivity, current_turn_interactivity};
 use crate::sanitize::sanitize_assistant_text;
+use crate::skill_promotion::{self, PromotionMode};
 use crate::tool_provenance::{
     GATE_BYPASSED_STATUS, GATE_CLOSED_STATUS, GATED_TIERS, GateChange, ToolGate, TurnProvenance,
     WITHHELD_STEP_TEXT,
@@ -513,6 +517,19 @@ pub struct ConversationHandler<S, L, T = NoopToolExecutor> {
     /// `wait=false` subagent's pad-borne result is never deleted mid-flight.
     /// `None` means no probe (cascade unconditionally when the delete is set).
     descendant_task_probe: Option<DescendantTaskProbe>,
+    /// Optional catalog search used to find a skill that may already cover a
+    /// finished plan (#1155). Set alongside [`Self::skill_write_authored`];
+    /// both together are what advertise `promote_plan_to_skill` and let a
+    /// completed plan be offered. `None` leaves the offer off entirely.
+    skill_search: Option<SkillSearchFn>,
+    /// Optional single-skill read, used to answer "is this name already
+    /// taken?" before a promotion writes (#1155). Without it a promotion
+    /// cannot tell an amend from a duplicate, so the whole feature stays off.
+    skill_get: Option<SkillGetFn>,
+    /// Optional writer for a skill the assistant authored from a completed
+    /// plan (#1155). The write always lands unapproved, so this closure cannot
+    /// grant a skill the right to be followed.
+    skill_write_authored: Option<SkillWriteAuthoredFn>,
     /// Optional pre-prompt recall lookup (#1100). When set, the turn embeds the
     /// user prompt once before its first round and surfaces the candidate
     /// memory it finds as a `[Recall]` system block. `None` - no knowledge
@@ -571,6 +588,9 @@ impl<S, L> ConversationHandler<S, L, NoopToolExecutor> {
             categorize_lock: tokio::sync::Mutex::new(()),
             scratchpad_get_many: None,
             scratchpad_write: None,
+            skill_search: None,
+            skill_get: None,
+            skill_write_authored: None,
             scratchpad_list: None,
             scratchpad_delete_subtree: None,
             scratchpad_release_references: None,
@@ -646,6 +666,17 @@ struct RecallLookup {
 /// `[Plan]` block a later turn renders from it, honest about the fact that a
 /// step happened, without carrying the model's wording forward into a turn
 /// that starts clean.
+/// The messages THIS turn added, from the watermark `send_prompt` captured.
+///
+/// Promotion asks "did this plan follow a skill", and the answer has to be
+/// about this turn. Reading the whole log would let one turn that opened a
+/// skill months ago suppress the offer for every unrelated plan in the
+/// conversation ever after. Tolerant of a watermark past the end, which a
+/// truncating compaction could produce.
+fn turn_messages(messages: &[Message], turn_start: usize) -> &[Message] {
+    messages.get(turn_start..).unwrap_or(&[])
+}
+
 fn step_text_to_record(text: &str, provenance: TurnProvenance) -> String {
     if provenance.ingested_external() {
         WITHHELD_STEP_TEXT.to_string()
@@ -671,6 +702,9 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             categorize_lock: tokio::sync::Mutex::new(()),
             scratchpad_get_many: None,
             scratchpad_write: None,
+            skill_search: None,
+            skill_get: None,
+            skill_write_authored: None,
             scratchpad_list: None,
             scratchpad_delete_subtree: None,
             scratchpad_release_references: None,
@@ -780,6 +814,27 @@ impl<S, L, T> ConversationHandler<S, L, T> {
     /// running (deleting its subtree mid-flight would destroy its result).
     pub fn with_descendant_task_probe(mut self, probe: DescendantTaskProbe) -> Self {
         self.descendant_task_probe = Some(probe);
+        self
+    }
+
+    /// Wire the skill catalog so a finished plan can be offered as a skill
+    /// (#1155): `search` finds skills that may already cover the procedure,
+    /// `get` answers whether a name is already taken, and `write` records the
+    /// one the model chooses to keep.
+    ///
+    /// All three are needed. Offering without the search fills the library with
+    /// near-duplicates, and writing without the read cannot tell an amend from
+    /// a duplicate. Leaving them unwired is how the feature is switched off:
+    /// the tool is not advertised and no plan is ever assessed.
+    pub fn with_skill_promotion(
+        mut self,
+        search: SkillSearchFn,
+        get: SkillGetFn,
+        write: SkillWriteAuthoredFn,
+    ) -> Self {
+        self.skill_search = Some(search);
+        self.skill_get = Some(get);
+        self.skill_write_authored = Some(write);
         self
     }
 
@@ -959,6 +1014,9 @@ impl<S, L, T> ConversationHandler<S, L, T> {
         args: &serde_json::Value,
         conversation_id: &ConversationId,
         provenance: TurnProvenance,
+        turn_start: usize,
+        plan_base: u32,
+        offer_made: &mut bool,
     ) -> String {
         let Some(write) = self.scratchpad_write.clone() else {
             return r#"{"ok":false,"error":"planning is not available in this turn"}"#.to_string();
@@ -1184,6 +1242,26 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             }
         }
 
+        // The plan just came back to the root, so the procedure it recorded is
+        // complete enough to judge (#1155). Offered at most once a turn: the
+        // model may open more top-level steps afterwards, and the promotion
+        // tool re-reads the whole plan when it is called, so one offer covers
+        // work done after it as well.
+        let skill_offer = if stack.depth() == 0 && !*offer_made {
+            let offer = self
+                .plan_promotion_offer(
+                    conversation_id,
+                    turn_messages(&conv.messages, turn_start),
+                    provenance,
+                    plan_base,
+                )
+                .await;
+            *offer_made = offer.is_some();
+            offer
+        } else {
+            None
+        };
+
         serde_json::json!({
             "ok": true,
             "action": "complete_step",
@@ -1193,6 +1271,269 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             "freed_bytes": freed,
             "outcome_note": note_keys.first(),
             "note": cascade_note,
+            "skill_offer": skill_offer,
+        })
+        .to_string()
+    }
+
+    /// Read the turn's plan back out of the scratchpad, as promotion sees it
+    /// (#1155).
+    ///
+    /// The plan, not the transcript: the transcript carries the dead ends, and
+    /// the notes carry the steps that worked and what each produced. An
+    /// unreadable scratchpad yields no plan and therefore no offer, which is
+    /// the same silent nothing a plan that does not clear the bar produces.
+    async fn read_plan_steps(
+        &self,
+        conversation_id: &ConversationId,
+        plan_base: u32,
+    ) -> Vec<skill_promotion::PlanStep> {
+        let Some(list) = self.scratchpad_list.clone() else {
+            return Vec::new();
+        };
+        // No type filter: a step's `outcome:*` note is `note`-typed, and the
+        // step's own todo is `todo`-typed, so both arms of a step arrive only
+        // in an unfiltered read.
+        let limit = planning::MAX_PLAN_ITEMS.saturating_mul(3);
+        let Ok(notes) = list(conversation_id.0.clone(), None, limit).await else {
+            return Vec::new();
+        };
+        // A full page means the read may have stopped before the whole plan,
+        // and the store orders `note`-typed rows ahead of `todo`-typed ones, so
+        // what gets cut is the END of the plan. A skill that stops halfway is
+        // worse than no skill, so a truncated read yields no plan at all rather
+        // than a procedure missing its last steps.
+        if notes.len() >= limit {
+            tracing::debug!(
+                notes = notes.len(),
+                limit,
+                "scratchpad read hit its cap; not offering a possibly-truncated plan"
+            );
+            return Vec::new();
+        }
+        let view: Vec<skill_promotion::PlanNote<'_>> = notes
+            .iter()
+            .map(|n| skill_promotion::PlanNote {
+                key: n.key.as_str(),
+                content: n.content.as_str(),
+                note_type: n.note_type.as_str(),
+                done: n.done,
+            })
+            .collect();
+        // The pad is the conversation's, not the turn's, so drop the steps
+        // earlier plans left behind (#1155).
+        skill_promotion::steps_this_turn(skill_promotion::plan_from_notes(&view), plan_base)
+    }
+
+    /// Catalog entries that may already cover a finished plan (#1155).
+    ///
+    /// Searched lexically, with no query vector: this asks "has the library
+    /// already got something about this", and the model makes the judgement
+    /// from the names and descriptions it gets back. A miss here costs a
+    /// near-duplicate the model may still catch, so it is not worth an
+    /// embedding round trip inside a tool acknowledgement.
+    async fn skills_that_may_cover(
+        &self,
+        plan: &skill_promotion::PromotablePlan,
+    ) -> Vec<IndexedSkill> {
+        let Some(search) = self.skill_search.clone() else {
+            return Vec::new();
+        };
+        let query = plan
+            .working_steps()
+            .iter()
+            .map(|s| s.goal.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        match search(
+            query,
+            Vec::new(),
+            String::new(),
+            skill_promotion::MAX_OFFERED_MATCHES,
+        )
+        .await
+        {
+            Ok(hits) => hits,
+            Err(e) => {
+                // A dedup miss is worse than no offer: it invites the
+                // near-duplicate this search exists to prevent.
+                tracing::warn!(error = %e, "skill dedup search failed; no promotion offer");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Offer to keep a finished plan as a skill, when it is worth keeping
+    /// (#1155).
+    ///
+    /// Returns `None` for every plan that is not a procedure, which is most of
+    /// them. Declining has to be cheap on both sides: nothing is written, and
+    /// the model reads no offer at all.
+    async fn plan_promotion_offer(
+        &self,
+        conversation_id: &ConversationId,
+        messages: &[Message],
+        provenance: TurnProvenance,
+        plan_base: u32,
+    ) -> Option<serde_json::Value> {
+        self.skill_search.as_ref()?;
+        self.skill_write_authored.as_ref()?;
+        // A turn that ingested external content does not durably record the
+        // model's own wording (#741), and a skill is nothing but wording.
+        if provenance.ingested_external() {
+            return None;
+        }
+
+        let steps = self.read_plan_steps(conversation_id, plan_base).await;
+        let plan = match skill_promotion::assess(steps, skill_promotion::followed_a_skill(messages))
+        {
+            Ok(plan) => plan,
+            Err(why) => {
+                tracing::debug!(reason = %why.reason(), "plan not offered as a skill");
+                return None;
+            }
+        };
+        let existing = self.skills_that_may_cover(&plan).await;
+        tracing::info!(
+            steps = plan.working_steps().len(),
+            possible_duplicates = existing.len(),
+            "offering to keep a completed plan as a skill"
+        );
+        Some(skill_promotion::render_offer(&plan, &existing))
+    }
+
+    /// Accept a promotion offer: write the finished plan as an UNAPPROVED skill
+    /// (#1155).
+    ///
+    /// The bar is re-checked here, not trusted from the offer, so a plan that
+    /// never cleared it cannot be kept by calling the tool directly. The body
+    /// is rendered from the plan; the model supplies only how the skill is
+    /// found and what it is for.
+    async fn handle_promote_plan(
+        &self,
+        messages: &[Message],
+        args: &serde_json::Value,
+        conversation_id: &ConversationId,
+        provenance: TurnProvenance,
+        plan_base: u32,
+    ) -> String {
+        let Some(write) = self.skill_write_authored.clone() else {
+            return r#"{"ok":false,"error":"the skill library is not available in this turn"}"#
+                .to_string();
+        };
+        if provenance.ingested_external() {
+            return serde_json::json!({
+                "ok": false,
+                "declined": "this turn read external content, so its own wording is not \
+                             recorded; a skill written from it could not be trusted",
+            })
+            .to_string();
+        }
+
+        let req = match skill_promotion::parse_promotion_request(args) {
+            Ok(req) => req,
+            Err(e) => {
+                return serde_json::json!({"ok": false, "error": e.to_string()}).to_string();
+            }
+        };
+
+        let steps = self.read_plan_steps(conversation_id, plan_base).await;
+        let plan = match skill_promotion::assess(steps, skill_promotion::followed_a_skill(messages))
+        {
+            Ok(plan) => plan,
+            Err(why) => {
+                return serde_json::json!({"ok": false, "declined": why.reason()}).to_string();
+            }
+        };
+
+        // The caller's own scope, never the host-global one: a skill the
+        // assistant wrote for one person is not a fact about the machine.
+        let owner = current_user_id();
+        // Fail CLOSED on an unanswerable lookup. The write below upserts on
+        // `(name, owner)`, so reading a failed lookup as "the name is free"
+        // would replace an existing skill's body and drop its approval -- a
+        // person's reviewed skill destroyed by a transient database error.
+        let Some(get) = &self.skill_get else {
+            return serde_json::json!({
+                "ok": false,
+                "error": "the skill catalog cannot be read, so a duplicate name cannot be \
+                          ruled out",
+            })
+            .to_string();
+        };
+        let existing = match get(req.name.clone(), Some(owner.as_str().to_string())).await {
+            Ok(found) => found,
+            Err(e) => {
+                tracing::warn!(skill = %req.name, error = %e, "skill name lookup failed");
+                return serde_json::json!({
+                    "ok": false,
+                    "error": format!(
+                        "could not check whether a skill named {:?} already exists: {e}",
+                        req.name
+                    ),
+                })
+                .to_string();
+            }
+        };
+        if let skill_promotion::PromotionAct::Refuse(why) =
+            skill_promotion::decide(&req, existing.as_ref())
+        {
+            return serde_json::json!({"ok": false, "declined": why}).to_string();
+        }
+
+        let body = skill_promotion::render_skill_body(&req.name, req.summary.as_deref(), &plan);
+        let skill_md =
+            skill_promotion::render_skill_md(&req.name, &req.description, &req.tags, &body);
+        let skill = IndexedSkill {
+            name: req.name.clone(),
+            description: req.description.clone(),
+            kind: detect_kind(&body),
+            // Catalog-only: nothing was written to a skill root, so there is no
+            // backlink to record. The catalog is the authoritative copy (#639),
+            // so the procedure still reads and searches; only bundled scripts
+            // would fail to resolve, and an authored skill has none.
+            disk_path: String::new(),
+            owner_user_id: Some(owner.as_str().to_string()),
+            locality: Locality::Daemon,
+            content_hash: skill_content_hash(skill_md.as_bytes(), &[]),
+            // Provenance, not consent: this really was authored locally. The
+            // store forces `approved_at` to NULL, which is the axis that
+            // decides whether it may be followed.
+            trust_tier: TrustTier::Local,
+            source: Some(skill_promotion::SELF_AUTHORED_SOURCE.to_string()),
+            tags: req.tags.clone(),
+            attachments: Vec::new(),
+            body,
+            metadata: serde_json::json!({"authored_from": "completed-plan"}),
+            present_on_disk: false,
+            last_seen_at: None,
+            approved_at: None,
+            approved_by: None,
+        };
+
+        if let Err(e) = write(skill).await {
+            tracing::warn!(skill = %req.name, error = %e, "failed to record promoted skill");
+            return serde_json::json!({
+                "ok": false,
+                "error": format!("could not record the skill: {e}"),
+            })
+            .to_string();
+        }
+        tracing::info!(
+            skill = %req.name,
+            mode = if req.mode == PromotionMode::Amend { "amend" } else { "new" },
+            steps = plan.working_steps().len(),
+            "recorded a self-authored skill, unapproved"
+        );
+
+        serde_json::json!({
+            "ok": true,
+            "skill": req.name,
+            "mode": if req.mode == PromotionMode::Amend { "amend" } else { "new" },
+            "steps": plan.working_steps().len(),
+            "approved": false,
+            "note": "Saved, but UNAPPROVED: it will not be offered or followed until a \
+                     person approves it.",
         })
         .to_string()
     }
@@ -1416,9 +1757,9 @@ impl<S, L, T> ConversationHandler<S, L, T> {
     /// `done`). Seeding the root counter from the highest existing top-level key
     /// makes a new turn mint the next number instead. Without a lister wired (or
     /// on a read error), falls back to a fresh stack — the prior behaviour.
-    async fn build_step_stack(&self, conversation_id: &ConversationId) -> StepStack {
+    async fn build_step_stack(&self, conversation_id: &ConversationId) -> (StepStack, u32) {
         let Some(list) = self.scratchpad_list.clone() else {
-            return StepStack::new();
+            return (StepStack::new(), 0);
         };
         // Only `todo`-typed notes are plan steps. Cap generously; only their
         // keys matter, and a conversation never accrues that many top-level
@@ -1432,9 +1773,9 @@ impl<S, L, T> ConversationHandler<S, L, T> {
         {
             Ok(notes) => {
                 let max = planning::max_top_level_key(notes.iter().map(|n| n.key.as_str()));
-                StepStack::with_root_counter(max)
+                (StepStack::with_root_counter(max), max)
             }
-            Err(_) => StepStack::new(),
+            Err(_) => (StepStack::new(), 0),
         }
     }
 }
@@ -2004,7 +2345,14 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         // Seeded from the conversation's existing `todo` keys so a later turn
         // continues the numbering instead of clobbering an earlier turn's note
         // via the scratchpad's upsert-by-key write (DA-7 / #292).
-        let mut step_stack = self.build_step_stack(conversation_id).await;
+        // `plan_base` is the highest top-level step number the conversation
+        // already held. Step notes outlive their turn, so it is what separates
+        // the plan THIS turn opens from every plan before it (#1155).
+        let (mut step_stack, plan_base) = self.build_step_stack(conversation_id).await;
+        // At most one offer to keep the turn's plan as a skill (#1155). A turn
+        // may return to the root plan several times, and repeating the offer
+        // each time would train the model to ignore it.
+        let mut skill_offer_made = false;
 
         // Coalescing run for the per-completion status (#941). Spans the whole
         // turn, not one round, so a tool the model keeps calling across rounds
@@ -2071,6 +2419,13 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
             if self.scratchpad_write.is_some() {
                 tool_defs.push(planning::begin_step_tool());
                 tool_defs.push(planning::complete_step_tool());
+                // Keeping a finished plan is a core-loop tool for the same
+                // reason the pair above is: the plan and the turn's messages
+                // are the loop's, and the offer arrives in a step's own
+                // acknowledgement (#1155). Off unless the catalog is wired.
+                if self.skill_write_authored.is_some() {
+                    tool_defs.push(skill_promotion::promote_plan_tool());
+                }
             }
 
             // Restrict the advertised tool set to the caller's allowlist
@@ -2617,6 +2972,28 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 // Gate on the same condition that advertises these tools, so when
                 // planning is off the names aren't shadowed (an MCP tool could
                 // otherwise share one) and dispatch falls through as normal.
+                // Keeping a finished plan as a skill (#1155) reads the same
+                // plan the step tools write, so it is intercepted here too.
+                // Gated on the condition that advertises it, so the name is not
+                // shadowed when the catalog is unwired.
+                if self.scratchpad_write.is_some()
+                    && self.skill_write_authored.is_some()
+                    && tool_call.name == skill_promotion::PROMOTE_PLAN_TOOL
+                {
+                    let ack = self
+                        .handle_promote_plan(
+                            turn_messages(&conv.messages, turn_start),
+                            &arguments,
+                            conversation_id,
+                            turn_provenance,
+                            plan_base,
+                        )
+                        .await;
+                    conv.messages
+                        .push(Message::tool_result(&tool_call.id, &ack));
+                    continue;
+                }
+
                 if self.scratchpad_write.is_some()
                     && (tool_call.name == planning::BEGIN_STEP_TOOL
                         || tool_call.name == planning::COMPLETE_STEP_TOOL)
@@ -2648,6 +3025,9 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                             &arguments,
                             conversation_id,
                             turn_provenance,
+                            turn_start,
+                            plan_base,
+                            &mut skill_offer_made,
                         )
                         .await;
                     conv.messages
@@ -6484,6 +6864,834 @@ mod tests {
             ),
             LlmResponse::text("done"),
         ]
+    }
+
+    // --- promoting a completed plan into a skill (#1155) ---------------------
+
+    /// A skill catalog for the promotion tests: a search that returns whatever
+    /// it is seeded with, a `get` over the same seed, and a writer that records
+    /// what the promotion wrote.
+    #[allow(clippy::type_complexity)]
+    fn in_memory_skill_catalog(
+        seed: Vec<IndexedSkill>,
+    ) -> (
+        crate::ports::skill_index::SkillSearchFn,
+        crate::ports::skill_index::SkillGetFn,
+        crate::ports::skill_index::SkillWriteAuthoredFn,
+        Arc<Mutex<Vec<IndexedSkill>>>,
+    ) {
+        let seed = Arc::new(seed);
+        let written: Arc<Mutex<Vec<IndexedSkill>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let s = Arc::clone(&seed);
+        let search: crate::ports::skill_index::SkillSearchFn =
+            Arc::new(move |_q, _emb, _model, _limit| {
+                let s = Arc::clone(&s);
+                Box::pin(async move { Ok(s.as_ref().clone()) })
+            });
+
+        let g = Arc::clone(&seed);
+        let get: crate::ports::skill_index::SkillGetFn = Arc::new(move |name: String, _owner| {
+            let g = Arc::clone(&g);
+            Box::pin(async move { Ok(g.iter().find(|s| s.name == name).cloned()) })
+        });
+
+        let w = Arc::clone(&written);
+        let write: crate::ports::skill_index::SkillWriteAuthoredFn =
+            Arc::new(move |skill: IndexedSkill| {
+                let w = Arc::clone(&w);
+                Box::pin(async move {
+                    w.lock().unwrap().push(skill);
+                    Ok(())
+                })
+            });
+
+        (search, get, write, written)
+    }
+
+    /// Whether any tool result the model read carried a promotion offer.
+    ///
+    /// Used where the exact acknowledgement cannot be named by call id, because
+    /// a turn's own bookkeeping calls (categorisation, folding) consume mock
+    /// responses and shift the pairing.
+    fn any_skill_offer(prompts: &Arc<Mutex<Vec<Vec<Message>>>>) -> bool {
+        prompts.lock().unwrap().iter().flatten().any(|m| {
+            serde_json::from_str::<serde_json::Value>(&m.content)
+                .is_ok_and(|v| !v["skill_offer"].is_null())
+        })
+    }
+
+    /// The `begin_step`/`complete_step` pair for one step of a plan.
+    fn plan_step_calls(n: usize, goal: &str, outcome: &str) -> Vec<LlmResponse> {
+        vec![
+            LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new(
+                    format!("b{n}"),
+                    "begin_step",
+                    serde_json::json!({"goal": goal}).to_string(),
+                )],
+            ),
+            LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new(
+                    format!("c{n}"),
+                    "complete_step",
+                    serde_json::json!({"outcome": outcome}).to_string(),
+                )],
+            ),
+        ]
+    }
+
+    /// Acceptance: a completed multi-step plan whose steps succeeded produces
+    /// an offer to write a skill.
+    #[tokio::test]
+    async fn a_completed_multi_step_plan_offers_to_become_a_skill() {
+        let mut responses = Vec::new();
+        responses.extend(plan_step_calls(1, "read the failing job", "it times out"));
+        responses.extend(plan_step_calls(2, "raise the timeout", "it now passes"));
+        responses.extend(plan_step_calls(3, "record the new value", "written down"));
+        responses.push(LlmResponse::text("Done."));
+
+        let (write, list, _sp) = in_memory_scratchpad();
+        let (search, get, skill_write, _written) = in_memory_skill_catalog(Vec::new());
+        let llm = ToolCallingLlm::new(responses);
+        let prompts = llm.prompts();
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            llm,
+            MockToolExecutor::new(Vec::new(), HashMap::new()),
+            id_gen(),
+        )
+        .with_scratchpad_write(write)
+        .with_scratchpad_list(list)
+        .with_skill_promotion(search, get, skill_write);
+
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(
+                &conv.id,
+                "fix the job".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await
+            .unwrap();
+
+        let third = last_prompt_result(&prompts, "c3");
+        let ack: serde_json::Value = serde_json::from_str(&third).expect("the ack is JSON");
+        let offer = &ack["skill_offer"];
+        assert_eq!(
+            offer["tool"], "promote_plan_to_skill",
+            "the third completed step should carry the offer, got: {third}"
+        );
+        assert_eq!(offer["steps"], 3);
+        assert_eq!(offer["mode_hint"], "new");
+
+        // And only once: the earlier completions cleared the stack too.
+        for earlier in ["c1", "c2"] {
+            let ack: serde_json::Value =
+                serde_json::from_str(&last_prompt_result(&prompts, earlier))
+                    .expect("the ack is JSON");
+            assert!(
+                ack["skill_offer"].is_null(),
+                "{earlier} must not offer: the plan had not cleared the bar yet"
+            );
+        }
+    }
+
+    /// Acceptance: a single-step plan produces no offer.
+    #[tokio::test]
+    async fn a_single_step_plan_offers_nothing() {
+        let mut responses = plan_step_calls(1, "write the file", "written");
+        responses.push(LlmResponse::text("Done."));
+
+        let (write, list, _sp) = in_memory_scratchpad();
+        let (search, get, skill_write, _written) = in_memory_skill_catalog(Vec::new());
+        let llm = ToolCallingLlm::new(responses);
+        let prompts = llm.prompts();
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            llm,
+            MockToolExecutor::new(Vec::new(), HashMap::new()),
+            id_gen(),
+        )
+        .with_scratchpad_write(write)
+        .with_scratchpad_list(list)
+        .with_skill_promotion(search, get, skill_write);
+
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "write it".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+
+        let ack: serde_json::Value =
+            serde_json::from_str(&last_prompt_result(&prompts, "c1")).expect("the ack is JSON");
+        assert!(
+            ack["skill_offer"].is_null(),
+            "writing one file is not a procedure"
+        );
+    }
+
+    /// A plan read that hit the scratchpad's page cap may be missing its last
+    /// steps, because the store returns `note`-typed rows before `todo`-typed
+    /// ones. A skill that stops halfway is worse than no skill, so the offer is
+    /// withheld rather than built from a plan that might be short.
+    #[tokio::test]
+    async fn a_truncated_scratchpad_read_offers_nothing() {
+        let mut responses = Vec::new();
+        responses.extend(plan_step_calls(1, "read the failing job", "it times out"));
+        responses.extend(plan_step_calls(2, "raise the timeout", "it now passes"));
+        responses.extend(plan_step_calls(3, "record the new value", "written down"));
+        responses.push(LlmResponse::text("Done."));
+
+        let (write, _list, sp) = in_memory_scratchpad();
+        // A lister that always returns a full page, as a real store does when
+        // the conversation holds more notes than the read asks for.
+        let padded: ScratchpadListFn = Arc::new(move |_conv, _note_type, limit: usize| {
+            let sp = Arc::clone(&sp);
+            Box::pin(async move {
+                use crate::domain::ScratchpadNote;
+                let mut out: Vec<ScratchpadNote> = sp.lock().unwrap().values().cloned().collect();
+                let mut filler = 0usize;
+                while out.len() < limit {
+                    filler += 1;
+                    out.push(ScratchpadNote::new(
+                        format!("filler-{filler}"),
+                        "conv",
+                        format!("filler-{filler}"),
+                        "chatter",
+                    ));
+                }
+                out.truncate(limit);
+                Ok(out)
+            })
+        });
+
+        let (search, get, skill_write, written) = in_memory_skill_catalog(Vec::new());
+        let llm = ToolCallingLlm::new(responses);
+        let prompts = llm.prompts();
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            llm,
+            MockToolExecutor::new(Vec::new(), HashMap::new()),
+            id_gen(),
+        )
+        .with_scratchpad_write(write)
+        .with_scratchpad_list(padded)
+        .with_skill_promotion(search, get, skill_write);
+
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(
+                &conv.id,
+                "fix the job".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await
+            .unwrap();
+
+        let ack: serde_json::Value =
+            serde_json::from_str(&last_prompt_result(&prompts, "c3")).expect("the ack is JSON");
+        assert!(
+            ack["skill_offer"].is_null(),
+            "a plan that may be short must not be offered: {ack}"
+        );
+        assert!(written.lock().unwrap().is_empty());
+    }
+
+    /// Acceptance: a plan that was started from an existing skill produces no
+    /// offer.
+    #[tokio::test]
+    async fn a_plan_that_followed_an_existing_skill_offers_nothing() {
+        let tools = vec![ToolDefinition::new(
+            "builtin_skill_get",
+            "Read a skill",
+            serde_json::json!({"type": "object"}),
+        )];
+        let mut results = HashMap::new();
+        results.insert(
+            "builtin_skill_get".to_string(),
+            serde_json::json!({
+                "name": "fix-the-job",
+                "trust_tier": "local",
+                "body": "Steps: do the thing",
+            })
+            .to_string(),
+        );
+
+        let mut responses = vec![LlmResponse::with_tool_calls(
+            "",
+            vec![ToolCall::new(
+                "s1",
+                "builtin_skill_get",
+                r#"{"name":"fix-the-job"}"#,
+            )],
+        )];
+        responses.extend(plan_step_calls(1, "read the failing job", "it times out"));
+        responses.extend(plan_step_calls(2, "raise the timeout", "it now passes"));
+        responses.extend(plan_step_calls(3, "record the new value", "written down"));
+        responses.push(LlmResponse::text("Done."));
+
+        let (write, list, _sp) = in_memory_scratchpad();
+        let (search, get, skill_write, _written) = in_memory_skill_catalog(Vec::new());
+        let llm = ToolCallingLlm::new(responses);
+        let prompts = llm.prompts();
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            llm,
+            MockToolExecutor::new(tools, results),
+            id_gen(),
+        )
+        .with_scratchpad_write(write)
+        .with_scratchpad_list(list)
+        .with_skill_promotion(search, get, skill_write);
+
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(
+                &conv.id,
+                "fix the job".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await
+            .unwrap();
+
+        let ack: serde_json::Value =
+            serde_json::from_str(&last_prompt_result(&prompts, "c3")).expect("the ack is JSON");
+        assert!(
+            ack["skill_offer"].is_null(),
+            "re-saving a skill the turn just followed is how a library fills with duplicates"
+        );
+    }
+
+    /// The discriminating half of the case above. `builtin_skill_search` and
+    /// `builtin_skill_get` carry the same tool provenance, so a turn that only
+    /// searched is suppressed by nothing at all and still gets its offer.
+    /// Without this, the case above would pass just as well against an
+    /// implementation that suppressed the offer for the wrong reason.
+    #[tokio::test]
+    async fn searching_the_library_without_reading_a_skill_still_offers() {
+        let tools = vec![ToolDefinition::new(
+            "builtin_skill_search",
+            "Search skills",
+            serde_json::json!({"type": "object"}),
+        )];
+        let mut results = HashMap::new();
+        results.insert(
+            "builtin_skill_search".to_string(),
+            serde_json::json!({"results": [], "trust_tier": "local"}).to_string(),
+        );
+
+        let mut responses = vec![LlmResponse::with_tool_calls(
+            "",
+            vec![ToolCall::new(
+                "s1",
+                "builtin_skill_search",
+                r#"{"query":"job timeout"}"#,
+            )],
+        )];
+        responses.extend(plan_step_calls(1, "read the failing job", "it times out"));
+        responses.extend(plan_step_calls(2, "raise the timeout", "it now passes"));
+        responses.extend(plan_step_calls(3, "record the new value", "written down"));
+        responses.push(LlmResponse::text("Done."));
+
+        let (write, list, _sp) = in_memory_scratchpad();
+        let (search, get, skill_write, _written) = in_memory_skill_catalog(Vec::new());
+        let llm = ToolCallingLlm::new(responses);
+        let prompts = llm.prompts();
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            llm,
+            MockToolExecutor::new(tools, results),
+            id_gen(),
+        )
+        .with_scratchpad_write(write)
+        .with_scratchpad_list(list)
+        .with_skill_promotion(search, get, skill_write);
+
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(
+                &conv.id,
+                "fix the job".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await
+            .unwrap();
+
+        let ack: serde_json::Value =
+            serde_json::from_str(&last_prompt_result(&prompts, "c3")).expect("the ack is JSON");
+        assert_eq!(
+            ack["skill_offer"]["tool"], "promote_plan_to_skill",
+            "searching the library is not following a skill: {ack}"
+        );
+    }
+
+    /// A skill read in an EARLIER turn must not suppress this turn's offer.
+    /// The question is whether THIS plan followed a skill, not whether the
+    /// conversation ever opened one - otherwise one lookup silences the feature
+    /// for the rest of the conversation.
+    #[tokio::test]
+    async fn a_skill_read_in_an_earlier_turn_does_not_suppress_this_turns_offer() {
+        let tools = vec![ToolDefinition::new(
+            "builtin_skill_get",
+            "Read a skill",
+            serde_json::json!({"type": "object"}),
+        )];
+        let mut results = HashMap::new();
+        results.insert(
+            "builtin_skill_get".to_string(),
+            serde_json::json!({"name": "unrelated", "trust_tier": "local"}).to_string(),
+        );
+
+        // Turn one reads a skill and plans nothing.
+        let mut responses = vec![
+            LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new(
+                    "s1",
+                    "builtin_skill_get",
+                    r#"{"name":"unrelated"}"#,
+                )],
+            ),
+            LlmResponse::text("That skill says to do X."),
+        ];
+        // Turn two works an unrelated plan through to the end.
+        responses.extend(plan_step_calls(1, "read the failing job", "it times out"));
+        responses.extend(plan_step_calls(2, "raise the timeout", "it now passes"));
+        responses.extend(plan_step_calls(3, "record the new value", "written down"));
+        // A fourth step, so the plan still clears the bar even though a turn's
+        // own bookkeeping call consumes one mock response.
+        responses.extend(plan_step_calls(4, "re-run the job", "it passes"));
+        responses.push(LlmResponse::text("Done."));
+
+        let (write, list, _sp) = in_memory_scratchpad();
+        let (search, get, skill_write, _written) = in_memory_skill_catalog(Vec::new());
+        let llm = ToolCallingLlm::new(responses);
+        let prompts = llm.prompts();
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            llm,
+            MockToolExecutor::new(tools, results),
+            id_gen(),
+        )
+        .with_scratchpad_write(write)
+        .with_scratchpad_list(list)
+        .with_skill_promotion(search, get, skill_write);
+
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(
+                &conv.id,
+                "what does that skill say?".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await
+            .unwrap();
+        handler
+            .send_prompt(
+                &conv.id,
+                "now fix the job".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            any_skill_offer(&prompts),
+            "an earlier turn's lookup is not this plan following a skill, so the second \
+             turn's completed plan must still be offered"
+        );
+    }
+
+    /// Step notes outlive their turn and the step stack keeps counting, so a
+    /// plain read of the pad returns every step the conversation ever
+    /// completed. Two unrelated two-step plans must not clear a three-step bar
+    /// between them, nor be written as one spliced procedure.
+    #[tokio::test]
+    async fn a_later_turns_plan_does_not_inherit_the_earlier_turns_steps() {
+        let mut responses = Vec::new();
+        responses.extend(plan_step_calls(1, "turn one, step one", "did a"));
+        responses.extend(plan_step_calls(2, "turn one, step two", "did b"));
+        responses.push(LlmResponse::text("First job done."));
+        responses.extend(plan_step_calls(3, "turn two, step one", "did c"));
+        responses.extend(plan_step_calls(4, "turn two, step two", "did d"));
+        responses.push(LlmResponse::text("Second job done."));
+
+        let (write, list, _sp) = in_memory_scratchpad();
+        let (search, get, skill_write, written) = in_memory_skill_catalog(Vec::new());
+        let llm = ToolCallingLlm::new(responses);
+        let prompts = llm.prompts();
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            llm,
+            MockToolExecutor::new(Vec::new(), HashMap::new()),
+            id_gen(),
+        )
+        .with_scratchpad_write(write)
+        .with_scratchpad_list(list)
+        .with_skill_promotion(search, get, skill_write);
+
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "first job".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+        handler
+            .send_prompt(
+                &conv.id,
+                "second job".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !any_skill_offer(&prompts),
+            "neither turn opened three steps of its own, so neither is a method"
+        );
+        assert!(written.lock().unwrap().is_empty());
+    }
+
+    /// Acceptance: a skill written this way is unapproved, and its body comes
+    /// from the plan's steps and outcomes.
+    #[tokio::test]
+    async fn accepting_the_offer_records_an_unapproved_skill_built_from_the_plan() {
+        let mut responses = Vec::new();
+        responses.extend(plan_step_calls(1, "read the failing job", "it times out"));
+        responses.extend(plan_step_calls(2, "raise the timeout", "it now passes"));
+        responses.extend(plan_step_calls(3, "record the new value", "written down"));
+        responses.push(LlmResponse::with_tool_calls(
+            "",
+            vec![ToolCall::new(
+                "p1",
+                "promote_plan_to_skill",
+                r#"{"name":"raise-a-job-timeout","description":"Use when a scheduled job times out."}"#,
+            )],
+        ));
+        responses.push(LlmResponse::text("Kept it."));
+
+        let (write, list, _sp) = in_memory_scratchpad();
+        let (search, get, skill_write, written) = in_memory_skill_catalog(Vec::new());
+        let llm = ToolCallingLlm::new(responses);
+        let prompts = llm.prompts();
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            llm,
+            MockToolExecutor::new(Vec::new(), HashMap::new()),
+            id_gen(),
+        )
+        .with_scratchpad_write(write)
+        .with_scratchpad_list(list)
+        .with_skill_promotion(search, get, skill_write);
+
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(
+                &conv.id,
+                "fix the job".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await
+            .unwrap();
+
+        let ack: serde_json::Value =
+            serde_json::from_str(&last_prompt_result(&prompts, "p1")).expect("the ack is JSON");
+        assert_eq!(ack["ok"], true, "the promotion should succeed: {ack}");
+        assert_eq!(ack["approved"], false);
+
+        let saved = written.lock().unwrap();
+        assert_eq!(saved.len(), 1, "exactly one skill was written");
+        let skill = &saved[0];
+        assert_eq!(skill.name, "raise-a-job-timeout");
+        assert_eq!(skill.kind, crate::domain::SkillKind::Workflow);
+        assert_eq!(skill.trust_tier, TrustTier::Local, "authored locally");
+        assert!(
+            !skill.is_approved(),
+            "provenance is the most trusted tier there is, and it still may not be followed"
+        );
+        assert!(!skill.present_on_disk, "no file was written");
+        for expected in ["read the failing job", "it times out", "raise the timeout"] {
+            assert!(
+                skill.body.contains(expected),
+                "the body must carry the plan's own {expected:?}: {}",
+                skill.body
+            );
+        }
+        assert!(
+            !skill.body.contains("fix the job"),
+            "the body comes from the plan, not from the user's prompt"
+        );
+    }
+
+    /// Acceptance: an existing skill covering the same procedure is amended or
+    /// declined, never duplicated.
+    #[tokio::test]
+    async fn promoting_over_an_existing_name_is_refused_rather_than_duplicated() {
+        let existing = IndexedSkill {
+            name: "raise-a-job-timeout".to_string(),
+            description: "The one already in the catalog.".to_string(),
+            kind: crate::domain::SkillKind::Workflow,
+            disk_path: String::new(),
+            owner_user_id: Some(current_user_id().as_str().to_string()),
+            locality: Locality::Daemon,
+            content_hash: "hash".to_string(),
+            trust_tier: TrustTier::Local,
+            source: Some("self-authored".to_string()),
+            tags: Vec::new(),
+            attachments: Vec::new(),
+            body: "## Steps\n1. the old way\n".to_string(),
+            metadata: serde_json::json!({}),
+            present_on_disk: false,
+            last_seen_at: None,
+            approved_at: None,
+            approved_by: None,
+        };
+
+        let mut responses = Vec::new();
+        responses.extend(plan_step_calls(1, "read the failing job", "it times out"));
+        responses.extend(plan_step_calls(2, "raise the timeout", "it now passes"));
+        responses.extend(plan_step_calls(3, "record the new value", "written down"));
+        responses.push(LlmResponse::with_tool_calls(
+            "",
+            vec![ToolCall::new(
+                "p1",
+                "promote_plan_to_skill",
+                r#"{"name":"raise-a-job-timeout","description":"Use when a job times out."}"#,
+            )],
+        ));
+        responses.push(LlmResponse::text("Left it alone."));
+
+        let (write, list, _sp) = in_memory_scratchpad();
+        let (search, get, skill_write, written) = in_memory_skill_catalog(vec![existing]);
+        let llm = ToolCallingLlm::new(responses);
+        let prompts = llm.prompts();
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            llm,
+            MockToolExecutor::new(Vec::new(), HashMap::new()),
+            id_gen(),
+        )
+        .with_scratchpad_write(write)
+        .with_scratchpad_list(list)
+        .with_skill_promotion(search, get, skill_write);
+
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(
+                &conv.id,
+                "fix the job".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await
+            .unwrap();
+
+        let ack: serde_json::Value =
+            serde_json::from_str(&last_prompt_result(&prompts, "p1")).expect("the ack is JSON");
+        assert_eq!(ack["ok"], false);
+        assert!(
+            ack["declined"]
+                .as_str()
+                .expect("a refusal says why")
+                .contains("amend"),
+            "the refusal must name the useful act: {ack}"
+        );
+        assert!(
+            written.lock().unwrap().is_empty(),
+            "a second skill of the same name must never be written"
+        );
+
+        // And the offer said so up front.
+        let offer: serde_json::Value =
+            serde_json::from_str(&last_prompt_result(&prompts, "c3")).expect("the ack is JSON");
+        assert_eq!(offer["skill_offer"]["mode_hint"], "amend");
+    }
+
+    /// A failed name lookup must NOT read as "the name is free". `write_authored`
+    /// upserts on `(name, owner)`, so creating over a name that is really taken
+    /// would replace the existing skill's body and drop its approval - which is
+    /// how a person's reviewed skill gets destroyed by a transient database
+    /// error.
+    #[tokio::test]
+    async fn a_failed_name_lookup_declines_rather_than_writing_over_it() {
+        let mut responses = Vec::new();
+        responses.extend(plan_step_calls(1, "read the failing job", "it times out"));
+        responses.extend(plan_step_calls(2, "raise the timeout", "it now passes"));
+        responses.extend(plan_step_calls(3, "record the new value", "written down"));
+        responses.push(LlmResponse::with_tool_calls(
+            "",
+            vec![ToolCall::new(
+                "p1",
+                "promote_plan_to_skill",
+                r#"{"name":"raise-a-job-timeout","description":"Use when a job times out."}"#,
+            )],
+        ));
+        responses.push(LlmResponse::text("Held off."));
+
+        let (write, list, _sp) = in_memory_scratchpad();
+        let (search, _get, skill_write, written) = in_memory_skill_catalog(Vec::new());
+        let failing_get: crate::ports::skill_index::SkillGetFn = Arc::new(|_name, _owner| {
+            Box::pin(async { Err(CoreError::Storage("the database is down".into())) })
+        });
+
+        let llm = ToolCallingLlm::new(responses);
+        let prompts = llm.prompts();
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            llm,
+            MockToolExecutor::new(Vec::new(), HashMap::new()),
+            id_gen(),
+        )
+        .with_scratchpad_write(write)
+        .with_scratchpad_list(list)
+        .with_skill_promotion(search, failing_get, skill_write);
+
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(
+                &conv.id,
+                "fix the job".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await
+            .unwrap();
+
+        let ack: serde_json::Value =
+            serde_json::from_str(&last_prompt_result(&prompts, "p1")).expect("the ack is JSON");
+        assert_eq!(
+            ack["ok"], false,
+            "an unanswerable lookup must not write: {ack}"
+        );
+        assert!(
+            written.lock().unwrap().is_empty(),
+            "nothing may be written while the catalog cannot say whether the name is taken"
+        );
+    }
+
+    /// A plan that never cleared the bar cannot be kept by calling the tool
+    /// directly: the bar is re-checked at the write, not trusted from an offer.
+    #[tokio::test]
+    async fn promoting_a_trivial_plan_is_declined_at_the_write() {
+        let mut responses = plan_step_calls(1, "write the file", "written");
+        responses.push(LlmResponse::with_tool_calls(
+            "",
+            vec![ToolCall::new(
+                "p1",
+                "promote_plan_to_skill",
+                r#"{"name":"write-a-file","description":"Use when writing a file."}"#,
+            )],
+        ));
+        responses.push(LlmResponse::text("Done."));
+
+        let (write, list, _sp) = in_memory_scratchpad();
+        let (search, get, skill_write, written) = in_memory_skill_catalog(Vec::new());
+        let llm = ToolCallingLlm::new(responses);
+        let prompts = llm.prompts();
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            llm,
+            MockToolExecutor::new(Vec::new(), HashMap::new()),
+            id_gen(),
+        )
+        .with_scratchpad_write(write)
+        .with_scratchpad_list(list)
+        .with_skill_promotion(search, get, skill_write);
+
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "write it".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+
+        let ack: serde_json::Value =
+            serde_json::from_str(&last_prompt_result(&prompts, "p1")).expect("the ack is JSON");
+        assert_eq!(ack["ok"], false);
+        assert!(written.lock().unwrap().is_empty());
+    }
+
+    /// With no catalog wired the feature is off rather than half-present: the
+    /// same plan that earns an offer above earns nothing here.
+    #[tokio::test]
+    async fn a_completed_plan_offers_nothing_without_a_catalog() {
+        let mut responses = Vec::new();
+        responses.extend(plan_step_calls(1, "read the failing job", "it times out"));
+        responses.extend(plan_step_calls(2, "raise the timeout", "it now passes"));
+        responses.extend(plan_step_calls(3, "record the new value", "written down"));
+        responses.push(LlmResponse::text("Done."));
+
+        let (write, list, _sp) = in_memory_scratchpad();
+        let llm = ToolCallingLlm::new(responses);
+        let prompts = llm.prompts();
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            llm,
+            MockToolExecutor::new(Vec::new(), HashMap::new()),
+            id_gen(),
+        )
+        .with_scratchpad_write(write)
+        .with_scratchpad_list(list);
+
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(
+                &conv.id,
+                "fix the job".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await
+            .unwrap();
+
+        let ack: serde_json::Value =
+            serde_json::from_str(&last_prompt_result(&prompts, "c3")).expect("the ack is JSON");
+        assert!(ack["skill_offer"].is_null());
     }
 
     #[tokio::test]

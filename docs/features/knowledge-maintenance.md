@@ -14,7 +14,7 @@ All live in `crates/storage/src/dreaming/` + `crates/storage/src/embedding_backf
 
 | Pass | Entry point | What it does | Cadence |
 | ---- | ----------- | ------------ | ------- |
-| **Extraction** | `run_dreaming_scan` | Scans conversations past their watermark, asks an LLM to extract durable facts, writes them (+ archival of long-quiet conversations). | frequent (hourly) |
+| **Extraction** | `run_dreaming_scan` | Scans conversations past their watermark, asks an LLM to extract durable facts, writes them (+ archival of long-quiet conversations). A finding that is a **method** goes to the skill catalog as an unapproved candidate instead - see "A method is not a fact". | frequent (hourly) |
 | **Summary backfill** | `run_dreaming_scan` | Writes the one-line `summary` for entries that have none, and rewrites one whose body changed after it was written. Batched, capped per cycle, and never touches `content`. | frequent (hourly) |
 | **Consolidation** | `run_consolidation_scan` | Loads a user's whole active KB and recomputes it holistically (prune / merge / tighten) with a stronger model, applied transactionally with soft-delete and bounded by the rules below. | slow (daily) |
 | **Embedding recompute** | `backfill_knowledge_embeddings` | Re-embeds rows. The periodic backfill only touches NULL/stale/model-mismatched rows; the **force** path (`invalidate_all_knowledge_embeddings` → backfill) re-embeds everything. | periodic + on-demand |
@@ -45,6 +45,51 @@ matching instead of vanishing; and a stamp whose digest matches the current
 model is treated as the same model even when the name is spelled differently, so
 a cosmetic rename costs nothing (see `crates/storage/tests/embedding_fingerprint.rs`
 and `crates/storage/tests/search_embedding_model_scope.rs`).
+
+## A method is not a fact
+
+Extraction has two destinations, not one (#1155). The rule that decides which:
+
+> **Knowledge records what is true. A skill records how to do something. And a
+> skill's preferences stay knowledge.**
+
+An entry that answers "what are the steps" is a skill in the wrong table.
+Procedural content in declarative memory is wrong three ways at once. It reads
+badly: a numbered method rendered as a fact is neither a good fact nor a
+runnable procedure. It surfaces badly: it competes for the knowledge arm's
+attention budget as though it were a fact about the world. And it cannot be
+followed: nothing can execute it, attach scripts to it, or record that it was
+run and worked.
+
+So the extraction prompt asks for two arrays, and a response may carry both:
+
+```json
+{"facts": [...], "skills": [...]}
+```
+
+A `skills` entry is `{name, description, steps: [{goal, outcome}], tags?}`. It
+is written to the skill catalog as an **unapproved candidate** - inert until a
+person approves it - and never to `knowledge_base`. Two guards bound what an
+unattended pass may do:
+
+- A method shorter than three steps is dropped. That is the same floor the
+  promotion path uses: a two-step "method" is a pair of acts, and the value of a
+  skill is the ordering and the reasons.
+- A name already held by an **approved** skill is left alone. A person reviewed
+  that body. An unapproved row of the same name is revised instead, which is
+  what stops every cycle adding another near-duplicate.
+
+The split has a second half worth naming. A routine written as a knowledge entry
+is generally two things stuck together: the method, and the preferences that
+tune it. The **skill** holds the method - the ordered steps, general enough to
+be followed more than once. The **knowledge entry** holds what configures a run
+- which sources, in what order, what to skip, what "done" looks like for this
+person. Those are facts, they change independently of the method, and they are
+exactly what a knowledge entry is for.
+
+Entries already stored the wrong way are not migrated by this pass. Moving them
+is a judgement, and getting it wrong destroys something useful, so a proposing
+sweep is tracked separately.
 
 ## What the summary backfill may and may not do
 
@@ -420,6 +465,7 @@ is a broader, cross-cutting change tracked separately.
 | Signal projection | `crates/api-model/src/signal.rs` (`SignalEvent::KnowledgeChanged`) |
 | Port | `crates/core/src/ports/inbound.rs` (`KnowledgeMaintenanceService`) |
 | Scans + force-recalc | `crates/storage/src/dreaming/`, `crates/storage/src/embedding_backfill.rs` |
+| Extraction's skill arm (the routing prompt, the parse, the write) | `crates/storage/src/dreaming/skills.rs` |
 | Trash lifecycle (count / empty / reap / sweep) | `crates/storage/src/dreaming/trash.rs`, sweep loop in `crates/daemon/src/main.rs` |
 | The one hard-delete statement + the policy | `crates/storage/src/knowledge_delete.rs`, audited by `crates/storage/tests/knowledge_hard_delete_audit.rs` |
 | Who asked for a delete | `crates/core/src/ports/knowledge_delete.rs` (`DeleteInitiator`, `with_delete_initiator`), installed in `crates/application/src/lib.rs` |

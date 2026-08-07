@@ -119,9 +119,14 @@ fn scan_skill_dir(
         body: parsed.body,
         metadata: parsed.frontmatter.metadata,
         // Presence is index state the reconcile pass stamps; a scanner only
-        // ever reports what it just read off disk.
+        // ever reports what it just read off disk. Approval (#1155) is stamped
+        // by the same pass, for the same reason: a scanner reports the file it
+        // read, and whether a person consented to it is not written in the
+        // file.
         present_on_disk: true,
         last_seen_at: None,
+        approved_at: None,
+        approved_by: None,
     })
 }
 

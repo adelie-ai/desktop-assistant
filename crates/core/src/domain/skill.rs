@@ -401,6 +401,40 @@ pub struct IndexedSkill {
     /// [`Self::present_on_disk`].
     #[serde(default)]
     pub last_seen_at: Option<DateTime<Utc>>,
+    /// When this skill was approved for use; `None` means not approved (#1155).
+    ///
+    /// Approval is a separate axis from [`Self::trust_tier`], and the two
+    /// answer different questions. The tier records **provenance** -- where the
+    /// skill came from. This records **consent** -- whether a person has said
+    /// it may be followed. One column cannot hold both: a skill fetched from
+    /// GitHub can be approved, and a skill Adele wrote for herself is
+    /// [`TrustTier::Local`], the most trusted provenance there is, and must
+    /// still not be followed until someone says so.
+    #[serde(default)]
+    pub approved_at: Option<DateTime<Utc>>,
+    /// Who approved the skill; `None` on a single-person deployment, where the
+    /// only possible approver is the user. Meaningless while
+    /// [`Self::approved_at`] is `None`.
+    #[serde(default)]
+    pub approved_by: Option<String>,
+}
+
+impl IndexedSkill {
+    /// Whether a person has approved this skill for use.
+    pub fn is_approved(&self) -> bool {
+        self.approved_at.is_some()
+    }
+}
+
+/// A recorded act of approving a skill for use (#1155).
+///
+/// Carried as one value so the instant and the approver cannot drift apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillApproval {
+    /// When the approval was given.
+    pub at: DateTime<Utc>,
+    /// Who gave it; `None` where the deployment has only one person.
+    pub by: Option<String>,
 }
 
 /// A row with no recorded presence predates presence tracking, and the skill it
