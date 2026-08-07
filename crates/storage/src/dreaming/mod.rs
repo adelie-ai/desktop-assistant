@@ -148,7 +148,7 @@ pub async fn run_consolidation_scan(
             "consolidation: reviewed {}, merged {} cluster(s), updated {}, scope-added {}, \
              soft-deleted {}; refused {} prune(s) of user-entered entries and {} \
              mutation(s) of settled ones; deferred {} prune(s) and {} rewrite(s) over the \
-             configured share",
+             configured share; dropped {} unreadable operation(s)",
             stats.reviewed,
             stats.merged_clusters,
             stats.updated,
@@ -158,6 +158,18 @@ pub async fn run_consolidation_scan(
             stats.settled_unchanged,
             stats.prunes_over_cap,
             stats.rewrites_over_cap,
+            stats.dropped_operations,
+        );
+    } else if stats.dropped_operations > 0 {
+        // A run that changed nothing because it could not read what the model
+        // proposed is not a quiet no-op. Say so at a level an operator reads,
+        // or it looks exactly like a run with nothing to do.
+        tracing::warn!(
+            "consolidation: reviewed {} entr{} and changed nothing, after dropping {} \
+             unreadable operation(s)",
+            stats.reviewed,
+            if stats.reviewed == 1 { "y" } else { "ies" },
+            stats.dropped_operations,
         );
     } else {
         tracing::debug!(

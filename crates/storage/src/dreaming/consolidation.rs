@@ -54,7 +54,8 @@ use super::common::{extract_json_payload, is_total_failure};
 use super::reconcile::{OpBuffer, ProposedOp, SynthesizedMerge, apply_ops};
 use super::types::{
     ConsolidationStats, DreamingLlmFn, KnowledgeChangeFn, MAX_DELETE_REASON_CHARS,
-    MAX_HOLISTIC_PROMPT_CHARS, MAX_REVIEW_GENERATION, MAX_SLICE_SPLIT_DEPTH, SOURCE_EXPLICIT,
+    MAX_DROPPED_OP_EXCERPT_CHARS, MAX_HOLISTIC_PROMPT_CHARS, MAX_REVIEW_GENERATION,
+    MAX_SLICE_SPLIT_DEPTH, SOURCE_EXPLICIT,
 };
 use crate::kb_metadata::{KbMetadata, KbScope};
 use crate::knowledge_delete::KnowledgeDeletePolicy;
@@ -134,6 +135,7 @@ pub async fn run_consolidation_phase(
                 total.settled_unchanged += stats.settled_unchanged;
                 total.prunes_over_cap += stats.prunes_over_cap;
                 total.rewrites_over_cap += stats.rewrites_over_cap;
+                total.dropped_operations += stats.dropped_operations;
                 // Live refresh: if this user's KB actually changed, let connected
                 // panels refetch as the scan progresses.
                 if (stats.merged_clusters > 0
@@ -200,6 +202,9 @@ async fn consolidate_user(
     // for and the guards keep declining.
     let mut protected_from_delete = 0usize;
     let mut settled_unchanged = 0usize;
+    // Operations the model proposed that could not be read back. Counted so a
+    // repaired answer is never quietly smaller than the one the model sent.
+    let mut dropped_operations = 0usize;
     // Track per-slice LLM/parse failures so a pass where EVERY slice failed
     // (e.g. the consolidation model is unauthorized or unreachable) surfaces as
     // an error instead of a silent "0 changes" success.
@@ -224,8 +229,8 @@ async fn consolidate_user(
             .map(|e| e.id.as_str())
             .collect();
 
-        let ops = match operations_for_slice(llm_fn, slice, cancellation).await {
-            Ok(ops) => ops,
+        let answer = match operations_for_slice(llm_fn, slice, cancellation).await {
+            Ok(answer) => answer,
             Err(e) => {
                 tracing::warn!("dreaming: consolidation slice failed: {e}");
                 failed_slices += 1;
@@ -233,8 +238,9 @@ async fn consolidate_user(
                 continue;
             }
         };
+        dropped_operations += answer.dropped;
 
-        for op in ops {
+        for op in answer.ops {
             match op {
                 RawOp::Delete { ids, id, reason } => {
                     for did in ids.into_iter().chain(id) {
@@ -420,7 +426,8 @@ async fn consolidate_user(
         "dreaming: holistic consolidation plan for {total_entries} entries — \
          {} merge(s), {} edit(s)/scope-add(s), {} prune(s); \
          {protected_from_delete} protected, {settled_unchanged} settled, \
-         {rewrites_over_cap} rewrite(s) and {prunes_over_cap} prune(s) over the configured share",
+         {rewrites_over_cap} rewrite(s) and {prunes_over_cap} prune(s) over the configured share, \
+         {dropped_operations} operation(s) unreadable and dropped",
         synthesized.len(),
         buffer.standalone_updates().len() + buffer.standalone_scope_adds().len(),
         delete_ops.len(),
@@ -431,6 +438,7 @@ async fn consolidate_user(
     stats.settled_unchanged = settled_unchanged;
     stats.prunes_over_cap = prunes_over_cap;
     stats.rewrites_over_cap = rewrites_over_cap;
+    stats.dropped_operations = dropped_operations;
     Ok(stats)
 }
 
@@ -688,10 +696,49 @@ impl std::fmt::Display for ParseFailure {
     }
 }
 
-fn parse_operations(response: &str) -> Result<Vec<RawOp>, ParseFailure> {
+/// One array element the parser could not read as an operation, kept so the
+/// caller can report what came back instead of dropping it without a trace.
+#[derive(Debug)]
+struct DroppedOperation {
+    /// Position in the answer's operations array, counting from zero.
+    index: usize,
+    /// What serde said was wrong with the element.
+    reason: String,
+    /// The element itself, bounded so one long merge body cannot fill the log.
+    excerpt: String,
+}
+
+impl std::fmt::Display for DroppedOperation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            index,
+            reason,
+            excerpt,
+        } = self;
+        write!(f, "operation #{index} ({reason}): {excerpt}")
+    }
+}
+
+/// What one consolidation answer yielded, after the elements that could not be
+/// read were set aside.
+#[derive(Debug, Default)]
+struct ParsedOperations {
+    /// The operations that read cleanly, in the order the model gave them.
+    ops: Vec<RawOp>,
+    /// One record per element that did not read as an operation.
+    dropped: Vec<DroppedOperation>,
+    /// How many `operations` keys the answer carried.
+    operations_keys: usize,
+}
+
+fn parse_operations(response: &str) -> Result<ParsedOperations, ParseFailure> {
     let payload = extract_json_payload(response);
     match serde_json::from_str::<OpsEnvelope>(&payload) {
-        Ok(env) => Ok(env.operations),
+        Ok(env) => Ok(ParsedOperations {
+            ops: env.operations,
+            dropped: Vec::new(),
+            operations_keys: 0,
+        }),
         // `classify` is the structured signal for "the input ended early".
         // Reading it off the message text would break on any serde_json wording
         // change.
@@ -717,8 +764,9 @@ async fn operations_for_slice(
     llm_fn: &DreamingLlmFn,
     slice: &[KbEntry],
     cancellation: &CancellationToken,
-) -> Result<Vec<RawOp>, String> {
+) -> Result<SliceAnswer, String> {
     let mut ops: Vec<RawOp> = Vec::new();
+    let mut dropped = 0usize;
     let mut pending: Vec<(&[KbEntry], usize)> = vec![(slice, 0)];
     let mut answered = 0usize;
     let mut unreviewed = 0usize;
@@ -733,7 +781,8 @@ async fn operations_for_slice(
         let failure = match llm_fn(build_system_prompt(), build_user_prompt(chunk)).await {
             Ok(response) => match parse_operations(&response) {
                 Ok(mut parsed) => {
-                    ops.append(&mut parsed);
+                    dropped += parsed.dropped.len();
+                    ops.append(&mut parsed.ops);
                     answered += 1;
                     continue;
                 }
@@ -777,14 +826,93 @@ async fn operations_for_slice(
         );
     }
 
-    Ok(ops)
+    Ok(SliceAnswer { ops, dropped })
+}
+
+/// What one slice yielded, across every part of it that answered.
+#[derive(Debug)]
+struct SliceAnswer {
+    /// Every operation recovered from the parts that answered, in the order
+    /// the model gave them.
+    ops: Vec<RawOp>,
+    /// How many proposed operations could not be read and were set aside. The
+    /// entries they named stay unchanged until the next run.
+    dropped: usize,
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::io::{self, Write};
+    use std::sync::{Arc, Mutex, Once};
 
     use super::*;
+
+    /// An `io::Write` sink that appends into a shared buffer, so every writer
+    /// handle a `fmt` layer builds lands in the same place.
+    #[derive(Clone)]
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedBuf {
+        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .expect("the capture buffer is not poisoned")
+                .extend_from_slice(data);
+            Ok(data.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    static PERMISSIVE_GLOBAL_DEFAULT: Once = Once::new();
+
+    /// Run `f` under a subscriber that writes every event into a buffer, and
+    /// return `f`'s result with the captured text. Used to hold a count to
+    /// reaching the log, rather than to the value the log line is built from.
+    ///
+    /// `tracing` caches each callsite's interest process-wide, so a callsite
+    /// first evaluated on a thread with no subscriber can latch "never" for the
+    /// whole test binary and a scoped subscriber then sees nothing. Installing a
+    /// permissive process-wide default once keeps every callsite reachable.
+    ///
+    /// Safe to hold across `.await`: `#[tokio::test]`'s `current_thread` flavor
+    /// never migrates a task to another thread mid-poll, so the thread-local
+    /// default stays in force for `f`'s whole run.
+    async fn capture_tracing<F, Fut, T>(f: F) -> (T, String)
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        PERMISSIVE_GLOBAL_DEFAULT.call_once(|| {
+            let _ = tracing::subscriber::set_global_default(
+                tracing_subscriber::fmt()
+                    .with_max_level(tracing::Level::TRACE)
+                    .with_writer(io::sink)
+                    .finish(),
+            );
+        });
+        let buf = SharedBuf(Arc::new(Mutex::new(Vec::new())));
+        let for_writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || for_writer.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let result = f().await;
+        drop(guard);
+        let bytes = buf
+            .0
+            .lock()
+            .expect("the capture buffer is not poisoned")
+            .clone();
+        (
+            result,
+            String::from_utf8(bytes).expect("captured log output is UTF-8"),
+        )
+    }
 
     fn entry(id: &str, content: &str, tags: &[&str]) -> KbEntry {
         KbEntry {
@@ -808,7 +936,7 @@ mod tests {
             {"op": "something_new", "id": "g"}
         ]}
         ```"#;
-        let ops = parse_operations(resp).unwrap();
+        let ops = parse_operations(resp).unwrap().ops;
         assert_eq!(ops.len(), 5);
         assert!(matches!(&ops[0], RawOp::Delete { ids, reason, .. }
             if ids == &["a", "b"] && reason == "trivial"));
@@ -823,7 +951,7 @@ mod tests {
 
     #[test]
     fn missing_operations_key_is_empty() {
-        let ops = parse_operations("{}").unwrap();
+        let ops = parse_operations("{}").unwrap().ops;
         assert!(ops.is_empty());
     }
 
@@ -928,11 +1056,265 @@ mod tests {
     }
 
     #[test]
-    fn malformed_json_reports_a_parse_error() {
+    fn a_wholly_unreadable_answer_still_fails_and_reports_why() {
         let err = parse_operations(MALFORMED).expect_err("invalid JSON cannot parse");
         assert!(
             matches!(err, ParseFailure::Malformed(_)),
             "expected a malformed verdict, got: {err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.len() > "dreaming: bad consolidation JSON: ".len(),
+            "the failure must carry serde's reason, not only its own label: {message}"
+        );
+    }
+
+    #[test]
+    fn truncation_is_reported_as_truncation_even_when_whole_operations_precede_the_cut() {
+        // Salvage reads complete elements out of a complete envelope. A cut-off
+        // answer has no complete envelope, so the operations before the cut are
+        // NOT salvaged - the answer keeps its truncation verdict and reaches the
+        // halve-and-recompute path, which is the fix that actually fits.
+        let err = parse_operations(TRUNCATED).expect_err("a cut-off response cannot parse");
+        assert!(
+            matches!(err, ParseFailure::Truncated(_)),
+            "a whole operation before the cut must not turn truncation into salvage: {err:?}"
+        );
+    }
+
+    /// One realistic rewritten-entry body. A dozen of these push a repeated key
+    /// several thousand characters into the answer, which is the shape the
+    /// observed failure had - a repeat at position ten is a different test.
+    fn rewritten_entry(index: usize) -> String {
+        format!(
+            "Preference {index}: the workspace keeps a dark theme in the editor and in the \
+             terminal, at a 13 point font. Stated during setup and held across later sessions, \
+             so it is durable rather than a one-off request. Merged from three near-duplicate \
+             notes that each recorded one half of the same setting, and tightened so the entry \
+             states the setting once."
+        )
+    }
+
+    /// A consolidation answer that gives `operations` twice: a long first array,
+    /// then a second copy of the key deep in the document.
+    fn answer_with_a_repeated_operations_key() -> String {
+        let first: Vec<String> = (0..14)
+            .map(|i| {
+                format!(
+                    r#"{{"op":"edit","id":"kb-{i:03}","content":"{}"}}"#,
+                    rewritten_entry(i)
+                )
+            })
+            .collect();
+        let second: Vec<String> = (0..3)
+            .map(|i| format!(r#"{{"op":"delete","ids":["kb-9{i:02}"],"reason":"transient"}}"#))
+            .collect();
+        format!(
+            r#"{{"operations":[{}],"operations":[{}]}}"#,
+            first.join(","),
+            second.join(",")
+        )
+    }
+
+    #[test]
+    fn a_repeated_operations_key_yields_the_union_of_both_arrays() {
+        let answer = answer_with_a_repeated_operations_key();
+        let repeat_at = answer
+            .rfind(r#""operations""#)
+            .expect("the fixture repeats the key");
+        assert!(
+            repeat_at > 4_000,
+            "the repeat must sit deep in the answer, not at position {repeat_at}"
+        );
+
+        let parsed =
+            parse_operations(&answer).expect("a repeated key is an encoding accident, not a loss");
+        assert_eq!(
+            parsed.operations_keys, 2,
+            "the answer carried the key twice and that must be visible"
+        );
+        assert!(
+            parsed.dropped.is_empty(),
+            "every operation in both arrays is individually valid: {:?}",
+            parsed.dropped
+        );
+
+        let edits: Vec<&str> = parsed
+            .ops
+            .iter()
+            .filter_map(|o| match o {
+                RawOp::Edit { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        let deletes: Vec<&str> = parsed
+            .ops
+            .iter()
+            .filter_map(|o| match o {
+                RawOp::Delete { ids, .. } => ids.first().map(String::as_str),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(edits.len(), 14, "the first array must survive in full");
+        assert_eq!(deletes.len(), 3, "the second array must survive in full");
+        assert_eq!(
+            parsed.ops.len(),
+            17,
+            "the union of both arrays, and nothing else"
+        );
+        // Order matters: the prune cap keeps the operations it sees first.
+        assert_eq!(edits.first(), Some(&"kb-000"));
+        assert_eq!(deletes.last(), Some(&"kb-902"));
+    }
+
+    #[test]
+    fn one_unreadable_operation_is_dropped_and_the_rest_apply() {
+        // A merge with no `content` is a well-formed JSON object that is not a
+        // well-formed operation: the two beside it are untouched by its fault.
+        let answer = r#"{"operations":[
+            {"op":"delete","ids":["kb-001"],"reason":"circumstantial"},
+            {"op":"merge","ids":["kb-002","kb-003"]},
+            {"op":"edit","id":"kb-004","content":"tightened"}
+        ]}"#;
+
+        let parsed =
+            parse_operations(answer).expect("one bad operation must not discard the others");
+        assert_eq!(parsed.ops.len(), 2, "the two valid operations must survive");
+        assert_eq!(
+            parsed.dropped.len(),
+            1,
+            "exactly one element was unreadable"
+        );
+
+        let report = parsed.dropped[0].to_string();
+        assert_eq!(parsed.dropped[0].index, 1, "the report names its position");
+        assert!(
+            report.contains("content"),
+            "the report must name the field that was missing: {report}"
+        );
+        assert!(
+            report.contains("kb-002"),
+            "the report must show the element it could not read: {report}"
+        );
+    }
+
+    #[test]
+    fn an_answer_whose_every_operation_is_unreadable_still_fails() {
+        // Salvage keeps what it can. When it can keep nothing, the answer is a
+        // fault, not an empty success: reporting it as "no changes" is the very
+        // thing that made the original loss invisible.
+        let answer = r#"{"operations":[{"op":"merge","ids":["kb-001","kb-002"]},{"id":"kb-003"}]}"#;
+        let err =
+            parse_operations(answer).expect_err("an answer with no usable operation is a failure");
+        assert!(
+            matches!(err, ParseFailure::Malformed(_)),
+            "expected a malformed verdict, got: {err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains('2'),
+            "the failure must count what it could not read: {message}"
+        );
+        assert!(
+            message.contains("content"),
+            "the failure must say why it could not read them: {message}"
+        );
+    }
+
+    #[test]
+    fn an_answer_with_no_operations_at_all_is_still_an_empty_success() {
+        // A model that keeps everything proposes nothing, which is a real
+        // outcome and must not be confused with an unreadable answer.
+        let parsed = parse_operations(r#"{"operations":[]}"#).expect("keeping everything is valid");
+        assert!(parsed.ops.is_empty());
+        assert!(parsed.dropped.is_empty());
+    }
+
+    #[test]
+    fn a_dropped_operation_excerpt_is_bounded() {
+        let huge = "é".repeat(MAX_DROPPED_OP_EXCERPT_CHARS * 4);
+        let answer = format!(
+            r#"{{"operations":[
+                {{"op":"edit","id":"kb-001","content":"tightened"}},
+                {{"op":"merge","body":"{huge}"}}
+            ]}}"#
+        );
+        let parsed = parse_operations(&answer).expect("the readable operation survives");
+        assert_eq!(parsed.dropped.len(), 1);
+
+        let report = parsed.dropped[0].to_string();
+        assert!(
+            report.chars().count() < huge.chars().count(),
+            "one long element must not carry its whole body into the log"
+        );
+        assert!(
+            report.contains("merge"),
+            "a bounded quote must still name the shape that came back: {report}"
+        );
+    }
+
+    /// An answer that proposes `good` valid deletes and one element that cannot
+    /// be read, so a caller sees both a salvaged count and a dropped count.
+    fn answer_with_one_unreadable_operation(good: usize) -> String {
+        let mut ops: Vec<String> = (0..good)
+            .map(|i| format!(r#"{{"op":"delete","ids":["kb-{i:03}"],"reason":"trivial"}}"#))
+            .collect();
+        ops.push(r#"{"op":"merge","ids":["kb-900","kb-901"]}"#.to_string());
+        format!(r#"{{"operations":[{}]}}"#, ops.join(","))
+    }
+
+    #[tokio::test]
+    async fn the_salvaged_and_dropped_counts_reach_the_log() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let llm = recording_llm(calls, |_| Ok(answer_with_one_unreadable_operation(2)));
+        let token = CancellationToken::new();
+
+        let slice = slice_of(2);
+        let (answer, logged) = capture_tracing(|| operations_for_slice(&llm, &slice, &token)).await;
+        let answer = answer.expect("two readable operations are still a usable answer");
+
+        assert_eq!(answer.ops.len(), 2);
+        assert_eq!(answer.dropped, 1, "the slice must carry the dropped count");
+        assert!(
+            logged.contains("salvaged 2 operation(s)"),
+            "the log must say how many were kept: {logged}"
+        );
+        assert!(
+            logged.contains("dropped 1"),
+            "the log must say how many were lost: {logged}"
+        );
+        assert!(
+            logged.contains("WARN"),
+            "dropping proposed work needs a level an operator reads: {logged}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repeated_operations_key_is_reported_in_the_log() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let llm = recording_llm(calls, |_| Ok(answer_with_a_repeated_operations_key()));
+        let token = CancellationToken::new();
+
+        let slice = slice_of(2);
+        let (answer, logged) = capture_tracing(|| operations_for_slice(&llm, &slice, &token)).await;
+        answer.expect("a repaired answer is still an answer");
+
+        assert!(
+            logged.contains("`operations`"),
+            "the repair must name what the model got wrong: {logged}"
+        );
+        assert!(
+            logged.contains("WARN"),
+            "a repaired answer is worth an operator's attention: {logged}"
+        );
+    }
+
+    #[test]
+    fn the_prompt_asks_for_exactly_one_operations_array() {
+        let prompt = build_system_prompt();
+        assert!(
+            prompt.contains("exactly one"),
+            "the prompt must ask for one `operations` array: {prompt}"
         );
     }
 
@@ -950,7 +1332,8 @@ mod tests {
 
         let ops = operations_for_slice(&llm, &slice_of(4), &CancellationToken::new())
             .await
-            .expect("splitting recovers the slice");
+            .expect("splitting recovers the slice")
+            .ops;
 
         assert!(!ops.is_empty(), "the retry must yield the recovered ops");
         let sizes: Vec<usize> = calls
@@ -979,7 +1362,8 @@ mod tests {
 
         let ops = operations_for_slice(&llm, &slice_of(4), &CancellationToken::new())
             .await
-            .expect("splitting recovers the slice");
+            .expect("splitting recovers the slice")
+            .ops;
 
         let deletes = ops
             .iter()
@@ -1010,7 +1394,8 @@ mod tests {
 
         let ops = operations_for_slice(&llm, &slice_of(4), &CancellationToken::new())
             .await
-            .expect("splitting recovers the slice");
+            .expect("splitting recovers the slice")
+            .ops;
 
         let deleted: Vec<String> = ops
             .iter()
@@ -1093,7 +1478,8 @@ mod tests {
 
         let ops = operations_for_slice(&llm, &slice_of(3), &CancellationToken::new())
             .await
-            .expect("a partial recovery still returns what worked");
+            .expect("a partial recovery still returns what worked")
+            .ops;
         assert!(
             !ops.is_empty(),
             "the half that answered must not be thrown away"

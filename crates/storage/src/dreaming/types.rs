@@ -133,6 +133,14 @@ pub const MAX_SUMMARY_TAGS_CHARS: usize = 200;
 /// response from writing an unbounded blob into a row that nothing else limits.
 pub const MAX_DELETE_REASON_CHARS: usize = 500;
 
+/// How much of an unreadable consolidation operation is quoted when it is
+/// reported.
+///
+/// Why bound it: the element is free text straight from the model and can hold
+/// a whole merge body, and a run can produce many of them. The point of the
+/// quote is to name the shape that came back, which the first line of it does.
+pub const MAX_DROPPED_OP_EXCERPT_CHARS: usize = 160;
+
 /// `knowledge_base.source` for an entry that was promoted deliberately: the
 /// user asked for it, or Adele decided in the moment that it was worth keeping.
 ///
@@ -188,4 +196,10 @@ pub struct ConsolidationStats {
     /// Proposed edits and merges dropped because the run had spent its rewrite
     /// share. Reported for the same reason.
     pub rewrites_over_cap: usize,
+    /// Operations the model proposed that could not be read back as an
+    /// operation, so they were set aside while the rest of the answer was
+    /// applied. Unlike the two caps above, this is a formatting fault in the
+    /// answer, not a deliberate refusal: it is reported so a repaired answer is
+    /// never quietly smaller than the one the model sent.
+    pub dropped_operations: usize,
 }
