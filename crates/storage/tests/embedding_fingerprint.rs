@@ -22,6 +22,7 @@ mod support;
 use desktop_assistant_core::domain::KnowledgeEntry;
 use desktop_assistant_core::ports::knowledge::KnowledgeBaseStore;
 use desktop_assistant_storage::embedding_backfill::invalidate_stale_embeddings;
+use desktop_assistant_storage::knowledge_delete::KnowledgeDeletePolicy;
 use desktop_assistant_storage::{PgKnowledgeBaseStore, UserId, run_migrations, with_user_id};
 use pgvector::Vector;
 use sqlx::PgPool;
@@ -37,7 +38,7 @@ async fn fixture() -> Option<support::DbFixture> {
 
 /// Write a knowledge row already embedded under `model`.
 async fn embedded_row(pool: &PgPool, id: &str, model: &str) {
-    let store = PgKnowledgeBaseStore::new(pool.clone());
+    let store = PgKnowledgeBaseStore::new(pool.clone(), KnowledgeDeletePolicy::default());
     with_user_id(UserId::new(USER), async {
         store
             .write(KnowledgeEntry::new(id, "content", vec!["notes".into()]))

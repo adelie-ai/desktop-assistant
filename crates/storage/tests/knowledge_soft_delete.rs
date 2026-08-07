@@ -31,6 +31,7 @@
 
 mod support;
 
+use desktop_assistant_storage::knowledge_delete::KnowledgeDeletePolicy;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -121,7 +122,7 @@ async fn semantic_search_excludes_soft_deleted() {
         eprintln!("skip: TEST_DATABASE_URL not set");
         return;
     };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     write_entry(&store, "live", "widget calibration notes").await;
     write_entry(&store, "retired", "widget calibration notes").await;
@@ -158,7 +159,7 @@ async fn text_search_excludes_soft_deleted() {
         eprintln!("skip: TEST_DATABASE_URL not set");
         return;
     };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     write_entry(&store, "live", "sprocket tolerance guidance").await;
     write_entry(&store, "retired", "sprocket tolerance guidance").await;
@@ -185,7 +186,7 @@ async fn hybrid_search_excludes_soft_deleted_matched_by_both_branches() {
         eprintln!("skip: TEST_DATABASE_URL not set");
         return;
     };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     // The deleted row matches the FTS term AND sits at distance 0 from the
     // query vector, so it enters both CTEs. If either branch leaks it, the
@@ -219,7 +220,7 @@ async fn soft_deleting_the_only_match_yields_empty_results() {
         eprintln!("skip: TEST_DATABASE_URL not set");
         return;
     };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     write_entry(&store, "retired", "singular quokka fact").await;
     set_embedding(&fx.pool, "retired", vec![vec![1.0, 0.0, 0.0]]).await;
@@ -244,7 +245,7 @@ async fn restored_entry_becomes_searchable_again() {
         eprintln!("skip: TEST_DATABASE_URL not set");
         return;
     };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     write_entry(&store, "row", "restorable marmot fact").await;
     set_embedding(&fx.pool, "row", vec![vec![1.0, 0.0, 0.0]]).await;
@@ -272,7 +273,7 @@ async fn list_excludes_soft_deleted() {
         eprintln!("skip: TEST_DATABASE_URL not set");
         return;
     };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     write_entry(&store, "live", "kept").await;
     write_entry(&store, "retired", "pruned").await;
@@ -296,7 +297,7 @@ async fn list_page_excludes_soft_deleted() {
         eprintln!("skip: TEST_DATABASE_URL not set");
         return;
     };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     write_entry(&store, "live", "kept").await;
     write_entry(&store, "retired", "pruned").await;
@@ -330,7 +331,7 @@ async fn get_returns_none_for_soft_deleted() {
         eprintln!("skip: TEST_DATABASE_URL not set");
         return;
     };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     write_entry(&store, "retired", "pruned").await;
     soft_delete(&fx.pool, "retired").await;
@@ -371,7 +372,7 @@ async fn write_to_a_retired_entry_is_refused_and_changes_nothing() {
         eprintln!("skip: TEST_DATABASE_URL not set");
         return;
     };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     write_entry(&store, "retired", "the original text").await;
     soft_delete(&fx.pool, "retired").await;
@@ -415,7 +416,7 @@ async fn write_to_a_restored_entry_succeeds_again() {
         eprintln!("skip: TEST_DATABASE_URL not set");
         return;
     };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     write_entry(&store, "retired", "the original text").await;
     soft_delete(&fx.pool, "retired").await;
@@ -437,7 +438,7 @@ async fn stale_invalidation_clears_soft_deleted_vectors_so_restore_is_safe() {
         eprintln!("skip: TEST_DATABASE_URL not set");
         return;
     };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     write_entry(&store, "retired", "pruned").await;
     set_embedding(&fx.pool, "retired", vec![vec![1.0, 0.0, 0.0]]).await;
@@ -469,7 +470,7 @@ async fn backfill_skips_soft_deleted() {
         eprintln!("skip: TEST_DATABASE_URL not set");
         return;
     };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     // Both rows are unembedded and therefore backfill candidates; only the
     // live one should be picked up.

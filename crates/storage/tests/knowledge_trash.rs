@@ -92,7 +92,7 @@ async fn empty_trash_removes_all_soft_deleted_entries_for_the_user() {
     let Some(fx) = fixture().await else {
         return;
     };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     write_entry(&store, ALICE, "fresh-tombstone", "retired today").await;
     write_entry(&store, ALICE, "old-tombstone", "retired long ago").await;
@@ -119,7 +119,7 @@ async fn empty_trash_leaves_live_entries_untouched() {
     let Some(fx) = fixture().await else {
         return;
     };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     write_entry(&store, ALICE, "live", "current fact").await;
     write_entry(&store, ALICE, "retired", "superseded fact").await;
@@ -143,7 +143,7 @@ async fn empty_trash_is_scoped_to_the_calling_user() {
     let Some(fx) = fixture().await else {
         return;
     };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     write_entry(&store, ALICE, "alice-retired", "alice trash").await;
     write_entry(&store, BOB, "bob-retired", "bob trash").await;
@@ -168,7 +168,7 @@ async fn empty_trash_on_an_empty_trash_is_a_no_op() {
     let Some(fx) = fixture().await else {
         return;
     };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     write_entry(&store, ALICE, "live", "current fact").await;
 
@@ -193,7 +193,7 @@ async fn trash_count_reports_only_soft_deleted_entries() {
     let Some(fx) = fixture().await else {
         return;
     };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     write_entry(&store, ALICE, "live-a", "current").await;
     write_entry(&store, ALICE, "live-b", "current").await;
@@ -218,7 +218,7 @@ async fn trash_count_is_scoped_to_the_calling_user() {
     let Some(fx) = fixture().await else {
         return;
     };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     write_entry(&store, ALICE, "alice-retired", "alice trash").await;
     write_entry(&store, BOB, "bob-retired-1", "bob trash").await;
@@ -245,7 +245,7 @@ async fn ttl_reap_runs_when_consolidation_is_disabled() {
     let Some(fx) = fixture().await else {
         return;
     };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     // No consolidation, no LLM, no dreaming: the periodic sweep alone must free
     // expired tombstones, for every user that has any.
@@ -276,7 +276,7 @@ async fn ttl_reap_respects_the_configured_retention() {
     let Some(fx) = fixture().await else {
         return;
     };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     write_entry(&store, ALICE, "ten-days-old", "retired ten days ago").await;
     soft_delete_aged(&fx.pool, "ten-days-old", 10).await;
@@ -316,7 +316,7 @@ async fn ttl_reap_with_zero_retention_reaps_immediately() {
     let Some(fx) = fixture().await else {
         return;
     };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     // Boundary: retention 0 means "do not retain" — a tombstone created moments
     // ago is already expired.
@@ -344,7 +344,7 @@ async fn ttl_reap_is_scoped_to_the_calling_user() {
     let Some(fx) = fixture().await else {
         return;
     };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     write_entry(&store, ALICE, "alice-expired", "expired").await;
     write_entry(&store, BOB, "bob-expired", "expired").await;

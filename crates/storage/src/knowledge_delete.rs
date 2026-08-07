@@ -346,6 +346,16 @@ where
 
 /// The ids a refused statement would have destroyed, bounded by
 /// [`MAX_REFUSAL_IDS`], with the true count beside them.
+///
+/// The bound is in the statement, not applied to the answer: the flag's whole
+/// point is that tombstones accumulate while it is set, so a sweep that read
+/// every matching row into memory to write one bounded log line would grow
+/// more expensive the longer the safety stayed on. `COUNT(*) OVER ()` reports
+/// the true total from the same statement, because a count is what makes the
+/// volume measurable.
+///
+/// Each arm repeats its DELETE's predicate exactly. A predicate that drifted
+/// would name rows the delete would not have touched.
 async fn rows_that_would_go<'e, E>(
     executor: E,
     user_id: &str,
@@ -355,47 +365,52 @@ async fn rows_that_would_go<'e, E>(
 where
     E: PgExecutor<'e>,
 {
-    let rows: Vec<(String,)> = match target {
+    let limit = MAX_REFUSAL_IDS as i64;
+    let rows: Vec<(String, i64)> = match target {
         HardDeleteTarget::ExpiredTombstones => {
             sqlx::query_as(
-                "SELECT id FROM knowledge_base \
-             WHERE user_id = $2 \
-               AND deleted_at IS NOT NULL \
-               AND deleted_at < NOW() - make_interval(days => $1) \
-             ORDER BY id",
+                "SELECT id, COUNT(*) OVER () AS total FROM knowledge_base \
+                 WHERE user_id = $2 \
+                   AND deleted_at IS NOT NULL \
+                   AND deleted_at < NOW() - make_interval(days => $1) \
+                 ORDER BY id LIMIT $3",
             )
             .bind(retention_days(policy))
             .bind(user_id)
+            .bind(limit)
             .fetch_all(executor)
             .await
         }
         HardDeleteTarget::AllTombstones => {
             sqlx::query_as(
-                "SELECT id FROM knowledge_base \
-             WHERE user_id = $1 AND deleted_at IS NOT NULL ORDER BY id",
+                "SELECT id, COUNT(*) OVER () AS total FROM knowledge_base \
+                 WHERE user_id = $1 AND deleted_at IS NOT NULL \
+                 ORDER BY id LIMIT $2",
             )
             .bind(user_id)
+            .bind(limit)
             .fetch_all(executor)
             .await
         }
         HardDeleteTarget::Ids(ids) => {
             sqlx::query_as(
-                "SELECT id FROM knowledge_base WHERE user_id = $1 AND id = ANY($2) ORDER BY id",
+                "SELECT id, COUNT(*) OVER () AS total FROM knowledge_base \
+                 WHERE user_id = $1 AND id = ANY($2) \
+                 ORDER BY id LIMIT $3",
             )
             .bind(user_id)
             .bind(ids)
+            .bind(limit)
             .fetch_all(executor)
             .await
         }
     }
     .map_err(|e| CoreError::Storage(format!("knowledge hard delete: refusal scan failed: {e}")))?;
 
-    let total = rows.len();
-    let entry_ids = rows
-        .into_iter()
-        .take(MAX_REFUSAL_IDS)
-        .map(|(id,)| id)
-        .collect();
+    let total = rows
+        .first()
+        .map_or(0, |(_, total)| (*total).max(0) as usize);
+    let entry_ids = rows.into_iter().map(|(id, _)| id).collect();
     Ok((entry_ids, total))
 }
 

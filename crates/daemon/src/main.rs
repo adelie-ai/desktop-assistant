@@ -1351,10 +1351,10 @@ async fn main() -> Result<()> {
         );
     }
     let kb_store = pg_pool.as_ref().map(|pool| {
-        Arc::new(
-            desktop_assistant_storage::PgKnowledgeBaseStore::new(pool.clone())
-                .with_delete_policy(knowledge_delete_policy),
-        )
+        Arc::new(desktop_assistant_storage::PgKnowledgeBaseStore::new(
+            pool.clone(),
+            knowledge_delete_policy,
+        ))
     });
 
     let tool_registry_store = pg_pool.as_ref().map(|pool| {

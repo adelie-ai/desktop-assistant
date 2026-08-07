@@ -16,19 +16,19 @@ pub struct PgKnowledgeBaseStore {
 }
 
 impl PgKnowledgeBaseStore {
-    /// A store that destroys rows under the shipped defaults.
-    pub fn new(pool: PgPool) -> Self {
+    /// A store that removes rows under `delete_policy`.
+    ///
+    /// The policy is a required argument rather than a default a caller may
+    /// extend later: a construction site that forgot to attach one would
+    /// silently run the permissive behaviour while the deployment believed its
+    /// safety flag was on. The daemon builds the policy from `[backend_tasks]`;
+    /// a caller that never deletes passes
+    /// [`KnowledgeDeletePolicy::default`] and says so.
+    pub fn new(pool: PgPool, delete_policy: KnowledgeDeletePolicy) -> Self {
         Self {
             pool,
-            delete_policy: KnowledgeDeletePolicy::default(),
+            delete_policy,
         }
-    }
-
-    /// Apply a configured deletion policy to every path in this store that
-    /// removes a row. The daemon builds the policy from `[backend_tasks]`.
-    pub fn with_delete_policy(mut self, policy: KnowledgeDeletePolicy) -> Self {
-        self.delete_policy = policy;
-        self
     }
 }
 

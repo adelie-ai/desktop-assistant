@@ -47,6 +47,10 @@ desktop-assistant-mcp-client.workspace = true
 # The executable `SkillIndexStore` contract, run against this adapter so the
 # stores cannot diverge on catalog semantics.
 desktop-assistant-core = { workspace = true, features = ["test-support"] }
+# A refused hard delete must reach the log, not only the returned value, so the
+# deletion suites capture real `tracing` output rather than asserting on the
+# string the log line is built from.
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

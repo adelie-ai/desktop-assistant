@@ -9,14 +9,30 @@
 //! one appears.
 //!
 //! The scan reads every `.rs` file under each workspace crate's `src`
-//! directory, folds away Rust string continuations and repeated whitespace,
-//! and looks for a `DELETE`, `TRUNCATE` or `DROP TABLE` that names the
-//! knowledge table. Anything found outside the guard module is reported with
-//! its file and line.
+//! directory and every `.sql` file under its `migrations` directory, folds
+//! away Rust string continuations and repeated whitespace, and looks for a
+//! destructive verb whose operand is the knowledge table. Anything found
+//! outside the guard module is reported with its file and line.
+//!
+//! Migrations are in scope because they run automatically on the next boot of
+//! every daemon. A one-time repair that reclaims disk space by deleting old
+//! tombstones would reach past the policy exactly the way a new Rust call site
+//! would.
+//!
+//! A verb whose operand is a Rust interpolation - `DELETE FROM {table}` - is
+//! reported too, whatever the table turns out to be at run time. The scanner
+//! cannot tell, and a generic per-table sweep is the natural refactor that
+//! would otherwise carry the knowledge table out of reach of this test.
 //!
 //! Test code is out of scope. A test may write any SQL it likes, including the
 //! statements the `db_query` tool must refuse, and no test is a production
 //! deletion path.
+//!
+//! ## What it does not reach
+//!
+//! SQL assembled from pieces that never sit next to each other in one file.
+//! The workspace has no query builder and forbids string-built SQL, so the
+//! remaining route is a deliberate one, not a slip.
 //!
 //! This runs without a database, so `just check` covers it.
 //!
@@ -32,9 +48,15 @@ use std::path::{Path, PathBuf};
 /// The one module allowed to destroy a knowledge row, as a path suffix.
 const GUARD_MODULE: &str = "storage/src/knowledge_delete.rs";
 
-/// SQL verbs that remove rows for good. A soft delete is an `UPDATE`, so it is
-/// deliberately absent.
-const DESTRUCTIVE_VERBS: &[&str] = &["delete from", "truncate", "drop table"];
+/// SQL verbs that can remove rows for good. A soft delete is an `UPDATE`, so it
+/// is deliberately absent.
+///
+/// `merge into` is here because Postgres 15 added a bare `DELETE` action to
+/// `MERGE`, which carries no `FROM` and so never contains the first entry. A
+/// merge that only inserts and updates is caught as well; the scanner cannot
+/// read the action list, and a `MERGE` against this table is close enough to a
+/// delete to belong beside one.
+const DESTRUCTIVE_VERBS: &[&str] = &["delete from", "truncate", "drop table", "merge into"];
 
 /// The table this audit protects. A schema-qualified `public.knowledge_base`
 /// matches too, because the qualifier is not an identifier character.
@@ -42,15 +64,24 @@ const TABLE: &str = "knowledge_base";
 
 /// How many following lines are joined to the line under test, so a statement
 /// broken over a continued string literal is still read as one statement.
+///
+/// Five is generous: in SQL the operand follows its verb immediately, so the
+/// two are never far apart however the literal is wrapped.
 const LOOKAHEAD_LINES: usize = 5;
 
 #[test]
 fn unguarded_delete_against_the_knowledge_table_fails_the_audit() {
-    let files = crate_source_files();
+    let files = scanned_files();
     assert!(
         files.len() > 100,
-        "the scan found only {} source files; it is not reaching the workspace",
+        "the scan found only {} files; it is not reaching the workspace",
         files.len()
+    );
+    assert!(
+        files
+            .iter()
+            .any(|f| f.extension().is_some_and(|e| e == "sql")),
+        "the scan found no migrations; a repair migration would slip past it"
     );
 
     let mut offenders: Vec<String> = Vec::new();
@@ -120,16 +151,24 @@ fn destructive_statements(content: &str) -> Vec<Hit> {
         for verb in DESTRUCTIVE_VERBS {
             for (at, _) in lower.match_indices(verb) {
                 // Only count a statement once, against the line it starts on.
-                if at >= head_len {
+                if at >= head_len || !is_whole_word_at(&lower, at, verb) {
                     continue;
                 }
-                if !names_the_table(&lower[at + verb.len()..]) {
-                    continue;
+                let reportable = match operand(&lower[at + verb.len()..]) {
+                    Operand::KnowledgeTable => true,
+                    // A Rust match arm reads as an interpolated operand -
+                    // `Statement::Truncate { .. }` - so require the mark of a
+                    // string literal before the verb. Every SQL statement has
+                    // one; a match arm does not.
+                    Operand::Interpolated => lower[..at].contains('"'),
+                    Operand::Other => false,
+                };
+                if reportable {
+                    hits.push(Hit {
+                        line: index + 1,
+                        excerpt: excerpt(&window, at),
+                    });
                 }
-                hits.push(Hit {
-                    line: index + 1,
-                    excerpt: excerpt(&window, at),
-                });
             }
         }
     }
@@ -172,13 +211,37 @@ fn excerpt(normalized: &str, at: usize) -> String {
     normalized[at..].chars().take(120).collect()
 }
 
-/// Does the text right after a destructive verb name the knowledge table?
+/// Is the verb at `at` a word of its own, rather than part of a longer
+/// identifier? Without this, `truncated` reads as `TRUNCATE`.
+fn is_whole_word_at(text: &str, at: usize, verb: &str) -> bool {
+    let before_ok = at == 0 || !is_ident_byte(text.as_bytes()[at - 1]);
+    let end = at + verb.len();
+    let after_ok = end == text.len() || !is_ident_byte(text.as_bytes()[end]);
+    before_ok && after_ok
+}
+
+fn is_ident_byte(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'_'
+}
+
+/// What a destructive verb is aimed at.
+#[derive(Debug, PartialEq)]
+enum Operand {
+    /// The knowledge table, named outright.
+    KnowledgeTable,
+    /// A Rust interpolation, so the table is decided at run time and could be
+    /// the knowledge table.
+    Interpolated,
+    /// Some other table.
+    Other,
+}
+
+/// Read the operand out of the text right after a destructive verb.
 ///
-/// The table must be the verb's own operand, so only the next token counts. A
-/// window of a fixed size instead reads across the end of the SQL literal and
-/// reports a delete against one table because a neighbouring literal mentions
-/// another.
-fn names_the_table(after_verb: &str) -> bool {
+/// Only the next token counts, because the operand is the verb's own. A window
+/// of a fixed size instead reads across the end of the SQL literal and reports
+/// a delete against one table because a neighbouring literal mentions another.
+fn operand(after_verb: &str) -> Operand {
     let mut tokens = after_verb.split_whitespace();
     let mut token = tokens.next();
     // Optional noise between the verb and its operand.
@@ -186,14 +249,21 @@ fn names_the_table(after_verb: &str) -> bool {
         token = tokens.next();
     }
     let Some(token) = token else {
-        return false;
+        return Operand::Other;
     };
+    if token.contains('{') {
+        return Operand::Interpolated;
+    }
     let bare = token
         .trim_matches(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
         .rsplit('.')
         .next()
         .unwrap_or_default();
-    bare == TABLE
+    if bare == TABLE {
+        Operand::KnowledgeTable
+    } else {
+        Operand::Other
+    }
 }
 
 fn is_guard_module(file: &Path) -> bool {
@@ -210,31 +280,30 @@ fn crates_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// Every `.rs` file under `crates/*/src`.
-fn crate_source_files() -> Vec<PathBuf> {
+/// Every `.rs` file under `crates/*/src` and every `.sql` file under
+/// `crates/*/migrations`.
+fn scanned_files() -> Vec<PathBuf> {
     let mut acc = Vec::new();
     let Ok(read) = std::fs::read_dir(crates_root()) else {
         return acc;
     };
     for entry in read.flatten() {
-        let src = entry.path().join("src");
-        if src.is_dir() {
-            walk_rust_files(&src, &mut acc);
-        }
+        walk_files(&entry.path().join("src"), "rs", &mut acc);
+        walk_files(&entry.path().join("migrations"), "sql", &mut acc);
     }
     acc.sort();
     acc
 }
 
-fn walk_rust_files(dir: &Path, acc: &mut Vec<PathBuf>) {
+fn walk_files(dir: &Path, extension: &str, acc: &mut Vec<PathBuf>) {
     let Ok(read) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in read.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            walk_rust_files(&path, acc);
-        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+            walk_files(&path, extension, acc);
+        } else if path.extension().and_then(|e| e.to_str()) == Some(extension) {
             acc.push(path);
         }
     }
@@ -265,9 +334,40 @@ fn scanner_reports_one_hit_per_statement() {
 }
 
 #[test]
+fn scanner_finds_a_merge_that_may_carry_a_delete_action() {
+    let src = "\"MERGE INTO knowledge_base USING plan ON plan.id = knowledge_base.id\"";
+    assert_eq!(destructive_statements(src).len(), 1);
+}
+
+#[test]
+fn scanner_finds_a_delete_against_a_table_chosen_at_run_time() {
+    let src = r#"sqlx::query(&format!("DELETE FROM {table} WHERE id = $1"))"#;
+    assert_eq!(
+        destructive_statements(src).len(),
+        1,
+        "a table name decided at run time could be the knowledge table"
+    );
+}
+
+#[test]
 fn scanner_ignores_a_delete_against_another_table() {
     let src = r#"sqlx::query("DELETE FROM scratchpads WHERE id = $1")"#;
     assert!(destructive_statements(src).is_empty());
+}
+
+#[test]
+fn scanner_ignores_a_verb_that_is_part_of_a_longer_word() {
+    let src = r#"format!("{truncated}-{suffix}")"#;
+    assert!(destructive_statements(src).is_empty());
+}
+
+#[test]
+fn scanner_ignores_a_rust_match_arm_that_names_a_statement_kind() {
+    let src = r#"Statement::Truncate { .. } => "TRUNCATE","#;
+    assert!(
+        destructive_statements(src).is_empty(),
+        "a match arm is not a statement against a table"
+    );
 }
 
 #[test]

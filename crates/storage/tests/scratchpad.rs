@@ -19,6 +19,7 @@
 
 mod support;
 
+use desktop_assistant_storage::knowledge_delete::KnowledgeDeletePolicy;
 use std::sync::Arc;
 
 use std::collections::HashSet;
@@ -1047,10 +1048,13 @@ async fn delete_owner_subtree_idempotent() {
 async fn write_entry(pool: &PgPool, id: &str, content: &str) {
     use desktop_assistant_core::domain::KnowledgeEntry;
     use desktop_assistant_core::ports::knowledge::KnowledgeBaseStore;
-    desktop_assistant_storage::PgKnowledgeBaseStore::new(pool.clone())
-        .write(KnowledgeEntry::new(id, content, vec![]))
-        .await
-        .expect("write knowledge entry");
+    desktop_assistant_storage::PgKnowledgeBaseStore::new(
+        pool.clone(),
+        KnowledgeDeletePolicy::default(),
+    )
+    .write(KnowledgeEntry::new(id, content, vec![]))
+    .await
+    .expect("write knowledge entry");
 }
 
 /// A note that attaches `entry_id`.
@@ -1314,7 +1318,10 @@ async fn deleting_a_knowledge_entry_leaves_the_attachment_for_the_render_to_repa
             use desktop_assistant_core::ports::knowledge::KnowledgeBaseStore;
             let convs = PgConversationStore::new(fx.pool.clone());
             let pad = PgScratchpadStore::new(fx.pool.clone());
-            let kb = desktop_assistant_storage::PgKnowledgeBaseStore::new(fx.pool.clone());
+            let kb = desktop_assistant_storage::PgKnowledgeBaseStore::new(
+                fx.pool.clone(),
+                KnowledgeDeletePolicy::default(),
+            );
             with_user_id(UserId::new("alice"), async {
                 convs.create(make_conversation("c1")).await.expect("conv");
                 write_entry(&fx.pool, "kb-1", "the durable fact").await;

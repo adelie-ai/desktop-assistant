@@ -36,6 +36,7 @@ use desktop_assistant_core::domain::KnowledgeEntry;
 use desktop_assistant_core::ports::knowledge::{
     KnowledgeBaseStore, KnowledgeListQuery, ListOrder, ListOrderOpt,
 };
+use desktop_assistant_storage::knowledge_delete::KnowledgeDeletePolicy;
 use desktop_assistant_storage::{PgKnowledgeBaseStore, UserId, with_user_id};
 use pgvector::Vector;
 use sqlx::PgPool;
@@ -87,7 +88,7 @@ async fn set_embedding(pool: &PgPool, id: &str, chunk: Vec<f32>) {
 #[tokio::test]
 async fn knowledge_summary_round_trips_through_the_store() {
     let Some(fx) = fixture().await else { return };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     with_user_id(UserId::new(USER), async {
         let saved = store
@@ -121,7 +122,7 @@ async fn knowledge_summary_round_trips_through_the_store() {
 #[tokio::test]
 async fn knowledge_list_carries_the_summary() {
     let Some(fx) = fixture().await else { return };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     with_user_id(UserId::new(USER), async {
         store
@@ -145,7 +146,7 @@ async fn knowledge_list_carries_the_summary() {
 #[tokio::test]
 async fn knowledge_list_page_carries_the_summary() {
     let Some(fx) = fixture().await else { return };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     with_user_id(UserId::new(USER), async {
         store
@@ -182,7 +183,7 @@ async fn knowledge_list_page_carries_the_summary() {
 #[tokio::test]
 async fn knowledge_search_text_carries_the_summary() {
     let Some(fx) = fixture().await else { return };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     with_user_id(UserId::new(USER), async {
         store
@@ -213,7 +214,7 @@ async fn knowledge_hybrid_search_carries_the_summary() {
     // from the result without an error, so this drives the vector arm with a
     // real embedding rather than the full-text fallback.
     let Some(fx) = fixture().await else { return };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     with_user_id(UserId::new(USER), async {
         store
@@ -249,7 +250,7 @@ async fn a_row_written_before_the_migration_reads_back_without_a_summary() {
     // nullable rather than inventing a value it cannot derive, so those rows
     // must read back as "no summary yet" and not fail the read.
     let Some(fx) = fixture().await else { return };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     sqlx::query("INSERT INTO knowledge_base (id, user_id, content, tags, metadata) VALUES ($1, $2, $3, $4, $5)")
         .bind("kb-legacy")
@@ -283,7 +284,7 @@ async fn read_paths_report_no_summary_rather_than_falling_back_to_the_content() 
     // fallback belongs at the render site, in
     // `KnowledgeEntry::display_line`, not in the query.
     let Some(fx) = fixture().await else { return };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     with_user_id(UserId::new(USER), async {
         store
@@ -345,7 +346,7 @@ async fn a_write_without_a_summary_leaves_the_stored_one_in_place() {
     // wiped what it did not mention, and the entry fell out of every
     // tag-filtered search.
     let Some(fx) = fixture().await else { return };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     with_user_id(UserId::new(USER), async {
         store
@@ -399,7 +400,7 @@ async fn a_write_with_an_empty_summary_clears_the_stored_one() {
     // pass that fills the field selects `WHERE summary IS NULL`, so it would
     // never write one again.
     let Some(fx) = fixture().await else { return };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     with_user_id(UserId::new(USER), async {
         store
@@ -446,7 +447,7 @@ async fn a_create_with_an_empty_summary_stores_none() {
     // empty summary has no stored value to clear, so the row must simply hold
     // none - the state a pass over unsummarised entries (#1099) looks for.
     let Some(fx) = fixture().await else { return };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     with_user_id(UserId::new(USER), async {
         store
@@ -475,7 +476,7 @@ async fn a_write_that_carries_a_summary_replaces_the_stored_one() {
     // The other half of the preserve rule: an update that does state a summary
     // must land, or the dream cycle could never rewrite a stale one.
     let Some(fx) = fixture().await else { return };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     with_user_id(UserId::new(USER), async {
         store

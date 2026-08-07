@@ -38,6 +38,7 @@ use desktop_assistant_core::ports::knowledge::KnowledgeBaseStore;
 use desktop_assistant_core::ports::skill_index::SkillIndexStore;
 use desktop_assistant_core::skill_catalog::reconcile_scan;
 use desktop_assistant_storage::embedding_backfill::BackfillEmbedFn;
+use desktop_assistant_storage::knowledge_delete::KnowledgeDeletePolicy;
 use desktop_assistant_storage::tag_registry::{CreateTagOutcome, TagProposal, create_or_match_tag};
 use desktop_assistant_storage::{PgKnowledgeBaseStore, PgSkillIndexStore, UserId, with_user_id};
 use pgvector::Vector;
@@ -87,7 +88,7 @@ fn other_dimension_vec() -> Vec<f32> {
 // --- knowledge base ---------------------------------------------------------
 
 async fn write_kb(pool: &PgPool, user: &str, id: &str, content: &str) {
-    let store = PgKnowledgeBaseStore::new(pool.clone());
+    let store = PgKnowledgeBaseStore::new(pool.clone(), KnowledgeDeletePolicy::default());
     with_user_id(UserId::new(user), async {
         store
             .write(KnowledgeEntry::new(id, content, vec!["notes".to_string()]))
@@ -115,7 +116,7 @@ async fn stamp_kb(pool: &PgPool, id: &str, chunk: Vec<f32>, model: Option<&str>)
 }
 
 async fn kb_search(pool: &PgPool, user: &str, query: &str, model: &str) -> Vec<String> {
-    let store = PgKnowledgeBaseStore::new(pool.clone());
+    let store = PgKnowledgeBaseStore::new(pool.clone(), KnowledgeDeletePolicy::default());
     with_user_id(UserId::new(user), async {
         store
             .search(query, query_vec(), model, None, None, 10)
@@ -306,7 +307,7 @@ async fn knowledge_search_with_an_empty_embedding_falls_back_to_full_text() {
     )
     .await;
 
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
     let hits = with_user_id(UserId::new(USER), async {
         store
             .search("quantum widget", Vec::new(), &current(), None, None, 10)

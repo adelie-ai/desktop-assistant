@@ -26,11 +26,14 @@ use desktop_assistant_core::ports::knowledge::KnowledgeBaseStore;
 use desktop_assistant_core::ports::knowledge_delete::{DeleteInitiator, with_delete_initiator};
 use desktop_assistant_storage::dreaming::{run_consolidation_scan, sweep_expired_trash};
 use desktop_assistant_storage::knowledge_delete::{
-    HardDeleteTarget, KnowledgeDeletePolicy, hard_delete_knowledge,
+    HardDeleteTarget, KnowledgeDeletePolicy, MAX_REFUSAL_IDS, hard_delete_knowledge,
 };
 use desktop_assistant_storage::{PgKnowledgeBaseStore, UserId, with_user_id};
 use sqlx::PgPool;
+use std::io;
+use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
+use tracing_subscriber::fmt::MakeWriter;
 
 const ALICE: &str = "kb1122-alice";
 
@@ -117,6 +120,64 @@ async fn kb_count_active(pool: &PgPool, user_id: &str) -> i64 {
     .fetch_one(pool)
     .await
     .expect("count active")
+}
+
+/// Collects everything the code under test writes to `tracing`, so a test can
+/// assert that a refusal reached the log and not only the returned value.
+#[derive(Clone, Default)]
+struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+impl CapturedLog {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().expect("log lock")).into_owned()
+    }
+}
+
+impl io::Write for CapturedLog {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().expect("log lock").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for CapturedLog {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// A runtime for a test that captures log output.
+///
+/// It is single-threaded on purpose. A captured subscriber is installed per
+/// thread, so a future that a multi-threaded runtime is free to poll on another
+/// worker would write its records where the test cannot see them - and the test
+/// would then pass or fail on how the scheduler felt.
+fn capture_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build a current-thread runtime")
+}
+
+/// Drive `fut` to completion with every `tracing` record captured, and return
+/// what was written beside the future's own result.
+fn run_capturing_logs<F: std::future::Future>(
+    rt: &tokio::runtime::Runtime,
+    fut: F,
+) -> (F::Output, String) {
+    let captured = CapturedLog::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(captured.clone())
+        .with_ansi(false)
+        .finish();
+    let out = tracing::subscriber::with_default(subscriber, || rt.block_on(fut));
+    (out, captured.text())
 }
 
 /// A delete plan naming every id.
@@ -232,7 +293,7 @@ async fn model_initiated_hard_delete_is_refused_while_the_safety_flag_is_set() {
         return;
     };
     let pool = &fx.pool;
-    let store = PgKnowledgeBaseStore::new(pool.clone()).with_delete_policy(person_only_policy());
+    let store = PgKnowledgeBaseStore::new(pool.clone(), person_only_policy());
 
     seed_kb(pool, ALICE, "model-kill-1", "a fact").await;
     seed_kb(pool, ALICE, "model-kill-2", "another fact").await;
@@ -268,7 +329,7 @@ async fn user_initiated_delete_still_erases_while_the_safety_flag_is_set() {
         return;
     };
     let pool = &fx.pool;
-    let store = PgKnowledgeBaseStore::new(pool.clone()).with_delete_policy(person_only_policy());
+    let store = PgKnowledgeBaseStore::new(pool.clone(), person_only_policy());
 
     with_user_id(UserId::new(ALICE), async {
         store
@@ -518,6 +579,98 @@ async fn a_merge_cluster_costs_one_rewrite_whatever_its_size() {
         Some("UNIFIED"),
         "a cluster of four costs one rewrite, not four"
     );
+
+    fx.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------
+// A refusal reaches the log on both disposals, not only the returned value
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_refused_background_reap_writes_the_entry_id_and_path_to_the_log() {
+    let rt = capture_runtime();
+    let Some(fx) = rt.block_on(support::DbFixture::try_new("kb1122")) else {
+        return;
+    };
+
+    rt.block_on(seed_tombstone(&fx.pool, ALICE, "logged-sweep", 90));
+
+    let (reaped, log) =
+        run_capturing_logs(&rt, sweep_expired_trash(&fx.pool, person_only_policy()));
+
+    assert_eq!(reaped.expect("sweep"), 0);
+    assert!(log.contains("logged-sweep"), "log names the entry: {log}");
+    assert!(
+        log.contains("dreaming::trash::reap_expired_for_user"),
+        "log names the calling path: {log}"
+    );
+
+    rt.block_on(fx.cleanup());
+}
+
+#[test]
+fn a_refused_caller_delete_writes_the_entry_id_and_path_to_the_log() {
+    let rt = capture_runtime();
+    let Some(fx) = rt.block_on(support::DbFixture::try_new("kb1122")) else {
+        return;
+    };
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), person_only_policy());
+
+    rt.block_on(seed_kb(&fx.pool, ALICE, "logged-tool-delete", "a fact"));
+
+    // A caller receives the refusal as a value. It must be recorded even so: a
+    // caller that swallows the error must not erase the evidence.
+    let (result, log) = run_capturing_logs(
+        &rt,
+        with_user_id(UserId::new(ALICE), async {
+            store.delete_many(&["logged-tool-delete".to_string()]).await
+        }),
+    );
+
+    assert!(result.is_err(), "the delete is refused");
+    assert!(log.contains("logged-tool-delete"), "log names it: {log}");
+    assert!(
+        log.contains("knowledge::PgKnowledgeBaseStore::delete_many"),
+        "log names the calling path: {log}"
+    );
+
+    rt.block_on(fx.cleanup());
+}
+
+#[tokio::test]
+async fn a_large_refusal_reports_the_true_count_and_lists_a_bounded_sample() {
+    let Some(fx) = support::DbFixture::try_new("kb1122").await else {
+        return;
+    };
+    let pool = &fx.pool;
+
+    // More tombstones than one refusal will list. The count must still be
+    // exact, because the count is what makes the volume measurable, and the
+    // list must stay bounded, because the flag lets tombstones accumulate.
+    let total = MAX_REFUSAL_IDS + 7;
+    for i in 0..total {
+        seed_tombstone(pool, ALICE, &format!("bulk-{i:04}"), 90).await;
+    }
+
+    let outcome = hard_delete_knowledge(
+        pool,
+        ALICE,
+        HardDeleteTarget::ExpiredTombstones,
+        person_only_policy(),
+        "test::bulk_refusal",
+    )
+    .await
+    .expect("a refusal is a normal outcome");
+
+    let refusal = outcome.refusal.expect("the outcome carries the refusal");
+    assert_eq!(refusal.total, total, "the count covers every spared row");
+    assert_eq!(
+        refusal.entry_ids.len(),
+        MAX_REFUSAL_IDS,
+        "the listed sample stays bounded"
+    );
+    assert!(refusal.log_line().contains(&format!("of {total}")));
 
     fx.cleanup().await;
 }
