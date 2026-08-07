@@ -274,13 +274,30 @@ Four consequences:
   uses - one more use raises the sum by over a factor of two when it is far more
   recent than everything before it, and that is recency, which this score is
   meant to carry.
-- **The whole term stays under about three deviations** over any history a store
-  produces, because it is a logarithm. On the measured corpus the weakest
-  candidate the bar admits sits about 4.6 deviations below the strongest, so use
-  cannot take the top line from the best semantic match - which is the caution
-  the use log raised. It can and does carry an entry a long way up the block:
-  ten opens inside the last half hour are worth about two and a half deviations.
-  That is the design working, not a leak in it.
+- **The whole term stays under three deviations** over any history a store
+  produces, because it is a logarithm. That is a bound and nothing more: history
+  cannot run away with the ranking, and a lead wider than three deviations cannot
+  be closed by any history at all.
+
+It does not follow that the best semantic match always keeps the top line, and
+it is worth being exact about when it does not. The bar is 6.8 by construction,
+so the weakest candidate in any block sits there, and the measured prompts put a
+real hit between 7.3 and 11.4 deviations. The best match therefore leads the bar
+by anywhere from half a deviation to 4.6, and only the wide end of that range is
+out of reach of a large history. Ten opens inside the last half hour are worth
+about two and a half deviations, which is enough to lead a best match sitting at
+7.3.
+
+**The narrow end is the design working.** A best match half a deviation above the
+bar means the prompt named nothing the store really holds - and a weakly cued
+prompt is exactly the condition under which what has been used recently should
+lead. An entry the assistant has been reading all morning taking the top line on
+a prompt that brushes it is the behaviour this score was chosen for, and it is
+the reason for base-level activation rather than a tiebreak bolted onto distance.
+When the prompt does name something the store holds, the semantic term is several
+deviations clear and the ceiling keeps that line where it belongs. The use log's
+caution is about the second case, and the second case is what the ceiling
+protects.
 - **A standing negative mark subtracts**, so an entry that was opened and found
   wrong ends below one nobody has ever opened.
 

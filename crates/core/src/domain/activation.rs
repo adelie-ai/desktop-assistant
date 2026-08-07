@@ -49,8 +49,9 @@
 //!   ranking drives retrieval, and retrieval is what lets an entry be marked, so
 //!   a linear count compounds. Doubling the accumulated sum adds at most
 //!   `use_lift * ln 2` however large that sum already is, which holds the whole
-//!   term to about three deviations over any history a store produces - see
-//!   [`DEFAULT_USE_LIFT`] for what that buys and what it does not.
+//!   term under [`MAX_REINFORCEMENT_DEVIATIONS`] over any history a store
+//!   produces - see [`DEFAULT_USE_LIFT`] for what that buys and what it does
+//!   not, because the loose reading of it is false.
 //!
 //!   **The sum, not the number of events.** One more use raises the sum by more
 //!   than a factor of two when it is far more recent than everything before it -
@@ -110,22 +111,40 @@ pub const USE_REFERENCE_AGE_SECONDS: f64 = 24.0 * 60.0 * 60.0;
 /// about a third of a deviation - enough to settle a near-tie - and an extreme
 /// history reaches about three.
 ///
-/// **Three deviations is the guarantee, and it is worth stating exactly, because
-/// the loose version of it is false.** The term has no absolute ceiling - the
-/// accumulated sum has none - but it has a logarithm, so reaching past three
-/// takes a history no store produces. On the measured corpus the weakest
-/// candidate the bar admits sits about 4.6 deviations below the strongest, so
-/// what the ceiling guarantees is that use cannot take the top line from the
-/// best semantic match.
+/// **What the ceiling buys, stated exactly, because the loose version is
+/// false.** It buys a bound and nothing more: the term stays under
+/// [`MAX_REINFORCEMENT_DEVIATIONS`], so history cannot run away with the
+/// ranking and a candidate cannot be carried an unbounded distance up a block.
+/// A lead wider than that ceiling cannot be closed by any history at all.
 ///
-/// It emphatically does **not** guarantee that a used entry stays where its
-/// distance put it. Ten opens inside the last half hour are worth about two and
-/// a half deviations, which carries an entry sitting on the bar past most of a
-/// full block. That is the design working: an entry the assistant has been
-/// reading all morning should come up on a prompt that brushes it. #698's
-/// caution is about the top line, and the top line is what the ceiling protects.
-/// #698's log is what lets a deployment replace this figure with a measurement.
+/// It does **not** buy the top line unconditionally, and a doc that claims
+/// otherwise is wrong on this project's own numbers. The bar is 6.8 by
+/// construction, so the weakest candidate in any block sits there; the measured
+/// prompts put a real hit between 7.3 and 11.4. The best match therefore leads
+/// the bar by anywhere from half a deviation to 4.6, and only the wide end of
+/// that range is out of reach of a large history.
+///
+/// **The narrow end is the design working, not a leak in it.** A best match half
+/// a deviation above the bar is a weakly cued prompt - the store held nothing
+/// the prompt really named. That is exactly the condition under which what has
+/// been used recently should lead, and it is the reason base-level activation is
+/// the right shape here rather than a tiebreak bolted onto distance. An entry
+/// the assistant has been reading all morning taking the top line on a prompt
+/// that brushes it is the behaviour asked for. When the prompt does name
+/// something the store holds, the semantic term is several deviations clear and
+/// the ceiling keeps that line where it belongs.
 pub const DEFAULT_USE_LIFT: f64 = 0.5;
+
+/// The most the reinforcement term reaches over any history a store
+/// realistically holds.
+///
+/// Not a clamp - nothing enforces it, and the accumulated sum has no ceiling of
+/// its own. It is a property of the logarithm at [`DEFAULT_USE_LIFT`], stated
+/// here so the guarantee that rests on it has one number to read, and pinned by
+/// `an_extreme_use_history_stays_inside_the_stated_ceiling` against the largest
+/// history worth modelling: hundreds of opens across a year, and a person's mark
+/// set a minute ago, which is the single largest term the log can carry.
+pub const MAX_REINFORCEMENT_DEVIATIONS: f64 = 3.0;
 
 /// The coefficients [`activation`] applies.
 ///
@@ -427,22 +446,36 @@ mod tests {
         veteran
     }
 
-    /// Acceptance (#1123), the reason the ceiling matters: an entry that has
-    /// been opened and marked for years, sitting exactly on the bar, must still
-    /// rank below an entry nobody has ever opened that the prompt matched
-    /// better. That is #698's caution, and it is about the top line.
+    /// Acceptance (#1123), and #698's caution about the top line: a match that
+    /// leads the bar by more than [`MAX_REINFORCEMENT_DEVIATIONS`] keeps its
+    /// line against any history at all.
     ///
-    /// Over every distance the measured prompts actually reached, not only the
-    /// strongest of them: a claim tested at one favourable point is not a
-    /// claim.
+    /// Over every distance the measured prompts reached that leads by that much,
+    /// not only the strongest of them: a claim tested at one favourable point is
+    /// not a claim. The boundary itself is asserted too, because it is the
+    /// number the guarantee is stated in.
     #[test]
-    fn a_heavily_used_entry_never_outranks_the_best_semantic_match() {
+    fn a_lead_wider_than_the_ceiling_cannot_be_closed_by_any_use_history() {
         let now = now();
         let weights = ActivationWeights::default();
         let veteran = a_veteran(now);
-
         let at_the_bar = activation(BAR, Some(&veteran), now, &weights);
-        for best in MEASURED_HITS {
+
+        let wide: Vec<f64> = MEASURED_HITS
+            .iter()
+            .copied()
+            .filter(|hit| hit - BAR > MAX_REINFORCEMENT_DEVIATIONS)
+            .collect();
+        assert!(
+            wide.len() >= 3,
+            "the measured corpus must hold several clearly-cued prompts, or this proves \
+             nothing: {wide:?}"
+        );
+
+        for best in wide
+            .iter()
+            .chain(std::iter::once(&(BAR + MAX_REINFORCEMENT_DEVIATIONS)))
+        {
             let cold = activation(*best, None, now, &weights);
             assert!(
                 at_the_bar < cold,
@@ -450,6 +483,40 @@ mod tests {
                  {best} deviations, which scored {cold}"
             );
         }
+    }
+
+    /// The other end of the same range, pinned as intended behaviour rather than
+    /// left as an exception to a guarantee that does not hold there.
+    ///
+    /// The weakest hit the measured prompts produced stands 7.3 deviations out,
+    /// half a deviation above the bar. A prompt whose best match is that close to
+    /// the floor named nothing the store really holds - and a weakly cued prompt
+    /// is exactly when what has been used recently should lead. An entry the
+    /// assistant has been reading all morning takes the top line here, and that
+    /// is the whole reason for choosing base-level activation over a tiebreak
+    /// bolted onto distance.
+    ///
+    /// Stated as a test so that a later change which clamps the term, or scales
+    /// it down until it cannot do this, fails here and has to argue with the
+    /// design rather than quietly undo it.
+    #[test]
+    fn a_weakly_cued_prompt_lets_use_history_lead() {
+        let now = now();
+        let weights = ActivationWeights::default();
+
+        // Ten opens inside the last half hour: an entry in the current working
+        // context, which is the ordinary case rather than an extreme one.
+        let worked_all_morning = evenly_over(now, 10, 1_800);
+
+        let best_cold_match = activation(7.3, None, now, &weights);
+        let just_above_the_bar = activation(6.9, Some(&worked_all_morning), now, &weights);
+
+        assert!(
+            just_above_the_bar > best_cold_match,
+            "the weakest measured hit scored {best_cold_match} and an entry the work keeps \
+             needing, four tenths of a deviation below it, scored {just_above_the_bar}; on a \
+             prompt this weakly cued the used entry is supposed to lead"
+        );
     }
 
     /// Acceptance (#1123): the semantic term is the source-normalized deviation
@@ -605,33 +672,25 @@ mod tests {
         );
     }
 
-    /// The ceiling the scale is chosen against, pinned so the claim cannot rot.
+    /// [`MAX_REINFORCEMENT_DEVIATIONS`], pinned so the guarantee resting on it
+    /// cannot rot.
     ///
-    /// The most extreme history a store realistically holds - hundreds of opens
-    /// across a year, and a person's mark set a minute ago, which is the largest
-    /// single term the log can carry - must stay inside the three deviations
-    /// [`DEFAULT_USE_LIFT`] promises. The bar's own corpus puts the weakest
-    /// admitted candidate and the strongest about 4.6 apart, so a term under
-    /// three cannot carry an entry from the bottom of a block to the top.
+    /// The largest history worth modelling - hundreds of opens across a year,
+    /// and a person's mark set a minute ago, which is the single largest term
+    /// the log can carry - must stay under it. Nothing enforces the bound; it is
+    /// a property of the logarithm, and this is what checks the property is
+    /// still true.
     #[test]
     fn an_extreme_use_history_stays_inside_the_stated_ceiling() {
         let now = now();
         let weights = ActivationWeights::default();
 
-        let mut extreme = evenly_over(now, 500, YEAR);
-        extreme.marked_count = 20;
-        extreme.marks = vec![KnowledgeMark {
-            source: MarkSource::Person,
-            polarity: MarkPolarity::Positive,
-            reason: None,
-            marked_at: at(now, 60),
-        }];
+        let lift = activation(0.0, Some(&a_veteran(now)), now, &weights);
 
-        let lift = activation(0.0, Some(&extreme), now, &weights);
         assert!(
-            (0.0..3.0).contains(&lift),
-            "an extreme history lifted {lift} deviations, past the three the scale is chosen \
-             against"
+            (0.0..MAX_REINFORCEMENT_DEVIATIONS).contains(&lift),
+            "an extreme history lifted {lift} deviations, past the \
+             {MAX_REINFORCEMENT_DEVIATIONS} the scale is chosen against"
         );
     }
 
