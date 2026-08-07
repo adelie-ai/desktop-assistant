@@ -207,7 +207,25 @@ string the model wrote has been replaced, leaving the `op` tag alone. The
 verdict is the same, the field name and the failure kind survive, and no value
 reaches the default stream. Reading the value back out of serde's message text
 would mean pattern-matching on an error string, which this codebase does not do.
-A named test holds the guarantee.
+
+Serde quotes a wrong **top-level** type the same way, and there the value is the
+whole answer: an answer that is one JSON string, either fenced or bare, comes
+back as ``invalid type: string "<the entire answer>", expected ...``. Bounding
+that is not a fix, because a bounded quote is still a quote. So a wrong envelope
+type is named by its JSON type alone - "the answer is a string" - read back from
+the payload with a streaming reader, which carries no content at all. An answer
+holding no JSON value keeps serde's own message, which states a reason and a
+position and quotes nothing.
+
+The `op` tag is the one part of an element that reaches the default stream as
+the model wrote it, so it is bounded where it is rendered. Nothing can make it
+long today, because `#[serde(other)]` folds every unrecognised tag into a no-op
+that reads cleanly and never reaches the dropped path - but that is a coupling
+between two distant decisions, not a guarantee, and the bound holds if the
+coupling goes.
+
+Named tests hold each of these, driving the routes that leak rather than
+asserting the values the log line is built from.
 
 Every dropped operation is counted exactly once, whatever the outcome: when the
 rest of the answer applies, when the whole answer is unreadable, and when the

@@ -802,10 +802,20 @@ impl std::fmt::Display for ParseFailure {
 struct DroppedOperation {
     /// Position in the answer's operations array, counting from zero.
     index: usize,
-    /// The element's `op` tag, when it has one. Named on its own rather than
-    /// left to the excerpt: `serde_json` writes an object's keys in
-    /// alphabetical order, so a long field ahead of `op` would push the one
-    /// thing that says what the model was attempting out of a bounded quote.
+    /// The element's `op` tag, when it has one. Bounded where it is rendered.
+    ///
+    /// Named on its own rather than left to the excerpt: `serde_json` writes an
+    /// object's keys in alphabetical order, so a long field ahead of `op` would
+    /// push the one thing that says what the model was attempting out of a
+    /// bounded quote.
+    ///
+    /// It is the one part of the element that reaches the default log stream as
+    /// the model wrote it. Today it can only be `delete`, `merge` or `edit`:
+    /// `#[serde(other)]` on [`RawOp`] folds every other tag into `Keep`, which
+    /// reads cleanly and so never arrives here. That is a coupling between two
+    /// distant decisions, not a guarantee - drop `#[serde(other)]` to reject an
+    /// unknown op and a tag of arbitrary length arrives at once. The bound in
+    /// [`Display`](std::fmt::Display) holds either way.
     op: Option<String>,
     /// Why the element did not read, taken from serde but with every value the
     /// model wrote replaced first. See [`reason_for`].
@@ -840,6 +850,9 @@ impl std::fmt::Display for DroppedOperation {
         let Self {
             index, op, reason, ..
         } = self;
+        // Bounded here, not where the record was built, so the guarantee this
+        // doc comment states is held by the code that states it.
+        let op = op.as_deref().map(bound_chars);
         let op = op.as_deref().unwrap_or("unstated");
         write!(f, "operation #{index} [op={op}]: {reason}")
     }
@@ -896,6 +909,49 @@ fn redact_values(element: &serde_json::Value) -> serde_json::Value {
                 .collect(),
         ),
         number_or_bool_or_null => number_or_bool_or_null.clone(),
+    }
+}
+
+/// Why an answer could not be read as the envelope at all, in words that carry
+/// nothing the model wrote.
+///
+/// Serde reports a wrong top-level type the way it reports a wrong field type -
+/// by quoting the value - and here the value is the whole answer. A payload
+/// that is one JSON string comes back as ``invalid type: string "<the entire
+/// answer>", expected ...``, and both routes into that are reachable: a fenced
+/// `json` block holding a bare quoted string, and a bare quoted string with no
+/// brackets anywhere. Bounding the message is not enough, because a bounded
+/// quote is still a quote. So a wrong type is named by its JSON type alone,
+/// read back from the payload, which carries no content at all.
+///
+/// A payload that holds no JSON value keeps serde's own message. Those state a
+/// reason and a position - `expected value at line 1 column 1` - and never
+/// quote what they found.
+///
+/// The value is read with a streaming deserializer rather than `from_str`,
+/// which would reject anything after the first value: `"a" and then some prose`
+/// is a wrong type followed by trailing characters, and it must still be
+/// reported as a string rather than fall through to the message that quotes it.
+fn envelope_fault(payload: &str, error: &serde_json::Error) -> String {
+    let mut reader = serde_json::Deserializer::from_str(payload);
+    match serde_json::Value::deserialize(&mut reader) {
+        Ok(value) => format!(
+            "the answer is {}, not a JSON object holding an `operations` array",
+            json_type_of(&value)
+        ),
+        Err(_) => bound_chars(&error.to_string()),
+    }
+}
+
+/// The JSON type of `value` as a phrase, and nothing of its content.
+fn json_type_of(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
     }
 }
 
@@ -983,7 +1039,7 @@ fn parse_operations(response: &str) -> Result<ParsedOperations, ParseFailure> {
         }
         Err(e) => {
             return Err(ParseFailure::Malformed {
-                detail: e.to_string(),
+                detail: envelope_fault(&payload, &e),
                 dropped: 0,
             });
         }
@@ -1635,6 +1691,85 @@ mod tests {
             diagnosis.chars().count() <= MAX_DROPPED_OP_EXCERPT_CHARS * 2,
             "the diagnosis must be bounded: {} chars",
             diagnosis.chars().count()
+        );
+    }
+
+    #[test]
+    fn an_answer_that_is_one_string_does_not_reach_the_default_log() {
+        // The element path is not the only route. Serde reports a wrong
+        // TOP-LEVEL type by quoting it too, and there the value is the whole
+        // answer. Both ways in are reachable: a fenced block holding a bare
+        // quoted string, and a bare quoted string with no brackets anywhere.
+        let private = "the-thing-the-user-told-adele-in-confidence ".repeat(20);
+        let routes = [
+            format!("```json\n\"{private}\"\n```"),
+            format!("\"{private}\""),
+            // A wrong type followed by prose: the trailing text must not push
+            // this back onto the message that quotes the value.
+            format!("\"{private}\" and that is my answer"),
+        ];
+
+        for answer in routes {
+            let err =
+                parse_operations(&answer).expect_err("one string is not an operations envelope");
+            let message = err.to_string();
+            assert!(
+                !message.contains("in-confidence"),
+                "no value the model wrote may reach the default log stream: {message}"
+            );
+            assert!(
+                message.contains("a string"),
+                "the failure must still say what came back: {message}"
+            );
+            assert_eq!(err.dropped(), 0, "no element was ever separated out");
+        }
+    }
+
+    #[test]
+    fn an_answer_that_is_not_json_at_all_still_says_what_was_wrong() {
+        // Serde's own message states a reason and a position and quotes
+        // nothing, so it is kept rather than replaced by a type name there is
+        // no value to read.
+        let err = parse_operations("I decided to keep everything, so here is nothing.")
+            .expect_err("prose is not an operations envelope");
+        assert!(
+            matches!(err, ParseFailure::Malformed { .. }),
+            "expected a malformed verdict, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("expected value"),
+            "the failure must still say why: {err}"
+        );
+    }
+
+    #[test]
+    fn an_answer_that_is_an_array_is_named_by_its_type() {
+        // The shape the pull request says is not salvaged. It must fail by
+        // naming its type, not by quoting what the array held.
+        let err = parse_operations(r#"[{"op":"delete","ids":["kb-001"],"reason":"trivial"}]"#)
+            .expect_err("a bare array is not an operations envelope");
+        assert!(
+            err.to_string().contains("an array"),
+            "the failure must name the type that came back: {err}"
+        );
+    }
+
+    #[test]
+    fn a_dropped_operations_op_tag_is_bounded() {
+        // `#[serde(other)]` folds every unrecognised tag into `Keep`, so a long
+        // prose `op` reads cleanly and never reaches the dropped path today.
+        // The bound is what keeps that a coupling rather than a dependency: an
+        // `op` this long must be cut whether or not anything can produce one.
+        let long_tag = "merge-".repeat(MAX_DROPPED_OP_EXCERPT_CHARS);
+        let dropped = DroppedOperation {
+            index: 0,
+            op: Some(long_tag.clone()),
+            reason: "missing field `content`".to_string(),
+            excerpt: "{}".to_string(),
+        };
+        assert!(
+            dropped.to_string().chars().count() < long_tag.chars().count(),
+            "an over-long op tag must not reach the log whole"
         );
     }
 
