@@ -202,12 +202,33 @@ impl PgSkillIndexStore {
     /// never an open. Filtering inside the scan also keeps the spread a
     /// statement about the catalog the arm actually draws from.
     ///
-    /// **One row per name.** The catalog can hold a global skill and this
-    /// user's own under one name, and `builtin_skill_get` resolves that to the
-    /// user's own. Two lines for one openable procedure would be two lines the
-    /// model cannot tell apart, so the scan keeps the row the fetch would
-    /// return - `owner_key DESC` puts a real owner id ahead of the global
-    /// `''`.
+    /// **Only a locally authored skill is offered.** A skill from a GitHub or
+    /// `.well-known` source carries a description its author wrote, and the
+    /// platform already rules that such text is third-party content:
+    /// `builtin_skill_search` returns the same field and is classified
+    /// `Declared(SkillTrustTier)`, so a non-local hit taints the turn and
+    /// closes the tool gate. This block has no tool call in it, so nothing
+    /// would taint - the text would land in a system message, ahead of the
+    /// user prompt, with every tier still open. Dropping is the answer rather
+    /// than tainting, for the reason the scratchpad arm drops a note stamped
+    /// as external: a catalog row lives indefinitely, and closing the gate
+    /// whenever one happened to rank near the prompt would degrade the
+    /// conversation permanently. An installed skill stays reachable through
+    /// `builtin_skill_search`, which taints correctly.
+    ///
+    /// The predicate sits on the final join rather than inside `d`, so it
+    /// applies after a name has resolved to one row. Filtering earlier would
+    /// let a local global skill be offered while the fetch returned the
+    /// non-local personal one that shadows it.
+    ///
+    /// **One row per name, and it is the row the fetch returns.** The catalog
+    /// can hold a global skill and this user's own under one name. Two lines
+    /// for one openable procedure would be two lines the model cannot tell
+    /// apart, and a line describing a procedure other than the one
+    /// `builtin_skill_get` hands back would be worse - the model would be
+    /// briefed on one method and given another's steps. So `pick` applies that
+    /// tool's own rule: the user's own row when its files are on disk, else
+    /// the global one, else the user's own tombstone.
     ///
     /// **The body is not read.** The arm renders a name and one line of what
     /// the skill is for; the body is the widest column on the row and nothing
@@ -294,17 +315,21 @@ impl PgSkillIndexStore {
              ),
              matched AS (
                  SELECT DISTINCT ON (s.name)
-                        s.name, s.description, s.present_on_disk,
+                        s.name, s.description, s.present_on_disk, s.trust_tier,
                         ts_rank_cd(s.tsv, q.query) AS rank
                  FROM skill_index s, q
                  WHERE (s.owner_user_id IS NULL OR s.owner_user_id = $3)
                    AND s.approved_at IS NOT NULL
                    AND q.query IS NOT NULL
                    AND s.tsv @@ q.query
-                 ORDER BY s.name, s.owner_key DESC
+                 ORDER BY s.name,
+                          CASE WHEN s.owner_key <> '' AND s.present_on_disk THEN 0
+                               WHEN s.owner_key = '' THEN 1
+                               ELSE 2 END
              )
              SELECT name, description, present_on_disk
              FROM matched
+             WHERE trust_tier = 'local'
              ORDER BY rank DESC, name
              LIMIT $2",
         )
@@ -614,15 +639,18 @@ pub const SKILL_RECALL_SCAN_STATEMENT_TIMEOUT: std::time::Duration =
 /// What [`PgSkillIndexStore::nearest_by_embedding`] reads.
 ///
 /// One scan, four uses. `d` computes one distance per catalog row and carries
-/// nothing else. `pick` cuts that to one row per name, keeping the row
-/// `builtin_skill_get` would return. `m` and `s` then take the median of those
-/// distances and the median of each distance's own distance from it, so the
-/// pass that measures the catalog's spread reads no description and no body.
-/// The rows the block may show are read last, by name and owner, and only
-/// those.
+/// only what resolving a name needs. `pick` cuts that to one row per name,
+/// keeping the row `builtin_skill_get` would return - its own row when the
+/// files are on disk, else the global one, else its own tombstone. `m` and `s`
+/// then take the median of those distances and the median of each distance's
+/// own distance from it, so the pass that measures the catalog's spread reads
+/// no description and no body. The rows the block may show are read last, by
+/// name and owner, and only those.
 ///
 /// The approval predicate sits inside `d`, so an unapproved skill is absent
-/// from the candidates *and* from the spread they are graded against.
+/// from the candidates *and* from the spread they are graded against. The
+/// trust predicate sits on the final join instead, because it must apply to
+/// the row a name resolved to rather than to the set a name resolves from.
 ///
 /// Every returned row carries the same spread, which is the price of stating it
 /// in the same answer as the candidates - three numbers on at most
@@ -641,7 +669,7 @@ pub const SKILL_RECALL_SCAN_STATEMENT_TIMEOUT: std::time::Duration =
 /// database - see `the_skill_recall_scan_does_not_read_the_body`.
 const NEAREST_SKILLS_BY_EMBEDDING_SQL: &str = "\
     WITH d AS (
-         SELECT name, owner_key, MIN(chunk <=> $1) AS distance
+         SELECT name, owner_key, present_on_disk, MIN(chunk <=> $1) AS distance
          FROM skill_index, unnest(embedding) AS chunk
          WHERE (owner_user_id IS NULL OR owner_user_id = $2)
            AND approved_at IS NOT NULL
@@ -651,12 +679,15 @@ const NEAREST_SKILLS_BY_EMBEDDING_SQL: &str = "\
                 OR (split_part($3, '@', 2) <> ''
                     AND split_part(embedding_model, '@', 2)
                         = split_part($3, '@', 2)))
-         GROUP BY name, owner_key
+         GROUP BY name, owner_key, present_on_disk
      ),
      pick AS (
          SELECT DISTINCT ON (name) name, owner_key, distance
          FROM d
-         ORDER BY name, owner_key DESC
+         ORDER BY name,
+                  CASE WHEN owner_key <> '' AND present_on_disk THEN 0
+                       WHEN owner_key = '' THEN 1
+                       ELSE 2 END
      ),
      m AS (
          SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY distance) AS median,
@@ -678,8 +709,9 @@ const NEAREST_SKILLS_BY_EMBEDDING_SQL: &str = "\
        ON si.name = pick.name
       AND si.owner_key = pick.owner_key
       AND (si.owner_user_id IS NULL OR si.owner_user_id = $2)
+      AND si.trust_tier = 'local'
      CROSS JOIN s
-     ORDER BY pick.distance
+     ORDER BY pick.distance, si.name
      LIMIT $4";
 
 /// One skill the recall scan ranked: what a line needs, and nothing else.
@@ -872,11 +904,13 @@ mod tests {
         );
     }
 
-    /// The scan bounds the database's own work, not only the caller's patience.
-    /// Abandoning a query future leaves the backend scanning, and recall runs
-    /// before every turn.
+    /// The scan's stated timeout is a real one. In PostgreSQL a
+    /// `statement_timeout` of zero means no timeout at all, so the constant
+    /// being positive is what makes the ceiling exist - and abandoning a query
+    /// future leaves the backend scanning, on a path that runs before every
+    /// turn.
     #[test]
-    fn the_skill_recall_scan_states_a_statement_timeout() {
+    fn the_skill_recall_scans_statement_timeout_is_not_zero() {
         assert!(
             SKILL_RECALL_SCAN_STATEMENT_TIMEOUT > std::time::Duration::ZERO,
             "a zero timeout means no timeout at all in PostgreSQL"

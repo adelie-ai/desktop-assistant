@@ -219,6 +219,13 @@ Three things follow for the catalog, and the whole design is in
 - **Only an approved skill is offered**, and the exclusion happens inside the
   scan, so an unapproved row is absent from the catalog's measured spread as
   well as from the candidates.
+- **Only a locally authored one, too.** A skill installed from a repository or
+  a web source carries a description its author wrote, and
+  `builtin_skill_search` is classified `Declared(SkillTrustTier)` precisely
+  because that text is third-party content. The block has no tool call in it,
+  so nothing would taint; the arm drops such a skill rather than putting its
+  author's prose in a system message with every tool tier open. It stays
+  reachable through the search tool, which taints correctly.
 - **A skill whose files are gone is offered and marked** `[files missing]`. The
   body still reads, so the procedure is still followable; only its bundled
   scripts are unreachable.

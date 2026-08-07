@@ -76,7 +76,8 @@ fn at_angle(radians: f32) -> Vec<f32> {
     vec![radians.cos(), radians.sin(), 0.0]
 }
 
-/// A catalog row, unapproved as every write path leaves one.
+/// A catalog row, unapproved as every write path leaves one, and locally
+/// authored as a skill somebody wrote on this machine is.
 fn a_skill(name: &str, description: &str, owner: Option<&str>) -> IndexedSkill {
     IndexedSkill {
         name: name.to_string(),
@@ -432,6 +433,194 @@ async fn the_degraded_full_text_read_also_withholds_an_unapproved_skill() {
             found[0].distance.is_none(),
             "a lexical match carries no distance to read against a spread"
         );
+    })
+    .await;
+
+    fx.cleanup().await;
+}
+
+/// Acceptance (#1154): a skill that came from outside this machine is not
+/// offered.
+///
+/// The block is a system message with no tool call in it, so nothing taints
+/// and the tool gate stays open. `builtin_skill_search` returns the same
+/// `description` field and is classified `Declared(SkillTrustTier)`, which
+/// means the platform already rules that a non-local skill's text is
+/// third-party content that must close the gate. Delivering the same bytes
+/// through a more trusted channel with less checking is the defect this
+/// excludes.
+#[tokio::test]
+async fn a_skill_from_outside_this_machine_is_absent_from_the_recall_scan() {
+    let Some(fx) = fixture().await else { return };
+    let store = PgSkillIndexStore::new(fx.pool.clone());
+
+    with_user_id(UserId::new(USER), async {
+        seed(
+            &store,
+            &fx.pool,
+            &a_skill("written-here", "A procedure somebody wrote here.", None),
+            axis(0),
+            true,
+        )
+        .await;
+        let mut installed = a_skill(
+            "from-github",
+            "A procedure fetched from a repository.",
+            None,
+        );
+        installed.trust_tier = TrustTier::Github;
+        seed(&store, &fx.pool, &installed, axis(0), true).await;
+
+        let found = store
+            .nearest_by_embedding(axis(0), MODEL, 10)
+            .await
+            .expect("the scan answers");
+        let names: Vec<&str> = found.skills.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["written-here"]);
+
+        let lexical = store
+            .search_text_any_term("a procedure", 10)
+            .await
+            .expect("the degraded read answers");
+        let names: Vec<&str> = lexical.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["written-here"],
+            "a backend outage must not turn into an offer of third-party text"
+        );
+    })
+    .await;
+
+    fx.cleanup().await;
+}
+
+/// A non-local skill shadowing a local one by name must not leave the block
+/// offering the local line while a fetch hands back the non-local body.
+///
+/// The trust rule therefore applies to the row a name resolved to, not to the
+/// set it resolves from: the name is dropped outright rather than falling
+/// through to the row underneath it.
+#[tokio::test]
+async fn a_name_whose_resolved_row_came_from_outside_is_dropped_rather_than_falling_through() {
+    let Some(fx) = fixture().await else { return };
+    let store = PgSkillIndexStore::new(fx.pool.clone());
+
+    with_user_id(UserId::new(USER), async {
+        seed(
+            &store,
+            &fx.pool,
+            &a_skill("deploy", "The host-global copy, written here.", None),
+            axis(0),
+            true,
+        )
+        .await;
+        let mut mine = a_skill(
+            "deploy",
+            "My own copy, installed from elsewhere.",
+            Some(USER),
+        );
+        mine.trust_tier = TrustTier::Github;
+        seed(&store, &fx.pool, &mine, axis(0), true).await;
+
+        let found = store
+            .nearest_by_embedding(axis(0), MODEL, 10)
+            .await
+            .expect("the scan answers");
+
+        assert!(
+            found.skills.is_empty(),
+            "the fetch would return the installed personal row, so offering the global \
+             line would describe a procedure the model will not be given: {:?}",
+            found.skills
+        );
+    })
+    .await;
+
+    fx.cleanup().await;
+}
+
+/// Acceptance (#1154): the line the block offers describes the procedure a
+/// fetch hands back.
+///
+/// `builtin_skill_get` prefers the caller's own row only while it is usable -
+/// on disk and approved - and falls back to the global one otherwise. The scan
+/// resolves a duplicated name by that same rule. Three states where a naive
+/// "the personal row always wins" would disagree.
+#[tokio::test]
+async fn the_scan_resolves_a_duplicated_name_the_way_a_fetch_does() {
+    let Some(fx) = fixture().await else { return };
+    let store = PgSkillIndexStore::new(fx.pool.clone());
+
+    // A personal tombstone must not shadow a live global skill.
+    with_user_id(UserId::new(USER), async {
+        let mut mine = a_skill("deploy", "My own copy, files gone.", Some(USER));
+        mine.present_on_disk = false;
+        seed(&store, &fx.pool, &mine, axis(0), true).await;
+        // `upsert` marks a row present, so the tombstone is set afterwards the
+        // way a reconcile pass sets it.
+        store
+            .set_presence(
+                &SkillScope::Owner(USER.to_string()),
+                &["deploy".to_string()],
+                false,
+            )
+            .await
+            .expect("mark the personal row absent");
+        seed(
+            &store,
+            &fx.pool,
+            &a_skill("deploy", "The host-global copy, live.", None),
+            axis(0),
+            true,
+        )
+        .await;
+
+        let found = store
+            .nearest_by_embedding(axis(0), MODEL, 10)
+            .await
+            .expect("the scan answers");
+        assert_eq!(found.skills.len(), 1);
+        assert_eq!(
+            found.skills[0].description, "The host-global copy, live.",
+            "the fetch reaches past a dead personal row, so the line must too"
+        );
+        assert!(
+            found.skills[0].present_on_disk,
+            "and the line must not wear the tombstone's marker"
+        );
+    })
+    .await;
+
+    // An unapproved personal row must not shadow a live global skill either.
+    with_user_id(UserId::new(OTHER_USER), async {
+        seed(
+            &store,
+            &fx.pool,
+            &a_skill("rotate", "My own draft, unapproved.", Some(OTHER_USER)),
+            axis(0),
+            false,
+        )
+        .await;
+        seed(
+            &store,
+            &fx.pool,
+            &a_skill("rotate", "The host-global copy, approved.", None),
+            axis(0),
+            true,
+        )
+        .await;
+
+        let found = store
+            .nearest_by_embedding(axis(0), MODEL, 10)
+            .await
+            .expect("the scan answers");
+        let rotate: Vec<&str> = found
+            .skills
+            .iter()
+            .filter(|s| s.name == "rotate")
+            .map(|s| s.description.as_str())
+            .collect();
+        assert_eq!(rotate, vec!["The host-global copy, approved."]);
     })
     .await;
 

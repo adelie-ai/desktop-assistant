@@ -4086,14 +4086,15 @@ mod tests {
         );
     }
 
-    /// Acceptance (#1154): a skill body is never rendered in the block.
+    /// A skill line spends a name and one bounded description, and nothing
+    /// else.
     ///
-    /// The body never reaches the core at all - `RecallSkill` has no field for
-    /// it, and the scan does not read the column - so what this pins is the
-    /// other half: the line is built from the name and the description, and
-    /// carries neither the whole description unbounded nor anything else.
+    /// One half of "the body is never rendered". The other half is structural
+    /// and cannot fail here - `RecallSkill` has no body field and the scan does
+    /// not read the column, which `the_skill_recall_scan_does_not_read_the_body`
+    /// pins against the statement itself.
     #[test]
-    fn a_skill_body_is_never_rendered_in_the_block() {
+    fn a_skill_line_spends_a_name_and_one_bounded_description_and_no_more() {
         let long_description = format!(
             "{} {}",
             "When you need to cut a release.",
@@ -4250,32 +4251,6 @@ mod tests {
             format!("- files-gone{RECALL_SKILL_ABSENT_MARKER}: Indexed only."),
             "a skill whose files are gone says so on its own line"
         );
-    }
-
-    /// Acceptance (#1154): an unapproved skill never reaches the block.
-    ///
-    /// The exclusion is the adapter's, and this is the core half of the
-    /// contract: the block renders exactly the candidates it is handed, so a
-    /// candidate the adapter withheld cannot appear. The adapter's own half -
-    /// that an unapproved row is withheld, and that being locally authored does
-    /// not approve it - is pinned in the storage suite, against a real
-    /// database.
-    #[test]
-    fn the_block_renders_only_the_skills_the_lookup_admitted() {
-        let candidates = RecallCandidates {
-            skills: vec![skill(
-                "approved",
-                "A procedure somebody blessed.",
-                true,
-                at(RECALL_BAR + 2.0),
-            )],
-            ..RecallCandidates::default()
-        };
-
-        let block = render(&candidates).expect("a block");
-
-        assert_eq!(skill_lines(&block).len(), 1, "{block}");
-        assert!(block.contains("approved"), "{block}");
     }
 
     /// Acceptance (#1154): offers reach the use log. The block reports the

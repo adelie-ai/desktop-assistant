@@ -231,7 +231,7 @@ async fn lookup(
                         .into_iter()
                         // No use records here either, for the reason the
                         // knowledge arm above states.
-                        .map(|skill| to_recall_skill(skill, RecallRelevance::LexicalMatch))
+                        .map(to_recall_skill)
                         .collect(),
                     None,
                 ))
@@ -363,9 +363,7 @@ async fn lookup(
                     .into_iter()
                     .map(|skill| {
                         let record = records.remove(&skill.name);
-                        let distance = skill.distance.unwrap_or_default();
-                        to_recall_skill(skill, RecallRelevance::Distance(distance))
-                            .with_use_record(record)
+                        to_recall_skill(skill).with_use_record(record)
                     })
                     .collect(),
                 found.dispersion,
@@ -381,7 +379,16 @@ async fn lookup(
 /// here, and the body was never read. How much of a description a line may
 /// spend, and how a skill whose files are gone is marked, are the core's
 /// decisions.
-fn to_recall_skill(skill: NearestSkill, relevance: RecallRelevance) -> RecallSkill {
+fn to_recall_skill(skill: NearestSkill) -> RecallSkill {
+    // The row states which kind of relevance it carries, rather than the call
+    // site stating it: the measured read and the degraded one answer with the
+    // same type, and a call site that assumed the wrong one would render a
+    // lexical row as a perfect distance - clearing any bar and being ranked by
+    // activation as though it held a semantic signal.
+    let relevance = match skill.distance {
+        Some(distance) => RecallRelevance::Distance(distance),
+        None => RecallRelevance::LexicalMatch,
+    };
     RecallSkill::new(
         skill.name,
         skill.description,

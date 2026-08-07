@@ -2036,22 +2036,39 @@ impl BuiltinToolService {
         // `builtin_skill_search` presents without asking the caller to pick
         // a scope either.
         //
-        // A live personal row wins outright, with no second lookup. A
-        // personal row that is a TOMBSTONE (`present_on_disk: false` -- its
-        // files are gone, but the append-only catalog keeps it) must not
-        // permanently shadow a live global skill of the same name: there is
-        // no `owner` argument any more for the caller to reach past it with,
-        // so the fallback has to reach past a dead personal row on its own.
-        // Only when the global lookup also comes up empty does the personal
-        // tombstone stand, since it is then the only record that ever
-        // existed for this name.
+        // A personal row wins outright when it is USABLE, with no second
+        // lookup. A personal row that is not must not permanently shadow a
+        // live global skill of the same name: there is no `owner` argument any
+        // more for the caller to reach past it with, so the fallback has to
+        // reach past an unusable personal row on its own.
+        //
+        // Two states make a personal row unusable, and they need the same
+        // answer. A TOMBSTONE (`present_on_disk: false` -- its files are gone,
+        // but the append-only catalog keeps it) cannot run its scripts. And an
+        // UNAPPROVED row cannot be followed at all, which matters more than it
+        // reads: `promote_plan_to_skill` writes unapproved personal rows under
+        // a name the assistant chose, so one draft could otherwise hide a
+        // blessed global skill of that name from every later fetch.
+        //
+        // The global row stands in only where it is itself approved. Otherwise
+        // the personal row stands, because it is the caller's own and the
+        // refusal below then names the state the caller can act on. When
+        // neither exists the answer is a miss.
+        //
+        // The `[Recall]` skill arm's scan applies this same rule when it cuts
+        // the catalog to one row per name (#1154). The two must agree: a block
+        // that described one procedure while this handed back another's steps
+        // would brief the model on the wrong method.
+        let usable =
+            |s: &desktop_assistant_core::domain::IndexedSkill| s.present_on_disk && s.is_approved();
         let mine = get_fn(name.clone(), Some(SKILL_GET_OWN_SCOPE.to_string())).await?;
-        let found = if mine.as_ref().is_some_and(|s| s.present_on_disk) {
+        let found = if mine.as_ref().is_some_and(usable) {
             mine
         } else {
-            match get_fn(name.clone(), None).await? {
-                Some(global) => Some(global),
-                None => mine,
+            match (get_fn(name.clone(), None).await?, mine) {
+                (Some(global), Some(own)) if !global.is_approved() => Some(own),
+                (Some(global), _) => Some(global),
+                (None, own) => own,
             }
         };
 
@@ -8796,6 +8813,94 @@ mod tests {
             "a personal tombstone must not shadow a live global skill of the same name"
         );
         assert_eq!(json["present_on_disk"], true);
+    }
+
+    /// An UNAPPROVED personal row must not shadow a live global skill either,
+    /// and this is the case that bites in practice: `promote_plan_to_skill`
+    /// writes unapproved personal rows under a name the assistant chose, so one
+    /// draft would otherwise hide a blessed global skill of that name from
+    /// every later fetch.
+    ///
+    /// The `[Recall]` skill arm resolves a duplicated name by this same rule
+    /// (#1154), and the two must agree - a block that described one procedure
+    /// while this handed back another's steps would brief the model on the
+    /// wrong method.
+    #[tokio::test]
+    async fn skill_get_an_unapproved_personal_skill_does_not_shadow_a_live_global_skill() {
+        use desktop_assistant_core::ports::skill_index::{SkillGetFn, SkillSearchFn};
+        use std::sync::Arc;
+
+        let get_fn: SkillGetFn = Arc::new(|name, owner| {
+            Box::pin(async move {
+                if name != "deploy" {
+                    return Ok(None);
+                }
+                Ok(Some(match owner {
+                    Some(_) => {
+                        let mut draft = deploy_skill("caller's own draft", true);
+                        draft.approved_at = None;
+                        draft
+                    }
+                    None => deploy_skill("global", true),
+                }))
+            })
+        });
+        let search_fn: SkillSearchFn =
+            Arc::new(|_q, _emb, _model, _limit| Box::pin(async { Ok(Vec::new()) }));
+        let service = BuiltinToolService::new().with_skills(search_fn, get_fn);
+
+        let out = service
+            .execute_tool(TOOL_SKILL_GET, serde_json::json!({"name": "deploy"}))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(json["ok"], true, "{json}");
+        assert_eq!(
+            json["description"], "global",
+            "an unapproved personal draft must not hide a blessed global skill"
+        );
+    }
+
+    /// The fallback reaches past an unusable personal row only to an APPROVED
+    /// global one. Where the global row is itself unapproved, the caller's own
+    /// row stands and the refusal names the state the caller can act on.
+    #[tokio::test]
+    async fn skill_get_keeps_the_callers_own_row_when_the_global_one_is_unapproved() {
+        use desktop_assistant_core::ports::skill_index::{SkillGetFn, SkillSearchFn};
+        use std::sync::Arc;
+
+        let get_fn: SkillGetFn = Arc::new(|name, owner| {
+            Box::pin(async move {
+                if name != "deploy" {
+                    return Ok(None);
+                }
+                Ok(Some(match owner {
+                    // Approved, but its files are gone - so not "usable", and
+                    // the fallback is consulted.
+                    Some(_) => deploy_skill("caller's own (removed)", false),
+                    None => {
+                        let mut draft = deploy_skill("global draft", true);
+                        draft.approved_at = None;
+                        draft
+                    }
+                }))
+            })
+        });
+        let search_fn: SkillSearchFn =
+            Arc::new(|_q, _emb, _model, _limit| Box::pin(async { Ok(Vec::new()) }));
+        let service = BuiltinToolService::new().with_skills(search_fn, get_fn);
+
+        let out = service
+            .execute_tool(TOOL_SKILL_GET, serde_json::json!({"name": "deploy"}))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(json["ok"], true, "{json}");
+        assert_eq!(
+            json["description"], "caller's own (removed)",
+            "an unapproved global row is not a usable stand-in, so the caller's own stands"
+        );
+        assert_eq!(json["present_on_disk"], false);
     }
 
     /// The mirror case: when the caller's personal row is a tombstone and

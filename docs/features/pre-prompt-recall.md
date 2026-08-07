@@ -208,11 +208,14 @@ cues it. "Deploy this" is a weak query and a strong situation. So the
 prompt-cued arm here is the first half of the answer and not the whole of it -
 the situation signal widens the cue later, and the arm reads it when it exists.
 
-**Only an approved skill is offered.** Approval (`approved_at`) records that a
-person agreed the procedure may be followed, and it is deliberately a separate
-axis from `trust_tier`, which records where the skill came from: a skill Adele
-wrote for herself is `TrustTier::Local`, the most trusted provenance the catalog
-has, and must still not be followed until somebody says so.
+**Only a skill somebody wrote on this machine and approved is offered**, and
+the two conditions answer different questions.
+
+Approval (`approved_at`) records that a person agreed the procedure may be
+followed. It is deliberately a separate axis from `trust_tier`, which records
+where the skill came from: a skill Adele wrote for herself is
+`TrustTier::Local`, the most trusted provenance the catalog has, and must still
+not be followed until somebody says so.
 
 An unapproved skill is **excluded**, not marked, and the reason is specific
 rather than general. `builtin_skill_get` refuses an unapproved skill's body, so a
@@ -231,6 +234,29 @@ browse surface to filter on. The block spends nothing on it, because it renders
 on every prompt and a standing line about a procedure nobody can approve yet is a
 nag with no resolution.
 
+**A skill from outside this machine is excluded too**, and this one is about
+provenance rather than consent. A skill installed from a repository or a
+`.well-known` source carries a description its author wrote, and the platform
+already rules that such text is third-party content: `builtin_skill_search`
+returns the same field and is classified `Declared(SkillTrustTier)`, so a
+non-local hit taints the turn and closes the tool gate. This block has no tool
+call in it, so nothing would taint - the text would land in a system message,
+ahead of the user prompt, with the Egress, Mutate and Execution tiers all still
+open, and with no model choice and no attacker step needed.
+
+Dropping is the answer rather than tainting, for exactly the reason the
+scratchpad arm drops a note stamped as external: a catalog row lives
+indefinitely, and closing the gate whenever one happened to rank near the prompt
+would degrade the conversation permanently. An installed skill stays reachable
+through `builtin_skill_search`, which taints correctly - the same shape as a
+subagent's external answer, which the block never carries and
+`get_subagent_status` does.
+
+**The cost, stated plainly.** A library that is mostly installed rather than
+written locally gets little from this arm today. Widening it needs either a way
+for the block to taint the turn it opens, or a person's judgement on the
+description itself - neither of which belongs in this arm.
+
 **A skill whose files are gone is marked, not excluded**, and the asymmetry is
 the same test applied twice: can the model act on the line? It can. The catalog
 is cumulative, so the body still reads and `builtin_skill_get` still returns it.
@@ -243,10 +269,24 @@ so one bar means the same in all three only when each is read against its own
 spread. The skill catalog is the case that makes the rule visible: it is small,
 and its rows are shaped unlike anything else the block reads.
 
-**One name, one line.** The catalog can hold a global skill and a user's own
-under one name, and `builtin_skill_get` resolves that to the user's own. The scan
-keeps the row a fetch would return, so the block never shows two lines for one
-openable procedure.
+**One name, one line, and it is the line a fetch would open.** The catalog can
+hold a global skill and a user's own under one name. Two lines for one openable
+procedure would be two the model cannot tell apart, and a line describing a
+procedure other than the one `builtin_skill_get` hands back would be worse - the
+model briefed on one method and given another's steps. So the scan applies that
+tool's own resolution: the user's own row while it is usable (on disk and
+approved), else the global one, else the user's own tombstone.
+
+Making the two agree also closed a defect in the tool. It used to prefer the
+caller's own row whenever the files were on disk, so an **unapproved** personal
+row shadowed a live global skill of the same name for every later fetch - and
+`promote_plan_to_skill` writes unapproved personal rows under a name the
+assistant chose. The fallback now reaches past an unusable personal row for
+either reason, on the argument the tombstone case already carried.
+
+The trust rule is applied after that resolution rather than before it, so a
+non-local row shadowing a local one drops the name outright instead of letting
+the block offer a line the fetch will not return.
 
 **Offers and opens are recorded.** The block's own skill lines are written to the
 skill use log as an offer, and a `builtin_skill_get` that hands the body back
