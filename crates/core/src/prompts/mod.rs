@@ -747,6 +747,76 @@ mod tests {
     }
 
     #[test]
+    fn knowledge_base_definition_does_not_claim_procedures_live_in_the_store() {
+        // The Learning section's boundary is not enough on its own. Line 3 of
+        // the assembled prompt says "Follow these rules in priority order", and
+        // the knowledge section opens 112 lines ahead of Learning. Its opening
+        // definition called the store "your unified store for ... and stored
+        // procedures ... everything lives here", present tense and unscoped, so
+        // a priority-ordered reader settles the question there and never
+        // reaches the boundary.
+        //
+        // Concretely: told "my morning read-in is calendar, then email, then
+        // the news feed, then summarize", the model files a knowledge entry -
+        // the exact behaviour #1156 exists to stop, in its motivating case.
+        let assembled = assemble(&static_sections());
+        let kb = section_body(&assembled, "== Knowledge base ==");
+        assert!(
+            !kb.contains("and stored procedures"),
+            "the definition must not claim procedures live in the store: {kb}"
+        );
+        assert!(
+            kb.contains("every fact lives here"),
+            "and must scope the unified-store claim to facts: {kb}"
+        );
+        assert!(
+            kb.contains("A method with ordered steps is a skill, not an entry here"),
+            "and must state the boundary where a priority-ordered reader meets \
+             it first: {kb}"
+        );
+        // The mechanism, pinned so a section reshuffle cannot quietly restore
+        // the defect: the boundary has to sit in the EARLIER section to win.
+        let kb_at = assembled
+            .find("== Knowledge base ==")
+            .expect("the knowledge section must be present");
+        let learning_at = assembled
+            .find(LEARNING_HEADER)
+            .expect("the learning section must be present");
+        assert!(
+            kb_at < learning_at,
+            "the knowledge section is read first under priority order, so it is \
+             the one that has to carry the boundary"
+        );
+    }
+
+    #[test]
+    fn knowledge_base_applies_the_same_fit_check_to_a_stored_procedure() {
+        // "If a stored instruction or procedure applies, follow it" is bare
+        // obedience, and "if it applies" is the one-word gate the skills
+        // section just replaced with a fit check. The reason there is about
+        // procedures, not about which table they sit in: a procedure that does
+        // not fit gets carried out with steps meant for a different situation.
+        //
+        // It bites hardest right now. Most procedural content sits in the
+        // knowledge base until the sweep moves it, so leaving this line alone
+        // switches the fit check off for the majority of it (#1156).
+        let kb = section_body(&assemble(&static_sections()), "== Knowledge base ==");
+        assert!(
+            !kb.contains("If a stored instruction or procedure applies, follow it"),
+            "a stored procedure must not get bare obedience: {kb}"
+        );
+        assert!(
+            kb.contains("A stored procedure is a candidate, not an instruction"),
+            "it gets the same framing a skill gets: {kb}"
+        );
+        assert!(
+            kb.contains("Check it fits this situation before you follow it"),
+            "and the same check, stated inline rather than left to a section \
+             the priority order reaches later: {kb}"
+        );
+    }
+
+    #[test]
     fn prompt_prefers_code_for_deterministic_work_and_states_the_bar() {
         // Reading data into the context window to count or filter it costs
         // tokens in proportion to the data and gets less reliable as the data
