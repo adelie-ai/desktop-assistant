@@ -5248,6 +5248,47 @@ mod tests {
         assert_eq!(llm.longest_prompt(), 0);
     }
 
+    /// A range that renders to nothing is not a declined fold. No call is made
+    /// and nothing is lost by leaving it, so it must not spend the caller's one
+    /// fold attempt - the outcome enum's whole reason for having three arms.
+    #[tokio::test]
+    async fn a_dropped_range_that_holds_nothing_to_summarise_costs_no_attempt() {
+        // `System` messages and empty assistant turns render to nothing in the
+        // summariser transcript, so the whole dropped range is empty.
+        let mut conv = Conversation::new("c1", "t");
+        for i in 0..40 {
+            conv.messages
+                .push(Message::new(Role::System, format!("sys {i}")));
+            conv.messages.push(Message::new(Role::Assistant, ""));
+        }
+        let requested_start = window_start(&conv.messages, MAX_CONTEXT_MESSAGES);
+        conv.compacted_through = requested_start;
+        let shrunk_start = window_start(&conv.messages, MIN_CONTEXT_MESSAGES);
+        assert!(
+            shrunk_start > requested_start,
+            "the fixture must actually shrink the window"
+        );
+
+        let llm = CountingSummariser::default();
+        let folded =
+            compact_preflight_shrink(&mut conv, shrunk_start, MAX_CONTEXT_MESSAGES, &llm).await;
+
+        assert_eq!(
+            folded,
+            PreflightFold::NotNeeded,
+            "an empty range is nothing to fold, not a fold that failed"
+        );
+        assert_eq!(
+            conv.compacted_through, requested_start,
+            "the marker may not step over a range no summary describes"
+        );
+        assert_eq!(
+            llm.longest_prompt(),
+            0,
+            "no summariser call may be made for an empty range"
+        );
+    }
+
     /// A summariser that declines leaves the marker where it was, exactly as
     /// the cadence path does, so the range is offered again rather than lost.
     #[tokio::test]
