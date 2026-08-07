@@ -221,7 +221,15 @@ rather than a choice:
 | One knowledge line | `"\n- " + id + " [" + tags + "] " + summary` = 391 bytes |
 | The fixed part | prefix, header, entry hint, five pad lines and their label, the tag line, and both "did not fit" lines = 2,410 bytes |
 | The budget | 2,560 tokens at four bytes a token = 10,240 bytes |
-| **The width** | **(10,240 - 2,410) / 391 = 20 lines** |
+| **The width the budget buys** | **(10,240 - 2,410) / 391 = 20 lines** |
+
+**The default ships at 8, not at 20.** Eight is not what the arithmetic
+computed; it is the width that was already in place. The block's width is also
+the number of unrelated memories a prompt of no content puts in front of the
+model, and the relevance floor admits such a prompt today, so widening the block
+before the floor has an admission gate would multiply the noise case rather than
+the recall case. #1121 lands the gate and raises the default to the budgeted
+width with it. A deployment that wants the wider index now sets `max_entries`.
 
 **Bytes, not characters, and the difference matters.** The token estimate the
 context budget uses is `bytes / 4`, and a character is one to four bytes.
@@ -234,11 +242,12 @@ through untouched, so the usual line is unchanged; a line in another script
 shows fewer characters for the same cost.
 
 Real entries carry a short id and a few tags, so a real line costs about a
-quarter of the worst case and a usual block lands near a third of the budget.
-The width rests on the bound rather than on the average, because only the bound
-is a promise. `crates/core/src/recall.rs` pins both numbers with a test - the
-worst case in ASCII, the worst case in a four-byte script, and the usual case -
-so a later change to the line format cannot inflate the block in silence.
+quarter of the worst case. The width rests on the bound rather than on the
+average, because only the bound is a promise. `crates/core/src/recall.rs` pins
+every number with a test - the worst case in ASCII, the worst case in a
+four-byte script, and the usual case, each at both the shipped width and the
+budgeted one - so a later change to the line format cannot inflate the block in
+silence.
 
 Five scratchpad lines and five tag names, unchanged. Those arms are not what the
 budget buys: the pad holds one conversation's notes, and the tag arm hands over a
@@ -321,15 +330,15 @@ them to it, and runs under `just test-db`.
 ```toml
 [recall]
 enabled = true   # the default
-# max_entries = 12   # absent means the width the token budget pays for
+# max_entries = 20   # absent means 8, the held default
 ```
 
 It also stays off on its own when there is no knowledge store or no embedding
 backend, and the daemon says which of the three reasons applies at startup.
 
-`max_entries` states how many knowledge lines the block may show. State it where
-this deployment's model carries a smaller window than the budget above assumes,
-or where an operator wants a narrower block. The value is held to what the block
+`max_entries` states how many knowledge lines the block may show. Set it to 20
+to take the index the budget pays for before #1121 raises the default, or lower
+it on a model with a small context window. The value is held to what the block
 can honestly render - at least one line, and never more than the 50 rows the
 lookup reads, because a block that showed more would count a tail it never saw.
 
@@ -347,16 +356,16 @@ assistant reaches its knowledge base only when it decides to search.
 rather than measured. The entry floor admits candidates for a prompt that asks
 nothing - an acknowledgement, or "continue" - so the block is not as quiet on a
 low-signal prompt as the floor was meant to make it. #1121 carries the
-admission gate that fixes this. Until it lands, a deployment that wants a
-narrower block sets `max_entries`.
+admission gate that fixes this.
 
-**A wider block renders more of what the floor admits.** Twenty lines is the
-right width for an index, and it is also twenty lines of whatever a loose floor
-lets through. The two changes belong together: the width makes recognition
-possible, and the gate above makes the width safe.
+**The block is narrower than its budget pays for, and the floor is why.** The
+width is also the number of unrelated memories a low-signal prompt renders, so
+the wider index waits on the gate above. The two belong together: the width
+makes recognition possible, and the gate makes the width safe. #1121 raises the
+default; `max_entries` takes it now.
 
-**The scan reads whole rows.** Fifty entries are read to render twenty lines,
-because the count of what did not fit has to be a count. The row count is
+**The scan reads whole rows.** Fifty entries are read to render a handful of
+lines, because the count of what did not fit has to be a count. The row count is
 bounded; the bytes those rows carry are not, so a store of unusually long entries
 pays more per prompt than a store of one-liners. Measured against a populated
 store, the wide projection costs a small fraction of a query that is already only

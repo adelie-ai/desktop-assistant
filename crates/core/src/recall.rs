@@ -29,9 +29,11 @@
 //!   floor's own question, and how well the current floor answers it is #1121's
 //!   (the entry floor admits more than a prompt of no content should reach).
 //! - **A line budget, derived from a token budget.**
-//!   [`RECALL_BLOCK_TOKEN_BUDGET`] pays for [`DEFAULT_MAX_RECALL_ENTRIES`]
+//!   [`RECALL_BLOCK_TOKEN_BUDGET`] pays for [`BUDGETED_MAX_RECALL_ENTRIES`]
 //!   entry lines, [`MAX_RECALL_NOTES`] note lines and [`MAX_RECALL_TAGS`] tag
-//!   names. A deployment may state its own width.
+//!   names. The entry arm ships narrower than the budget pays for, at
+//!   [`DEFAULT_MAX_RECALL_ENTRIES`], until #1121 gates what the floor admits.
+//!   A deployment may state its own width.
 //! - **Nothing already in view.** A note `[Pinned]` renders in full, a key the
 //!   `[Scratchpad]` index has just listed, a step or finding `[Plan]` has just
 //!   named, and a knowledge entry a pin attaches (#1104) are all dropped here.
@@ -141,16 +143,36 @@ const RECALL_FIXED_MAX_BYTES: usize = RECALL_BLOCK_PREFIX_BYTES
     + 1
     + RECALL_TAG_LINE_MAX_BYTES;
 
-/// How many knowledge lines the block shows where a deployment states nothing:
-/// what [`RECALL_BLOCK_TOKEN_BUDGET`] pays for once the fixed part is taken.
+/// How many knowledge lines [`RECALL_BLOCK_TOKEN_BUDGET`] pays for, once the
+/// fixed part of the block is taken.
 ///
 /// The width is the quotient, not a chosen number. Eight was the right width
 /// for a block that injected entry bodies; this block injects none, so the
 /// budget buys an index instead of a handful of extracts. Breadth is the point:
 /// a title the model can see but has not opened still says that something
 /// exists, and an entry that never appears cannot be asked for.
-pub const DEFAULT_MAX_RECALL_ENTRIES: usize =
+///
+/// This is not what ships today - see [`DEFAULT_MAX_RECALL_ENTRIES`].
+pub const BUDGETED_MAX_RECALL_ENTRIES: usize =
     (RECALL_BLOCK_MAX_BYTES - RECALL_FIXED_MAX_BYTES) / (1 + RECALL_ENTRY_LINE_MAX_BYTES);
+
+/// How many knowledge lines the block shows where a deployment states nothing.
+///
+/// **The budget derives [`BUDGETED_MAX_RECALL_ENTRIES`], and the default is
+/// held below it on purpose.** Eight is not what the arithmetic computed; it is
+/// the width that was already shipping.
+///
+/// Why it is held there: [`RECALL_ENTRY_MAX_DISTANCE`] admits candidates for a
+/// prompt that asks nothing - an acknowledgement, or "continue" - so the number
+/// of lines is also the number of unrelated memories such a prompt puts in
+/// front of the model. Widening the block before that floor has an admission
+/// gate would multiply the noise case rather than the recall case, and a
+/// deployment would meet the regression before anyone measured it. #1121 lands
+/// the gate and raises this to [`BUDGETED_MAX_RECALL_ENTRIES`] with it.
+///
+/// A deployment that wants the index now sets its own width - see
+/// [`set_max_recall_entries`].
+pub const DEFAULT_MAX_RECALL_ENTRIES: usize = 8;
 
 /// The width this deployment renders: [`DEFAULT_MAX_RECALL_ENTRIES`] until
 /// [`set_max_recall_entries`] installs another.
@@ -961,28 +983,32 @@ mod tests {
         }
     }
 
-    /// Acceptance (#1124): the block's total token cost at the default width
-    /// stays within the stated budget. A line-format change that inflates the
-    /// block fails here.
+    /// Acceptance (#1124): the block's total token cost stays within the stated
+    /// budget. A line-format change that inflates the block fails here.
+    ///
+    /// Both widths, because the shipped default is narrower than the budget
+    /// pays for: the budgeted width is the binding case, and the default is the
+    /// one a turn actually pays today.
     #[test]
-    fn the_recall_block_stays_within_its_stated_token_budget_at_the_default_width() {
-        let candidates = worst_case_candidates(DEFAULT_MAX_RECALL_ENTRIES);
+    fn the_recall_block_stays_within_its_stated_token_budget() {
+        for width in [DEFAULT_MAX_RECALL_ENTRIES, BUDGETED_MAX_RECALL_ENTRIES] {
+            let block = render_at(&worst_case_candidates(width), width).expect("every arm is full");
+            let tokens = block_tokens(&block);
 
-        let block = render(&candidates).expect("every arm is full");
-        let tokens = block_tokens(&block);
-
-        assert!(
-            tokens <= RECALL_BLOCK_TOKEN_BUDGET,
-            "the worst block the renderer can produce costs {tokens} tokens, over the \
-             {RECALL_BLOCK_TOKEN_BUDGET}-token budget - re-derive the width or shorten the line"
-        );
+            assert!(
+                tokens <= RECALL_BLOCK_TOKEN_BUDGET,
+                "the worst block of {width} lines costs {tokens} tokens, over the \
+                 {RECALL_BLOCK_TOKEN_BUDGET}-token budget - re-derive the width or shorten the \
+                 line"
+            );
+        }
     }
 
-    /// The width is derived from the budget rather than chosen: one line more
-    /// than the default does not fit inside it.
+    /// The budgeted width is derived from the budget rather than chosen: one
+    /// line more does not fit inside it.
     #[test]
-    fn the_default_recall_width_is_the_widest_its_token_budget_allows() {
-        let one_wider = DEFAULT_MAX_RECALL_ENTRIES + 1;
+    fn the_budgeted_recall_width_is_the_widest_its_token_budget_allows() {
+        let one_wider = BUDGETED_MAX_RECALL_ENTRIES + 1;
 
         let block =
             render_at(&worst_case_candidates(one_wider), one_wider).expect("every arm is full");
@@ -996,17 +1022,28 @@ mod tests {
         );
     }
 
-    /// Acceptance (#1124): the default width is materially wider than the eight
-    /// lines a block that injected bodies could afford. An entry that never
-    /// appears cannot be asked for, and breadth is what one-line summaries buy.
+    /// Acceptance (#1124), deferred in part: the budget pays for an index
+    /// materially wider than the eight lines a block that injected bodies could
+    /// afford, and the shipped default is held at eight until #1121 gates what
+    /// the relevance floor admits.
+    ///
+    /// The second assertion is the deferral, written down. #1121 raises the
+    /// default to [`BUDGETED_MAX_RECALL_ENTRIES`] and edits this test to say so,
+    /// which is the point: the flip is a deliberate act, not a drift.
     #[test]
-    fn the_default_recall_width_is_materially_wider_than_eight() {
-        let width = DEFAULT_MAX_RECALL_ENTRIES;
-
+    fn the_budget_pays_for_a_width_materially_wider_than_the_default_that_ships() {
+        let budgeted = BUDGETED_MAX_RECALL_ENTRIES;
         assert!(
-            width >= 16,
-            "an index of one-line summaries exists for breadth; \
-             {width} lines is not materially wider than eight"
+            budgeted >= 16,
+            "an index of one-line summaries exists for breadth; the budget pays for {budgeted} \
+             lines, which is not materially wider than eight"
+        );
+
+        let shipped = DEFAULT_MAX_RECALL_ENTRIES;
+        assert_eq!(
+            shipped, 8,
+            "the default is held at the width that was already shipping until #1121 gates the \
+             relevance floor; raise it to {budgeted} with that gate, not before"
         );
     }
 
@@ -1034,13 +1071,14 @@ mod tests {
     /// N more" still counts rows the lookup actually read.
     #[test]
     fn the_recall_scan_limit_stays_at_or_above_the_width() {
-        let width = DEFAULT_MAX_RECALL_ENTRIES;
         let scan = RECALL_ENTRY_SCAN_LIMIT;
 
-        assert!(
-            width <= scan,
-            "the default width of {width} shows lines the {scan}-row scan never read"
-        );
+        for width in [DEFAULT_MAX_RECALL_ENTRIES, BUDGETED_MAX_RECALL_ENTRIES] {
+            assert!(
+                width <= scan,
+                "a width of {width} shows lines the {scan}-row scan never read"
+            );
+        }
         assert_eq!(
             resolve_max_recall_entries(RECALL_ENTRY_SCAN_LIMIT + 10),
             RECALL_ENTRY_SCAN_LIMIT,
@@ -1057,18 +1095,19 @@ mod tests {
     /// line contains.
     #[test]
     fn widening_the_block_does_not_change_what_a_line_contains() {
-        let narrow_width = 8;
+        let narrow_width = DEFAULT_MAX_RECALL_ENTRIES;
+        let wide_width = BUDGETED_MAX_RECALL_ENTRIES;
         let candidates = RecallCandidates {
-            entries: near_hits(DEFAULT_MAX_RECALL_ENTRIES),
+            entries: near_hits(wide_width),
             notes: near_notes(2),
             tags: vec![tag("topic:mine", 0.10)],
         };
 
         let narrow = render_at(&candidates, narrow_width).expect("a block");
-        let wide = render_at(&candidates, DEFAULT_MAX_RECALL_ENTRIES).expect("a block");
+        let wide = render_at(&candidates, wide_width).expect("a block");
 
         assert_eq!(entry_lines(&narrow).len(), narrow_width);
-        assert_eq!(entry_lines(&wide).len(), DEFAULT_MAX_RECALL_ENTRIES);
+        assert_eq!(entry_lines(&wide).len(), wide_width);
         assert_eq!(
             entry_lines(&narrow),
             entry_lines(&wide)[..narrow_width],
@@ -1123,9 +1162,10 @@ mod tests {
     /// four-byte text must therefore cost no more than an ASCII one.
     #[test]
     fn a_block_of_multi_byte_text_stays_within_the_same_token_budget() {
-        let candidates = wide_worst_case_candidates(DEFAULT_MAX_RECALL_ENTRIES);
+        let width = BUDGETED_MAX_RECALL_ENTRIES;
+        let candidates = wide_worst_case_candidates(width);
 
-        let block = render(&candidates).expect("every arm is full");
+        let block = render_at(&candidates, width).expect("every arm is full");
         let tokens = block_tokens(&block);
 
         assert!(!block.is_ascii(), "the fixture must not be ASCII");
@@ -1141,8 +1181,9 @@ mod tests {
     /// gave it, whatever script its parts arrive in.
     #[test]
     fn every_rendered_line_stays_inside_its_byte_bound() {
-        let block = render(&wide_worst_case_candidates(DEFAULT_MAX_RECALL_ENTRIES))
-            .expect("every arm is full");
+        let width = BUDGETED_MAX_RECALL_ENTRIES;
+        let block =
+            render_at(&wide_worst_case_candidates(width), width).expect("every arm is full");
 
         for line in entry_lines(&block) {
             assert!(
@@ -1198,18 +1239,26 @@ mod tests {
     /// format cannot inflate the usual case without a reader seeing it. The
     /// worst case is a ceiling nothing real reaches; this is the number a turn
     /// actually pays.
+    ///
+    /// Both widths: what the shipped default costs today, and what the budgeted
+    /// width will cost when #1121 raises the default to it.
     #[test]
     fn a_typical_recall_block_costs_far_less_than_its_worst_case() {
-        let candidates = typical_candidates(DEFAULT_MAX_RECALL_ENTRIES + 4);
+        for (width, low, high) in [
+            (DEFAULT_MAX_RECALL_ENTRIES, 250, 450),
+            (BUDGETED_MAX_RECALL_ENTRIES, 500, 800),
+        ] {
+            let candidates = typical_candidates(width + 4);
 
-        let block = render(&candidates).expect("a block");
-        let tokens = block_tokens(&block);
+            let block = render_at(&candidates, width).expect("a block");
+            let tokens = block_tokens(&block);
 
-        assert!(
-            (500..=800).contains(&tokens),
-            "a typical block costs {tokens} tokens; the pinned range is 500 to 800. \
-             Re-derive the range where the change is intended"
-        );
+            assert!(
+                (low..=high).contains(&tokens),
+                "a typical block of {width} lines costs {tokens} tokens; the pinned range is \
+                 {low} to {high}. Re-derive the range where the change is intended"
+            );
+        }
     }
 
     #[test]

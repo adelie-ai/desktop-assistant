@@ -194,10 +194,12 @@ pub struct RecallConfig {
     pub enabled: bool,
     /// How many knowledge lines the `[Recall]` block may show.
     ///
-    /// Absent means the built-in width, which is derived from a token budget
-    /// for the block (`desktop_assistant_core::recall`). State a value here
-    /// where this deployment's model carries a smaller context window than that
-    /// budget assumes, or where an operator wants a narrower block.
+    /// Absent means the built-in default. That default is held below the width
+    /// the block's token budget derives, because the relevance floor admits
+    /// candidates for a prompt that asks nothing - see
+    /// `desktop_assistant_core::recall`, which states both numbers. State a
+    /// value here to take the wider index now, or to hold a narrower block on a
+    /// model with a small context window.
     ///
     /// The value is held to what the block can honestly render: at least one
     /// line, and never more lines than the lookup reads, because a block that
