@@ -1914,7 +1914,15 @@ impl BuiltinToolService {
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(5) as usize;
 
-        tracing::info!(query = %query, ?kind_filter, limit, "skill search");
+        // The query is what the user asked, so INFO carries its size and the
+        // filters, and the query itself goes to DEBUG.
+        tracing::info!(
+            query_bytes = query.len(),
+            ?kind_filter,
+            limit,
+            "skill search"
+        );
+        tracing::debug!(query = %query, "skill search query");
 
         let (query_embedding, embedding_model) = self.embed_query(&query).await;
         // Over-fetch when filtering by kind, then trim to the requested limit.
@@ -9400,35 +9408,56 @@ mod tests {
         //! > Never content.
         //! > DEBUG carries prompts, the full assembled context, and tool arguments.
         //!
-        //! A search query is a tool argument, and it is written by the user or by
-        //! the model on the user's behalf. The three search builtins used to put it
-        //! on an INFO line, which every shipped deployment turns on, so the journal
-        //! and the cluster log stack accumulated what people asked their assistant.
+        //! A search query is a tool argument, and it is written by the user or
+        //! by the model on the user's behalf. Every search builtin used to put
+        //! it on an INFO line, which every shipped deployment turns on, so the
+        //! journal and the cluster log stack accumulated what people asked
+        //! their assistant.
+        //!
+        //! The test drives **every** search builtin in one pass rather than a
+        //! chosen few. Four exist, and the fourth was missed the first time
+        //! precisely because the other three were fixed one at a time.
 
         use std::io;
         use std::sync::{Arc, Mutex, Once};
 
+        use desktop_assistant_core::domain::ToolDefinition;
+        use desktop_assistant_core::ports::conversation_search::ConversationSearchFn;
         use desktop_assistant_core::ports::knowledge::{KnowledgeSearchPage, ScopeSize};
+        use desktop_assistant_core::ports::skill_index::{SkillGetFn, SkillSearchFn};
+        use desktop_assistant_core::ports::tool_registry::{ToolDefinitionFn, ToolSearchFn};
         use tracing::Level;
 
-        use super::{kb_search_response, kb_service_reporting};
+        use super::*;
 
-        /// A query no other part of the test suite emits.
+        /// A query no other test emits.
         const QUERY_SENTINEL: &str = "SENTINEL-WHAT-THE-USER-ASKED-ABOUT";
+
+        /// Every builtin that takes a `query` argument. A new one belongs here
+        /// the day it is added, which is what stops the next one being missed.
+        const SEARCH_TOOLS: &[&str] = &[
+            TOOL_KB_SEARCH,
+            TOOL_CONV_SEARCH,
+            TOOL_SEARCH,
+            TOOL_SKILL_SEARCH,
+        ];
 
         #[derive(Clone, Default)]
         struct CapturedLog(Arc<Mutex<Vec<u8>>>);
 
         impl CapturedLog {
             fn text(&self) -> String {
-                String::from_utf8(self.0.lock().expect("lock the capture buffer").clone())
-                    .expect("captured log output is UTF-8")
+                let bytes = self.0.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                String::from_utf8(bytes).expect("captured log output is UTF-8")
             }
         }
 
         impl io::Write for CapturedLog {
             fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-                self.0.lock().expect("lock the capture buffer").extend(buf);
+                self.0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend_from_slice(buf);
                 Ok(buf.len())
             }
 
@@ -9450,9 +9479,9 @@ mod tests {
         /// One process-wide subscriber that accepts everything.
         ///
         /// `tracing` caches a callsite's interest globally. Without this, a
-        /// callsite first evaluated under the INFO-capped test can latch "never"
-        /// for the process and the DEBUG-capped test then never sees it - a
-        /// scheduling-dependent flake rather than a real failure.
+        /// callsite first evaluated under the INFO-capped test can latch
+        /// "never" for the process and the DEBUG-capped test then never sees
+        /// it - a scheduling-dependent flake rather than a real failure.
         fn ensure_permissive_global_default() {
             PERMISSIVE_GLOBAL_DEFAULT.call_once(|| {
                 let subscriber = tracing_subscriber::fmt()
@@ -9463,8 +9492,55 @@ mod tests {
             });
         }
 
-        /// Run one knowledge-base search with every record at `level` or above captured.
-        fn search_capturing(level: Level) -> String {
+        /// A service with every search closure wired to an empty result.
+        ///
+        /// The results do not matter here. What matters is that each tool runs
+        /// far enough to write its own log line.
+        fn service_with_every_search() -> BuiltinToolService {
+            let kb_search: KnowledgeSearchFn = Arc::new(|_q, _emb, _model, _tags, _ex, _lim| {
+                Box::pin(async {
+                    Ok(KnowledgeSearchPage {
+                        entries: Vec::new(),
+                        scope_size: ScopeSize::None,
+                        available_tags: Vec::new(),
+                    })
+                })
+            });
+            let kb_write: KnowledgeWriteFn = Arc::new(|entry| Box::pin(async move { Ok(entry) }));
+            let kb_delete: KnowledgeDeleteFn = Arc::new(|_ids| Box::pin(async { Ok(0) }));
+            let kb_list: KnowledgeListFn = Arc::new(|_q| {
+                Box::pin(async {
+                    Ok(
+                        desktop_assistant_core::ports::knowledge::KnowledgeListPage {
+                            entries: Vec::new(),
+                            next_cursor: None,
+                        },
+                    )
+                })
+            });
+            let kb_get: KnowledgeGetFn = Arc::new(|_id| Box::pin(async { Ok(None) }));
+
+            let conversation_search: ConversationSearchFn =
+                Arc::new(|_q, _limit, _role| Box::pin(async { Ok(Vec::new()) }));
+
+            let tool_search: ToolSearchFn =
+                Arc::new(|_q, _emb, _limit| Box::pin(async { Ok(Vec::<ToolDefinition>::new()) }));
+            let tool_definition: ToolDefinitionFn = Arc::new(|_name| Box::pin(async { Ok(None) }));
+
+            let skill_search: SkillSearchFn =
+                Arc::new(|_q, _emb, _model, _limit| Box::pin(async { Ok(Vec::new()) }));
+            let skill_get: SkillGetFn = Arc::new(|_name, _owner| Box::pin(async { Ok(None) }));
+
+            BuiltinToolService::new()
+                .with_knowledge_base(kb_write, kb_search, kb_delete, kb_list, kb_get)
+                .with_conversation_search(conversation_search)
+                .with_tool_registry(tool_search, tool_definition)
+                .with_skills(skill_search, skill_get)
+        }
+
+        /// Run every search builtin with the sentinel query, capturing every
+        /// record at `level` or above.
+        fn every_search_capturing(level: Level) -> String {
             ensure_permissive_global_default();
             let captured = CapturedLog::default();
             let subscriber = tracing_subscriber::fmt()
@@ -9478,13 +9554,13 @@ mod tests {
                 .expect("build a current-thread runtime");
             tracing::subscriber::with_default(subscriber, || {
                 runtime.block_on(async {
-                    let (service, _probe) = kb_service_reporting(KnowledgeSearchPage {
-                        entries: Vec::new(),
-                        scope_size: ScopeSize::None,
-                        available_tags: Vec::new(),
-                    });
-                    kb_search_response(&service, serde_json::json!({ "query": QUERY_SENTINEL }))
-                        .await;
+                    let service = service_with_every_search();
+                    for tool in SEARCH_TOOLS {
+                        service
+                            .execute_tool(tool, serde_json::json!({ "query": QUERY_SENTINEL }))
+                            .await
+                            .unwrap_or_else(|e| panic!("{tool} must run far enough to log: {e}"));
+                    }
                 });
             });
             captured.text()
@@ -9492,26 +9568,39 @@ mod tests {
 
         #[test]
         fn no_search_query_at_info() {
-            let logs = search_capturing(Level::INFO);
+            let logs = every_search_capturing(Level::INFO);
             assert!(
                 !logs.contains(QUERY_SENTINEL),
                 "a search query is a tool argument and must not reach an INFO line\n\
                  --- captured at INFO ---\n{logs}"
             );
-            assert!(
-                logs.contains("knowledge base search"),
-                "the INFO line itself must survive - the fix is to drop the query, not the line\n\
-                 --- captured at INFO ---\n{logs}"
-            );
+            // Each tool's own line must survive: the fix is to drop the query,
+            // not the line. Without this, deleting a log site would pass.
+            for marker in [
+                "knowledge base search",
+                "conversation search",
+                "tool search",
+                "skill search",
+            ] {
+                assert!(
+                    logs.contains(marker),
+                    "the INFO line for {marker:?} must survive\n\
+                     --- captured at INFO ---\n{logs}"
+                );
+            }
         }
 
         #[test]
-        fn search_query_appears_at_debug() {
-            let logs = search_capturing(Level::DEBUG);
-            assert!(
-                logs.contains(QUERY_SENTINEL),
-                "the query belongs at DEBUG, so an operator who needs it can ask\n\
-                 --- captured at DEBUG ---\n{logs}"
+        fn search_queries_appear_at_debug() {
+            let logs = every_search_capturing(Level::DEBUG);
+            // One DEBUG line per search builtin, so a tool whose query was
+            // dropped rather than moved fails here.
+            let occurrences = logs.matches(QUERY_SENTINEL).count();
+            assert_eq!(
+                occurrences,
+                SEARCH_TOOLS.len(),
+                "every search builtin must put its query at DEBUG, so an \
+                 operator who needs it can ask\n--- captured at DEBUG ---\n{logs}"
             );
         }
     }

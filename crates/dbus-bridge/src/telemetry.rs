@@ -35,3 +35,27 @@ pub fn config() -> Config {
         // slow call readable in `journalctl` with no trace backend to open.
         .with_span_close_events(true)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_default_filter_matches_the_previous_subscriber() {
+        // The bridge fell back to `info` before it took the shared crate.
+        // Adopting one must not quietly change how loud a desktop process is.
+        assert_eq!(config().default_filter(), "info");
+    }
+
+    #[test]
+    fn the_service_name_is_this_binary_not_the_daemon() {
+        // Both processes export to the same collector. One name for both would
+        // merge their telemetry and lose the distinction an operator needs.
+        assert_eq!(config().service_name(), "adele-dbus-bridge");
+    }
+
+    #[test]
+    fn span_close_events_are_on() {
+        assert!(config().span_close_events());
+    }
+}

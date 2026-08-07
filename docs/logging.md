@@ -76,13 +76,15 @@ RUST_LOG=info,desktop_assistant_mcp_client=debug
 **A new log line is checked against the contract before it lands.** Named tests
 hold the line where content used to leak: `no_content_at_info` and
 `content_appears_at_debug` in `crates/core/tests/log_content_contract.rs`,
-`no_search_query_at_info` in `crates/mcp-client/src/builtin.rs`, and
+`no_search_query_at_info` in `crates/mcp-client/src/builtin.rs` - which drives
+every search builtin, not a chosen few - and
 `no_extracted_fact_content_at_info` in
 `crates/storage/tests/dreaming_db_paths.rs`.
 
 `scripts/tests/systemd-logging.test.sh` holds the shipped systemd units to a
-global `RUST_LOG` of `info` or quieter, and forbids `debug` on the three
-targets that carry content.
+global `RUST_LOG` of `info` or quieter, and forbids `debug` on the targets that
+carry content. A target that starts logging content belongs on that list the
+same day.
 
 ## Span timing
 
@@ -200,13 +202,18 @@ client on the exporter's own thread.
 `#[tokio::main]` and install telemetry inside the runtime, so both transports
 work in both.
 
-The two transports trust different certificate stores, and the difference
-decides what a container image needs:
+**Both transports read the operating system trust store**, and neither bundles
+a root set of its own. Two things follow:
 
-| transport | trust anchors | consequence |
-|---|---|---|
-| `grpc` | compiled-in webpki roots | independent of the image |
-| `http/protobuf` | the OS trust store | the image needs `ca-certificates`, or every HTTPS export fails |
+- A container image that exports over HTTPS needs a CA bundle
+  (`ca-certificates`) whichever transport it uses, or every export fails on an
+  unknown issuer. Both images this repo ships already install it.
+- A private certificate authority installed on the host works with no code
+  change, again on either transport.
+
+A bundled root set was tried and removed: it is always one CA rotation away
+from rejecting a valid certificate, and fixing that needs an upstream release
+and a rebuild rather than an image update.
 
 ### When export does not work
 

@@ -1,10 +1,17 @@
 #!/usr/bin/env bash
 # Acceptance criteria for the shipped units' log level (#776).
 #
-# Three tracing targets log conversation content verbatim at `debug`:
-#   - desktop_assistant_core::service   whole tool results, before the ingestion cap
-#   - desktop_assistant_mcp_client      every MCP JSON-RPC request and response, in full
+# Four tracing targets log conversation content verbatim at `debug`:
+#   - desktop_assistant_core::service   whole tool results and tool arguments
+#   - desktop_assistant_mcp_client      every MCP JSON-RPC request and response,
+#                                       in full, plus every search query
 #   - desktop_assistant_llm_openai      the head of each assembled prompt
+#   - desktop_assistant_storage         each extracted personal fact, in full
+#
+# The level contract puts conversation content at `debug` on purpose, so this
+# list grows whenever a content-carrying target does. A target that logs
+# content but is missing here can be raised to `debug` in a shipped unit with
+# nothing to catch it.
 #
 # `just install-service` copies systemd/desktop-assistant-daemon.service verbatim
 # into the user's systemd directory, so a `debug` on any of those in a shipped
@@ -23,6 +30,7 @@ CONTENT_TARGETS=(
     'desktop_assistant_core::service'
     'desktop_assistant_mcp_client'
     'desktop_assistant_llm_openai'
+    'desktop_assistant_storage'
 )
 
 _units() { find "$SCRIPT_TESTS_ROOT/systemd" -name '*.service' | sort; }

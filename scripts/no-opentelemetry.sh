@@ -20,9 +20,12 @@
 #   point it at a throwaway fixture.
 set -euo pipefail
 
-# Below this many distinct crates the run proved nothing: this workspace
-# resolves several hundred, so a handful means cargo selected almost nothing.
-MIN_CRATES=50
+# The floor is not a guess at "enough crates". It is read from the workspace
+# itself: every member must appear in the tree, or the invocation resolved a
+# subset and the clean result is worth nothing. A count alone is too weak - one
+# richly-dependent binary crate here resolves 349 of the workspace's 364, so a
+# `-p desktop-assistant-daemon` slipped in by a merge would clear any plausible
+# count while silently checking none of the other members.
 
 loud() { # loud <headline> <line>...
     local headline="$1"
@@ -62,11 +65,42 @@ fi
 
 mapfile -t crates < <(awk 'NF { print $1 }' "$tree_out" | sort -u)
 
-if [ "${#crates[@]}" -lt "$MIN_CRATES" ]; then
-    die_loud 'NO-OPENTELEMETRY STEP RESOLVED ALMOST NOTHING - hard gate failure' \
-        "cargo tree reported ${#crates[@]} distinct crate(s); this workspace resolves" \
-        "several hundred. Fewer than $MIN_CRATES means the invocation selected almost no" \
-        'packages, so a green result here would read as coverage it does not have.'
+# The workspace members, read from cargo rather than listed here, so a new
+# member crate is covered the day it is added.
+members_out="$(mktemp)"
+trap 'rm -f "$tree_out" "$members_out"' EXIT
+members_status=0
+cargo tree --workspace --depth 0 --prefix none >"$members_out" 2>&1 || members_status=$?
+[ "$members_status" -eq 0 ] || die_loud \
+    'NO-OPENTELEMETRY STEP DID NOT RUN: cannot list the workspace members' \
+    'Without the member list this script cannot tell a full scan from a partial' \
+    'one, so it will not report a clean result.' \
+    '' \
+    "$(sed 's/^/    /' "$members_out" | head -20)"
+
+mapfile -t members < <(awk 'NF { print $1 }' "$members_out" | sort -u)
+[ "${#members[@]}" -gt 0 ] || die_loud \
+    'NO-OPENTELEMETRY STEP DID NOT RUN: the workspace has no members' \
+    'cargo reported an empty member list, so nothing was checked.'
+
+unchecked=()
+for member in "${members[@]}"; do
+    found=''
+    for name in "${crates[@]}"; do
+        [ "$name" = "$member" ] || continue
+        found=1
+        break
+    done
+    [ -n "$found" ] || unchecked+=("$member")
+done
+
+if [ "${#unchecked[@]}" -gt 0 ]; then
+    die_loud 'NO-OPENTELEMETRY STEP CHECKED ONLY PART OF THE WORKSPACE - hard gate failure' \
+        "${#unchecked[@]} of the ${#members[@]} workspace member(s) are absent from the tree that" \
+        'was scanned, so nothing was proved about them and a green result here' \
+        'would read as coverage it does not have.' \
+        '' \
+        "$(printf '    %s\n' "${unchecked[@]}")"
 fi
 
 # Substring, not a prefix: `tracing-opentelemetry` is the layer that bridges
@@ -96,5 +130,5 @@ if [ "${#offenders[@]}" -gt 0 ]; then
         '    cargo tree --workspace --edges normal,build --invert opentelemetry'
 fi
 
-printf 'no-opentelemetry: clean - %d crate(s) resolved, no opentelemetry among them\n' \
-    "${#crates[@]}"
+printf 'no-opentelemetry: clean - %d crate(s) resolved across all %d workspace member(s), no opentelemetry among them\n' \
+    "${#crates[@]}" "${#members[@]}"

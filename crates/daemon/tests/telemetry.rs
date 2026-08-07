@@ -61,6 +61,27 @@ fn run(mut command: Command) -> (String, String) {
 }
 
 #[test]
+fn the_default_filter_keeps_a_bare_run_as_quiet_as_before() {
+    // The daemon used `EnvFilter::from_default_env()`, which falls back to
+    // ERROR when `RUST_LOG` is unset. Adopting a shared crate must not make a
+    // desktop daemon start logging where it used to be silent, and only a run
+    // of the real binary with the variable genuinely absent proves that the
+    // configured fallback is the one the installed subscriber applies.
+    let mut command = Command::new(env!("CARGO_BIN_EXE_desktop-assistant-daemon"));
+    command.arg("--revoke-token").env_remove("RUST_LOG");
+    let (stdout, stderr) = run(command);
+
+    assert!(
+        !stderr.contains("desktop-assistant starting"),
+        "with RUST_LOG unset the daemon logs nothing below ERROR\n--- stderr ---\n{stderr}"
+    );
+    assert!(
+        stdout.is_empty(),
+        "nothing belongs on stdout either\n--- stdout ---\n{stdout}"
+    );
+}
+
+#[test]
 fn logs_go_to_stderr_not_stdout() {
     // `--revoke-token` with no argument is rejected straight after telemetry
     // is installed, so the process starts, logs, and exits without opening a

@@ -17,18 +17,26 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 SCAN_SH="$SCRIPT_TESTS_ROOT/scripts/no-opentelemetry.sh"
 
-# A tree large enough to look real, with nothing telemetry-related in it.
+# A workspace of three members, and a resolved tree that holds all three plus
+# their dependencies, with nothing telemetry-related in it.
+MEMBERS='member-one v0.1.0
+member-two v0.1.0
+member-three v0.1.0'
+
 CLEAN_TREE="$(
-    for i in $(seq 1 100); do printf 'crate-%03d v1.0.0\n' "$i"; done
+    printf '%s\n' "$MEMBERS"
+    for i in $(seq 1 40); do printf 'crate-%03d v1.0.0\n' "$i"; done
     printf 'tracing v0.1.44\ntracing-subscriber v0.3.23\nadelie-telemetry v0.1.0\n'
 )"
 
-# Put the fake cargo on PATH and point the script at it.
+# Put the fake cargo on PATH and point the script at it. Both `cargo tree`
+# calls answer from the clean workspace unless a test overrides one.
 with_fake_cargo() {
     mkdir -p "$TEST_TMP/bin"
     cp "$SCRIPT_TESTS_FIXTURES/fake-cargo-tree.sh" "$TEST_TMP/bin/cargo"
     chmod +x "$TEST_TMP/bin/cargo"
     export PATH="$TEST_TMP/bin:$PATH"
+    export FAKE_TREE_STDOUT="$CLEAN_TREE" FAKE_MEMBERS_STDOUT="$MEMBERS"
 }
 
 default_build_pulls_no_opentelemetry() {
@@ -66,13 +74,24 @@ the_scan_fails_loudly_when_cargo_cannot_read_the_tree() {
     [ "$RUN_STATUS" -ne 0 ] || fail 'a cargo that could not resolve must fail the step'
 }
 
-the_scan_fails_when_the_tree_is_too_small_to_be_this_workspace() {
-    # A `cargo tree` that selects almost nothing exits 0 and prints almost
-    # nothing, which reads in the log exactly like "no opentelemetry here".
+the_scan_fails_when_a_workspace_member_was_not_scanned() {
+    # A `cargo tree` narrowed to one package - by a merge, or a copy-paste from
+    # the feature-gated lint steps - still resolves plenty of crates and finds
+    # no opentelemetry, which reads in the log exactly like a full clean scan.
+    # Only the member list tells a full scan from a partial one.
     with_fake_cargo
-    export FAKE_TREE_STDOUT='serde v1.0.0'
+    export FAKE_TREE_STDOUT="member-one v0.1.0
+$(for i in $(seq 1 40); do printf 'crate-%03d v1.0.0\n' "$i"; done)"
     run_cmd "$SCAN_SH"
-    [ "$RUN_STATUS" -ne 0 ] || fail 'a tree too small to be this workspace must fail the step'
+    [ "$RUN_STATUS" -ne 0 ] || fail 'a scan missing a workspace member must fail the step'
+    assert_contains "$RUN_ERR" 'member-two' 'the failure names the member that was not scanned'
+}
+
+the_scan_fails_loudly_when_the_member_list_cannot_be_read() {
+    with_fake_cargo
+    export FAKE_MEMBERS_STDOUT='' FAKE_MEMBERS_STATUS=101
+    run_cmd "$SCAN_SH"
+    [ "$RUN_STATUS" -ne 0 ] || fail 'an unreadable member list must fail the step'
 }
 
 # --- the step is in the gate -------------------------------------------------
@@ -119,7 +138,8 @@ run_test default_build_pulls_no_opentelemetry
 run_test the_scan_fails_when_an_opentelemetry_crate_is_resolved
 run_test the_scan_fails_when_the_tracing_bridge_is_resolved
 run_test the_scan_fails_loudly_when_cargo_cannot_read_the_tree
-run_test the_scan_fails_when_the_tree_is_too_small_to_be_this_workspace
+run_test the_scan_fails_when_a_workspace_member_was_not_scanned
+run_test the_scan_fails_loudly_when_the_member_list_cannot_be_read
 run_test the_gate_runs_the_no_opentelemetry_step
 run_test the_gate_lints_both_binaries_with_the_otel_feature
 run_test the_gate_runs_both_binaries_tests_with_the_otel_feature

@@ -100,6 +100,29 @@ mod tests {
         });
     }
 
+    /// Restores the process's stderr when it is dropped.
+    ///
+    /// A guard rather than a pair of calls around `body`: a panic inside
+    /// `body` would skip a plain restore, and the process would then run every
+    /// later test with file descriptor 2 pointing at an orphaned temporary
+    /// file. That swallows the panic's own message, so the test that broke
+    /// would report a failure with nothing to read.
+    struct RestoreStderr(libc::c_int);
+
+    impl Drop for RestoreStderr {
+        fn drop(&mut self) {
+            std::io::stderr().flush().ok();
+            // SAFETY: `self.0` is the descriptor `dup` returned in
+            // `capture_stderr` and has not been closed. `dup2` puts it back
+            // over descriptor 2 and `close` releases the duplicate, which is
+            // not used again.
+            unsafe {
+                libc::dup2(self.0, libc::STDERR_FILENO);
+                libc::close(self.0);
+            }
+        }
+    }
+
     /// Run `body` with the process's stderr redirected into a buffer, and
     /// return what was written.
     ///
@@ -107,33 +130,31 @@ mod tests {
     /// descriptor 2 at write time, so redirecting the descriptor captures it.
     /// Nothing short of this observes the real writer: a layer built over a
     /// test buffer would prove only that the test buffer works.
+    ///
+    /// The capture is not exclusive. Descriptor 2 belongs to the process, and
+    /// the mutex below only orders one `capture_stderr` against another - it
+    /// cannot stop another test, or a background thread, writing to stderr
+    /// while the swap is in place. So assert on what must be present, never on
+    /// what must be absent.
     fn capture_stderr<R>(body: impl FnOnce() -> R) -> (R, String) {
         let _serialized = STDERR.lock().unwrap_or_else(|e| e.into_inner());
         let mut file = tempfile::tempfile().expect("a temporary file for stderr");
 
-        // SAFETY: `dup`/`dup2` on the process's own stderr. The original
-        // descriptor is duplicated first and restored below, so the process
-        // ends with the stderr it started with. The mutex above makes the
-        // swap exclusive, so no other test writes through the descriptor
-        // while it points at the temporary file.
+        // SAFETY: `dup` on the process's own stderr, to keep a handle on it
+        // while descriptor 2 points elsewhere. `RestoreStderr` puts it back.
         let saved = unsafe { libc::dup(libc::STDERR_FILENO) };
         assert!(saved >= 0, "duplicate the real stderr");
-        // SAFETY: as above.
+        let _restore = RestoreStderr(saved);
+
+        // SAFETY: `dup2` of an open descriptor over the process's own stderr.
+        // The guard above restores it, on the panicking path as well.
         assert!(
             unsafe { libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO) } >= 0,
             "point stderr at the temporary file"
         );
 
         let result = body();
-
-        std::io::stderr().flush().ok();
-        // SAFETY: as above - this is the restore half of the swap.
-        assert!(
-            unsafe { libc::dup2(saved, libc::STDERR_FILENO) } >= 0,
-            "restore the real stderr"
-        );
-        // SAFETY: `saved` came from `dup` above and is not used again.
-        unsafe { libc::close(saved) };
+        drop(_restore);
 
         file.seek(SeekFrom::Start(0)).expect("rewind the capture");
         let mut captured = String::new();
