@@ -9483,7 +9483,8 @@ mod tests {
                         scope_size: ScopeSize::None,
                         available_tags: Vec::new(),
                     });
-                    kb_search_response(&service, serde_json::json!({ "query": QUERY_SENTINEL })).await;
+                    kb_search_response(&service, serde_json::json!({ "query": QUERY_SENTINEL }))
+                        .await;
                 });
             });
             captured.text()

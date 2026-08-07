@@ -175,6 +175,43 @@ If D-Bus calls return "The name is not activatable", re-run
 `just install-service` / `just install-service-dev` and reload the user manager
 (`systemctl --user daemon-reload`).
 
+## Logging
+
+Every log line goes to **stderr**, never stdout, as plain text. `RUST_LOG` sets
+the verbosity through `EnvFilter`; the shipped systemd units and container
+images set `RUST_LOG=info`.
+
+```bash
+RUST_LOG=info desktop-assistant-daemon
+RUST_LOG=info,desktop_assistant_mcp_client=debug desktop-assistant-daemon
+```
+
+The level contract is a rule, not a preference:
+
+- **INFO** carries ids, counts, byte sizes, durations, model names and token
+  counts. Never content.
+- **DEBUG** carries prompts, the assembled context, tool arguments, tool
+  results, search queries and extracted facts.
+
+So `RUST_LOG=debug` puts conversation content in the journal on purpose. Raise
+one target rather than the whole process when you are debugging one thing.
+
+Metrics are kept in process and summarized every 10 minutes, with no collector
+needed. Export of traces, metrics and logs to an OpenTelemetry collector is
+available behind an off-by-default `otel` Cargo feature, configured from the
+standard `OTEL_*` environment variables:
+
+```bash
+cargo build -p desktop-assistant-daemon --features otel
+OTEL_EXPORTER_OTLP_ENDPOINT=http://collector.example.com:4318 \
+OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf \
+  desktop-assistant-daemon
+```
+
+A default build resolves no opentelemetry crate at all, so `cargo install`
+costs nothing extra. See [Logging and telemetry](docs/logging.md) for the full
+variable list, the transport trade-offs and the metrics facade.
+
 ## Core commands
 
 ```bash
@@ -200,6 +237,7 @@ just package-snap           # run on host with snapd/core24
 - [MCP services](docs/mcp-services.md) — adding and configuring MCP servers
 - [MCP integration internals](docs/mcp-integration.md)
 - [Development guide](docs/development.md)
+- [Logging and telemetry](docs/logging.md) — `RUST_LOG`, the level contract, OTLP export
 - [Cloud providers](docs/cloud-providers.md)
 
 ## What's not done yet
