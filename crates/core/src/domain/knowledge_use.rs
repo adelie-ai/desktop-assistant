@@ -226,6 +226,31 @@ impl Default for UseScoreWeights {
     }
 }
 
+impl UseScoreWeights {
+    /// The decay exponent, held inside the range the formula is defined over.
+    fn safe_decay(&self) -> f64 {
+        self.decay.clamp(0.01, 0.99)
+    }
+
+    /// What one mark from `source` is worth, in uses.
+    fn mark_weight(&self, source: MarkSource) -> f64 {
+        match source {
+            MarkSource::Model => self.model_mark,
+            MarkSource::Person => self.person_mark,
+        }
+    }
+}
+
+/// Seconds between `then` and `now`, never less than one.
+///
+/// One second is the floor because the score raises this to a negative power,
+/// so an age of zero is an infinity and a negative age - which a clock that
+/// stepped backwards produces - is not a number.
+fn age_seconds(now: DateTime<Utc>, then: DateTime<Utc>) -> f64 {
+    let seconds = (now - then).num_milliseconds() as f64 / 1000.0;
+    seconds.max(1.0)
+}
+
 impl KnowledgeUseRecord {
     /// An entry the log has never seen, as of `now`.
     ///
@@ -249,7 +274,7 @@ impl KnowledgeUseRecord {
     /// Opens plus marks: every time the entry was taken up rather than merely
     /// shown.
     pub fn total_uses(&self) -> u64 {
-        unimplemented!()
+        self.opened_count.saturating_add(self.marked_count)
     }
 
     /// How often an offer led to the entry being opened, or `None` when the
@@ -259,13 +284,16 @@ impl KnowledgeUseRecord {
     /// turns has earned all three opens, and capping the figure would hide
     /// exactly the entries that are carrying their weight.
     pub fn take_up_rate(&self) -> Option<f64> {
-        unimplemented!()
+        (self.offered_count > 0).then(|| self.opened_count as f64 / self.offered_count as f64)
     }
 
     /// The mark that speaks for this entry: a person's where there is one, and
     /// the model's otherwise.
     pub fn standing_mark(&self) -> Option<&KnowledgeMark> {
-        unimplemented!()
+        self.marks
+            .iter()
+            .find(|m| m.source == MarkSource::Person)
+            .or_else(|| self.marks.iter().find(|m| m.source == MarkSource::Model))
     }
 
     /// What the log says this entry is worth, as of `now`.
@@ -301,8 +329,52 @@ impl KnowledgeUseRecord {
     /// window it reduces to `n / (1 - d) * T^-d`, whose logarithm is the
     /// familiar `ln(n / (1 - d)) - d * ln(T)`.
     pub fn usefulness(&self, now: DateTime<Utc>, weights: &UseScoreWeights) -> f64 {
-        let _ = (now, weights);
-        unimplemented!()
+        let d = weights.safe_decay();
+
+        let window: Vec<f64> = self
+            .recent_uses
+            .iter()
+            .map(|t| age_seconds(now, *t))
+            .collect();
+        let recent: f64 = window.iter().map(|age| age.powf(-d)).sum();
+
+        let tail = self.tail_term(now, d, window.iter().copied().fold(0.0, f64::max));
+
+        let marks: f64 = self
+            .marks
+            .iter()
+            .map(|mark| {
+                let age = age_seconds(now, mark.marked_at);
+                mark.polarity.sign() * weights.mark_weight(mark.source) * age.powf(-d)
+            })
+            .sum();
+
+        (recent + tail + marks).max(MIN_ACTIVATION_SUM).ln()
+    }
+
+    /// The approximated contribution of the uses that fell out of the recent
+    /// window, given the age of the oldest use still in it (`oldest`, zero when
+    /// the window is empty).
+    fn tail_term(&self, now: DateTime<Utc>, d: f64, oldest: f64) -> f64 {
+        let held = self.recent_uses.len() as u64;
+        let total = self.total_uses();
+        if total <= held {
+            return 0.0;
+        }
+        let missing = (total - held) as f64;
+        let lifetime = age_seconds(now, self.first_seen_at);
+        // The window already covers everything back to the first use, so there
+        // is no span left for the older uses to be spread over.
+        if lifetime <= oldest {
+            return 0.0;
+        }
+        if oldest <= 0.0 {
+            // No exact timestamps at all: the uses are spread over the whole
+            // lifetime, which is the streaming approximation on its own.
+            return missing / (1.0 - d) * lifetime.powf(-d);
+        }
+        missing * (lifetime.powf(1.0 - d) - oldest.powf(1.0 - d))
+            / ((1.0 - d) * (lifetime - oldest))
     }
 }
 

@@ -1,9 +1,11 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::clock::NowSnapshot;
+use desktop_assistant_core::domain::knowledge_use::{MarkPolarity, MarkSource};
 use desktop_assistant_core::domain::{
     KnowledgeEntry, Role, SUMMARY_MAX_CHARS, ToolDefinition, ToolRunner,
 };
@@ -18,7 +20,8 @@ use desktop_assistant_core::ports::knowledge::{
     KnowledgeTagResolveFn, KnowledgeWriteFn, ListOrder, ListOrderOpt, ProposedTag, ScopeSize,
 };
 use desktop_assistant_core::ports::knowledge_use::{
-    KnowledgeMarkFn, KnowledgeOfferedFn, KnowledgeOpenedFn,
+    KnowledgeMarkFn, KnowledgeOfferedFn, KnowledgeOpenedFn, MarkRequest, OfferScope,
+    record_in_background,
 };
 use desktop_assistant_core::ports::notify::{NotifyFn, NotifyUrgency};
 use desktop_assistant_core::ports::scratchpad::{
@@ -2132,7 +2135,19 @@ impl BuiltinToolService {
     /// nothing: an offer is taken up inside the conversation it was made in,
     /// and an offer with no conversation could be taken up by any read at all.
     fn record_offer(&self, entry_ids: Vec<String>) {
-        let _ = entry_ids;
+        let (Some(record), Some(conversation)) = (&self.kb_offered_fn, current_conversation_id())
+        else {
+            return;
+        };
+        if entry_ids.is_empty() {
+            return;
+        }
+        let record = Arc::clone(record);
+        let scope = OfferScope::search(conversation.0);
+        record_in_background(
+            "search_offered",
+            async move { record(scope, entry_ids).await },
+        );
     }
 
     /// Record that `entry_ids` were fetched by id (#698).
@@ -2141,7 +2156,18 @@ impl BuiltinToolService {
     /// log applies that rule. Off the tool's path and never fatal, for the same
     /// reason [`Self::record_offer`] is.
     fn record_open(&self, entry_ids: Vec<String>) {
-        let _ = entry_ids;
+        let (Some(record), Some(conversation)) = (&self.kb_opened_fn, current_conversation_id())
+        else {
+            return;
+        };
+        if entry_ids.is_empty() {
+            return;
+        }
+        let record = Arc::clone(record);
+        let conversation_id = conversation.0;
+        record_in_background("get_opened", async move {
+            record(conversation_id, entry_ids).await
+        });
     }
 
     /// Mark entries useful or not (`builtin_knowledge_base_mark`).
@@ -2155,8 +2181,77 @@ impl BuiltinToolService {
     /// twice on the same entry replaces the first mark rather than adding a
     /// second. That makes a retried call safe and a change of mind ordinary.
     async fn kb_mark(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
-        let _ = arguments;
-        unimplemented!()
+        let mark_fn = self
+            .kb_mark_fn
+            .as_ref()
+            .ok_or_else(|| CoreError::ToolExecution("knowledge base not configured".to_string()))?;
+
+        let useful = arguments
+            .get("useful")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or_else(|| {
+                CoreError::ToolExecution(
+                    "knowledge_base mark requires `useful` as true or false".to_string(),
+                )
+            })?;
+
+        // The same two id shapes `builtin_knowledge_base_get` accepts, so an id
+        // read there can be marked here without reshaping it.
+        let mut ids = optional_string_array(&arguments, "ids");
+        if let Some(id) = optional_string(&arguments, "id") {
+            ids.push(id);
+        }
+        let mut seen = HashSet::new();
+        ids.retain(|id| seen.insert(id.clone()));
+        if ids.is_empty() {
+            return Err(CoreError::ToolExecution(
+                "knowledge_base mark requires `id` or `ids`".to_string(),
+            ));
+        }
+        let mut cap_truncated = false;
+        if ids.len() > KNOWLEDGE_GET_MAX_IDS {
+            cap_truncated = true;
+            ids.truncate(KNOWLEDGE_GET_MAX_IDS);
+        }
+
+        let polarity = if useful {
+            MarkPolarity::Positive
+        } else {
+            MarkPolarity::Negative
+        };
+        let marked = mark_fn(MarkRequest {
+            entry_ids: ids.clone(),
+            polarity,
+            source: MarkSource::Model,
+            reason: optional_string(&arguments, "reason"),
+        })
+        .await?;
+
+        // An id that did not land is a normal outcome, named rather than
+        // raised: another user's id, a retired entry and an id nobody holds are
+        // one case here, and nothing in the response says which.
+        let not_marked: Vec<&String> = ids.iter().filter(|id| !marked.contains(id)).collect();
+        tracing::info!(
+            asked = ids.len(),
+            marked = marked.len(),
+            polarity = polarity.as_str(),
+            "knowledge base mark"
+        );
+
+        let mut response = serde_json::json!({
+            "ok": true,
+            "polarity": polarity.as_str(),
+            "marked": marked,
+            "not_marked": not_marked,
+        });
+        if cap_truncated {
+            response["truncated"] = serde_json::Value::Bool(true);
+            response["message"] = serde_json::json!(format!(
+                "more than {KNOWLEDGE_GET_MAX_IDS} ids were given; the rest were not marked. \
+                 Mark them in another call."
+            ));
+        }
+        Ok(response.to_string())
     }
 
     /// Read knowledge entries by id (`builtin_knowledge_base_get`).
@@ -8899,8 +8994,7 @@ mod tests {
 
     // -- the knowledge use log (#698) ----------------------------------------
 
-    use desktop_assistant_core::domain::knowledge_use::{MarkPolarity, MarkSource};
-    use desktop_assistant_core::ports::knowledge_use::{MarkRequest, OfferScope, OfferSource};
+    use desktop_assistant_core::ports::knowledge_use::OfferSource;
 
     /// Everything one use log recorded, so a test can prove what a tool wrote.
     #[derive(Default)]

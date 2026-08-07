@@ -29,27 +29,50 @@
 
 use std::sync::Arc;
 
-use desktop_assistant_core::ports::recall::{RecallCandidates, RecallSearchFn};
+use desktop_assistant_core::ports::knowledge_use::{
+    KnowledgeUseLog, OfferScope, record_in_background,
+};
+use desktop_assistant_core::ports::recall::{RecallCandidates, RecallRequest, RecallSearchFn};
+use desktop_assistant_core::recall::{RECALL_ENTRY_MAX_DISTANCE, max_recall_entries};
 use desktop_assistant_storage::PgKnowledgeUseLog;
 
 /// The ids a `[Recall]` block built from `candidates` will show.
 ///
 /// Public to the crate so the daemon's own tests can hold it to the renderer's
 /// rules; see the module doc for the one rule it cannot apply.
-#[allow(dead_code)]
 pub(crate) fn offered_entry_ids(candidates: &RecallCandidates) -> Vec<String> {
-    let _ = candidates;
-    unimplemented!()
+    candidates
+        .entries
+        .iter()
+        .filter(|hit| hit.relevance.clears_floor(RECALL_ENTRY_MAX_DISTANCE))
+        .filter(|hit| !hit.entry.display_line().is_empty())
+        .take(max_recall_entries())
+        .map(|hit| hit.entry.id.clone())
+        .collect()
 }
 
 /// Wrap a recall lookup so the entries it will show are recorded as offered.
 ///
 /// The record is written off the turn's path and its failure is dropped, so a
 /// use log that cannot be written costs the measurement and never the block -
-/// see [`record_in_background`].
+/// see `desktop_assistant_core::ports::knowledge_use::record_in_background`.
 pub fn with_offer_recording(inner: RecallSearchFn, log: Arc<PgKnowledgeUseLog>) -> RecallSearchFn {
-    let _ = (inner, log);
-    unimplemented!()
+    Arc::new(move |request: RecallRequest| {
+        let inner = Arc::clone(&inner);
+        let log = Arc::clone(&log);
+        let conversation_id = request.conversation_id.clone();
+        Box::pin(async move {
+            let candidates = inner(request).await?;
+            let offered = offered_entry_ids(&candidates);
+            if !offered.is_empty() {
+                let scope = OfferScope::recall(conversation_id);
+                record_in_background("recall_offered", async move {
+                    log.record_offered(scope, offered).await
+                });
+            }
+            Ok(candidates)
+        })
+    })
 }
 
 #[cfg(test)]
@@ -57,7 +80,6 @@ mod tests {
     use super::*;
     use desktop_assistant_core::domain::KnowledgeEntry;
     use desktop_assistant_core::ports::recall::{RecallEntry, RecallRelevance};
-    use desktop_assistant_core::recall::{RECALL_ENTRY_MAX_DISTANCE, max_recall_entries};
 
     fn hit(id: &str, distance: f64, content: &str) -> RecallEntry {
         RecallEntry {
