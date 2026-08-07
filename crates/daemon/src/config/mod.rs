@@ -201,7 +201,11 @@ pub struct RecallConfig {
     ///
     /// The value is held to what the block can honestly render: at least one
     /// line, and never more lines than the lookup reads, because a block that
-    /// showed more would count rows it never saw. Read once, at startup.
+    /// showed more would count rows it never saw.
+    ///
+    /// Read once, when the conversation handler is built, so an edit needs a
+    /// restart. A reload reports the whole section as
+    /// [`RestartArea::Recall`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_entries: Option<usize>,
 }

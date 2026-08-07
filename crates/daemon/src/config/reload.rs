@@ -18,9 +18,10 @@
 //!
 //! - **Restart-required** — wired once at process start and not swappable
 //!   live: the database pool/url, embeddings backend, persistence, WS auth,
-//!   TLS, and profiling. A reload still applies every hot knob in the same
-//!   edit; these are flagged in the plan so the daemon logs that a restart is
-//!   needed for them to take effect, rather than silently ignoring them.
+//!   TLS, profiling, the administrator allowlist, and pre-prompt recall. A
+//!   reload still applies every hot knob in the same edit; these are flagged in
+//!   the plan so the daemon logs that a restart is needed for them to take
+//!   effect, rather than silently ignoring them.
 //!
 //! The embedding backend is a purpose-driven knob that lands in the *hot*
 //! arm's diff (`[purposes]`) but is not hot-applicable: the embedding client is
@@ -73,6 +74,10 @@ pub enum RestartArea {
     /// `[authz]`: the remote-administrator allowlist is read into the transport
     /// validators once at startup, so an edit does not reach a live connection.
     Authz,
+    /// `[recall]`: whether the pre-prompt lookup is wired, and how many lines
+    /// its block shows, are both read once when the conversation handler is
+    /// built.
+    Recall,
 }
 
 impl RestartArea {
@@ -88,6 +93,7 @@ impl RestartArea {
             Self::Tls => "tls",
             Self::Profiling => "profiling",
             Self::Authz => "authz",
+            Self::Recall => "recall",
         }
     }
 }
@@ -168,6 +174,9 @@ pub fn plan_reload(old: &DaemonConfig, new: &DaemonConfig) -> ReloadPlan {
     }
     if old.authz != new.authz {
         plan.restart_required.push(RestartArea::Authz);
+    }
+    if old.recall != new.recall {
+        plan.restart_required.push(RestartArea::Recall);
     }
 
     plan
@@ -517,6 +526,7 @@ mod tests {
         assert_eq!(RestartArea::Tls.as_key(), "tls");
         assert_eq!(RestartArea::Profiling.as_key(), "profiling");
         assert_eq!(RestartArea::Authz.as_key(), "authz");
+        assert_eq!(RestartArea::Recall.as_key(), "recall");
     }
 
     /// The admin allowlist is read into the transport validators once, so an
@@ -535,6 +545,38 @@ mod tests {
     #[test]
     fn an_unchanged_authz_section_reports_nothing() {
         let cfg = DaemonConfig::default();
+        assert!(plan_reload(&cfg, &cfg).is_empty());
+    }
+
+    /// Pre-prompt recall is wired once, when the conversation handler is built,
+    /// so an edit must read as pending a restart. Without this the reload says
+    /// "nothing to apply" about a file that demonstrably changed.
+    #[test]
+    fn changing_the_recall_section_requires_a_restart() {
+        let old = DaemonConfig::default();
+
+        let mut narrower = DaemonConfig::default();
+        narrower.recall.max_entries = Some(8);
+        let plan = plan_reload(&old, &narrower);
+        assert!(plan.restart_required.contains(&RestartArea::Recall));
+        assert!(!plan.rebuild_registry);
+
+        let mut off = DaemonConfig::default();
+        off.recall.enabled = false;
+        assert!(
+            plan_reload(&old, &off)
+                .restart_required
+                .contains(&RestartArea::Recall),
+            "the switch is wired once as well"
+        );
+    }
+
+    /// An unchanged `[recall]` section is not reported, so a desktop reload
+    /// stays quiet.
+    #[test]
+    fn an_unchanged_recall_section_reports_nothing() {
+        let mut cfg = DaemonConfig::default();
+        cfg.recall.max_entries = Some(12);
         assert!(plan_reload(&cfg, &cfg).is_empty());
     }
 }

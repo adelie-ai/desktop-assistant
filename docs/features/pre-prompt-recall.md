@@ -211,24 +211,34 @@ allowed 2,560 tokens in the worst case. That is two percent of a
 daemon drives usually carry - spent once per turn, on the first round only, on a
 hint the model is told it may ignore.
 
-Every part of every line is capped: 64 characters of id, 120 of an entry's tags,
-200 of summary, 128 of a note key, 200 of a note's content, and 240 for the whole
-tag line. So a worst-case line costs a known number of characters, and the width
-is arithmetic rather than a choice:
+Every part of every line is capped: 64 of id, 120 of an entry's tags, 200 of
+summary, 128 of a note key, 200 of a note's content, and 240 for the whole tag
+line. So a worst-case line costs a known size, and the width is arithmetic
+rather than a choice:
 
 | Part | Worst case |
 | --- | --- |
-| One knowledge line | `"\n- " + id + " [" + tags + "] " + summary` = 391 characters |
-| The fixed part | prefix, header, entry hint, five pad lines and their label, the tag line, and both "did not fit" lines = 2,410 characters |
-| The budget | 2,560 tokens at four characters a token = 10,240 characters |
+| One knowledge line | `"\n- " + id + " [" + tags + "] " + summary` = 391 bytes |
+| The fixed part | prefix, header, entry hint, five pad lines and their label, the tag line, and both "did not fit" lines = 2,410 bytes |
+| The budget | 2,560 tokens at four bytes a token = 10,240 bytes |
 | **The width** | **(10,240 - 2,410) / 391 = 20 lines** |
 
-Tokens are counted the way the context budget counts them, at four characters
-each. Real entries carry a short id and a few tags, so a real line costs about a
-quarter of the worst case and a usual block lands near a third of the budget;
-the width rests on the bound rather than on the average, because only the bound
-is a promise. `crates/core/src/recall.rs` pins both numbers with a test, so a
-later change to the line format cannot inflate the block in silence.
+**Bytes, not characters, and the difference matters.** The token estimate the
+context budget uses is `bytes / 4`, and a character is one to four bytes.
+Nothing restricts an entry id, a tag, or a model-written summary to ASCII, so a
+line inside its character bounds can carry four times the size the block is
+charged for. Each rendered line is therefore cut to its byte bound, on a
+character boundary, and a line that lost anything ends in `...` the same way a
+truncated value does. An all-ASCII line is already inside the bound and passes
+through untouched, so the usual line is unchanged; a line in another script
+shows fewer characters for the same cost.
+
+Real entries carry a short id and a few tags, so a real line costs about a
+quarter of the worst case and a usual block lands near a third of the budget.
+The width rests on the bound rather than on the average, because only the bound
+is a promise. `crates/core/src/recall.rs` pins both numbers with a test - the
+worst case in ASCII, the worst case in a four-byte script, and the usual case -
+so a later change to the line format cannot inflate the block in silence.
 
 Five scratchpad lines and five tag names, unchanged. Those arms are not what the
 budget buys: the pad holds one conversation's notes, and the tag arm hands over a
@@ -242,10 +252,10 @@ or ignored.
 
 ## Saying what did not fit
 
-A model that sees twenty entries cannot tell whether the store holds exactly
-twenty relevant things or four hundred, and those call for different next moves -
-accept the list, or go search properly. So the block ends with a count of what
-cleared the floor and did not fit.
+A model that sees the lines the block had room for cannot tell whether the store
+holds exactly that many relevant things or four hundred, and those call for
+different next moves - accept the list, or go search properly. So the block ends
+with a count of what cleared the floor and did not fit.
 
 That count means something only because the floor defines it. "How many matched"
 is not a defined quantity over a hybrid search, where every embedded row scores
@@ -311,7 +321,7 @@ them to it, and runs under `just test-db`.
 ```toml
 [recall]
 enabled = true   # the default
-# max_entries = 20   # absent means the width the token budget pays for
+# max_entries = 12   # absent means the width the token budget pays for
 ```
 
 It also stays off on its own when there is no knowledge store or no embedding
@@ -322,8 +332,11 @@ this deployment's model carries a smaller window than the budget above assumes,
 or where an operator wants a narrower block. The value is held to what the block
 can honestly render - at least one line, and never more than the 50 rows the
 lookup reads, because a block that showed more would count a tail it never saw.
-Both settings are read once, at startup; changing either needs a restart. The
-daemon logs the width it wired.
+
+Both settings are read once, when the conversation handler is built, so an edit
+needs a restart. A live config reload reports `[recall]` as a restart-required
+area rather than reporting no change, and the daemon logs the width it wired at
+startup.
 
 Turning it off restores exactly the behaviour that preceded the feature: the
 assistant reaches its knowledge base only when it decides to search.

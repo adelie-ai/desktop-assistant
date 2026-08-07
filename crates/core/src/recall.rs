@@ -44,9 +44,10 @@
 //!
 //! ## Saying what did not fit
 //!
-//! A model that sees twenty entries cannot tell whether the store holds exactly
-//! twenty relevant things or four hundred, and those call for different next
-//! moves. So the block reports how many cleared the floor and did not fit.
+//! A model that sees the lines the block had room for cannot tell whether the
+//! store holds exactly that many relevant things or four hundred, and those
+//! call for different next moves. So the block reports how many cleared the
+//! floor and did not fit.
 //!
 //! That count means something only because the floor defines it. Over a hybrid
 //! search every row scores non-zero against any query, so "how many matched" is
@@ -72,65 +73,73 @@ use crate::ports::scratchpad::NOTE_KEY_MAX_CHARS;
 /// [`set_max_recall_entries`].
 pub const RECALL_BLOCK_TOKEN_BUDGET: usize = 2_560;
 
-/// Characters to a token: the rule the context budget itself counts by
+/// Bytes to a token: the rule the context budget itself counts by
 /// ([`crate::ports::tool_usage::estimate_tokens`]).
 ///
-/// Every part of the block is bounded in characters, so the budget is converted
-/// once, here, and the whole derivation below is arithmetic on character
-/// bounds.
-const RECALL_CHARS_PER_TOKEN: usize = 4;
+/// **Bytes, not characters, and the difference is the whole point.** The
+/// per-part bounds below (`RECALL_ID_MAX_CHARS` and the rest) are stated in
+/// characters, because their job is to make one physical line of a value that
+/// might carry a newline. A character bound says nothing about cost: nothing
+/// restricts an id, a tag or a model-written summary to ASCII, and four bytes
+/// to the character is a real case, so a line inside its character bounds can
+/// carry four times the bytes the block is charged for. Every bound the budget
+/// rests on is therefore a byte bound, and `bounded_bytes` holds each rendered
+/// line to it.
+const RECALL_BYTES_PER_TOKEN: usize = 4;
 
-/// [`RECALL_BLOCK_TOKEN_BUDGET`] in the characters the bounds are stated in.
-const RECALL_BLOCK_MAX_CHARS: usize = RECALL_BLOCK_TOKEN_BUDGET * RECALL_CHARS_PER_TOKEN;
+/// [`RECALL_BLOCK_TOKEN_BUDGET`] in the bytes the bounds are stated in.
+const RECALL_BLOCK_MAX_BYTES: usize = RECALL_BLOCK_TOKEN_BUDGET * RECALL_BYTES_PER_TOKEN;
 
 /// What `crate::context` puts in front of the body, and the model pays for.
-const RECALL_BLOCK_PREFIX_CHARS: usize = "[Recall] ".len();
+const RECALL_BLOCK_PREFIX_BYTES: usize = "[Recall] ".len();
 
-/// What one knowledge line costs, worst case.
+/// What one knowledge line may cost, in bytes, its newline apart.
 ///
-/// `"\n- " + id + " [" + tags + "] " + summary`, with the id at
-/// [`RECALL_ID_MAX_CHARS`], the tag list at [`RECALL_TAGS_MAX_CHARS`] and the
-/// summary at [`crate::domain::knowledge::SUMMARY_MAX_CHARS`]. Real entries
-/// carry a short id and a few tags, so a real line costs a quarter of this;
-/// the width rests on the bound rather than on the average, because only the
-/// bound is a promise.
-const RECALL_ENTRY_LINE_MAX_CHARS: usize = 1
-    + 2
+/// The shape is `"- " + id + " [" + tags + "] " + summary`, and the figure is
+/// the sum of the parts' own bounds read as bytes. An all-ASCII line is inside
+/// it already, so the usual line is untouched; a line of multi-byte text is cut
+/// to it and shows fewer characters for the same cost. Real entries carry a
+/// short id and a few tags, so a real line costs a quarter of this - the width
+/// rests on the bound rather than on the average, because only the bound is a
+/// promise.
+const RECALL_ENTRY_LINE_MAX_BYTES: usize = 2
     + RECALL_ID_MAX_CHARS
     + 2
-    + RECALL_TAGS_MAX_CHARS
+    + RECALL_TAGS_MAX_BYTES
     + 2
     + crate::domain::knowledge::SUMMARY_MAX_CHARS;
 
-/// What one scratchpad line costs, worst case: `"\n- " + key + ": " + content`,
-/// at [`NOTE_KEY_MAX_CHARS`] and [`RECALL_NOTE_MAX_CHARS`].
-const RECALL_NOTE_LINE_MAX_CHARS: usize = 1 + 2 + NOTE_KEY_MAX_CHARS + 2 + RECALL_NOTE_MAX_CHARS;
+/// What one scratchpad line may cost, in bytes, its newline apart:
+/// `"- " + key + ": " + content`, at [`NOTE_KEY_MAX_CHARS`] and
+/// [`RECALL_NOTE_MAX_CHARS`] read as bytes.
+const RECALL_NOTE_LINE_MAX_BYTES: usize = 2 + NOTE_KEY_MAX_CHARS + 2 + RECALL_NOTE_MAX_CHARS;
 
 /// What one "did not fit" line costs, worst case.
 ///
 /// The newline, `"...and "` (7), the digits of any `usize` (20), the hedge
 /// `" or more"` (8), a space, the longer of the two nouns - `"entries"` (7) -
-/// and `" matched less closely."` (22). `dropped_line` is held to it by
+/// and `" matched less closely."` (22). Every part is ASCII, so the figure is
+/// bytes as well as characters. `dropped_line` is held to it by
 /// `the_did_not_fit_line_stays_inside_the_bound_the_budget_assumes`.
-const RECALL_DROPPED_LINE_MAX_CHARS: usize = 1 + 7 + 20 + 8 + 1 + 7 + 22;
+const RECALL_DROPPED_LINE_MAX_BYTES: usize = 1 + 7 + 20 + 8 + 1 + 7 + 22;
 
 /// What the block costs before its first knowledge line, worst case: the
 /// prefix, the header and its entry hint, the entry arm's "did not fit" line,
 /// the pad label with [`MAX_RECALL_NOTES`] lines and its own "did not fit"
 /// line, and the tag label with a full tag line.
-const RECALL_FIXED_MAX_CHARS: usize = RECALL_BLOCK_PREFIX_CHARS
+const RECALL_FIXED_MAX_BYTES: usize = RECALL_BLOCK_PREFIX_BYTES
     + RECALL_HEADER.len()
     + 1
     + RECALL_ENTRY_HINT.len()
-    + RECALL_DROPPED_LINE_MAX_CHARS
+    + RECALL_DROPPED_LINE_MAX_BYTES
     + 1
     + RECALL_NOTE_LABEL.len()
-    + MAX_RECALL_NOTES * RECALL_NOTE_LINE_MAX_CHARS
-    + RECALL_DROPPED_LINE_MAX_CHARS
+    + MAX_RECALL_NOTES * (1 + RECALL_NOTE_LINE_MAX_BYTES)
+    + RECALL_DROPPED_LINE_MAX_BYTES
     + 1
     + RECALL_TAG_LABEL.len()
     + 1
-    + RECALL_TAG_LINE_MAX_CHARS;
+    + RECALL_TAG_LINE_MAX_BYTES;
 
 /// How many knowledge lines the block shows where a deployment states nothing:
 /// what [`RECALL_BLOCK_TOKEN_BUDGET`] pays for once the fixed part is taken.
@@ -141,7 +150,7 @@ const RECALL_FIXED_MAX_CHARS: usize = RECALL_BLOCK_PREFIX_CHARS
 /// a title the model can see but has not opened still says that something
 /// exists, and an entry that never appears cannot be asked for.
 pub const DEFAULT_MAX_RECALL_ENTRIES: usize =
-    (RECALL_BLOCK_MAX_CHARS - RECALL_FIXED_MAX_CHARS) / RECALL_ENTRY_LINE_MAX_CHARS;
+    (RECALL_BLOCK_MAX_BYTES - RECALL_FIXED_MAX_BYTES) / (1 + RECALL_ENTRY_LINE_MAX_BYTES);
 
 /// The width this deployment renders: [`DEFAULT_MAX_RECALL_ENTRIES`] until
 /// [`set_max_recall_entries`] installs another.
@@ -205,16 +214,19 @@ pub const RECALL_ID_MAX_CHARS: usize = 64;
 /// Tags are normalised and cannot carry whitespace, but nothing bounds how many
 /// an entry may hold, and the list is a decoration on a line whose subject is
 /// the summary.
-pub const RECALL_TAGS_MAX_CHARS: usize = 120;
+///
+/// In bytes, because that is the unit [`RECALL_BLOCK_TOKEN_BUDGET`] is stated
+/// in and a tag name may be in any script.
+pub const RECALL_TAGS_MAX_BYTES: usize = 120;
 
-/// How much of the block's tag line the tag names may spend.
+/// How much of the block's tag line the tag names may spend, in bytes.
 ///
 /// A registry name is `TEXT` with no length cap and no truncation on the write
 /// path, so five of them is a bound on the count and not on the size.
-pub const RECALL_TAG_LINE_MAX_CHARS: usize = 240;
+pub const RECALL_TAG_LINE_MAX_BYTES: usize = 240;
 
 /// How many tag names the block may show, before
-/// [`RECALL_TAG_LINE_MAX_CHARS`] takes whichever of them fit.
+/// [`RECALL_TAG_LINE_MAX_BYTES`] takes whichever of them fit.
 ///
 /// Names only, and few of them: the arm exists to hand the model this user's
 /// working vocabulary before its first search, not to list the vocabulary.
@@ -495,7 +507,7 @@ fn render_recall_with_width(surface: &RecallSurface<'_>, max_entries: usize) -> 
         .take(MAX_RECALL_TAGS)
         .map(|tag| tag.name.as_str())
         .collect();
-    let tags = tag_list(&near_tags, RECALL_TAG_LINE_MAX_CHARS);
+    let tags = tag_list(&near_tags, RECALL_TAG_LINE_MAX_BYTES);
 
     if showable.is_empty() && showable_notes.is_empty() && tags.is_empty() {
         return None;
@@ -553,20 +565,24 @@ fn contains(values: &[String], wanted: &str) -> bool {
     values.iter().any(|value| value == wanted)
 }
 
-/// Join tag names into at most `max_chars` characters, taking whole names.
+/// Join tag names into at most `max_bytes` bytes, taking whole names.
 ///
 /// A name is never cut. Half a tag name is a tag no row carries, and the model
 /// is being handed this list precisely so it can search on one - so a name that
 /// does not fit is left out instead. Empty when the first name alone is too
 /// long, which is the honest answer for a vocabulary this block cannot show.
 ///
+/// Bytes rather than characters, because a name may be in any script and the
+/// block's budget is stated in bytes. This is the one part of a line that
+/// [`bounded_bytes`] must not cut, so it bounds itself.
+///
 /// Normalisation already guarantees a name carries no whitespace, so only the
 /// size needs bounding here, never the shape.
-fn tag_list(names: &[&str], max_chars: usize) -> String {
+fn tag_list(names: &[&str], max_bytes: usize) -> String {
     let mut out = String::new();
     for name in names {
         let separator = if out.is_empty() { 0 } else { 2 };
-        if out.chars().count() + separator + name.chars().count() > max_chars {
+        if out.len() + separator + name.len() > max_bytes {
             break;
         }
         if !out.is_empty() {
@@ -574,6 +590,44 @@ fn tag_list(names: &[&str], max_chars: usize) -> String {
         }
         out.push_str(name);
     }
+    out
+}
+
+/// Hold a rendered line to `max_bytes`, cutting on a character boundary.
+///
+/// The per-part bounds a line is built from are stated in characters, and a
+/// character is one to four bytes. The block's budget is stated in bytes,
+/// because that is what the model is charged. So a line that is inside its
+/// character bounds can still be four times the size the budget allowed it, and
+/// this is where that is settled.
+///
+/// A line that had to lose anything ends in the same `...` a truncated value
+/// carries, so a cut line never reads as a whole one. An all-ASCII line is
+/// already inside the bound and passes through untouched, which is every real
+/// line; the cut is what keeps a line of another script honest rather than what
+/// shapes the usual one.
+fn bounded_bytes(line: String, max_bytes: usize) -> String {
+    if line.len() <= max_bytes {
+        return line;
+    }
+    const MARKER: &str = "...";
+    // A bound too small to hold the marker cannot carry it. The bound wins: a
+    // line that overran it to announce the cut would defeat the point of it.
+    let keep = if max_bytes < MARKER.len() {
+        max_bytes
+    } else {
+        max_bytes - MARKER.len()
+    };
+    let mut end = keep;
+    while end > 0 && !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    if max_bytes < MARKER.len() {
+        return line[..end].to_string();
+    }
+    let mut out = String::with_capacity(end + MARKER.len());
+    out.push_str(&line[..end]);
+    out.push_str(MARKER);
     out
 }
 
@@ -602,17 +656,18 @@ fn bounded(value: &str, max_chars: usize) -> String {
 /// an entry for the lack of a summary.
 fn entry_line(hit: &RecallEntry, line: &str) -> String {
     let id = bounded(&hit.entry.id, RECALL_ID_MAX_CHARS);
-    if hit.entry.tags.is_empty() {
+    let rendered = if hit.entry.tags.is_empty() {
         format!("- {id} {line}")
     } else {
         let names: Vec<&str> = hit.entry.tags.iter().map(String::as_str).collect();
-        let tags = tag_list(&names, RECALL_TAGS_MAX_CHARS);
+        let tags = tag_list(&names, RECALL_TAGS_MAX_BYTES);
         if tags.is_empty() {
             format!("- {id} {line}")
         } else {
             format!("- {id} [{tags}] {line}")
         }
-    }
+    };
+    bounded_bytes(rendered, RECALL_ENTRY_LINE_MAX_BYTES)
 }
 
 /// One scratchpad line: the note's key, then the start of what it says.
@@ -635,11 +690,12 @@ fn note_line(note: &RecallNote) -> Option<String> {
         return None;
     }
     let content = bounded(&note.content, RECALL_NOTE_MAX_CHARS);
-    if content.is_empty() {
-        Some(format!("- {key}"))
+    let rendered = if content.is_empty() {
+        format!("- {key}")
     } else {
-        Some(format!("- {key}: {content}"))
-    }
+        format!("- {key}: {content}")
+    };
+    Some(bounded_bytes(rendered, RECALL_NOTE_LINE_MAX_BYTES))
 }
 
 /// The "did not fit" line for one arm, or `None` when nothing was dropped.
@@ -790,20 +846,22 @@ mod tests {
     const BLOCK_PREFIX: &str = "[Recall] ";
 
     /// `n` characters with no whitespace in them, so a bounded part of a line
-    /// comes out at exactly its bound rather than shorter.
+    /// comes out at exactly its bound rather than shorter. One byte each.
     fn filler(n: usize) -> String {
         "x".repeat(n)
     }
 
+    /// The same length in characters, four bytes each: what a summary in
+    /// another script, or an id nobody restricted, actually costs.
+    fn wide_filler(n: usize) -> String {
+        "\u{1F600}".repeat(n)
+    }
+
     /// What the block costs the turn, counted the way the context budget counts
-    /// it (`chars / 4`).
+    /// it (`bytes / 4`).
     fn block_tokens(block: &str) -> usize {
-        assert!(
-            block.is_ascii(),
-            "the budget counts bytes as characters, which holds for ASCII only"
-        );
-        let chars = BLOCK_PREFIX.len() + block.len();
-        crate::ports::tool_usage::estimate_tokens(chars as u64) as usize
+        let bytes = BLOCK_PREFIX.len() + block.len();
+        crate::ports::tool_usage::estimate_tokens(bytes as u64) as usize
     }
 
     /// The most expensive knowledge candidate the renderer can be handed: the
@@ -812,7 +870,7 @@ mod tests {
         let mut entry = KnowledgeEntry::new(
             format!("{i:0>width$}", width = RECALL_ID_MAX_CHARS),
             "a body the summary stands in for",
-            vec![filler(RECALL_TAGS_MAX_CHARS)],
+            vec![filler(RECALL_TAGS_MAX_BYTES)],
         );
         entry.summary = Some(filler(crate::domain::knowledge::SUMMARY_MAX_CHARS));
         RecallEntry {
@@ -836,7 +894,41 @@ mod tests {
                     )
                 })
                 .collect(),
-            tags: vec![tag(&filler(RECALL_TAG_LINE_MAX_CHARS), 0.10)],
+            tags: vec![tag(&filler(RECALL_TAG_LINE_MAX_BYTES), 0.10)],
+        }
+    }
+
+    /// The same block with every value in a four-byte script, each part still
+    /// inside its own character bound. Nothing restricts an id, a tag or a
+    /// model-written summary to ASCII, so this is what the budget has to
+    /// survive.
+    fn wide_worst_case_candidates(entries: usize) -> RecallCandidates {
+        let wide_hit = |_i: usize| {
+            let mut entry = KnowledgeEntry::new(
+                wide_filler(RECALL_ID_MAX_CHARS),
+                "a body the summary stands in for",
+                // A whole name or none, so the tag bound is stated in the
+                // bytes `tag_list` counts.
+                vec![wide_filler(RECALL_TAGS_MAX_BYTES / 4)],
+            );
+            entry.summary = Some(wide_filler(crate::domain::knowledge::SUMMARY_MAX_CHARS));
+            RecallEntry {
+                entry,
+                relevance: RecallRelevance::Distance(0.10),
+            }
+        };
+        RecallCandidates {
+            entries: (0..=entries).map(wide_hit).collect(),
+            notes: (0..=MAX_RECALL_NOTES)
+                .map(|_| {
+                    note(
+                        &wide_filler(NOTE_KEY_MAX_CHARS),
+                        &wide_filler(RECALL_NOTE_MAX_CHARS),
+                        0.10,
+                    )
+                })
+                .collect(),
+            tags: vec![tag(&wide_filler(RECALL_TAG_LINE_MAX_BYTES / 4), 0.10)],
         }
     }
 
@@ -995,7 +1087,7 @@ mod tests {
     fn the_did_not_fit_line_stays_inside_the_bound_the_budget_assumes() {
         // The constant carries the line's own newline, so the text itself has
         // one character less to spend.
-        let bound = RECALL_DROPPED_LINE_MAX_CHARS - 1;
+        let bound = RECALL_DROPPED_LINE_MAX_BYTES - 1;
         for noun in ["entries", "notes"] {
             let line = dropped_line(usize::MAX, true, noun).expect("a count that dropped rows");
             assert!(
@@ -1007,10 +1099,10 @@ mod tests {
         }
     }
 
-    /// The budget arithmetic counts a byte as a character, which holds only
-    /// while the block's fixed text is ASCII.
+    /// The budget counts one newline for each line it expects, so the block's
+    /// fixed text must not carry a line the arithmetic never counted.
     #[test]
-    fn the_blocks_fixed_text_is_ascii_so_the_character_budget_is_exact() {
+    fn the_blocks_fixed_text_carries_no_line_of_its_own() {
         for text in [
             BLOCK_PREFIX,
             RECALL_HEADER,
@@ -1018,8 +1110,88 @@ mod tests {
             RECALL_NOTE_LABEL,
             RECALL_TAG_LABEL,
         ] {
-            assert!(text.is_ascii(), "not ASCII: {text}");
+            assert!(
+                !text.contains('\n'),
+                "a line the budget did not count: {text}"
+            );
         }
+    }
+
+    /// Acceptance (#1124), and the case an ASCII fixture cannot reach: the
+    /// budget is stated in bytes, a character is one to four of them, and
+    /// nothing restricts an id, a tag or a summary to ASCII. A block of
+    /// four-byte text must therefore cost no more than an ASCII one.
+    #[test]
+    fn a_block_of_multi_byte_text_stays_within_the_same_token_budget() {
+        let candidates = wide_worst_case_candidates(DEFAULT_MAX_RECALL_ENTRIES);
+
+        let block = render(&candidates).expect("every arm is full");
+        let tokens = block_tokens(&block);
+
+        assert!(!block.is_ascii(), "the fixture must not be ASCII");
+        assert!(
+            tokens <= RECALL_BLOCK_TOKEN_BUDGET,
+            "a block of four-byte text costs {tokens} tokens, over the \
+             {RECALL_BLOCK_TOKEN_BUDGET}-token budget - a bound in characters does not bound a \
+             cost in bytes"
+        );
+    }
+
+    /// Every line the block renders stays inside the byte bound the budget
+    /// gave it, whatever script its parts arrive in.
+    #[test]
+    fn every_rendered_line_stays_inside_its_byte_bound() {
+        let block = render(&wide_worst_case_candidates(DEFAULT_MAX_RECALL_ENTRIES))
+            .expect("every arm is full");
+
+        for line in entry_lines(&block) {
+            assert!(
+                line.len() <= RECALL_ENTRY_LINE_MAX_BYTES,
+                "entry line is {} bytes, over {RECALL_ENTRY_LINE_MAX_BYTES}",
+                line.len()
+            );
+        }
+        for line in note_lines(&block) {
+            assert!(
+                line.len() <= RECALL_NOTE_LINE_MAX_BYTES,
+                "note line is {} bytes, over {RECALL_NOTE_LINE_MAX_BYTES}",
+                line.len()
+            );
+        }
+    }
+
+    /// Acceptance (#1124): the configured width reaches the renderer the
+    /// context assembly actually calls, not only the pure function beneath it.
+    ///
+    /// The only test in this binary that installs a process width, and it
+    /// installs the widest the block will take. A wider width never cuts a
+    /// list, and every other test that reaches `render_recall` renders a
+    /// handful of lines, so this install cannot change what any of them sees.
+    #[test]
+    fn the_configured_width_reaches_the_renderer_the_assembly_calls() {
+        let installed = set_max_recall_entries(RECALL_ENTRY_SCAN_LIMIT);
+        assert_eq!(
+            installed, RECALL_ENTRY_SCAN_LIMIT,
+            "no other test in this binary may install a width"
+        );
+
+        let wanted = DEFAULT_MAX_RECALL_ENTRIES + 5;
+        let candidates = RecallCandidates {
+            entries: near_hits(wanted),
+            ..RecallCandidates::default()
+        };
+        let block = render_recall(&RecallSurface::new(
+            &candidates,
+            RECALL_ENTRY_SCAN_LIMIT,
+            RECALL_NOTE_SCAN_LIMIT,
+        ))
+        .expect("a block");
+
+        assert_eq!(
+            entry_lines(&block).len(),
+            wanted,
+            "render_recall must read the configured width, not the derived default"
+        );
     }
 
     /// Pins what a block of realistic shape costs, so a change to the line
@@ -1440,15 +1612,11 @@ mod tests {
         let block = render(&candidates).expect("a block");
         let line = entry_lines(&block)[0];
 
-        let ceiling = RECALL_ID_MAX_CHARS
-            + RECALL_TAGS_MAX_CHARS
-            + crate::domain::knowledge::SUMMARY_MAX_CHARS
-            // "- ", " [", "] "
-            + 6;
+        let ceiling = RECALL_ENTRY_LINE_MAX_BYTES;
         assert!(
-            line.chars().count() <= ceiling,
-            "line is {} characters, over the {ceiling} the constants promise",
-            line.chars().count()
+            line.len() <= ceiling,
+            "line is {} bytes, over the {ceiling} the constants promise",
+            line.len()
         );
     }
 
@@ -1525,10 +1693,9 @@ mod tests {
             .find(|l| l.starts_with(RECALL_TAG_LABEL))
             .expect("a tag line");
         assert!(
-            line.chars().count()
-                <= RECALL_TAG_LABEL.chars().count() + 1 + RECALL_TAG_LINE_MAX_CHARS,
-            "tag line is {} characters: {line}",
-            line.chars().count()
+            line.len() <= RECALL_TAG_LABEL.len() + 1 + RECALL_TAG_LINE_MAX_BYTES,
+            "tag line is {} bytes: {line}",
+            line.len()
         );
         assert!(line.contains("topic:short"), "{line}");
     }
