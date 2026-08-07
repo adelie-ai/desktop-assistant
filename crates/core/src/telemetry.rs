@@ -54,6 +54,7 @@
 use std::fmt;
 use std::time::Duration;
 
+use adelie_telemetry::Safe;
 use adelie_telemetry::metrics::{self, Label};
 
 use crate::ports::llm::TokenUsage;
@@ -251,13 +252,18 @@ pub(crate) fn llm_span(parent: &tracing::Span, round: usize, route: &TurnRoute) 
     )
 }
 
-/// One tool dispatch, hung from its round. `tool` is the model-chosen name,
-/// capped at the same boundary every other tool-name field uses.
+/// One tool dispatch, hung from its round.
+///
+/// `tool` is chosen by the model, so it is rendered through [`Safe`] - the one
+/// way a caller-influenced value reaches a log field. Nothing else bounds it:
+/// a newline in a name produces what reads as a second genuine log line, an
+/// ANSI escape survives with colour off, and a bidi control shows a name as
+/// something it is not.
 pub(crate) fn tool_span(parent: &tracing::Span, tool: &str, runner: ToolRunner) -> tracing::Span {
     tracing::info_span!(
         parent: parent,
         "tool.call",
-        tool = %crate::tools::summarize_tool_name(tool),
+        tool = %Safe::name(tool),
         runner = runner.as_label(),
         outcome = tracing::field::Empty,
     )
@@ -322,7 +328,7 @@ pub(crate) fn record_tool_call(
         TOOL_CALL_DURATION,
         elapsed,
         &[
-            Label::new("tool", crate::tools::summarize_tool_name(tool)),
+            Label::new("tool", Safe::name(tool).to_string()),
             Label::new("runner", runner.as_label()),
             Label::new("outcome", outcome.as_label()),
         ],
@@ -498,12 +504,10 @@ impl RoundGuard {
         self.usage = usage;
     }
 
-    /// Note which tools this round called. Names only, each capped at the same
-    /// boundary every other tool-name field uses.
+    /// Note which tools this round called. Names only, each rendered through
+    /// [`Safe`] because the model chooses them.
     pub(crate) fn set_tools(&mut self, names: impl Iterator<Item = String>) {
-        let names: Vec<String> = names
-            .map(|n| crate::tools::summarize_tool_name(&n))
-            .collect();
+        let names: Vec<String> = names.map(|n| Safe::name(n).to_string()).collect();
         self.span.record("tools", names.join(","));
     }
 

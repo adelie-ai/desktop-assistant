@@ -214,6 +214,13 @@ would capture each argument by default.
 reads span fields back in process, and it reads console text, because neither
 can see what the other does.
 
+One field in the turn path is written by the model: the tool name. It goes
+through `adelie_telemetry::Safe`, which caps it and replaces the characters
+that change what a reader sees. Without that, a newline in a name produces what
+reads as a second genuine log line - its own timestamp column, its own level -
+and an ANSI escape survives even with colour off.
+`a_model_chosen_tool_name_cannot_forge_a_log_line` holds it.
+
 ## Metrics
 
 Call sites record through `adelie_telemetry::metrics` and never through an

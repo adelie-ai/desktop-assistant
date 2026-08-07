@@ -55,6 +55,7 @@ use crate::tools::{
     NoopToolExecutor, categorize_tool_namespaces, summarize_tool_name, summarize_tool_text,
     summarize_tool_value, tool_set_hash,
 };
+use adelie_telemetry::Safe;
 use chrono::{Duration, Local};
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
@@ -3105,7 +3106,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                         Ok(v) => v,
                         Err(e) => {
                             tracing::warn!(
-                                tool = %tool_call.name,
+                                tool = %Safe::name(&tool_call.name),
                                 error = %e,
                                 "tool call arguments were not valid JSON"
                             );
@@ -3124,12 +3125,16 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 // user's document, file path or credential in them. INFO
                 // carries the tool name and the size; the arguments go to
                 // DEBUG, beside the tool result that already lives there.
+                //
+                // The name is the one field here the model writes, so it goes
+                // through `Safe`: a newline in it produces what reads as a
+                // second genuine log line, with its own timestamp and level.
                 tracing::info!(
-                    tool = %tool_call.name,
+                    tool = %Safe::name(&tool_call.name),
                     arg_bytes = tool_call.arguments.len(),
                     "executing tool"
                 );
-                tracing::debug!(tool = %tool_call.name, %arguments, "tool arguments");
+                tracing::debug!(tool = %Safe::name(&tool_call.name), %arguments, "tool arguments");
 
                 // Step-planning + compaction control (#240) is handled here in
                 // the loop, not by the tool executor: only the loop owns
@@ -3261,7 +3266,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                     && !allowed.iter().any(|t| t == &tool_call.name)
                 {
                     tracing::warn!(
-                        tool = %tool_call.name,
+                        tool = %Safe::name(&tool_call.name),
                         "tool call rejected: not on the subagent's allowlist"
                     );
                     let rejection = format!(
@@ -3299,7 +3304,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                     turn_provenance.check(&tool_call.name, current_turn_interactivity())
                 {
                     tracing::warn!(
-                        tool = %summarize_tool_name(&tool_call.name),
+                        tool = %Safe::name(&tool_call.name),
                         "tool call refused: this turn ingested externally-controlled content"
                     );
                     notify_tool_event(ToolEvent::Started {
@@ -3364,7 +3369,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                         .await
                     {
                         Ok(output) => {
-                            tracing::debug!(tool = %tool_call.name, output = %output, "client tool result");
+                            tracing::debug!(tool = %Safe::name(&tool_call.name), output = %output, "client tool result");
                             (output, true)
                         }
                         // Cancellation while a client tool was suspended (e.g.
@@ -3390,12 +3395,12 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                             // carries which tool and which kind; the message
                             // goes to DEBUG, beside the result above.
                             tracing::warn!(
-                                tool = %tool_call.name,
+                                tool = %Safe::name(&tool_call.name),
                                 error_kind = e.kind(),
                                 "client tool execution failed"
                             );
                             tracing::debug!(
-                                tool = %tool_call.name,
+                                tool = %Safe::name(&tool_call.name),
                                 error = %e,
                                 "client tool failure detail"
                             );
@@ -3450,7 +3455,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                     // `advance_tool_completion_status`.
                     match outcome {
                         Ok(output) => {
-                            tracing::debug!(tool = %tool_call.name, output = %output, "tool result");
+                            tracing::debug!(tool = %Safe::name(&tool_call.name), output = %output, "tool result");
                             on_status(advance_tool_completion_status(
                                 &mut tool_completion_run,
                                 &tool_call.name,
@@ -3466,12 +3471,12 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                             // "failed to read <path>: permission denied"
                             // arrives here intact.
                             tracing::warn!(
-                                tool = %tool_call.name,
+                                tool = %Safe::name(&tool_call.name),
                                 error_kind = e.kind(),
                                 "tool execution failed"
                             );
                             tracing::debug!(
-                                tool = %tool_call.name,
+                                tool = %Safe::name(&tool_call.name),
                                 error = %e,
                                 "tool failure detail"
                             );
@@ -3511,7 +3516,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 let stored = match cap_tool_result(&result, self.max_tool_result_bytes) {
                     Some(truncated) => {
                         tracing::warn!(
-                            tool = %tool_call.name,
+                            tool = %Safe::name(&tool_call.name),
                             original_bytes = result.len(),
                             kept_bytes = truncated.len(),
                             cap_bytes = self.max_tool_result_bytes,

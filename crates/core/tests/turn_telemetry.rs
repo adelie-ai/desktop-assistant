@@ -1149,6 +1149,70 @@ fn every_probed_span_actually_opened() {
     }
 }
 
+/// A tool name shaped like a whole log line, which is what a model can put in
+/// one. Ends with an ANSI escape, which survives with colour off.
+const FORGED_TOOL_NAME: &str =
+    "write_note\n2026-01-01T00:00:00.0Z ERROR forged: the database is on fire\u{1b}[31m";
+
+#[test]
+fn a_model_chosen_tool_name_cannot_forge_a_log_line() {
+    let _serialised = serialised();
+    // The tool name is the one field in the turn path the model writes, and it
+    // reaches a span field, a metric label and a log line. Nothing else bounds
+    // it: a newline produces what reads as a second genuine line, complete
+    // with its own timestamp and level.
+    let script = vec![
+        LlmResponse::with_tool_calls(
+            "",
+            vec![ToolCall::new(
+                "c1",
+                FORGED_TOOL_NAME,
+                serde_json::json!({}).to_string(),
+            )],
+        )
+        .with_usage(usage(100, 10)),
+        LlmResponse::text(REPLY_SENTINEL).with_usage(usage(200, 20)),
+    ];
+    let tools = ScriptedTools {
+        tools: vec![ToolDefinition::new(
+            FORGED_TOOL_NAME,
+            "write a note",
+            serde_json::json!({"type": "object"}),
+        )],
+        failure: None,
+    };
+    let captured = run(Level::INFO, script, tools);
+
+    let tool = captured.span("tool.call");
+    let rendered = tool.field("tool").expect("the tool span names its tool");
+    assert!(
+        !rendered.contains('\n') && !rendered.contains('\u{1b}'),
+        "a model-chosen name must be sanitised before it reaches a span field; \
+         got {rendered:?}"
+    );
+    assert!(
+        rendered.starts_with("write_note"),
+        "and the real name must still be legible; got {rendered:?}"
+    );
+    // The name itself still appears, and should: it is what the model asked
+    // for and an operator needs to see it. What must not happen is a *line*
+    // that the model wrote - with its own timestamp column, level and target.
+    assert!(
+        !captured
+            .console
+            .lines()
+            .any(|l| l.starts_with("2026-01-01") || l.contains('\u{1b}')),
+        "no console line may begin with a timestamp the model wrote, or carry an \
+         escape it chose\n--- console ---\n{}",
+        captured.console
+    );
+    let labels = label_values_in_window(&captured.after);
+    assert!(
+        !labels.iter().any(|v| v.contains('\n')),
+        "and no metric label may carry a newline; got {labels:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The profiler this replaces.
 // ---------------------------------------------------------------------------
