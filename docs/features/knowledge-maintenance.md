@@ -196,8 +196,18 @@ The element **itself** is quoted at `DEBUG`, in a bounded excerpt. A rejected
 merge or edit carries the prose the model wrote for the entry, which is a
 fragment of the user's own knowledge base, and the journal is world-readable and
 is shipped on. So the quote sits at the same level this pass already keeps a
-model-supplied delete reason at, and the default stream carries the diagnosis
-without it.
+model-supplied delete reason at.
+
+Keeping the quote out of the `WARN` line is not enough on its own, because serde
+reports a wrong type by quoting the value: ``invalid type: string "<the whole
+value>", expected a sequence``, unbounded. A model that string-encodes an array
+instead of nesting it is an ordinary mistake, so that path is a likely one. The
+reason is therefore taken from a re-read of a copy of the element in which every
+string the model wrote has been replaced, leaving the `op` tag alone. The
+verdict is the same, the field name and the failure kind survive, and no value
+reaches the default stream. Reading the value back out of serde's message text
+would mean pattern-matching on an error string, which this codebase does not do.
+A named test holds the guarantee.
 
 Every dropped operation is counted exactly once, whatever the outcome: when the
 rest of the answer applies, when the whole answer is unreadable, and when the

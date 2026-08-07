@@ -807,7 +807,8 @@ struct DroppedOperation {
     /// alphabetical order, so a long field ahead of `op` would push the one
     /// thing that says what the model was attempting out of a bounded quote.
     op: Option<String>,
-    /// What serde said was wrong with the element.
+    /// Why the element did not read, taken from serde but with every value the
+    /// model wrote replaced first. See [`reason_for`].
     reason: String,
     /// The element itself, bounded so one long merge body cannot fill the log.
     excerpt: String,
@@ -828,8 +829,12 @@ impl DroppedOperation {
 }
 
 /// The diagnosis without the element: where it sat, what the model said it was
-/// attempting, and why it did not read. Model-authored prose is deliberately
-/// absent, so this is safe for the default log stream.
+/// attempting, and why it did not read.
+///
+/// Every value the model wrote has been replaced by the time this is built (see
+/// [`reason_for`]), and the field names serde can name are this code's own, so
+/// nothing here carries the user's knowledge base. That is what makes it safe
+/// for the default log stream.
 impl std::fmt::Display for DroppedOperation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let Self {
@@ -850,6 +855,77 @@ struct ParsedOperations {
     dropped: Vec<DroppedOperation>,
     /// How many `operations` keys the answer carried.
     operations_keys: usize,
+}
+
+/// Stands in for a value the model wrote, in a diagnosis that must not carry
+/// one. Short, so it cannot crowd out the rest of the message.
+const REDACTED_VALUE: &str = "<value>";
+
+/// A copy of `element` with every string the model wrote replaced by
+/// [`REDACTED_VALUE`], except the `op` tag.
+///
+/// Why: serde reports a wrong type as ``invalid type: string "<the whole
+/// value>", expected a sequence``, with no bound on the value. A model that
+/// string-encodes an array instead of nesting it is an ordinary mistake, and
+/// for a rejected merge or edit that value is the prose the model wrote for a
+/// knowledge-base entry. So the reason is taken from a re-read of this copy
+/// instead. Cutting the value back out of serde's message would mean
+/// pattern-matching on an error string, which this codebase does not do.
+///
+/// The verdict does not change, because the `op` tag is the only content the
+/// shape depends on and it is kept: replacing a string with another string
+/// leaves every type the same. [`reason_for`] handles the case where it changes
+/// anyway rather than trusting that argument.
+fn redact_values(element: &serde_json::Value) -> serde_json::Value {
+    match element {
+        serde_json::Value::String(_) => serde_json::Value::String(REDACTED_VALUE.to_string()),
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(redact_values).collect())
+        }
+        serde_json::Value::Object(fields) => serde_json::Value::Object(
+            fields
+                .iter()
+                .map(|(name, value)| {
+                    let value = if name == "op" {
+                        value.clone()
+                    } else {
+                        redact_values(value)
+                    };
+                    (name.clone(), value)
+                })
+                .collect(),
+        ),
+        number_or_bool_or_null => number_or_bool_or_null.clone(),
+    }
+}
+
+/// Why an element did not read, in words that carry no value the model wrote
+/// and that are bounded in length.
+fn reason_for(element: &serde_json::Value) -> String {
+    match RawOp::deserialize(&redact_values(element)) {
+        // Bounding a redacted message is defence in depth, not a live need: no
+        // input reaches this with a long one today, because the only value
+        // serde quotes without a length of its own is a string and every string
+        // has been replaced. It costs one call and it survives a serde whose
+        // messages grow.
+        Err(e) => bound_chars(&e.to_string()),
+        // Redaction changed the verdict, which the argument above says it
+        // cannot. Say that plainly rather than fall back to a message that
+        // would carry the value.
+        Ok(_) => "could not be read as an operation".to_string(),
+    }
+}
+
+/// `text`, cut to [`MAX_DROPPED_OP_EXCERPT_CHARS`] characters.
+///
+/// By characters, not bytes, so multi-byte text cannot be cut mid-codepoint.
+fn bound_chars(text: &str) -> String {
+    if text.chars().count() <= MAX_DROPPED_OP_EXCERPT_CHARS {
+        return text.to_string();
+    }
+    let mut cut: String = text.chars().take(MAX_DROPPED_OP_EXCERPT_CHARS).collect();
+    cut.push_str("...");
+    cut
 }
 
 /// The first few dropped operations as one line, so an error or a log names
@@ -879,15 +955,7 @@ fn summarize_dropped(
 /// A bounded rendering of one element, so the report names the shape that came
 /// back without carrying a whole merge body with it.
 fn excerpt_of(element: &serde_json::Value) -> String {
-    let text = element.to_string();
-    // Bounded by characters, not bytes, so a multi-byte element cannot be cut
-    // mid-codepoint.
-    if text.chars().count() <= MAX_DROPPED_OP_EXCERPT_CHARS {
-        return text;
-    }
-    let mut cut: String = text.chars().take(MAX_DROPPED_OP_EXCERPT_CHARS).collect();
-    cut.push_str("...");
-    cut
+    bound_chars(&element.to_string())
 }
 
 /// Read one consolidation answer into the operations it proposes.
@@ -930,13 +998,13 @@ fn parse_operations(response: &str) -> Result<ParsedOperations, ParseFailure> {
         // the element in hand for the excerpt when it does not read.
         match RawOp::deserialize(element) {
             Ok(op) => parsed.ops.push(op),
-            Err(e) => parsed.dropped.push(DroppedOperation {
+            Err(_) => parsed.dropped.push(DroppedOperation {
                 index,
                 op: element
                     .get("op")
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_string),
-                reason: e.to_string(),
+                reason: reason_for(element),
                 excerpt: excerpt_of(element),
             }),
         }
@@ -1505,6 +1573,74 @@ mod tests {
         let parsed = parse_operations(r#"{"operations":[]}"#).expect("keeping everything is valid");
         assert!(parsed.ops.is_empty());
         assert!(parsed.dropped.is_empty());
+    }
+
+    #[test]
+    fn a_dropped_operation_never_carries_a_model_value_into_the_default_log() {
+        // serde reports a wrong type by quoting the value, whole and unbounded.
+        // A model that string-encodes an array instead of nesting it is an
+        // ordinary mistake, and for a merge that value is the prose written for
+        // a knowledge-base entry, so this is the likely path and not an exotic
+        // one.
+        let private = "the-thing-the-user-told-adele-in-confidence ".repeat(20);
+        let answer = format!(
+            r#"{{"operations":[
+                {{"op":"edit","id":"kb-001","content":"tightened"}},
+                {{"op":"merge","ids":"{private}","content":"unified"}}
+            ]}}"#
+        );
+
+        let parsed = parse_operations(&answer).expect("the readable operation survives");
+        assert_eq!(parsed.dropped.len(), 1);
+
+        let diagnosis = parsed.dropped[0].to_string();
+        assert!(
+            !diagnosis.contains("in-confidence"),
+            "no value the model wrote may reach the default log stream: {diagnosis}"
+        );
+        assert!(
+            diagnosis.contains("sequence"),
+            "the diagnosis must still say what was wrong: {diagnosis}"
+        );
+        assert!(
+            diagnosis.contains("op=merge"),
+            "and what the model was attempting: {diagnosis}"
+        );
+        assert!(
+            diagnosis.chars().count() <= MAX_DROPPED_OP_EXCERPT_CHARS * 2,
+            "the diagnosis must be bounded: {} chars",
+            diagnosis.chars().count()
+        );
+    }
+
+    #[test]
+    fn a_missing_field_is_still_named_after_the_values_are_replaced() {
+        // Replacing the values must not cost the diagnosis its usefulness: the
+        // field names serde can report are this code's own, not the model's.
+        let answer = r#"{"operations":[
+            {"op":"edit","id":"kb-001","content":"tightened"},
+            {"op":"merge","ids":["kb-002","kb-003"]}
+        ]}"#;
+        let parsed = parse_operations(answer).expect("the readable operation survives");
+        assert!(
+            parsed.dropped[0].to_string().contains("content"),
+            "the missing field must still be named: {}",
+            parsed.dropped[0]
+        );
+    }
+
+    #[test]
+    fn bound_chars_cuts_on_a_character_boundary() {
+        let over_long = "é".repeat(MAX_DROPPED_OP_EXCERPT_CHARS + 40);
+        let cut = bound_chars(&over_long);
+        assert_eq!(cut.chars().count(), MAX_DROPPED_OP_EXCERPT_CHARS + 3);
+        assert!(cut.ends_with("..."), "a cut must say that it cut");
+        assert!(
+            cut.trim_end_matches('.').chars().all(|c| c == 'é'),
+            "no partial codepoint"
+        );
+        let short = "already short";
+        assert_eq!(bound_chars(short), short, "a short text is left alone");
     }
 
     #[test]
