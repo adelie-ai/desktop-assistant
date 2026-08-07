@@ -73,9 +73,17 @@ const STDERR_TAIL_TRUNCATED: &str = "...";
 const STDERR_TAIL_SEPARATOR: &str = " | ";
 
 /// Introduces the stderr tail in a failure message. One phrasing across every
-/// failure shape - a clean exit, a hang, a closed stdout - so an operator
-/// learns to look for the same words wherever the failure came from.
+/// failure shape - a clean exit, a hang, a closed stdout, a failed write - so
+/// an operator learns to look for the same words wherever the failure came
+/// from.
 const STDERR_TAIL_PREFIX: &str = "; it last wrote this to stderr: ";
+
+/// What is said instead of the tail when a server died without a word: a guess
+/// at the commonest silent cause, offered only where there is no evidence to
+/// offer in its place.
+const NO_STDERR_HINT: &str = " and wrote nothing to stderr; if it needs an environment \
+     variable, set it in this server's own `env` config (see \
+     docs/mcp-services.md#environment-variables) rather than relying on it being inherited";
 
 /// Cap on a remote (HTTP) response body — the streamable-HTTP analogue of
 /// [`MAX_LINE_BYTES`]. A remote server (or a hostile endpoint impersonating
@@ -838,10 +846,16 @@ impl Transport {
     /// running and so never reaches
     /// [`StdioTransport::enrich_failure`].
     ///
-    /// Reads the ring as it stands and does not wait for the drain: the child
+    /// Reads the tail as it stands and does not wait for the drain: the child
     /// is alive by definition here, so its end of the pipe stays open and the
-    /// drain cannot finish. Nothing is lost by not waiting, because a bound
-    /// only expires after seconds of silence and the drain reads continuously.
+    /// drain can never reach end-of-file. Waiting for it would spend the whole
+    /// bound and return the same answer.
+    ///
+    /// Not waiting is only safe because the drain republishes the unterminated
+    /// remainder on every read rather than holding it until a newline arrives
+    /// (see [`StderrTailState::pending`]). A server that says why and then
+    /// hangs is the case this exists for, and it is exactly the case that
+    /// leaves its last line unterminated.
     fn stderr_tail(&self) -> Option<String> {
         match self {
             Transport::Stdio(t) => stderr_tail_message(&t.stderr_tail),
@@ -852,10 +866,27 @@ impl Transport {
     }
 }
 
-/// The last few lines a spawned MCP server wrote to stderr, newest last.
-///
-/// Shared between the draining task and the failure path that reads it.
-type StderrTail = Arc<Mutex<VecDeque<String>>>;
+/// What a spawned MCP server has most recently written to stderr.
+#[derive(Default)]
+struct StderrTailState {
+    /// The last [`STDERR_TAIL_LINES`] completed lines, oldest first.
+    lines: VecDeque<String>,
+    /// The line the server has begun and not yet terminated.
+    ///
+    /// Published separately from `lines`, and refreshed on every read, because
+    /// a newline is not the only thing that ends a line in practice. A process
+    /// killed part-way through a `write`, or one that prints its complaint
+    /// without a trailing newline, leaves its last and most useful line here
+    /// and never terminates it. Two of the three failure shapes report a
+    /// server that is *still running*, so they never see end-of-file either,
+    /// and a fragment held only in the reader's own buffer would never be
+    /// reported at all.
+    pending: Option<String>,
+}
+
+/// [`StderrTailState`], shared between the draining task and the failure path
+/// that reads it.
+type StderrTail = Arc<Mutex<StderrTailState>>;
 
 /// Read `stderr` to end-of-file, keeping the last [`STDERR_TAIL_LINES`] lines
 /// in `tail`.
@@ -881,6 +912,7 @@ async fn drain_stderr(mut stderr: ChildStderr, tail: StderrTail) {
     let mut chunk = [0u8; 4096];
     let mut line: Vec<u8> = Vec::with_capacity(STDERR_TAIL_LINE_BYTES);
     let mut cut = false;
+    let mut completed: Vec<String> = Vec::new();
 
     loop {
         let read = match stderr.read(&mut chunk).await {
@@ -896,9 +928,10 @@ async fn drain_stderr(mut stderr: ChildStderr, tail: StderrTail) {
                 break;
             }
         };
+        completed.clear();
         for &byte in &chunk[..read] {
             if byte == b'\n' {
-                push_stderr_line(&tail, &line, cut);
+                completed.extend(stderr_display_line(&line, cut));
                 line.clear();
                 cut = false;
             } else if line.len() < STDERR_TAIL_LINE_BYTES {
@@ -907,11 +940,33 @@ async fn drain_stderr(mut stderr: ChildStderr, tail: StderrTail) {
                 cut = true;
             }
         }
+        // One lock per read rather than per line, so a chatty server costs a
+        // handful of acquisitions a second rather than thousands. The
+        // unterminated remainder is republished each time, which is what makes
+        // it visible to a failure raised while the server is still running.
+        publish_stderr(&tail, &completed, stderr_display_line(&line, cut));
     }
 
-    // A process that dies mid-line leaves its last line unterminated, and
-    // that line is often the one that names the cause.
-    push_stderr_line(&tail, &line, cut);
+    // End of the stream promotes the remainder to a completed line: there will
+    // be no newline for it, and it is often the one that names the cause.
+    let remainder = stderr_display_line(&line, cut);
+    publish_stderr(&tail, remainder.as_slice(), None);
+}
+
+/// Append `completed` to the ring and replace the unterminated remainder.
+///
+/// `PoisonError::into_inner`, not `unwrap`: the guarded section cannot panic,
+/// and a poisoned tail would still hold usable lines. Losing the diagnostic to
+/// a panic in the diagnostic is the worst outcome here.
+fn publish_stderr(tail: &Mutex<StderrTailState>, completed: &[String], pending: Option<String>) {
+    let mut state = tail.lock().unwrap_or_else(PoisonError::into_inner);
+    for line in completed {
+        if state.lines.len() == STDERR_TAIL_LINES {
+            state.lines.pop_front();
+        }
+        state.lines.push_back(line.clone());
+    }
+    state.pending = pending;
 }
 
 /// True for a character that re-shapes the text around it instead of adding
@@ -947,12 +1002,13 @@ fn is_display_hazard(c: char) -> bool {
     )
 }
 
-/// Add one stderr line to `tail`, evicting the oldest once the ring is full.
+/// One raw stderr line as it will be stored, or `None` when nothing worth
+/// keeping is left of it.
 ///
 /// `cut` says the reader already discarded bytes from this line. Surrounding
 /// whitespace is trimmed, and a line left blank by that is dropped rather than
 /// stored: it says nothing, and each one would evict a line that does.
-fn push_stderr_line(tail: &Mutex<VecDeque<String>>, raw: &[u8], cut: bool) {
+fn stderr_display_line(raw: &[u8], cut: bool) -> Option<String> {
     // Lossy, never fallible: stderr is a byte stream, and a server with a
     // mis-set locale (or one relaying a binary dependency's output) must
     // cost the operator a replacement character, not the whole diagnostic.
@@ -967,40 +1023,35 @@ fn push_stderr_line(tail: &Mutex<VecDeque<String>>, raw: &[u8], cut: bool) {
         .collect();
     let text = cleaned.trim();
     if text.is_empty() {
-        return;
+        return None;
     }
 
     // Bound the stored line, not the raw bytes: lossy decoding expands each
     // undecodable byte to three, so a cap applied before decoding would not
     // hold. Cutting on a char boundary keeps the result valid UTF-8.
-    let line = if cut || text.len() > STDERR_TAIL_LINE_BYTES {
-        let mut end = (STDERR_TAIL_LINE_BYTES - STDERR_TAIL_TRUNCATED.len()).min(text.len());
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}{STDERR_TAIL_TRUNCATED}", &text[..end])
-    } else {
-        text.to_string()
-    };
-
-    // `PoisonError::into_inner`, not `unwrap`: the guarded section cannot
-    // panic, and a poisoned ring would still hold usable lines. Losing the
-    // diagnostic to a panic in the diagnostic is the worst outcome here.
-    let mut ring = tail.lock().unwrap_or_else(PoisonError::into_inner);
-    if ring.len() == STDERR_TAIL_LINES {
-        ring.pop_front();
+    if !cut && text.len() <= STDERR_TAIL_LINE_BYTES {
+        return Some(text.to_string());
     }
-    ring.push_back(line);
+    let mut end = (STDERR_TAIL_LINE_BYTES - STDERR_TAIL_TRUNCATED.len()).min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(format!("{}{STDERR_TAIL_TRUNCATED}", &text[..end]))
 }
 
 /// The tail as one line, oldest first, or `None` if the server said nothing.
-fn stderr_tail_message(tail: &Mutex<VecDeque<String>>) -> Option<String> {
-    let ring = tail.lock().unwrap_or_else(PoisonError::into_inner);
-    if ring.is_empty() {
+///
+/// The unterminated remainder comes last, because that is where the server put
+/// it. It is not itself bounded by [`STDERR_TAIL_LINES`], so a full tail is
+/// that many completed lines plus one fragment.
+fn stderr_tail_message(tail: &Mutex<StderrTailState>) -> Option<String> {
+    let state = tail.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut parts: Vec<&str> = state.lines.iter().map(String::as_str).collect();
+    parts.extend(state.pending.as_deref());
+    if parts.is_empty() {
         return None;
     }
-    let lines: Vec<&str> = ring.iter().map(String::as_str).collect();
-    Some(lines.join(STDERR_TAIL_SEPARATOR))
+    Some(parts.join(STDERR_TAIL_SEPARATOR))
 }
 
 /// JSON-RPC over the stdio of a spawned MCP server child process.
@@ -1067,8 +1118,10 @@ impl StdioTransport {
         let reader = BufReader::new(stdout);
         let stderr = child.stderr.take().ok_or(McpError::NoStderr)?;
 
-        let stderr_tail: StderrTail =
-            Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL_LINES)));
+        let stderr_tail: StderrTail = Arc::new(Mutex::new(StderrTailState {
+            lines: VecDeque::with_capacity(STDERR_TAIL_LINES),
+            pending: None,
+        }));
         let stderr_drain = tokio::spawn(drain_stderr(stderr, Arc::clone(&stderr_tail)));
 
         Ok(Self {
@@ -1227,7 +1280,7 @@ impl StdioTransport {
     /// needed and did not get (see [`ENV_PASSTHROUGH_ALLOWLIST`]) is a fair
     /// guess and there is nothing better to offer.
     ///
-    /// Three failure shapes reach here, and each gets the tail:
+    /// Four failure shapes reach here, and each gets the tail:
     ///
     /// 1. **Stdout ended and the child exited.** The message names the exit
     ///    status and quotes the tail.
@@ -1240,12 +1293,21 @@ impl StdioTransport {
     ///    tail rides on [`McpError::Timeout`] instead. A hang is the failure
     ///    an operator finds hardest to read, and the server has usually
     ///    already said why.
+    /// 4. **The write failed.** `round_trip` writes and reads at once, and a
+    ///    server that has gone leaves the read end of the client's stdin pipe
+    ///    closed, so `write_all` fails with `EPIPE` before the read sees
+    ///    end-of-file. Which of the two wins is a race, and an operator must
+    ///    not be able to tell: `Broken pipe` on its own names no status and
+    ///    quotes no stderr. The error keeps its class — a caller matching
+    ///    [`McpError::Io`] still matches, and the [`std::io::ErrorKind`] is
+    ///    preserved — and gains the same sentence shapes 1 and 2 produce.
     ///
     /// Note that shape 3 is the *inner*, per-line bound. A handshake that
     /// hangs normally trips the outer bound in [`McpClient::from_transport`]
     /// first, which attaches the tail itself.
     ///
-    /// Two waits, both bounded, and both only on shape 1:
+    /// Two waits, both bounded, and both only where the child may have exited
+    /// (shapes 1, 2 and 4):
     ///
     /// 1. `child.wait()`, not the non-blocking `try_wait()`. The pipe's read
     ///    end closes (which is what produced `err`) as soon as the kernel
@@ -1270,7 +1332,7 @@ impl StdioTransport {
     async fn enrich_failure(
         child: &mut Child,
         stderr_drain: &mut JoinHandle<()>,
-        stderr_tail: &Mutex<VecDeque<String>>,
+        stderr_tail: &Mutex<StderrTailState>,
         err: McpError,
     ) -> McpError {
         // Shape 3. The child is alive and still holds the stderr pipe open,
@@ -1285,12 +1347,19 @@ impl StdioTransport {
             };
         }
 
-        let McpError::UnexpectedResponse(ref msg) = err else {
-            return err;
+        // Shapes 1, 2 and 4. Anything else is a failure the server explained
+        // for itself (a JSON-RPC error, an unsupported protocol version) and
+        // needs no help from its stderr.
+        let write_failed = match &err {
+            McpError::UnexpectedResponse(msg) => {
+                if msg != Self::CLOSED_STDOUT {
+                    return err;
+                }
+                false
+            }
+            McpError::Io(_) => true,
+            _ => return err,
         };
-        if msg != Self::CLOSED_STDOUT {
-            return err;
-        }
 
         let status = tokio::time::timeout(Self::EXIT_STATUS_WAIT, child.wait())
             .await
@@ -1311,33 +1380,48 @@ impl StdioTransport {
         }
 
         let tail = stderr_tail_message(stderr_tail);
-        let Some(status) = status else {
-            // Shape 2.
-            return match tail {
-                Some(tail) => McpError::UnexpectedResponse(format!(
-                    "{}{STDERR_TAIL_PREFIX}{tail}",
-                    Self::CLOSED_STDOUT
-                )),
-                None => err,
-            };
+
+        // What became of the server, or nothing when it is still running and
+        // said nothing either.
+        let account = match (&status, &tail) {
+            (Some(status), _) => {
+                let detail = match status.code() {
+                    Some(code) => format!("exited with status {code}"),
+                    None => format!("was terminated by a signal ({status})"),
+                };
+                let suffix = match &tail {
+                    Some(tail) => format!("{STDERR_TAIL_PREFIX}{tail}"),
+                    None => NO_STDERR_HINT.to_string(),
+                };
+                Some(format!(
+                    "MCP server {detail} before completing the handshake{suffix}"
+                ))
+            }
+            (None, Some(tail)) => {
+                Some(format!("{}{STDERR_TAIL_PREFIX}{tail}", Self::CLOSED_STDOUT))
+            }
+            (None, None) => None,
         };
 
-        // Shape 1.
-        let detail = match status.code() {
-            Some(code) => format!("exited with status {code}"),
-            None => format!("was terminated by a signal ({status})"),
+        let Some(account) = account else {
+            // Shape 2 with a server that said nothing: there is no exit status
+            // and no stderr, so the original message is already the whole
+            // truth.
+            return err;
         };
-        match tail {
-            Some(tail) => McpError::UnexpectedResponse(format!(
-                "MCP server {detail} before completing the handshake{STDERR_TAIL_PREFIX}{tail}"
-            )),
-            None => McpError::UnexpectedResponse(format!(
-                "MCP server {detail} before completing the handshake and wrote nothing \
-                 to stderr; if it needs an environment variable, set it in this server's \
-                 own `env` config (see docs/mcp-services.md#environment-variables) rather \
-                 than relying on it being inherited"
-            )),
+
+        if !write_failed {
+            // Shapes 1 and 2: the account replaces the generic message.
+            return McpError::UnexpectedResponse(account);
         }
+
+        // Shape 4: the account joins the I/O error rather than replacing it.
+        // "Broken pipe" is why *this request* failed; the account is why the
+        // server was not there to answer it, and a reader needs both.
+        let McpError::Io(io) = &err else {
+            return err;
+        };
+        McpError::Io(std::io::Error::new(io.kind(), format!("{io}; {account}")))
     }
 
     async fn send_notification(

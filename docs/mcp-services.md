@@ -474,7 +474,7 @@ If the server process exits before completing the handshake, the logged error na
 MCP server exited with status 2 before completing the handshake; it last wrote this to stderr: error: the following required arguments were not provided: --config <CONFIG>
 ```
 
-A server does not have to exit to fail, and the other two shapes carry the same clause. A server that stops answering is reported as a timeout, so a hang — the startup failure that is hardest to read, because nothing exited and nothing was refused — still names its cause:
+A server does not have to exit to fail, and the other three shapes carry the same clause. A server that stops answering is reported as a timeout, so a hang — the startup failure that is hardest to read, because nothing exited and nothing was refused — still names its cause:
 
 ```
 MCP request 'initialize' timed out after 30s of silence; it last wrote this to stderr: fatal: cannot open database
@@ -486,7 +486,13 @@ A server that abandons its stdout but keeps running has no exit status to name, 
 MCP server closed stdout; it last wrote this to stderr: fatal: no write access to the state directory
 ```
 
-The quoted tail is bounded: the last 10 lines, each capped at 512 bytes and marked with `...` where it was cut, joined with ` | ` onto one line. Lines beyond that are discarded as they arrive, so a server that floods stderr cannot enlarge the message. Characters that would re-shape the line the message lands in are replaced with spaces before it is quoted — the C0/C1 controls, the Unicode format characters (bidi overrides, zero-width marks) and U+2028/U+2029, which a JSON field and an HTML renderer both treat as a line break. The text is a server-chosen remote string, and a renderer must still escape it for its own medium.
+A server that has already gone when the daemon next writes to it fails on the write, because the read end of its stdin pipe is closed. The error keeps its I/O class and gains the same account, so which side of the exchange noticed first is not something a reader has to work out:
+
+```
+I/O error communicating with MCP server: Broken pipe (os error 32); MCP server exited with status 4 before completing the handshake; it last wrote this to stderr: fatal: lost its database connection
+```
+
+The quoted tail is bounded: the last 10 completed lines, plus an unterminated final fragment where the server left one, each capped at 512 bytes and marked with `...` where it was cut, joined with ` | ` onto one line. The fragment matters because a server killed part-way through a write, or one that prints its complaint without a trailing newline, puts its most useful line there and never terminates it. Lines beyond that are discarded as they arrive, so a server that floods stderr cannot enlarge the message. Characters that would re-shape the line the message lands in are replaced with spaces before it is quoted — the C0/C1 controls, the Unicode format characters (bidi overrides, zero-width marks) and U+2028/U+2029, which a JSON field and an HTML renderer both treat as a line break. The text is a server-chosen remote string, and a renderer must still escape it for its own medium.
 
 A server's stderr appears **only** in this failure message. It is never streamed to the log as it arrives, at any level, because it is the server's own unfiltered output and can carry a credential or a fragment of user content — see [Logging](logging.md#what-may-appear-at-each-level).
 
