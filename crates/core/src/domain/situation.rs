@@ -185,13 +185,13 @@ pub const MAX_SITUATION_VALUE_CHARS: usize = 128;
 /// [`MAX_STANDING_OFFERS`]: crate::ports::knowledge_use::MAX_STANDING_OFFERS
 pub const MAX_SITUATION_VALUES_PER_FIELD: usize = 8;
 
-/// One situation value as it is stored: trimmed, cut to
+/// One situation value as it is stored: trimmed, lowercased, cut to
 /// [`MAX_SITUATION_VALUE_CHARS`], and with anything a text column cannot hold
 /// removed.
 ///
 /// `None` where nothing usable is left, which is the same answer as a field with
-/// no source. Two rules, and both exist because the value is a database key
-/// rather than a display string:
+/// no source. Three rules, and all three exist because the value is a database
+/// key rather than a display string:
 ///
 /// - **No NUL byte.** Postgres `text` cannot hold one, so a value carrying one
 ///   raises on the wire and takes the whole write with it - the trap
@@ -199,11 +199,22 @@ pub const MAX_SITUATION_VALUES_PER_FIELD: usize = 8;
 /// - **No newline or control character.** The value is a key a fan is counted
 ///   over and a name an operator reads back; a control character makes two
 ///   values that look identical count separately.
+/// - **One case.** The match is string equality, so a machine that answers
+///   `Workshop` to one client and `workshop` to another would hold two values,
+///   halve its own fan, and match neither prompt in full. Folding here rather
+///   than at the one caller that needs it today means a free-form field added
+///   later inherits the rule instead of quietly going without it.
+///
+/// **Idempotent, and it has to be.** Every value read back out of the store
+/// passes through [`SituationRecord::with`] and is cleaned again, so a cleaner
+/// that changed a value it had already cleaned would make a stored value stop
+/// matching itself.
 fn storable_value(value: &str) -> Option<String> {
     let cleaned: String = value
         .trim()
         .chars()
         .filter(|c| !c.is_control())
+        .flat_map(char::to_lowercase)
         .take(MAX_SITUATION_VALUE_CHARS)
         .collect();
     let cleaned = cleaned.trim().to_string();
@@ -367,11 +378,7 @@ impl Situation {
     pub fn observe(now: DateTime<Utc>, sources: &SituationSources<'_>) -> Self {
         let mut situation = Self::new();
         if let Some(host) = sources.host {
-            // Trimmed and lowercased, because the match is string equality and
-            // the value is self-reported. One machine that answers `Workshop`
-            // to one client and `workshop` to another would otherwise hold two
-            // values, halve its own fan, and match neither prompt fully.
-            situation = situation.with(SituationField::Host, host.to_lowercase());
+            situation = situation.with(SituationField::Host, host);
         }
         let Some(local) = sources.timezone.and_then(|zone| local_time(now, zone)) else {
             return situation;
@@ -532,15 +539,17 @@ impl SituationCue {
     /// Read `situation` against a store, or `None` where the store cannot grade
     /// it.
     ///
-    /// `population` is how many entries of the source carry any situation record
-    /// at all, and `fan` is how many of those carry the cue's own value for each
-    /// field. Both are counted over the whole source rather than over the
-    /// candidates one lookup returned.
+    /// `fans` says, for each field the situation states, how many entries record
+    /// that field at all and how many of those carry the cue's own value - see
+    /// [`FieldFan`], which holds why both counts are per field. Both are counted
+    /// over the whole source rather than over the candidates one lookup
+    /// returned.
     ///
     /// `None` - the quiet answer, which leaves every entry ranked the way it
-    /// ranked before this term existed - for a population under
-    /// [`SITUATION_MIN_POPULATION`], for an empty situation, and for a count
-    /// that is not a number.
+    /// ranked before this term existed - for an empty situation, and for a store
+    /// where no field the cue states reaches [`SITUATION_MIN_POPULATION`]. A
+    /// field the store says nothing about is weighted at zero rather than
+    /// silencing the fields beside it.
     pub fn measured(
         situation: Situation,
         fans: &BTreeMap<SituationField, FieldFan>,

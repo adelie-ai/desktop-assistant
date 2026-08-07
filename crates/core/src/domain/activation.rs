@@ -273,9 +273,10 @@ impl ActivationWeights {
         }
         // `max(0.0)` rather than a bare product, so "never negative" is a
         // property of this function and not of the weights it happens to be
-        // handed. `use_lift` is a deployment's to state, and a negative one
-        // would otherwise make a matching situation subtract - the opposite of
-        // what every line above claims.
+        // handed. Nothing constructs these weights but `Default` today; the
+        // struct exists so a deployment can fit its own from its own use log,
+        // and a negative `use_lift` would otherwise make a matching situation
+        // subtract - the opposite of what every line above claims.
         self.situation_lift().max(0.0) * coverage.min(1.0)
     }
 }

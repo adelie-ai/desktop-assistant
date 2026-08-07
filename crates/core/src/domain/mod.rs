@@ -18,8 +18,8 @@ pub use knowledge_use::{
 pub use message::{Message, Role};
 pub use scratchpad::{DEFAULT_NOTE_TYPE, ScratchpadNote};
 pub use situation::{
-    MAX_SITUATION_VALUES_PER_FIELD, SITUATION_MIN_POPULATION, Situation, SituationCue,
-    SituationField, SituationRecord, SituationSources, TimeOfDay,
+    FieldFan, MAX_SITUATION_VALUE_CHARS, MAX_SITUATION_VALUES_PER_FIELD, SITUATION_MIN_POPULATION,
+    Situation, SituationCue, SituationField, SituationRecord, SituationSources, TimeOfDay,
 };
 pub use skill::{
     AttachmentDigest, IndexedSkill, Locality, ParsedSkill, SkillApproval, SkillError,

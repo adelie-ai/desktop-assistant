@@ -440,12 +440,15 @@ where the block loses the order, never the lines, and says so once in the
 journal.
 
 **A value a client chooses never becomes a value the database refuses.** The
-host is self-reported and nothing upstream bounds it, and it becomes part of a
-primary key and a btree index, so it is trimmed, lowercased, stripped of control
-characters and cut to `MAX_SITUATION_VALUE_CHARS` before it is stored - the
-trade a mark's reason already makes. Lowercasing earns its place on its own: one
-machine answering `Workshop` to one client and `workshop` to another would hold
-two values, halve its own fan, and match neither prompt in full.
+host is self-reported and nothing upstream bounds it - `sanitize_client_field`
+runs at the prompt renderer, not at the transport - and it becomes part of a
+primary key and a btree index. So every situation value is trimmed, lowercased,
+stripped of control characters and cut to `MAX_SITUATION_VALUE_CHARS` before it
+is stored, the trade a mark's reason already makes. The cleaner is idempotent,
+because a value read back out of the store passes through it again. Lowercasing
+earns its place on its own: one machine answering `Workshop` to one client and
+`workshop` to another would hold two values, halve its own fan, and match
+neither prompt in full.
 
 **Recording the situation of a reuse cannot cost the reuse.** The write runs
 after the transaction that counts the open has committed, in its own

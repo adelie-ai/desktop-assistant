@@ -828,6 +828,63 @@ mod tests {
         assert!(records.is_empty());
     }
 
+    // --- The situation behind the third term (#1125) ------------------------
+
+    /// A situation the store answers with is keyed by the entry it is about, and
+    /// travels beside the cue that grades it.
+    #[tokio::test]
+    async fn the_situation_answers_are_keyed_by_the_entry_they_are_about() {
+        let (records, cue) = situation_signal(async {
+            Ok(SituationSignal {
+                records: vec![
+                    ("kb-1".to_string(), SituationRecord::new()),
+                    ("kb-2".to_string(), SituationRecord::new()),
+                ],
+                cue: None,
+            })
+        })
+        .await;
+
+        assert_eq!(records.len(), 2);
+        assert!(records.contains_key("kb-1"));
+        assert!(records.contains_key("kb-2"));
+        assert!(cue.is_none());
+    }
+
+    /// A situation that cannot be read costs the ranking, not the block - the
+    /// same bargain the use log makes, and the reason the read is separate from
+    /// it.
+    ///
+    /// Both halves go, and that is deliberate: a record nothing can grade scores
+    /// zero and a cue nothing carries a record for scores zero, so half an
+    /// answer is worth what no answer is worth.
+    #[tokio::test]
+    async fn a_situation_that_cannot_be_read_costs_the_ranking_and_not_the_block() {
+        let (records, cue) =
+            situation_signal(async { Err(CoreError::Storage("the table is not there".into())) })
+                .await;
+
+        assert!(records.is_empty());
+        assert!(cue.is_none());
+    }
+
+    /// The same for a read that is merely slow. The situation is the cheapest
+    /// signal in the score, so it must never be what makes a turn slow.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_situation_read_costs_the_ranking_and_not_the_block() {
+        let (records, cue) = situation_signal(async {
+            tokio::time::sleep(USE_LOG_READ_CEILING * 2).await;
+            Ok(SituationSignal {
+                records: vec![("kb-1".to_string(), SituationRecord::new())],
+                cue: None,
+            })
+        })
+        .await;
+
+        assert!(records.is_empty());
+        assert!(cue.is_none());
+    }
+
     #[tokio::test]
     async fn a_backend_that_answers_with_no_vector_degrades() {
         // An empty batch, and an empty vector, are both "no embedding". Passing

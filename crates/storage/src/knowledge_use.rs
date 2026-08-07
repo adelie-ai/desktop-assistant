@@ -14,9 +14,11 @@
 //!
 //! It is a fact about what happened to an entry, which is what this log holds,
 //! and half of it *is* a use: #238's accumulation rule says an entry records
-//! where it proved useful, so the write rides
-//! [`KnowledgeUseLog::record_opened`]'s own transaction and against exactly the
-//! ids that transaction counted as opens. The other half - the situation an
+//! where it proved useful, so [`KnowledgeUseLog::record_opened`] records it
+//! against exactly the ids its own transaction counted as opens. It does so
+//! *after* that transaction commits, and in its own - a measurement must not be
+//! able to break what it measures, and inside the transaction a failing
+//! situation write would roll the open back. The other half - the situation an
 //! entry was written in - has no use behind it and arrives through
 //! [`KnowledgeUseLog::record_situation`]. Both land in one table, because from
 //! the reader's side they are one question.
@@ -133,8 +135,10 @@ struct SituationRow {
     value: String,
 }
 
-/// What the store says one cue value is worth: how many entries carry it, and
-/// how many entries the store holds records for at all.
+/// What the store says one cue value is worth: how many entries record the
+/// field it belongs to, and how many of those carry the value itself. Both
+/// counts are per field - see
+/// [`FieldFan`](desktop_assistant_core::domain::situation::FieldFan).
 #[derive(sqlx::FromRow)]
 struct FanRow {
     field: String,
@@ -142,14 +146,19 @@ struct FanRow {
     fan: i64,
 }
 
-/// Read `situation` against the whole store: how many entries carry any record,
-/// and how many carry each of the cue's own values (#1125).
+/// Read `situation` against the whole store: for each field the cue states, how
+/// many entries record that field and how many of those carry the cue's own
+/// value (#1125).
 ///
-/// One statement, so the population every fan is read against and the fans
-/// themselves describe one store at one instant. A population counted in a
-/// second round trip could disagree with a fan by however many entries landed
-/// between them, and a fan larger than its own population is an information
-/// quantity below zero.
+/// **Per field on both sides.** Which fields an observation can read depends on
+/// the client that made it, so a store's coverage is uneven, and a fan divided
+/// by a store-wide count would read a gap in coverage as evidence - see
+/// [`FieldFan`](desktop_assistant_core::domain::situation::FieldFan).
+///
+/// One statement, so every count describes one store at one instant. A
+/// population counted in a second round trip could disagree with a fan by
+/// however many entries landed between them, and a fan larger than its own
+/// population is an information quantity below zero.
 ///
 /// Runs inside the caller's transaction, so it shares that transaction's
 /// connection and its statement timeout.
@@ -212,11 +221,8 @@ async fn measure_cue(
 /// Record `situation` against every one of `ids` the caller owns, and hold each
 /// entry's record inside its per-field bound (#1125).
 ///
-/// Shared by the two writes that produce one - the observation
-/// ([`KnowledgeUseLog::record_situation`]) and the reuse
-/// ([`KnowledgeUseLog::record_opened`]) - because they differ only in which ids
-/// they arrive with, and a second copy of an upsert-then-evict pair is a second
-/// place for the bound to be forgotten.
+/// The upsert and the eviction that bounds it are one unit, in one transaction,
+/// because a record that grew without the trim is a record nothing later bounds.
 ///
 /// **Idempotent by key.** A value the entry's record already holds moves `times`
 /// and `last_seen_at` and changes nothing any ranking reads, so a retried write
@@ -267,11 +273,13 @@ async fn write_situation(
     // been useful from more machines than this has stopped saying anything about
     // where it is useful. Least recently seen goes first, and the value breaks a
     // tie so the trim is the same trim every time.
-    // The two leading predicates are not redundant with the subquery: without
-    // them the deleting side of a row-constructor `IN` has no restriction of its
-    // own and the planner scans the whole table, on every write. With them it
-    // walks the primary key's own `(user_id, entry_id)` prefix, so the scan is
-    // one entry's handful of rows.
+    // The two leading predicates are logically implied by the subquery, which
+    // carries the same two, so the set deleted is the same either way. They are
+    // there to state the restriction on the deleting side rather than leave it
+    // to be pushed down: this statement runs on every write, and what it may
+    // touch - one user's named entries, nothing else - should be readable
+    // without tracing it through a window function. Measured on this repo's own
+    // Postgres, both forms index-scan the primary key.
     sqlx::query(
         "DELETE FROM knowledge_situation ks \
          WHERE ks.user_id = $1 \
