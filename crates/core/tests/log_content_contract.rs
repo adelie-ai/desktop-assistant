@@ -21,6 +21,7 @@ use desktop_assistant_core::domain::{
     Conversation, ConversationId, ConversationSummary, Message, ToolCall, ToolDefinition,
     ToolNamespace,
 };
+use desktop_assistant_core::ports::client_tools::{ClientToolPort, with_client_tools};
 use desktop_assistant_core::ports::inbound::ConversationService;
 use desktop_assistant_core::ports::llm::{ChunkCallback, LlmClient, LlmResponse, ReasoningConfig};
 use desktop_assistant_core::ports::store::ConversationStore;
@@ -210,6 +211,8 @@ impl LlmClient for ScriptedLlm {
 
 struct ScriptedToolExecutor {
     tools: Vec<ToolDefinition>,
+    /// When set, every dispatch fails with this error instead of succeeding.
+    failure: Option<String>,
 }
 
 impl ToolExecutor for ScriptedToolExecutor {
@@ -234,8 +237,63 @@ impl ToolExecutor for ScriptedToolExecutor {
         _name: &str,
         _arguments: serde_json::Value,
     ) -> Result<String, CoreError> {
-        Ok("ok".to_string())
+        match &self.failure {
+            Some(message) => Err(CoreError::ToolExecution(message.clone())),
+            None => Ok("ok".to_string()),
+        }
     }
+}
+
+/// A client-tool port whose every call fails with `failure`.
+///
+/// The turn loop routes a registered name here instead of to the server-side
+/// executor, and that arm has its own log site, so it needs its own coverage.
+struct FailingClientToolPort {
+    tools: Vec<ToolDefinition>,
+    failure: String,
+}
+
+#[async_trait::async_trait]
+impl ClientToolPort for FailingClientToolPort {
+    async fn tool_definitions(&self) -> Vec<ToolDefinition> {
+        self.tools.clone()
+    }
+
+    async fn is_registered(&self, name: &str) -> bool {
+        self.tools.iter().any(|t| t.name == name)
+    }
+
+    async fn execute(
+        &self,
+        _tool_call_id: &str,
+        _tool_name: &str,
+        _arguments: serde_json::Value,
+    ) -> Result<String, CoreError> {
+        Err(CoreError::ToolExecution(self.failure.clone()))
+    }
+}
+
+/// A handler whose every tool dispatch fails with `failure`.
+fn failing_handler(
+    failure: &str,
+) -> ConversationHandler<MemStore, ScriptedLlm, ScriptedToolExecutor> {
+    ConversationHandler::with_tools(
+        MemStore {
+            data: Mutex::new(HashMap::new()),
+        },
+        ScriptedLlm {
+            responses: Mutex::new(tool_call_script()),
+        },
+        ScriptedToolExecutor {
+            tools: vec![ToolDefinition::new(
+                "write_note",
+                "write a note",
+                serde_json::json!({"type": "object"}),
+            )],
+            failure: Some(failure.to_string()),
+        },
+        Box::new(|| "conv-1".to_string()),
+    )
 }
 
 fn handler(
@@ -254,6 +312,7 @@ fn handler(
                 "write a note",
                 serde_json::json!({"type": "object"}),
             )],
+            failure: None,
         },
         Box::new(|| "conv-1".to_string()),
     )
@@ -349,4 +408,100 @@ fn no_model_text_at_info_when_the_reply_sanitizes_to_nothing() {
         "the warning itself must survive - it is how an operator sees the condition\n\
          --- captured at INFO ---\n{logs}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// A failing tool's own words.
+//
+// The success arm puts a tool's output at DEBUG, so tool output is already
+// treated as content. The failure arm is the same content by another route: an
+// MCP server says what it could not do, and that sentence quotes the argument
+// it was given. `McpError::ServerError` renders the server's message verbatim,
+// so "failed to read <path>: permission denied" arrives at the log site whole.
+// WARN is above INFO, so it is on in every deployment.
+// ---------------------------------------------------------------------------
+
+/// Shaped like what a file or shell tool actually says when it fails.
+const TOOL_ERROR_SENTINEL: &str =
+    "failed to read /home/example/.ssh/SENTINEL-ID-ED25519: permission denied";
+
+/// Run one turn whose tool call fails inside the server-side executor.
+fn server_tool_failure_capturing(level: Level) -> String {
+    let (_, logs) = capture_at(level, async {
+        let handler = failing_handler(TOOL_ERROR_SENTINEL);
+        turn_with_a_tool_call(&handler).await;
+    });
+    logs
+}
+
+/// Run one turn whose tool call is routed to a client tool that fails.
+fn client_tool_failure_capturing(level: Level) -> String {
+    let (_, logs) = capture_at(level, async {
+        let handler = handler(tool_call_script());
+        let port: std::sync::Arc<dyn ClientToolPort> = std::sync::Arc::new(FailingClientToolPort {
+            tools: vec![ToolDefinition::new(
+                "write_note",
+                "write a note",
+                serde_json::json!({"type": "object"}),
+            )],
+            failure: TOOL_ERROR_SENTINEL.to_string(),
+        });
+        with_client_tools(port, async {
+            turn_with_a_tool_call(&handler).await;
+        })
+        .await;
+    });
+    logs
+}
+
+#[test]
+fn no_tool_error_text_at_info() {
+    let logs = server_tool_failure_capturing(Level::INFO);
+    assert!(
+        !logs.contains(TOOL_ERROR_SENTINEL),
+        "a failing tool's message quotes what it failed on and must not reach a WARN line\n\
+         --- captured at INFO ---\n{logs}"
+    );
+    // The line itself must survive, and must still say which tool and what
+    // went wrong - otherwise deleting the log site would pass this test.
+    assert!(
+        logs.contains("tool execution failed"),
+        "the failure line must survive\n--- captured at INFO ---\n{logs}"
+    );
+    assert!(
+        logs.contains(r#"error_kind="tool_execution""#),
+        "the line must still classify the failure\n--- captured at INFO ---\n{logs}"
+    );
+}
+
+#[test]
+fn no_client_tool_error_text_at_info() {
+    let logs = client_tool_failure_capturing(Level::INFO);
+    assert!(
+        !logs.contains(TOOL_ERROR_SENTINEL),
+        "the client-tool arm has its own log site and the same rule applies\n\
+         --- captured at INFO ---\n{logs}"
+    );
+    assert!(
+        logs.contains("client tool execution failed"),
+        "the failure line must survive\n--- captured at INFO ---\n{logs}"
+    );
+    assert!(
+        logs.contains(r#"error_kind="tool_execution""#),
+        "the line must still classify the failure\n--- captured at INFO ---\n{logs}"
+    );
+}
+
+#[test]
+fn tool_error_text_appears_at_debug() {
+    for logs in [
+        server_tool_failure_capturing(Level::DEBUG),
+        client_tool_failure_capturing(Level::DEBUG),
+    ] {
+        assert!(
+            logs.contains(TOOL_ERROR_SENTINEL),
+            "the message belongs at DEBUG, so an operator diagnosing the tool can ask\n\
+             --- captured at DEBUG ---\n{logs}"
+        );
+    }
 }

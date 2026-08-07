@@ -68,7 +68,19 @@ async fn main() -> anyhow::Result<()> {
     // Held for the whole of `main`. Dropping it flushes and shuts down the
     // telemetry pipelines; a process that exits without that flush loses
     // whatever was still buffered.
-    let _telemetry = adelie_telemetry::init(desktop_assistant_dbus_bridge::telemetry::config())?;
+    //
+    // Matched rather than `?`, for the same reason the daemon does: a bridge
+    // that refuses to start because telemetry could not be installed takes the
+    // desktop's whole D-Bus surface down with it. The report goes to stderr
+    // directly, since the subscriber is the thing that failed.
+    let _telemetry = match adelie_telemetry::init(desktop_assistant_dbus_bridge::telemetry::config())
+    {
+        Ok(guard) => Some(guard),
+        Err(error) => {
+            eprintln!("telemetry could not be installed, continuing without it: {error}");
+            None
+        }
+    };
 
     let cli = Cli::parse();
 

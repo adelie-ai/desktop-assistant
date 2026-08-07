@@ -825,7 +825,19 @@ async fn main() -> Result<()> {
     // whatever was still buffered, which is usually the part worth having.
     // Every early return below drops it, so the two command-line escape
     // hatches flush as well.
-    let _telemetry = adelie_telemetry::init(telemetry::config())?;
+    //
+    // Matched rather than `?`: telemetry that could not be installed must not
+    // stop the daemon. An assistant that refuses to start because a collector
+    // endpoint was mistyped is worse than one that starts without export, and
+    // the report has nowhere to go but stderr, since the subscriber is the
+    // thing that failed.
+    let _telemetry = match adelie_telemetry::init(telemetry::config()) {
+        Ok(guard) => Some(guard),
+        Err(error) => {
+            eprintln!("telemetry could not be installed, continuing without it: {error}");
+            None
+        }
+    };
     tracing::info!("desktop-assistant starting");
 
     // DT-3 (#269): operator escape hatch. `desktop-assistant --revoke-token

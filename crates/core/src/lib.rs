@@ -108,6 +108,38 @@ pub enum CoreError {
     },
 }
 
+impl CoreError {
+    /// A stable, machine-readable name for which error this is.
+    ///
+    /// This exists so a log line can say what went wrong without saying what
+    /// the caller was doing. Every string-carrying variant above quotes
+    /// something it was given: a tool error carries whatever an MCP server put
+    /// in its message, which is routinely a file path or the argument it
+    /// failed on, and an LLM error carries whatever the provider returned.
+    /// The `Display` form is therefore conversation content and belongs at
+    /// DEBUG; this is not, and belongs beside it at INFO or WARN.
+    ///
+    /// The strings are part of the operator-facing contract - they are what an
+    /// alert or a log query matches on - so treat them as stable and add a new
+    /// one rather than renaming an existing one.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::SystemService(_) => "system_service",
+            Self::ConversationNotFound(_) => "conversation_not_found",
+            Self::Llm(_) => "llm",
+            Self::ContextOverflow { .. } => "context_overflow",
+            Self::RateLimited { .. } => "rate_limited",
+            Self::QuotaExceeded { .. } => "quota_exceeded",
+            Self::ModelLoading { .. } => "model_loading",
+            Self::ToolsUnsupported { .. } => "tools_unsupported",
+            Self::Storage(_) => "storage",
+            Self::ToolExecution(_) => "tool_execution",
+            Self::Cancelled => "cancelled",
+            Self::InvalidInput { .. } => "invalid_input",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

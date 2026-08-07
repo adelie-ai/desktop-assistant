@@ -2813,7 +2813,21 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                             return Err(CoreError::Cancelled);
                         }
                         Err(e) => {
-                            tracing::warn!(tool = %tool_call.name, error = %e, "client tool execution failed");
+                            // The error text is content by another route: a
+                            // client tool reports what it failed on, which is
+                            // the path or the argument the model gave it. WARN
+                            // carries which tool and which kind; the message
+                            // goes to DEBUG, beside the result above.
+                            tracing::warn!(
+                                tool = %tool_call.name,
+                                error_kind = e.kind(),
+                                "client tool execution failed"
+                            );
+                            tracing::debug!(
+                                tool = %tool_call.name,
+                                error = %e,
+                                "client tool failure detail"
+                            );
                             (format!("Error: {e}"), false)
                         }
                     }
@@ -2873,7 +2887,22 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                             (output, true)
                         }
                         Err(e) => {
-                            tracing::warn!(tool = %tool_call.name, error = %e, "tool execution failed");
+                            // Same as the client-tool arm above: an MCP server
+                            // says what it could not do, and that sentence
+                            // quotes the argument. `McpError::ServerError`
+                            // renders the server's own message verbatim, so
+                            // "failed to read <path>: permission denied"
+                            // arrives here intact.
+                            tracing::warn!(
+                                tool = %tool_call.name,
+                                error_kind = e.kind(),
+                                "tool execution failed"
+                            );
+                            tracing::debug!(
+                                tool = %tool_call.name,
+                                error = %e,
+                                "tool failure detail"
+                            );
                             on_status(advance_tool_completion_status(
                                 &mut tool_completion_run,
                                 &tool_call.name,

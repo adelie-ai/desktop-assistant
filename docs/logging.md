@@ -54,13 +54,20 @@ This contract is a rule, not a preference.
 
 | Level | Carries |
 |---|---|
-| INFO | ids, counts, byte sizes, durations, model names, tool names, token counts. **Never content.** |
-| DEBUG | prompts, the assembled context, tool arguments, tool results, search queries, extracted facts. |
+| INFO | ids, counts, byte sizes, durations, model names, tool names, error kinds, token counts. **Never content.** |
+| DEBUG | prompts, the assembled context, tool arguments, tool results, tool failure messages, search queries, extracted facts. |
 
 "Content" is anything derived from what a person or a model wrote: a prompt, a
 message body, a tool-call argument, a tool result, a search query, an extracted
 personal fact. Ids, counts, sizes, durations, and the *names* of tools, models
 and providers are not content.
+
+**A failing tool's message is content**, and it is the case that catches people
+out. A tool says what it could not do, and that sentence quotes what it was
+given - "failed to read `<path>`: permission denied". An MCP server's message
+arrives here verbatim. So a log line carries `CoreError::kind()`, which names
+the variant and nothing else, and the message goes to DEBUG beside the tool
+result.
 
 Two things follow.
 
