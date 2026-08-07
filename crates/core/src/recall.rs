@@ -12,28 +12,30 @@
 //! line per entry costs about a tenth as much, and the model keeps its own
 //! judgement about whether any of it matters.
 //!
-//! ## Three arms
+//! ## Two arms, and a vocabulary that lights up from them
 //!
 //! - **The knowledge base**, the durable memory across conversations.
 //! - **This conversation's scratchpad** (#1101), the working pad. `[Scratchpad]`
 //!   already lists its keys, but that block is gated on context starting to
 //!   drop, which is right for an index and wrong for recall: a note written
 //!   earlier in a short, fully-visible conversation is durable and invisible.
-//! - **The tag registry**, a working vocabulary for the model's first search.
+//! - **The tags those entries carry**, a working vocabulary for the model's
+//!   first search. Derived from what surfaced rather than searched for, so it
+//!   cannot speak when nothing surfaced - see [`carried_tags`].
 //!
 //! ## What bounds it
 //!
-//! - **A relevance floor, not a top-k.** A candidate under the floor is
-//!   dropped rather than padded out to fill the budget, so a prompt with
-//!   nothing near it produces no block at all. How near is near enough is the
-//!   floor's own question, and how well the current floor answers it is #1121's
-//!   (the entry floor admits more than a prompt of no content should reach).
+//! - **One dimensionless bar, and the width is what comes out.** Each candidate
+//!   is read against the spread of its own source ([`RecallDispersion`]), and
+//!   every candidate that stands [`RECALL_BAR`] deviations out is shown. A
+//!   candidate under the bar is dropped rather than padded out to fill the
+//!   budget, so a prompt with no cue produces no block at all, and a prompt with
+//!   a strong cue produces an index.
 //! - **A line budget, derived from a token budget.**
 //!   [`RECALL_BLOCK_TOKEN_BUDGET`] pays for [`BUDGETED_MAX_RECALL_ENTRIES`]
 //!   entry lines, [`MAX_RECALL_NOTES`] note lines and [`MAX_RECALL_TAGS`] tag
-//!   names. The entry arm ships narrower than the budget pays for, at
-//!   [`DEFAULT_MAX_RECALL_ENTRIES`], until #1121 gates what the floor admits.
-//!   A deployment may state its own width.
+//!   names. That width is a safety cap on the worst case rather than the
+//!   mechanism, and a deployment may state its own.
 //! - **Nothing already in view.** A note `[Pinned]` renders in full, a key the
 //!   `[Scratchpad]` index has just listed, a step or finding `[Plan]` has just
 //!   named, and a knowledge entry a pin attaches (#1104) are all dropped here.
@@ -51,9 +53,9 @@
 //! call for different next moves. So the block reports how many cleared the
 //! floor and did not fit.
 //!
-//! That count means something only because the floor defines it. Over a hybrid
+//! That count means something only because the bar defines it. Over a hybrid
 //! search every row scores non-zero against any query, so "how many matched" is
-//! not a defined quantity; "how many cleared the floor" is. The lookup reads to
+//! not a defined quantity; "how many cleared the bar" is. The lookup reads to
 //! [`RECALL_ENTRY_SCAN_LIMIT`] (and [`RECALL_NOTE_SCAN_LIMIT`]) and no further,
 //! so when a scan fills up the count is a lower bound and says so.
 
@@ -151,32 +153,21 @@ const RECALL_FIXED_MAX_BYTES: usize = RECALL_BLOCK_PREFIX_BYTES
 /// budget buys an index instead of a handful of extracts. Breadth is the point:
 /// a title the model can see but has not opened still says that something
 /// exists, and an entry that never appears cannot be asked for.
-///
-/// This is not what ships today - see [`DEFAULT_MAX_RECALL_ENTRIES`].
 pub const BUDGETED_MAX_RECALL_ENTRIES: usize =
     (RECALL_BLOCK_MAX_BYTES - RECALL_FIXED_MAX_BYTES) / (1 + RECALL_ENTRY_LINE_MAX_BYTES);
 
-/// How many knowledge lines the block shows where a deployment states nothing.
+/// The most knowledge lines the block shows where a deployment states nothing.
 ///
-/// **The budget derives [`BUDGETED_MAX_RECALL_ENTRIES`], and the default is
-/// held below it on purpose.** Eight is not what the arithmetic computed; it is
-/// the width that was already shipping.
+/// **A safety cap, and not the mechanism.** [`RECALL_BAR`] decides how many
+/// lines render: a prompt with no cue clears none, and a strong cue clears a
+/// dozen. What remains for this constant is protecting the token budget against
+/// the case where a great many candidates all stand out, so the budget's own
+/// figure - [`BUDGETED_MAX_RECALL_ENTRIES`] - is the value it wants. A lower one
+/// would be a second, unstated policy about width.
 ///
-/// Why it is held there: [`RECALL_ENTRY_MAX_DISTANCE`] admits candidates for a
-/// prompt that asks nothing - an acknowledgement, or "continue" - so the number
-/// of lines is also the number of unrelated memories such a prompt puts in
-/// front of the model. Widening the block before that floor has an admission
-/// gate would multiply the noise case rather than the recall case, and a
-/// deployment would meet the regression before anyone measured it.
-///
-/// #1121 grades the width from the prompt's own signal, which turns this
-/// constant into a safety cap rather than the mechanism, and sets it to
-/// [`BUDGETED_MAX_RECALL_ENTRIES`]: a cap exists to protect the token budget, so
-/// the budget's own figure is the value it wants.
-///
-/// A deployment that wants the wider index now sets it - see
-/// [`set_max_recall_entries`].
-pub const DEFAULT_MAX_RECALL_ENTRIES: usize = 8;
+/// A deployment may state its own, to hold a narrower block on a model with a
+/// small context window - see [`set_max_recall_entries`].
+pub const DEFAULT_MAX_RECALL_ENTRIES: usize = BUDGETED_MAX_RECALL_ENTRIES;
 
 /// The width this deployment renders: [`DEFAULT_MAX_RECALL_ENTRIES`] until
 /// [`set_max_recall_entries`] installs another.
@@ -291,37 +282,6 @@ pub const RECALL_NOTE_MAX_CHARS: usize = crate::domain::knowledge::SUMMARY_MAX_C
 /// closely" is a count rather than a guess.
 pub const RECALL_NOTE_SCAN_LIMIT: usize = 25;
 
-/// The relevance floor for the scratchpad arm, in the same cosine-distance
-/// terms as [`RECALL_ENTRY_MAX_DISTANCE`].
-///
-/// Its own constant because it measures a different text: a note embeds
-/// `"<key> <content>"`, which is terser and more telegraphic than an entry's
-/// body, so the two distances are not directly comparable. Untuned and
-/// conservative for the same reason - a quiet block on an unrelated prompt is
-/// the failure that costs the user something.
-pub const RECALL_NOTE_MAX_DISTANCE: f64 = 0.45;
-
-/// How many tag rows one lookup reads before the floor is applied.
-///
-/// Enough headroom that the floor can drop weak neighbours without a second
-/// query, and no more: no count is reported for tags, so reading further would
-/// buy nothing.
-pub const RECALL_TAG_SCAN_LIMIT: usize = 20;
-
-/// The relevance floor for the knowledge arm, stated as the cosine distance a
-/// candidate must stay at or under.
-///
-/// pgvector's `<=>` returns cosine distance in `[0, 2]`, and lower is nearer.
-/// The registry's near-duplicate threshold is far tighter (0.10) because it
-/// asks whether two tags are the *same concept*; this asks the much looser
-/// question of whether an entry is *about what was just asked*.
-///
-/// This value is a deliberately conservative starting point rather than a
-/// measured one: it is set to keep the block quiet on an unrelated prompt,
-/// which is the failure that costs the user something. Widening it is the safe
-/// direction to tune once a real store has been observed.
-pub const RECALL_ENTRY_MAX_DISTANCE: f64 = 0.45;
-
 /// How far a candidate must stand out from its own source to be shown, counted
 /// in that source's median absolute deviations below its median.
 ///
@@ -357,15 +317,6 @@ pub const RECALL_BAR: f64 = 6.8;
 /// keeps it loud costs every prompt.
 pub const RECALL_ASSUMED_DISPERSION: RecallDispersion = RecallDispersion::assumed(0.65, 0.05);
 
-/// The relevance floor for the tag arm, in the same cosine-distance terms as
-/// [`RECALL_ENTRY_MAX_DISTANCE`].
-///
-/// Its own constant because it measures a different text: a registry row
-/// embeds `"<name>: <description>"`, which is terse next to an entry's body, so
-/// the two distances are not directly comparable. Untuned for the same reason,
-/// and conservative for the same reason.
-pub const RECALL_TAG_MAX_DISTANCE: f64 = 0.45;
-
 /// The block's opening line. It states that the material may not fit and that
 /// ignoring it is correct, because this fires on every prompt and a weak match
 /// set that reads as an instruction is worse than no block at all.
@@ -393,7 +344,7 @@ const RECALL_NOTE_LABEL: &str = "Notes on this conversation's scratchpad. Each l
      what it says - not the whole note.";
 
 /// Label on the tag line.
-const RECALL_TAG_LABEL: &str = "Tags near this prompt:";
+const RECALL_TAG_LABEL: &str = "Tags the entries above carry:";
 
 /// One turn's recall input: what the lookup found, how far it read, and what
 /// the rest of this turn's prompt already shows.
@@ -480,9 +431,10 @@ impl<'a> RecallSurface<'a> {
 ///
 /// The arms render in order of how far the material is from the turn: the
 /// durable knowledge base, then this conversation's own pad, then the
-/// vocabulary. Every candidate list is taken in the order it arrives - nearest
-/// first - and is never reordered: a cosine distance and a lexical match are
-/// not comparable, and one lookup only ever produces one of the two.
+/// vocabulary those entries carry. Every candidate list is taken in the order it
+/// arrives - nearest first - and is never reordered: a cosine distance and a
+/// lexical match are not comparable, and one lookup only ever produces one of
+/// the two.
 pub(crate) fn render_recall(surface: &RecallSurface<'_>) -> Option<RenderedRecall> {
     render_recall_with_width(surface, max_recall_entries())
 }
@@ -512,21 +464,24 @@ fn render_recall_with_width(
 ) -> Option<RenderedRecall> {
     let candidates = surface.candidates;
 
-    let above_floor: Vec<&RecallEntry> = candidates
+    let entry_dispersion = candidates
+        .entry_dispersion
+        .unwrap_or(RECALL_ASSUMED_DISPERSION);
+    let above_bar: Vec<&RecallEntry> = candidates
         .entries
         .iter()
-        .filter(|hit| hit.relevance.clears_floor(RECALL_ENTRY_MAX_DISTANCE))
+        .filter(|hit| hit.relevance.clears_bar(entry_dispersion, RECALL_BAR))
         .collect();
 
-    // Whether the count below is a lower bound is decided here, on the floor
-    // filter alone. Rows arrive nearest-first, so the floor drops a suffix: a
-    // scan that read past the floor knows there is nothing better beyond it,
-    // and a scan that filled up with rows that all cleared knows only "at least
-    // this many". Any later filter that is not ordered by distance must stay
-    // out of this decision, or an exact-sounding count would outrun what the
-    // scan actually saw.
+    // Whether the count below is a lower bound is decided here, on the bar
+    // alone. Rows arrive nearest-first and the bar rises with distance, so it
+    // drops a suffix: a scan that read past the bar knows there is nothing
+    // better beyond it, and a scan that filled up with rows that all cleared
+    // knows only "at least this many". Any later filter that is not ordered by
+    // distance must stay out of this decision, or an exact-sounding count would
+    // outrun what the scan actually saw.
     let capped = candidates.entries.len() >= surface.entry_scan_limit
-        && above_floor.len() == candidates.entries.len();
+        && above_bar.len() == candidates.entries.len();
 
     // Three later filters, none ordered by distance, hence none in the
     // decision above:
@@ -551,7 +506,7 @@ fn render_recall_with_width(
     //
     // All three drop rather than count, because "matched less closely" promises
     // the reader something it has not already been given.
-    let showable: Vec<(&RecallEntry, String)> = above_floor
+    let showable: Vec<(&RecallEntry, String)> = above_bar
         .iter()
         .filter(|hit| !contains(surface.pinned_entry_ids, &hit.entry.id))
         .filter(|hit| bounded(&hit.entry.id, RECALL_ID_MAX_CHARS) == hit.entry.id)
@@ -561,13 +516,21 @@ fn render_recall_with_width(
         })
         .collect();
 
-    let notes_above_floor: Vec<&RecallNote> = candidates
+    // The pad is its own source and carries its own spread. A note embeds
+    // `"<key> <content>"`, which is terser and more telegraphic than an entry's
+    // body, so a distance from the pad and a distance from the store are not
+    // the same quantity - and reading each against its own dispersion is what
+    // makes them comparable.
+    let note_dispersion = candidates
+        .note_dispersion
+        .unwrap_or(RECALL_ASSUMED_DISPERSION);
+    let notes_above_bar: Vec<&RecallNote> = candidates
         .notes
         .iter()
-        .filter(|note| note.relevance.clears_floor(RECALL_NOTE_MAX_DISTANCE))
+        .filter(|note| note.relevance.clears_bar(note_dispersion, RECALL_BAR))
         .collect();
     let notes_capped = candidates.notes.len() >= surface.note_scan_limit
-        && notes_above_floor.len() == candidates.notes.len();
+        && notes_above_bar.len() == candidates.notes.len();
 
     // The same two kinds of drop, for the pad - a note already in view, and a
     // note with no key to name it by - plus one this arm alone has to make.
@@ -583,7 +546,7 @@ fn render_recall_with_width(
     // near the prompt would degrade the conversation permanently. The parent
     // still reaches that answer through `get_subagent_status`, which taints
     // correctly.
-    let showable_notes: Vec<String> = notes_above_floor
+    let showable_notes: Vec<String> = notes_above_bar
         .iter()
         .filter(|note| {
             !note.pinned
@@ -594,16 +557,7 @@ fn render_recall_with_width(
         .filter_map(|note| note_line(note))
         .collect();
 
-    let near_tags: Vec<&str> = candidates
-        .tags
-        .iter()
-        .filter(|tag| tag.relevance.clears_floor(RECALL_TAG_MAX_DISTANCE))
-        .take(MAX_RECALL_TAGS)
-        .map(|tag| tag.name.as_str())
-        .collect();
-    let tags = tag_list(&near_tags, RECALL_TAG_LINE_MAX_BYTES);
-
-    if showable.is_empty() && showable_notes.is_empty() && tags.is_empty() {
+    if showable.is_empty() && showable_notes.is_empty() {
         return None;
     }
 
@@ -613,8 +567,9 @@ fn render_recall_with_width(
         block.push_str(RECALL_ENTRY_HINT);
     }
 
+    let shown: Vec<&(&RecallEntry, String)> = showable.iter().take(max_entries).collect();
     let mut entry_ids = Vec::new();
-    for (hit, line) in showable.iter().take(max_entries) {
+    for (hit, line) in &shown {
         block.push('\n');
         block.push_str(&entry_line(hit, line));
         entry_ids.push(hit.entry.id.clone());
@@ -640,6 +595,7 @@ fn render_recall_with_width(
         }
     }
 
+    let tags = tag_list(&carried_tags(&shown), RECALL_TAG_LINE_MAX_BYTES);
     if !tags.is_empty() {
         block.push('\n');
         block.push_str(RECALL_TAG_LABEL);
@@ -651,6 +607,45 @@ fn render_recall_with_width(
         text: block,
         entry_ids,
     })
+}
+
+/// The tag names the entries this block showed carry, most-carried first, and
+/// at most [`MAX_RECALL_TAGS`] of them.
+///
+/// **The vocabulary lights up from the content that lit up.** A direct search of
+/// the tag registry cannot do this job: a registry row embeds a label and a
+/// prompt is a question, so the distance between them measures style as much as
+/// subject, and the distributions of a real hit and an acknowledgement overlap
+/// completely. Reading the tags off the entries that surfaced costs no second
+/// query and no second embedding comparison, cannot fire when the entry arm is
+/// silent, and puts a name in front of the model because it describes something
+/// the prompt actually reached.
+///
+/// Only the entries the block **showed**. An entry the width dropped is not in
+/// front of the model, so its tags did not light up.
+///
+/// Ranked by how many of those entries carry each name, and names of equal
+/// weight keep the order the entries arrived in - which is nearest first. A
+/// linear scan rather than a map: at most [`BUDGETED_MAX_RECALL_ENTRIES`]
+/// entries take part, each with a few tags, and a scan of that keeps the order
+/// deterministic without sorting on a hash.
+fn carried_tags<'a>(shown: &[&(&'a RecallEntry, String)]) -> Vec<&'a str> {
+    let mut counted: Vec<(&str, usize)> = Vec::new();
+    for (hit, _) in shown {
+        for name in &hit.entry.tags {
+            match counted.iter_mut().find(|(seen, _)| *seen == name.as_str()) {
+                Some((_, carried)) => *carried += 1,
+                None => counted.push((name.as_str(), 1)),
+            }
+        }
+    }
+    // A stable sort, so equal counts keep their first-seen order.
+    counted.sort_by_key(|(_, carried)| std::cmp::Reverse(*carried));
+    counted
+        .into_iter()
+        .take(MAX_RECALL_TAGS)
+        .map(|(name, _)| name)
+        .collect()
 }
 
 /// Whether `values` names `wanted`.
@@ -1065,7 +1060,7 @@ mod tests {
     /// against another, and the bar reads both correctly.
     #[test]
     fn no_raw_cosine_constant_decides_whether_the_block_renders() {
-        let distance = 0.50;
+        let distance = 0.45;
         let tight = RecallDispersion::measured(0.80, 0.05, 400).expect("a store's statistics");
         let loose = RecallDispersion::measured(0.80, 0.30, 400).expect("a store's statistics");
 
@@ -1077,7 +1072,7 @@ mod tests {
 
         assert!(
             render(&against(tight)).is_some(),
-            "six deviations out of a tight store is exceptional"
+            "seven deviations out of a tight store is exceptional"
         );
         assert!(
             render(&against(loose)).is_none(),
@@ -1359,28 +1354,33 @@ mod tests {
         crate::ports::tool_usage::estimate_tokens(bytes as u64) as usize
     }
 
-    /// Half a tag line of ASCII, unique to `(i, k)`.
+    /// One of the two tag names a worst-case entry carries, unique to `(i, k)`.
     ///
-    /// The block's tag line takes whole names, so a pair of these fills it to
-    /// its bound. Unique, because the line lists distinct names: one name every
-    /// entry shared would fill an entry's own tag list and leave the tag line
-    /// showing one name.
+    /// The first fills an entry's own tag list to its bound, and the pair fills
+    /// the block's tag line to its own - which takes whole names, so the second
+    /// is what is left of the line after the first and its separator. Unique,
+    /// because the tag line lists distinct names: a name every entry shared
+    /// would leave that line showing one.
     fn unique_tag(i: usize, k: usize) -> String {
+        let bytes = if k == 0 {
+            RECALL_TAGS_MAX_BYTES
+        } else {
+            RECALL_TAG_LINE_MAX_BYTES - 2 - RECALL_TAGS_MAX_BYTES
+        };
         let suffix = format!("-{i}-{k}");
-        format!(
-            "{}{suffix}",
-            filler((RECALL_TAG_LINE_MAX_BYTES - 2) / 2 - suffix.len())
-        )
+        format!("{}{suffix}", filler(bytes - suffix.len()))
     }
 
     /// The same in a four-byte script, with an ASCII suffix so the name is
     /// unique and its size stays a whole number of characters.
     fn unique_wide_tag(i: usize, k: usize) -> String {
+        let bytes = if k == 0 {
+            RECALL_TAGS_MAX_BYTES
+        } else {
+            RECALL_TAG_LINE_MAX_BYTES - 2 - RECALL_TAGS_MAX_BYTES
+        };
         let suffix = format!("-{i}-{k}");
-        format!(
-            "{}{suffix}",
-            wide_filler(((RECALL_TAG_LINE_MAX_BYTES - 2) / 2 - suffix.len()) / 4)
-        )
+        format!("{}{suffix}", wide_filler((bytes - suffix.len()) / 4))
     }
 
     /// The most expensive knowledge candidate the renderer can be handed: the
@@ -1744,8 +1744,8 @@ mod tests {
     #[test]
     fn a_typical_recall_block_costs_far_less_than_its_worst_case() {
         for (width, low, high) in [
-            (DEFAULT_MAX_RECALL_ENTRIES / 2, 250, 450),
-            (DEFAULT_MAX_RECALL_ENTRIES, 500, 800),
+            (DEFAULT_MAX_RECALL_ENTRIES / 2, 400, 600),
+            (DEFAULT_MAX_RECALL_ENTRIES, 650, 950),
         ] {
             let candidates = typical_candidates(width + 4);
 
@@ -2740,7 +2740,7 @@ mod tests {
     /// refused against another.
     #[test]
     fn a_note_is_read_against_the_pads_own_dispersion() {
-        let distance = 0.50;
+        let distance = 0.45;
         let tight = RecallDispersion::assumed(0.80, 0.05);
         let loose = RecallDispersion::assumed(0.80, 0.30);
 
@@ -2752,7 +2752,7 @@ mod tests {
 
         assert!(
             render(&with(tight)).is_some(),
-            "six deviations out of a tight pad is exceptional"
+            "seven deviations out of a tight pad is exceptional"
         );
         assert!(
             render(&with(loose)).is_none(),

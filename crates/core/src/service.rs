@@ -1255,7 +1255,6 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             conversation_id: conversation_id.0.clone(),
             entry_limit: crate::recall::RECALL_ENTRY_SCAN_LIMIT,
             note_limit: crate::recall::RECALL_NOTE_SCAN_LIMIT,
-            tag_limit: crate::recall::RECALL_TAG_SCAN_LIMIT,
         };
         let entry_scan_limit = request.entry_limit;
         let note_scan_limit = request.note_limit;

@@ -907,10 +907,15 @@ mod tests {
         // speak with one voice: a registered name is a real name rather than a
         // guess, and a filter that returns nothing means no entry in that scope
         // carries the tag (#1071, #1102).
+        //
+        // It must also say where the names came from (#1121). They are the tags
+        // the entries above carry, so a name is offered because the prompt
+        // reached something that carries it - and a search on one reaches the
+        // entries the block had no room for.
         let assembled = assemble(&static_sections());
         let recall = recall_guidance(&assembled);
         assert!(
-            recall.contains("registered tags of this store"),
+            recall.contains("the tags the entries above it carry"),
             "the guidance must say what the tag names are"
         );
         assert!(

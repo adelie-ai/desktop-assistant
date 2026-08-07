@@ -1,17 +1,19 @@
 //! The reads behind the `[Recall]` block (issues #1100 and #1101).
 //!
-//! `PgKnowledgeBaseStore::nearest_by_embedding`, `tag_registry::nearest_tags`
-//! and `PgScratchpadStore::nearest_by_embedding` are what a turn asks before
-//! the model's first move. All are new query surfaces over personal data, so
-//! the suite pins the properties the block's correctness rests on.
+//! `PgKnowledgeBaseStore::nearest_by_embedding`,
+//! `PgKnowledgeBaseStore::embedding_distance_dispersion` and
+//! `PgScratchpadStore::nearest_by_embedding` are what a turn asks before the
+//! model's first move. All are query surfaces over personal data, so the suite
+//! pins the properties the block's correctness rests on.
 //!
 //! 1. **One user's rows and no other's.** Row-level security is a non-FORCE
 //!    backstop the table owner bypasses, so the `WHERE user_id` predicate in
 //!    each query is the only real guard. A read that leaked another tenant's
 //!    memory would put it in front of the model as this user's own.
-//! 2. **Nearest first, with a usable distance.** The block sets a relevance
-//!    floor over the distance these queries return. An unordered result, or one
-//!    whose distance is not a cosine distance, would make the floor meaningless.
+//! 2. **Nearest first, with a usable distance.** The block reads each distance
+//!    against the spread of the source it came from. An unordered result, or
+//!    one whose distance is not a cosine distance, would make the bar
+//!    meaningless - and so would a spread measured over another tenant's rows.
 //! 3. **Only rows embedded by the query's own model.** A stored vector from
 //!    another model has another dimension, and the vector operator answers that
 //!    with an error rather than a miss - which would fail the read instead of
@@ -36,13 +38,13 @@ mod support;
 
 use desktop_assistant_core::domain::{Conversation, ConversationId, KnowledgeEntry, Message, Role};
 use desktop_assistant_core::ports::knowledge::KnowledgeBaseStore;
+use desktop_assistant_core::ports::recall::RECALL_DISPERSION_MIN_ROWS;
 use desktop_assistant_core::ports::scratchpad::{
     NewScratchpadNote, NoteEmbedding, ScratchpadStore,
 };
 use desktop_assistant_core::ports::scratchpad_scope::{SubagentScope, with_subagent_scope};
 use desktop_assistant_core::ports::store::ConversationStore;
 use desktop_assistant_storage::knowledge_delete::KnowledgeDeletePolicy;
-use desktop_assistant_storage::tag_registry::nearest_tags;
 use desktop_assistant_storage::{
     PgConversationStore, PgKnowledgeBaseStore, PgPool, PgScratchpadStore, UserId, with_user_id,
 };
@@ -111,24 +113,6 @@ async fn seed_entry_with_model(
     .execute(pool)
     .await
     .expect("stamp embedding");
-}
-
-/// Insert a registry row directly so the test owns its vector and its model
-/// stamp, rather than going through the dedup path that would compute both.
-async fn seed_tag(pool: &PgPool, user: &str, name: &str, chunk: Vec<f32>, model: &str) {
-    let vector = Vector::from(chunk);
-    sqlx::query(
-        "INSERT INTO tag_registry \
-            (user_id, name, description, examples, distinguish_from, embedding, embedding_model) \
-         VALUES ($1, $2, 'seeded', '[]'::jsonb, '{}', $3, $4)",
-    )
-    .bind(user)
-    .bind(name)
-    .bind(&vector)
-    .bind(model)
-    .execute(pool)
-    .await
-    .expect("seed tag");
 }
 
 // -- the knowledge arm -------------------------------------------------------
@@ -296,47 +280,43 @@ async fn nearest_entries_answer_nothing_without_an_embedding() {
     fx.cleanup().await;
 }
 
-// -- the tag arm -------------------------------------------------------------
+// -- the source's own dispersion (#1121) -------------------------------------
 
+/// Acceptance (#1121): the block reads a candidate against the spread of the
+/// whole store, so the store has to be able to state it.
 #[tokio::test]
-async fn nearest_tags_come_back_nearest_first_with_their_distance() {
+async fn the_store_measures_the_dispersion_of_its_own_distances() {
     let Some(fx) = fixture().await else { return };
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
-    seed_tag(&fx.pool, USER, "topic:near", axis(0), MODEL).await;
-    seed_tag(&fx.pool, USER, "topic:far", axis(1), MODEL).await;
+    // Enough rows for a measurement, spread over two axes: two thirds of them
+    // sit one axis away from the query and one third sits on it, so the median
+    // distance is 1.0 and half the rows are 1.0 away from that median.
+    for i in 0..RECALL_DISPERSION_MIN_ROWS {
+        seed_entry(
+            &fx.pool,
+            USER,
+            &format!("kb-spread-{i}"),
+            "a stored fact",
+            axis(usize::from(i % 3 != 0)),
+        )
+        .await;
+    }
 
     with_user_id(UserId::new(USER), async {
-        let hits = nearest_tags(&fx.pool, axis(0), MODEL, 10)
+        let measured = store
+            .embedding_distance_dispersion(axis(0), MODEL)
             .await
-            .expect("the read succeeds");
+            .expect("the read succeeds")
+            .expect("a store of this size states its own geometry");
 
-        let names: Vec<&str> = hits.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(names, vec!["topic:near", "topic:far"]);
-        assert!(hits[0].1 < 1e-6, "got {}", hits[0].1);
-        assert!((hits[1].1 - 1.0).abs() < 1e-6, "got {}", hits[1].1);
-    })
-    .await;
-
-    fx.cleanup().await;
-}
-
-#[tokio::test]
-async fn nearest_tags_never_cross_the_user_boundary() {
-    let Some(fx) = fixture().await else { return };
-
-    seed_tag(&fx.pool, OTHER_USER, "topic:theirs", axis(0), MODEL).await;
-    seed_tag(&fx.pool, USER, "topic:mine", axis(1), MODEL).await;
-
-    with_user_id(UserId::new(USER), async {
-        let hits = nearest_tags(&fx.pool, axis(0), MODEL, 10)
-            .await
-            .expect("the read succeeds");
-
-        let names: Vec<&str> = hits.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(
-            names,
-            vec!["topic:mine"],
-            "another tenant's vocabulary is not this user's"
+        assert!(
+            (measured.distance_at(0.0) - 1.0).abs() < 1e-6,
+            "the median of a two-thirds-far store is the far distance: {measured:?}"
+        );
+        assert!(
+            measured.deviations_below_median(0.0) > 0.0,
+            "a row on the query's own axis stands out of that median: {measured:?}"
         );
     })
     .await;
@@ -344,82 +324,78 @@ async fn nearest_tags_never_cross_the_user_boundary() {
     fx.cleanup().await;
 }
 
+/// The measurement is the store's, so it stops at the user boundary the way
+/// every other read here does. Another tenant's rows would move the median the
+/// bar is read against.
 #[tokio::test]
-async fn nearest_tags_skip_a_deprecated_tag() {
-    // A deprecated tag points at its replacement. Offering it as vocabulary
-    // would send the model's next search at a name no row carries any more.
+async fn the_dispersion_never_crosses_the_user_boundary() {
     let Some(fx) = fixture().await else { return };
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
-    seed_tag(&fx.pool, USER, "topic:current", axis(1), MODEL).await;
-    seed_tag(&fx.pool, USER, "topic:retired", axis(0), MODEL).await;
-    sqlx::query("UPDATE tag_registry SET deprecated_for_tag = $1 WHERE user_id = $2 AND name = $3")
-        .bind("topic:current")
-        .bind(USER)
-        .bind("topic:retired")
-        .execute(&fx.pool)
-        .await
-        .expect("deprecate the tag");
+    for i in 0..RECALL_DISPERSION_MIN_ROWS {
+        seed_entry(
+            &fx.pool,
+            OTHER_USER,
+            &format!("kb-theirs-{i}"),
+            "another tenant's fact",
+            axis(i % 2),
+        )
+        .await;
+    }
+    seed_entry(&fx.pool, USER, "kb-mine", "my one fact", axis(0)).await;
 
     with_user_id(UserId::new(USER), async {
-        let hits = nearest_tags(&fx.pool, axis(0), MODEL, 10)
-            .await
-            .expect("the read succeeds");
-
-        let names: Vec<&str> = hits.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(names, vec!["topic:current"]);
+        assert_eq!(
+            store
+                .embedding_distance_dispersion(axis(0), MODEL)
+                .await
+                .expect("the read succeeds"),
+            None,
+            "one row is not a distribution, whatever another tenant holds"
+        );
     })
     .await;
 
     fx.cleanup().await;
 }
 
+/// A store with nothing this query can be compared with states nothing, and the
+/// block falls back to its stated estimate.
 #[tokio::test]
-async fn nearest_tags_ignore_a_row_embedded_by_another_model() {
+async fn a_store_with_no_comparable_row_states_no_dispersion() {
     let Some(fx) = fixture().await else { return };
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
-    seed_tag(
+    seed_entry_with_model(
         &fx.pool,
         USER,
-        "topic:other-model",
+        "kb-other-model",
+        "a fact embedded by another model",
         vec![1.0, 0.0, 0.0, 0.0],
         OTHER_MODEL,
     )
     .await;
-    seed_tag(&fx.pool, USER, "topic:mine", axis(0), MODEL).await;
 
     with_user_id(UserId::new(USER), async {
-        let hits = nearest_tags(&fx.pool, axis(0), MODEL, 10)
-            .await
-            .expect("a row from another model must not fail the read");
-
-        let names: Vec<&str> = hits.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(names, vec!["topic:mine"]);
+        assert_eq!(
+            store
+                .embedding_distance_dispersion(axis(0), MODEL)
+                .await
+                .expect("a row from another model must not fail the read"),
+            None
+        );
+        assert_eq!(
+            store
+                .embedding_distance_dispersion(Vec::new(), MODEL)
+                .await
+                .expect("an absent embedding is not an error"),
+            None
+        );
     })
     .await;
 
     fx.cleanup().await;
 }
-
-#[tokio::test]
-async fn nearest_tags_answer_nothing_without_an_embedding() {
-    // The registry carries no full-text index, so the tag arm has nothing to
-    // degrade to. It goes quiet rather than raising.
-    let Some(fx) = fixture().await else { return };
-
-    seed_tag(&fx.pool, USER, "topic:mine", axis(0), MODEL).await;
-
-    with_user_id(UserId::new(USER), async {
-        let hits = nearest_tags(&fx.pool, Vec::new(), MODEL, 10)
-            .await
-            .expect("an absent embedding is not an error");
-        assert!(hits.is_empty());
-    })
-    .await;
-
-    fx.cleanup().await;
-}
-
-// -- the degraded (no embedding) arm ----------------------------------------
 
 #[tokio::test]
 async fn any_term_search_matches_an_entry_that_carries_one_of_the_prompts_words() {

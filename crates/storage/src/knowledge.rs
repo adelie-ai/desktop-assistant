@@ -5,6 +5,7 @@ use desktop_assistant_core::ports::knowledge::{
     AVAILABLE_TAGS_LIMIT, KNOWLEDGE_TAG_CENSUS_SAMPLE, KnowledgeBaseStore, KnowledgeListPage,
     KnowledgeListQuery, KnowledgeSearchPage, ListOrder, ScopeSize,
 };
+use desktop_assistant_core::ports::recall::RecallDispersion;
 use pgvector::Vector;
 use sqlx::PgPool;
 
@@ -578,11 +579,12 @@ impl PgKnowledgeBaseStore {
     /// them there, nearest first.
     ///
     /// Backs the knowledge arm of the `[Recall]` block (#1100). It is a plain
-    /// vector search rather than the hybrid `search`, because the block applies
-    /// a relevance floor and a fused RRF score is not a quantity a floor can be
-    /// set against: over a hybrid search every row scores non-zero against any
-    /// query. A cosine distance is comparable, so a floor over it means
-    /// something.
+    /// vector search rather than the hybrid `search`, because the block reads
+    /// each candidate against the spread of the store's own distances, and a
+    /// fused RRF score is not a quantity that has a spread of that kind: over a
+    /// hybrid search every row scores non-zero against any query. A cosine
+    /// distance is comparable, so a distribution over it means something - see
+    /// [`Self::embedding_distance_dispersion`].
     ///
     /// Scoped to the task-local user by an explicit `WHERE user_id` predicate.
     /// Row-level security is a backstop the table owner bypasses, so the
@@ -597,6 +599,11 @@ impl PgKnowledgeBaseStore {
     /// An empty `query_embedding` yields no rows. The vector operator raises on
     /// a zero-dimension vector, and the caller that has no embedding has a
     /// full-text path to fall back to (`search_text`).
+    ///
+    /// `metadata` is not read. The block renders an id, an entry's tags and one
+    /// line of what it says, and nothing downstream of this call looks at the
+    /// column, so the entries answer with [`serde_json::Value::Null`] there -
+    /// the same way this file's other search row drops `source`.
     pub async fn nearest_by_embedding(
         &self,
         query_embedding: Vec<f32>,
@@ -607,37 +614,70 @@ impl PgKnowledgeBaseStore {
             return Ok(Vec::new());
         }
         let user_id = current_user_id();
-        let rows: Vec<KbNearestRow> = sqlx::query_as(
-            "SELECT id, content, tags, metadata, created_at, updated_at, source, summary,
-                    MIN(chunk <=> $1) AS distance
-             FROM knowledge_base, unnest(embedding) AS chunk
-             WHERE user_id = $2
-               AND deleted_at IS NULL
-               AND embedding IS NOT NULL
-               AND embedding_model IS NOT NULL
-               AND (embedding_model = $3
-                    OR (split_part($3, '@', 2) <> ''
-                        AND split_part(embedding_model, '@', 2)
-                            = split_part($3, '@', 2)))
-             GROUP BY id, content, tags, metadata, created_at, updated_at, source, summary
-             ORDER BY distance
-             LIMIT $4",
-        )
-        .bind(Vector::from(query_embedding))
-        .bind(user_id.as_str())
-        .bind(embedding_model)
-        .bind(limit as i64)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CoreError::Storage(e.to_string()))?;
+        let rows: Vec<KbNearestRow> = sqlx::query_as(NEAREST_BY_EMBEDDING_SQL)
+            .bind(Vector::from(query_embedding))
+            .bind(user_id.as_str())
+            .bind(embedding_model)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
 
         Ok(rows
             .into_iter()
             .map(|r| {
                 let distance = r.distance;
-                (r.row.into_entry(), distance)
+                (r.into_entry(), distance)
             })
             .collect())
+    }
+
+    /// How spread out this user's knowledge distances are for one query
+    /// embedding: the median of them, the median absolute deviation around that
+    /// median, and how many rows both were measured over.
+    ///
+    /// **This is what makes the `[Recall]` bar dimensionless.** A cosine
+    /// distance means nothing on its own, so the block reads a candidate as how
+    /// far it sits below the store's own middling row, counted in the store's
+    /// own spread. Both statistics are properties of the store's geometry rather
+    /// than of one query, so a caller measures them now and then rather than
+    /// every turn - see the recall adapter, which holds one estimate per user
+    /// and embedding model.
+    ///
+    /// Measured over **every** row the search could reach, not over the nearest
+    /// ones: the near rows are the part a cued prompt moves, so their spread is
+    /// not the store's and normalizing inside it would inflate every score.
+    ///
+    /// `None` where the store holds no row this query can be compared with. The
+    /// caller then falls back to a stated estimate. Same scope and same model
+    /// rule as [`Self::nearest_by_embedding`], because the two describe one
+    /// distribution.
+    pub async fn embedding_distance_dispersion(
+        &self,
+        query_embedding: Vec<f32>,
+        embedding_model: &str,
+    ) -> Result<Option<RecallDispersion>, CoreError> {
+        if query_embedding.is_empty() {
+            return Ok(None);
+        }
+        let user_id = current_user_id();
+        let measured: Option<(Option<f64>, i64, Option<f64>)> =
+            sqlx::query_as(EMBEDDING_DISTANCE_DISPERSION_SQL)
+                .bind(Vector::from(query_embedding))
+                .bind(user_id.as_str())
+                .bind(embedding_model)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| CoreError::Storage(e.to_string()))?;
+
+        let Some((Some(median), rows, Some(deviation))) = measured else {
+            return Ok(None);
+        };
+        Ok(RecallDispersion::measured(
+            median,
+            deviation,
+            rows.max(0) as usize,
+        ))
     }
 
     /// Full-text search that asks for **any** of the query's terms, best match
@@ -826,13 +866,88 @@ fn decode_cursor(cursor: &str) -> Result<(chrono::DateTime<chrono::Utc>, String)
     Ok((ts, id.to_string()))
 }
 
-/// A [`KbRow`] plus the cosine distance that ranked it, for
-/// [`PgKnowledgeBaseStore::nearest_by_embedding`].
+/// What [`PgKnowledgeBaseStore::nearest_by_embedding`] reads.
+///
+/// Held as its own string so the projection can be asserted on without a
+/// database - see `the_recall_scan_does_not_read_metadata`.
+const NEAREST_BY_EMBEDDING_SQL: &str = "\
+    SELECT id, content, tags, created_at, updated_at, source, summary,
+           MIN(chunk <=> $1) AS distance
+     FROM knowledge_base, unnest(embedding) AS chunk
+     WHERE user_id = $2
+       AND deleted_at IS NULL
+       AND embedding IS NOT NULL
+       AND embedding_model IS NOT NULL
+       AND (embedding_model = $3
+            OR (split_part($3, '@', 2) <> ''
+                AND split_part(embedding_model, '@', 2)
+                    = split_part($3, '@', 2)))
+     GROUP BY id, content, tags, created_at, updated_at, source, summary
+     ORDER BY distance
+     LIMIT $4";
+
+/// What [`PgKnowledgeBaseStore::embedding_distance_dispersion`] reads.
+///
+/// One row per entry, then two passes over those distances: the median, and the
+/// median of each distance's own distance from it. The `GROUP BY id` reduces to
+/// the primary key, and the projection carries the distance alone, so the pass
+/// reads the geometry and none of the content.
+const EMBEDDING_DISTANCE_DISPERSION_SQL: &str = "\
+    WITH d AS (
+         SELECT MIN(chunk <=> $1) AS distance
+         FROM knowledge_base, unnest(embedding) AS chunk
+         WHERE user_id = $2
+           AND deleted_at IS NULL
+           AND embedding IS NOT NULL
+           AND embedding_model IS NOT NULL
+           AND (embedding_model = $3
+                OR (split_part($3, '@', 2) <> ''
+                    AND split_part(embedding_model, '@', 2)
+                        = split_part($3, '@', 2)))
+         GROUP BY id
+     ),
+     m AS (
+         SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY distance) AS median,
+                count(*) AS rows_read
+         FROM d
+     )
+     SELECT m.median,
+            m.rows_read,
+            percentile_cont(0.5) WITHIN GROUP (ORDER BY abs(d.distance - m.median))
+                AS deviation
+     FROM d CROSS JOIN m
+     GROUP BY m.median, m.rows_read";
+
+/// One entry the recall scan ranked, plus the cosine distance that ranked it.
+///
+/// Its own row rather than a flattened [`KbRow`], because the scan does not read
+/// `metadata`: recall never looks at it, and the column is the widest thing on
+/// the row.
 #[derive(sqlx::FromRow)]
 struct KbNearestRow {
-    #[sqlx(flatten)]
-    row: KbRow,
+    id: String,
+    content: String,
+    tags: Vec<String>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+    source: Option<String>,
+    summary: Option<String>,
     distance: f64,
+}
+
+impl KbNearestRow {
+    fn into_entry(self) -> KnowledgeEntry {
+        KnowledgeEntry {
+            id: self.id,
+            content: self.content,
+            tags: self.tags,
+            metadata: serde_json::Value::Null,
+            created_at: self.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+            updated_at: self.updated_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+            source: self.source,
+            summary: self.summary,
+        }
+    }
 }
 
 #[derive(sqlx::FromRow)]
@@ -998,5 +1113,27 @@ mod tests {
             normalize_tag_filter(Some(vec!["   ".to_string(), String::new()])),
             Some(vec![])
         );
+    }
+
+    /// Acceptance (#1121): `metadata` is not read by the recall scan. The
+    /// column is the widest thing on the row and the block never looks at it.
+    #[test]
+    fn the_recall_scan_does_not_read_metadata() {
+        assert!(
+            !NEAREST_BY_EMBEDDING_SQL.contains("metadata"),
+            "the recall scan selects a column recall never reads: \n{NEAREST_BY_EMBEDDING_SQL}"
+        );
+    }
+
+    /// The dispersion pass reads the geometry and none of the content: one
+    /// distance per row, and no column of the entry itself.
+    #[test]
+    fn the_dispersion_pass_reads_no_entry_content() {
+        for column in ["metadata", "content", "summary", "tags"] {
+            assert!(
+                !EMBEDDING_DISTANCE_DISPERSION_SQL.contains(column),
+                "the dispersion pass reads {column}, which it has no use for"
+            );
+        }
     }
 }

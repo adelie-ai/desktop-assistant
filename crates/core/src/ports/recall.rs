@@ -60,19 +60,6 @@ pub enum RecallRelevance {
 }
 
 impl RecallRelevance {
-    /// Whether this candidate is near enough to the prompt to show.
-    ///
-    /// `max_distance` is the relevance floor stated as a cosine-distance
-    /// ceiling: a candidate must sit at or under it. A [`Self::LexicalMatch`]
-    /// always clears, because the database applied its own floor before the
-    /// row travelled.
-    pub fn clears_floor(self, max_distance: f64) -> bool {
-        match self {
-            Self::Distance(distance) => distance <= max_distance,
-            Self::LexicalMatch => true,
-        }
-    }
-
     /// Whether this candidate stands out from its source far enough to show.
     ///
     /// `bar` is dimensionless: how many median absolute deviations below the
@@ -212,17 +199,6 @@ pub struct RecallNote {
     pub relevance: RecallRelevance,
 }
 
-/// One tag name offered as a recall candidate.
-///
-/// The name alone: the point of the tag arm is a working vocabulary for the
-/// model's first knowledge search, and a tag's description says what the tag
-/// means rather than what this prompt is about.
-#[derive(Debug, Clone)]
-pub struct RecallTag {
-    pub name: String,
-    pub relevance: RecallRelevance,
-}
-
 /// What one recall lookup asks for.
 ///
 /// Every limit is a ceiling on rows *read*, not on rows shown. The block
@@ -239,8 +215,6 @@ pub struct RecallRequest {
     pub entry_limit: usize,
     /// Ceiling on scratchpad rows read.
     pub note_limit: usize,
-    /// Ceiling on tag rows read.
-    pub tag_limit: usize,
 }
 
 /// What one recall lookup found, each list nearest-first, and how spread out
@@ -254,7 +228,6 @@ pub struct RecallRequest {
 pub struct RecallCandidates {
     pub entries: Vec<RecallEntry>,
     pub notes: Vec<RecallNote>,
-    pub tags: Vec<RecallTag>,
     /// The knowledge source's own dispersion, measured over the whole source.
     /// `None` where the adapter could not measure one, which leaves the block on
     /// its stated estimate.

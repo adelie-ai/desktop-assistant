@@ -6,8 +6,8 @@ notice, the knowledge base is a store nobody reads, and a note it stashed on its
 own scratchpad an hour ago may as well not exist.
 
 Pre-prompt recall makes memory arrive unasked. When a user prompt lands, the
-daemon embeds it once, asks the three indexes that share that embedding space
-what is near it, and puts a short list of candidates in front of the model as a
+daemon embeds it once, asks the two indexes that share that embedding space what
+is near it, and puts a short list of candidates in front of the model as a
 `[Recall]` system block, before the model's first move.
 
 The block is a hint. Nothing is asserted, and the model decides whether any of
@@ -23,7 +23,7 @@ it matters.
 Notes on this conversation's scratchpad. Each line is one note: its key, then the start of what it says - not the whole note.
 - deploy-window: Fridays after 18:00, never before
 ...and 2 more notes matched less closely.
-Tags near this prompt: project:adelie-ai, infra, deploy, ui, preference
+Tags the entries above carry: infra, deploy, ui, preference
 ```
 
 Each entry line carries the entry id, the entry's tags, and the one line that
@@ -46,7 +46,8 @@ The two kinds of `- ` line are separated by the scratchpad label, because they
 carry different authority: an entry is what the assistant chose to keep across
 conversations, a note is what this conversation happens to have written down.
 
-Tag names are listed nearest first, not alphabetically.
+The tag names are the tags the entries above them carry, most-carried first.
+They are not searched for; they light up from the entries that surfaced.
 
 **The block names no tool.** Which read fetches an entry by its id is a property
 of the tool set on the day the block renders, and a block naming a tool the model
@@ -94,13 +95,14 @@ does not take one. `builtin_scratchpad_search` reads the note back. A note
 another block is already showing is left out, so what appears there is material
 nothing else in the turn is showing.
 
-**What the tag names are for.** They are registered tags of this store, so they
-are real names and not guesses - the same vocabulary `available_tags` reports
-after a search, offered before the model makes one. A filter on one that returns
-nothing means no entry in that scope carries the tag.
+**What the tag names are for.** They are the tags the entries above them carry,
+so they are real names of this store and not guesses - the same vocabulary
+`available_tags` reports after a search, offered before the model makes one. A
+search or a filter on one reaches the entries the block had no room for. A filter
+that returns nothing means no entry in that scope carries the tag.
 
 **That the block never replaces a search.** An absent block is not an empty
-store: the floors are conservative, and the lookup ran against the user's prompt
+store: the bar is conservative, and the lookup ran against the user's prompt
 rather than against the question the model would have asked. The section's
 mandatory search rule is unaffected.
 
@@ -108,18 +110,34 @@ The same text also lives in `runtime_system_instruction.txt`, the legacy
 monolith that `assembled_static_sections_match_original` byte-compares the
 assembled sections against. Both files carry it or the gate fails.
 
-## Three arms, one embedding
+## Two arms, one embedding, and a vocabulary that lights up from them
 
 | Arm | Index | What it offers |
 | --- | --- | --- |
 | Knowledge | `knowledge_base.embedding` | The entries nearest the prompt, best first. |
 | Scratchpad | `scratchpads.embedding` | This conversation's notes nearest the prompt. |
-| Tag | `tag_registry.embedding` | The names of the tags nearest the prompt. |
+| Tags | none | The tags the surfaced entries carry, most-carried first. |
 
-The tag arm reads vectors the near-duplicate check already built, and writes
-nothing. Its point is vocabulary: the model's first knowledge search is otherwise
-a guess at what words this user's tags use, and `available_tags` answers that
-only *after* a search has already come back thin.
+The point of the tag names is vocabulary: the model's first knowledge search is
+otherwise a guess at what words this user's tags use, and `available_tags`
+answers that only *after* a search has already come back thin.
+
+**The names are derived, not searched for.** A direct search of the tag registry
+was measured and does not discriminate at any threshold: a registry row embeds
+`"<name>: <description>"`, which is a label, and a prompt is a question, so the
+distance between them measures style as much as subject. Acknowledgements sat
+0.35 to 0.42 from the nearest registry row and real hits sat 0.22 to 0.44, so two
+of four hits were further away than every acknowledgement. The registry's own
+near-duplicate check works at 0.10 because it compares a label with a label.
+
+Reading the names off the entries that surfaced is spreading activation from a
+hit rather than a weak direct match, and three properties follow. It cannot fire
+when the entry arm is silent. It costs no second query and no second embedding
+comparison. And a name appears because it describes something the prompt actually
+reached.
+
+Only the entries the block **showed**. An entry the width dropped is not in front
+of the model, so its tags did not light up.
 
 Descriptions do not travel with the names. A tag's `description` says what the
 tag means; the caller is asking what this prompt is about.
@@ -198,12 +216,38 @@ permanently. The parent still reaches that answer through
 
 ## What bounds the cost
 
-**A relevance floor, not a top-k.** Each arm drops a candidate that is not near
-enough, rather than padding the list out to fill the budget. A prompt with
-nothing near it emits no block at all. The floors are cosine-distance ceilings,
-in `crates/core/src/recall.rs`. They are starting points rather than measured
-values, and how much a prompt of no content should reach is #1121's question,
-not this one's.
+**One dimensionless bar, and the width is what comes out.** Each arm drops a
+candidate that does not stand out from its own source, rather than padding the
+list out to fill the budget. A prompt with nothing that stands out emits no block
+at all.
+
+The bar is not a distance. A cosine distance means nothing on its own: what
+counts as near depends on the embedding model, on how much text a row holds, and
+on how wide the store's subject matter is, so a value fitted to one deployment
+says nothing about the next. Each candidate is read as **how far below its
+source's own median it sits, counted in that source's median absolute
+deviation** - and one dimensionless bar decides. That is `RECALL_BAR` in
+`crates/core/src/recall.rs`.
+
+The width is then an output rather than an input. A prompt with no cue clears
+nothing, a weak cue clears a line or two, and a strong cue clears a dozen. The
+block is wide exactly when there is something to be wide about, and the
+configured width is a safety cap on the worst case rather than the mechanism.
+
+**Measured over the source, never over the candidates.** The lookup reads only
+the nearest rows, so their spread is the near tail's and not the store's, and
+normalizing inside a truncated set inflates every score.
+`PgKnowledgeBaseStore::embedding_distance_dispersion` measures the median and the
+median absolute deviation over every row the search could reach. Both are
+properties of the store's geometry rather than of one query and barely move
+between turns, so the adapter holds one estimate per user and embedding model and
+measures again a quarter of an hour later.
+
+Before a source can measure its own, the block reads it by a stated estimate,
+which is deliberately narrow. A measurement is refused, and the estimate stands,
+when the sample is under 20 rows, when a value is not a number, or when the
+spread is under two percent of the median - a store of near-identical rows would
+otherwise report almost no spread and put half of itself past any bar.
 
 **A token budget, and a line budget derived from it.** The whole block is
 allowed 2,560 tokens in the worst case. That is two percent of a
@@ -223,14 +267,11 @@ rather than a choice:
 | The budget | 2,560 tokens at four bytes a token = 10,240 bytes |
 | **The width the budget buys** | **(10,240 - 2,410) / 391 = 20 lines** |
 
-**The default ships at 8, not at 20.** Eight is not what the arithmetic
-computed; it is the width that was already in place. The block's width is also
-the number of unrelated memories a prompt of no content puts in front of the
-model, and the relevance floor admits such a prompt today, so widening the block
-before the floor has an admission gate would multiply the noise case rather than
-the recall case. #1121 grades the width from the prompt's own signal, which
-leaves this number as a safety cap and sets it to the budgeted width. A
-deployment that wants the wider index now sets `max_entries`.
+**The shipped width is the width the budget pays for.** The bar decides how many
+lines render, which leaves this number protecting the token budget and nothing
+else - so the budget's own figure is the value it takes. A lower one would be a
+second, unstated policy about width. A deployment on a model with a small context
+window states a narrower one with `max_entries`.
 
 **Bytes, not characters, and the difference matters.** The token estimate the
 context budget uses is `bytes / 4`, and a character is one to four bytes.
@@ -246,13 +287,13 @@ Real entries carry a short id and a few tags, so a real line costs about a
 quarter of the worst case. The width rests on the bound rather than on the
 average, because only the bound is a promise. `crates/core/src/recall.rs` pins
 every number with a test - the worst case in ASCII, the worst case in a
-four-byte script, and the usual case, each at both the shipped width and the
-budgeted one - so a later change to the line format cannot inflate the block in
+four-byte script, and the usual case, each at the shipped width and at a
+narrower one - so a later change to the line format cannot inflate the block in
 silence.
 
-Five scratchpad lines and five tag names, unchanged. Those arms are not what the
-budget buys: the pad holds one conversation's notes, and the tag arm hands over a
-vocabulary rather than listing one.
+Five scratchpad lines and five tag names, unchanged. Those are not what the
+budget buys: the pad holds one conversation's notes, and the tag line hands over
+a vocabulary rather than listing one.
 
 **One round.** Every other per-turn block re-renders each round, because each is
 answering "is this still in view?". `[Recall]` answers "what might this prompt be
@@ -265,9 +306,9 @@ or ignored.
 A model that sees the lines the block had room for cannot tell whether the store
 holds exactly that many relevant things or four hundred, and those call for
 different next moves - accept the list, or go search properly. So the block ends
-with a count of what cleared the floor and did not fit.
+with a count of what cleared the bar and did not fit.
 
-That count means something only because the floor defines it. "How many matched"
+That count means something only because the bar defines it. "How many matched"
 is not a defined quantity over a hybrid search, where every embedded row scores
 non-zero against any query - the same trap that produced `scope_size` instead of
 a match count in the search tool.
@@ -275,9 +316,9 @@ a match count in the search tool.
 Each arm counts its own, and says which. The knowledge lookup reads at most 50
 rows and the scratchpad lookup at most 25 - fewer, because it reads one
 conversation's pad rather than the whole store, so the tail it would be counting
-is short. When a scan fills up *and* every row it read cleared the floor, that
+is short. When a scan fills up *and* every row it read cleared the bar, that
 arm's count is a lower bound and says so: "and 42 or more entries matched less
-closely." When the scan read past the floor, the count is exact and carries no
+closely." When the scan read past the bar, the count is exact and carries no
 hedge. When nothing was dropped, there is no line.
 
 ## Failure
@@ -285,10 +326,10 @@ hedge. When nothing was dropped, there is no line.
 Recall never fails a turn.
 
 The embedding call is bounded at five seconds, the same ceiling the
-knowledge-base search tool applies. On timeout or an embedding error the
-knowledge and scratchpad arms degrade to full-text search, and the tag arm goes
-quiet - the registry carries no full-text index to fall back to. The degradation
-is logged once, not once per arm.
+knowledge-base search tool applies. On timeout or an embedding error both arms
+degrade to full-text search, and no dispersion is measured - a full-text row
+carries no distance to read against a spread. The degradation is logged once, not
+once per arm.
 
 The whole lookup carries a second ceiling of ten seconds. The embedding timeout
 bounds only the embedding; the database round trips around it are bounded by the
@@ -304,18 +345,23 @@ model-authored query of two or three words and wrong for a whole user sentence:
 answer nothing at exactly the moment it exists to answer something. Ranking still
 puts the entry carrying more of the terms first.
 
-Over the full-text path there is no distance to compare, and no floor is applied:
-a row that carries none of the prompt's terms is never returned, which is a floor
+Over the full-text path there is no distance to compare, and no bar is applied: a
+row that carries none of the prompt's terms is never returned, which is a floor
 of its own.
 
 If the degraded read fails as well, the block is omitted and the turn proceeds.
 
 An arm that fails outright is a narrower loss. The scratchpad arm reads a
-different table from the other two, so it can fail on its own, and when it does
-it costs its own lines and nothing else: the knowledge and tag arms still
-render. The knowledge arm gets no such treatment, because a knowledge arm that
-cannot read is the block's whole point failing - losing the pad lines is a
-smaller loss than losing the block.
+different table from the knowledge arm, so it can fail on its own, and when it
+does it costs its own lines and nothing else: the knowledge arm still renders.
+The knowledge arm gets no such treatment, because a knowledge arm that cannot
+read is the block's whole point failing - losing the pad lines is a smaller loss
+than losing the block.
+
+A dispersion measurement that fails costs the block its unit and nothing else:
+the candidates still travel, and the block reads them against the stated
+estimate. The failure is logged and the estimate is not held, so the next turn
+measures again.
 
 ## Multi-tenancy
 
@@ -331,17 +377,18 @@ them to it, and runs under `just test-db`.
 ```toml
 [recall]
 enabled = true   # the default
-# max_entries = 20   # absent means 8, the held default
+# max_entries = 20   # absent means 20, the width the token budget pays for
 ```
 
 It also stays off on its own when there is no knowledge store or no embedding
 backend, and the daemon says which of the three reasons applies at startup.
 
-`max_entries` states how many knowledge lines the block may show. Set it to 20
-to take the index the budget pays for before #1121 raises the cap, or lower it
-on a model with a small context window. The value is held to what the block
-can honestly render - at least one line, and never more than the 50 rows the
-lookup reads, because a block that showed more would count a tail it never saw.
+`max_entries` states the most knowledge lines the block may show. It is a safety
+cap rather than a target: the bar decides how many lines a prompt actually
+renders, and most prompts render fewer. Lower it on a model with a small context
+window. The value is held to what the block can honestly render - at least one
+line, and never more than the 50 rows the lookup reads, because a block that
+showed more would count a tail it never saw.
 
 Both settings are read once, when the conversation handler is built, so an edit
 needs a restart. A live config reload reports `[recall]` as a restart-required
@@ -353,18 +400,24 @@ assistant reaches its knowledge base only when it decides to search.
 
 ## Known limits
 
-**The floors are untuned, and the entry floor is loose.** Both were chosen
-rather than measured. The entry floor admits candidates for a prompt that asks
-nothing - an acknowledgement, or "continue" - so the block is not as quiet on a
-low-signal prompt as the floor was meant to make it. #1121 carries the
-admission gate that fixes this.
+**The bar was measured against one store.** It separated cleanly over thirteen
+prompts on one store with one embedding model: the strongest candidate for a
+prompt with no cue reached 6.4 deviations, and the weakest candidate for a prompt
+with a real cue reached 7.3, so the margin between the two classes is about
+fifteen percent. The bar is dimensionless, so it has a far better claim to
+carrying across stores and models than a raw cosine ceiling does, and that claim
+is untested on a second store.
 
-**The block is narrower than its budget pays for, and the floor is why.** The
-width is also the number of unrelated memories a low-signal prompt renders, so
-the wider index waits on the gate above. The two belong together: the width
-makes recognition possible, and the gate makes the width safe. #1121 grades the
-width and raises this number to the budgeted one, where it becomes a cap rather
-than the mechanism; `max_entries` takes the wider index now.
+**The stated estimate is a stand-in, not a measurement.** A store under 20
+comparable rows has no measurable geometry, so the block reads it by a fixed
+median and spread until it has one. Those two numbers are the one place a
+distance is still stated by hand.
+
+**The pad is read by the stated estimate too.** One conversation's scratchpad
+rarely holds enough rows for a median absolute deviation over it to be a
+measurement rather than noise, and the pad read is already the block's most
+expensive query, so no second pass measures it. #1148 covers measuring it where
+a pad is large enough to state its own.
 
 **The scan reads whole rows.** Fifty entries are read to render a handful of
 lines, because the count of what did not fit has to be a count. The row count is
@@ -372,8 +425,7 @@ bounded; the bytes those rows carry are not, so a store of unusually long entrie
 pays more per prompt than a store of one-liners. Measured against a populated
 store, the wide projection costs a small fraction of a query that is already only
 a few milliseconds, so the read is left as one query rather than split into a
-rank pass and a body pass. `metadata` is selected and never read, which is a
-column to drop rather than a query to restructure.
+rank pass and a body pass.
 
 **It fires on every turn, including agent and subagent runs.** Any turn that goes
 through `send_prompt` gets a lookup, so a spawned agent working from a
@@ -407,6 +459,7 @@ measured.
 | Embedding, every query, degradation | `crates/daemon/src/recall.rs` |
 | The knowledge query | `PgKnowledgeBaseStore::nearest_by_embedding`, `crates/storage/src/knowledge.rs` |
 | Its degraded form | `PgKnowledgeBaseStore::search_text_any_term`, same file |
+| The dispersion measurement | `PgKnowledgeBaseStore::embedding_distance_dispersion`, same file |
 | The scratchpad query | `PgScratchpadStore::nearest_by_embedding`, `crates/storage/src/scratchpad.rs` |
 | Its degraded form | `PgScratchpadStore::search_text_any_term`, same file |
-| The tag query | `tag_registry::nearest_tags`, `crates/storage/src/tag_registry.rs` |
+| The tag names | `recall::carried_tags`, `crates/core/src/recall.rs` |
