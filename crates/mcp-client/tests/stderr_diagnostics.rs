@@ -70,6 +70,15 @@ async fn handshake_failure(label: &str, script: &str) -> String {
     }
 }
 
+/// [`handshake_failure`] for a case whose error *variant* is a race, returning
+/// the rendered message of whichever one arrived.
+async fn handshake_failure_text(label: &str, script: &str) -> String {
+    match connect_to_script(label, script).await {
+        Ok(_) => panic!("{label}: expected the handshake to fail, but connect succeeded"),
+        Err(err) => err.to_string(),
+    }
+}
+
 /// Upper bound asserted on a whole handshake failure message.
 ///
 /// The tail is bounded by construction (a fixed number of lines, each capped
@@ -590,6 +599,185 @@ while true; do sleep 1; done
     assert!(
         !msg.contains("environment variable"),
         "the environment-variable guess must not compete with real stderr, got: {msg}"
+    );
+}
+
+// --- The last line has no newline after it --------------------------------
+//
+// A line reaches the ring when its terminating newline arrives, and a final
+// unterminated line is published when the stream reaches end-of-file. Both of
+// the failure shapes above are defined by the child still running, so neither
+// ever reaches end-of-file: an unterminated last line would sit in the
+// reader's own buffer, unpublished, while the failure it explains is reported
+// without it. A program killed part-way through a `write` leaves exactly
+// that, and so does one that prints its complaint with `print!` rather than
+// `println!`.
+
+/// A hang whose last stderr line has no newline must still surface it.
+#[tokio::test]
+async fn a_hanging_server_surfaces_an_unterminated_last_stderr_line() {
+    // `printf '%s'`, not `printf '%s\n'`: the complaint is never terminated.
+    let script = r#"#!/bin/sh
+read -r line
+printf '%s' 'fatal: cannot open database' >&2
+trap '' TERM
+while true; do sleep 1; done
+"#;
+
+    let path = temp_path("hangs-mid-line");
+    std::fs::write(&path, script).expect("write hanging server script");
+    let args = [path.display().to_string()];
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(20),
+        McpClient::connect_with_request_timeout(
+            "/bin/sh",
+            &args,
+            &HashMap::new(),
+            Duration::from_secs(1),
+        ),
+    )
+    .await
+    .expect("connect must return within the test bound");
+
+    let _ = std::fs::remove_file(&path);
+
+    match result {
+        Ok(_) => panic!("expected the handshake to time out, but connect succeeded"),
+        Err(err @ McpError::Timeout { .. }) => {
+            let text = err.to_string();
+            assert!(
+                text.contains("fatal: cannot open database"),
+                "an unterminated last line must still reach the timeout, got: {text}"
+            );
+        }
+        Err(other) => panic!("expected McpError::Timeout, got: {other}"),
+    }
+}
+
+/// A live server that closed stdout mid-stderr-line must still surface it.
+#[tokio::test]
+async fn a_live_server_surfaces_an_unterminated_last_stderr_line() {
+    let msg = handshake_failure(
+        "closes-stdout-mid-line",
+        r#"#!/bin/sh
+read -r line
+printf '%s' 'fatal: no write access to the state directory' >&2
+exec 1>&-
+trap '' TERM
+while true; do sleep 1; done
+"#,
+    )
+    .await;
+
+    assert!(
+        msg.contains("fatal: no write access to the state directory"),
+        "an unterminated last line must still reach the failure, got: {msg}"
+    );
+}
+
+// --- The write side fails too ---------------------------------------------
+
+/// A server that is gone when the client next writes must be reported by what
+/// it did, not only by the broken pipe.
+///
+/// `round_trip` writes and reads at once. When the server has exited, its end
+/// of the client's stdin pipe is closed, so the *write* fails with `EPIPE`
+/// before the read ever sees end-of-file — and that surfaces as
+/// `McpError::Io`, a fourth failure shape beside the three the transport
+/// already names. On its own it says `Broken pipe` and nothing about the
+/// server: no exit status, no stderr, nothing to act on.
+///
+/// Deterministic by construction: the server exits while handling the
+/// `initialized` notification, and the call below happens after it is gone.
+#[tokio::test]
+async fn a_write_to_a_departed_server_reports_its_exit_status_and_stderr() {
+    let script = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf %s "$line" | sed 's/.*"id":\([0-9]*\).*/\1/')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"departs","version":"0.0"}}}\n' "$id"
+      ;;
+    *'"method":"notifications/initialized"'*)
+      printf '%s\n' 'fatal: lost its database connection' >&2
+      exit 4
+      ;;
+    *) : ;;
+  esac
+done
+"#;
+
+    let path = temp_path("departs-after-the-handshake");
+    std::fs::write(&path, script).expect("write departing server script");
+    let args = [path.display().to_string()];
+
+    let mut client = McpClient::connect("/bin/sh", &args, &HashMap::new())
+        .await
+        .expect("the handshake should succeed before the server departs");
+
+    // Let the server consume the notification and exit, so the write below
+    // meets a closed pipe rather than racing one.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(20),
+        client.call_tool("echo", serde_json::json!({})),
+    )
+    .await
+    .expect("the call must return, not hang");
+
+    client.shutdown().await;
+    let _ = std::fs::remove_file(&path);
+
+    match result {
+        Ok(value) => panic!("expected the call to fail, got: {value}"),
+        Err(err) => {
+            assert!(
+                matches!(err, McpError::Io(_)),
+                "a failed write stays an I/O error rather than changing class, got: {err:?}"
+            );
+            let text = err.to_string();
+            assert!(
+                text.contains("exited with status 4"),
+                "the write failure must name what became of the server, got: {text}"
+            );
+            assert!(
+                text.contains("fatal: lost its database connection"),
+                "the write failure must carry the server's stderr, got: {text}"
+            );
+        }
+    }
+}
+
+/// The motivating case, whichever way it lands.
+///
+/// A server that refuses its own command line and exits without ever reading
+/// stdin can fail the client's first round trip from either side: the read
+/// sees end-of-file, or the write meets a closed pipe first. Which one wins
+/// depends on whether the request reached the pipe buffer before the child
+/// died, and that is a race rather than a guarantee. The operator must not be
+/// able to tell the difference, so both shapes carry the same two facts.
+#[tokio::test]
+async fn a_server_that_never_reads_stdin_reports_the_same_facts_either_way() {
+    let text = handshake_failure_text(
+        "never-reads-stdin",
+        r#"#!/bin/sh
+printf '%s\n' 'error: the following required arguments were not provided: --config <CONFIG>' >&2
+exit 2
+"#,
+    )
+    .await;
+
+    assert!(
+        text.contains("exited with status 2"),
+        "the exit status must be named however the failure surfaced, got: {text}"
+    );
+    assert!(
+        text.contains(
+            "error: the following required arguments were not provided: --config <CONFIG>"
+        ),
+        "the stderr must be carried however the failure surfaced, got: {text}"
     );
 }
 
