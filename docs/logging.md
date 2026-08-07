@@ -127,7 +127,7 @@ turn streams, so a client already shows it. That value is a field on the turn
 span, and every line the turn writes carries it through span scope:
 
 ```text
-INFO turn{request_id=4bf92f35-... conversation_id=c-91 user_id=alice}: executing tool tool=web_fetch
+INFO turn{request_id="4bf92f35-..." conversation_id="c-91" user_id="alice"}: executing tool tool=web_fetch arg_bytes=214
 ```
 
 So one identifier, taken from a client's own event stream, greps the pod log
@@ -172,9 +172,12 @@ One per round, and one per turn. Both carry fields, never an interpolated
 sentence, so a backend can group and sort by any of them.
 
 ```text
-INFO turn{...}:turn.round{round=2}: round finished round=2 duration_ms=1840 outcome="tools_called" input_tokens=8120 output_tokens=96 cache_write_tokens=- cache_read_tokens=-
-INFO turn{...}: turn finished duration_ms=241033 model="claude-example" rounds=17 input_tokens=214800 output_tokens=3311 cache_write_tokens=- cache_read_tokens=- outcome="answered"
+INFO turn{...}:turn.round{round=2 input_tokens=8120 output_tokens=96 tools="web_fetch" outcome="tools_called"}: round finished round=2 duration_ms=1840 outcome="tools_called" input_tokens=8120 output_tokens=96 cache_write_tokens=- cache_read_tokens=-
+INFO turn{... rounds=17 outcome="answered" duration_ms=241033}: turn finished duration_ms=241033 model="claude-example" rounds=17 input_tokens=214800 output_tokens=3311 cache_write_tokens=- cache_read_tokens=- outcome="answered"
 ```
+
+Each line carries its own fields *and* the fields of every span above it, so a
+round line names its round and its turn without either being threaded by hand.
 
 A `-` means the provider did not report that count. It is never `0`, because a
 zero and an absence are different facts and nothing downstream could tell them
@@ -186,7 +189,7 @@ Both binaries turn span-close events on, so every closing span writes a line
 carrying how long it was open:
 
 ```text
-INFO turn{request_id=4bf92f35-...}: close time.busy=208ms time.idle=14.9ms
+INFO turn{request_id="4bf92f35-..."}:turn.round{round=2}:llm.call{round=2 provider="anthropic" model="claude-example" outcome="ok"}: close time.busy=1.81s time.idle=74.2µs
 ```
 
 That is what makes turn timing readable in `journalctl` or `kubectl logs`,
