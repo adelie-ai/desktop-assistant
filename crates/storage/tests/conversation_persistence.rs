@@ -345,6 +345,113 @@ async fn tail_truncation_deletes_only_the_tail() {
     .await;
 }
 
+/// #798: `messages.id` is the message's identity, its ordering key and the
+/// client's resume cursor, and `uuidv7_ts(id)` reads its creation time out of
+/// it. A mid-history insert shifts every later message into the next slot, so
+/// each shifted row must take its own id with it. Reconciling by slot alone
+/// left every shifted row holding the previous occupant's id, and made the
+/// whole update fail on the primary key when the tail row was written.
+#[tokio::test]
+async fn a_shifted_message_keeps_its_own_id() {
+    with_fixture("a_shifted_message_keeps_its_own_id", |fx| async move {
+        let store = PgConversationStore::new(fx.pool.clone());
+        let mut conv = conversation_with_messages("conv-shift-insert", 4);
+        let created: Vec<(String, String)> = conv
+            .messages
+            .iter()
+            .map(|m| (m.content.clone(), m.id.clone()))
+            .collect();
+
+        with_user_id(UserId::new("u1"), async {
+            store.create(conv.clone()).await.expect("create");
+        })
+        .await;
+
+        // The shape `close_unanswered_tool_calls` produces: a placeholder
+        // result inserted in the middle of the transcript.
+        conv.messages
+            .insert(1, Message::new(Role::Assistant, "inserted"));
+        let inserted_id = conv.messages[1].id.clone();
+        with_user_id(UserId::new("u1"), async {
+            store.update(conv.clone()).await.expect("update");
+        })
+        .await;
+
+        let loaded = with_user_id(UserId::new("u1"), async {
+            store.get(&ConversationId::from("conv-shift-insert")).await
+        })
+        .await
+        .expect("get");
+
+        assert_eq!(loaded.messages.len(), 5);
+        for (content, id) in &created {
+            let stored = loaded
+                .messages
+                .iter()
+                .find(|m| m.content == *content)
+                .unwrap_or_else(|| panic!("{content} must still be stored"));
+            assert_eq!(
+                stored.id, *id,
+                "{content} must keep the id it was created with"
+            );
+        }
+        assert_eq!(
+            loaded.messages[1].id, inserted_id,
+            "the inserted message must keep its own id"
+        );
+
+        fx
+    })
+    .await;
+}
+
+/// #798: the same contract under a mid-history removal, where every later
+/// message shifts the other way.
+#[tokio::test]
+async fn a_message_shifted_by_a_removal_keeps_its_own_id() {
+    with_fixture(
+        "a_message_shifted_by_a_removal_keeps_its_own_id",
+        |fx| async move {
+            let store = PgConversationStore::new(fx.pool.clone());
+            let mut conv = conversation_with_messages("conv-shift-remove", 6);
+            let survivors: Vec<(String, String)> = conv.messages[1..]
+                .iter()
+                .map(|m| (m.content.clone(), m.id.clone()))
+                .collect();
+
+            with_user_id(UserId::new("u1"), async {
+                store.create(conv.clone()).await.expect("create");
+            })
+            .await;
+
+            conv.messages.remove(0);
+            with_user_id(UserId::new("u1"), async {
+                store.update(conv).await.expect("update");
+            })
+            .await;
+
+            let loaded = with_user_id(UserId::new("u1"), async {
+                store.get(&ConversationId::from("conv-shift-remove")).await
+            })
+            .await
+            .expect("get");
+
+            assert_eq!(loaded.messages.len(), 5);
+            for (content, id) in &survivors {
+                let stored = loaded
+                    .messages
+                    .iter()
+                    .find(|m| m.content == *content)
+                    .unwrap_or_else(|| panic!("{content} must still be stored"));
+                assert_eq!(stored.id, *id, "{content} must keep its own id");
+            }
+
+            fx
+        },
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn mid_history_removal_round_trips() {
     with_fixture("mid_history_removal_round_trips", |fx| async move {
@@ -570,14 +677,14 @@ async fn user_message_without_key_loads_as_none() {
     .await;
 }
 
-/// The key travels with its message across an ordinal shift. `update` reconciles
-/// `conv.messages` against persisted rows by ordinal SLOT, so when an earlier
-/// message is removed — anything that drops a message and shifts the rest into
-/// lower slots — a keyed user row is UPDATEd into a slot the prior occupant
-/// held. `update_message` must
-/// carry `idempotency_key` or the user's key would be lost and the prior
-/// occupant's stale key would strand on the row now in the old slot — violating
-/// the USER-rows-only invariant migration 031 documents.
+/// The key travels with its message across an ordinal shift. `update`
+/// reconciles `conv.messages` against persisted rows by ordinal SLOT, so when
+/// an earlier message is removed - anything that drops a message and shifts the
+/// rest into lower slots - a keyed user row lands in a slot the prior occupant
+/// held. The rewrite of that slot must carry `idempotency_key` from the message
+/// that now holds it, or the user's key would be lost and the prior occupant's
+/// stale key would strand on the row now in the old slot - violating the
+/// USER-rows-only invariant migration 031 documents.
 #[tokio::test]
 async fn shifted_user_key_travels_with_its_message() {
     with_fixture(

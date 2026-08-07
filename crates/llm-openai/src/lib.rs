@@ -768,9 +768,10 @@ fn is_context_overflow_code(code: Option<&str>) -> bool {
 /// - **A structured envelope.** OpenAI's `code = "context_length_exceeded"`
 ///   and LiteLLM's `type = "context_window_exceeded"`. Where a code field
 ///   exists it is authoritative, and a body naming some other code is not an
-///   overflow however its message reads. Getting that wrong is destructive:
-///   the core's `recover_from_overflow` rewrites the largest tool result's
-///   content in place, up to `MAX_OVERFLOW_RETRIES` times.
+///   overflow however its message reads. Getting that wrong costs the turn:
+///   the core's `recover_from_overflow` drops the largest tool result from the
+///   model's view and shrinks the message window, up to `MAX_OVERFLOW_RETRIES`
+///   times, and then ends the turn.
 /// - **A flat body with no `error` key**, as vLLM emits. There is no code to
 ///   trust here, so the message is the only signal there is.
 ///
@@ -1742,9 +1743,10 @@ mod tests {
 
     /// The structured code is authoritative wherever there is one. A body that
     /// parses as the envelope and names some other code is not an overflow,
-    /// however its message reads - misclassifying is destructive, because
-    /// `recover_from_overflow` rewrites the largest tool result's content in
-    /// place, up to `MAX_OVERFLOW_RETRIES` times.
+    /// however its message reads - misclassifying costs the turn, because
+    /// `recover_from_overflow` drops the largest tool result from the model's
+    /// view and shrinks the message window, up to `MAX_OVERFLOW_RETRIES`
+    /// times, and then ends the turn.
     #[test]
     fn detect_context_overflow_trusts_the_structured_code_over_the_message() {
         // A quota refusal that happens to discuss the context window.

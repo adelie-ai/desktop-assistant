@@ -422,13 +422,14 @@ impl ConversationStore for PgConversationStore {
 
         // Structural diff-and-write (DS-5): load the existing rows in this
         // same transaction (which already proved ownership) and write only
-        // what actually changed, keeping row ids stable per (conversation,
-        // ordinal) slot. The dominant cases — append-only turns and
-        // compaction stamping `summary_id` — touch no prior rows, so their
-        // tsvectors are not regenerated. Every statement stays scoped by
-        // user_id as defense-in-depth.
+        // what actually changed. A row still holding the same message is not
+        // touched at all, so its tsvector is not regenerated - which is the
+        // dominant case, because an append-only turn changes no prior row. A
+        // slot now holding a different message is rewritten from that message,
+        // id included. Every statement stays scoped by user_id as
+        // defense-in-depth.
         let existing: Vec<ExistingMsgRow> = sqlx::query_as(
-            "SELECT ordinal, role, content, tool_calls, tool_call_id, summary_id \
+            "SELECT id, ordinal, role, content, tool_calls, tool_call_id, summary_id \
              FROM messages \
              WHERE user_id = $1 AND conversation_id = $2 \
              ORDER BY ordinal",
@@ -439,37 +440,49 @@ impl ConversationStore for PgConversationStore {
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;
 
-        for (ordinal, msg) in conv.messages.iter().enumerate() {
-            match existing.get(ordinal) {
-                // Row at this slot is structurally identical — no write at
-                // all, so its id and tsvector are untouched.
-                Some(row) if row.matches(msg) => {}
-                // Row exists but differs (e.g. summary_id stamped, or
-                // content shifted up by a mid-history removal): UPDATE in
-                // place, preserving the row id.
-                Some(_) => {
-                    update_message(&mut tx, user_id.as_str(), &conv.id.0, ordinal, msg).await?;
-                }
-                // No row at this slot — a genuinely new (appended) message.
-                None => {
-                    insert_message(&mut tx, user_id.as_str(), &conv.id.0, ordinal, msg).await?;
-                }
-            }
-        }
+        // The slots whose stored row is not the message that now sits there.
+        // Collected first because every one of them is deleted before any of
+        // them is written: a shift moves a message to a slot whose neighbour
+        // still holds that message's id, and `id` is the primary key, so
+        // writing slot by slot would collide with a row this same statement is
+        // about to replace.
+        let restated: Vec<usize> = conv
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(ordinal, msg)| existing.get(*ordinal).is_some_and(|row| !row.matches(msg)))
+            .map(|(ordinal, _)| ordinal)
+            .collect();
 
-        // Tail truncation: drop any persisted rows past the new length in a
-        // single ranged DELETE.
-        if existing.len() > conv.messages.len() {
+        // One ranged DELETE covers both: the slots being rewritten, and any
+        // tail past the new length.
+        if !restated.is_empty() || existing.len() > conv.messages.len() {
+            let ordinals: Vec<i32> = restated.iter().map(|o| *o as i32).collect();
             sqlx::query(
                 "DELETE FROM messages \
-                 WHERE user_id = $1 AND conversation_id = $2 AND ordinal >= $3",
+                 WHERE user_id = $1 AND conversation_id = $2 \
+                   AND (ordinal >= $3 OR ordinal = ANY($4))",
             )
             .bind(user_id.as_str())
             .bind(&conv.id.0)
             .bind(conv.messages.len() as i32)
+            .bind(&ordinals)
             .execute(&mut *tx)
             .await
             .map_err(|e| CoreError::Storage(e.to_string()))?;
+        }
+
+        for (ordinal, msg) in conv.messages.iter().enumerate() {
+            match existing.get(ordinal) {
+                // The row at this slot is the same message — no write at all,
+                // so its tsvector is not regenerated.
+                Some(row) if row.matches(msg) => {}
+                // The slot was deleted above, so write the message that holds
+                // it now, id and all.
+                _ => {
+                    insert_message(&mut tx, user_id.as_str(), &conv.id.0, ordinal, msg).await?;
+                }
+            }
         }
 
         tx.commit()
@@ -650,52 +663,9 @@ async fn insert_message(
     .bind(&msg.tool_call_id)
     .bind(&msg.summary_id)
     // #570 Phase 1b: carried on USER rows only (the persist site stamps it);
-    // NULL for assistant/tool rows and keyless sends. `update_message` rebinds
-    // it so the key follows its message across an ordinal shift (#570).
-    .bind(&msg.idempotency_key)
-    .execute(&mut **tx)
-    .await
-    .map_err(|e| CoreError::Storage(e.to_string()))?;
-
-    Ok(())
-}
-
-/// In-place UPDATE of the message occupying `(conversation_id, ordinal)`,
-/// preserving its row id (and so its primary-key identity). Only called when
-/// the slot's content differs from what's persisted, so the regenerated
-/// tsvector cost is paid only for genuinely changed rows.
-///
-/// `idempotency_key` is bound alongside the content so the key travels with its
-/// message (#570). Reconciliation is by ordinal SLOT, so any caller that hands
-/// back a list with an earlier message removed shifts a keyed user row into a
-/// slot the prior occupant held; without rebinding the key here that row would
-/// inherit the prior occupant's key column — losing the user's key and
-/// stranding a stale one on a non-user row (the USER-rows-only invariant in
-/// migration 031). This runs only when the slot's content already differs, so
-/// stable slots take no extra write.
-async fn update_message(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    user_id: &str,
-    conversation_id: &str,
-    ordinal: usize,
-    msg: &Message,
-) -> Result<(), CoreError> {
-    let tool_calls_json = tool_calls_json(msg);
-
-    sqlx::query(
-        "UPDATE messages \
-         SET role = $4, content = $5, tool_calls = $6, \
-             tool_call_id = $7, summary_id = $8, idempotency_key = $9 \
-         WHERE user_id = $1 AND conversation_id = $2 AND ordinal = $3",
-    )
-    .bind(user_id)
-    .bind(conversation_id)
-    .bind(ordinal as i32)
-    .bind(role_to_str(&msg.role))
-    .bind(&msg.content)
-    .bind(tool_calls_json)
-    .bind(&msg.tool_call_id)
-    .bind(&msg.summary_id)
+    // NULL for assistant/tool rows and keyless sends. The key travels with its
+    // message across an ordinal shift, because `update` rewrites a shifted slot
+    // from the message that now holds it rather than editing the row in place.
     .bind(&msg.idempotency_key)
     .execute(&mut **tx)
     .await
@@ -795,10 +765,11 @@ struct SummaryRow {
 
 /// An existing persisted message row, loaded inside `update`'s transaction to
 /// drive the structural diff. Carries exactly the columns `insert_message`
-/// writes (minus the id, which is what we are preserving) so a row can be
-/// compared structurally against an in-memory `Message`.
+/// writes, so a row can be compared against an in-memory `Message` - the id
+/// included, because the id belongs to the message and not to the slot.
 #[derive(sqlx::FromRow)]
 struct ExistingMsgRow {
+    id: String,
     #[allow(dead_code)]
     ordinal: i32,
     role: String,
@@ -809,13 +780,20 @@ struct ExistingMsgRow {
 }
 
 impl ExistingMsgRow {
-    /// Whether this persisted row is structurally identical to `msg`, i.e. a
-    /// re-insert would produce the same data. `tool_calls` is compared as a
+    /// Whether this persisted row is the same message as `msg`, i.e. a
+    /// re-insert would produce the same row. `tool_calls` is compared as a
     /// `serde_json::Value` so JSONB key-order normalization cannot cause a
     /// false mismatch; empty tool calls are stored as SQL `NULL` on both sides
     /// (see `tool_calls_json`).
+    ///
+    /// The id is part of the comparison. A message's UUIDv7 is its identity,
+    /// its ordering key and the client's resume cursor, and `uuidv7_ts` reads
+    /// the time it was created out of it. A slot that holds a different
+    /// message therefore has to take that message's id, so the comparison has
+    /// to see the difference.
     fn matches(&self, msg: &Message) -> bool {
-        self.role == role_to_str(&msg.role)
+        self.id == msg.id
+            && self.role == role_to_str(&msg.role)
             && self.content == msg.content
             && self.tool_call_id == msg.tool_call_id
             && self.summary_id == msg.summary_id
