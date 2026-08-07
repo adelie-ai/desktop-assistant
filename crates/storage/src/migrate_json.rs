@@ -3,6 +3,7 @@
 //! Reads existing JSON files and inserts records into Postgres tables.
 //! Intended for first-startup migration when JSON files exist and DB tables are empty.
 
+use crate::knowledge_delete::KnowledgeDeletePolicy;
 use std::path::Path;
 
 use desktop_assistant_core::CoreError;
@@ -128,7 +129,9 @@ pub async fn migrate_knowledge(
     memory_path: &Path,
     pool: &PgPool,
 ) -> Result<usize, CoreError> {
-    let kb_store = PgKnowledgeBaseStore::new(pool.clone());
+    // The bootstrap only writes, so no deletion policy of the deployment's is
+    // in play; the defaults stand in for one that is never consulted.
+    let kb_store = PgKnowledgeBaseStore::new(pool.clone(), KnowledgeDeletePolicy::default());
     let mut count = 0;
 
     // --- Preferences ---

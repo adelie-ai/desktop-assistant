@@ -63,14 +63,16 @@ knowledge.
 
 Consolidation policy is only reachable through Postgres, so it is outside `just check` and
 only runs under `just test-db` (`cargo test -p desktop-assistant-storage`, justfile:108).
-`just check` verifies exactly one dreaming policy *rule* today - the plain `#[test]` at
-`dreaming_db_paths.rs:399` asserting `MAX_DELETE_FRACTION == 0.1` - plus 28 helper-level
-unit tests. The delete cap, the never-prune-explicit rule, the settled-entry rules and
-tenant isolation are all behind a container someone has to remember to boot.
+`just check` verifies the pure deletion-policy rules today - the caps and the refusal
+decision are unit-tested in `knowledge_delete.rs`, and a plain `#[test]` in
+`dreaming_db_paths.rs` pins the shipped default prune fraction at 0.1 - plus 28
+helper-level unit tests. The delete cap *applied to a real store*, the
+never-prune-explicit rule, the settled-entry rules and tenant isolation are all behind a
+container someone has to remember to boot.
 
-That constant has a price attached: `types.rs:66-74` records that the previous
-`MAX_DELETE_FRACTION = 0.5` cost the reference instance 606 of 608 extracted facts (#694).
-The rule that would have caught it is exactly the kind that does not run in the gate.
+That fraction has a price attached: `knowledge_delete.rs` records that the previous 0.5
+cost the reference instance 606 of 608 extracted facts (#694). The rule that would have
+caught it is exactly the kind that does not run in the gate.
 
 ### The leak is small and precisely located
 
@@ -383,8 +385,10 @@ that file, where `trash_count` and `empty_trash` delegate to `dreaming::trash`
 
 ## Where the constants, tunables and prompts land
 
-**To `core`, verbatim, as domain policy.** `MAX_DELETE_FRACTION` (types.rs:75, with its
-#694 incident note intact), `MAX_DELETE_REASON_CHARS` (:82), `MAX_MESSAGE_CHARS` (:29),
+**To `core`, verbatim, as domain policy.** `DEFAULT_PRUNE_FRACTION` and
+`DEFAULT_REWRITE_FRACTION` (knowledge_delete.rs, with the #694 incident note intact,
+together with `KnowledgeDeletePolicy` itself), `MAX_DELETE_REASON_CHARS` (:82),
+`MAX_MESSAGE_CHARS` (:29),
 `MAX_HOLISTIC_PROMPT_CHARS` (:61), the function-local `PER_ENTRY_OVERHEAD = 200`
 (consolidation.rs:456), and `SOFT_DELETE_TTL_DAYS` (:55). Five of the eight are crate-private
 today (`mod.rs:33-37` re-exports only five of the eight), so most of this is invisible
@@ -393,7 +397,7 @@ outside the crate.
 `SOFT_DELETE_TTL_DAYS` is the one the daemon reaches across the boundary for
 (config/mod.rs:539, asserted at :2013). It stays a *default* that `[backend_tasks]
 knowledge_trash_retention_days` overrides, and the configured value keeps threading daemon
-config -> `soft_delete_retention_days` (maintenance_service.rs:56) -> the pass -> the reap
+config -> the `KnowledgeDeletePolicy` the maintenance service holds -> the pass -> the reap
 byte for byte. The config default simply points at core instead of at the adapter. It must
 not be replaced with a literal `30`, or two independent thirties start drifting.
 
@@ -583,8 +587,9 @@ scanning source - but they do not replace the audit.
 - **It does not change dream-cycle behaviour, prompts, or any tunable's value.** Not the
   delete cap, not the generation cap, not the retention default. A behaviour change hiding
   in a move is the main way this goes wrong.
-- **It does not turn any constant into a config knob.** `MAX_DELETE_FRACTION` is the
-  strongest candidate given #694, and it stays a compile-time constant here.
+- **It does not turn any remaining constant into a config knob.** The prune and rewrite
+  shares became `[backend_tasks]` keys under #1122, before this port; the rest stay
+  compile-time constants here.
 - **It does not fix two things that look like bugs and may not be touched in a
   behaviour-preserving move.** `slice_entries` measures `content.len()` in *bytes* against a
   constant named `..._CHARS` (consolidation.rs:462-464), and `run_archival_phase` branches

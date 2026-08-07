@@ -31,10 +31,10 @@
 mod support;
 
 use desktop_assistant_storage::dreaming::{
-    BackfillEmbedFn, DreamingLlmFn, MAX_DELETE_FRACTION, MAX_DELETE_REASON_CHARS,
-    MAX_REVIEW_GENERATION, SOFT_DELETE_TTL_DAYS, SOURCE_EXPLICIT, run_consolidation_scan,
-    run_dreaming_scan, update_watermark,
+    BackfillEmbedFn, DreamingLlmFn, MAX_DELETE_REASON_CHARS, MAX_REVIEW_GENERATION,
+    SOURCE_EXPLICIT, run_consolidation_scan, run_dreaming_scan, update_watermark,
 };
+use desktop_assistant_storage::knowledge_delete::{DEFAULT_PRUNE_FRACTION, KnowledgeDeletePolicy};
 use desktop_assistant_storage::{UserId, with_user_id};
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
@@ -303,7 +303,7 @@ async fn apply_ops_soft_deletes_members_and_updates_canonical() {
     let stats = run_consolidation_scan(
         pool,
         &llm,
-        SOFT_DELETE_TTL_DAYS,
+        KnowledgeDeletePolicy::default(),
         &CancellationToken::new(),
         None,
     )
@@ -363,7 +363,7 @@ async fn apply_ops_never_touches_other_users_kb() {
     run_consolidation_scan(
         pool,
         &llm,
-        SOFT_DELETE_TTL_DAYS,
+        KnowledgeDeletePolicy::default(),
         &CancellationToken::new(),
         None,
     )
@@ -394,13 +394,15 @@ async fn apply_ops_never_touches_other_users_kb() {
 // consolidation — deletion cap and per-user scoping.
 // ---------------------------------------------------------------------------
 
-/// The cap is a blast-radius bound on one night's unreviewed judgment, so its
-/// value is part of the contract, not an implementation detail.
+/// The cap is a blast-radius bound on one run's unreviewed judgment, so the
+/// shipped value is part of the contract, not an implementation detail. It is
+/// configurable now, and the default is what an instance that sets nothing
+/// gets.
 #[test]
-fn max_delete_fraction_is_the_reviewed_value() {
+fn the_default_prune_fraction_is_the_reviewed_value() {
     assert!(
-        (MAX_DELETE_FRACTION - 0.1).abs() < f64::EPSILON,
-        "MAX_DELETE_FRACTION is {MAX_DELETE_FRACTION}; changing the share of a \
+        (DEFAULT_PRUNE_FRACTION - 0.1).abs() < f64::EPSILON,
+        "the default prune fraction is {DEFAULT_PRUNE_FRACTION}; changing the share of a \
          knowledge base one run may destroy is a reviewed decision, not a tweak"
     );
 }
@@ -417,8 +419,8 @@ async fn delete_cap_is_enforced_at_the_documented_fraction() {
         seed_kb(pool, "u1", id, "trivial fact").await;
     }
 
-    // A plan that deletes all 10. cap = ceil(10 * 0.1) = 1, so nine are dropped
-    // this run.
+    // A plan that deletes all 10. cap = ceil(10 * 0.1) = 1, so nine are
+    // deferred to a later run.
     let plan = format!(
         r#"{{"operations":[{{"op":"delete","ids":[{}],"reason":"trivial"}}]}}"#,
         ids.iter()
@@ -430,7 +432,7 @@ async fn delete_cap_is_enforced_at_the_documented_fraction() {
     let stats = run_consolidation_scan(
         pool,
         &llm,
-        SOFT_DELETE_TTL_DAYS,
+        KnowledgeDeletePolicy::default(),
         &CancellationToken::new(),
         None,
     )
@@ -439,7 +441,7 @@ async fn delete_cap_is_enforced_at_the_documented_fraction() {
 
     assert_eq!(
         stats.soft_deleted, 1,
-        "delete plan clamped to ceil(10 * MAX_DELETE_FRACTION)"
+        "delete plan clamped to ceil(10 * the configured prune fraction)"
     );
     assert_eq!(kb_count_deleted(pool, "u1").await, 1);
     assert_eq!(kb_count_active(pool, "u1").await, 9);
@@ -481,7 +483,7 @@ async fn explicit_entry_proposed_for_deletion_is_not_pruned_and_is_counted() {
     let stats = run_consolidation_scan(
         pool,
         &llm,
-        SOFT_DELETE_TTL_DAYS,
+        KnowledgeDeletePolicy::default(),
         &CancellationToken::new(),
         None,
     )
@@ -526,7 +528,7 @@ async fn edit_of_an_explicit_entry_does_not_launder_its_source() {
     run_consolidation_scan(
         pool,
         &llm,
-        SOFT_DELETE_TTL_DAYS,
+        KnowledgeDeletePolicy::default(),
         &CancellationToken::new(),
         None,
     )
@@ -566,7 +568,7 @@ async fn merge_whose_canonical_is_explicit_keeps_the_explicit_source() {
     run_consolidation_scan(
         pool,
         &llm,
-        SOFT_DELETE_TTL_DAYS,
+        KnowledgeDeletePolicy::default(),
         &CancellationToken::new(),
         None,
     )
@@ -601,7 +603,7 @@ async fn merge_with_an_explicit_member_keeps_explicit_source_on_the_canonical() 
     run_consolidation_scan(
         pool,
         &llm,
-        SOFT_DELETE_TTL_DAYS,
+        KnowledgeDeletePolicy::default(),
         &CancellationToken::new(),
         None,
     )
@@ -638,7 +640,7 @@ async fn merge_records_superseding_id_on_every_soft_deleted_member() {
     run_consolidation_scan(
         pool,
         &llm,
-        SOFT_DELETE_TTL_DAYS,
+        KnowledgeDeletePolicy::default(),
         &CancellationToken::new(),
         None,
     )
@@ -683,7 +685,7 @@ async fn standalone_prune_records_prune_kind_and_the_models_reason() {
     run_consolidation_scan(
         pool,
         &llm,
-        SOFT_DELETE_TTL_DAYS,
+        KnowledgeDeletePolicy::default(),
         &CancellationToken::new(),
         None,
     )
@@ -729,7 +731,7 @@ async fn merge_and_prune_tombstones_are_distinguishable_by_sql() {
     run_consolidation_scan(
         pool,
         &llm,
-        SOFT_DELETE_TTL_DAYS,
+        KnowledgeDeletePolicy::default(),
         &CancellationToken::new(),
         None,
     )
@@ -762,7 +764,7 @@ async fn prune_with_no_stated_reason_records_null_not_an_empty_string() {
     run_consolidation_scan(
         pool,
         &llm,
-        SOFT_DELETE_TTL_DAYS,
+        KnowledgeDeletePolicy::default(),
         &CancellationToken::new(),
         None,
     )
@@ -801,7 +803,7 @@ async fn delete_reason_from_the_model_is_bounded_before_storage() {
     run_consolidation_scan(
         pool,
         &llm,
-        SOFT_DELETE_TTL_DAYS,
+        KnowledgeDeletePolicy::default(),
         &CancellationToken::new(),
         None,
     )
@@ -837,7 +839,7 @@ async fn delete_provenance_is_never_written_to_another_tenants_rows() {
     run_consolidation_scan(
         pool,
         &llm,
-        SOFT_DELETE_TTL_DAYS,
+        KnowledgeDeletePolicy::default(),
         &CancellationToken::new(),
         None,
     )
@@ -875,7 +877,7 @@ async fn empty_knowledge_base_consolidates_to_a_clean_no_op() {
     let stats = run_consolidation_scan(
         pool,
         &llm,
-        SOFT_DELETE_TTL_DAYS,
+        KnowledgeDeletePolicy::default(),
         &CancellationToken::new(),
         None,
     )
@@ -912,7 +914,7 @@ async fn consolidate_user_is_tenant_isolated() {
     run_consolidation_scan(
         pool,
         &llm,
-        SOFT_DELETE_TTL_DAYS,
+        KnowledgeDeletePolicy::default(),
         &CancellationToken::new(),
         None,
     )
@@ -958,7 +960,7 @@ async fn review_generation_increments_on_each_mutation() {
     run_consolidation_scan(
         pool,
         &llm,
-        SOFT_DELETE_TTL_DAYS,
+        KnowledgeDeletePolicy::default(),
         &CancellationToken::new(),
         None,
     )
@@ -988,7 +990,7 @@ async fn entry_at_review_generation_cap_is_excluded_from_further_mutation() {
     let stats = run_consolidation_scan(
         pool,
         &llm,
-        SOFT_DELETE_TTL_DAYS,
+        KnowledgeDeletePolicy::default(),
         &CancellationToken::new(),
         None,
     )
@@ -1030,7 +1032,7 @@ async fn merge_touching_a_settled_entry_is_skipped_entirely() {
     let stats = run_consolidation_scan(
         pool,
         &llm,
-        SOFT_DELETE_TTL_DAYS,
+        KnowledgeDeletePolicy::default(),
         &CancellationToken::new(),
         None,
     )
@@ -1068,7 +1070,7 @@ async fn settled_entry_can_still_be_pruned() {
     run_consolidation_scan(
         pool,
         &llm,
-        SOFT_DELETE_TTL_DAYS,
+        KnowledgeDeletePolicy::default(),
         &CancellationToken::new(),
         None,
     )

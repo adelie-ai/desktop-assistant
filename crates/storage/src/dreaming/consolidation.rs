@@ -7,9 +7,9 @@
 //! ids. The operations are applied transactionally with soft-delete via
 //! [`reconcile::apply_ops`].
 //!
-//! The plan is not applied verbatim. Three rules bound what one night's
-//! judgment can do, because that judgment is formed from prose alone with no
-//! signal about whether an entry was ever retrieved or cited:
+//! The plan is not applied verbatim. Four rules bound what one run's judgment
+//! can do, because that judgment is formed from prose alone with no signal
+//! about whether an entry was ever retrieved or cited:
 //!
 //! 1. A deliberately promoted entry ([`SOURCE_EXPLICIT`]) is never pruned. It
 //!    may be rewritten or merged, and the provenance follows it, so the
@@ -18,8 +18,18 @@
 //!    consolidation re-reads its own output every pass, so without a stop the
 //!    store drifts from what was observed toward paraphrase of paraphrase. A
 //!    settled entry stays prunable - the cap settles its prose, not the store.
-//! 3. Outright prunes are capped at [`MAX_DELETE_FRACTION`] of the active set
-//!    per run. Merges do not count: their content survives in a canonical row.
+//! 3. Outright prunes are capped at the configured share of the active set per
+//!    run ([`KnowledgeDeletePolicy::prune_cap`]). Merges do not count: their
+//!    content survives in a canonical row. A configured share of zero applies
+//!    the merges and the edits and retires nothing.
+//! 4. Rewrites are capped the same way
+//!    ([`KnowledgeDeletePolicy::rewrite_cap`]). An edit and a merge both
+//!    overwrite content with no prior version kept, so one degraded answer
+//!    must not reach the whole store. A merge costs one whatever its cluster
+//!    size, because only the canonical row's content is replaced.
+//!
+//! Both caps defer rather than discard: the entries are still there for the
+//! next run, and the counts are reported.
 //!
 //! When a user's KB is too large for a single prompt it is sliced into
 //! tag-grouped chunks under a character budget and each chunk is recomputed
@@ -43,11 +53,11 @@ use tokio_util::sync::CancellationToken;
 use super::common::{extract_json_payload, is_total_failure};
 use super::reconcile::{OpBuffer, ProposedOp, SynthesizedMerge, apply_ops};
 use super::types::{
-    ConsolidationStats, DreamingLlmFn, KnowledgeChangeFn, MAX_DELETE_FRACTION,
-    MAX_DELETE_REASON_CHARS, MAX_HOLISTIC_PROMPT_CHARS, MAX_REVIEW_GENERATION,
-    MAX_SLICE_SPLIT_DEPTH, SOURCE_EXPLICIT,
+    ConsolidationStats, DreamingLlmFn, KnowledgeChangeFn, MAX_DELETE_REASON_CHARS,
+    MAX_HOLISTIC_PROMPT_CHARS, MAX_REVIEW_GENERATION, MAX_SLICE_SPLIT_DEPTH, SOURCE_EXPLICIT,
 };
 use crate::kb_metadata::{KbMetadata, KbScope};
+use crate::knowledge_delete::KnowledgeDeletePolicy;
 
 /// One active KB entry loaded for holistic review.
 struct KbEntry {
@@ -84,7 +94,7 @@ impl KbEntry {
 pub async fn run_consolidation_phase(
     pool: &PgPool,
     llm_fn: &DreamingLlmFn,
-    soft_delete_retention_days: u32,
+    policy: KnowledgeDeletePolicy,
     cancellation: &CancellationToken,
     on_change: Option<&KnowledgeChangeFn>,
 ) -> Result<ConsolidationStats, CoreError> {
@@ -109,7 +119,7 @@ pub async fn run_consolidation_phase(
             break;
         }
         let result = with_user_id(UserId::new(user_id_str.clone()), async {
-            consolidate_user(pool, llm_fn, soft_delete_retention_days, cancellation).await
+            consolidate_user(pool, llm_fn, policy, cancellation).await
         })
         .await;
 
@@ -122,6 +132,8 @@ pub async fn run_consolidation_phase(
                 total.soft_deleted += stats.soft_deleted;
                 total.protected_from_delete += stats.protected_from_delete;
                 total.settled_unchanged += stats.settled_unchanged;
+                total.prunes_over_cap += stats.prunes_over_cap;
+                total.rewrites_over_cap += stats.rewrites_over_cap;
                 // Live refresh: if this user's KB actually changed, let connected
                 // panels refetch as the scan progresses.
                 if (stats.merged_clusters > 0
@@ -157,7 +169,7 @@ pub async fn run_consolidation_phase(
 async fn consolidate_user(
     pool: &PgPool,
     llm_fn: &DreamingLlmFn,
-    soft_delete_retention_days: u32,
+    policy: KnowledgeDeletePolicy,
     cancellation: &CancellationToken,
 ) -> Result<ConsolidationStats, CoreError> {
     let entries = load_active_entries(pool).await?;
@@ -176,13 +188,13 @@ async fn consolidate_user(
     }
 
     let mut buffer = OpBuffer::new();
-    // Merge groups are routed through the buffer's union-find (pairwise) so a
-    // member can't also be edited/deleted standalone, and the model's
-    // synthesized content is recorded keyed by the group's lowest id.
-    let mut merge_content: std::collections::HashMap<String, (String, Option<KbScope>)> =
-        std::collections::HashMap::new();
-    // Deletes are collected across slices so the per-run deletion cap applies
-    // to the user's whole KB, not each slice.
+    // Every op the model proposes is collected across all slices and only then
+    // absorbed, because both caps apply to the user's whole KB rather than to
+    // each slice. Order is the order the model answered in, so a capped run is
+    // deterministic.
+    let mut merge_ops: Vec<MergeOp> = Vec::new();
+    let mut update_ops: Vec<(String, String)> = Vec::new();
+    let mut scope_ops: Vec<(String, KbScope)> = Vec::new();
     let mut delete_ops: Vec<(String, Option<String>)> = Vec::new();
     // Refusals, reported so an operator can see what the model keeps asking
     // for and the guards keep declining.
@@ -265,16 +277,11 @@ async fn consolidate_user(
                         settled_unchanged += 1;
                         continue;
                     }
-                    // Chain pairwise merges so the union-find groups the members;
-                    // record the synthesized content under the lowest id.
-                    let canonical = members.iter().min().cloned().unwrap();
-                    for other in members.iter().skip(1) {
-                        buffer.absorb(ProposedOp::Merge {
-                            a: members[0].clone(),
-                            b: other.clone(),
-                        });
-                    }
-                    merge_content.insert(canonical, (content, scope.filter(|s| !s.is_empty())));
+                    merge_ops.push(MergeOp {
+                        members,
+                        content,
+                        scope: scope.filter(|s| !s.is_empty()),
+                    });
                 }
                 RawOp::Edit { id, content, scope } => {
                     if !valid.contains(id.as_str()) {
@@ -286,17 +293,14 @@ async fn consolidate_user(
                             settled_unchanged += 1;
                             tracing::debug!("dreaming: skipping rewrite of settled entry {id}");
                         } else {
-                            buffer.absorb(ProposedOp::Update {
-                                id: id.clone(),
-                                new_content: content,
-                            });
+                            update_ops.push((id.clone(), content));
                         }
                     }
                     // Attaching a scope is metadata, not paraphrase: it does not
                     // advance the review generation and cannot drift the prose,
                     // so a settled entry can still be filed more precisely.
                     if let Some(scope) = scope.filter(|s| !s.is_empty()) {
-                        buffer.absorb(ProposedOp::AddScope { id, scope });
+                        scope_ops.push((id, scope));
                     }
                 }
                 RawOp::Keep => {}
@@ -322,6 +326,49 @@ async fn consolidate_user(
         }
     }
 
+    // Rewrite cap over the whole KB. A merge and an edit both overwrite
+    // `content` with no prior version kept, so the prune cap says nothing
+    // about them and this one does.
+    let rewrite_cap = policy.rewrite_cap(total_entries);
+    let proposed_rewrites = merge_ops.len() + update_ops.len();
+    let (merge_ops, update_ops) = take_within_rewrite_cap(merge_ops, update_ops, rewrite_cap);
+    let rewrites_over_cap = proposed_rewrites - (merge_ops.len() + update_ops.len());
+    if rewrites_over_cap > 0 {
+        tracing::warn!(
+            "dreaming: holistic consolidation proposed {proposed_rewrites} rewrite(s) for \
+             {total_entries} entries; capping at {rewrite_cap} ({rewrites_over_cap} deferred to \
+             a later run)"
+        );
+    }
+
+    // Chain each surviving group's pairwise merges so the union-find collects
+    // the members, and record the synthesized content under the group's lowest
+    // id.
+    let mut merge_content: std::collections::HashMap<String, (String, Option<KbScope>)> =
+        std::collections::HashMap::new();
+    for merge in merge_ops {
+        let canonical = merge
+            .members
+            .iter()
+            .min()
+            .cloned()
+            .expect("a merge op holds at least two members");
+        for other in merge.members.iter().skip(1) {
+            buffer.absorb(ProposedOp::Merge {
+                a: merge.members[0].clone(),
+                b: other.clone(),
+            });
+        }
+        merge_content.insert(canonical, (merge.content, merge.scope));
+    }
+    for (id, new_content) in update_ops {
+        buffer.absorb(ProposedOp::Update { id, new_content });
+    }
+    // Attaching a scope is metadata, not a rewrite, so it is uncapped.
+    for (id, scope) in scope_ops {
+        buffer.absorb(ProposedOp::AddScope { id, scope });
+    }
+
     // Resolve merge clusters (union-find over the chained pairwise merges) into
     // synthesized merges, pulling the recorded content for each group.
     let mut synthesized: Vec<SynthesizedMerge> = Vec::new();
@@ -344,19 +391,19 @@ async fn consolidate_user(
         });
     }
 
-    // Deletion cap over the whole KB. Protected ids never reach `delete_ops`,
-    // so refusing them does not consume the budget. The `.max(1)` floor keeps a
-    // genuinely bad entry removable from a tiny store, where the fraction would
-    // otherwise round to zero.
-    let cap = ((total_entries as f64) * MAX_DELETE_FRACTION).ceil() as usize;
-    let cap = cap.max(1);
-    if delete_ops.len() > cap {
+    // Prune cap over the whole KB. Protected ids never reach `delete_ops`, so
+    // refusing them does not consume the budget. A configured fraction of zero
+    // yields a cap of zero, which is how a deployment keeps consolidation's
+    // merges and declines its deletes.
+    let prune_cap = policy.prune_cap(total_entries);
+    let prunes_over_cap = delete_ops.len().saturating_sub(prune_cap);
+    if prunes_over_cap > 0 {
         tracing::warn!(
-            "dreaming: holistic consolidation proposed {} deletes for {total_entries} entries; \
-             capping at {cap} (excess dropped this run)",
+            "dreaming: holistic consolidation proposed {} prune(s) for {total_entries} entries; \
+             capping at {prune_cap} ({prunes_over_cap} deferred to a later run)",
             delete_ops.len()
         );
-        delete_ops.truncate(cap);
+        delete_ops.truncate(prune_cap);
     }
     for (id, reason) in &delete_ops {
         tracing::debug!(
@@ -372,16 +419,47 @@ async fn consolidate_user(
     tracing::info!(
         "dreaming: holistic consolidation plan for {total_entries} entries — \
          {} merge(s), {} edit(s)/scope-add(s), {} prune(s); \
-         {protected_from_delete} protected, {settled_unchanged} settled",
+         {protected_from_delete} protected, {settled_unchanged} settled, \
+         {rewrites_over_cap} rewrite(s) and {prunes_over_cap} prune(s) over the configured share",
         synthesized.len(),
         buffer.standalone_updates().len() + buffer.standalone_scope_adds().len(),
         delete_ops.len(),
     );
 
-    let mut stats = apply_ops(pool, &buffer, &synthesized, soft_delete_retention_days).await?;
+    let mut stats = apply_ops(pool, &buffer, &synthesized, policy).await?;
     stats.protected_from_delete = protected_from_delete;
     stats.settled_unchanged = settled_unchanged;
+    stats.prunes_over_cap = prunes_over_cap;
+    stats.rewrites_over_cap = rewrites_over_cap;
     Ok(stats)
+}
+
+/// One merge the model proposed, before the rewrite cap decides whether it is
+/// applied this run.
+struct MergeOp {
+    members: Vec<String>,
+    content: String,
+    scope: Option<KbScope>,
+}
+
+/// Keep as many proposed rewrites as the cap allows.
+///
+/// A merge costs one, whatever the size of its cluster: it overwrites the
+/// canonical row's content, and every other member keeps its own text on its
+/// tombstone. Counting members instead would put a large cluster permanently
+/// out of reach on a small store, where the cap is smaller than the cluster.
+///
+/// Merges are taken before edits. Merging duplicates is the work consolidation
+/// exists to do, and an edit only tightens prose that is already correct.
+fn take_within_rewrite_cap(
+    merges: Vec<MergeOp>,
+    updates: Vec<(String, String)>,
+    cap: usize,
+) -> (Vec<MergeOp>, Vec<(String, String)>) {
+    let kept_merges: Vec<MergeOp> = merges.into_iter().take(cap).collect();
+    let remaining = cap - kept_merges.len();
+    let kept_updates: Vec<(String, String)> = updates.into_iter().take(remaining).collect();
+    (kept_merges, kept_updates)
 }
 
 /// The model's stated delete reason, normalized for storage: trimmed, bounded,

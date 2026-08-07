@@ -29,6 +29,7 @@
 
 mod support;
 
+use desktop_assistant_storage::knowledge_delete::KnowledgeDeletePolicy;
 use std::sync::Arc;
 
 use desktop_assistant_core::CoreError;
@@ -361,7 +362,7 @@ async fn request_with_default_user_id_succeeds_in_single_tenant_path() {
 #[tokio::test]
 async fn knowledge_writes_are_isolated_per_user() {
     with_fixture("knowledge_writes_are_isolated_per_user", |fx| async move {
-        let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+        let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
         with_user_id(UserId::new("alice"), async {
             let entry = KnowledgeEntry::new("kb-alice", "alice loves rust", vec!["pref".into()]);
@@ -402,7 +403,8 @@ async fn knowledge_search_does_not_leak_across_users() {
     with_fixture(
         "knowledge_search_does_not_leak_across_users",
         |fx| async move {
-            let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+            let store =
+                PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
             with_user_id(UserId::new("alice"), async {
                 let entry = KnowledgeEntry::new(
@@ -441,7 +443,8 @@ async fn knowledge_search_with_empty_embedding_falls_back_to_fts() {
     with_fixture(
         "knowledge_search_with_empty_embedding_falls_back_to_fts",
         |fx| async move {
-            let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+            let store =
+                PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
             with_user_id(UserId::new("alice"), async {
                 let entry = KnowledgeEntry::new(
@@ -484,7 +487,8 @@ async fn knowledge_get_by_id_does_not_leak_across_users() {
     with_fixture(
         "knowledge_get_by_id_does_not_leak_across_users",
         |fx| async move {
-            let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+            let store =
+                PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
             with_user_id(UserId::new("alice"), async {
                 let entry =
@@ -528,7 +532,8 @@ async fn knowledge_write_to_another_users_id_is_refused_and_changes_nothing() {
     with_fixture(
         "knowledge_write_to_another_users_id_is_refused_and_changes_nothing",
         |fx| async move {
-            let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+            let store =
+                PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
             with_user_id(UserId::new("alice"), async {
                 let entry =

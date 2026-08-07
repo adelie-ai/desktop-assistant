@@ -22,6 +22,7 @@
 
 mod support;
 
+use desktop_assistant_storage::knowledge_delete::KnowledgeDeletePolicy;
 use std::sync::Arc;
 
 use desktop_assistant_core::CoreError;
@@ -1376,7 +1377,7 @@ async fn migrate_json_imports_conversations_and_knowledge() {
                 .expect("migrated conversation is retrievable");
             assert_eq!(got.messages.len(), 1);
 
-            let kb = PgKnowledgeBaseStore::new(fx.pool.clone());
+            let kb = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
             let pref = kb.get("pref_theme").await.expect("get pref");
             assert!(
                 pref.is_some_and(|e: KnowledgeEntry| e.content.contains("dark")),

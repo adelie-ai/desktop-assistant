@@ -24,6 +24,7 @@ mod support;
 
 use desktop_assistant_core::domain::KnowledgeEntry;
 use desktop_assistant_core::ports::knowledge::KnowledgeBaseStore;
+use desktop_assistant_storage::knowledge_delete::KnowledgeDeletePolicy;
 use desktop_assistant_storage::{PgKnowledgeBaseStore, UserId, with_user_id};
 use sqlx::PgPool;
 
@@ -75,7 +76,7 @@ async fn get_ids_as(store: &PgKnowledgeBaseStore, user: &str, ids: &[&str]) -> V
 #[tokio::test]
 async fn kb_get_treats_another_tenants_id_as_missing() {
     let Some(fx) = fixture().await else { return };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     // `knowledge_base.id` is a global primary key, so Bob can name Alice's id
     // exactly. He must get the same answer he would get for an id nobody holds.
@@ -114,7 +115,7 @@ async fn kb_get_treats_another_tenants_id_as_missing() {
 #[tokio::test]
 async fn kb_get_treats_a_retired_entry_as_missing() {
     let Some(fx) = fixture().await else { return };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     write_as(&store, ALICE, "kb-live", "still true").await;
     write_as(&store, ALICE, "kb-retired", "superseded and withdrawn").await;
@@ -133,7 +134,7 @@ async fn kb_get_treats_a_retired_entry_as_missing() {
 #[tokio::test]
 async fn kb_get_treats_an_id_no_row_can_hold_as_missing() {
     let Some(fx) = fixture().await else { return };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     // A stored id cannot contain a NUL byte, because Postgres `text` cannot
     // hold one. So an id carrying one names nothing, and must answer the way
@@ -154,7 +155,7 @@ async fn kb_get_treats_an_id_no_row_can_hold_as_missing() {
 #[tokio::test]
 async fn kb_get_resolves_a_batch_in_one_read() {
     let Some(fx) = fixture().await else { return };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     for i in 0..3 {
         write_as(&store, ALICE, &format!("kb-{i}"), &format!("fact {i}")).await;

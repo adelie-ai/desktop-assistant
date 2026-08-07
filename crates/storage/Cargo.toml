@@ -47,9 +47,12 @@ desktop-assistant-mcp-client.workspace = true
 # The executable `SkillIndexStore` contract, run against this adapter so the
 # stores cannot diverge on catalog semantics.
 desktop-assistant-core = { workspace = true, features = ["test-support"] }
-# Captures tracing output in `embedding_backfill_short_answer.rs` (#1108), to
-# assert a warning names both the returned and the expected count rather than
-# only checking database state.
+# Captures real `tracing` output, so a suite can hold a warning to reaching the
+# log rather than asserting on the string it is built from. Two need it:
+# `embedding_backfill_short_answer.rs` (#1108) checks that a warning names both
+# the returned and the expected count, and `knowledge_delete_capability.rs`
+# (#1122) checks that a refused hard delete names the entry and the calling
+# path.
 tracing-subscriber.workspace = true
 
 [lints]

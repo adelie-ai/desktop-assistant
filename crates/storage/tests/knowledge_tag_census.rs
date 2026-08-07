@@ -17,6 +17,7 @@
 
 mod support;
 
+use desktop_assistant_storage::knowledge_delete::KnowledgeDeletePolicy;
 use std::sync::Arc;
 
 use desktop_assistant_core::domain::KnowledgeEntry;
@@ -175,7 +176,8 @@ async fn tag_census_samples_the_thousand_most_recent_entries() {
     with_fixture(
         "tag_census_samples_the_thousand_most_recent_entries",
         |fx| async move {
-            let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+            let store =
+                PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
             seed(&fx.pool, "alice", "old", 5, &["topic:ancient"], 1_000).await;
             seed(
                 &fx.pool,
@@ -236,7 +238,7 @@ async fn tag_census_sample_ordering_is_total() {
     // `topic:cut` enters the sample and the second run reports a tag the first
     // did not -> this test goes RED.
     with_fixture("tag_census_sample_ordering_is_total", |fx| async move {
-        let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+        let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
         let cut = 10_i64;
         let total = KNOWLEDGE_TAG_CENSUS_SAMPLE as i64 + cut;
 
@@ -264,7 +266,11 @@ async fn tag_census_sample_ordering_is_total() {
             .expect("search")
         };
 
-        let first = census(PgKnowledgeBaseStore::new(fx.pool.clone())).await;
+        let first = census(PgKnowledgeBaseStore::new(
+            fx.pool.clone(),
+            KnowledgeDeletePolicy::default(),
+        ))
+        .await;
         assert_eq!(
             first.available_tags,
             vec!["topic:kept".to_string()],
@@ -312,7 +318,8 @@ async fn tag_census_never_returns_another_users_tags() {
     with_fixture(
         "tag_census_never_returns_another_users_tags",
         |fx| async move {
-            let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+            let store =
+                PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
             seed(
                 &fx.pool,
                 "alice",
@@ -358,7 +365,8 @@ async fn tag_census_orders_available_tags_by_frequency_then_name() {
     with_fixture(
         "tag_census_orders_available_tags_by_frequency_then_name",
         |fx| async move {
-            let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+            let store =
+                PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
             seed(
                 &fx.pool,
                 "alice",
@@ -398,7 +406,7 @@ async fn tag_census_caps_available_tags_at_fifty() {
     // The list travels to a language model inside a tool result, so an
     // unbounded vocabulary spends context without adding signal.
     with_fixture("tag_census_caps_available_tags_at_fifty", |fx| async move {
-        let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+        let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
         let over_cap = AVAILABLE_TAGS_LIMIT + 10;
         for i in 0..over_cap {
             let tag = format!("topic:t{i:03}");
@@ -442,7 +450,8 @@ async fn tag_census_honours_include_and_exclude_filters() {
     with_fixture(
         "tag_census_honours_include_and_exclude_filters",
         |fx| async move {
-            let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+            let store =
+                PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
             write_entry(&store, "alice", "kb-a", "alpha note", &["keep", "alpha"]).await;
             write_entry(&store, "alice", "kb-b", "beta note", &["keep", "beta"]).await;
             write_entry(&store, "alice", "kb-c", "gamma note", &["drop", "gamma"]).await;
@@ -488,7 +497,8 @@ async fn knowledge_search_fallback_reports_scope_and_tags() {
     with_fixture(
         "knowledge_search_fallback_reports_scope_and_tags",
         |fx| async move {
-            let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+            let store =
+                PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
             write_entry(
                 &store,
                 "alice",

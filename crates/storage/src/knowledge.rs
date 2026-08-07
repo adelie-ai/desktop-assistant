@@ -8,13 +8,27 @@ use desktop_assistant_core::ports::knowledge::{
 use pgvector::Vector;
 use sqlx::PgPool;
 
+use crate::knowledge_delete::{HardDeleteTarget, KnowledgeDeletePolicy, hard_delete_knowledge};
+
 pub struct PgKnowledgeBaseStore {
     pool: PgPool,
+    delete_policy: KnowledgeDeletePolicy,
 }
 
 impl PgKnowledgeBaseStore {
-    pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+    /// A store that removes rows under `delete_policy`.
+    ///
+    /// The policy is a required argument rather than a default a caller may
+    /// extend later: a construction site that forgot to attach one would
+    /// silently run the permissive behaviour while the deployment believed its
+    /// safety flag was on. The daemon builds the policy from `[backend_tasks]`;
+    /// a caller that never deletes passes
+    /// [`KnowledgeDeletePolicy::default`] and says so.
+    pub fn new(pool: PgPool, delete_policy: KnowledgeDeletePolicy) -> Self {
+        Self {
+            pool,
+            delete_policy,
+        }
     }
 }
 
@@ -230,12 +244,16 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
 
     async fn delete(&self, id: &str) -> Result<(), CoreError> {
         let user_id = current_user_id();
-        sqlx::query("DELETE FROM knowledge_base WHERE user_id = $1 AND id = $2")
-            .bind(user_id.as_str())
-            .bind(id)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| CoreError::Storage(e.to_string()))?;
+        let ids = [id.to_string()];
+        hard_delete_knowledge(
+            &self.pool,
+            user_id.as_str(),
+            HardDeleteTarget::Ids(&ids),
+            self.delete_policy,
+            "knowledge::PgKnowledgeBaseStore::delete",
+        )
+        .await?
+        .into_removed_or_refusal()?;
         Ok(())
     }
 
@@ -264,7 +282,7 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
     }
 
     async fn empty_trash(&self) -> Result<usize, CoreError> {
-        crate::dreaming::empty_trash(&self.pool).await
+        crate::dreaming::empty_trash(&self.pool, self.delete_policy).await
     }
 }
 
@@ -677,18 +695,26 @@ impl PgKnowledgeBaseStore {
 
     /// Delete a batch of entries by id in a single statement. Returns the
     /// number of rows actually removed (ids not owned by the user are no-ops).
+    ///
+    /// This is what `builtin_knowledge_base_delete` reaches, so the model's own
+    /// judgement arrives here with no person scope installed. A policy that
+    /// reserves hard deletes to a person declines it, and the caller is told
+    /// why rather than being handed a count of zero.
     pub async fn delete_many(&self, ids: &[String]) -> Result<usize, CoreError> {
         if ids.is_empty() {
             return Ok(0);
         }
         let user_id = current_user_id();
-        let res = sqlx::query("DELETE FROM knowledge_base WHERE user_id = $1 AND id = ANY($2)")
-            .bind(user_id.as_str())
-            .bind(ids)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| CoreError::Storage(e.to_string()))?;
-        Ok(res.rows_affected() as usize)
+        let removed = hard_delete_knowledge(
+            &self.pool,
+            user_id.as_str(),
+            HardDeleteTarget::Ids(ids),
+            self.delete_policy,
+            "knowledge::PgKnowledgeBaseStore::delete_many",
+        )
+        .await?
+        .into_removed_or_refusal()?;
+        Ok(removed as usize)
     }
 
     /// Non-semantic, keyset-paginated listing for audits. Cursor is on

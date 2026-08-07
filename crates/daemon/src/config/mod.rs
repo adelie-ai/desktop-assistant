@@ -92,6 +92,7 @@ use crate::purposes::PurposeKind;
 use crate::purposes::Purposes;
 #[allow(unused_imports)]
 use desktop_assistant_core::ports::llm::{BudgetSource, ContextBudget};
+use desktop_assistant_storage::knowledge_delete::KnowledgeDeletePolicy;
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct DaemonConfig {
@@ -641,6 +642,35 @@ pub struct BackendTasksConfig {
     /// independently of whether dreaming is enabled at all.
     #[serde(default = "default_knowledge_trash_sweep_interval_secs")]
     pub knowledge_trash_sweep_interval_secs: u64,
+    /// Share of a user's active knowledge entries one consolidation run may
+    /// prune outright, as a fraction between 0 and 1. Merges do not count
+    /// against it, because their content survives in the canonical row.
+    ///
+    /// `0` applies a run's merges and edits and retires nothing, which is how
+    /// an instance runs consolidation for its tidying and declines its
+    /// deletes.
+    #[serde(default = "default_knowledge_prune_fraction")]
+    pub knowledge_prune_fraction: f64,
+    /// Share of a user's active knowledge entries one consolidation run may
+    /// rewrite in place, as a fraction between 0 and 1. An edit and a merge
+    /// both overwrite content and no prior version is kept, so this bounds how
+    /// much of the store one degraded answer can restate. A merge counts once,
+    /// whatever the size of its cluster.
+    #[serde(default = "default_knowledge_rewrite_fraction")]
+    pub knowledge_rewrite_fraction: f64,
+    /// Refuse any permanent delete of a knowledge row that a person did not
+    /// ask for.
+    ///
+    /// With this set, the trash sweep, the reap inside a consolidation
+    /// transaction, and the model's own delete tool all free nothing, and each
+    /// refusal is logged with the entries it spared. Deleting an entry from a
+    /// client panel, and emptying the trash, still erase: a request to be
+    /// forgotten is not answered with a tombstone.
+    ///
+    /// Default `false`, which is the behaviour every instance already has.
+    /// Tombstones accumulate while it is set, and only a person frees them.
+    #[serde(default)]
+    pub knowledge_hard_delete_requires_person: bool,
 }
 
 impl BackendTasksConfig {
@@ -653,6 +683,40 @@ impl BackendTasksConfig {
     pub fn trash_sweep_enabled(&self) -> bool {
         self.knowledge_trash_sweep_interval_secs > 0
     }
+
+    /// What one maintenance run may destroy or rewrite, as the storage layer
+    /// reads it.
+    ///
+    /// A fraction outside 0..=1 is clamped and reported, because a typed
+    /// nonsense value must not widen what a run may destroy and must not stop
+    /// the daemon from starting.
+    pub fn knowledge_delete_policy(&self) -> KnowledgeDeletePolicy {
+        KnowledgeDeletePolicy {
+            trash_retention_days: self.knowledge_trash_retention_days,
+            prune_fraction: clamp_fraction(
+                self.knowledge_prune_fraction,
+                "knowledge_prune_fraction",
+            ),
+            rewrite_fraction: clamp_fraction(
+                self.knowledge_rewrite_fraction,
+                "knowledge_rewrite_fraction",
+            ),
+            require_person_for_hard_delete: self.knowledge_hard_delete_requires_person,
+        }
+    }
+}
+
+/// Hold a configured share inside 0..=1, saying so when it was not.
+fn clamp_fraction(value: f64, key: &str) -> f64 {
+    if !value.is_finite() {
+        tracing::warn!("[backend_tasks] {key} = {value} is not a number; reading it as 0");
+        return 0.0;
+    }
+    let clamped = value.clamp(0.0, 1.0);
+    if (clamped - value).abs() > f64::EPSILON {
+        tracing::warn!("[backend_tasks] {key} = {value} is outside 0..=1; reading it as {clamped}");
+    }
+    clamped
 }
 
 impl Default for BackendTasksConfig {
@@ -667,6 +731,9 @@ impl Default for BackendTasksConfig {
             consolidation_llm: None,
             knowledge_trash_retention_days: default_knowledge_trash_retention_days(),
             knowledge_trash_sweep_interval_secs: default_knowledge_trash_sweep_interval_secs(),
+            knowledge_prune_fraction: default_knowledge_prune_fraction(),
+            knowledge_rewrite_fraction: default_knowledge_rewrite_fraction(),
+            knowledge_hard_delete_requires_person: false,
         }
     }
 }
@@ -675,6 +742,19 @@ impl Default for BackendTasksConfig {
 /// a configurable knob without changing behaviour for existing instances.
 pub(super) fn default_knowledge_trash_retention_days() -> u32 {
     desktop_assistant_storage::dreaming::SOFT_DELETE_TTL_DAYS
+}
+
+/// Prune-share default. The reasoning behind the figure, and the incident that
+/// set it, are recorded on
+/// [`desktop_assistant_storage::knowledge_delete::DEFAULT_PRUNE_FRACTION`].
+pub(super) fn default_knowledge_prune_fraction() -> f64 {
+    desktop_assistant_storage::knowledge_delete::DEFAULT_PRUNE_FRACTION
+}
+
+/// Rewrite-share default, from
+/// [`desktop_assistant_storage::knowledge_delete::DEFAULT_REWRITE_FRACTION`].
+pub(super) fn default_knowledge_rewrite_fraction() -> f64 {
+    desktop_assistant_storage::knowledge_delete::DEFAULT_REWRITE_FRACTION
 }
 
 /// Sweep cadence default: hourly. The sweep is a single indexed DELETE per user
@@ -2633,6 +2713,69 @@ type = "openai"
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- Deletion as a configured capability (#1122) ------------------------
+
+    #[test]
+    fn the_deletion_policy_is_read_from_backend_tasks() {
+        let dir = unique_test_dir("da-test-delete-policy");
+        let path = dir.join("daemon.toml");
+        std::fs::write(
+            &path,
+            "[backend_tasks]\n\
+             knowledge_trash_retention_days = 7\n\
+             knowledge_prune_fraction = 0.0\n\
+             knowledge_rewrite_fraction = 0.4\n\
+             knowledge_hard_delete_requires_person = true\n",
+        )
+        .unwrap();
+
+        let loaded = load_daemon_config(&path).unwrap().unwrap();
+        let policy = loaded.backend_tasks.knowledge_delete_policy();
+
+        assert_eq!(policy.trash_retention_days, 7);
+        assert_eq!(policy.prune_fraction, 0.0);
+        assert_eq!(policy.rewrite_fraction, 0.4);
+        assert!(policy.require_person_for_hard_delete);
+        assert_eq!(
+            policy.prune_cap(100),
+            0,
+            "a configured zero share must prune nothing"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_instance_that_sets_nothing_keeps_the_shipped_deletion_behaviour() {
+        let policy = BackendTasksConfig::default().knowledge_delete_policy();
+        assert_eq!(policy, KnowledgeDeletePolicy::default());
+        assert!(
+            !policy.require_person_for_hard_delete,
+            "the safety flag is opt-in, so an existing instance keeps reaping"
+        );
+    }
+
+    #[test]
+    fn a_share_outside_zero_to_one_is_clamped_rather_than_obeyed() {
+        let cfg = BackendTasksConfig {
+            knowledge_prune_fraction: 5.0,
+            knowledge_rewrite_fraction: -1.0,
+            ..Default::default()
+        };
+        let policy = cfg.knowledge_delete_policy();
+        assert_eq!(policy.prune_fraction, 1.0);
+        assert_eq!(policy.rewrite_fraction, 0.0);
+    }
+
+    #[test]
+    fn a_share_that_is_not_a_number_is_read_as_zero() {
+        let cfg = BackendTasksConfig {
+            knowledge_prune_fraction: f64::NAN,
+            ..Default::default()
+        };
+        assert_eq!(cfg.knowledge_delete_policy().prune_fraction, 0.0);
     }
 
     fn load_migrates_legacy_for_connector(connector: &str, extra_fields: &str) {

@@ -33,6 +33,7 @@
 
 mod support;
 
+use desktop_assistant_storage::knowledge_delete::KnowledgeDeletePolicy;
 use std::sync::{Arc, Mutex};
 
 use desktop_assistant_core::domain::{KnowledgeEntry, SUMMARY_MAX_CHARS};
@@ -563,7 +564,7 @@ async fn dream_summary_pass_leaves_a_summary_supplied_through_the_store_alone() 
         return;
     };
     let pool = &fx.pool;
-    let store = PgKnowledgeBaseStore::new(pool.clone());
+    let store = PgKnowledgeBaseStore::new(pool.clone(), KnowledgeDeletePolicy::default());
 
     with_user_id(UserId::new("u1"), async {
         let mut entry = KnowledgeEntry::new(

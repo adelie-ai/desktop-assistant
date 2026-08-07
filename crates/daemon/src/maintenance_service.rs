@@ -30,6 +30,7 @@ use desktop_assistant_storage::dreaming::{
 use desktop_assistant_storage::embedding_backfill::{
     backfill_knowledge_embeddings, invalidate_all_knowledge_embeddings,
 };
+use desktop_assistant_storage::knowledge_delete::KnowledgeDeletePolicy;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -50,10 +51,10 @@ pub struct DaemonKnowledgeMaintenanceService {
     embed_client: Arc<dyn EmbeddingClient>,
     embedding_model: String,
     archive_after_days: u32,
-    /// Retention applied to the opportunistic trash reap inside a consolidation
-    /// cycle, so a manual or timed consolidation uses the same window the
-    /// periodic sweep does.
-    soft_delete_retention_days: u32,
+    /// What one consolidation run may destroy and rewrite, and the retention
+    /// its opportunistic trash reap applies. A manual run and a timed one read
+    /// the same configured answer the periodic sweep does.
+    delete_policy: KnowledgeDeletePolicy,
     on_change: KnowledgeChangeFn,
     // Per-op mutual exclusion. A manual trigger that collides with an already
     // running pass of the same op (timer- or manually-driven) is rejected rather
@@ -75,7 +76,7 @@ impl DaemonKnowledgeMaintenanceService {
         embed_client: Arc<dyn EmbeddingClient>,
         embedding_model: String,
         archive_after_days: u32,
-        soft_delete_retention_days: u32,
+        delete_policy: KnowledgeDeletePolicy,
         on_change: KnowledgeChangeFn,
     ) -> Self {
         Self {
@@ -87,7 +88,7 @@ impl DaemonKnowledgeMaintenanceService {
             embed_client,
             embedding_model,
             archive_after_days,
-            soft_delete_retention_days,
+            delete_policy,
             on_change,
             extraction_lock: Mutex::new(()),
             consolidation_lock: Mutex::new(()),
@@ -187,7 +188,7 @@ impl KnowledgeMaintenanceService for DaemonKnowledgeMaintenanceService {
         let stats = run_consolidation_scan(
             &self.pool,
             &llm_fn,
-            self.soft_delete_retention_days,
+            self.delete_policy,
             &cancellation,
             Some(&self.on_change),
         )

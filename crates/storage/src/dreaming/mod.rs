@@ -34,12 +34,14 @@ use desktop_assistant_core::CoreError;
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 
+use crate::knowledge_delete::KnowledgeDeletePolicy;
+
 pub use summarize::{SummaryStats, run_summary_phase};
 pub use trash::{empty_trash, reap_expired_trash, sweep_expired_trash, trash_count};
 pub use types::{
     BackfillEmbedFn, ConsolidationStats, DreamingLlmFn, KbDeleteKind, KnowledgeChangeFn,
-    MAX_DELETE_FRACTION, MAX_DELETE_REASON_CHARS, MAX_REVIEW_GENERATION, MAX_SUMMARIES_PER_CYCLE,
-    SOFT_DELETE_TTL_DAYS, SOURCE_EXPLICIT,
+    MAX_DELETE_REASON_CHARS, MAX_REVIEW_GENERATION, MAX_SUMMARIES_PER_CYCLE, SOFT_DELETE_TTL_DAYS,
+    SOURCE_EXPLICIT,
 };
 
 /// Surfaced for the DB-gated watermark-scoping integration test (#435). The
@@ -122,24 +124,21 @@ pub async fn run_dreaming_scan(
 /// on-demand run can be stopped via the task registry. `on_change`, when set, is
 /// invoked after each user whose KB changed so connected panels refetch live.
 ///
-/// `soft_delete_retention_days` is applied to the opportunistic trash reap
-/// inside each user's apply transaction, so a cycle uses the same retention the
-/// periodic sweep does.
+/// `policy` states what one run may destroy and rewrite: the share of the
+/// active set it may prune, the share it may rewrite in place, whether a hard
+/// delete needs a person, and the retention its opportunistic trash reap
+/// applies. The reap uses the same retention the periodic sweep does, because
+/// both read the same configured value.
 pub async fn run_consolidation_scan(
     pool: &PgPool,
     llm_fn: &DreamingLlmFn,
-    soft_delete_retention_days: u32,
+    policy: KnowledgeDeletePolicy,
     cancellation: &CancellationToken,
     on_change: Option<&KnowledgeChangeFn>,
 ) -> Result<ConsolidationStats, CoreError> {
-    let stats = consolidation::run_consolidation_phase(
-        pool,
-        llm_fn,
-        soft_delete_retention_days,
-        cancellation,
-        on_change,
-    )
-    .await?;
+    let stats =
+        consolidation::run_consolidation_phase(pool, llm_fn, policy, cancellation, on_change)
+            .await?;
     if stats.merged_clusters > 0
         || stats.updated > 0
         || stats.soft_deleted > 0
@@ -148,7 +147,8 @@ pub async fn run_consolidation_scan(
         tracing::info!(
             "consolidation: reviewed {}, merged {} cluster(s), updated {}, scope-added {}, \
              soft-deleted {}; refused {} prune(s) of user-entered entries and {} \
-             mutation(s) of settled ones",
+             mutation(s) of settled ones; deferred {} prune(s) and {} rewrite(s) over the \
+             configured share",
             stats.reviewed,
             stats.merged_clusters,
             stats.updated,
@@ -156,6 +156,8 @@ pub async fn run_consolidation_scan(
             stats.soft_deleted,
             stats.protected_from_delete,
             stats.settled_unchanged,
+            stats.prunes_over_cap,
+            stats.rewrites_over_cap,
         );
     } else {
         tracing::debug!(

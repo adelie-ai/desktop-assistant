@@ -41,6 +41,7 @@ use desktop_assistant_core::ports::scratchpad::{
 };
 use desktop_assistant_core::ports::scratchpad_scope::{SubagentScope, with_subagent_scope};
 use desktop_assistant_core::ports::store::ConversationStore;
+use desktop_assistant_storage::knowledge_delete::KnowledgeDeletePolicy;
 use desktop_assistant_storage::tag_registry::nearest_tags;
 use desktop_assistant_storage::{
     PgConversationStore, PgKnowledgeBaseStore, PgPool, PgScratchpadStore, UserId, with_user_id,
@@ -89,7 +90,7 @@ async fn seed_entry_with_model(
     chunk: Vec<f32>,
     model: &str,
 ) {
-    let store = PgKnowledgeBaseStore::new(pool.clone());
+    let store = PgKnowledgeBaseStore::new(pool.clone(), KnowledgeDeletePolicy::default());
     with_user_id(UserId::new(user), async {
         store
             .write(KnowledgeEntry::new(id, content, vec!["topic".to_string()]))
@@ -135,7 +136,7 @@ async fn seed_tag(pool: &PgPool, user: &str, name: &str, chunk: Vec<f32>, model:
 #[tokio::test]
 async fn nearest_entries_come_back_nearest_first_with_their_distance() {
     let Some(fx) = fixture().await else { return };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     seed_entry(&fx.pool, USER, "kb-near", "the near one", axis(0)).await;
     seed_entry(&fx.pool, USER, "kb-far", "the far one", axis(1)).await;
@@ -168,7 +169,7 @@ async fn nearest_entries_come_back_nearest_first_with_their_distance() {
 #[tokio::test]
 async fn nearest_entries_never_cross_the_user_boundary() {
     let Some(fx) = fixture().await else { return };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     // The other tenant's entry is a perfect match for the query vector, so
     // anything but an explicit scope would rank it first.
@@ -196,7 +197,7 @@ async fn nearest_entries_never_cross_the_user_boundary() {
 #[tokio::test]
 async fn nearest_entries_ignore_a_row_embedded_by_another_model() {
     let Some(fx) = fixture().await else { return };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     // Four dimensions against the query's three: comparing them raises rather
     // than missing, so the scope predicate must keep the row out entirely.
@@ -230,7 +231,7 @@ async fn nearest_entries_stop_at_the_scan_limit() {
     // The limit is what makes the block's "and N more" a bounded count rather
     // than an unbounded read.
     let Some(fx) = fixture().await else { return };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     for i in 0..5 {
         seed_entry(&fx.pool, USER, &format!("kb-{i}"), "a note", axis(0)).await;
@@ -253,7 +254,7 @@ async fn nearest_entries_skip_a_retired_entry() {
     // A soft-deleted entry is hidden from every other read path, and offering
     // it back as a recall candidate would resurrect it in the model's view.
     let Some(fx) = fixture().await else { return };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     seed_entry(&fx.pool, USER, "kb-retired", "a retired note", axis(0)).await;
     sqlx::query("UPDATE knowledge_base SET deleted_at = NOW() WHERE id = $1")
@@ -279,7 +280,7 @@ async fn nearest_entries_answer_nothing_without_an_embedding() {
     // No embedding means no vector arm. The caller has a full-text path to fall
     // back to; what it must not get is an error from a zero-dimension vector.
     let Some(fx) = fixture().await else { return };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     seed_entry(&fx.pool, USER, "kb-mine", "my own note", axis(0)).await;
 
@@ -426,7 +427,7 @@ async fn any_term_search_matches_an_entry_that_carries_one_of_the_prompts_words(
     // lexeme, so a whole sentence asks one entry to contain all of it. The
     // entry below says nothing about "live", and must still be found.
     let Some(fx) = fixture().await else { return };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     with_user_id(UserId::new(USER), async {
         store
@@ -464,7 +465,7 @@ async fn any_term_search_ranks_the_entry_that_carries_more_of_the_terms_first() 
     // Widening the match set must not put the weakest hit at the top: the block
     // renders the first eight and drops the rest.
     let Some(fx) = fixture().await else { return };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     with_user_id(UserId::new(USER), async {
         // Both entries match, so the ordering is what is under test: `kb-weak`
@@ -501,7 +502,7 @@ async fn any_term_search_ranks_the_entry_that_carries_more_of_the_terms_first() 
 #[tokio::test]
 async fn any_term_search_never_crosses_the_user_boundary() {
     let Some(fx) = fixture().await else { return };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     with_user_id(UserId::new(OTHER_USER), async {
         store
@@ -533,7 +534,7 @@ async fn any_term_search_never_crosses_the_user_boundary() {
 #[tokio::test]
 async fn any_term_search_skips_a_retired_entry() {
     let Some(fx) = fixture().await else { return };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     with_user_id(UserId::new(USER), async {
         store
@@ -569,7 +570,7 @@ async fn any_term_search_answers_nothing_for_a_prompt_with_no_terms() {
     // "the a of" reduces to no lexemes at all, which builds a NULL query. It
     // must match no row rather than every row.
     let Some(fx) = fixture().await else { return };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     with_user_id(UserId::new(USER), async {
         store
@@ -599,7 +600,7 @@ async fn any_term_search_treats_tsquery_operators_as_text() {
     // A user prompt is text. Left as syntax, `!` and `&` and `<->` would either
     // raise or silently change what was asked.
     let Some(fx) = fixture().await else { return };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     with_user_id(UserId::new(USER), async {
         store
@@ -626,7 +627,7 @@ async fn any_term_search_treats_tsquery_operators_as_text() {
 #[tokio::test]
 async fn any_term_search_stops_at_its_limit() {
     let Some(fx) = fixture().await else { return };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     with_user_id(UserId::new(USER), async {
         for i in 0..5 {

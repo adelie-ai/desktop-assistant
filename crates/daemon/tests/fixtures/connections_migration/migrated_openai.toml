@@ -41,6 +41,9 @@ embedding_backfill_interval_secs = 300
 consolidation_interval_secs = 86400
 knowledge_trash_retention_days = 30
 knowledge_trash_sweep_interval_secs = 3600
+knowledge_prune_fraction = 0.1
+knowledge_rewrite_fraction = 0.25
+knowledge_hard_delete_requires_person = false
 
 [purposes.interactive]
 connection = "default"

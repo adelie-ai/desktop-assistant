@@ -8,7 +8,8 @@
 //!    instance with dreaming/consolidation disabled accumulated tombstones
 //!    forever -- invisible to every read path, but never freed.
 //! 2. There was no way to empty the trash on demand, and no way to see how much
-//!    was in it (on `adele-prod`, 681 tombstones against 75 live entries).
+//!    was in it. A live instance held several hundred tombstones against a few
+//!    dozen live entries.
 //!
 //! Every reap is per-tenant: one user's sweep must never touch another's rows.
 //!
@@ -25,11 +26,20 @@ mod support;
 use desktop_assistant_core::domain::KnowledgeEntry;
 use desktop_assistant_core::ports::knowledge::KnowledgeBaseStore;
 use desktop_assistant_storage::dreaming::{reap_expired_trash, sweep_expired_trash};
+use desktop_assistant_storage::knowledge_delete::KnowledgeDeletePolicy;
 use desktop_assistant_storage::{PgKnowledgeBaseStore, UserId, with_user_id};
 use sqlx::PgPool;
 
 const ALICE: &str = "kb-trash-alice";
 const BOB: &str = "kb-trash-bob";
+
+/// A retention of `days`, with everything else at the shipped default.
+fn retention(days: u32) -> KnowledgeDeletePolicy {
+    KnowledgeDeletePolicy {
+        trash_retention_days: days,
+        ..KnowledgeDeletePolicy::default()
+    }
+}
 
 /// Boot a fixture in its own schema with migrations applied. `None` when
 /// `TEST_DATABASE_URL` is unset, which is how each test pass-skips.
@@ -82,7 +92,7 @@ async fn empty_trash_removes_all_soft_deleted_entries_for_the_user() {
     let Some(fx) = fixture().await else {
         return;
     };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     write_entry(&store, ALICE, "fresh-tombstone", "retired today").await;
     write_entry(&store, ALICE, "old-tombstone", "retired long ago").await;
@@ -109,7 +119,7 @@ async fn empty_trash_leaves_live_entries_untouched() {
     let Some(fx) = fixture().await else {
         return;
     };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     write_entry(&store, ALICE, "live", "current fact").await;
     write_entry(&store, ALICE, "retired", "superseded fact").await;
@@ -133,7 +143,7 @@ async fn empty_trash_is_scoped_to_the_calling_user() {
     let Some(fx) = fixture().await else {
         return;
     };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     write_entry(&store, ALICE, "alice-retired", "alice trash").await;
     write_entry(&store, BOB, "bob-retired", "bob trash").await;
@@ -158,7 +168,7 @@ async fn empty_trash_on_an_empty_trash_is_a_no_op() {
     let Some(fx) = fixture().await else {
         return;
     };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     write_entry(&store, ALICE, "live", "current fact").await;
 
@@ -183,7 +193,7 @@ async fn trash_count_reports_only_soft_deleted_entries() {
     let Some(fx) = fixture().await else {
         return;
     };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     write_entry(&store, ALICE, "live-a", "current").await;
     write_entry(&store, ALICE, "live-b", "current").await;
@@ -208,7 +218,7 @@ async fn trash_count_is_scoped_to_the_calling_user() {
     let Some(fx) = fixture().await else {
         return;
     };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     write_entry(&store, ALICE, "alice-retired", "alice trash").await;
     write_entry(&store, BOB, "bob-retired-1", "bob trash").await;
@@ -235,7 +245,7 @@ async fn ttl_reap_runs_when_consolidation_is_disabled() {
     let Some(fx) = fixture().await else {
         return;
     };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     // No consolidation, no LLM, no dreaming: the periodic sweep alone must free
     // expired tombstones, for every user that has any.
@@ -245,7 +255,7 @@ async fn ttl_reap_runs_when_consolidation_is_disabled() {
     soft_delete_aged(&fx.pool, "alice-expired", 40).await;
     soft_delete_aged(&fx.pool, "bob-expired", 40).await;
 
-    let reaped = sweep_expired_trash(&fx.pool, 30)
+    let reaped = sweep_expired_trash(&fx.pool, retention(30))
         .await
         .expect("sweep_expired_trash");
 
@@ -266,14 +276,14 @@ async fn ttl_reap_respects_the_configured_retention() {
     let Some(fx) = fixture().await else {
         return;
     };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     write_entry(&store, ALICE, "ten-days-old", "retired ten days ago").await;
     soft_delete_aged(&fx.pool, "ten-days-old", 10).await;
 
     // Retention longer than the tombstone's age: it stays.
     let reaped = with_user_id(UserId::new(ALICE), async {
-        reap_expired_trash(&fx.pool, 30).await
+        reap_expired_trash(&fx.pool, retention(30)).await
     })
     .await
     .expect("reap with 30-day retention");
@@ -286,7 +296,7 @@ async fn ttl_reap_respects_the_configured_retention() {
 
     // Retention shorter than its age: it goes.
     let reaped = with_user_id(UserId::new(ALICE), async {
-        reap_expired_trash(&fx.pool, 5).await
+        reap_expired_trash(&fx.pool, retention(5)).await
     })
     .await
     .expect("reap with 5-day retention");
@@ -306,7 +316,7 @@ async fn ttl_reap_with_zero_retention_reaps_immediately() {
     let Some(fx) = fixture().await else {
         return;
     };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     // Boundary: retention 0 means "do not retain" — a tombstone created moments
     // ago is already expired.
@@ -315,7 +325,7 @@ async fn ttl_reap_with_zero_retention_reaps_immediately() {
     soft_delete_aged(&fx.pool, "just-retired", 0).await;
 
     let reaped = with_user_id(UserId::new(ALICE), async {
-        reap_expired_trash(&fx.pool, 0).await
+        reap_expired_trash(&fx.pool, retention(0)).await
     })
     .await
     .expect("reap with zero retention");
@@ -334,7 +344,7 @@ async fn ttl_reap_is_scoped_to_the_calling_user() {
     let Some(fx) = fixture().await else {
         return;
     };
-    let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+    let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
     write_entry(&store, ALICE, "alice-expired", "expired").await;
     write_entry(&store, BOB, "bob-expired", "expired").await;
@@ -342,7 +352,7 @@ async fn ttl_reap_is_scoped_to_the_calling_user() {
     soft_delete_aged(&fx.pool, "bob-expired", 40).await;
 
     let reaped = with_user_id(UserId::new(ALICE), async {
-        reap_expired_trash(&fx.pool, 30).await
+        reap_expired_trash(&fx.pool, retention(30)).await
     })
     .await
     .expect("reap");

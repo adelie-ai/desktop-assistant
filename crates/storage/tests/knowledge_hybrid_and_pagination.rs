@@ -24,6 +24,7 @@
 
 mod support;
 
+use desktop_assistant_storage::knowledge_delete::KnowledgeDeletePolicy;
 use std::sync::Arc;
 
 use desktop_assistant_core::CoreError;
@@ -180,7 +181,7 @@ async fn knowledge_hybrid_search_is_user_scoped() {
     // (knowledge.rs:96) makes Alice's [1,0,0] doc leak into Bob's vector-ranked
     // set (distance 0 to Bob's query embedding) → this test goes RED.
     with_fixture("knowledge_hybrid_search_is_user_scoped", |fx| async move {
-        let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+        let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
         with_user_id(UserId::new("alice"), async {
             store
@@ -258,7 +259,7 @@ async fn knowledge_hybrid_search_excludes_tags() {
     // MUTATION: removing `AND ($7 ... NOT (tags && $7))` from the vector branch
     // lets the `secret`-tagged doc back into vector_ranked → RED.
     with_fixture("knowledge_hybrid_search_excludes_tags", |fx| async move {
-        let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+        let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
         with_user_id(UserId::new("alice"), async {
             store
@@ -329,7 +330,8 @@ async fn knowledge_hybrid_search_rrf_orders_by_fused_rank() {
     with_fixture(
         "knowledge_hybrid_search_rrf_orders_by_fused_rank",
         |fx| async move {
-            let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+            let store =
+                PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
             with_user_id(UserId::new("alice"), async {
                 store
@@ -396,7 +398,8 @@ async fn list_page_walks_cursors_without_dup_or_gap() {
     with_fixture(
         "list_page_walks_cursors_without_dup_or_gap",
         |fx| async move {
-            let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+            let store =
+                PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
             let ids = ["p1", "p2", "p3", "p4", "p5"];
             with_user_id(UserId::new("alice"), async {
@@ -465,7 +468,8 @@ async fn list_page_tiebreaks_on_created_at_then_id() {
     with_fixture(
         "list_page_tiebreaks_on_created_at_then_id",
         |fx| async move {
-            let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+            let store =
+                PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
             let ids = ["aaa", "bbb", "ccc", "ddd"];
             with_user_id(UserId::new("alice"), async {
@@ -549,7 +553,7 @@ async fn list_page_rejects_malformed_cursor() {
     // MUTATION: relaxing `micros.parse().map_err(...)?` to `.unwrap_or(0)` makes
     // the "notanumber:kb" case succeed → RED.
     with_fixture("list_page_rejects_malformed_cursor", |fx| async move {
-        let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+        let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
         with_user_id(UserId::new("alice"), async {
             store
@@ -597,7 +601,7 @@ async fn list_page_clamps_limit_1_to_500() {
     // MUTATION: changing `.clamp(1, 500)` to `.clamp(0, 500)` makes the limit-0
     // request return an empty page → RED.
     with_fixture("list_page_clamps_limit_1_to_500", |fx| async move {
-        let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+        let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
         let ids = ["c1", "c2", "c3"];
         with_user_id(UserId::new("alice"), async {
@@ -664,7 +668,7 @@ async fn delete_many_ignores_foreign_ids() {
     // MUTATION: dropping `WHERE user_id = $1` lets Alice delete Bob's row too →
     // count becomes 2 and Bob's row vanishes → RED.
     with_fixture("delete_many_ignores_foreign_ids", |fx| async move {
-        let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+        let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
         with_user_id(UserId::new("alice"), async {
             store
@@ -723,7 +727,8 @@ async fn knowledge_write_normalizes_tags_case_whitespace_and_preserves_facets() 
     with_fixture(
         "knowledge_write_normalizes_tags_case_whitespace_and_preserves_facets",
         |fx| async move {
-            let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+            let store =
+                PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
             with_user_id(UserId::new("alice"), async {
                 store
@@ -781,7 +786,8 @@ async fn knowledge_read_filters_are_case_insensitive_and_symmetric() {
     with_fixture(
         "knowledge_read_filters_are_case_insensitive_and_symmetric",
         |fx| async move {
-            let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+            let store =
+                PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
             with_user_id(UserId::new("alice"), async {
                 store
@@ -954,7 +960,8 @@ async fn vector_arm_truncates_to_the_nearest_candidates_not_an_arbitrary_subset(
     with_fixture(
         "vector_arm_truncates_to_the_nearest_candidates_not_an_arbitrary_subset",
         |fx| async move {
-            let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+            let store =
+                PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
             // 20 rows -- more than fetch_limit (limit=6 -> fetch_limit=12).
             with_user_id(UserId::new("alice"), async {
@@ -1016,7 +1023,8 @@ async fn text_arm_truncates_to_the_highest_ranked() {
     with_fixture(
         "text_arm_truncates_to_the_highest_ranked",
         |fx| async move {
-            let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+            let store =
+                PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
             // 20 rows -- more than fetch_limit (limit=6 -> fetch_limit=12).
             with_user_id(UserId::new("alice"), async {
@@ -1095,7 +1103,8 @@ async fn fused_search_truncates_to_a_defined_row_when_rrf_scores_tie() {
     with_fixture(
         "fused_search_truncates_to_a_defined_row_when_rrf_scores_tie",
         |fx| async move {
-            let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+            let store =
+                PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
             with_user_id(UserId::new("alice"), async {
                 store
