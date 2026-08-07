@@ -402,6 +402,10 @@ pub const CLASSIFIED_SOURCES: &[ClassifiedSource] = &[
             tool("builtin_knowledge_base_delete", Mutate, Trusted),
             tool("builtin_knowledge_base_list", Read, Trusted),
             tool("builtin_knowledge_base_get", Read, Trusted),
+            // Says whether an entry was worth reading. It writes only to the
+            // use log, which nothing renders back into a prompt, so a tainted
+            // turn's mark cannot carry text to a later one.
+            tool("builtin_knowledge_base_mark", Mutate, Trusted),
             tool("builtin_tool_search", Read, Trusted),
             tool("builtin_notify", Present, Trusted),
             tool("builtin_sys_props", Read, Trusted),
@@ -1225,6 +1229,7 @@ mod tests {
         ("builtin_knowledge_base_search", Read, Trusted),
         ("builtin_knowledge_base_list", Read, Trusted),
         ("builtin_knowledge_base_get", Read, Trusted),
+        ("builtin_knowledge_base_mark", Mutate, Trusted),
         ("builtin_tool_search", Read, Trusted),
         ("builtin_notify", Present, Trusted),
         ("builtin_sys_props", Read, Trusted),

@@ -22,6 +22,8 @@ pub mod tools;
 /// Knowledge base store port — outbound trait for unified knowledge persistence.
 pub mod knowledge;
 
+pub mod knowledge_use;
+
 /// Scratchpad store port — outbound trait for ephemeral per-conversation notes.
 pub mod scratchpad;
 

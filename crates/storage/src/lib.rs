@@ -13,6 +13,7 @@ pub mod idempotency_keys;
 pub mod kb_metadata;
 pub mod knowledge;
 pub mod knowledge_delete;
+pub mod knowledge_use;
 pub mod migrate_json;
 pub mod pool;
 pub mod scratchpad;
@@ -44,6 +45,7 @@ pub use database::{
 pub use error_classifications::PgErrorClassificationStore;
 pub use idempotency_keys::PgIdempotencyKeyStore;
 pub use knowledge::PgKnowledgeBaseStore;
+pub use knowledge_use::PgKnowledgeUseLog;
 pub use migrate_json::{
     is_conversations_table_empty, is_knowledge_base_table_empty, migrate_conversations,
     migrate_knowledge,

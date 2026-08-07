@@ -17,6 +17,9 @@ use desktop_assistant_core::ports::knowledge::{
     KnowledgeGetFn, KnowledgeGetManyFn, KnowledgeListFn, KnowledgeListQuery, KnowledgeSearchFn,
     KnowledgeTagResolveFn, KnowledgeWriteFn, ListOrder, ListOrderOpt, ProposedTag, ScopeSize,
 };
+use desktop_assistant_core::ports::knowledge_use::{
+    KnowledgeMarkFn, KnowledgeOfferedFn, KnowledgeOpenedFn,
+};
 use desktop_assistant_core::ports::notify::{NotifyFn, NotifyUrgency};
 use desktop_assistant_core::ports::scratchpad::{
     MAX_KEYS_PER_CALL, MAX_NOTE_BYTES, MAX_NOTES_PER_WRITE, MAX_PINNED_NOTES, MAX_RESULTS_CEILING,
@@ -301,6 +304,7 @@ const KB_SEARCH_MAX_LIMIT: u64 = 500;
 const TOOL_KB_DELETE: &str = "builtin_knowledge_base_delete";
 const TOOL_KB_LIST: &str = "builtin_knowledge_base_list";
 const TOOL_KB_GET: &str = "builtin_knowledge_base_get";
+const TOOL_KB_MARK: &str = "builtin_knowledge_base_mark";
 const TOOL_SEARCH: &str = "builtin_tool_search";
 const TOOL_NOTIFY: &str = "builtin_notify";
 const TOOL_SYS_PROPS: &str = "builtin_sys_props";
@@ -346,6 +350,9 @@ pub struct BuiltinToolService {
     kb_get_fn: Option<KnowledgeGetFn>,
     kb_get_many_fn: Option<KnowledgeGetManyFn>,
     kb_tag_resolve_fn: Option<KnowledgeTagResolveFn>,
+    kb_offered_fn: Option<KnowledgeOfferedFn>,
+    kb_opened_fn: Option<KnowledgeOpenedFn>,
+    kb_mark_fn: Option<KnowledgeMarkFn>,
     tool_search_fn: Option<ToolSearchFn>,
     #[allow(dead_code)]
     tool_definition_fn: Option<ToolDefinitionFn>,
@@ -389,6 +396,9 @@ impl BuiltinToolService {
             kb_get_fn: None,
             kb_get_many_fn: None,
             kb_tag_resolve_fn: None,
+            kb_offered_fn: None,
+            kb_opened_fn: None,
+            kb_mark_fn: None,
             tool_search_fn: None,
             tool_definition_fn: None,
             db_query_fn: None,
@@ -486,6 +496,25 @@ impl BuiltinToolService {
     /// flat in the number of ids.
     pub fn with_knowledge_get_many(mut self, get_many_fn: KnowledgeGetManyFn) -> Self {
         self.kb_get_many_fn = Some(get_many_fn);
+        self
+    }
+
+    /// Wire the knowledge use log (#698), so what a search offers, what a read
+    /// opens, and what the model marks are all recorded.
+    ///
+    /// Capability-gated, like every other knowledge closure. Without it the
+    /// tools behave exactly as they did before the log existed and
+    /// `builtin_knowledge_base_mark` reports that the knowledge base is not
+    /// configured, which is the answer every unwired knowledge tool gives.
+    pub fn with_knowledge_use_log(
+        mut self,
+        offered_fn: KnowledgeOfferedFn,
+        opened_fn: KnowledgeOpenedFn,
+        mark_fn: KnowledgeMarkFn,
+    ) -> Self {
+        self.kb_offered_fn = Some(offered_fn);
+        self.kb_opened_fn = Some(opened_fn);
+        self.kb_mark_fn = Some(mark_fn);
         self
     }
 
@@ -786,6 +815,49 @@ impl BuiltinToolService {
                             "description": "Single-entry convenience: read one id. Combined with `ids` when both are given."
                         }
                     }
+                }),
+            ),
+            ToolDefinition::new(
+                TOOL_KB_MARK,
+                format!(
+                    "Say whether a knowledge entry you just read was worth reading. Call it \
+                     after {TOOL_KB_GET} when the entry settled the question, and after it \
+                     when the entry was wrong, stale or misleading. Marking is how the store \
+                     learns which entries earn their place: an entry that is offered often \
+                     and never marked is a candidate for retirement, and an entry marked \
+                     wrong is the clearest case there is. Set `useful` to true or false, and \
+                     give a short `reason` - a reason on a false mark says what the entry \
+                     got wrong, which is what a later reader needs. Your latest mark on an \
+                     entry replaces your previous one, so marking twice is safe and changing \
+                     your mind is normal. Ids you cannot read are reported in `not_marked` \
+                     and the rest of the batch still lands. Never mark an entry you have not \
+                     read: a mark stands for a judgement, and a guess spends the signal."
+                ),
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": format!(
+                                "Ids of the entries to mark, at most {KNOWLEDGE_GET_MAX_IDS} \
+                                 per call."
+                            )
+                        },
+                        "id": {
+                            "type": "string",
+                            "description": "Single-entry convenience: mark one id. Combined with `ids` when both are given."
+                        },
+                        "useful": {
+                            "type": "boolean",
+                            "description": "True when the entry helped. False when it was wrong, stale or misleading."
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": "Short statement of why, in your own words. Always send one with a false mark."
+                        }
+                    },
+                    "required": ["useful"]
                 }),
             ),
             ToolDefinition::new(
@@ -1259,6 +1331,7 @@ impl BuiltinToolService {
         TOOL_KB_DELETE,
         TOOL_KB_LIST,
         TOOL_KB_GET,
+        TOOL_KB_MARK,
         TOOL_SEARCH,
         TOOL_NOTIFY,
         TOOL_SYS_PROPS,
@@ -1280,9 +1353,8 @@ impl BuiltinToolService {
     /// on that fallback.
     pub fn provider_group(tool_name: &str) -> Option<&'static str> {
         match tool_name {
-            TOOL_KB_WRITE | TOOL_KB_SEARCH | TOOL_KB_DELETE | TOOL_KB_LIST | TOOL_KB_GET => {
-                Some("knowledge")
-            }
+            TOOL_KB_WRITE | TOOL_KB_SEARCH | TOOL_KB_DELETE | TOOL_KB_LIST | TOOL_KB_GET
+            | TOOL_KB_MARK => Some("knowledge"),
             TOOL_SCRATCHPAD_WRITE
             | TOOL_SCRATCHPAD_SEARCH
             | TOOL_SCRATCHPAD_DELETE
@@ -1320,6 +1392,7 @@ impl BuiltinToolService {
             TOOL_KB_DELETE => self.kb_delete(arguments).await,
             TOOL_KB_LIST => self.kb_list(arguments).await,
             TOOL_KB_GET => self.kb_get(arguments).await,
+            TOOL_KB_MARK => self.kb_mark(arguments).await,
             TOOL_SEARCH => self.tool_search(arguments).await,
             TOOL_NOTIFY => self.notify(arguments).await,
             TOOL_SYS_PROPS => Ok(self.sys_props()),
@@ -1754,6 +1827,11 @@ impl BuiltinToolService {
         let mut available_tags = page.available_tags;
         available_tags.truncate(AVAILABLE_TAGS_LIMIT);
 
+        // Every entry on this page is now in front of the model, which is an
+        // offer (#698). The record is what makes an id the model later reads an
+        // open rather than an unexplained fetch.
+        self.record_offer(page.entries.iter().map(|e| e.id.clone()).collect());
+
         let items: Vec<serde_json::Value> = page
             .entries
             .into_iter()
@@ -2046,6 +2124,41 @@ impl BuiltinToolService {
         .to_string())
     }
 
+    /// Record that `entry_ids` were put in front of the model by a search
+    /// (#698).
+    ///
+    /// Off the tool's path and never fatal - see
+    /// [`record_in_background`]. A call outside a conversation records
+    /// nothing: an offer is taken up inside the conversation it was made in,
+    /// and an offer with no conversation could be taken up by any read at all.
+    fn record_offer(&self, entry_ids: Vec<String>) {
+        let _ = entry_ids;
+    }
+
+    /// Record that `entry_ids` were fetched by id (#698).
+    ///
+    /// Only the ids standing offered in this conversation become opens, and the
+    /// log applies that rule. Off the tool's path and never fatal, for the same
+    /// reason [`Self::record_offer`] is.
+    fn record_open(&self, entry_ids: Vec<String>) {
+        let _ = entry_ids;
+    }
+
+    /// Mark entries useful or not (`builtin_knowledge_base_mark`).
+    ///
+    /// The one write on the use log that a caller asks for rather than one that
+    /// measures a read, so - unlike an offer and an open - it is awaited and its
+    /// failure reaches the caller. A caller that asked to record a judgement has
+    /// to learn whether the judgement landed.
+    ///
+    /// A mark is a standing opinion, one per source per entry, so calling this
+    /// twice on the same entry replaces the first mark rather than adding a
+    /// second. That makes a retried call safe and a change of mind ordinary.
+    async fn kb_mark(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
+        let _ = arguments;
+        unimplemented!()
+    }
+
     /// Read knowledge entries by id (`builtin_knowledge_base_get`).
     ///
     /// The read the `[Recall]` block depends on: that block offers ids and no
@@ -2099,6 +2212,10 @@ impl BuiltinToolService {
 
         // Enforce the response byte budget so one read cannot blow out context.
         let mut items: Vec<serde_json::Value> = Vec::new();
+        // The ids that actually reach the model. An entry the byte budget left
+        // behind was asked for and not delivered, so it is not an open (#698):
+        // the caller still holds its id and reads it in its own call.
+        let mut delivered: Vec<String> = Vec::new();
         let mut bytes = 0usize;
         let mut budget_truncated = false;
         let mut content_cut = false;
@@ -2112,6 +2229,7 @@ impl BuiltinToolService {
                 content_cut = cut;
                 bytes += row.to_string().len();
                 items.push(row);
+                delivered.push(id.clone());
                 continue;
             }
             let item = kb_get_row(entry, &entry.content, false);
@@ -2124,7 +2242,13 @@ impl BuiltinToolService {
             }
             bytes += size;
             items.push(item);
+            delivered.push(id.clone());
         }
+
+        // A fetch of an entry this conversation was offered is the deliberate
+        // act the use log exists to record (#698). One that nothing offered
+        // records nothing - the log decides that, not this call site.
+        self.record_open(delivered);
 
         tracing::info!(
             asked = ids.len(),
@@ -8770,6 +8894,388 @@ mod tests {
             seen.lock().unwrap().as_ref().expect("search ran").len(),
             0,
             "a timed-out embedding must yield an empty vector so the store falls back to FTS"
+        );
+    }
+
+    // -- the knowledge use log (#698) ----------------------------------------
+
+    use desktop_assistant_core::domain::knowledge_use::{MarkPolarity, MarkSource};
+    use desktop_assistant_core::ports::knowledge_use::{MarkRequest, OfferScope, OfferSource};
+
+    /// Everything one use log recorded, so a test can prove what a tool wrote.
+    #[derive(Default)]
+    struct UseLogProbe {
+        offered: Vec<(OfferScope, Vec<String>)>,
+        opened: Vec<(String, Vec<String>)>,
+        marked: Vec<MarkRequest>,
+    }
+
+    type SharedUseLog = std::sync::Arc<std::sync::Mutex<UseLogProbe>>;
+
+    /// Wire a use log onto `service` that records into the probe it returns.
+    ///
+    /// `mark_answer` decides what the mark write reports back: `Ok` with the
+    /// ids that landed, or an error.
+    fn with_use_log(
+        service: BuiltinToolService,
+        mark_answer: Result<Vec<String>, &'static str>,
+    ) -> (BuiltinToolService, SharedUseLog) {
+        use std::sync::{Arc, Mutex};
+        let probe: SharedUseLog = Arc::new(Mutex::new(UseLogProbe::default()));
+
+        let for_offer = Arc::clone(&probe);
+        let offered_fn: KnowledgeOfferedFn = Arc::new(move |scope, ids| {
+            let probe = Arc::clone(&for_offer);
+            Box::pin(async move {
+                let count = ids.len();
+                probe.lock().expect("probe lock").offered.push((scope, ids));
+                Ok(count)
+            })
+        });
+
+        let for_open = Arc::clone(&probe);
+        let opened_fn: KnowledgeOpenedFn = Arc::new(move |conversation, ids| {
+            let probe = Arc::clone(&for_open);
+            Box::pin(async move {
+                let count = ids.len();
+                probe
+                    .lock()
+                    .expect("probe lock")
+                    .opened
+                    .push((conversation, ids));
+                Ok(count)
+            })
+        });
+
+        let for_mark = Arc::clone(&probe);
+        let mark_fn: KnowledgeMarkFn = Arc::new(move |request: MarkRequest| {
+            let probe = Arc::clone(&for_mark);
+            let answer = mark_answer.clone();
+            Box::pin(async move {
+                probe.lock().expect("probe lock").marked.push(request);
+                answer.map_err(|e| CoreError::Storage(e.to_string()))
+            })
+        });
+
+        (
+            service.with_knowledge_use_log(offered_fn, opened_fn, mark_fn),
+            probe,
+        )
+    }
+
+    /// A use log whose every write blocks until the test releases it, so a test
+    /// can prove a tool answered without waiting for the record.
+    fn with_blocking_use_log(
+        service: BuiltinToolService,
+    ) -> (BuiltinToolService, tokio::sync::oneshot::Sender<()>) {
+        use std::sync::{Arc, Mutex};
+        let (release, held) = tokio::sync::oneshot::channel::<()>();
+        let held = Arc::new(tokio::sync::Mutex::new(Some(held)));
+
+        let for_offer = Arc::clone(&held);
+        let offered_fn: KnowledgeOfferedFn = Arc::new(move |_scope, _ids| {
+            let held = Arc::clone(&for_offer);
+            Box::pin(async move {
+                if let Some(rx) = held.lock().await.take() {
+                    let _ = rx.await;
+                }
+                Ok(0)
+            })
+        });
+        let for_open = Arc::clone(&held);
+        let opened_fn: KnowledgeOpenedFn = Arc::new(move |_conversation, _ids| {
+            let held = Arc::clone(&for_open);
+            Box::pin(async move {
+                if let Some(rx) = held.lock().await.take() {
+                    let _ = rx.await;
+                }
+                Ok(0)
+            })
+        });
+        let mark_fn: KnowledgeMarkFn =
+            Arc::new(move |_request| Box::pin(async move { Ok(vec![]) }));
+        let _unused: Option<Arc<Mutex<()>>> = None;
+
+        (
+            service.with_knowledge_use_log(offered_fn, opened_fn, mark_fn),
+            release,
+        )
+    }
+
+    /// Run `body` inside a conversation, the way the dispatch loop does.
+    async fn in_conversation<F, T>(body: F) -> T
+    where
+        F: std::future::Future<Output = T>,
+    {
+        use desktop_assistant_core::domain::ConversationId;
+        use desktop_assistant_core::ports::conversation_ctx::with_conversation_id;
+        with_conversation_id(ConversationId::from("conv-698"), body).await
+    }
+
+    /// Let a spawned recording task run to completion before the probe is read.
+    async fn settle() {
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// A knowledge-base service whose search returns `entries`, so a test can
+    /// prove what a search put in front of the model.
+    fn kb_service_searching(
+        entries: Vec<desktop_assistant_core::domain::KnowledgeEntry>,
+    ) -> BuiltinToolService {
+        use std::sync::Arc;
+        let write_fn: KnowledgeWriteFn = Arc::new(|entry| Box::pin(async move { Ok(entry) }));
+        let search_fn: KnowledgeSearchFn = Arc::new(move |_q, _e, _m, _t, _x, _l| {
+            let entries = entries.clone();
+            Box::pin(async move {
+                Ok(KnowledgeSearchPage {
+                    entries,
+                    scope_size: ScopeSize::Few,
+                    available_tags: Vec::new(),
+                })
+            })
+        });
+        let delete_fn: KnowledgeDeleteFn = Arc::new(|_ids| Box::pin(async { Ok(0) }));
+        let list_fn: KnowledgeListFn = Arc::new(|_q| {
+            Box::pin(async {
+                Ok(
+                    desktop_assistant_core::ports::knowledge::KnowledgeListPage {
+                        entries: Vec::new(),
+                        next_cursor: None,
+                    },
+                )
+            })
+        });
+        let get_fn: KnowledgeGetFn = Arc::new(|_id| Box::pin(async { Ok(None) }));
+        BuiltinToolService::new()
+            .with_knowledge_base(write_fn, search_fn, delete_fn, list_fn, get_fn)
+    }
+
+    #[tokio::test]
+    async fn a_read_by_id_records_an_open_for_the_entries_it_delivered() {
+        let (service, _get_probe) = kb_service_holding(vec![kb_full_entry("kb-1")]);
+        let (service, log) = with_use_log(service, Ok(vec![]));
+
+        in_conversation(async {
+            kb_get_response(&service, serde_json::json!({"ids": ["kb-1", "kb-absent"]})).await
+        })
+        .await;
+        settle().await;
+
+        let recorded = &log.lock().expect("probe lock").opened;
+        assert_eq!(recorded.len(), 1, "one recording for one call");
+        assert_eq!(recorded[0].0, "conv-698");
+        assert_eq!(
+            recorded[0].1,
+            vec!["kb-1".to_string()],
+            "only the id that resolved and travelled is reported as read"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_search_records_the_entries_it_offered() {
+        let (service, log) = with_use_log(
+            kb_service_searching(vec![kb_full_entry("kb-1"), kb_full_entry("kb-2")]),
+            Ok(vec![]),
+        );
+
+        in_conversation(async {
+            service
+                .execute_tool(TOOL_KB_SEARCH, serde_json::json!({"query": "the fact"}))
+                .await
+                .expect("search succeeds")
+        })
+        .await;
+        settle().await;
+
+        let recorded = &log.lock().expect("probe lock").offered;
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].0.source, OfferSource::Search);
+        assert_eq!(recorded[0].0.conversation_id, "conv-698");
+        assert_eq!(
+            recorded[0].1,
+            vec!["kb-1".to_string(), "kb-2".to_string()],
+            "every entry the page carried is an offer"
+        );
+    }
+
+    #[tokio::test]
+    async fn recording_runs_off_the_read_path_so_it_cannot_slow_it() {
+        // The record is written in its own task. A log that never answers must
+        // therefore cost the record and not the read - which is the criterion,
+        // stated as something a test can hold rather than as a stopwatch.
+        let (service, _probe) = kb_service_holding(vec![kb_full_entry("kb-1")]);
+        let (service, release) = with_blocking_use_log(service);
+
+        let json = in_conversation(async {
+            kb_get_response(&service, serde_json::json!({"ids": ["kb-1"]})).await
+        })
+        .await;
+
+        assert_eq!(json["ok"], true, "the read answered while the log was held");
+        assert_eq!(json["returned"], 1);
+        let _ = release.send(());
+    }
+
+    #[tokio::test]
+    async fn a_read_outside_a_conversation_records_nothing() {
+        // An offer is taken up inside the conversation it was made in. A record
+        // with no conversation could be taken up by any read at all, so a tool
+        // call with no conversation scope records nothing rather than guessing.
+        let (service, _get_probe) = kb_service_holding(vec![kb_full_entry("kb-1")]);
+        let (service, log) = with_use_log(service, Ok(vec![]));
+
+        kb_get_response(&service, serde_json::json!({"ids": ["kb-1"]})).await;
+        settle().await;
+
+        assert!(log.lock().expect("probe lock").opened.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_read_and_the_search_still_work_with_no_use_log_wired() {
+        // The log is capability-gated, like every other knowledge closure. An
+        // installation without one behaves exactly as it did before it existed.
+        let (service, _probe) = kb_service_holding(vec![kb_full_entry("kb-1")]);
+        let json = in_conversation(async {
+            kb_get_response(&service, serde_json::json!({"ids": ["kb-1"]})).await
+        })
+        .await;
+        assert_eq!(json["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn marking_an_entry_useful_records_a_positive_mark() {
+        let (service, log) = with_use_log(BuiltinToolService::new(), Ok(vec!["kb-1".to_string()]));
+
+        let raw = service
+            .execute_tool(
+                TOOL_KB_MARK,
+                serde_json::json!({"id": "kb-1", "useful": true, "reason": "settled it"}),
+            )
+            .await
+            .expect("mark succeeds");
+        let json: serde_json::Value = serde_json::from_str(&raw).expect("mark response is JSON");
+
+        assert_eq!(json["ok"], true, "{json}");
+        assert_eq!(json["polarity"], "positive");
+        assert_eq!(json["marked"], serde_json::json!(["kb-1"]));
+        assert_eq!(json["not_marked"], serde_json::json!([]));
+
+        let request = &log.lock().expect("probe lock").marked[0];
+        assert_eq!(request.polarity, MarkPolarity::Positive);
+        assert_eq!(request.source, MarkSource::Model);
+        assert_eq!(request.reason.as_deref(), Some("settled it"));
+    }
+
+    #[tokio::test]
+    async fn marking_an_entry_wrong_records_a_negative_mark() {
+        let (service, log) = with_use_log(BuiltinToolService::new(), Ok(vec!["kb-1".to_string()]));
+
+        let raw = service
+            .execute_tool(
+                TOOL_KB_MARK,
+                serde_json::json!({
+                    "ids": ["kb-1", "kb-gone"],
+                    "useful": false,
+                    "reason": "names a host that no longer exists"
+                }),
+            )
+            .await
+            .expect("mark succeeds");
+        let json: serde_json::Value = serde_json::from_str(&raw).expect("mark response is JSON");
+
+        assert_eq!(json["polarity"], "negative");
+        assert_eq!(json["marked"], serde_json::json!(["kb-1"]));
+        assert_eq!(
+            json["not_marked"],
+            serde_json::json!(["kb-gone"]),
+            "an id that did not land is named, not raised"
+        );
+        assert_eq!(
+            log.lock().expect("probe lock").marked[0].polarity,
+            MarkPolarity::Negative
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mark_with_no_polarity_is_refused() {
+        let (service, _log) = with_use_log(BuiltinToolService::new(), Ok(vec![]));
+        let err = service
+            .execute_tool(TOOL_KB_MARK, serde_json::json!({"id": "kb-1"}))
+            .await
+            .expect_err("a mark that says nothing is refused");
+        assert!(err.to_string().contains("useful"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_mark_with_no_ids_is_refused() {
+        let (service, _log) = with_use_log(BuiltinToolService::new(), Ok(vec![]));
+        let err = service
+            .execute_tool(TOOL_KB_MARK, serde_json::json!({"useful": true}))
+            .await
+            .expect_err("a mark that names no entry is refused");
+        assert!(err.to_string().contains("`id` or `ids`"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_mark_reaches_the_caller() {
+        // Unlike an offer and an open, a mark is what the caller asked for, so
+        // its failure is the caller's answer rather than a dropped measurement.
+        let (service, _log) = with_use_log(BuiltinToolService::new(), Err("the database is gone"));
+        let err = service
+            .execute_tool(
+                TOOL_KB_MARK,
+                serde_json::json!({"id": "kb-1", "useful": true}),
+            )
+            .await
+            .expect_err("a mark that did not land is reported");
+        assert!(err.to_string().contains("the database is gone"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn the_mark_tool_reports_that_the_knowledge_base_is_unconfigured() {
+        let service = BuiltinToolService::new();
+        let err = service
+            .execute_tool(
+                TOOL_KB_MARK,
+                serde_json::json!({"id": "kb-1", "useful": true}),
+            )
+            .await
+            .expect_err("an unwired mark tool declines");
+        assert!(
+            err.to_string().contains("knowledge base not configured"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_mark_tool_advertises_what_it_needs_and_what_it_does() {
+        let service = BuiltinToolService::new();
+        let def = service
+            .tool_definitions()
+            .into_iter()
+            .find(|t| t.name == TOOL_KB_MARK)
+            .expect("the mark tool is advertised");
+        let props = &def.parameters["properties"];
+        assert_eq!(props["useful"]["type"], "boolean");
+        assert_eq!(
+            def.parameters["required"],
+            serde_json::json!(["useful"]),
+            "a mark that says nothing is not a mark"
+        );
+        let text = &def.description;
+        // A model that does not know a repeated mark is safe will avoid
+        // marking at all, which costs the highest-quality signal there is.
+        assert!(
+            text.contains("replaces"),
+            "the description must say a second mark replaces the first: {text}"
+        );
+        // The negative half is the one worth the most and the one a model
+        // volunteers least, so the schema has to ask for it by name.
+        assert!(
+            text.contains("wrong"),
+            "the description must ask for the negative mark too: {text}"
         );
     }
 }

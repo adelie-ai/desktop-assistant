@@ -110,6 +110,11 @@ const PERSONAL_DATA_TABLES: &[&str] = &[
     // keyed by (user_id, conversation_id, key); scope so LLM-supplied SQL
     // can't read another user's replies.
     "idempotency_keys",
+    // 044 — the knowledge use log. Both tables key on (user_id, entry_id) and
+    // hold what one person's assistant offered, opened and marked, which says
+    // as much about the person as the entries themselves do.
+    "knowledge_use_stats",
+    "knowledge_use_marks",
 ];
 
 /// The canonical set of personal-data tables (see `PERSONAL_DATA_TABLES`).

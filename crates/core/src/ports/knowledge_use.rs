@@ -1,0 +1,246 @@
+//! Outbound port for the knowledge use log (#698).
+//!
+//! Three acts are recorded through this port, and one read comes back out of
+//! it. What each act means, and why none of them is an inference, is in
+//! [`crate::domain::knowledge_use`].
+//!
+//! ## An open is a taken-up offer
+//!
+//! [`KnowledgeUseLog::record_opened`] does not count every fetch by id. It
+//! counts a fetch of an entry that is standing offered in the same
+//! conversation, and it takes that offer down as it counts. Two things follow,
+//! and both are the point:
+//!
+//! - A read that nothing offered - an id from a pinned note, an id the model
+//!   held from an earlier task - records nothing. Otherwise ordinary
+//!   bookkeeping would inflate the signal that ranking reads.
+//! - A second fetch of the same entry in the same turn records one open. The
+//!   offer is already down, so the write is idempotent and a retried tool call
+//!   is safe.
+//!
+//! ## An offer stands for one turn
+//!
+//! A `[Recall]` block is rendered once per turn, from the user's prompt, so an
+//! offer made by it **replaces** whatever that conversation had standing. A
+//! search happens inside a turn that is already running, so an offer made by
+//! one is **added** to what stands. [`OfferSource`] carries which. The effect
+//! is that "offered in the same turn" needs no turn identifier: the standing
+//! set is this turn's set, because the turn's first block replaced it.
+//!
+//! The one degraded case is a deployment with recall switched off. Nothing then
+//! replaces the set at a turn boundary, so an offer made by a search stands
+//! until it is taken up. That is a wider window than a turn, never a narrower
+//! one, and it still refuses the read that nothing offered.
+//!
+//! ## Recording never fails a read
+//!
+//! A use record is a measurement of a read, and a measurement must not be able
+//! to break what it measures. Every call site therefore goes through
+//! [`record_in_background`], which runs the write off the caller's path and
+//! drops its error into a log line.
+
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+
+use crate::CoreError;
+use crate::domain::knowledge_use::{KnowledgeUseRecord, MarkPolarity, MarkSource};
+use crate::ports::auth::{current_user_id, with_user_id};
+
+/// Which kind of surface put the entries in front of the model.
+///
+/// The distinction is not descriptive. It decides what happens to the offers
+/// that were already standing - see the module documentation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OfferSource {
+    /// The `[Recall]` block, rendered once at the start of a turn. Replaces
+    /// the conversation's standing offers.
+    Recall,
+    /// A knowledge-base search the model ran inside a turn. Adds to the
+    /// conversation's standing offers.
+    Search,
+}
+
+/// Where an offer was made, and by what.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OfferScope {
+    /// The conversation the entries were shown in. An open counts only when it
+    /// happens in the same conversation.
+    pub conversation_id: String,
+    /// What showed them.
+    pub source: OfferSource,
+}
+
+impl OfferScope {
+    /// An offer made by the `[Recall]` block of `conversation_id`.
+    pub fn recall(conversation_id: impl Into<String>) -> Self {
+        Self {
+            conversation_id: conversation_id.into(),
+            source: OfferSource::Recall,
+        }
+    }
+
+    /// An offer made by a search inside `conversation_id`.
+    pub fn search(conversation_id: impl Into<String>) -> Self {
+        Self {
+            conversation_id: conversation_id.into(),
+            source: OfferSource::Search,
+        }
+    }
+}
+
+/// One request to set a mark on one or more entries.
+///
+/// A source holds one standing mark per entry, so a second request from the
+/// same source replaces the first rather than adding to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkRequest {
+    /// The entries to mark. Ids the caller does not own, and ids of retired
+    /// entries, are simply not marked.
+    pub entry_ids: Vec<String>,
+    /// Whether the entries helped or were wrong.
+    pub polarity: MarkPolarity,
+    /// Who is marking.
+    pub source: MarkSource,
+    /// Why, in the marker's own words. A negative mark's reason is what makes
+    /// the record usable later.
+    pub reason: Option<String>,
+}
+
+/// The knowledge use log: what was offered, what was opened, what was marked.
+///
+/// Every method is scoped to the current user through
+/// [`crate::ports::auth::current_user_id`], and every write refuses an entry
+/// the caller does not own. Counts returned are rows actually written, so a
+/// caller can tell "recorded nothing" from "recorded everything asked".
+pub trait KnowledgeUseLog: Send + Sync {
+    /// Record that `entry_ids` were put in front of the model, and leave them
+    /// standing as offers in `scope.conversation_id`.
+    ///
+    /// [`OfferSource::Recall`] clears that conversation's standing offers
+    /// first, because the block that produced it is rendered once per turn.
+    fn record_offered(
+        &self,
+        scope: OfferScope,
+        entry_ids: Vec<String>,
+    ) -> impl Future<Output = Result<usize, CoreError>> + Send;
+
+    /// Record an open for each of `entry_ids` that is standing offered in
+    /// `conversation_id`, and take those offers down.
+    ///
+    /// An id with no standing offer records nothing and is not an error: the
+    /// model reads entries for many reasons, and only a taken-up offer is
+    /// evidence.
+    fn record_opened(
+        &self,
+        conversation_id: String,
+        entry_ids: Vec<String>,
+    ) -> impl Future<Output = Result<usize, CoreError>> + Send;
+
+    /// Set the standing mark for `request.source` on each owned entry named,
+    /// and report the ids that were marked.
+    ///
+    /// The ids come back rather than a count, because the caller asked for
+    /// this write and has to be able to say which of the ids it named did not
+    /// land. An id the caller does not own, and one that names a retired
+    /// entry, are both simply absent - the same answer every other read of the
+    /// knowledge base gives for the same id.
+    fn record_mark(
+        &self,
+        request: MarkRequest,
+    ) -> impl Future<Output = Result<Vec<String>, CoreError>> + Send;
+
+    /// What the log knows about each of `entry_ids`.
+    ///
+    /// The read that ranking will use. Ids with no record are absent from the
+    /// answer rather than returned as zeroes, so a caller can tell an entry
+    /// nothing has seen from one that was offered and ignored -
+    /// [`KnowledgeUseRecord::unseen`] fills in the first case where a caller
+    /// wants one record per id.
+    fn records(
+        &self,
+        entry_ids: Vec<String>,
+    ) -> impl Future<Output = Result<Vec<KnowledgeUseRecord>, CoreError>> + Send;
+}
+
+/// Boxed async closure that records an offer, for wiring the log through
+/// non-generic boundaries.
+pub type KnowledgeOfferedFn = Arc<
+    dyn Fn(
+            OfferScope,
+            Vec<String>,
+        ) -> Pin<Box<dyn Future<Output = Result<usize, CoreError>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Boxed async closure that records opens for a conversation's standing
+/// offers. Args: `(conversation_id, entry_ids)`.
+pub type KnowledgeOpenedFn = Arc<
+    dyn Fn(String, Vec<String>) -> Pin<Box<dyn Future<Output = Result<usize, CoreError>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Boxed async closure that sets a standing mark and reports the ids marked.
+pub type KnowledgeMarkFn = Arc<
+    dyn Fn(MarkRequest) -> Pin<Box<dyn Future<Output = Result<Vec<String>, CoreError>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Run a use-log write off the caller's path.
+///
+/// Two rules the log has to keep, both of them here rather than at each call
+/// site. The write must not add its latency to a search or a read, so it runs
+/// in its own task. And a write that fails must not fail the read it was
+/// measuring, so its error becomes a log line and stops there.
+///
+/// The user id is captured before the task is spawned and re-installed inside
+/// it. A `tokio::task_local` does not cross `tokio::spawn`, so a write that did
+/// not carry it would run as the default user and scope itself to the wrong
+/// rows.
+///
+/// `what` names the write in the log line. It is a static string so a failing
+/// write is greppable without reading the arguments.
+pub fn record_in_background<F>(what: &'static str, write: F)
+where
+    F: Future<Output = Result<usize, CoreError>> + Send + 'static,
+{
+    let user_id = current_user_id();
+    tokio::spawn(async move {
+        match with_user_id(user_id, write).await {
+            Ok(0) => {}
+            Ok(rows) => tracing::debug!(target: "knowledge_use", what, rows, "use log written"),
+            Err(error) => tracing::debug!(
+                target: "knowledge_use",
+                what,
+                %error,
+                "use log write failed; the read it measured is unaffected"
+            ),
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_recall_offer_and_a_search_offer_are_different_scopes() {
+        // The two are not interchangeable: one replaces the conversation's
+        // standing offers and the other adds to them.
+        assert_eq!(OfferScope::recall("c1").source, OfferSource::Recall);
+        assert_eq!(OfferScope::search("c1").source, OfferSource::Search);
+        assert_ne!(OfferScope::recall("c1"), OfferScope::search("c1"));
+    }
+
+    #[tokio::test]
+    async fn a_background_write_that_fails_does_not_reach_the_caller() {
+        // The call returns immediately and returns nothing to fail on. This is
+        // the whole contract: a measurement cannot break what it measures.
+        record_in_background("test", async {
+            Err(CoreError::Storage("the database is gone".to_string()))
+        });
+    }
+}
