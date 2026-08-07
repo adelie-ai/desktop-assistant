@@ -184,12 +184,25 @@ with no `content`, an object with no `op`, a bare value where an object belongs
 still validated against the slice, so leniency about encoding buys nothing about
 what an operation may do.
 
-**What was kept and what was set aside are both counted and logged**, at
-`WARN`, with the position, the `op` tag and a bounded quote of each element that
-could not be read. A run that changed nothing after dropping operations logs at
-`WARN` too, rather than at the `DEBUG` level a genuine no-op run uses. Salvage
-that quietly returns less than the model proposed is the same loss in a smaller
-number, so the counts reach the log rather than only the code.
+**What was kept and what was set aside are both counted and logged.** The `WARN`
+line gives the two counts and, for each element it could not read, where the
+element sat, what the model said it was attempting, and what serde objected to.
+A run that changed nothing after dropping operations logs at `WARN` too, rather
+than at the `DEBUG` level a genuine no-op run uses. Salvage that quietly returns
+less than the model proposed is the same loss in a smaller number, so the counts
+reach the log rather than only the code.
+
+The element **itself** is quoted at `DEBUG`, in a bounded excerpt. A rejected
+merge or edit carries the prose the model wrote for the entry, which is a
+fragment of the user's own knowledge base, and the journal is world-readable and
+is shipped on. So the quote sits at the same level this pass already keeps a
+model-supplied delete reason at, and the default stream carries the diagnosis
+without it.
+
+Every dropped operation is counted exactly once, whatever the outcome: when the
+rest of the answer applies, when the whole answer is unreadable, and when the
+slice fails outright. Operations lost to a truncated answer are not counted,
+because that slice is halved and recomputed and the same operations come back.
 
 Two shapes stay unrecoverable, and each keeps its own verdict:
 

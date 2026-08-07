@@ -252,9 +252,10 @@ async fn consolidate_user(
         let answer = match operations_for_slice(llm_fn, slice, cancellation).await {
             Ok(answer) => answer,
             Err(e) => {
-                tracing::warn!("dreaming: consolidation slice failed: {e}");
+                tracing::warn!("dreaming: consolidation slice failed: {}", e.message);
+                dropped_operations += e.dropped;
                 failed_slices += 1;
-                last_failure = Some(e);
+                last_failure = Some(e.message);
                 continue;
             }
         };
@@ -754,8 +755,30 @@ impl<'de> Deserialize<'de> for OpsEnvelope {
 enum ParseFailure {
     /// The response ended before the JSON did.
     Truncated(String),
-    /// The response is not valid JSON, for a reason other than ending early.
-    Malformed(String),
+    /// The response is not valid JSON, or holds no operation that could be
+    /// read, for a reason other than ending early.
+    Malformed {
+        detail: String,
+        /// How many proposed operations were read as elements of the answer but
+        /// could not be read as operations. Zero when the JSON itself did not
+        /// parse, because then no element was ever separated out to count.
+        dropped: usize,
+    },
+}
+
+impl ParseFailure {
+    /// Proposed operations this failure lost, for the caller's running count.
+    ///
+    /// Truncation loses none. The slice is halved and recomputed, so the same
+    /// operations come back in the retry and counting them here would count
+    /// them twice; a retry that never succeeds is reported as unreviewed
+    /// entries instead.
+    fn dropped(&self) -> usize {
+        match self {
+            Self::Truncated(_) => 0,
+            Self::Malformed { dropped, .. } => *dropped,
+        }
+    }
 }
 
 impl std::fmt::Display for ParseFailure {
@@ -766,7 +789,9 @@ impl std::fmt::Display for ParseFailure {
                 "dreaming: the consolidation answer stopped before the JSON ended, \
                  which means the model reached its output limit: {detail}"
             ),
-            Self::Malformed(detail) => write!(f, "dreaming: bad consolidation JSON: {detail}"),
+            Self::Malformed { detail, .. } => {
+                write!(f, "dreaming: bad consolidation JSON: {detail}")
+            }
         }
     }
 }
@@ -788,16 +813,30 @@ struct DroppedOperation {
     excerpt: String,
 }
 
+impl DroppedOperation {
+    /// The diagnosis with a bounded quote of the element itself.
+    ///
+    /// The quote can hold a fragment of the user's own knowledge base, because
+    /// a rejected merge or edit carries the prose the model wrote for it. So
+    /// this belongs at `DEBUG`, beside the delete reasons this file already
+    /// keeps there: the journal is world-readable and is shipped on. The
+    /// [`Display`](std::fmt::Display) form carries the diagnosis without the
+    /// quote and is what reaches the default log stream.
+    fn with_element(&self) -> String {
+        format!("{self} -- {}", self.excerpt)
+    }
+}
+
+/// The diagnosis without the element: where it sat, what the model said it was
+/// attempting, and why it did not read. Model-authored prose is deliberately
+/// absent, so this is safe for the default log stream.
 impl std::fmt::Display for DroppedOperation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let Self {
-            index,
-            op,
-            reason,
-            excerpt,
+            index, op, reason, ..
         } = self;
         let op = op.as_deref().unwrap_or("unstated");
-        write!(f, "operation #{index} [op={op}]: {reason} -- {excerpt}")
+        write!(f, "operation #{index} [op={op}]: {reason}")
     }
 }
 
@@ -815,12 +854,20 @@ struct ParsedOperations {
 
 /// The first few dropped operations as one line, so an error or a log names
 /// what came back without listing every element of a long answer.
-fn summarize_dropped(dropped: &[DroppedOperation]) -> String {
+///
+/// `render` chooses how much of each one is shown:
+/// [`Display`](std::fmt::Display) for the default log stream, and
+/// [`DroppedOperation::with_element`] for the `DEBUG` line that quotes the
+/// element.
+fn summarize_dropped(
+    dropped: &[DroppedOperation],
+    render: impl Fn(&DroppedOperation) -> String,
+) -> String {
     const SHOWN: usize = 3;
     let mut line = dropped
         .iter()
         .take(SHOWN)
-        .map(DroppedOperation::to_string)
+        .map(render)
         .collect::<Vec<_>>()
         .join("; ");
     if let Some(rest) = dropped.len().checked_sub(SHOWN).filter(|r| *r > 0) {
@@ -866,7 +913,12 @@ fn parse_operations(response: &str) -> Result<ParsedOperations, ParseFailure> {
         Err(e) if e.classify() == serde_json::error::Category::Eof => {
             return Err(ParseFailure::Truncated(e.to_string()));
         }
-        Err(e) => return Err(ParseFailure::Malformed(e.to_string())),
+        Err(e) => {
+            return Err(ParseFailure::Malformed {
+                detail: e.to_string(),
+                dropped: 0,
+            });
+        }
     };
 
     let mut parsed = ParsedOperations {
@@ -891,11 +943,14 @@ fn parse_operations(response: &str) -> Result<ParsedOperations, ParseFailure> {
     }
 
     if parsed.ops.is_empty() && !parsed.dropped.is_empty() {
-        return Err(ParseFailure::Malformed(format!(
-            "none of the {} proposed operation(s) could be read: {}",
-            parsed.dropped.len(),
-            summarize_dropped(&parsed.dropped)
-        )));
+        return Err(ParseFailure::Malformed {
+            detail: format!(
+                "none of the {} proposed operation(s) could be read: {}",
+                parsed.dropped.len(),
+                summarize_dropped(&parsed.dropped, DroppedOperation::to_string)
+            ),
+            dropped: parsed.dropped.len(),
+        });
     }
     Ok(parsed)
 }
@@ -921,7 +976,15 @@ fn report_salvage(parsed: &ParsedOperations) {
              it could not read; the entries those named stay unchanged until the next run: {}",
             parsed.ops.len(),
             parsed.dropped.len(),
-            summarize_dropped(&parsed.dropped)
+            summarize_dropped(&parsed.dropped, DroppedOperation::to_string)
+        );
+        // What the model actually emitted, which is the next question anyone
+        // asks. Held at DEBUG because the quote can carry the user's own
+        // knowledge-base prose, the same level this file keeps a model-supplied
+        // delete reason at.
+        tracing::debug!(
+            "dreaming: the operations consolidation could not read: {}",
+            summarize_dropped(&parsed.dropped, DroppedOperation::with_element)
         );
     }
 }
@@ -941,7 +1004,7 @@ async fn operations_for_slice(
     llm_fn: &DreamingLlmFn,
     slice: &[KbEntry],
     cancellation: &CancellationToken,
-) -> Result<SliceAnswer, String> {
+) -> Result<SliceAnswer, SliceFailure> {
     let mut ops: Vec<RawOp> = Vec::new();
     let mut dropped = 0usize;
     let mut pending: Vec<(&[KbEntry], usize)> = vec![(slice, 0)];
@@ -982,7 +1045,13 @@ async fn operations_for_slice(
                     pending.push((head, depth + 1));
                     continue;
                 }
-                Err(e) => e.to_string(),
+                Err(e) => {
+                    // An answer nothing could be read out of still lost the
+                    // operations it proposed, so the count leaves with the
+                    // failure rather than only as prose inside it.
+                    dropped += e.dropped();
+                    e.to_string()
+                }
             },
             Err(e) => e,
         };
@@ -992,8 +1061,11 @@ async fn operations_for_slice(
     }
 
     if answered == 0 {
-        return Err(last_failure
-            .unwrap_or_else(|| "dreaming: consolidation produced no answer".to_string()));
+        return Err(SliceFailure {
+            message: last_failure
+                .unwrap_or_else(|| "dreaming: consolidation produced no answer".to_string()),
+            dropped,
+        });
     }
 
     if unreviewed > 0 {
@@ -1005,6 +1077,17 @@ async fn operations_for_slice(
     }
 
     Ok(SliceAnswer { ops, dropped })
+}
+
+/// Why a slice produced nothing at all, and what it lost on the way.
+#[derive(Debug)]
+struct SliceFailure {
+    /// The last failure the slice hit, for the log and for the run's error.
+    message: String,
+    /// Proposed operations that were read but could not be used before the
+    /// slice gave up. Counted here as well, so a loss is never invisible just
+    /// because the slice as a whole failed.
+    dropped: usize,
 }
 
 /// What one slice yielded, across every part of it that answered.
@@ -1237,7 +1320,7 @@ mod tests {
     fn a_wholly_unreadable_answer_still_fails_and_reports_why() {
         let err = parse_operations(MALFORMED).expect_err("invalid JSON cannot parse");
         assert!(
-            matches!(err, ParseFailure::Malformed(_)),
+            matches!(err, ParseFailure::Malformed { .. }),
             "expected a malformed verdict, got: {err:?}"
         );
         let message = err.to_string();
@@ -1253,10 +1336,22 @@ mod tests {
         // answer has no complete envelope, so the operations before the cut are
         // NOT salvaged - the answer keeps its truncation verdict and reaches the
         // halve-and-recompute path, which is the fix that actually fits.
+        // The premise this test rests on: the fixture really does carry one
+        // complete, valid operation before the cut, so salvage would be
+        // tempting here and is deliberately not attempted.
+        assert!(
+            TRUNCATED.contains(r#"{"op": "delete", "ids": ["a"], "reason": "trivial"}"#),
+            "the fixture must hold a complete operation ahead of the cut"
+        );
         let err = parse_operations(TRUNCATED).expect_err("a cut-off response cannot parse");
         assert!(
             matches!(err, ParseFailure::Truncated(_)),
             "a whole operation before the cut must not turn truncation into salvage: {err:?}"
+        );
+        assert_eq!(
+            err.dropped(),
+            0,
+            "a retried slice must not have its operations counted as lost as well"
         );
     }
 
@@ -1371,8 +1466,12 @@ mod tests {
             "the report must name the field that was missing: {report}"
         );
         assert!(
-            report.contains("kb-002"),
-            "the report must show the element it could not read: {report}"
+            report.contains("op=merge"),
+            "the report must name what the model was attempting: {report}"
+        );
+        assert!(
+            parsed.dropped[0].with_element().contains("kb-002"),
+            "the quoted form must show the element it could not read"
         );
     }
 
@@ -1385,7 +1484,7 @@ mod tests {
         let err =
             parse_operations(answer).expect_err("an answer with no usable operation is a failure");
         assert!(
-            matches!(err, ParseFailure::Malformed(_)),
+            matches!(err, ParseFailure::Malformed { .. }),
             "expected a malformed verdict, got: {err:?}"
         );
         let message = err.to_string();
@@ -1420,17 +1519,24 @@ mod tests {
         let parsed = parse_operations(&answer).expect("the readable operation survives");
         assert_eq!(parsed.dropped.len(), 1);
 
-        let report = parsed.dropped[0].to_string();
+        let quoted = parsed.dropped[0].with_element();
         assert!(
-            report.chars().count() < huge.chars().count(),
+            quoted.chars().count() < huge.chars().count(),
             "one long element must not carry its whole body into the log"
         );
         // `serde_json` writes an object's keys in alphabetical order, so `body`
         // precedes `op` and a bounded quote alone would cut the one field that
         // says what the model was attempting.
         assert!(
-            report.contains("op=merge"),
-            "a bounded report must still name what the operation was: {report}"
+            quoted.contains("op=merge"),
+            "a bounded report must still name what the operation was: {quoted}"
+        );
+        // The default log stream gets the diagnosis without the element, so a
+        // fragment of the user's knowledge base does not reach it.
+        let diagnosis = parsed.dropped[0].to_string();
+        assert!(
+            !diagnosis.contains(&huge[..8]),
+            "the element itself must not reach the default log stream: {diagnosis}"
         );
     }
 
@@ -1467,6 +1573,51 @@ mod tests {
         assert!(
             logged.contains("WARN"),
             "dropping proposed work needs a level an operator reads: {logged}"
+        );
+    }
+
+    /// An answer that proposes two operations and neither can be read.
+    const ALL_UNREADABLE: &str =
+        r#"{"operations":[{"op":"merge","ids":["kb-1","kb-2"]},{"id":"kb-3"}]}"#;
+
+    #[tokio::test]
+    async fn operations_dropped_by_an_unreadable_answer_are_still_counted() {
+        // An answer where nothing at all could be read is returned as a
+        // failure, not as an empty success. The work it proposed is just as
+        // lost as one bad operation among ten, so the count must leave with the
+        // failure rather than only as prose inside it.
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        // Three entries split into one and two when the first answer is cut
+        // off. The two-entry half answers; the one-entry half is unreadable.
+        let llm = recording_llm(calls, |seen| match seen {
+            n if n > 2 => Ok(TRUNCATED.to_string()),
+            2 => Ok(ops_response(&["kb-001"])),
+            _ => Ok(ALL_UNREADABLE.to_string()),
+        });
+
+        let answer = operations_for_slice(&llm, &slice_of(3), &CancellationToken::new())
+            .await
+            .expect("the half that answered still returns what worked");
+
+        assert_eq!(answer.ops.len(), 1, "the readable half must survive");
+        assert_eq!(
+            answer.dropped, 2,
+            "a half that lost every operation must still report the loss"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_slice_that_fails_outright_still_reports_what_it_dropped() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let llm = recording_llm(calls, |_| Ok(ALL_UNREADABLE.to_string()));
+
+        let failure = operations_for_slice(&llm, &slice_of(1), &CancellationToken::new())
+            .await
+            .expect_err("an answer with no usable operation fails the slice");
+
+        assert_eq!(
+            failure.dropped, 2,
+            "a failed slice must still say how much proposed work it lost"
         );
     }
 
