@@ -2531,8 +2531,19 @@ mod tests {
     /// A store of two hundred entries in which each named value is carried by a
     /// quarter of them, so every cue field is informative and none dominates.
     fn a_gradeable_cue(situation: crate::domain::Situation) -> crate::domain::SituationCue {
-        let fan = situation.iter().map(|(field, _)| (field, 50)).collect();
-        crate::domain::SituationCue::measured(situation, 200, &fan)
+        let fans = situation
+            .iter()
+            .map(|(field, _)| {
+                (
+                    field,
+                    crate::domain::situation::FieldFan {
+                        population: 200,
+                        holding: 50,
+                    },
+                )
+            })
+            .collect();
+        crate::domain::SituationCue::measured(situation, &fans)
             .expect("two hundred entries is a gradeable store")
     }
 

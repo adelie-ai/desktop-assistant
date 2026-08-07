@@ -13,6 +13,8 @@
 //! - `a_cross_tenant_read_of_a_situation_record_returns_nothing`
 //! - `an_entry_cannot_accumulate_situation_values_without_limit`
 //! - `deleting_an_entry_takes_its_situation_rows_with_it`
+//! - `a_reuse_records_its_open_even_when_the_situation_cannot_be_written`
+//! - `a_field_only_some_entries_record_is_measured_against_those_entries`
 //!
 //! ## Running locally
 //!
@@ -26,9 +28,11 @@ mod support;
 
 use std::collections::BTreeMap;
 
+use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::KnowledgeEntry;
+use desktop_assistant_core::domain::situation::SituationCue;
 use desktop_assistant_core::domain::situation::{
-    MAX_SITUATION_VALUES_PER_FIELD, SITUATION_MIN_POPULATION, Situation, SituationField,
+    FieldFan, MAX_SITUATION_VALUES_PER_FIELD, SITUATION_MIN_POPULATION, Situation, SituationField,
     SituationRecord,
 };
 use desktop_assistant_core::ports::knowledge::KnowledgeBaseStore;
@@ -60,14 +64,25 @@ async fn write_as(pool: &PgPool, user: &str, id: &str) {
 /// The situation record the log holds for `id` as `user`.
 async fn situation_of(log: &PgKnowledgeUseLog, user: &str, id: &str) -> Option<SituationRecord> {
     with_user_id(UserId::new(user), async {
-        log.situations(vec![id.to_string()])
+        log.situation_signal(vec![id.to_string()], Situation::new())
             .await
-            .expect("situations read succeeds")
+            .expect("situation read succeeds")
+            .records
     })
     .await
     .into_iter()
     .next()
     .map(|(_, record)| record)
+}
+
+/// The cue the store measures for `situation`, with no candidate ids to read.
+async fn cue_for(
+    log: &PgKnowledgeUseLog,
+    situation: Situation,
+) -> Result<Option<SituationCue>, CoreError> {
+    log.situation_signal(Vec::new(), situation)
+        .await
+        .map(|signal| signal.cue)
 }
 
 /// A situation at `host`, on `weekday`.
@@ -257,7 +272,7 @@ async fn the_cue_counts_the_whole_store_and_not_one_lookups_candidates() {
             .await
             .expect("recorded");
         assert_eq!(
-            log.situation_cue(at("workshop", "thursday"))
+            cue_for(&log, at("workshop", "thursday"))
                 .await
                 .expect("cue read succeeds"),
             None,
@@ -280,7 +295,7 @@ async fn the_cue_counts_the_whole_store_and_not_one_lookups_candidates() {
     }
 
     let cue = with_user_id(UserId::new(ALICE), async {
-        log.situation_cue(at("workshop", "thursday"))
+        cue_for(&log, at("workshop", "thursday"))
             .await
             .expect("cue read succeeds")
     })
@@ -339,9 +354,12 @@ async fn a_value_the_whole_store_shares_is_measured_as_worth_nothing() {
     }
 
     let cue = with_user_id(UserId::new(ALICE), async {
-        log.situation_cue(Situation::new().with(SituationField::Host, "the-only-host"))
-            .await
-            .expect("cue read succeeds")
+        cue_for(
+            &log,
+            Situation::new().with(SituationField::Host, "the-only-host"),
+        )
+        .await
+        .expect("cue read succeeds")
     })
     .await
     .expect("a store this size can grade a cue");
@@ -356,6 +374,114 @@ async fn a_value_the_whole_store_shares_is_measured_as_worth_nothing() {
             "the-only-host"
         )])),
         0.0
+    );
+
+    fx.cleanup().await;
+}
+
+/// The situation of a reuse cannot cost the reuse.
+///
+/// The situation write is a measurement of the open, and this log's rule is that
+/// a measurement must not break what it measures. An unmigrated database is the
+/// blunt version of every way that write can fail - a missing grant, a value the
+/// index refuses - and the open, the counter and the offer take-down must all
+/// survive it.
+#[tokio::test]
+async fn a_reuse_records_its_open_even_when_the_situation_cannot_be_written() {
+    let Some(fx) = fixture().await else { return };
+    let log = PgKnowledgeUseLog::new(fx.pool.clone());
+    write_as(&fx.pool, ALICE, "kb-1").await;
+
+    with_user_id(UserId::new(ALICE), async {
+        log.record_offered(OfferScope::recall(CONV), vec!["kb-1".to_string()])
+            .await
+            .expect("offer recorded");
+    })
+    .await;
+
+    sqlx::query("DROP TABLE knowledge_situation")
+        .execute(&fx.pool)
+        .await
+        .expect("the situation table can be taken away");
+
+    let opened = with_user_id(UserId::new(ALICE), async {
+        log.record_opened(
+            CONV.to_string(),
+            vec!["kb-1".to_string()],
+            at("workshop", "thursday"),
+        )
+        .await
+        .expect("an unwritable situation must not fail the open")
+    })
+    .await;
+
+    assert_eq!(opened, 1, "the open still counts");
+    let opens: i64 = sqlx::query_scalar(
+        "SELECT opened_count FROM knowledge_use_stats WHERE user_id = $1 AND entry_id = $2",
+    )
+    .bind(ALICE)
+    .bind("kb-1")
+    .fetch_one(&fx.pool)
+    .await
+    .expect("the counter row exists");
+    assert_eq!(opens, 1, "the counter moved, so nothing rolled back");
+
+    fx.cleanup().await;
+}
+
+/// The fan of a field is counted over the entries that record that field, not
+/// over the whole store.
+///
+/// Two clients of different reach leave a store where every entry records a
+/// weekday and only some record a host. The one host among the entries that
+/// have one separates nobody, so it must be worth nothing - and it is only
+/// worth nothing if the denominator is the entries that record the field.
+#[tokio::test]
+async fn a_field_only_some_entries_record_is_measured_against_those_entries() {
+    let Some(fx) = fixture().await else { return };
+    let log = PgKnowledgeUseLog::new(fx.pool.clone());
+    let population = SITUATION_MIN_POPULATION as usize + 40;
+
+    for i in 0..population {
+        let id = format!("kb-{i}");
+        write_as(&fx.pool, ALICE, &id).await;
+        // Every entry records a weekday. Only half record a host, and every one
+        // of those records the same host.
+        let mut seen = Situation::new().with(SituationField::Weekday, "thursday");
+        if i % 2 == 0 {
+            seen = seen.with(SituationField::Host, "the-only-host");
+        }
+        with_user_id(UserId::new(ALICE), async {
+            log.record_situation(vec![id.clone()], seen)
+                .await
+                .expect("recorded");
+        })
+        .await;
+    }
+
+    let cue = with_user_id(UserId::new(ALICE), async {
+        cue_for(
+            &log,
+            Situation::new()
+                .with(SituationField::Host, "the-only-host")
+                .with(SituationField::Weekday, "thursday"),
+        )
+        .await
+        .expect("cue read succeeds")
+    })
+    .await
+    .expect("a store this size can grade a cue");
+
+    assert_eq!(
+        cue.information(SituationField::Host),
+        0.0,
+        "the only host among the entries that record one separates nobody, however many \
+         entries record no host at all"
+    );
+    assert_eq!(cue.information(SituationField::Weekday), 0.0);
+    assert!(
+        cue.is_empty(),
+        "a cue of two values the whole store shares must lift nobody"
     );
 
     fx.cleanup().await;
@@ -501,9 +627,12 @@ async fn the_cue_the_store_measures_agrees_with_the_domain_rule() {
     }
 
     let measured = with_user_id(UserId::new(ALICE), async {
-        log.situation_cue(Situation::new().with(SituationField::Host, "workshop"))
-            .await
-            .expect("cue read succeeds")
+        cue_for(
+            &log,
+            Situation::new().with(SituationField::Host, "workshop"),
+        )
+        .await
+        .expect("cue read succeeds")
     })
     .await
     .expect("a store this size can grade a cue");
@@ -511,8 +640,13 @@ async fn the_cue_the_store_measures_agrees_with_the_domain_rule() {
     let at_the_workshop = population.div_ceil(4) as u64;
     let expected = desktop_assistant_core::domain::situation::SituationCue::measured(
         Situation::new().with(SituationField::Host, "workshop"),
-        population as u64,
-        &BTreeMap::from([(SituationField::Host, at_the_workshop)]),
+        &BTreeMap::from([(
+            SituationField::Host,
+            FieldFan {
+                population: population as u64,
+                holding: at_the_workshop,
+            },
+        )]),
     )
     .expect("the same counts grade the same cue");
 

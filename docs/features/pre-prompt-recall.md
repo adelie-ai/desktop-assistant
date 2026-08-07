@@ -349,13 +349,16 @@ day computed in the daemon's zone is a wrong value rather than a missing one, an
 a wrong value costs every entry that recorded the same instant honestly. Adding
 a dimension is a variant on `SituationField` and one arm in `Situation::observe`.
 
-**When it is recorded.** An entry acquires the situation it was written in, and
-adds to it every time it proves useful somewhere new - #238's accumulation rule.
-The reuse write rides the same transaction that decides which ids count as
-opens, so an entry that was not standing offered accumulates nothing, exactly as
-it accrues no open. Neither write touches `knowledge_base`: an entry that had to
-be rewritten to learn where it is useful would restate its own content, move its
-`updated_at`, and put itself back in the embedding backfill queue.
+**When it is recorded.** An entry written by the model inside a turn acquires
+the situation it was written in, and every entry adds to its record each time it
+proves useful somewhere new - #238's accumulation rule. An entry the dream cycle
+extracts has no client context to read, because no client is present when the
+cycle runs, so it carries no situation until the first time it is reused. The
+reuse write runs against the ids the open transaction counted, so an entry that
+was not standing offered accumulates nothing, exactly as it accrues no open.
+Neither write touches `knowledge_base`: an entry that had to be rewritten to
+learn where it is useful would restate its own content, move its `updated_at`,
+and put itself back in the embedding backfill queue.
 
 **Presence is the match, not how often.** The record holds how many times each
 value has been seen, and no ranking rule reads it. The use log already measures
@@ -381,6 +384,14 @@ self-information over the store, `ln(population / fan)`:
   field on which no candidate can match separates nobody. Without that rule, a
   cue value the store has never met would be maximally informative and would
   silence the fields that did match.
+
+**Both counts are per field.** Which fields an observation can read depends on
+the client that made it, so a store's coverage is uneven: a host may sit on a
+third of the entries while the weekday sits on all of them. Divided by one
+store-wide count, the only host in a store would come out informative merely
+because two thirds of the entries record no host at all - the very error the
+weight exists to prevent, displaced from "before or after the feature shipped"
+onto "which client wrote it".
 
 This is Anderson's fan effect, arriving as the definition of the weight rather
 than as a correction bolted onto one.
@@ -417,12 +428,33 @@ largest where the admitted band is narrowest, which is the weakly cued prompt.
 bar admitted, so it permutes the block and cannot change its membership. That is
 what keeps the "and N more entries also matched" hedge true.
 
-**A store too small to measure produces no cue at all.** A fan over a handful of
-entries is noise, and noise in the weight makes the ratio meaningless, so below
-`SITUATION_MIN_POPULATION` entries with records there is no cue and every entry
-ranks the way it ranked before this existed. The same holds for a deployment with
-nothing connected, and for a read that fails or overruns its half-second ceiling
-- the block loses the order, never the lines, and says so once in the journal.
+**A field too thinly recorded to measure is weighted at zero.** A fan over a
+handful of entries is noise, and noise in the weight makes the ratio
+meaningless, so a field recorded on fewer than `SITUATION_MIN_POPULATION`
+entries contributes nothing while the fields beside it keep what they are worth.
+A cue whose every field is below the floor is no cue at all, and every entry
+then ranks the way it ranked before this existed. The same holds for a
+deployment with nothing connected - where the read is skipped rather than run
+and discarded - and for a read that fails or overruns its half-second ceiling,
+where the block loses the order, never the lines, and says so once in the
+journal.
+
+**A value a client chooses never becomes a value the database refuses.** The
+host is self-reported and nothing upstream bounds it, and it becomes part of a
+primary key and a btree index, so it is trimmed, lowercased, stripped of control
+characters and cut to `MAX_SITUATION_VALUE_CHARS` before it is stored - the
+trade a mark's reason already makes. Lowercasing earns its place on its own: one
+machine answering `Workshop` to one client and `workshop` to another would hold
+two values, halve its own fan, and match neither prompt in full.
+
+**Recording the situation of a reuse cannot cost the reuse.** The write runs
+after the transaction that counts the open has committed, in its own
+transaction, and its failure becomes a warning. Inside that transaction an
+unmigrated database or a missing grant would roll back the open and the counter
+with it, taking out the strongest signal in the use log for as long as the cause
+lasted, and saying so only in a log line. What is given up is atomicity between
+the two, which costs nothing: the record is idempotent by key, so the next reuse
+in the same situation records what this one missed.
 
 The rule is `crates/core/src/domain/situation.rs`; the table is
 `knowledge_situation`, created by `047_knowledge_situation.sql` and bounded per

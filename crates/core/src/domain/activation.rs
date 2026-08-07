@@ -271,7 +271,12 @@ impl ActivationWeights {
         if !coverage.is_finite() || coverage <= 0.0 {
             return 0.0;
         }
-        self.situation_lift() * coverage.min(1.0)
+        // `max(0.0)` rather than a bare product, so "never negative" is a
+        // property of this function and not of the weights it happens to be
+        // handed. `use_lift` is a deployment's to state, and a negative one
+        // would otherwise make a matching situation subtract - the opposite of
+        // what every line above claims.
+        self.situation_lift().max(0.0) * coverage.min(1.0)
     }
 }
 

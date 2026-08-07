@@ -54,7 +54,9 @@ use desktop_assistant_core::domain::ScratchpadNote;
 use desktop_assistant_core::domain::knowledge_use::KnowledgeUseRecord;
 use desktop_assistant_core::domain::situation::{SituationCue, SituationRecord};
 use desktop_assistant_core::ports::embedding::{EMBED_TIMEOUT, EmbedFn};
-use desktop_assistant_core::ports::knowledge_use::{KnowledgeUseLog, current_situation};
+use desktop_assistant_core::ports::knowledge_use::{
+    KnowledgeUseLog, SituationSignal, current_situation,
+};
 use desktop_assistant_core::ports::recall::{
     RecallCandidates, RecallDispersion, RecallEntry, RecallNote, RecallRelevance, RecallRequest,
     RecallSearchFn,
@@ -235,11 +237,20 @@ async fn lookup(
                     std::collections::HashMap::new(),
                     None,
                 )
+            } else if here.is_empty() {
+                // Nothing connected, so no cue can be graded and no record can
+                // score against one. The read is skipped rather than run and
+                // discarded: a deployment that reports no client context pays
+                // nothing per turn for a feature it is not using.
+                (
+                    use_records(uses.records(ids)).await,
+                    std::collections::HashMap::new(),
+                    None,
+                )
             } else {
-                let cue_read = uses.situation_cue(here.clone());
                 let (records, (situations, cue)) = tokio::join!(
                     use_records(uses.records(ids.clone())),
-                    situation_signal(uses.situations(ids), cue_read),
+                    situation_signal(uses.situation_signal(ids, here)),
                 );
                 (records, situations, cue)
             };
@@ -350,15 +361,24 @@ async fn use_records(
 /// Generic over the reads, and separate from [`lookup`], so what it guarantees
 /// is provable without a database.
 async fn situation_signal(
-    records: impl Future<Output = Result<Vec<(String, SituationRecord)>, CoreError>>,
-    cue: impl Future<Output = Result<Option<SituationCue>, CoreError>>,
+    read: impl Future<Output = Result<SituationSignal, CoreError>>,
 ) -> (
     std::collections::HashMap<String, SituationRecord>,
     Option<SituationCue>,
 ) {
-    let both = async { tokio::join!(records, cue) };
-    let (records, cue) = match tokio::time::timeout(USE_LOG_READ_CEILING, both).await {
-        Ok(pair) => pair,
+    let signal = match tokio::time::timeout(USE_LOG_READ_CEILING, read).await {
+        Ok(Ok(signal)) => signal,
+        Ok(Err(error)) => {
+            // The error text, not just the fact: an unmigrated database, a
+            // missing grant and an exhausted pool all silence the cue and all
+            // need a different fix. This is a read, so no message it carries can
+            // echo a stored value.
+            tracing::warn!(
+                %error,
+                "recall: the situation could not be read; ranking without the cue"
+            );
+            return (std::collections::HashMap::new(), None);
+        }
         Err(_) => {
             tracing::warn!(
                 timeout = ?USE_LOG_READ_CEILING,
@@ -367,11 +387,7 @@ async fn situation_signal(
             return (std::collections::HashMap::new(), None);
         }
     };
-    let (Ok(records), Ok(cue)) = (records, cue) else {
-        tracing::warn!("recall: the situation could not be read; ranking without the cue");
-        return (std::collections::HashMap::new(), None);
-    };
-    (records.into_iter().collect(), cue)
+    (signal.records.into_iter().collect(), signal.cue)
 }
 
 /// Run the two arms together and fold what they answered into one candidate

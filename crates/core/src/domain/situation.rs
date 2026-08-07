@@ -52,6 +52,14 @@
 //!   of zero is not in its domain - and it is stated rather than clamped,
 //!   because the reasoning is the reasoning and not an edge case.
 //!
+//! **Both counts are per field**, and that is load-bearing rather than tidy -
+//! see [`FieldFan`]. Which fields an observation can read depends on the client
+//! that made it, so a store's coverage is uneven: a host may sit on a third of
+//! the entries while the weekday sits on all of them. Divided by one store-wide
+//! count, the only host in a store would come out informative merely because
+//! two thirds of the entries record no host at all, which is the very error the
+//! weight exists to prevent.
+//!
 //! This is Anderson's fan effect, and it arrives here as the definition of the
 //! weight rather than as a correction bolted onto one.
 //!
@@ -125,18 +133,45 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Datelike, Timelike, Utc};
 
-/// How many entries a store must hold records for before a fan count is read as
-/// information.
+/// How many entries a store must hold records for **on one field** before that
+/// field's fan is read as information.
 ///
 /// A fan measured over a handful of entries is noise, and noise in the weight
 /// makes the ratio meaningless. The same floor, and the same reason, as
 /// [`RECALL_DISPERSION_MIN_ROWS`]: it is a sample-size floor rather than a
 /// coefficient, so it says when a measurement may be believed and never how much
-/// the measurement is worth. Below it there is no cue, and every entry ranks the
+/// the measurement is worth. A field below it is weighted at zero, and a cue
+/// whose every field is below it is no cue at all - every entry then ranks the
 /// way it ranked before this term existed.
+///
+/// **Per field, not per store**, because the fan is per field. Which fields an
+/// observation could read depends on what the client that made it reported, so
+/// two clients give a store uneven coverage: a host may be recorded on a third
+/// of the entries while the weekday is on all of them. Measuring both against
+/// one store-wide count would read the host's absence from two thirds of the
+/// store as evidence that the host is informative, when among the entries that
+/// have one it may separate nobody.
 ///
 /// [`RECALL_DISPERSION_MIN_ROWS`]: crate::ports::recall::RECALL_DISPERSION_MIN_ROWS
 pub const SITUATION_MIN_POPULATION: u64 = 20;
+
+/// How long one situation value may be.
+///
+/// A host arrives from a client's self-reported context and nothing before this
+/// point bounds it. That matters more here than it would in a text column,
+/// because the value is part of a primary key and part of the fan index: a
+/// btree tuple has a hard size limit, so an unbounded value would let a client
+/// choose a value the database refuses to index, and the write carrying it would
+/// fail rather than the value being odd. Cutting rather than refusing is the
+/// trade a mark's reason already makes - an over-long value costs its tail,
+/// never the record.
+///
+/// The figure comes from the longest value a real source produces: a fully
+/// qualified domain name is at most 253 characters and a single label at most
+/// 63, so this holds any host a person would recognise. Counted in characters
+/// and read as bytes it is at most four times this, which leaves the index
+/// tuple an order of magnitude inside what a btree accepts.
+pub const MAX_SITUATION_VALUE_CHARS: usize = 128;
 
 /// How many values one entry may hold for one field.
 ///
@@ -149,6 +184,31 @@ pub const SITUATION_MIN_POPULATION: u64 = 20;
 ///
 /// [`MAX_STANDING_OFFERS`]: crate::ports::knowledge_use::MAX_STANDING_OFFERS
 pub const MAX_SITUATION_VALUES_PER_FIELD: usize = 8;
+
+/// One situation value as it is stored: trimmed, cut to
+/// [`MAX_SITUATION_VALUE_CHARS`], and with anything a text column cannot hold
+/// removed.
+///
+/// `None` where nothing usable is left, which is the same answer as a field with
+/// no source. Two rules, and both exist because the value is a database key
+/// rather than a display string:
+///
+/// - **No NUL byte.** Postgres `text` cannot hold one, so a value carrying one
+///   raises on the wire and takes the whole write with it - the trap
+///   `storable` already guards for an entry id.
+/// - **No newline or control character.** The value is a key a fan is counted
+///   over and a name an operator reads back; a control character makes two
+///   values that look identical count separately.
+fn storable_value(value: &str) -> Option<String> {
+    let cleaned: String = value
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_SITUATION_VALUE_CHARS)
+        .collect();
+    let cleaned = cleaned.trim().to_string();
+    (!cleaned.is_empty()).then_some(cleaned)
+}
 
 /// One dimension of a situation.
 ///
@@ -283,10 +343,9 @@ impl Situation {
     /// that know a value directly - chiefly tests and later sources.
     #[must_use]
     pub fn with(mut self, field: SituationField, value: impl Into<String>) -> Self {
-        let value = value.into();
-        if value.is_empty() {
+        let Some(value) = storable_value(&value.into()) else {
             return self;
-        }
+        };
         self.0.insert(field, value);
         self
     }
@@ -308,7 +367,11 @@ impl Situation {
     pub fn observe(now: DateTime<Utc>, sources: &SituationSources<'_>) -> Self {
         let mut situation = Self::new();
         if let Some(host) = sources.host {
-            situation = situation.with(SituationField::Host, host.trim());
+            // Trimmed and lowercased, because the match is string equality and
+            // the value is self-reported. One machine that answers `Workshop`
+            // to one client and `workshop` to another would otherwise hold two
+            // values, halve its own fan, and match neither prompt fully.
+            situation = situation.with(SituationField::Host, host.to_lowercase());
         }
         let Some(local) = sources.timezone.and_then(|zone| local_time(now, zone)) else {
             return situation;
@@ -355,10 +418,9 @@ impl SituationRecord {
     /// The same record with one more value seen for one field.
     #[must_use]
     pub fn with(mut self, field: SituationField, value: impl Into<String>) -> Self {
-        let value = value.into();
-        if value.is_empty() {
+        let Some(value) = storable_value(&value.into()) else {
             return self;
-        }
+        };
         self.0.entry(field).or_default().insert(value);
         self
     }
@@ -405,6 +467,49 @@ impl SituationRecord {
     }
 }
 
+/// What one store says about one cue value: how far it narrows the field.
+///
+/// Both counts are taken over the entries that record **this field**, never over
+/// the store as a whole, because that is the population the value is drawn
+/// from. `holding / population` is then the probability an entry carries this
+/// value given that it says anything about the field at all, and its logarithm
+/// is the information the value carries. A store-wide denominator would answer a
+/// different question - how many entries record this field - and read a gap in
+/// coverage as evidence.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FieldFan {
+    /// Entries that record any value for this field.
+    pub population: u64,
+    /// How many of those carry the cue's own value. Never more than
+    /// `population`, and zero for a value the store has never seen.
+    pub holding: u64,
+}
+
+impl FieldFan {
+    /// What knowing this value is worth over this field's own population, in
+    /// nats, or zero where it separates nobody or the sample is too small to
+    /// believe.
+    ///
+    /// `ln(population / holding)`. Three populations sit outside the formula and
+    /// all three are worth nothing, for one reason rather than three: a value
+    /// that separates nobody tells nobody anything.
+    ///
+    /// - `holding == population`: every entry that records the field carries it.
+    /// - `holding == 0`: no entry carries it, so no candidate can match on the
+    ///   field and it discriminates among none of them.
+    /// - `population < SITUATION_MIN_POPULATION`: the field is recorded on too
+    ///   few entries for its fan to be a measurement.
+    pub fn information(self) -> f64 {
+        if self.population < SITUATION_MIN_POPULATION
+            || self.holding == 0
+            || self.holding >= self.population
+        {
+            return 0.0;
+        }
+        (self.population as f64 / self.holding as f64).ln().max(0.0)
+    }
+}
+
 /// The present situation, read against one store.
 ///
 /// Carries the cue itself and how much each of its values separates one entry of
@@ -438,17 +543,23 @@ impl SituationCue {
     /// that is not a number.
     pub fn measured(
         situation: Situation,
-        population: u64,
-        fan: &BTreeMap<SituationField, u64>,
+        fans: &BTreeMap<SituationField, FieldFan>,
     ) -> Option<Self> {
-        if situation.is_empty() || population < SITUATION_MIN_POPULATION {
+        if situation.is_empty() {
+            return None;
+        }
+        let measurable = situation.iter().any(|(field, _)| {
+            fans.get(&field)
+                .is_some_and(|fan| fan.population >= SITUATION_MIN_POPULATION)
+        });
+        if !measurable {
             return None;
         }
         let information: BTreeMap<SituationField, f64> = situation
             .iter()
             .map(|(field, _)| {
-                let held = fan.get(&field).copied().unwrap_or(0);
-                (field, self_information(population, held))
+                let fan = fans.get(&field).copied().unwrap_or_default();
+                (field, fan.information())
             })
             .collect();
         Some(Self {
@@ -544,23 +655,6 @@ fn weekday_name(local: chrono::NaiveDateTime) -> &'static str {
     }
 }
 
-/// What knowing one value is worth over a store of `population` entries, in
-/// nats, when `fan` of them carry it.
-///
-/// `ln(population / fan)`, the value's own self-information. Two populations sit
-/// outside the formula and both are worth nothing, for one reason rather than
-/// two: a value that separates nobody tells nobody anything.
-///
-/// - `fan == population`: every entry carries it.
-/// - `fan == 0`: no entry carries it, so no candidate can match on the field and
-///   it discriminates among none of them.
-fn self_information(population: u64, fan: u64) -> f64 {
-    if fan == 0 || fan >= population {
-        return 0.0;
-    }
-    (population as f64 / fan as f64).ln().max(0.0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -573,11 +667,22 @@ mod tests {
             .with_timezone(&Utc)
     }
 
-    /// A store of a hundred entries in which every named value is held by a
-    /// quarter of them, so every field carries the same information and the
-    /// arithmetic below is legible.
-    fn even_fan(fields: &[SituationField]) -> (u64, BTreeMap<SituationField, u64>) {
-        (100, fields.iter().map(|field| (*field, 25)).collect())
+    /// A store in which every named field is recorded on a hundred entries and
+    /// every named value is held by a quarter of them, so each field carries the
+    /// same information and the arithmetic below is legible.
+    fn even_fan(fields: &[SituationField]) -> BTreeMap<SituationField, FieldFan> {
+        fields
+            .iter()
+            .map(|field| {
+                (
+                    *field,
+                    FieldFan {
+                        population: 100,
+                        holding: 25,
+                    },
+                )
+            })
+            .collect()
     }
 
     /// Acceptance (#1125): a situation record is written with every observation,
@@ -642,13 +747,12 @@ mod tests {
     /// credited for what it knows and got wrong.
     #[test]
     fn a_missing_field_neither_matches_nor_penalises() {
-        let (population, fan) = even_fan(&[SituationField::Host, SituationField::TimeOfDay]);
+        let fans = even_fan(&[SituationField::Host, SituationField::TimeOfDay]);
         let cue = SituationCue::measured(
             Situation::new()
                 .with(SituationField::Host, "workshop")
                 .with(SituationField::TimeOfDay, "morning"),
-            population,
-            &fan,
+            &fans,
         )
         .expect("a hundred entries is a gradeable store");
 
@@ -681,11 +785,11 @@ mod tests {
     /// `crate::recall` holds it as the order of a rendered block.
     #[test]
     fn an_entry_written_in_the_recurring_situation_outranks_one_written_elsewhere() {
-        let (population, fan) = even_fan(&[SituationField::Host, SituationField::Weekday]);
+        let fans = even_fan(&[SituationField::Host, SituationField::Weekday]);
         let thursday_at_the_workshop = Situation::new()
             .with(SituationField::Host, "workshop")
             .with(SituationField::Weekday, "thursday");
-        let cue = SituationCue::measured(thursday_at_the_workshop.clone(), population, &fan)
+        let cue = SituationCue::measured(thursday_at_the_workshop.clone(), &fans)
             .expect("a hundred entries is a gradeable store");
 
         let written_here = SituationRecord::from_pairs([
@@ -714,8 +818,7 @@ mod tests {
 
         let narrow = SituationCue::measured(
             Situation::new().with(SituationField::Host, "workshop"),
-            one_field.0,
-            &one_field.1,
+            &one_field,
         )
         .expect("gradeable");
         let wide = SituationCue::measured(
@@ -723,8 +826,7 @@ mod tests {
                 .with(SituationField::Host, "workshop")
                 .with(SituationField::TimeOfDay, "morning")
                 .with(SituationField::Weekday, "thursday"),
-            every_field.0,
-            &every_field.1,
+            &every_field,
         )
         .expect("gradeable");
 
@@ -746,16 +848,12 @@ mod tests {
     /// so nothing this module produces can move a ranking.
     #[test]
     fn with_no_situation_sources_connected_there_is_no_cue() {
-        let (population, fan) = even_fan(&SituationField::ALL);
-        assert_eq!(
-            SituationCue::measured(Situation::new(), population, &fan),
-            None
-        );
+        let fans = even_fan(&SituationField::ALL);
+        assert_eq!(SituationCue::measured(Situation::new(), &fans), None);
         assert_eq!(
             SituationCue::measured(
                 Situation::observe(now(), &SituationSources::default()),
-                population,
-                &fan
+                &fans
             ),
             None
         );
@@ -769,12 +867,16 @@ mod tests {
     /// written before records existed.
     #[test]
     fn a_value_the_whole_store_shares_is_worth_nothing() {
-        let population = 100;
-        let fan = BTreeMap::from([(SituationField::Host, population)]);
+        let fans = BTreeMap::from([(
+            SituationField::Host,
+            FieldFan {
+                population: 100,
+                holding: 100,
+            },
+        )]);
         let cue = SituationCue::measured(
             Situation::new().with(SituationField::Host, "the-only-host"),
-            population,
-            &fan,
+            &fans,
         )
         .expect("gradeable");
 
@@ -785,6 +887,93 @@ mod tests {
         );
     }
 
+    /// A field only some entries record is measured against those entries, not
+    /// against the whole store.
+    ///
+    /// The store has one host, recorded on a third of its entries because the
+    /// rest were written by a client that reported no hostname. Among the
+    /// entries that have a host, that host separates nobody, so it must be
+    /// worth nothing - and it is only worth nothing if the denominator is the
+    /// entries that record the field. Divided by the store-wide count it would
+    /// come out informative, and an entry would then be lifted for matching a
+    /// value no entry could fail to match, which is the exact failure the fan
+    /// weighting exists to prevent.
+    #[test]
+    fn a_field_only_some_entries_record_is_measured_against_those_entries() {
+        let one_host_on_a_third = BTreeMap::from([(
+            SituationField::Host,
+            FieldFan {
+                population: 40,
+                holding: 40,
+            },
+        )]);
+        let cue = SituationCue::measured(
+            Situation::new().with(SituationField::Host, "the-only-host"),
+            &one_host_on_a_third,
+        )
+        .expect("forty entries is a gradeable field");
+
+        assert_eq!(
+            cue.information(SituationField::Host),
+            0.0,
+            "the only host among the entries that record one separates nobody"
+        );
+        assert_eq!(
+            cue.coverage(&SituationRecord::new().with(SituationField::Host, "the-only-host")),
+            0.0
+        );
+    }
+
+    /// A field the store has too few records of is weighted at zero, while the
+    /// fields beside it keep theirs.
+    ///
+    /// Two clients with different reach leave a store where the weekday is on
+    /// every entry and the host is on three. A host measured from three samples
+    /// is noise, and noise weighted at `ln(3)` would swamp a weekday measured
+    /// over hundreds.
+    #[test]
+    fn a_field_measured_over_too_few_entries_is_weighted_at_zero() {
+        let uneven = BTreeMap::from([
+            (
+                SituationField::Host,
+                FieldFan {
+                    population: 3,
+                    holding: 1,
+                },
+            ),
+            (
+                SituationField::Weekday,
+                FieldFan {
+                    population: 700,
+                    holding: 100,
+                },
+            ),
+        ]);
+        let cue = SituationCue::measured(
+            Situation::new()
+                .with(SituationField::Host, "the-boat")
+                .with(SituationField::Weekday, "thursday"),
+            &uneven,
+        )
+        .expect("the weekday is measurable, so the cue is");
+
+        assert_eq!(cue.information(SituationField::Host), 0.0);
+        assert!(cue.information(SituationField::Weekday) > 0.0);
+
+        // So the host neither lifts nor suppresses: an entry that matches only
+        // the weekday scores the same as one that matches both.
+        let weekday_only = SituationRecord::from_pairs([
+            (SituationField::Host, "elsewhere"),
+            (SituationField::Weekday, "thursday"),
+        ]);
+        let both = SituationRecord::from_pairs([
+            (SituationField::Host, "the-boat"),
+            (SituationField::Weekday, "thursday"),
+        ]);
+        assert_eq!(cue.coverage(&weekday_only), cue.coverage(&both));
+        assert_eq!(cue.coverage(&both), 1.0);
+    }
+
     /// The other end of the same rule: a value no entry has been seen with
     /// separates nobody either, so it neither lifts nor suppresses.
     ///
@@ -793,14 +982,27 @@ mod tests {
     /// silencing the fields that did match.
     #[test]
     fn a_value_no_entry_holds_is_worth_nothing_rather_than_everything() {
-        let population = 100;
-        let fan = BTreeMap::from([(SituationField::Host, 25), (SituationField::TimeOfDay, 0)]);
+        let fans = BTreeMap::from([
+            (
+                SituationField::Host,
+                FieldFan {
+                    population: 100,
+                    holding: 25,
+                },
+            ),
+            (
+                SituationField::TimeOfDay,
+                FieldFan {
+                    population: 100,
+                    holding: 0,
+                },
+            ),
+        ]);
         let cue = SituationCue::measured(
             Situation::new()
                 .with(SituationField::Host, "workshop")
                 .with(SituationField::TimeOfDay, "night"),
-            population,
-            &fan,
+            &fans,
         )
         .expect("gradeable");
 
@@ -821,14 +1023,27 @@ mod tests {
     /// weight a measurement rather than a label.
     #[test]
     fn a_rarer_value_carries_more_information_than_a_common_one() {
-        let population = 1_000;
-        let fan = BTreeMap::from([(SituationField::Host, 5), (SituationField::Weekday, 500)]);
+        let fans = BTreeMap::from([
+            (
+                SituationField::Host,
+                FieldFan {
+                    population: 1_000,
+                    holding: 5,
+                },
+            ),
+            (
+                SituationField::Weekday,
+                FieldFan {
+                    population: 1_000,
+                    holding: 500,
+                },
+            ),
+        ]);
         let cue = SituationCue::measured(
             Situation::new()
                 .with(SituationField::Host, "the-boat")
                 .with(SituationField::Weekday, "monday"),
-            population,
-            &fan,
+            &fans,
         )
         .expect("gradeable");
 
@@ -852,24 +1067,33 @@ mod tests {
     #[test]
     fn a_store_below_the_population_floor_produces_no_cue() {
         let situation = Situation::new().with(SituationField::Host, "workshop");
-        let fan = BTreeMap::from([(SituationField::Host, 1)]);
+        let below = BTreeMap::from([(
+            SituationField::Host,
+            FieldFan {
+                population: SITUATION_MIN_POPULATION - 1,
+                holding: 1,
+            },
+        )]);
+        let at_the_floor = BTreeMap::from([(
+            SituationField::Host,
+            FieldFan {
+                population: SITUATION_MIN_POPULATION,
+                holding: 1,
+            },
+        )]);
 
-        assert_eq!(
-            SituationCue::measured(situation.clone(), SITUATION_MIN_POPULATION - 1, &fan),
-            None
-        );
-        assert!(SituationCue::measured(situation, SITUATION_MIN_POPULATION, &fan).is_some());
+        assert_eq!(SituationCue::measured(situation.clone(), &below), None);
+        assert!(SituationCue::measured(situation, &at_the_floor).is_some());
     }
 
     /// An entry with no record scores zero, which is the same as not being
     /// scored at all.
     #[test]
     fn an_entry_with_no_situation_record_scores_zero() {
-        let (population, fan) = even_fan(&SituationField::ALL);
+        let fans = even_fan(&SituationField::ALL);
         let cue = SituationCue::measured(
             Situation::new().with(SituationField::Host, "workshop"),
-            population,
-            &fan,
+            &fans,
         )
         .expect("gradeable");
 
@@ -880,11 +1104,10 @@ mod tests {
     /// what closes the retrieve-record-retrieve loop after one step.
     #[test]
     fn recording_a_situation_the_entry_already_holds_changes_no_score() {
-        let (population, fan) = even_fan(&[SituationField::Host]);
+        let fans = even_fan(&[SituationField::Host]);
         let cue = SituationCue::measured(
             Situation::new().with(SituationField::Host, "workshop"),
-            population,
-            &fan,
+            &fans,
         )
         .expect("gradeable");
 
@@ -901,19 +1124,22 @@ mod tests {
     #[test]
     fn coverage_stays_inside_zero_and_one_over_every_shape_of_store() {
         for population in [SITUATION_MIN_POPULATION, 100, 10_000] {
-            for held in [0, 1, 7, population / 2, population] {
-                let fan = BTreeMap::from([
-                    (SituationField::Host, held),
-                    (SituationField::TimeOfDay, held),
-                    (SituationField::Weekday, held),
+            for holding in [0, 1, 7, population / 2, population] {
+                let fan = FieldFan {
+                    population,
+                    holding,
+                };
+                let fans = BTreeMap::from([
+                    (SituationField::Host, fan),
+                    (SituationField::TimeOfDay, fan),
+                    (SituationField::Weekday, fan),
                 ]);
                 let Some(cue) = SituationCue::measured(
                     Situation::new()
                         .with(SituationField::Host, "workshop")
                         .with(SituationField::TimeOfDay, "morning")
                         .with(SituationField::Weekday, "thursday"),
-                    population,
-                    &fan,
+                    &fans,
                 ) else {
                     continue;
                 };
@@ -930,7 +1156,8 @@ mod tests {
                     let coverage = cue.coverage(&record);
                     assert!(
                         (0.0..=1.0).contains(&coverage),
-                        "population {population}, fan {held} produced a coverage of {coverage}"
+                        "population {population}, holding {holding} produced a coverage of \
+                         {coverage}"
                     );
                 }
             }
@@ -998,6 +1225,65 @@ mod tests {
         assert_eq!(TimeOfDay::at_hour(21), TimeOfDay::Evening);
         assert_eq!(TimeOfDay::at_hour(22), TimeOfDay::Night);
         assert_eq!(TimeOfDay::at_hour(0), TimeOfDay::Night);
+    }
+
+    /// A situation value is bounded and cleaned before it is stored, because a
+    /// client chooses it and the store makes it part of an index key.
+    ///
+    /// A btree tuple has a hard size limit, so an unbounded value would let a
+    /// client pick one the database refuses - and the write carrying it would
+    /// fail rather than the value merely being odd. A NUL byte is worse: a text
+    /// column cannot hold one, so it raises on the wire.
+    #[test]
+    fn a_situation_value_is_bounded_and_cleaned_before_it_is_stored() {
+        let far_too_long = "h".repeat(MAX_SITUATION_VALUE_CHARS * 40);
+        let situation = Situation::new().with(SituationField::Host, &far_too_long);
+        let stored = situation
+            .get(SituationField::Host)
+            .expect("an over-long value is cut, not dropped");
+        assert_eq!(stored.chars().count(), MAX_SITUATION_VALUE_CHARS);
+
+        let hostile = Situation::new().with(SituationField::Host, "work\0shop\nkb-forged");
+        assert_eq!(
+            hostile.get(SituationField::Host),
+            Some("workshopkb-forged"),
+            "a value a text column cannot hold, or that forges a line, is cleaned"
+        );
+
+        // Nothing usable left is the same answer as a field with no source.
+        for nothing in ["", "   ", "\0", "\n\t"] {
+            assert!(
+                Situation::new()
+                    .with(SituationField::Host, nothing)
+                    .is_empty()
+            );
+            assert!(
+                SituationRecord::new()
+                    .with(SituationField::Host, nothing)
+                    .is_empty()
+            );
+        }
+    }
+
+    /// A host matches whatever case the client reported it in.
+    ///
+    /// One machine that answers `Workshop` to one client and `workshop` to
+    /// another would otherwise hold two values, halve its own fan, and match
+    /// neither prompt in full.
+    #[test]
+    fn a_host_is_recorded_in_one_case_whatever_the_client_reported() {
+        let sources = |host| SituationSources {
+            host: Some(host),
+            ..SituationSources::default()
+        };
+        assert_eq!(
+            Situation::observe(now(), &sources("Workshop")),
+            Situation::observe(now(), &sources("  workshop ")),
+        );
+        assert_eq!(
+            Situation::observe(now(), &sources("WORKSHOP")).get(SituationField::Host),
+            Some("workshop")
+        );
     }
 
     /// A field name round-trips, and a name from a later version is skipped

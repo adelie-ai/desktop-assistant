@@ -130,6 +130,21 @@ pub struct MarkRequest {
     pub reason: Option<String>,
 }
 
+/// What the situation says about one recall lookup (#1125).
+///
+/// Two answers to one question, read together because they are only meaningful
+/// together: a record nothing can grade scores zero, and a cue nothing carries a
+/// record for scores zero as well.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SituationSignal {
+    /// The situations each candidate has been seen in, by entry id. An id the
+    /// table holds nothing for is absent.
+    pub records: Vec<(String, SituationRecord)>,
+    /// The present situation read against the whole store, or `None` where the
+    /// store cannot grade it.
+    pub cue: Option<SituationCue>,
+}
+
 /// The knowledge use log: what was offered, what was opened, what was marked.
 ///
 /// Every method is scoped to the current user through
@@ -183,29 +198,31 @@ pub trait KnowledgeUseLog: Send + Sync {
         situation: Situation,
     ) -> impl Future<Output = Result<usize, CoreError>> + Send;
 
-    /// The situations each of `entry_ids` has been seen in.
+    /// Everything one lookup needs of the situation: what each candidate has
+    /// been seen in, and what the present situation is worth over this store.
     ///
-    /// Ids with no record are absent from the answer rather than returned
-    /// empty, on the same terms as [`Self::records`].
-    fn situations(
+    /// **One call rather than two, because it is one connection rather than
+    /// two.** This read sits on the pre-prompt recall path, which already runs
+    /// the pad arm and the use-log read at the same time, and the default
+    /// connection pool holds five. Two more concurrent reads per turn would let
+    /// one turn hold the whole pool, and a second turn would then wait on
+    /// acquisition - which no statement timeout bounds. The two halves also
+    /// describe one instant this way, so a fan can never be counted against a
+    /// population that has already moved.
+    ///
+    /// Ids with no record are absent from [`SituationSignal::records`] rather
+    /// than returned empty, on the same terms as [`Self::records`]. The cue is
+    /// `None` where the store cannot grade one - see [`SituationCue::measured`] -
+    /// and the caller then ranks the way it ranked before the cue existed.
+    ///
+    /// The cue is measured over the source and never over one lookup's
+    /// candidates, for the reason [`crate::ports::recall::RecallDispersion`]
+    /// states.
+    fn situation_signal(
         &self,
         entry_ids: Vec<String>,
-    ) -> impl Future<Output = Result<Vec<(String, SituationRecord)>, CoreError>> + Send;
-
-    /// Read `situation` against the whole store, so the core can grade it.
-    ///
-    /// Counts how many entries carry any situation record, and how many carry
-    /// each of the cue's own values, then answers the
-    /// [`SituationCue`] those two make. `None` where the store cannot grade the
-    /// cue - see [`SituationCue::measured`] - and the caller then ranks the way
-    /// it ranked before the cue existed.
-    ///
-    /// Measured over the source and never over one lookup's candidates, for the
-    /// reason [`crate::ports::recall::RecallDispersion`] states.
-    fn situation_cue(
-        &self,
         situation: Situation,
-    ) -> impl Future<Output = Result<Option<SituationCue>, CoreError>> + Send;
+    ) -> impl Future<Output = Result<SituationSignal, CoreError>> + Send;
 
     /// Set the standing mark for `request.source` on each owned entry named,
     /// and report the ids that were marked.
