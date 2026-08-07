@@ -1393,6 +1393,14 @@ async fn main() -> Result<()> {
         ))
     });
 
+    // The skill use log (#1154): which skills the `[Recall]` block offered, and
+    // which of those the model went on to read. Its own tables rather than the
+    // knowledge log's, whose foreign key to `knowledge_base(id)` a skill has no
+    // row for.
+    let skill_use_log = pg_pool
+        .as_ref()
+        .map(|pool| Arc::new(desktop_assistant_storage::PgSkillUseLog::new(pool.clone())));
+
     // Index on-disk skills at startup (#573): scan the configured roots and
     // reconcile each scope against the catalog (#639) -- skills accrete, and one
     // a scan no longer sees is marked absent rather than deleted. Capability-off
@@ -1662,6 +1670,20 @@ async fn main() -> Result<()> {
             let log = Arc::clone(&situated);
             Box::pin(async move { log.record_situation(ids, situation).await })
         }));
+    }
+
+    // The skill use log behind `builtin_skill_get` (#1154): a read by name
+    // records the offer the `[Recall]` block made, where one is standing. The
+    // offer half is written by the turn itself, not here - see the handler's
+    // `with_skill_offer_log`.
+    if let Some(log) = &skill_use_log {
+        use desktop_assistant_core::ports::skill_use::SkillUseLog;
+        let opened = Arc::clone(log);
+        builtin_tools =
+            builtin_tools.with_skill_open_log(Arc::new(move |conversation_id, names| {
+                let log = Arc::clone(&opened);
+                Box::pin(async move { log.record_opened(conversation_id, names).await })
+            }));
     }
 
     // Desktop notifications (builtin_notify). Capability-gated: only wired when
@@ -2881,6 +2903,17 @@ async fn main() -> Result<()> {
             Box::pin(async move { log.record_offered(scope, ids).await })
         }));
     }
+    // #1154: the same for the skills the block offered, against the skill use
+    // log. Gated on a database only, like the knowledge one above: a deployment
+    // with no skill catalog simply has no skill names to record.
+    if let Some(log) = &skill_use_log {
+        use desktop_assistant_core::ports::skill_use::SkillUseLog;
+        let log = Arc::clone(log);
+        handler = handler.with_skill_offer_log(Arc::new(move |scope, names| {
+            let log = Arc::clone(&log);
+            Box::pin(async move { log.record_offered(scope, names).await })
+        }));
+    }
     if let Some(release_fn) = scratchpad_release_references_fn {
         handler = handler.with_scratchpad_release_references(release_fn);
     }
@@ -2947,14 +2980,20 @@ async fn main() -> Result<()> {
                 }
                 None => desktop_assistant_core::recall::max_recall_entries(),
             };
+            // The skill arm (#1154) is wired only where a skill catalog exists.
+            // Absent, the block renders its other arms and nothing says a
+            // procedure might fit - the same absence as a catalog holding
+            // nothing near the prompt.
             handler = handler.with_recall_search(recall::build_recall_search(
                 Arc::clone(kb),
+                skill_index_store.clone(),
                 pool.clone(),
                 Arc::clone(embed),
                 embedding_model_id.clone(),
             ));
             tracing::info!(
                 entry_lines,
+                skills = skill_index_store.is_some(),
                 "pre-prompt recall wired: prompts are looked up against memory"
             );
         }

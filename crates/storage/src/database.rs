@@ -120,6 +120,11 @@ const PERSONAL_DATA_TABLES: &[&str] = &[
     // name and the hours somebody works are personal data in their own right,
     // before any entry is read.
     "knowledge_situation",
+    // 048 — the skill use log. Both tables key on (user_id, skill_name) and
+    // hold which procedures one person's assistant was offered and which it
+    // took up, which says as much about the person as the skills do.
+    "skill_use_stats",
+    "skill_offers",
 ];
 
 /// The canonical set of personal-data tables (see `PERSONAL_DATA_TABLES`).

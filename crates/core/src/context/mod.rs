@@ -296,6 +296,10 @@ pub(crate) struct AssembledTurn {
     /// showed: it applies the floor, the width, and every "already in view"
     /// drop. The use log (#698) records these as offered.
     pub recalled_entry_ids: Vec<String>,
+    /// The skills the `[Recall]` block put in front of the model, by name, in
+    /// the order it rendered them (#1154). Reported for the same reason, and
+    /// recorded against the skill use log rather than the knowledge one.
+    pub recalled_skill_names: Vec<String>,
 }
 
 /// Build the message list for a single turn, optionally enforcing a
@@ -352,6 +356,7 @@ pub(crate) fn assemble_turn_within_budget(
         messages: pass.messages,
         window_from: window_start(conversation.messages, max),
         recalled_entry_ids: pass.recalled_entry_ids,
+        recalled_skill_names: pass.recalled_skill_names,
     };
 
     let mut current_max = max_messages;
@@ -922,6 +927,7 @@ fn assemble_turn(
     TurnMessages {
         messages,
         recalled_entry_ids: surfaced.recalled_entry_ids,
+        recalled_skill_names: surfaced.recalled_skill_names,
     }
 }
 
@@ -934,6 +940,8 @@ struct TurnMessages {
     messages: Vec<Message>,
     /// See [`AssembledTurn::recalled_entry_ids`].
     recalled_entry_ids: Vec<String>,
+    /// See [`AssembledTurn::recalled_skill_names`].
+    recalled_skill_names: Vec<String>,
 }
 
 /// Build the turn's system-instruction string: the assembled prompt sections
@@ -993,6 +1001,8 @@ struct SurfacedBlocks {
     blocks: Vec<Message>,
     /// See [`AssembledTurn::recalled_entry_ids`].
     recalled_entry_ids: Vec<String>,
+    /// See [`AssembledTurn::recalled_skill_names`].
+    recalled_skill_names: Vec<String>,
 }
 
 /// Build the per-turn `[..]` system messages that re-surface durable context so
@@ -1034,6 +1044,7 @@ fn surfaced_blocks(
 ) -> SurfacedBlocks {
     let mut blocks = Vec::new();
     let mut recalled_entry_ids = Vec::new();
+    let mut recalled_skill_names = Vec::new();
 
     // Ambient "now": a tiny, always-present line giving the assistant a sense of
     // the current date/time without spending a `builtin_sys_props` tool round.
@@ -1161,12 +1172,14 @@ fn surfaced_blocks(
                 format!("[Recall] {}", recall.text),
             ));
             recalled_entry_ids = recall.entry_ids;
+            recalled_skill_names = recall.skill_names;
         }
     }
 
     SurfacedBlocks {
         blocks,
         recalled_entry_ids,
+        recalled_skill_names,
     }
 }
 
@@ -4137,6 +4150,7 @@ mod tests {
             candidates,
             crate::recall::RECALL_ENTRY_SCAN_LIMIT,
             crate::recall::RECALL_NOTE_SCAN_LIMIT,
+            crate::recall::RECALL_SKILL_SCAN_LIMIT,
             chrono::Utc::now(),
         )
         .already_in_view(indexed_keys, planned_keys, &[])

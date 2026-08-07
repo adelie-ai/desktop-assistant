@@ -220,6 +220,10 @@ const MIGRATIONS: &[Migration] = &[
     // and where it has proved useful -- so a recurring situation can reach it
     // again. One row per (entry, field, value), bounded per entry by the writer.
     migration!("047_knowledge_situation.sql"),
+    // #1154: the skill use log -- which skills the `[Recall]` block offered and
+    // which of those the model opened. Its own tables rather than migration
+    // 044's, whose foreign key to `knowledge_base(id)` a skill has no row for.
+    migration!("048_skill_use_log.sql"),
 ];
 
 /// Second half of the advisory-lock key: the schema the migrations write to.

@@ -1,11 +1,11 @@
-//! Pre-prompt recall port (#1100, #1101): the lookup behind the `[Recall]`
-//! block.
+//! Pre-prompt recall port (#1100, #1101, #1154): the lookup behind the
+//! `[Recall]` block.
 //!
-//! When a user prompt lands, the daemon embeds it once and asks the two indexes
-//! that share that embedding space - the knowledge base and this conversation's
-//! scratchpad - what is near it. The answer travels back through this port as
-//! candidates, and [`crate::recall`] decides which of them clear the bar and how
-//! they render.
+//! When a user prompt lands, the daemon embeds it once and asks every index
+//! that shares that embedding space - the knowledge base, this conversation's
+//! scratchpad, and the skill catalog - what is near it. The answer travels back
+//! through this port as candidates, and [`crate::recall`] decides which of them
+//! clear the bar and how they render.
 //!
 //! ## Why the bar is not applied here
 //!
@@ -17,7 +17,7 @@
 //!
 //! ## What the adapter owes this port
 //!
-//! - **Best match first.** Both lists arrive ordered, nearest first. That order
+//! - **Best match first.** Every list arrives ordered, nearest first. That order
 //!   is what the bar rests on - it drops a suffix only because a nearer row is
 //!   never further down the list - and it is what a list of lexical matches is
 //!   ranked by, because such a row carries no distance to score. The core
@@ -44,6 +44,13 @@
 //!   `WHERE user_id` predicate. The scratchpad arm carries a `conversation_id`
 //!   predicate beside it: the pad is per-conversation by design, and reaching
 //!   across conversations is a different feature with its own privacy question.
+//!   The skill arm reads a host-global catalog, so its scope predicate is the
+//!   catalog's own: the global skills, plus this user's.
+//! - **Only a skill a person approved** (#1154, #1155). Approval is consent -
+//!   whether somebody agreed the procedure may be followed - and it is a
+//!   separate axis from provenance. The adapter applies it, so an unapproved
+//!   skill reaches neither the candidates nor the spread they are read against;
+//!   [`RecallSkill`] says why that is an exclusion rather than a mark.
 //! - **No failure reaches the turn.** An adapter that cannot answer returns an
 //!   error, and the caller drops the block and proceeds.
 
@@ -53,6 +60,7 @@ use std::sync::Arc;
 
 use crate::CoreError;
 use crate::domain::KnowledgeEntry;
+use crate::domain::activation::NO_SITUATION;
 use crate::domain::knowledge_use::KnowledgeUseRecord;
 use crate::domain::situation::{SituationCue, SituationRecord};
 
@@ -273,6 +281,131 @@ impl RecallEntry {
     }
 }
 
+impl Activatable for RecallEntry {
+    fn relevance(&self) -> RecallRelevance {
+        self.relevance
+    }
+
+    fn use_record(&self) -> Option<&KnowledgeUseRecord> {
+        self.use_record.as_ref()
+    }
+
+    fn situation_coverage(&self, cue: Option<&SituationCue>) -> f64 {
+        cue.map_or(NO_SITUATION, |cue| cue.coverage(&self.situation))
+    }
+}
+
+/// One skill offered as a recall candidate (#1154): procedural memory, cued by
+/// the prompt rather than searched for.
+///
+/// **The body never travels.** A skill body is a whole playbook, and the block's
+/// economy is that recognition costs less than recall - a line says a procedure
+/// exists, and the model reads it only if it decides to. So the candidate
+/// carries the name it can be fetched by and the one line that says what it is
+/// for, and nothing else of what it holds.
+///
+/// **An unapproved skill is never a candidate.** Approval (#1155) records that
+/// a person agreed the procedure may be followed, and nothing in the system
+/// will hand its body over until they have: `builtin_skill_get` refuses one by
+/// name. A line offering it is therefore a line the model can only fail on, and
+/// it would accrue an offer every turn it ranked near a prompt and never an
+/// open - the profile ranking reads as the cleanest evidence to retire an entry.
+/// The exclusion is the adapter's, so the spread the arm is read against is the
+/// spread of the followable catalog.
+#[derive(Debug, Clone)]
+pub struct RecallSkill {
+    /// The catalog name, which is also the handle the skill is fetched by.
+    pub name: String,
+    /// The skill's own "when to use" line, as its frontmatter states it.
+    pub description: String,
+    /// Whether the skill's files were on disk at the last scan of its scope.
+    ///
+    /// `false` does **not** make the skill unusable, which is why it is marked
+    /// on the line rather than excluded from the arm: the catalog is cumulative
+    /// (#639), the body still reads, and the procedure is still good. What is
+    /// gone is `disk_path` and the attachments, so the skill's bundled scripts
+    /// cannot be run.
+    pub present_on_disk: bool,
+    pub relevance: RecallRelevance,
+    /// What the use log knows about this skill (#1154), on the same terms as
+    /// [`RecallEntry::use_record`]: the reinforcement half of its activation.
+    pub use_record: Option<KnowledgeUseRecord>,
+}
+
+impl RecallSkill {
+    /// A candidate the use log has nothing to say about.
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        present_on_disk: bool,
+        relevance: RecallRelevance,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            present_on_disk,
+            relevance,
+            use_record: None,
+        }
+    }
+
+    /// The same candidate, carrying what the log knows about it.
+    pub fn with_use_record(mut self, record: Option<KnowledgeUseRecord>) -> Self {
+        self.use_record = record;
+        self
+    }
+}
+
+impl Activatable for RecallSkill {
+    fn relevance(&self) -> RecallRelevance {
+        self.relevance
+    }
+
+    fn use_record(&self) -> Option<&KnowledgeUseRecord> {
+        self.use_record.as_ref()
+    }
+
+    /// A skill records no situation yet (#1154). `knowledge_situation` is keyed
+    /// on a knowledge entry, and nothing writes a row for a skill, so the term
+    /// has nothing to read and contributes exactly zero - which is how every
+    /// candidate scored before #1125 existed.
+    ///
+    /// This is the arm's largest known gap rather than a settled answer. A
+    /// procedure is more situational than a fact, not less: "deploy this" is a
+    /// weak query and a strong situation, which is the whole reason this arm
+    /// exists. Giving a skill a situation record is what would let the cue
+    /// reach it.
+    fn situation_coverage(&self, _cue: Option<&SituationCue>) -> f64 {
+        NO_SITUATION
+    }
+}
+
+/// What a candidate contributes to its activation score
+/// ([`crate::domain::activation`]).
+///
+/// One ranking rule, read through one trait, so the knowledge arm and the skill
+/// arm cannot drift apart. Both hold the same two signals - how far the
+/// candidate stands out of its own source, and what the use log knows about it -
+/// and the block orders each arm by the same function of them.
+pub trait Activatable {
+    /// How near this candidate is to the prompt, and in which sense.
+    fn relevance(&self) -> RecallRelevance;
+    /// What the use log knows about it, where anything does.
+    fn use_record(&self) -> Option<&KnowledgeUseRecord>;
+    /// How much of what the present situation could have said about this
+    /// candidate it did say (#1125), or
+    /// [`NO_SITUATION`] where there is
+    /// nothing to read.
+    ///
+    /// A source answers `NO_SITUATION` where it keeps no situation record of
+    /// its own, and the term then contributes exactly zero - the same answer a
+    /// knowledge entry gets when no cue was measured. That is a statement about
+    /// what is recorded, not a judgement that the situation does not matter
+    /// here: a procedure is if anything more situational than a fact, which is
+    /// why #1154 reads #1125 rather than duplicating it.
+    fn situation_coverage(&self, cue: Option<&SituationCue>) -> f64;
+}
+
 /// One scratchpad note offered as a recall candidate (#1101).
 ///
 /// The note itself travels, not a pre-rendered line, because how much of a note
@@ -309,6 +442,8 @@ pub struct RecallRequest {
     pub entry_limit: usize,
     /// Ceiling on scratchpad rows read.
     pub note_limit: usize,
+    /// Ceiling on skill catalog rows read.
+    pub skill_limit: usize,
 }
 
 /// What one recall lookup found, each list nearest-first, and how spread out
@@ -322,6 +457,8 @@ pub struct RecallRequest {
 pub struct RecallCandidates {
     pub entries: Vec<RecallEntry>,
     pub notes: Vec<RecallNote>,
+    /// The skills nearest the prompt, nearest first (#1154).
+    pub skills: Vec<RecallSkill>,
     /// The knowledge source's own dispersion, measured over the whole source.
     /// `None` where the adapter could not measure one, which leaves the block on
     /// its stated estimate.
@@ -339,6 +476,16 @@ pub struct RecallCandidates {
     /// failed - and every entry then ranks the way it ranked before the cue
     /// existed.
     pub situation_cue: Option<SituationCue>,
+    /// The skill catalog's own dispersion, on the same terms.
+    ///
+    /// Its own, and never the knowledge arm's. A skill row embeds a name, a
+    /// short "when to use" line and a playbook body, and a knowledge row embeds
+    /// a fact - so the two sources put their distances in different places, and
+    /// a bar read against one says nothing about the other. That is the rule
+    /// [`RecallDispersion`] exists for, and the skill catalog is the case that
+    /// makes it visible: it is small, and its rows are shaped unlike anything
+    /// else the block reads.
+    pub skill_dispersion: Option<RecallDispersion>,
 }
 
 /// Boxed async closure that runs one recall lookup.

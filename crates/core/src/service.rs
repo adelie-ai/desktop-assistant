@@ -33,6 +33,7 @@ use crate::ports::scratchpad_scope::{
     current_scratchpad_scope, with_pending_child_scope,
 };
 use crate::ports::skill_index::{SkillGetFn, SkillSearchFn, SkillWriteAuthoredFn};
+use crate::ports::skill_use::SkillOfferedFn;
 use crate::ports::store::ConversationStore;
 use crate::ports::tool_observer::{ToolEvent, notify_tool_event};
 use crate::ports::tools::ToolExecutor;
@@ -539,6 +540,10 @@ pub struct ConversationHandler<S, L, T = NoopToolExecutor> {
     /// Optional use-log write for what the `[Recall]` block offered (#698).
     /// `None` - no database, and the turn records nothing.
     knowledge_offered: Option<KnowledgeOfferedFn>,
+    /// The same, for the skills the `[Recall]` block offered (#1154). Its own
+    /// slot rather than the one above, because a skill is keyed by name in its
+    /// own log - see [`crate::ports::skill_use`].
+    skill_offered: Option<SkillOfferedFn>,
     /// Maximum byte length a single tool result may occupy before it is
     /// truncated at ingestion (issue #174). Defaults to
     /// [`DEFAULT_MAX_TOOL_RESULT_BYTES`]; override via
@@ -598,6 +603,7 @@ impl<S, L> ConversationHandler<S, L, NoopToolExecutor> {
             descendant_task_probe: None,
             recall_search: None,
             knowledge_offered: None,
+            skill_offered: None,
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             host: DEFAULT_HOST_LABEL.to_string(),
             on_workstation: true,
@@ -650,6 +656,7 @@ struct RecallLookup {
     candidates: crate::ports::recall::RecallCandidates,
     entry_scan_limit: usize,
     note_scan_limit: usize,
+    skill_scan_limit: usize,
     /// When the lookup answered, and so the instant every use record it carries
     /// is a statement about (#1123). Captured once here rather than read again
     /// at render time, because the block renders on every round of the turn and
@@ -712,6 +719,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             descendant_task_probe: None,
             recall_search: None,
             knowledge_offered: None,
+            skill_offered: None,
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             host: DEFAULT_HOST_LABEL.to_string(),
             on_workstation: true,
@@ -859,6 +867,18 @@ impl<S, L, T> ConversationHandler<S, L, T> {
     /// existed and nothing is recorded.
     pub fn with_knowledge_offer_log(mut self, offered: KnowledgeOfferedFn) -> Self {
         self.knowledge_offered = Some(offered);
+        self
+    }
+
+    /// Wire the skill use log's record of what the `[Recall]` block offered
+    /// (#1154).
+    ///
+    /// Separate from [`Self::with_knowledge_offer_log`] because the two write
+    /// to different tables under different keys, and either may be present
+    /// without the other: a deployment with no skill catalog has knowledge
+    /// offers to record and no skill offers.
+    pub fn with_skill_offer_log(mut self, offered: SkillOfferedFn) -> Self {
+        self.skill_offered = Some(offered);
         self
     }
 
@@ -1728,9 +1748,11 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             conversation_id: conversation_id.0.clone(),
             entry_limit: crate::recall::RECALL_ENTRY_SCAN_LIMIT,
             note_limit: crate::recall::RECALL_NOTE_SCAN_LIMIT,
+            skill_limit: crate::recall::RECALL_SKILL_SCAN_LIMIT,
         };
         let entry_scan_limit = request.entry_limit;
         let note_scan_limit = request.note_limit;
+        let skill_scan_limit = request.skill_limit;
         match lookup(request).await {
             // Read after the lookup, not before it: the lookup may spend its
             // whole ceiling, and what the use records are a statement about is
@@ -1739,6 +1761,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
                 candidates,
                 entry_scan_limit,
                 note_scan_limit,
+                skill_scan_limit,
                 looked_up_at: chrono::Utc::now(),
             }),
             Err(e) => {
@@ -2497,6 +2520,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                     &found.candidates,
                     found.entry_scan_limit,
                     found.note_scan_limit,
+                    found.skill_scan_limit,
                     found.looked_up_at,
                 )
                 .already_in_view(
@@ -2607,6 +2631,21 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                     "recall_offered",
                     async move { record(scope, offered).await },
                 );
+            }
+            // The same for the skills the block offered (#1154), against the
+            // skill use log. An empty list on the first round is recorded for
+            // the same reason it is above: the write is what ends the previous
+            // turn's standing skill offers, so an open on a later turn cannot
+            // be credited to a block that no longer names the skill.
+            if tool_rounds_since_anchor == 0
+                && let Some(record) = &self.skill_offered
+            {
+                let record = Arc::clone(record);
+                let scope = OfferScope::recall(conversation_id.0.clone());
+                let offered = assembled.recalled_skill_names;
+                record_in_background("recall_skills_offered", async move {
+                    record(scope, offered).await
+                });
             }
             let llm_messages = assembled.messages;
             // Incremental sanitizer: carries think-block parser state across

@@ -31,6 +31,7 @@ use desktop_assistant_core::ports::scratchpad::{
     ScratchpadWriteFn, plan_pin,
 };
 use desktop_assistant_core::ports::skill_index::{SkillGetFn, SkillSearchFn};
+use desktop_assistant_core::ports::skill_use::SkillOpenedFn;
 use desktop_assistant_core::ports::tool_registry::{ToolDefinitionFn, ToolSearchFn};
 use desktop_assistant_core::ports::transport::{
     current_client_context, current_client_label, current_co_location, current_transport_kind,
@@ -360,6 +361,7 @@ pub struct BuiltinToolService {
     kb_opened_fn: Option<KnowledgeOpenedFn>,
     kb_situation_fn: Option<KnowledgeSituationFn>,
     kb_mark_fn: Option<KnowledgeMarkFn>,
+    skill_opened_fn: Option<SkillOpenedFn>,
     tool_search_fn: Option<ToolSearchFn>,
     #[allow(dead_code)]
     tool_definition_fn: Option<ToolDefinitionFn>,
@@ -407,6 +409,7 @@ impl BuiltinToolService {
             kb_opened_fn: None,
             kb_situation_fn: None,
             kb_mark_fn: None,
+            skill_opened_fn: None,
             tool_search_fn: None,
             tool_definition_fn: None,
             db_query_fn: None,
@@ -534,6 +537,23 @@ impl BuiltinToolService {
     /// entry acquires its first situation the next time it is reused.
     pub fn with_knowledge_situation(mut self, situation_fn: KnowledgeSituationFn) -> Self {
         self.kb_situation_fn = Some(situation_fn);
+        self
+    }
+
+    /// Wire the skill use log's record of an open (#1154), so a skill the
+    /// `[Recall]` block offered and the model then read is recorded as taken
+    /// up.
+    ///
+    /// Only the open half. Nothing here offers a skill:
+    /// `builtin_skill_search` is free recall - the model already knew to look -
+    /// and the block is what makes the offer this measures. Recording a search
+    /// hit as an offer would credit the block for a skill the model found on
+    /// its own.
+    ///
+    /// Capability-gated, like every other closure here. Without it
+    /// `builtin_skill_get` behaves exactly as it did before the log existed.
+    pub fn with_skill_open_log(mut self, opened_fn: SkillOpenedFn) -> Self {
+        self.skill_opened_fn = Some(opened_fn);
         self
     }
 
@@ -2053,20 +2073,27 @@ impl BuiltinToolService {
         }
 
         match found {
-            Some(s) => Ok(serde_json::json!({
-                "ok": true,
-                "name": s.name,
-                "description": s.description,
-                "kind": s.kind.as_str(),
-                "trust_tier": s.trust_tier.as_str(),
-                "disk_path": s.disk_path,
-                "attachments": s.attachments,
-                "present_on_disk": s.present_on_disk,
-                "last_seen_at": s.last_seen_at.map(|ts| ts.to_rfc3339()),
-                "tags": s.tags,
-                "body": s.body,
-            })
-            .to_string()),
+            Some(s) => {
+                // The body is going back, so this read is a real open (#1154).
+                // Recorded here and not above the approval check: a refusal
+                // hands over nothing, and counting it would make an
+                // unfollowable skill look taken up.
+                self.record_skill_open(s.name.clone());
+                Ok(serde_json::json!({
+                    "ok": true,
+                    "name": s.name,
+                    "description": s.description,
+                    "kind": s.kind.as_str(),
+                    "trust_tier": s.trust_tier.as_str(),
+                    "disk_path": s.disk_path,
+                    "attachments": s.attachments,
+                    "present_on_disk": s.present_on_disk,
+                    "last_seen_at": s.last_seen_at.map(|ts| ts.to_rfc3339()),
+                    "tags": s.tags,
+                    "body": s.body,
+                })
+                .to_string())
+            }
             None => Ok(
                 serde_json::json!({ "ok": false, "reason": format!("no skill named {name}") })
                     .to_string(),
@@ -2280,6 +2307,25 @@ impl BuiltinToolService {
         let situation = current_situation();
         record_in_background("get_opened", async move {
             record(conversation_id, entry_ids, situation).await
+        });
+    }
+
+    /// Record that the skill named `name` was read by id (#1154).
+    ///
+    /// Only a name standing offered in this conversation becomes an open, and
+    /// the log applies that rule - so a skill the model found through
+    /// `builtin_skill_search` and read is not credited to the `[Recall]` block.
+    /// Off the tool's path and never fatal, for the reason
+    /// [`Self::record_open`] is.
+    fn record_skill_open(&self, name: String) {
+        let (Some(record), Some(conversation)) = (&self.skill_opened_fn, current_conversation_id())
+        else {
+            return;
+        };
+        let record = Arc::clone(record);
+        let conversation_id = conversation.0;
+        record_in_background("skill_get_opened", async move {
+            record(conversation_id, vec![name]).await
         });
     }
 
