@@ -73,7 +73,9 @@ The project follows a ports-and-adapters (hexagonal) layout:
 2. D-Bus adapter forwards to core service
 3. Core looks the prompt up against memory and surfaces the candidates as a
    `[Recall]` block on the turn's first round - see
-   [pre-prompt recall](features/pre-prompt-recall.md)
+   [pre-prompt recall](features/pre-prompt-recall.md). What that block offered,
+   and what the model then opened or marked, is recorded in the
+   [knowledge use log](features/knowledge-use-log.md)
 4. Core requests LLM streaming completion
 5. If tool calls are requested, core checks each one against the caller's tool
    allowlist and the turn's provenance gate, then executes the permitted ones

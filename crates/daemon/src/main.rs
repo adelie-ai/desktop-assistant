@@ -1357,6 +1357,16 @@ async fn main() -> Result<()> {
         ))
     });
 
+    // The knowledge use log (#698): what a knowledge entry was offered for,
+    // what was opened, and what was marked. Present whenever the knowledge base
+    // is, because the two share a pool and the log is only ever written about
+    // entries the knowledge base holds.
+    let kb_use_log = pg_pool.as_ref().map(|pool| {
+        Arc::new(desktop_assistant_storage::PgKnowledgeUseLog::new(
+            pool.clone(),
+        ))
+    });
+
     let tool_registry_store = pg_pool.as_ref().map(|pool| {
         Arc::new(desktop_assistant_storage::PgToolRegistryStore::new(
             pool.clone(),
@@ -1606,6 +1616,30 @@ async fn main() -> Result<()> {
             let store = Arc::clone(&kb_gm);
             Box::pin(async move { store.get_many(&ids).await })
         }));
+    }
+
+    // The use log behind the knowledge tools (#698): a search records what it
+    // put in front of the model, a read by id records the offers it takes up,
+    // and `builtin_knowledge_base_mark` records a judgement.
+    if let Some(log) = &kb_use_log {
+        use desktop_assistant_core::ports::knowledge_use::KnowledgeUseLog;
+        let offered = Arc::clone(log);
+        let opened = Arc::clone(log);
+        let marked = Arc::clone(log);
+        builtin_tools = builtin_tools.with_knowledge_use_log(
+            Arc::new(move |scope, ids| {
+                let log = Arc::clone(&offered);
+                Box::pin(async move { log.record_offered(scope, ids).await })
+            }),
+            Arc::new(move |conversation_id, ids| {
+                let log = Arc::clone(&opened);
+                Box::pin(async move { log.record_opened(conversation_id, ids).await })
+            }),
+            Arc::new(move |request| {
+                let log = Arc::clone(&marked);
+                Box::pin(async move { log.record_mark(request).await })
+            }),
+        );
     }
 
     // Desktop notifications (builtin_notify). Capability-gated: only wired when
@@ -2779,6 +2813,19 @@ async fn main() -> Result<()> {
         handler = handler.with_knowledge_get_many(Arc::new(move |ids: Vec<String>| {
             let store = Arc::clone(&kb_gm);
             Box::pin(async move { store.get_many(&ids).await })
+        }));
+    }
+    // #698: the `[Recall]` block puts entries in front of the model outside any
+    // tool call, so the turn records the offer itself, from the ids the renderer
+    // reports. Gated on a database only - a deployment with no embedding backend
+    // renders no block, and then records an empty offer, which is what ends the
+    // previous turn's.
+    if let Some(log) = &kb_use_log {
+        use desktop_assistant_core::ports::knowledge_use::KnowledgeUseLog;
+        let log = Arc::clone(log);
+        handler = handler.with_knowledge_offer_log(Arc::new(move |scope, ids| {
+            let log = Arc::clone(&log);
+            Box::pin(async move { log.record_offered(scope, ids).await })
         }));
     }
     if let Some(release_fn) = scratchpad_release_references_fn {

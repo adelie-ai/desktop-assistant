@@ -202,6 +202,10 @@ const MIGRATIONS: &[Migration] = &[
     // #1099: when a knowledge entry's summary was last written, so the dream
     // cycle can find the entries whose body changed after their summary did.
     migration!("043_knowledge_base_summary_freshness.sql"),
+    // #698: the use log - what a knowledge entry was offered for, what was
+    // opened, and what was marked, so a deployment can measure the weights
+    // its retrieval path uses instead of carrying values fitted elsewhere.
+    migration!("044_knowledge_use_log.sql"),
 ];
 
 /// Second half of the advisory-lock key: the schema the migrations write to.
