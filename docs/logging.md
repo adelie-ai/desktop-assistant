@@ -161,16 +161,21 @@ builders in code, so every variable below reaches them.
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | Endpoint for traces, used exactly as written, so it must include the path. |
 | `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | Endpoint for metrics. Same rule. |
 | `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` | Endpoint for log records. Same rule. |
-| `OTEL_EXPORTER_OTLP_PROTOCOL` | `grpc`, `http/protobuf` or `http/json`, for all three. |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | `grpc` or `http/protobuf`, for all three. |
 | `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` | Protocol for traces. Per-signal forms exist for metrics and logs too. |
 | `OTEL_EXPORTER_OTLP_HEADERS` | Headers for all three, as `key=value,key=value`. Per-signal forms exist. |
 | `OTEL_EXPORTER_OTLP_TIMEOUT` | Export timeout in milliseconds. Per-signal forms exist. |
 | `OTEL_EXPORTER_OTLP_COMPRESSION` | `gzip` or `zstd`. Per-signal forms exist. |
-| `OTEL_TRACES_EXPORTER` | `none` switches traces off. `OTEL_METRICS_EXPORTER` and `OTEL_LOGS_EXPORTER` do the same for their signal. |
-| `OTEL_SDK_DISABLED` | `true` switches all three off. |
 | `OTEL_RESOURCE_ATTRIBUTES` | Extra resource attributes, as `key=value,key=value`. |
 
 A per-signal variable beats the generic one.
+
+**There is no run-time switch that turns export off.** The specification
+defines `OTEL_SDK_DISABLED` and the per-signal `OTEL_TRACES_EXPORTER=none`
+form, and neither `adelie-telemetry` at the pinned revision nor
+`opentelemetry_sdk` 0.32 reads them (`adelie-ai/adelie-telemetry#4`). A build
+with the `otel` feature always tries to export; a build without it never does.
+Ship the default-feature binary where export is not wanted.
 
 ```sh
 OTEL_EXPORTER_OTLP_ENDPOINT=http://collector.example.com:4318 \
@@ -183,8 +188,10 @@ Each binary reports its own `service.name`: `adele-daemon` and
 
 ### Choosing a transport
 
-Both transports are compiled in and `OTEL_EXPORTER_OTLP_PROTOCOL` selects one
-at run time.
+Two transports are compiled in and `OTEL_EXPORTER_OTLP_PROTOCOL` selects one at
+run time. A third value the specification defines, `http/json`, is **not**
+compiled in. Asking for it does not fail at startup; it fails every export at
+run time instead, so check this value first when nothing arrives.
 
 `http/protobuf` (port 4318) is the safer default. It uses a blocking HTTP
 client on the exporter's own thread.
@@ -201,13 +208,31 @@ decides what a container image needs:
 | `grpc` | compiled-in webpki roots | independent of the image |
 | `http/protobuf` | the OS trust store | the image needs `ca-certificates`, or every HTTPS export fails |
 
-### When a pipeline cannot be built
+### When export does not work
 
 A wrong value in the environment costs the process its export and nothing else.
-The console layer is installed either way, the metrics summary keeps running,
-and the reason is written at ERROR together with the `OTEL_*` variables that
-were set. Header values are never printed, because they routinely carry an API
-key. A typo in one variable must not be able to silence a process.
+The console layer is installed either way and the metrics summary keeps
+running. A typo in one variable must not be able to silence a process.
+
+There are two distinct failures, and they look different in the log.
+
+**The pipeline could not be built** - for example an `https` endpoint in a build
+whose TLS backend was compiled out. `init` writes one ERROR line naming the
+cause together with the `OTEL_*` variables that were set. Header values are
+never printed, because they routinely carry an API key.
+
+**The pipeline was built and each export fails** - an unreachable collector, a
+malformed endpoint, or `http/json`. This is *not* caught at startup. Each batch
+fails and the SDK writes its own line, which names the transport and little
+else:
+
+```text
+ERROR opentelemetry_sdk: name="BatchLogProcessor.ExportError" error="Operation failed: HTTP export failed: network error"
+```
+
+So a malformed `OTEL_EXPORTER_OTLP_ENDPOINT` and a collector that is simply
+down are indistinguishable from the log alone. Re-read the variables before
+looking at the network.
 
 ### Shutdown
 
