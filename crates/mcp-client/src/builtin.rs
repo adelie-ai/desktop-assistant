@@ -9372,4 +9372,126 @@ mod tests {
             "the description must ask for the negative mark too: {text}"
         );
     }
+
+    mod log_content_contract {
+        //! The level contract for the search builtins.
+        //!
+        //! > INFO carries ids, counts, durations, model names and token counts.
+        //! > Never content.
+        //! > DEBUG carries prompts, the full assembled context, and tool arguments.
+        //!
+        //! A search query is a tool argument, and it is written by the user or by
+        //! the model on the user's behalf. The three search builtins used to put it
+        //! on an INFO line, which every shipped deployment turns on, so the journal
+        //! and the cluster log stack accumulated what people asked their assistant.
+
+        use std::io;
+        use std::sync::{Arc, Mutex, Once};
+
+        use desktop_assistant_core::ports::knowledge::{KnowledgeSearchPage, ScopeSize};
+        use tracing::Level;
+
+        use super::{kb_search_response, kb_service_reporting};
+
+        /// A query no other part of the test suite emits.
+        const QUERY_SENTINEL: &str = "SENTINEL-WHAT-THE-USER-ASKED-ABOUT";
+
+        #[derive(Clone, Default)]
+        struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+        impl CapturedLog {
+            fn text(&self) -> String {
+                String::from_utf8(self.0.lock().expect("lock the capture buffer").clone())
+                    .expect("captured log output is UTF-8")
+            }
+        }
+
+        impl io::Write for CapturedLog {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.lock().expect("lock the capture buffer").extend(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+            type Writer = Self;
+
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        static PERMISSIVE_GLOBAL_DEFAULT: Once = Once::new();
+
+        /// One process-wide subscriber that accepts everything.
+        ///
+        /// `tracing` caches a callsite's interest globally. Without this, a
+        /// callsite first evaluated under the INFO-capped test can latch "never"
+        /// for the process and the DEBUG-capped test then never sees it - a
+        /// scheduling-dependent flake rather than a real failure.
+        fn ensure_permissive_global_default() {
+            PERMISSIVE_GLOBAL_DEFAULT.call_once(|| {
+                let subscriber = tracing_subscriber::fmt()
+                    .with_max_level(Level::TRACE)
+                    .with_writer(io::sink)
+                    .finish();
+                let _ = tracing::subscriber::set_global_default(subscriber);
+            });
+        }
+
+        /// Run one knowledge-base search with every record at `level` or above captured.
+        fn search_capturing(level: Level) -> String {
+            ensure_permissive_global_default();
+            let captured = CapturedLog::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(level)
+                .with_writer(captured.clone())
+                .with_ansi(false)
+                .finish();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build a current-thread runtime");
+            tracing::subscriber::with_default(subscriber, || {
+                runtime.block_on(async {
+                    let (service, _probe) = kb_service_reporting(KnowledgeSearchPage {
+                        entries: Vec::new(),
+                        scope_size: ScopeSize::None,
+                        available_tags: Vec::new(),
+                    });
+                    kb_search_response(&service, serde_json::json!({ "query": QUERY_SENTINEL })).await;
+                });
+            });
+            captured.text()
+        }
+
+        #[test]
+        fn no_search_query_at_info() {
+            let logs = search_capturing(Level::INFO);
+            assert!(
+                !logs.contains(QUERY_SENTINEL),
+                "a search query is a tool argument and must not reach an INFO line\n\
+                 --- captured at INFO ---\n{logs}"
+            );
+            assert!(
+                logs.contains("knowledge base search"),
+                "the INFO line itself must survive - the fix is to drop the query, not the line\n\
+                 --- captured at INFO ---\n{logs}"
+            );
+        }
+
+        #[test]
+        fn search_query_appears_at_debug() {
+            let logs = search_capturing(Level::DEBUG);
+            assert!(
+                logs.contains(QUERY_SENTINEL),
+                "the query belongs at DEBUG, so an operator who needs it can ask\n\
+                 --- captured at DEBUG ---\n{logs}"
+            );
+        }
+    }
 }

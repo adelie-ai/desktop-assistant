@@ -1232,3 +1232,59 @@ async fn archival_moves_expected_rows() {
 
     fx.cleanup().await;
 }
+
+// ---------------------------------------------------------------------------
+// The level contract for the dreaming worker.
+//
+// > INFO carries ids, counts, durations, model names and token counts. Never
+// > content.
+// > DEBUG carries prompts, the full assembled context, and tool arguments.
+//
+// An extracted fact is, by construction, personal: the extraction prompt asks
+// for preferences and personal context. The worker used to write the head of
+// each one on an INFO line, which every shipped deployment turns on, so a
+// central log store accumulated one tenant's personal facts where a reader
+// with pod-log access could see them - a much wider audience than the
+// per-user row-level boundary the rest of the module maintains.
+// ---------------------------------------------------------------------------
+
+/// A fact body no other test emits.
+const FACT_SENTINEL: &str = "SENTINEL-THE-USER-HAS-A-PEANUT-ALLERGY";
+
+#[tokio::test]
+async fn no_extracted_fact_content_at_info() {
+    let Some(fx) = support::DbFixture::try_new("dream1005").await else {
+        return;
+    };
+    let pool = &fx.pool;
+
+    seed_conversation(pool, "u1", "conv-1").await;
+    seed_message(pool, "u1", "conv-1", "m1", 1, "user", "remember this").await;
+
+    let llm = llm_returning(&format!(
+        r#"{{"facts":[{{"content":"{FACT_SENTINEL}","tags":[],"scope":null}}]}}"#
+    ));
+    let embed = unused_embed_fn();
+    let token = CancellationToken::new();
+
+    let (written, logs) = support::capture_tracing_at(tracing::Level::INFO, || async {
+        run_dreaming_scan(pool, &llm, &embed, "test-model", 0, &token, None)
+            .await
+            .expect("the dreaming scan succeeds")
+    })
+    .await;
+
+    assert_eq!(written, 1, "the scan wrote the fact under test");
+    assert!(
+        !logs.contains(FACT_SENTINEL),
+        "an extracted fact is personal content and must not reach an INFO line\n\
+         --- captured at INFO ---\n{logs}"
+    );
+    assert!(
+        logs.contains("dreaming: wrote fact"),
+        "the INFO line itself must survive - the fix is to drop the content, not the line\n\
+         --- captured at INFO ---\n{logs}"
+    );
+
+    fx.cleanup().await;
+}
