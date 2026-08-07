@@ -192,12 +192,31 @@ pub struct RecallConfig {
     /// configured.
     #[serde(default = "default_recall_enabled")]
     pub enabled: bool,
+    /// How many knowledge lines the `[Recall]` block may show.
+    ///
+    /// Absent means the built-in default. That default is held below the width
+    /// the block's token budget derives, because the relevance floor admits
+    /// candidates for a prompt that asks nothing - see
+    /// `desktop_assistant_core::recall`, which states both numbers. State a
+    /// value here to take the wider index now, or to hold a narrower block on a
+    /// model with a small context window.
+    ///
+    /// The value is held to what the block can honestly render: at least one
+    /// line, and never more lines than the lookup reads, because a block that
+    /// showed more would count rows it never saw.
+    ///
+    /// Read once, when the conversation handler is built, so an edit needs a
+    /// restart. A reload reports the whole section as
+    /// [`RestartArea::Recall`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_entries: Option<usize>,
 }
 
 impl Default for RecallConfig {
     fn default() -> Self {
         Self {
             enabled: default_recall_enabled(),
+            max_entries: None,
         }
     }
 }
@@ -4079,6 +4098,35 @@ max_context_tokens = 1000000
         .unwrap();
 
         assert!(!config.recall.enabled);
+
+        let serialized = toml::to_string(&config).unwrap();
+        let reparsed: DaemonConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(config.recall, reparsed.recall);
+    }
+
+    /// Acceptance (#1124): the width is configurable, so the block's token
+    /// budget can be tuned per deployment without a rebuild.
+    #[test]
+    fn the_recall_width_is_configurable_and_round_trips() {
+        let absent: DaemonConfig = toml::from_str("").unwrap();
+        assert_eq!(
+            absent.recall.max_entries, None,
+            "an install that says nothing gets the built-in width"
+        );
+
+        let config: DaemonConfig = toml::from_str(
+            r#"
+            [recall]
+            max_entries = 12
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.recall.max_entries, Some(12));
+        assert!(
+            config.recall.enabled,
+            "the width says nothing about the switch"
+        );
 
         let serialized = toml::to_string(&config).unwrap();
         let reparsed: DaemonConfig = toml::from_str(&serialized).unwrap();
