@@ -138,14 +138,18 @@ pub fn activation(
 /// - **Doubling the use adds at most `lift * ln 2`.** That is the cap #698 asks
 ///   for, as a property of the function.
 pub fn reinforcement(sum: f64, lift: f64) -> f64 {
-    let _ = (sum, lift);
-    0.0
+    if !sum.is_finite() {
+        return 0.0;
+    }
+    lift * sum.abs().ln_1p() * sum.signum()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::knowledge_use::{KnowledgeMark, MarkPolarity, MarkSource, RECENT_USE_WINDOW};
+    use crate::domain::knowledge_use::{
+        KnowledgeMark, MarkPolarity, MarkSource, RECENT_USE_WINDOW,
+    };
     use chrono::TimeDelta;
 
     const DAY: i64 = 24 * 3600;
@@ -171,7 +175,11 @@ mod tests {
             marked_count: 0,
             first_seen_at: at(now, ages.iter().copied().max().unwrap_or(1)),
             last_offered_at: Some(at(now, 1)),
-            recent_uses: ages.iter().take(RECENT_USE_WINDOW).map(|a| at(now, *a)).collect(),
+            recent_uses: ages
+                .iter()
+                .take(RECENT_USE_WINDOW)
+                .map(|a| at(now, *a))
+                .collect(),
             marks: Vec::new(),
         }
     }
@@ -195,7 +203,10 @@ mod tests {
         let first = activation(7.0, Some(&record), now, &weights);
         let again = activation(7.0, Some(&record), now, &weights);
 
-        assert_eq!(first, again, "the score is a pure function of what it is given");
+        assert_eq!(
+            first, again,
+            "the score is a pure function of what it is given"
+        );
         assert!(first.is_finite());
         assert!(
             first > 7.0,
@@ -393,8 +404,7 @@ mod tests {
         }];
 
         assert!(
-            activation(7.0, Some(&refuted), now, &weights)
-                < activation(7.0, None, now, &weights)
+            activation(7.0, Some(&refuted), now, &weights) < activation(7.0, None, now, &weights)
         );
     }
 

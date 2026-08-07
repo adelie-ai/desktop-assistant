@@ -19,10 +19,10 @@ it matters.
 [Recall] Memory that may relate to what was just asked. It may not fit; ignore what does not. Each line is one entry: its id, its tags, and one line of what it says - not the entry itself. Look one up before you rely on it.
 - kb-1a2b [preference, ui] Prefers dark themes in every editor
 - kb-9f31 [infra, deploy] The deploy target is the lab cluster
-...and 17 more entries matched less closely.
+...and 17 more entries were also relevant.
 Notes on this conversation's scratchpad. Each line is one note: its key, then the start of what it says - not the whole note.
 - deploy-window: Fridays after 18:00, never before
-...and 2 more notes matched less closely.
+...and 2 more notes were also relevant.
 Tags the entries above carry: infra, deploy, ui, preference
 ```
 
@@ -191,7 +191,7 @@ is rendered there, after that decision. On a short turn where the index stays
 silent, no key is dropped for it - which is the case the arm exists for. The two
 `[Pinned]` rules apply on every turn, because that block is ungated.
 
-A dropped candidate is not counted in the "matched less closely" line either.
+A dropped candidate is not counted in the "were also relevant" line either.
 That line promises the model something it has not been given.
 
 ## Nothing stamped as external content
@@ -233,6 +233,46 @@ The width is then an output rather than an input. A prompt with no cue clears
 nothing, a weak cue clears a line or two, and a strong cue clears a dozen. The
 block is wide exactly when there is something to be wide about, and the
 configured width is a safety cap on the worst case rather than the mechanism.
+
+**One activation score decides the order.** The bar says which candidates are
+offered; activation says in what order, and it is one function rather than a
+blend of multipliers:
+
+```text
+A_i = semantic + reinforcement
+```
+
+`semantic` is the same dimensionless deviation count the bar reads - never a raw
+distance, so a source added later joins on the same scale without refitting
+anything. `reinforcement` is what the use log knows (`docs/features/knowledge-use-log.md`),
+read as `use_lift * ln(1 + S)` and carrying `S`'s sign, where `S` is the ACT-R
+base-level sum over the entry's opens and marks. Three consequences:
+
+- **An entry nothing has used contributes nothing**, so a store with no history
+  renders exactly the block it rendered before this existed. The sort is stable,
+  so distance breaks every tie.
+- **Doubling the accumulated use buys at most `use_lift * ln 2`**, however large
+  the count already is. That is the cap the use log asks for, as a property of
+  the function rather than a clamp, and it is why a heavily marked entry cannot
+  outrank a strong semantic match.
+- **A standing negative mark subtracts**, so an entry that was opened and found
+  wrong ends below one nobody has ever opened.
+
+The score is `crates/core/src/domain/activation.rs`. Its weights are a struct
+rather than constants, so a deployment that has kept a use log can fit its own.
+
+**A lexical match is not ranked by activation.** It carries no distance, so it
+has no semantic term - and scoring it on the use log alone would order a
+degraded block by what has been opened most and throw away how well each row
+matched. That is the embedding backend being unreachable, so it is the worst
+moment to make the ranking worse. Such a candidate keeps the order the database
+gave it, and one lookup uses one mode, so the two kinds are never in one list.
+
+**Reading the use log costs the ranking at most.** The ids exist only once the
+scan has answered, so it is one batched read after it, bounded at half a second.
+A read that fails or overruns leaves every candidate on its semantic signal
+alone - which is how they all ranked before the log existed - and says so once in
+the journal.
 
 **Measured over the source, never over the candidates.** The lookup shows only
 the nearest rows, so their spread is the near tail's and not the store's, and
@@ -334,9 +374,26 @@ Each arm counts its own, and says which. The knowledge lookup reads at most 50
 rows and the scratchpad lookup at most 25 - fewer, because it reads one
 conversation's pad rather than the whole store, so the tail it would be counting
 is short. When a scan fills up *and* every row it read cleared the bar, that
-arm's count is a lower bound and says so: "and 42 or more entries matched less
-closely." When the scan read past the bar, the count is exact and carries no
+arm's count is a lower bound and says so: "and 42 or more entries were also
+relevant." When the scan read past the bar, the count is exact and carries no
 hedge. When nothing was dropped, there is no line.
+
+**The line says "were also relevant", not "matched less closely".** The count has
+always been the number that cleared the bar, and "relevant" is what the bar
+names. Distance decided the *order* as well, until activation ranking landed - so
+an entry that did not fit may now have matched more closely than one that did,
+and the scratchpad arm, which activation does not rank, would be described one
+way and the entry arm another. One wording is true of both, and of a capped scan.
+
+Activation ranking does not touch the count or the hedge, and the reason is worth
+stating because it is easy to assume otherwise. The rule the hedge rests on is
+about **admission**: rows arrive nearest-first, the bar is a test on distance, so
+the rows it admits are a prefix - and a scan that read past the bar therefore
+knows there is nothing better beyond it. Activation reorders that admitted set
+and never changes its membership, so the count of it, and whether that count is
+exact, are the numbers they were. What ranking does change is which admitted rows
+*fit*: on a capped scan the lines are the best of what was read rather than the
+best that exists, which is what the hedge already says.
 
 ## Failure
 
@@ -479,12 +536,15 @@ measured.
 | Piece | Path |
 | --- | --- |
 | Floors, caps, and the block text | `crates/core/src/recall.rs` |
+| The activation score | `crates/core/src/domain/activation.rs` |
+| The base-level sum it reads | `KnowledgeUseRecord::use_sum`, `crates/core/src/domain/knowledge_use.rs` |
 | The standing guidance for the block | `crates/core/src/prompts/sections/knowledge_base.txt` |
 | The port the daemon fills | `crates/core/src/ports/recall.rs` |
 | Looked up once per turn | `ConversationHandler::recall_lookup`, `crates/core/src/service.rs` |
 | What the other blocks showed | `planning::listed_scratchpad_keys` and `planning::plan_note_keys` |
 | Rendered on the first round | `surfaced_blocks`, `crates/core/src/context/mod.rs` |
 | Embedding, every query, degradation | `crates/daemon/src/recall.rs` |
+| The bounded use-log read | `recall::use_records`, same file |
 | The knowledge query, and the spread it states | `PgKnowledgeBaseStore::nearest_by_embedding`, `crates/storage/src/knowledge.rs` |
 | Its degraded form | `PgKnowledgeBaseStore::search_text_any_term`, same file |
 | The scratchpad query | `PgScratchpadStore::nearest_by_embedding`, `crates/storage/src/scratchpad.rs` |

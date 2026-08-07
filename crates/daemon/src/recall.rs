@@ -14,6 +14,15 @@
 //! scan could reach. One scan states both, so the spread always describes the
 //! query whose candidates it grades.
 //!
+//! ## What the use log adds, and what it costs
+//!
+//! A candidate the store measured also carries what the use log knows about it
+//! (#698), which is the reinforcement half of its activation score (#1123). The
+//! ids only exist once the scan has answered, so this is one batched read after
+//! it rather than a third arm beside it - see [`use_records`], which bounds it
+//! and degrades to nothing. A lexical candidate carries no record, because
+//! nothing ranks it by activation.
+//!
 //! ## Recall never fails a turn
 //!
 //! The embedding call is bounded by [`EMBED_TIMEOUT`], the same ceiling the
@@ -41,12 +50,16 @@ use std::sync::Arc;
 
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::ScratchpadNote;
+use desktop_assistant_core::domain::knowledge_use::KnowledgeUseRecord;
 use desktop_assistant_core::ports::embedding::{EMBED_TIMEOUT, EmbedFn};
+use desktop_assistant_core::ports::knowledge_use::KnowledgeUseLog;
 use desktop_assistant_core::ports::recall::{
     RecallCandidates, RecallDispersion, RecallEntry, RecallNote, RecallRelevance, RecallRequest,
     RecallSearchFn,
 };
-use desktop_assistant_storage::{PgKnowledgeBaseStore, PgPool, PgScratchpadStore};
+use desktop_assistant_storage::{
+    PgKnowledgeBaseStore, PgKnowledgeUseLog, PgPool, PgScratchpadStore,
+};
 
 /// How long one whole recall lookup may take before the turn gives up on it.
 ///
@@ -58,6 +71,19 @@ use desktop_assistant_storage::{PgKnowledgeBaseStore, PgPool, PgScratchpadStore}
 ///
 /// Exceeding it costs the block, never the turn.
 const RECALL_CALL_CEILING: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long the use-log read may take before the candidates travel without it.
+///
+/// Two reads by primary key over at most one scan's worth of ids, so half a
+/// second is already generous; what the ceiling buys is the guarantee that the
+/// reinforcement half of the score can never be what makes a turn slow. Exceed
+/// it and every candidate ranks on its semantic signal alone, which is how they
+/// ranked before the log existed - see [`use_records`].
+///
+/// It fits inside what [`RECALL_CALL_CEILING`] has left after the embedding and
+/// the scan, and `the_three_reads_together_stay_inside_the_lookups_ceiling`
+/// holds the four constants to that.
+const USE_LOG_READ_CEILING: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Build the recall lookup the conversation handler calls once per turn.
 ///
@@ -71,17 +97,27 @@ pub fn build_recall_search(
     embed: EmbedFn,
     embedding_model: String,
 ) -> RecallSearchFn {
-    // The pad adapter is a handle on the same pool, built once here rather than
-    // threaded in: nothing else in the daemon holds one, and the two reads
-    // behind the scratchpad arm are inherent to it.
+    // The pad adapter and the use log are handles on the same pool, built once
+    // here rather than threaded in: nothing else in the daemon holds the pad
+    // one, and the reads behind these arms are inherent to them.
     let pad = Arc::new(PgScratchpadStore::new(pool.clone()));
+    let uses = Arc::new(PgKnowledgeUseLog::new(pool.clone()));
     Arc::new(move |request: RecallRequest| {
         let kb_store = Arc::clone(&kb_store);
         let pad = Arc::clone(&pad);
+        let uses = Arc::clone(&uses);
         let embed = Arc::clone(&embed);
         let embedding_model = embedding_model.clone();
         Box::pin(async move {
-            within_ceiling(lookup(&kb_store, &pad, &embed, &embedding_model, request)).await
+            within_ceiling(lookup(
+                &kb_store,
+                &pad,
+                &uses,
+                &embed,
+                &embedding_model,
+                request,
+            ))
+            .await
         })
     })
 }
@@ -106,6 +142,7 @@ async fn within_ceiling(
 async fn lookup(
     kb_store: &PgKnowledgeBaseStore,
     pad: &PgScratchpadStore,
+    uses: &PgKnowledgeUseLog,
     embed: &EmbedFn,
     embedding_model: &str,
     request: RecallRequest,
@@ -124,10 +161,13 @@ async fn lookup(
                         .search_text_any_term(&request.prompt, request.entry_limit)
                         .await?
                         .into_iter()
-                        .map(|entry| RecallEntry {
-                            entry,
-                            relevance: RecallRelevance::LexicalMatch,
-                        })
+                        // No use records are read here, and that is deliberate.
+                        // A lexical candidate carries no distance, so it has no
+                        // semantic term, so the core does not rank it by
+                        // activation (#1123) and a record would be a query
+                        // whose answer nothing reads - at exactly the moment
+                        // something upstream is already failing.
+                        .map(|entry| RecallEntry::new(entry, RecallRelevance::LexicalMatch))
                         .collect(),
                     None,
                 ))
@@ -155,13 +195,23 @@ async fn lookup(
             let found = kb_store
                 .nearest_by_embedding(vector, embedding_model, request.entry_limit)
                 .await?;
+            // The use log is read after the scan rather than beside it: only
+            // the scan knows which ids to ask about. It is one batched read of
+            // at most one scan's worth of rows, by primary key.
+            let ids: Vec<String> = found.entries.iter().map(|(e, _)| e.id.clone()).collect();
+            let mut records = if ids.is_empty() {
+                std::collections::HashMap::new()
+            } else {
+                use_records(uses.records(ids)).await
+            };
             Ok((
                 found
                     .entries
                     .into_iter()
-                    .map(|(entry, distance)| RecallEntry {
-                        entry,
-                        relevance: RecallRelevance::Distance(distance),
+                    .map(|(entry, distance)| {
+                        let record = records.remove(&entry.id);
+                        RecallEntry::new(entry, RecallRelevance::Distance(distance))
+                            .with_use_record(record)
                     })
                     .collect(),
                 found.dispersion,
@@ -182,6 +232,48 @@ async fn lookup(
         },
     )
     .await
+}
+
+/// What the use log knows about `ids`, keyed by id, and an empty map where it
+/// could not be read (#1123).
+///
+/// **A read that fails costs the ranking and never the block.** The
+/// reinforcement half of the activation score is the half retrieval worked
+/// without until now, so an entry with no record ranks on its semantic signal
+/// alone - which is exactly how every entry ranked before the log existed. A
+/// slow or broken use log therefore degrades the order of the lines rather than
+/// removing them, and it says so once in the journal.
+///
+/// Ids the log has never seen are simply absent, so they get the same `None` as
+/// a failed read. The core does not distinguish the two and does not have to:
+/// both mean "nothing to add".
+/// Generic over the read, and separate from [`lookup`], so both halves of what
+/// it guarantees are provable without a database - the same reason
+/// [`within_ceiling`] and [`gather`] stand on their own.
+async fn use_records(
+    read: impl Future<Output = Result<Vec<KnowledgeUseRecord>, CoreError>>,
+) -> std::collections::HashMap<String, KnowledgeUseRecord> {
+    let records = match tokio::time::timeout(USE_LOG_READ_CEILING, read).await {
+        Ok(Ok(records)) => records,
+        Ok(Err(e)) => {
+            tracing::warn!(
+                error = %e,
+                "recall: the use log could not be read; ranking on the semantic signal alone"
+            );
+            return std::collections::HashMap::new();
+        }
+        Err(_) => {
+            tracing::warn!(
+                timeout = ?USE_LOG_READ_CEILING,
+                "recall: the use log read timed out; ranking on the semantic signal alone"
+            );
+            return std::collections::HashMap::new();
+        }
+    };
+    records
+        .into_iter()
+        .map(|record| (record.entry_id.clone(), record))
+        .collect()
 }
 
 /// Run the two arms together and fold what they answered into one candidate
@@ -395,10 +487,10 @@ mod tests {
     }
 
     fn an_entry() -> RecallEntry {
-        RecallEntry {
-            entry: desktop_assistant_core::domain::KnowledgeEntry::new("kb-1", "body", vec![]),
-            relevance: RecallRelevance::Distance(0.12),
-        }
+        RecallEntry::new(
+            desktop_assistant_core::domain::KnowledgeEntry::new("kb-1", "body", vec![]),
+            RecallRelevance::Distance(0.12),
+        )
     }
 
     /// A store that measured its own geometry.
@@ -545,14 +637,55 @@ mod tests {
     /// they add up: raising either of the first two is what would break it, and
     /// neither sits beside this ceiling.
     #[test]
-    fn the_embedding_and_the_scan_together_stay_inside_the_lookups_ceiling() {
-        let worst = EMBED_TIMEOUT + RECALL_SCAN_STATEMENT_TIMEOUT;
+    fn the_three_reads_together_stay_inside_the_lookups_ceiling() {
+        let worst = EMBED_TIMEOUT + RECALL_SCAN_STATEMENT_TIMEOUT + USE_LOG_READ_CEILING;
         assert!(
             worst < RECALL_CALL_CEILING,
-            "an embedding at {EMBED_TIMEOUT:?} and a scan at \
-             {RECALL_SCAN_STATEMENT_TIMEOUT:?} spend {worst:?} of the {RECALL_CALL_CEILING:?} \
-             the whole lookup has, so the lookup is what gives up first and the block is dropped"
+            "an embedding at {EMBED_TIMEOUT:?}, a scan at {RECALL_SCAN_STATEMENT_TIMEOUT:?} and \
+             a use-log read at {USE_LOG_READ_CEILING:?} spend {worst:?} of the \
+             {RECALL_CALL_CEILING:?} the whole lookup has, so the lookup is what gives up first \
+             and the block is dropped"
         );
+    }
+
+    // --- The use log behind the reinforcement term (#1123) ------------------
+
+    fn a_record(entry_id: &str) -> KnowledgeUseRecord {
+        KnowledgeUseRecord::unseen(entry_id, chrono::Utc::now())
+    }
+
+    #[tokio::test]
+    async fn the_use_log_answers_are_keyed_by_the_entry_they_are_about() {
+        let records = use_records(async { Ok(vec![a_record("kb-1"), a_record("kb-2")]) }).await;
+
+        assert_eq!(records.len(), 2);
+        assert!(records.contains_key("kb-1"));
+        assert!(records.contains_key("kb-2"));
+    }
+
+    /// Acceptance (#1123): a use log that cannot be read costs the ranking, not
+    /// the block. Every candidate then ranks on its semantic signal alone, which
+    /// is how they all ranked before the log existed.
+    #[tokio::test]
+    async fn a_use_log_that_cannot_be_read_costs_the_ranking_and_not_the_block() {
+        let records =
+            use_records(async { Err(CoreError::Storage("the log is down".into())) }).await;
+
+        assert!(records.is_empty());
+    }
+
+    /// The same for a log that is merely slow. The reinforcement half of the
+    /// score is the half retrieval worked without until now, so it must never be
+    /// what makes a turn slow.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_use_log_costs_the_ranking_and_not_the_block() {
+        let records = use_records(async {
+            tokio::time::sleep(USE_LOG_READ_CEILING * 2).await;
+            Ok(vec![a_record("kb-1")])
+        })
+        .await;
+
+        assert!(records.is_empty());
     }
 
     #[tokio::test]

@@ -4104,7 +4104,7 @@ mod tests {
         crate::ports::recall::RecallEntry {
             entry,
             relevance: crate::ports::recall::RecallRelevance::Distance(0.10),
-        use_record: None,
+            use_record: None,
         }
     }
 

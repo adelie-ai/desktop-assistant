@@ -7032,10 +7032,7 @@ mod tests {
                 );
                 entry.summary = Some("The registry runs on the storage host".to_string());
                 Ok(RecallCandidates {
-                    entries: vec![RecallEntry::new(
-                        entry,
-                        RecallRelevance::Distance(0.12),
-                    )],
+                    entries: vec![RecallEntry::new(entry, RecallRelevance::Distance(0.12))],
                     ..RecallCandidates::default()
                 })
             })
