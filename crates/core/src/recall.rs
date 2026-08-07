@@ -764,11 +764,6 @@ fn render_recall_with_width(
         candidates.situation_cue.as_ref(),
         surface.now,
     );
-    // TODO(#1154): the arm admits nothing until the implementation lands.
-    let showable_skills: Vec<(&RecallSkill, String)> = {
-        let _ = showable_skills;
-        Vec::new()
-    };
 
     if showable.is_empty() && showable_notes.is_empty() && showable_skills.is_empty() {
         return None;

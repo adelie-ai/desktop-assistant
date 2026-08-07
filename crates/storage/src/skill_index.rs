@@ -298,6 +298,7 @@ impl PgSkillIndexStore {
                         ts_rank_cd(s.tsv, q.query) AS rank
                  FROM skill_index s, q
                  WHERE (s.owner_user_id IS NULL OR s.owner_user_id = $3)
+                   AND s.approved_at IS NOT NULL
                    AND q.query IS NOT NULL
                    AND s.tsv @@ q.query
                  ORDER BY s.name, s.owner_key DESC
@@ -643,6 +644,7 @@ const NEAREST_SKILLS_BY_EMBEDDING_SQL: &str = "\
          SELECT name, owner_key, MIN(chunk <=> $1) AS distance
          FROM skill_index, unnest(embedding) AS chunk
          WHERE (owner_user_id IS NULL OR owner_user_id = $2)
+           AND approved_at IS NOT NULL
            AND embedding IS NOT NULL
            AND embedding_model IS NOT NULL
            AND (embedding_model = $3
