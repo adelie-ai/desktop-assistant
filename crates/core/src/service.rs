@@ -1489,7 +1489,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
         let existing = match get(req.name.clone(), Some(owner.as_str().to_string())).await {
             Ok(found) => found,
             Err(e) => {
-                tracing::warn!(skill = %req.name, error = %e, "skill name lookup failed");
+                tracing::warn!(skill = %Safe::name(&req.name), error = %e, "skill name lookup failed");
                 return serde_json::json!({
                     "ok": false,
                     "error": format!(
@@ -1537,7 +1537,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
         };
 
         if let Err(e) = write(skill).await {
-            tracing::warn!(skill = %req.name, error = %e, "failed to record promoted skill");
+            tracing::warn!(skill = %Safe::name(&req.name), error = %e, "failed to record promoted skill");
             return serde_json::json!({
                 "ok": false,
                 "error": format!("could not record the skill: {e}"),
@@ -1545,7 +1545,10 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             .to_string();
         }
         tracing::info!(
-            skill = %req.name,
+            // The name comes from the model's own `promote_plan` argument, and
+            // `validate_skill_name` rejects only the path characters - not a
+            // newline, an escape, or any length.
+            skill = %Safe::name(&req.name),
             mode = if req.mode == PromotionMode::Amend { "amend" } else { "new" },
             steps = plan.working_steps().len(),
             "recorded a self-authored skill, unapproved"
@@ -1975,15 +1978,18 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
             request_id.as_deref().unwrap_or(TURN_TELEMETRY_UNSET),
             user_id.as_str(),
         );
-        let started = std::time::Instant::now();
-        let mut report = crate::telemetry::TurnReport::default();
+        // Reports on drop, so a turn that ends by panicking still writes its
+        // completion line and its measurement. The body fills it in as it runs,
+        // for the same reason the round guard exists: an exit that has to
+        // remember to report is an exit that will not.
+        let mut report = crate::telemetry::TurnGuard::new(span.clone());
         // Boxed so the turn body lives on the heap rather than inside this
         // future. A caller composes several task-local scopes around this
         // call, and each one embeds what it wraps by value, which is the
         // accounting that overflowed a worker thread's stack in #205/#206.
         let result =
             Box::pin(self.run_turn(conversation_id, prompt, on_chunk, on_status, &mut report))
-                .instrument(span.clone())
+                .instrument(span)
                 .await;
 
         // An error the body never classified is read from the result rather
@@ -1995,26 +2001,6 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 _ => crate::telemetry::TurnOutcome::Failed,
             };
         }
-        let elapsed = started.elapsed();
-        crate::telemetry::record_turn(elapsed, report.rounds, report.outcome);
-        span.record("rounds", report.rounds);
-        span.record("outcome", report.outcome.as_label());
-        span.record("duration_ms", elapsed.as_millis() as u64);
-        // The one line an operator greps, at INFO, with everything as fields.
-        // Emitted inside the turn span so it carries the ids too.
-        span.in_scope(|| {
-            tracing::info!(
-                duration_ms = elapsed.as_millis() as u64,
-                model = crate::ports::turn_telemetry::current_turn_route().model(),
-                rounds = report.rounds,
-                input_tokens = %crate::telemetry::Count(report.tokens.input),
-                output_tokens = %crate::telemetry::Count(report.tokens.output),
-                cache_write_tokens = %crate::telemetry::Count(report.tokens.cache_write),
-                cache_read_tokens = %crate::telemetry::Count(report.tokens.cache_read),
-                outcome = report.outcome.as_label(),
-                "turn finished"
-            );
-        });
         result
     }
 }
@@ -2035,7 +2021,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
         prompt: String,
         on_chunk: ChunkCallback,
         mut on_status: StatusCallback,
-        report: &mut crate::telemetry::TurnReport,
+        report: &mut crate::telemetry::TurnGuard,
     ) -> Result<String, CoreError> {
         // Cooperative cancellation checkpoint (issue #109): bail out
         // before any I/O if the caller has already tripped the token.
@@ -2813,7 +2799,6 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
             let llm_span = crate::telemetry::llm_span(round_report.span(), round + 1, &route);
             let mut llm_call = llm_call.instrument(llm_span.clone());
             let llm_started = std::time::Instant::now();
-            round_report.llm_called();
             let llm_result = loop {
                 tokio::select! {
                     r = &mut llm_call => break r,
@@ -2827,12 +2812,29 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
             // would be missing from whichever arm nobody thought about.
             crate::telemetry::record_llm_call(llm_started.elapsed(), &route, llm_result.is_ok());
             llm_span.record("outcome", if llm_result.is_ok() { "ok" } else { "error" });
+            // Both handles are dropped here, deliberately and by name. A span
+            // ends when its last handle drops, and these are locals of the
+            // round body - so left alone they would keep `llm.call` open until
+            // the round ended, and an exported trace would draw the provider
+            // call across every tool the round then ran. The console line's
+            // busy time would still be right, which is what makes it easy to
+            // miss: the two signals would disagree and only the trace is
+            // wrong, in the direction that blames the provider.
+            drop(llm_call);
+            drop(llm_span);
             match &llm_result {
                 Ok(_) => {}
                 Err(CoreError::Cancelled) => {
                     round_report.set_outcome(crate::telemetry::RoundOutcome::Cancelled)
                 }
                 Err(_) => round_report.set_outcome(crate::telemetry::RoundOutcome::LlmError),
+            }
+            // Only a call that answered can have reported usage. Setting this
+            // before the call would count an outage, a rejected prompt or a
+            // cancellation as four counts the connector failed to report,
+            // which reads as "this provider does not report tokens".
+            if llm_result.is_ok() {
+                round_report.llm_called();
             }
             let response = match llm_result {
                 Ok(r) => r,
@@ -2856,15 +2858,18 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                         max_tokens = ?max_tokens,
                         "context overflow — running recovery ladder"
                     );
-                    let outcome = recover_from_overflow(
-                        &mut conv,
-                        &mut projection,
-                        prompt_tokens,
-                        max_tokens,
-                        window_from,
-                        &mut target_window,
-                        self.task_llm(),
-                        &estimate,
+                    let outcome = crate::telemetry::measured_aux_call(
+                        crate::telemetry::LlmPurpose::OverflowRecovery,
+                        recover_from_overflow(
+                            &mut conv,
+                            &mut projection,
+                            prompt_tokens,
+                            max_tokens,
+                            window_from,
+                            &mut target_window,
+                            self.task_llm(),
+                            &estimate,
+                        ),
                     )
                     .await;
                     if outcome == RecoveryOutcome::Exhausted {
@@ -2876,7 +2881,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                             attempt = overflow_retries,
                             prompt_tokens = ?prompt_tokens,
                             max_tokens = ?max_tokens,
-                            provider_detail = %detail,
+                            provider_detail = %Safe::message(&detail),
                             "context overflow — recovery exhausted, ending the turn"
                         );
                         let friendly = user_visible_llm_error_message(&CoreError::Llm(
@@ -2937,6 +2942,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
             // — the partial text is discarded, the completed tool rounds
             // are saved (#731).
             if is_cancelled() {
+                round_report.set_outcome(crate::telemetry::RoundOutcome::Cancelled);
                 self.persist_abandoned_turn(&conv, turn_start).await;
                 return Err(CoreError::Cancelled);
             }
@@ -2974,7 +2980,11 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                             "context pressure — shrinking window and compacting"
                         );
                         target_window = new_window;
-                        compact_into_summary(&mut conv, target_window, self.task_llm()).await;
+                        crate::telemetry::measured_aux_call(
+                            crate::telemetry::LlmPurpose::Compaction,
+                            compact_into_summary(&mut conv, target_window, self.task_llm()),
+                        )
+                        .await;
                         compaction_active = true;
                     } else {
                         tracing::debug!(
@@ -3010,6 +3020,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                          falling back to builtin_tool_search"
                     );
                     hosted_search_demoted = true;
+                    round_report.set_outcome(crate::telemetry::RoundOutcome::Retried);
                     // Keep the assistant text so the model has context,
                     // then inject a system nudge to use builtin_tool_search.
                     if !response.text.is_empty() {
@@ -3054,15 +3065,23 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 // so the conversation list shows meaningful names rather than
                 // timestamp-based placeholders.
                 if is_first_message {
-                    let generated = generate_conversation_title(&prompt, self.task_llm()).await;
+                    let generated = crate::telemetry::measured_aux_call(
+                        crate::telemetry::LlmPurpose::Title,
+                        generate_conversation_title(&prompt, self.task_llm()),
+                    )
+                    .await;
                     if !generated.is_empty() {
                         conv.title = generated;
                     }
                 }
                 conv.updated_at = now_timestamp();
-                self.store.update(conv).await?;
+                // Classified before the write, not after: a `?` here would
+                // otherwise leave the round at its unclassified default and
+                // report a storage failure as a cancellation. The turn's own
+                // outcome is corrected from the error by the caller.
                 round_report.set_outcome(crate::telemetry::RoundOutcome::Answered);
                 report.outcome = crate::telemetry::TurnOutcome::Answered;
+                self.store.update(conv).await?;
                 return Ok(visible_text);
             }
 
@@ -3089,6 +3108,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 // side effects already committed by the tools that ran are
                 // recorded before we go (#731).
                 if is_cancelled() {
+                    round_report.set_outcome(crate::telemetry::RoundOutcome::Cancelled);
                     self.persist_abandoned_turn(&conv, turn_start).await;
                     return Err(CoreError::Cancelled);
                 }
@@ -3385,6 +3405,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                                 ok: false,
                                 output: "cancelled".to_string(),
                             });
+                            round_report.set_outcome(crate::telemetry::RoundOutcome::Cancelled);
                             self.persist_abandoned_turn(&conv, turn_start).await;
                             return Err(CoreError::Cancelled);
                         }
@@ -3495,10 +3516,20 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                     crate::telemetry::ToolOutcome::Error
                 };
                 tool_span.record("outcome", tool_outcome.as_label());
+                // Whether this turn actually put the name in front of the
+                // model. Anything else is the model's invention, and it must
+                // not reach the metric as itself - see `UNKNOWN_TOOL`. Read
+                // from what was offered this round rather than from the tool
+                // registry, because the registry would call a real-but-unoffered
+                // name known and that is not the question.
+                let advertised = tool_defs.iter().any(|t| t.name == tool_call.name)
+                    || namespaces
+                        .iter()
+                        .any(|ns| ns.tools.iter().any(|t| t.name == tool_call.name));
                 crate::telemetry::record_tool_call(
                     tool_started.elapsed(),
                     &tool_call.name,
-                    tool_runner,
+                    advertised,
                     tool_outcome,
                 );
                 if !tool_ok {
@@ -3547,7 +3578,10 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                             && !core_tools.iter().any(|t| t.name == name)
                             && let Ok(Some(def)) = self.tools.tool_definition(name).await
                         {
-                            tracing::info!("dynamically activated tool: {}", def.name);
+                            tracing::info!(
+                                tool = %Safe::name(&def.name),
+                                "dynamically activated a tool"
+                            );
                             activated_tools.insert(def.name.clone(), def);
                         }
                     }
@@ -3568,9 +3602,9 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                                     && !core_tools.iter().any(|ct| ct.name == t.name)
                                 {
                                     tracing::info!(
-                                        "activated deferred tool from namespace {:?}: {}",
-                                        ns.name,
-                                        t.name
+                                        namespace = %Safe::name(&ns.name),
+                                        tool = %Safe::name(&t.name),
+                                        "activated a deferred tool from its namespace"
                                     );
                                     activated_tools.insert(t.name.clone(), t.clone());
                                 }
@@ -3718,10 +3752,12 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
             }
         });
         let reasoning = crate::ports::llm::current_reasoning_config();
-        let closing = match self
-            .llm
-            .stream_completion(wind_down_messages, &[], reasoning, wind_down_stream)
-            .await
+        let closing = match crate::telemetry::measured_aux_call(
+            crate::telemetry::LlmPurpose::WindDown,
+            self.llm
+                .stream_completion(wind_down_messages, &[], reasoning, wind_down_stream),
+        )
+        .await
         {
             Ok(response) => {
                 let visible = sanitize_assistant_text(&response.text);
@@ -3740,14 +3776,18 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
         // Persist the whole turn: prompt + tool transcript + closing.
         conv.messages.push(Message::new(Role::Assistant, &closing));
         if is_first_message {
-            let generated = generate_conversation_title(&prompt, self.task_llm()).await;
+            let generated = crate::telemetry::measured_aux_call(
+                crate::telemetry::LlmPurpose::Title,
+                generate_conversation_title(&prompt, self.task_llm()),
+            )
+            .await;
             if !generated.is_empty() {
                 conv.title = generated;
             }
         }
         conv.updated_at = now_timestamp();
-        self.store.update(conv).await?;
         report.outcome = crate::telemetry::TurnOutcome::RoundsExhausted;
+        self.store.update(conv).await?;
         Ok(closing)
     }
 }

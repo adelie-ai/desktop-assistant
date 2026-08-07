@@ -157,14 +157,23 @@ Field summary:
 |---|---|
 | `turn` | `request_id`, `conversation_id`, `user_id`, `connection_id`, `provider`, `model`, then `rounds`, `outcome` and `duration_ms` when it ends |
 | `turn.round` | `round` (one-based), `tools`, `outcome`, and the four token counts the provider reported |
-| `llm.call` | `round`, `provider`, `model`, `outcome` |
+| `llm.call` | `purpose`, `provider`, `model`, plus `round` and `outcome` for a round's own call |
 | `tool.call` | `tool`, `runner` (`client` or `server`), `outcome` |
 | `recall.lookup` | `conversation_id` |
 
-`connection_id`, `provider` and `model` read `unset` when routing fell through
-to the statically configured primary client, because the daemon genuinely does
-not know which connection that is. A sentinel rather than an empty field: an
+`connection_id` reads `unset` when routing fell through to the statically
+configured primary client, because there is no configured connection to name.
+`provider` and `model` still say what ran: the primary is built from `[llm]`
+through the same resolver, so a `[llm]`-only install - the ordinary desktop
+shape - is attributed like any other. A sentinel rather than an empty field: an
 empty field renders as nothing and reads as absent.
+
+A turn also spends provider time outside its rounds - naming a new
+conversation, summarising to fit the window, the recovery ladder after an
+overflow, the wind-down when the round budget runs out. Each of those is an
+`llm.call` span too, hung from the turn rather than from a round, and the
+`purpose` field says which it is. Without them a turn whose four minutes went
+into compaction would decompose into a gap.
 
 ### The two lines an operator greps
 
@@ -266,8 +275,8 @@ report a user files.
 | `turn.duration` | histogram | `outcome` |
 | `turn.rounds` | counter | `outcome` |
 | `turn.round.duration` | histogram | `outcome` |
-| `llm.call.duration` | histogram | `provider`, `model`, `outcome` |
-| `tool.call.duration` | histogram | `tool`, `runner`, `outcome` |
+| `llm.call.duration` | histogram | `provider`, `model`, `purpose`, and `outcome` for a round's own call |
+| `tool.call.duration` | histogram | `tool`, `outcome` |
 | `llm.tokens.input` | counter | `provider`, `model` |
 | `llm.tokens.output` | counter | `provider`, `model` |
 | `llm.tokens.cache_write` | counter | `provider`, `model` |
@@ -293,10 +302,23 @@ identical to a cold one.
 which one. So a total that looks low can be checked against how many calls said
 nothing, which a silent `0` would make impossible.
 
-Every `outcome` and `runner` label is an enum rendering to a `&'static str`, so
-an unbounded value cannot be passed: it has the wrong lifetime. `provider`,
-`model` and `tool` come from operator configuration and from the daemon's own
-tool list. A conversation id, a user id or a request id is never a label.
+Every `outcome` and `purpose` label is an enum rendering to a `&'static str`,
+so an unbounded value cannot be passed: it has the wrong lifetime. `provider`
+and `model` come from operator configuration.
+
+`tool` is the one label whose value the **model** writes, and it is bounded at
+the call site rather than by its type: a name the turn did not advertise this
+round is recorded as `unknown`. Without that, sixty-four invented names - about
+sixty-four rounds of one conversation, and reachable by prompt injection - fill
+this metric's label budget, which has no eviction, and every real tool
+afterwards folds into `cardinality=other` until the process restarts. `runner`
+is on the `tool.call` span rather than on the metric for the same budget
+reason: a span field has no series key to spend.
+
+The daemon raises that budget from the facade's default of 64 to 512, because
+it fronts a fleet of MCP servers and `tool.call.duration` spends one label set
+per (tool, outcome) pair. A conversation id, a user id or a request id is never
+a label.
 
 ## Export to a collector
 

@@ -89,7 +89,13 @@ pub fn record_scan_cycle(
             tracing::info!(
                 cycle = cycle.as_label(),
                 duration_ms,
-                facts_written = written.unwrap_or_default(),
+                // `-` for a cycle that does not count facts, never `0`: the
+                // same rule the token counts follow, for the same reason. A
+                // zero here would read as "consolidation wrote nothing".
+                facts_written = %match written {
+                    Some(n) => n.to_string(),
+                    None => "-".to_string(),
+                },
                 "backend cycle finished"
             );
         }
@@ -102,10 +108,25 @@ pub fn record_scan_cycle(
     }
 }
 
+/// How many distinct label sets one metric may hold before the rest fold into
+/// a single `cardinality=other` series.
+///
+/// The facade's own default is 64, which is right for a small binary and too
+/// small here: the daemon fronts a fleet of MCP servers, and
+/// `tool.call.duration` carries one label set per (tool, outcome) pair. Thirty
+/// or so tools would exhaust the default and collapse the axis that names
+/// which tool is slow - permanently, because the budget has no eviction.
+///
+/// Not a licence to label with anything. Every label the daemon records is
+/// still bounded at its call site; this only sizes the ceiling to what a
+/// bounded set legitimately needs.
+pub const CARDINALITY_CAP: usize = 512;
+
 /// The daemon's telemetry configuration.
 pub fn config() -> Config {
     Config::new(SERVICE_NAME)
         .with_default_filter(DEFAULT_FILTER)
+        .with_cardinality_cap(CARDINALITY_CAP)
         // A closing span writes how long it was open. That is what makes turn
         // timing readable in `kubectl logs` or `journalctl`, where there is no
         // trace backend to open.
@@ -345,6 +366,11 @@ mod tests {
             "and so must what the cycle did\n--- captured at INFO ---\n{text}"
         );
         assert!(
+            !text.contains("facts_written=0"),
+            "a cycle that wrote seven facts must not also report zero\n\
+             --- captured at INFO ---\n{text}"
+        );
+        assert!(
             text.contains("cycle=\"dreaming\""),
             "and which loop it was, so one query covers both\n\
              --- captured at INFO ---\n{text}"
@@ -384,6 +410,49 @@ mod tests {
         assert!(
             text.contains("cycle=\"consolidation\""),
             "--- captured at INFO ---\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_cycle_that_counts_nothing_reports_absence_not_zero() {
+        // Consolidation does not count facts. Reporting `0` would read as "it
+        // wrote nothing", which is a different and wrong statement.
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            record_scan_cycle(
+                BackendCycle::Consolidation,
+                std::time::Duration::from_millis(10),
+                Ok(None),
+            );
+        });
+
+        let text = captured.text();
+        assert!(
+            !text.contains("facts_written=0"),
+            "--- captured at INFO ---\n{text}"
+        );
+        assert!(
+            text.contains("facts_written=-"),
+            "--- captured at INFO ---\n{text}"
+        );
+    }
+
+    #[test]
+    fn the_label_budget_fits_a_tool_fleet() {
+        // `tool.call.duration` spends one label set per (tool, outcome) pair,
+        // so the facade's default of 64 would collapse the tool axis on a
+        // daemon fronting more than about thirty tools. The budget has no
+        // eviction, so that collapse is permanent until the process restarts.
+        assert!(
+            config().cardinality_cap() >= 256,
+            "the daemon's label budget must hold a tool fleet; got {}",
+            config().cardinality_cap()
         );
     }
 

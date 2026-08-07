@@ -1726,15 +1726,30 @@ where
             .resolve_turn(user_driven_selection.as_ref(), effective_selection.as_ref())
             .await?;
 
-        // Where this turn dispatches, for its spans and its metrics. Every
-        // field is `None` when routing fell through to the statically
-        // configured primary client, because the daemon genuinely does not
-        // know which connection or model that is; the core loop reports that
-        // state as `unset` rather than guessing.
-        let route = desktop_assistant_core::ports::turn_telemetry::TurnRoute {
-            connection_id: chosen.as_ref().map(|(c, _)| c.clone()),
-            provider: connector,
-            model: chosen.as_ref().map(|(_, m)| m.clone()),
+        // Where this turn dispatches, for its spans and its metrics.
+        //
+        // When routing resolved a live connection, that is the answer. When it
+        // fell through to the statically configured primary, there is no
+        // connection id - but there is still a connector and a model, because
+        // `main` built that client from `[llm]` through the same resolver read
+        // here. Reporting `unset` for those two would leave every `[llm]`-only
+        // install, which is the ordinary desktop shape, with no provider or
+        // model on any span, any metric or the completion line.
+        let route = match &chosen {
+            Some((connection, model)) => desktop_assistant_core::ports::turn_telemetry::TurnRoute {
+                connection_id: Some(connection.clone()),
+                provider: connector,
+                model: Some(model.clone()),
+            },
+            None => {
+                let primary =
+                    crate::config::resolve_llm_config(Some(&self.registry.snapshot_config()));
+                desktop_assistant_core::ports::turn_telemetry::TurnRoute {
+                    connection_id: None,
+                    provider: Some(primary.connector),
+                    model: Some(primary.model),
+                }
+            }
         };
 
         // The turn's tool-discovery mode is NOT logged here, deliberately.

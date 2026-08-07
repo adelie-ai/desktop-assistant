@@ -67,6 +67,15 @@ const TOOL_ARGUMENT_SENTINEL: &str = "SENTINEL-ARGUMENT-sk-live-AND-A-HOME-PATH"
 /// The model's own reply text.
 const REPLY_SENTINEL: &str = "SENTINEL-REPLY-WHAT-THE-MODEL-CONCLUDED";
 
+/// What a tool returned. The largest content surface in the loop: a file, a
+/// web page, a database row.
+const TOOL_RESULT_SENTINEL: &str = "SENTINEL-RESULT-THE-FILE-THIS-TOOL-READ";
+
+/// What a failing tool said it could not do. Shaped like the real thing,
+/// which quotes the path or the command it was given.
+const TOOL_ERROR_SENTINEL: &str =
+    "failed to read /home/example/.ssh/SENTINEL-ERROR-ED25519: permission denied";
+
 /// The conversation id used by turns that check label bounding. Distinctive
 /// enough that finding it in a label value is unambiguous.
 const CONVERSATION_ID: &str = "conv-SENTINEL-UNBOUNDED-CONVERSATION-ID";
@@ -496,13 +505,25 @@ impl ConversationStore for MemStore {
     }
 }
 
+/// One scripted provider turn: a reply, or a failure.
+enum Reply {
+    Answer(Box<LlmResponse>),
+    Fail(CoreError),
+}
+
+impl From<LlmResponse> for Reply {
+    fn from(response: LlmResponse) -> Self {
+        Self::Answer(Box::new(response))
+    }
+}
+
 /// An LLM that replays a script, so the turn's shape is fixed by the test.
 struct ScriptedLlm {
-    responses: Mutex<Vec<LlmResponse>>,
+    responses: Mutex<Vec<Reply>>,
 }
 
 impl ScriptedLlm {
-    fn new(responses: Vec<LlmResponse>) -> Self {
+    fn new(responses: Vec<Reply>) -> Self {
         Self {
             responses: Mutex::new(responses),
         }
@@ -518,12 +539,16 @@ impl LlmClient for ScriptedLlm {
         _reasoning: ReasoningConfig,
         mut on_chunk: ChunkCallback,
     ) -> Result<LlmResponse, CoreError> {
-        let response = {
+        let reply = {
             let mut responses = self.responses.lock().unwrap();
             if responses.is_empty() {
                 return Ok(LlmResponse::text("done"));
             }
             responses.remove(0)
+        };
+        let response = match reply {
+            Reply::Answer(response) => *response,
+            Reply::Fail(error) => return Err(error),
         };
         if !response.text.is_empty() {
             on_chunk(response.text.clone());
@@ -549,7 +574,7 @@ impl ScriptedTools {
     fn failing() -> Self {
         Self {
             tools: vec![write_note()],
-            failure: Some("the tool refused".to_string()),
+            failure: Some(TOOL_ERROR_SENTINEL.to_string()),
         }
     }
 }
@@ -586,13 +611,16 @@ impl ToolExecutor for ScriptedTools {
     ) -> Result<String, CoreError> {
         match &self.failure {
             Some(message) => Err(CoreError::ToolExecution(message.clone())),
-            None => Ok("ok".to_string()),
+            // The tool's own output is content and belongs at DEBUG. Returning
+            // a sentinel rather than "ok" is what lets the leak tests see the
+            // largest content surface the loop handles.
+            None => Ok(TOOL_RESULT_SENTINEL.to_string()),
         }
     }
 }
 
 fn handler(
-    responses: Vec<LlmResponse>,
+    responses: Vec<Reply>,
     tools: ScriptedTools,
 ) -> ConversationHandler<MemStore, ScriptedLlm, ScriptedTools> {
     ConversationHandler::with_tools(
@@ -621,19 +649,29 @@ fn tool_call(id: &str) -> ToolCall {
 }
 
 /// Two tool rounds then an answer, each round reporting its own usage.
-fn three_round_script() -> Vec<LlmResponse> {
+fn three_round_script() -> Vec<Reply> {
     vec![
-        LlmResponse::with_tool_calls("", vec![tool_call("c1")]).with_usage(usage(100, 10)),
-        LlmResponse::with_tool_calls("", vec![tool_call("c2")]).with_usage(usage(200, 20)),
-        LlmResponse::text(REPLY_SENTINEL).with_usage(usage(300, 30)),
+        LlmResponse::with_tool_calls("", vec![tool_call("c1")])
+            .with_usage(usage(100, 10))
+            .into(),
+        LlmResponse::with_tool_calls("", vec![tool_call("c2")])
+            .with_usage(usage(200, 20))
+            .into(),
+        LlmResponse::text(REPLY_SENTINEL)
+            .with_usage(usage(300, 30))
+            .into(),
     ]
 }
 
 /// One tool round then an answer.
-fn two_round_script() -> Vec<LlmResponse> {
+fn two_round_script() -> Vec<Reply> {
     vec![
-        LlmResponse::with_tool_calls("", vec![tool_call("c1")]).with_usage(usage(100, 10)),
-        LlmResponse::text(REPLY_SENTINEL).with_usage(usage(200, 20)),
+        LlmResponse::with_tool_calls("", vec![tool_call("c1")])
+            .with_usage(usage(100, 10))
+            .into(),
+        LlmResponse::text(REPLY_SENTINEL)
+            .with_usage(usage(200, 20))
+            .into(),
     ]
 }
 
@@ -649,7 +687,10 @@ async fn one_turn(handler: &ConversationHandler<MemStore, ScriptedLlm, ScriptedT
         with_request_id(
             REQUEST_ID.to_string(),
             with_turn_route(route(), async {
-                handler
+                // The result is deliberately dropped. Half the paths under
+                // test end in an error, and what they are being tested for is
+                // what they recorded on the way out.
+                let _ = handler
                     .send_prompt_with_override(
                         &conv.id,
                         PROMPT_SENTINEL.to_string(),
@@ -659,15 +700,14 @@ async fn one_turn(handler: &ConversationHandler<MemStore, ScriptedLlm, ScriptedT
                         Box::new(|_| {}),
                         CancellationToken::new(),
                     )
-                    .await
-                    .expect("the turn completes");
+                    .await;
             }),
         ),
     )
     .await;
 }
 
-fn run(level: Level, responses: Vec<LlmResponse>, tools: ScriptedTools) -> Captured {
+fn run(level: Level, responses: Vec<Reply>, tools: ScriptedTools) -> Captured {
     capture(level, async move {
         let handler = handler(responses, tools);
         one_turn(&handler).await;
@@ -882,12 +922,16 @@ fn missing_token_counts_are_not_recorded_as_zero() {
     // A connector that reports input but not output. Recording `0` for the
     // absence would silently understate every total that includes it, with no
     // way afterwards to tell a real zero from a missing number.
-    let script = vec![LlmResponse::text(REPLY_SENTINEL).with_usage(TokenUsage {
-        input_tokens: Some(100),
-        output_tokens: None,
-        cache_creation_input_tokens: None,
-        cache_read_input_tokens: None,
-    })];
+    let script = vec![
+        LlmResponse::text(REPLY_SENTINEL)
+            .with_usage(TokenUsage {
+                input_tokens: Some(100),
+                output_tokens: None,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            })
+            .into(),
+    ];
     let captured = run(Level::INFO, script, ScriptedTools::ok());
 
     assert_eq!(
@@ -924,12 +968,16 @@ fn cache_token_counts_are_recorded_when_present() {
     // On a caching provider the cache counts are the whole cost story: a cache
     // read costs a fraction of a fresh input token, so reporting input alone
     // makes a well-cached turn look identical to a cold one.
-    let script = vec![LlmResponse::text(REPLY_SENTINEL).with_usage(TokenUsage {
-        input_tokens: Some(100),
-        output_tokens: Some(10),
-        cache_creation_input_tokens: Some(40),
-        cache_read_input_tokens: Some(4_000),
-    })];
+    let script = vec![
+        LlmResponse::text(REPLY_SENTINEL)
+            .with_usage(TokenUsage {
+                input_tokens: Some(100),
+                output_tokens: Some(10),
+                cache_creation_input_tokens: Some(40),
+                cache_read_input_tokens: Some(4_000),
+            })
+            .into(),
+    ];
     let captured = run(Level::INFO, script, ScriptedTools::ok());
 
     assert_eq!(captured.counter_delta("llm.tokens.cache_write", &[]), 40);
@@ -1052,11 +1100,22 @@ fn a_turn_decomposes_into_provider_time_and_tool_time() {
     assert_eq!(
         captured.histogram_delta(
             "llm.call.duration",
-            &[&format!("model={MODEL}"), &format!("provider={PROVIDER}")]
+            &[
+                &format!("model={MODEL}"),
+                &format!("provider={PROVIDER}"),
+                "purpose=turn",
+            ]
         ),
         2,
         "each round's provider call is measured by provider and model, so a \
          slow provider is attributable without reproducing the turn"
+    );
+    assert_eq!(
+        captured.histogram_delta("llm.call.duration", &["purpose=title"]),
+        1,
+        "and the provider time a turn spends outside its rounds - here naming \
+         a new conversation - is measured too, separated by purpose, so a turn \
+         whose minutes went into an overhead does not decompose into a gap"
     );
     assert_eq!(
         captured.histogram_delta("tool.call.duration", &["tool=write_note", "outcome=ok"]),
@@ -1085,32 +1144,101 @@ fn a_failing_tool_is_measured_as_a_failure() {
 // The level contract (epic D10), on the new surface.
 // ---------------------------------------------------------------------------
 
+/// Every sentinel, so a failure names which content-bearing value leaked
+/// rather than only that something did.
+const SENTINELS: [(&str, &str); 5] = [
+    ("the user's prompt", PROMPT_SENTINEL),
+    ("a tool call's arguments", TOOL_ARGUMENT_SENTINEL),
+    ("the model's reply", REPLY_SENTINEL),
+    ("a tool's output", TOOL_RESULT_SENTINEL),
+    ("a failing tool's message", TOOL_ERROR_SENTINEL),
+];
+
+/// Every path a turn can take, so the content assertion covers the failure
+/// arms and not only the one that works.
+///
+/// Each case names the round outcome it must produce, which is what stops a
+/// case passing vacuously: a "failure" that silently succeeded would assert
+/// that nothing leaked from a path that never ran.
+fn every_turn_path() -> Vec<(&'static str, Vec<Reply>, ScriptedTools, &'static str)> {
+    vec![
+        (
+            "the model answers after a tool round",
+            two_round_script(),
+            ScriptedTools::ok(),
+            "answered",
+        ),
+        (
+            "a tool fails and the turn carries on",
+            two_round_script(),
+            ScriptedTools::failing(),
+            "tool_error",
+        ),
+        (
+            "the provider call fails",
+            vec![Reply::Fail(CoreError::Llm(
+                "the provider is unreachable".to_string(),
+            ))],
+            ScriptedTools::ok(),
+            "llm_error",
+        ),
+        (
+            "the turn is cancelled mid-stream",
+            vec![Reply::Fail(CoreError::Cancelled)],
+            ScriptedTools::ok(),
+            "cancelled",
+        ),
+    ]
+}
+
 #[test]
 fn turn_span_records_no_content() {
     let _serialised = serialised();
-    let captured = run(Level::INFO, two_round_script(), ScriptedTools::ok());
+    for (name, script, tools, _) in every_turn_path() {
+        let captured = run(Level::INFO, script, tools);
 
-    // Span fields first: an `#[instrument]` without `skip` captures its
-    // arguments, and nothing prints them, so this is invisible on the console
-    // and still exports over OTLP.
-    for span in &captured.spans {
-        for (key, value) in &span.fields {
-            for sentinel in [PROMPT_SENTINEL, TOOL_ARGUMENT_SENTINEL, REPLY_SENTINEL] {
-                assert!(
-                    !value.contains(sentinel),
-                    "span `{}` field `{key}` carries content: {value}",
-                    span.name
-                );
+        // Span fields first: an `#[instrument]` without `skip` captures its
+        // arguments, and nothing prints them, so this is invisible on the
+        // console and still exports over OTLP.
+        for span in &captured.spans {
+            for (key, value) in &span.fields {
+                for (what, sentinel) in SENTINELS {
+                    assert!(
+                        !value.contains(sentinel),
+                        "on the path where {name}: span `{}` field `{key}` \
+                         carries {what}: {value}",
+                        span.name
+                    );
+                }
             }
         }
-    }
 
-    // Then events, which the console does show.
-    for sentinel in [PROMPT_SENTINEL, TOOL_ARGUMENT_SENTINEL, REPLY_SENTINEL] {
+        // Then events, which the console does show.
+        for (what, sentinel) in SENTINELS {
+            assert!(
+                !captured.console.contains(sentinel),
+                "on the path where {name}: {what} reached an INFO line\n\
+                 --- console ---\n{}",
+                captured.console
+            );
+        }
+    }
+}
+
+#[test]
+fn every_probed_path_really_took_the_path_it_names() {
+    let _serialised = serialised();
+    // A leak test that drives a "failure" which silently succeeds passes
+    // vacuously - it asserts nothing leaked from a path that never ran. This
+    // asserts each case in the table produced the round outcome it claims.
+    for (name, script, tools, outcome) in every_turn_path() {
+        let captured = run(Level::INFO, script, tools);
+        let rounds = captured.spans_named("turn.round");
+        let observed: Vec<Option<&str>> = rounds.iter().map(|r| r.field("outcome")).collect();
         assert!(
-            !captured.console.contains(sentinel),
-            "`{sentinel}` reached an INFO line\n--- console ---\n{}",
-            captured.console
+            observed.contains(&Some(outcome)),
+            "the case where {name} must produce a round with outcome \
+             `{outcome}`; got {observed:?}"
         );
     }
 }
@@ -1119,15 +1247,26 @@ fn turn_span_records_no_content() {
 fn the_content_test_can_see_content_when_there_is_some() {
     let _serialised = serialised();
     // The positive control for `turn_span_records_no_content`. Without it that
-    // test cannot tell "nothing leaked" from "nothing ran": tool arguments are
-    // logged at DEBUG deliberately, so they must be visible when asked for.
-    let captured = run(Level::TRACE, two_round_script(), ScriptedTools::ok());
+    // test cannot tell "nothing leaked" from "nothing ran": each value below
+    // is logged at DEBUG deliberately, so each must be visible when asked for.
+    let ok = run(Level::TRACE, two_round_script(), ScriptedTools::ok());
+    for (what, sentinel) in [
+        ("a tool call's arguments", TOOL_ARGUMENT_SENTINEL),
+        ("a tool's output", TOOL_RESULT_SENTINEL),
+    ] {
+        assert!(
+            ok.console.contains(sentinel),
+            "{what} belongs at DEBUG, so an operator who needs it can ask\n\
+             --- console ---\n{}",
+            ok.console
+        );
+    }
 
+    let failed = run(Level::TRACE, two_round_script(), ScriptedTools::failing());
     assert!(
-        captured.console.contains(TOOL_ARGUMENT_SENTINEL),
-        "tool arguments belong at DEBUG, so an operator who needs them can ask\n\
-         --- console ---\n{}",
-        captured.console
+        failed.console.contains(TOOL_ERROR_SENTINEL),
+        "a failing tool's message belongs at DEBUG too\n--- console ---\n{}",
+        failed.console
     );
 }
 
@@ -1170,8 +1309,11 @@ fn a_model_chosen_tool_name_cannot_forge_a_log_line() {
                 serde_json::json!({}).to_string(),
             )],
         )
-        .with_usage(usage(100, 10)),
-        LlmResponse::text(REPLY_SENTINEL).with_usage(usage(200, 20)),
+        .with_usage(usage(100, 10))
+        .into(),
+        LlmResponse::text(REPLY_SENTINEL)
+            .with_usage(usage(200, 20))
+            .into(),
     ];
     let tools = ScriptedTools {
         tools: vec![ToolDefinition::new(
@@ -1210,6 +1352,67 @@ fn a_model_chosen_tool_name_cannot_forge_a_log_line() {
     assert!(
         !labels.iter().any(|v| v.contains('\n')),
         "and no metric label may carry a newline; got {labels:?}"
+    );
+}
+
+#[test]
+fn an_invented_tool_name_cannot_burn_the_metric_budget() {
+    let _serialised = serialised();
+    // The registry caps a metric at 64 distinct label sets, first come, with
+    // no eviction. A tool name comes straight off the model's reply and an
+    // invented one is dispatched, fails, and is recorded like any other - so
+    // without a bound, sixty-four invented names, about sixty-four rounds of
+    // one conversation, would kill per-tool latency until the process
+    // restarts. Every real tool afterwards would fold into `cardinality=other`.
+    let mut script: Vec<Reply> = (0..8)
+        .map(|i| {
+            LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new(
+                    format!("c{i}"),
+                    format!("invented_tool_{i}"),
+                    serde_json::json!({}).to_string(),
+                )],
+            )
+            .with_usage(usage(10, 1))
+            .into()
+        })
+        .collect();
+    script.push(
+        LlmResponse::text(REPLY_SENTINEL)
+            .with_usage(usage(20, 2))
+            .into(),
+    );
+    let captured = run(Level::INFO, script, ScriptedTools::ok());
+
+    let values = label_values_in_window(&captured.after);
+    let invented: Vec<&String> = values
+        .iter()
+        .filter(|v| v.starts_with("invented_tool_"))
+        .collect();
+    assert!(
+        invented.is_empty(),
+        "a name this turn never advertised must not become its own series; \
+         got {invented:?}"
+    );
+    assert_eq!(
+        captured.histogram_delta("tool.call.duration", &["tool=unknown"]),
+        8,
+        "the dispatches are still counted - under one bounded name, so an \
+         operator can see that unadvertised names are being called at all"
+    );
+}
+
+#[test]
+fn an_advertised_tool_keeps_its_own_name() {
+    let _serialised = serialised();
+    // The other half of the bound. Folding every name to `unknown` would pass
+    // the test above and destroy the axis it exists to protect.
+    let captured = run(Level::INFO, two_round_script(), ScriptedTools::ok());
+    assert_eq!(
+        captured.histogram_delta("tool.call.duration", &["tool=write_note"]),
+        1,
+        "a tool the turn advertised is recorded under its own name"
     );
 }
 

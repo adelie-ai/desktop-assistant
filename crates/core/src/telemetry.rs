@@ -45,11 +45,16 @@
 //!
 //! The metrics registry caps a metric at 64 distinct label sets, first come,
 //! with no eviction. Once burned, that dimension is dead until the process
-//! restarts. So every outcome label is an enum rendering to `&'static str`,
-//! which makes an unbounded value impossible to pass, and the two
-//! caller-influenced axes - model and provider - come from operator
-//! configuration rather than from a prompt. A conversation id, a user id or a
-//! request id is never a label.
+//! restarts.
+//!
+//! So every outcome and purpose label is an enum rendering to `&'static str`,
+//! which makes an unbounded value impossible to pass, and `provider` and
+//! `model` come from operator configuration rather than from a prompt.
+//!
+//! One label is not bounded by its type, and it is the one to keep an eye on:
+//! `tool`, whose value the **model** writes. It is bounded at the call site
+//! instead - a name the turn did not advertise is recorded as [`UNKNOWN_TOOL`].
+//! A conversation id, a user id or a request id is never a label.
 
 use std::fmt;
 use std::time::Duration;
@@ -77,8 +82,22 @@ pub(crate) const ROUND_DURATION: &str = "turn.round.duration";
 /// How long one provider call took, by provider, model and outcome.
 pub(crate) const LLM_CALL_DURATION: &str = "llm.call.duration";
 
-/// How long one tool dispatch took, by tool name, where it ran, and outcome.
+/// How long one tool dispatch took, by tool name and outcome.
+///
+/// **Not** by where it ran. `runner` is on the span, where a series key costs
+/// nothing; on the metric it would double the label sets this one name spends,
+/// and the tool axis is the one under pressure.
 pub(crate) const TOOL_CALL_DURATION: &str = "tool.call.duration";
+
+/// The `tool` label for a name this turn never advertised.
+///
+/// A model can emit any string as a tool name, and an invented one is
+/// dispatched, fails, and is recorded like any other. Without this, sixty-four
+/// invented names - about sixty-four rounds of one conversation - fill the
+/// registry's per-metric label budget, which has no eviction, and every real
+/// tool afterwards folds into `cardinality=other` until the process restarts.
+/// So a name the turn did not offer is not a name; it is this.
+pub(crate) const UNKNOWN_TOOL: &str = "unknown";
 
 /// Prompt tokens the provider reported, by provider and model.
 pub(crate) const TOKENS_INPUT: &str = "llm.tokens.input";
@@ -143,6 +162,11 @@ pub(crate) enum RoundOutcome {
     ToolError,
     /// The provider call itself failed.
     LlmError,
+    /// The round produced nothing the turn could use and it went round again
+    /// with different settings - the hosted-search demotion. Distinct from a
+    /// cancellation, which is what it read as before, and distinct from an
+    /// error, because nothing failed.
+    Retried,
     /// The round did not finish: the turn was cancelled inside it.
     Cancelled,
 }
@@ -154,6 +178,7 @@ impl RoundOutcome {
             Self::ToolsCalled => "tools_called",
             Self::ToolError => "tool_error",
             Self::LlmError => "llm_error",
+            Self::Retried => "retried",
             Self::Cancelled => "cancelled",
         }
     }
@@ -235,6 +260,81 @@ pub(crate) fn round_span(round: usize) -> tracing::Span {
     )
 }
 
+/// Which of a turn's provider calls this is.
+///
+/// A turn spends provider time outside its rounds - a title on the first
+/// message, a compaction summary, the recovery ladder after an overflow, the
+/// wind-down when the round budget runs out. Without this axis those calls are
+/// a gap in the trace, and a turn whose four minutes went into compaction
+/// decomposes into nothing an operator can act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LlmPurpose {
+    /// A round of the tool loop: the model answering the user.
+    Turn,
+    /// Naming a new conversation from its first message.
+    Title,
+    /// Summarising the transcript to fit the window.
+    Compaction,
+    /// The ladder that runs after the provider rejects an oversized prompt.
+    OverflowRecovery,
+    /// The closing reply when the round budget is spent.
+    WindDown,
+}
+
+impl LlmPurpose {
+    pub(crate) fn as_label(self) -> &'static str {
+        match self {
+            Self::Turn => "turn",
+            Self::Title => "title",
+            Self::Compaction => "compaction",
+            Self::OverflowRecovery => "overflow_recovery",
+            Self::WindDown => "wind_down",
+        }
+    }
+}
+
+/// A provider call a turn makes outside its rounds, hung from the turn itself.
+///
+/// The turn span is current wherever these are built, so the parent is
+/// contextual rather than named. Unlike a round's call they have no round to
+/// hang from - they are the turn's own overheads.
+pub(crate) fn aux_llm_span(purpose: LlmPurpose) -> tracing::Span {
+    let route = crate::ports::turn_telemetry::current_turn_route();
+    tracing::info_span!(
+        "llm.call",
+        purpose = purpose.as_label(),
+        provider = route.provider(),
+        model = route.model(),
+    )
+}
+
+/// Measure a provider call a turn makes outside its rounds.
+///
+/// Returns whatever the call returned, so a call site wraps rather than
+/// restructures. The measurement lands on the same histogram as a round's
+/// call, separated by the `purpose` label, so one query answers "where did the
+/// provider time go" for the whole turn.
+pub(crate) async fn measured_aux_call<F, T>(purpose: LlmPurpose, call: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    use tracing::Instrument;
+    let started = std::time::Instant::now();
+    let outcome = call.instrument(aux_llm_span(purpose)).await;
+    let route = crate::ports::turn_telemetry::current_turn_route();
+    let [provider, model] = route_labels(&route);
+    // These helpers absorb their own failures and answer with a fallback, so
+    // there is no outcome to report beyond "a call happened and took this
+    // long". A failure shows as a duration in the bucket the timeout lands in,
+    // and on the WARN line the helper itself writes.
+    metrics::record_duration(
+        LLM_CALL_DURATION,
+        started.elapsed(),
+        &[provider, model, Label::new("purpose", purpose.as_label())],
+    );
+    outcome
+}
+
 /// One provider call, hung from its round.
 ///
 /// The parent is explicit because the round span is never *entered*: entering
@@ -245,6 +345,7 @@ pub(crate) fn llm_span(parent: &tracing::Span, round: usize, route: &TurnRoute) 
     tracing::info_span!(
         parent: parent,
         "llm.call",
+        purpose = LlmPurpose::Turn.as_label(),
         round = round,
         provider = route.provider(),
         model = route.model(),
@@ -312,24 +413,34 @@ pub(crate) fn record_llm_call(elapsed: Duration, route: &TurnRoute, ok: bool) {
         &[
             provider,
             model,
+            Label::new("purpose", LlmPurpose::Turn.as_label()),
             Label::new("outcome", if ok { "ok" } else { "error" }),
         ],
     );
 }
 
 /// Record a finished tool dispatch.
+///
+/// `advertised` is whether this turn actually offered the name. It is the
+/// caller's answer rather than something read here, because only the turn
+/// knows what it put in front of the model this round. A name it did not offer
+/// is recorded as [`UNKNOWN_TOOL`]: see that constant for what it prevents.
 pub(crate) fn record_tool_call(
     elapsed: Duration,
     tool: &str,
-    runner: ToolRunner,
+    advertised: bool,
     outcome: ToolOutcome,
 ) {
+    let tool = if advertised {
+        Safe::name(tool).to_string()
+    } else {
+        UNKNOWN_TOOL.to_string()
+    };
     metrics::record_duration(
         TOOL_CALL_DURATION,
         elapsed,
         &[
-            Label::new("tool", Safe::name(tool).to_string()),
-            Label::new("runner", runner.as_label()),
+            Label::new("tool", tool),
             Label::new("outcome", outcome.as_label()),
         ],
     );
@@ -372,6 +483,9 @@ pub(crate) fn record_token_usage(usage: Option<&TokenUsage>, route: &TurnRoute) 
         }
     }
 }
+
+/// The most tool names one round's span attribute lists by name.
+const MAX_TOOLS_ON_SPAN: usize = 16;
 
 /// A token count the provider may not have reported.
 ///
@@ -418,31 +532,67 @@ impl TokenTotals {
     }
 }
 
-/// What a turn reports when it ends.
+/// One turn, reported when it ends by any path.
 ///
 /// The turn body has several exits - an answer, a cancellation, a user-visible
 /// error, an exhausted round budget - and one completion line has to cover all
-/// of them. So the body fills this in as it runs and the caller reads it once,
-/// rather than each exit remembering to write its own line.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct TurnReport {
+/// of them. So the body fills this in as it runs and the reporting happens on
+/// drop, for the same reason [`RoundGuard`] does: an exit that has to remember
+/// to write its own line is an exit that will not, and a turn that ends by
+/// panicking is one worth having a line for.
+///
+/// The default outcome is [`TurnOutcome::Failed`], so an exit nobody
+/// classified reads as a problem rather than as a success.
+pub(crate) struct TurnGuard {
+    span: tracing::Span,
+    started: std::time::Instant,
     /// How many rounds of the tool loop the turn ran.
     pub(crate) rounds: usize,
-    /// How the turn ended. `Failed` until a path says otherwise, so an exit
-    /// nobody classified reads as a problem rather than as a success.
+    /// How the turn ended.
     pub(crate) outcome: TurnOutcome,
     /// The turn's tokens, summed from its rounds rather than counted
     /// separately, so the two can never disagree.
     pub(crate) tokens: TokenTotals,
 }
 
-impl Default for TurnReport {
-    fn default() -> Self {
+impl TurnGuard {
+    /// Open a turn against the span it runs inside.
+    pub(crate) fn new(span: tracing::Span) -> Self {
         Self {
+            span,
+            started: std::time::Instant::now(),
             rounds: 0,
             outcome: TurnOutcome::Failed,
             tokens: TokenTotals::default(),
         }
+    }
+}
+
+impl Drop for TurnGuard {
+    fn drop(&mut self) {
+        let elapsed = self.started.elapsed();
+        record_turn(elapsed, self.rounds, self.outcome);
+        self.span.record("rounds", self.rounds);
+        self.span.record("outcome", self.outcome.as_label());
+        self.span.record("duration_ms", elapsed.as_millis() as u64);
+        let tokens = self.tokens;
+        let outcome = self.outcome;
+        let rounds = self.rounds;
+        // The one line an operator greps. Emitted inside the turn span so it
+        // carries the ids too.
+        self.span.in_scope(|| {
+            tracing::info!(
+                duration_ms = elapsed.as_millis() as u64,
+                model = crate::ports::turn_telemetry::current_turn_route().model(),
+                rounds = rounds,
+                input_tokens = %Count(tokens.input),
+                output_tokens = %Count(tokens.output),
+                cache_write_tokens = %Count(tokens.cache_write),
+                cache_read_tokens = %Count(tokens.cache_read),
+                outcome = outcome.as_label(),
+                "turn finished"
+            );
+        });
     }
 }
 
@@ -506,9 +656,23 @@ impl RoundGuard {
 
     /// Note which tools this round called. Names only, each rendered through
     /// [`Safe`] because the model chooses them.
+    ///
+    /// The list is capped as well as each name, because nothing bounds how
+    /// many calls a provider returns in one response and the whole attribute
+    /// is exported when the span closes. Past the cap the count is kept, which
+    /// is the part worth reading anyway.
     pub(crate) fn set_tools(&mut self, names: impl Iterator<Item = String>) {
         let names: Vec<String> = names.map(|n| Safe::name(n).to_string()).collect();
-        self.span.record("tools", names.join(","));
+        let rendered = if names.len() <= MAX_TOOLS_ON_SPAN {
+            names.join(",")
+        } else {
+            format!(
+                "{},and {} more",
+                names[..MAX_TOOLS_ON_SPAN].join(","),
+                names.len() - MAX_TOOLS_ON_SPAN
+            )
+        };
+        self.span.record("tools", rendered);
     }
 
     /// Note how the round ended.
@@ -617,6 +781,7 @@ mod tests {
             RoundOutcome::ToolsCalled,
             RoundOutcome::ToolError,
             RoundOutcome::LlmError,
+            RoundOutcome::Retried,
             RoundOutcome::Cancelled,
         ]
         .map(RoundOutcome::as_label);
