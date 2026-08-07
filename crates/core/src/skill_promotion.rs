@@ -398,20 +398,27 @@ pub fn render_offer(plan: &PromotablePlan, existing: &[IndexedSkill]) -> serde_j
             })
         })
         .collect();
-    let amend = !matches.is_empty();
+    // The hint has to agree with what `decide` will actually allow. Amend only
+    // works on the assistant's own unadopted drafts, so hinting at it when
+    // every match belongs to a person would steer the model into a refusal.
+    let amendable = existing.iter().take(MAX_OFFERED_MATCHES).any(is_own_draft);
+    let covered = !matches.is_empty();
     serde_json::json!({
         "tool": PROMOTE_PLAN_TOOL,
         "steps": plan.working_steps().len(),
-        "mode_hint": if amend { "amend" } else { "new" },
+        "mode_hint": if amendable { "amend" } else { "new" },
         "existing": matches,
         "bar": "Offer it only if the method would work again on different inputs. \
                 A question answered, a file written, or a one-off fix is not a skill.",
-        "note": if amend {
-            "The library may already cover this. Amend the closest match rather than \
-             adding a second skill about the same thing, or say nothing and it is dropped."
-        } else {
-            "Call the tool if this generalises. Saying nothing drops the plan, which \
-             costs nothing."
+        "note": match (covered, amendable) {
+            (_, true) => "The library already has a draft close to this. Amend that draft \
+                          rather than adding a second skill about the same thing, or say \
+                          nothing and this is dropped.",
+            (true, false) => "The library already covers this, and those skills are not \
+                              yours to revise. Add one only if your method is genuinely \
+                              different; otherwise say nothing and this is dropped.",
+            (false, false) => "Call the tool if this generalises. Saying nothing drops the \
+                               plan, which costs nothing.",
         },
     })
 }
@@ -1088,6 +1095,29 @@ mod tests {
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0]["name"], "fix-replayed-migration");
         assert_eq!(offer["mode_hint"], "amend");
+    }
+
+    /// The hint must agree with what the write will allow: a match a person
+    /// owns cannot be amended, so steering the model at it would only produce
+    /// a refusal.
+    #[test]
+    fn offer_does_not_hint_at_amending_a_skill_a_person_owns() {
+        let plan = assess(good_plan(), false).expect("clears the bar");
+        let mut theirs = indexed("fix-replayed-migration", "Repair a migration that replays.");
+        theirs.approved_at = Some(chrono::Utc::now());
+        let offer = render_offer(&plan, &[theirs]);
+        assert_eq!(offer["mode_hint"], "new");
+        assert_eq!(
+            offer["existing"].as_array().expect("array").len(),
+            1,
+            "the match is still named, so the model can decline knowingly"
+        );
+        assert!(
+            offer["note"]
+                .as_str()
+                .expect("a note")
+                .contains("not yours to revise")
+        );
     }
 
     #[test]
