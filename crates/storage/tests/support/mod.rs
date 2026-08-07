@@ -12,11 +12,13 @@
 //! Included by each integration test via `mod support;` (it lives in a
 //! subdirectory so cargo does not compile it as its own test binary).
 
-use std::sync::Arc;
+use std::io;
 use std::sync::Once;
+use std::sync::{Arc, Mutex};
 
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
+use tracing::Level;
 use uuid::Uuid;
 
 static SKIP_BANNER: Once = Once::new();
@@ -200,4 +202,128 @@ impl DbFixture {
         }
         admin.close().await;
     }
+}
+
+/// An `io::Write` sink that appends into a shared buffer, so a `fmt` layer's
+/// writer closures (which each construct a fresh handle) all land in the same
+/// place.
+#[derive(Clone)]
+struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+impl io::Write for SharedBuf {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.0
+            .lock()
+            .expect("lock capture buffer")
+            .extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+static PERMISSIVE_GLOBAL_DEFAULT: Once = Once::new();
+
+/// Install a permissive baseline subscriber as the process-wide global
+/// default, once per test binary.
+///
+/// `tracing` caches each callsite's `Interest` globally, not per thread. Without
+/// this, a callsite first evaluated on a thread that has no `set_default`
+/// override (the ambient no-op default, which accepts nothing) latches
+/// "never" for the whole process -- and then a *different* thread's
+/// `capture_tracing` call below never sees that callsite's event at all,
+/// because interest is checked before dispatch, upstream of which subscriber
+/// is current. This showed up as a rare flake: the assertion failed only when
+/// several tests using `capture_tracing` ran concurrently with tests that
+/// don't, never when run alone.
+///
+/// The fix is to make every subscriber this module ever installs -- this one
+/// and the per-call one below -- accept everything down to `TRACE`, with an
+/// explicit `with_max_level`. `tracing_subscriber::fmt()` defaults to
+/// `LevelFilter::INFO` (its own `DEFAULT_MAX_LEVEL`), so without this call a
+/// `warn!` line still gets through -- WARN is more severe than INFO, so it
+/// passes an INFO cap -- but a `debug!` or `trace!` line would not: its
+/// callsite could still latch "never" on a thread with no override, and this
+/// module's own subscribers would never lift that cap back up. Setting the
+/// cap explicitly to `TRACE` here removes the level as a variable entirely,
+/// rather than leaving this module's coverage keyed to whichever levels its
+/// current callers happen to use.
+/// Build the permissive baseline subscriber's configuration. Factored out of
+/// [`ensure_permissive_global_default`] so [`permissive_global_default_max_level`]
+/// can inspect it directly through the public `Subscriber::max_level_hint`
+/// trait method, rather than through `Dispatch`, whose own `max_level_hint`
+/// wrapper is private to `tracing-core` and unreachable from a test.
+fn build_permissive_subscriber() -> impl tracing::Subscriber + Send + Sync + 'static {
+    tracing_subscriber::fmt()
+        .with_max_level(Level::TRACE)
+        .with_writer(io::sink)
+        .finish()
+}
+
+fn ensure_permissive_global_default() {
+    PERMISSIVE_GLOBAL_DEFAULT.call_once(|| {
+        tracing::subscriber::set_global_default(build_permissive_subscriber())
+            .expect("install the permissive global default subscriber exactly once");
+    });
+}
+
+/// Test-only: the level cap [`build_permissive_subscriber`] declares -- the
+/// same configuration [`ensure_permissive_global_default`] installs.
+///
+/// This is a deliberately narrow, white-box seam onto an otherwise-private
+/// function. A *behavioral* test -- capture a `debug!`/`trace!` line and
+/// check it arrived -- cannot mutation-kill a dropped `with_max_level` on
+/// the global default specifically, and not because the cap stopped
+/// mattering: `Interest::and` resolves disagreement between two dispatchers
+/// as `Sometimes` (ask again dynamically), not `Never`, so as long as
+/// *some* dispatcher active at event time -- typically `capture_tracing`'s
+/// own per-call one -- has a high enough cap, the event still gets through
+/// even when the global default's cap is low. The global default's cap
+/// only decides the outcome in the narrower, scheduling-dependent race it
+/// was added for (a callsite whose *very first* evaluation, on some other
+/// thread, happens before any correctly-capped dispatcher has ever
+/// registered) -- which a single deterministic test cannot reliably force.
+/// Reading the declared cap directly instead pins the one thing a dropped
+/// `with_max_level` here actually changes.
+pub fn permissive_global_default_max_level() -> Option<tracing::level_filters::LevelFilter> {
+    use tracing::Subscriber;
+    build_permissive_subscriber().max_level_hint()
+}
+
+/// Run `f` under a `fmt` subscriber that writes every emitted event into a
+/// buffer, and return `f`'s result alongside the captured text. Used to
+/// assert on a log line's content -- e.g. that a warning names both the
+/// returned and the expected vector count -- rather than only on database
+/// state, which cannot tell "cleared because of a count mismatch" apart from
+/// "cleared because the backend errored".
+///
+/// Safe to hold across `.await`: `#[tokio::test]`'s default `current_thread`
+/// flavor never migrates a task to another OS thread mid-poll, so the
+/// thread-local default subscriber `set_default` installs stays in force for
+/// `f`'s entire run, not just its first poll.
+pub async fn capture_tracing<F, Fut, T>(f: F) -> (T, String)
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    ensure_permissive_global_default();
+    let buf = SharedBuf(Arc::new(Mutex::new(Vec::new())));
+    let for_writer = buf.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(Level::TRACE)
+        .with_writer(move || for_writer.clone())
+        .with_ansi(false)
+        .with_level(false)
+        .with_target(false)
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+    let result = f().await;
+    drop(guard);
+    let bytes = buf.0.lock().expect("lock capture buffer").clone();
+    (
+        result,
+        String::from_utf8(bytes).expect("captured log output is UTF-8"),
+    )
 }
