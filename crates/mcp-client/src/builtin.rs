@@ -20,8 +20,8 @@ use desktop_assistant_core::ports::knowledge::{
     KnowledgeTagResolveFn, KnowledgeWriteFn, ListOrder, ListOrderOpt, ProposedTag, ScopeSize,
 };
 use desktop_assistant_core::ports::knowledge_use::{
-    KnowledgeMarkFn, KnowledgeOfferedFn, KnowledgeOpenedFn, MarkRequest, OfferScope,
-    record_in_background,
+    KnowledgeMarkFn, KnowledgeOfferedFn, KnowledgeOpenedFn, KnowledgeSituationFn, MarkRequest,
+    OfferScope, current_situation, record_in_background,
 };
 use desktop_assistant_core::ports::notify::{NotifyFn, NotifyUrgency};
 use desktop_assistant_core::ports::scratchpad::{
@@ -358,6 +358,7 @@ pub struct BuiltinToolService {
     kb_tag_resolve_fn: Option<KnowledgeTagResolveFn>,
     kb_offered_fn: Option<KnowledgeOfferedFn>,
     kb_opened_fn: Option<KnowledgeOpenedFn>,
+    kb_situation_fn: Option<KnowledgeSituationFn>,
     kb_mark_fn: Option<KnowledgeMarkFn>,
     tool_search_fn: Option<ToolSearchFn>,
     #[allow(dead_code)]
@@ -404,6 +405,7 @@ impl BuiltinToolService {
             kb_tag_resolve_fn: None,
             kb_offered_fn: None,
             kb_opened_fn: None,
+            kb_situation_fn: None,
             kb_mark_fn: None,
             tool_search_fn: None,
             tool_definition_fn: None,
@@ -521,6 +523,17 @@ impl BuiltinToolService {
         self.kb_offered_fn = Some(offered_fn);
         self.kb_opened_fn = Some(opened_fn);
         self.kb_mark_fn = Some(mark_fn);
+        self
+    }
+
+    /// Wire the situation record (#1125), so an entry written inside a turn
+    /// carries the situation it was written in.
+    ///
+    /// Capability-gated like every other knowledge closure. Without it the
+    /// write path behaves exactly as it did before the cue existed, and the
+    /// entry acquires its first situation the next time it is reused.
+    pub fn with_knowledge_situation(mut self, situation_fn: KnowledgeSituationFn) -> Self {
+        self.kb_situation_fn = Some(situation_fn);
         self
     }
 
@@ -1554,6 +1567,16 @@ impl BuiltinToolService {
             }));
         }
         tag_budget.report();
+        // Every entry this call actually stored carries the situation it was
+        // stored in (#1125), including the entries a later spec's failure did
+        // not reach: they landed, so their situation is as true as any other's.
+        self.record_situation(
+            saved_out
+                .iter()
+                .filter_map(|saved| saved.get("id").and_then(|id| id.as_str()))
+                .map(str::to_string)
+                .collect(),
+        );
         if let Some(e) = failure {
             return Err(e);
         }
@@ -2215,6 +2238,30 @@ impl BuiltinToolService {
         );
     }
 
+    /// Record the situation `entry_ids` were observed in (#1125).
+    ///
+    /// The write path's half of encoding specificity: an entry acquires the
+    /// situation it was written in, so the cue can find it again when that
+    /// situation recurs. Off the tool's path and never fatal, for the same
+    /// reason [`Self::record_offer`] is - a record of where a write happened
+    /// must not be able to fail the write.
+    ///
+    /// Nothing is recorded where nothing is connected: the situation is then
+    /// empty and the log writes no row.
+    fn record_situation(&self, entry_ids: Vec<String>) {
+        let Some(record) = &self.kb_situation_fn else {
+            return;
+        };
+        let situation = current_situation();
+        if entry_ids.is_empty() || situation.is_empty() {
+            return;
+        }
+        let record = Arc::clone(record);
+        record_in_background("write_situation", async move {
+            record(entry_ids, situation).await
+        });
+    }
+
     /// Record that `entry_ids` were fetched by id (#698).
     ///
     /// Only the ids standing offered in this conversation become opens, and the
@@ -2230,8 +2277,9 @@ impl BuiltinToolService {
         }
         let record = Arc::clone(record);
         let conversation_id = conversation.0;
+        let situation = current_situation();
         record_in_background("get_opened", async move {
-            record(conversation_id, entry_ids).await
+            record(conversation_id, entry_ids, situation).await
         });
     }
 
@@ -9212,14 +9260,17 @@ mod tests {
 
     // -- the knowledge use log (#698) ----------------------------------------
 
+    use desktop_assistant_core::domain::situation::{Situation, SituationField};
     use desktop_assistant_core::ports::knowledge_use::OfferSource;
+    use desktop_assistant_core::ports::transport::{ClientContext, with_client_context};
 
     /// Everything one use log recorded, so a test can prove what a tool wrote.
     #[derive(Default)]
     struct UseLogProbe {
         offered: Vec<(OfferScope, Vec<String>)>,
-        opened: Vec<(String, Vec<String>)>,
+        opened: Vec<(String, Vec<String>, Situation)>,
         marked: Vec<MarkRequest>,
+        situated: Vec<(Vec<String>, Situation)>,
     }
 
     type SharedUseLog = std::sync::Arc<std::sync::Mutex<UseLogProbe>>;
@@ -9246,7 +9297,7 @@ mod tests {
         });
 
         let for_open = Arc::clone(&probe);
-        let opened_fn: KnowledgeOpenedFn = Arc::new(move |conversation, ids| {
+        let opened_fn: KnowledgeOpenedFn = Arc::new(move |conversation, ids, situation| {
             let probe = Arc::clone(&for_open);
             Box::pin(async move {
                 let count = ids.len();
@@ -9254,7 +9305,7 @@ mod tests {
                     .lock()
                     .expect("probe lock")
                     .opened
-                    .push((conversation, ids));
+                    .push((conversation, ids, situation));
                 Ok(count)
             })
         });
@@ -9269,8 +9320,24 @@ mod tests {
             })
         });
 
+        let for_situation = Arc::clone(&probe);
+        let situation_fn: KnowledgeSituationFn = Arc::new(move |ids, situation| {
+            let probe = Arc::clone(&for_situation);
+            Box::pin(async move {
+                let count = ids.len();
+                probe
+                    .lock()
+                    .expect("probe lock")
+                    .situated
+                    .push((ids, situation));
+                Ok(count)
+            })
+        });
+
         (
-            service.with_knowledge_use_log(offered_fn, opened_fn, mark_fn),
+            service
+                .with_knowledge_use_log(offered_fn, opened_fn, mark_fn)
+                .with_knowledge_situation(situation_fn),
             probe,
         )
     }
@@ -9295,7 +9362,7 @@ mod tests {
             })
         });
         let for_open = Arc::clone(&held);
-        let opened_fn: KnowledgeOpenedFn = Arc::new(move |_conversation, _ids| {
+        let opened_fn: KnowledgeOpenedFn = Arc::new(move |_conversation, _ids, _situation| {
             let held = Arc::clone(&for_open);
             Box::pin(async move {
                 if let Some(rx) = held.lock().await.take() {
@@ -9382,6 +9449,165 @@ mod tests {
             recorded[0].1,
             vec!["kb-1".to_string()],
             "only the id that resolved and travelled is reported as read"
+        );
+    }
+
+    // -- the situation as a cue (#1125) --------------------------------------
+
+    /// A client that reported where it is and what zone it keeps.
+    fn a_client_that_reports_its_situation() -> ClientContext {
+        ClientContext {
+            hostname: Some("workshop".to_string()),
+            timezone: Some("Europe/London".to_string()),
+            ..ClientContext::default()
+        }
+    }
+
+    /// Acceptance (#1125): an entry accumulates a usage-context on reuse, per
+    /// #238, and it travels with the write that already decides which ids count
+    /// as opens - so no second pass rewrites the entry.
+    #[tokio::test]
+    async fn an_entry_accumulates_a_usage_context_on_reuse() {
+        let (service, _get_probe) = kb_service_holding(vec![kb_full_entry("kb-1")]);
+        let (service, log) = with_use_log(service, Ok(vec![]));
+
+        with_client_context(
+            Some(a_client_that_reports_its_situation()),
+            in_conversation(async {
+                kb_get_response(&service, serde_json::json!({"ids": ["kb-1"]})).await
+            }),
+        )
+        .await;
+        settle().await;
+
+        let recorded = &log.lock().expect("probe lock").opened;
+        assert_eq!(recorded.len(), 1);
+        let situation = &recorded[0].2;
+        assert_eq!(
+            situation.get(SituationField::Host),
+            Some("workshop"),
+            "a reuse must carry where it happened, or the entry never learns the context it \
+             keeps proving useful in"
+        );
+        assert!(situation.get(SituationField::TimeOfDay).is_some());
+    }
+
+    /// Acceptance (#1125): a situation record is written with every
+    /// observation, and every field of it is optional.
+    ///
+    /// Two writes of the same entry through the same tool, one by a client that
+    /// reports where it is and one by a client that reports nothing. The first
+    /// records what it could read; the second records nothing at all and does
+    /// not fail.
+    #[tokio::test]
+    async fn a_situation_record_is_written_with_every_observation() {
+        let (service, log) = with_use_log(kb_service_searching(vec![]), Ok(vec![]));
+
+        with_client_context(
+            Some(a_client_that_reports_its_situation()),
+            in_conversation(async {
+                kb_write_response(&service, serde_json::json!({"content": "a fact"})).await
+            }),
+        )
+        .await;
+        settle().await;
+
+        {
+            let situated = &log.lock().expect("probe lock").situated;
+            assert_eq!(situated.len(), 1, "one write, one situation record");
+            assert_eq!(
+                situated[0].1.get(SituationField::Host),
+                Some("workshop"),
+                "an entry must carry the situation it was written in"
+            );
+            assert!(situated[0].1.get(SituationField::Weekday).is_some());
+        }
+
+        in_conversation(async {
+            kb_write_response(&service, serde_json::json!({"content": "another fact"})).await
+        })
+        .await;
+        settle().await;
+
+        let situated = &log.lock().expect("probe lock").situated;
+        assert_eq!(
+            situated.len(),
+            1,
+            "a client with nothing connected writes no situation row, and no error: {situated:?}"
+        );
+    }
+
+    /// Acceptance (#1125): situation capture adds no synchronous model call to
+    /// the write path.
+    ///
+    /// The write answers whether or not the situation record ever lands, and it
+    /// answers without waiting for it - the same contract every other use-log
+    /// write keeps. Nothing between the tool and the record consults a model:
+    /// [`desktop_assistant_core::ports::knowledge_use::current_situation`] reads
+    /// a task-local and a clock, and the record is written off the caller's
+    /// path.
+    #[tokio::test]
+    async fn situation_capture_adds_no_synchronous_model_call_to_the_write_path() {
+        use std::sync::{Arc, Mutex};
+        let held: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+        let (release, receive) = tokio::sync::oneshot::channel::<()>();
+        *held.lock().await = Some(receive);
+        let seen: Arc<Mutex<Vec<Situation>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let for_write = Arc::clone(&held);
+        let recorded = Arc::clone(&seen);
+        let situation_fn: KnowledgeSituationFn = Arc::new(move |_ids, situation| {
+            let held = Arc::clone(&for_write);
+            let recorded = Arc::clone(&recorded);
+            Box::pin(async move {
+                if let Some(rx) = held.lock().await.take() {
+                    let _ = rx.await;
+                }
+                recorded.lock().expect("probe lock").push(situation);
+                Ok(1)
+            })
+        });
+        let service = kb_service_searching(vec![]).with_knowledge_situation(situation_fn);
+
+        // The write returns while the recorder is still blocked.
+        let answer = with_client_context(
+            Some(a_client_that_reports_its_situation()),
+            in_conversation(async {
+                kb_write_response(&service, serde_json::json!({"content": "a fact"})).await
+            }),
+        )
+        .await;
+        assert_eq!(answer.get("ok"), Some(&serde_json::json!(true)));
+        assert!(
+            seen.lock().expect("probe lock").is_empty(),
+            "the write must not have waited on the situation record"
+        );
+
+        let _ = release.send(());
+        settle().await;
+        assert_eq!(seen.lock().expect("probe lock").len(), 1);
+    }
+
+    /// Acceptance (#1125): a client that reports nothing produces an empty
+    /// situation, and the reuse is still recorded.
+    #[tokio::test]
+    async fn a_reuse_with_no_situation_sources_records_an_empty_situation() {
+        let (service, _get_probe) = kb_service_holding(vec![kb_full_entry("kb-1")]);
+        let (service, log) = with_use_log(service, Ok(vec![]));
+
+        in_conversation(async {
+            kb_get_response(&service, serde_json::json!({"ids": ["kb-1"]})).await
+        })
+        .await;
+        settle().await;
+
+        let recorded = &log.lock().expect("probe lock").opened;
+        assert_eq!(recorded.len(), 1, "the open is still recorded");
+        assert_eq!(
+            recorded[0].2,
+            Situation::new(),
+            "nothing connected must produce nothing recorded, and no failure"
         );
     }
 

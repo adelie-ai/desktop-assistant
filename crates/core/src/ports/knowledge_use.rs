@@ -54,7 +54,9 @@ use std::sync::Arc;
 
 use crate::CoreError;
 use crate::domain::knowledge_use::{KnowledgeUseRecord, MarkPolarity, MarkSource};
+use crate::domain::situation::{Situation, SituationCue, SituationRecord, SituationSources};
 use crate::ports::auth::{current_user_id, with_user_id};
+use crate::ports::transport::current_client_context;
 
 /// How many offers one conversation may have standing.
 ///
@@ -128,6 +130,21 @@ pub struct MarkRequest {
     pub reason: Option<String>,
 }
 
+/// What the situation says about one recall lookup (#1125).
+///
+/// Two answers to one question, read together because they are only meaningful
+/// together: a record nothing can grade scores zero, and a cue nothing carries a
+/// record for scores zero as well.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SituationSignal {
+    /// The situations each candidate has been seen in, by entry id. An id the
+    /// table holds nothing for is absent.
+    pub records: Vec<(String, SituationRecord)>,
+    /// The present situation read against the whole store, or `None` where the
+    /// store cannot grade it.
+    pub cue: Option<SituationCue>,
+}
+
 /// The knowledge use log: what was offered, what was opened, what was marked.
 ///
 /// Every method is scoped to the current user through
@@ -152,11 +169,60 @@ pub trait KnowledgeUseLog: Send + Sync {
     /// An id with no standing offer records nothing and is not an error: the
     /// model reads entries for many reasons, and only a taken-up offer is
     /// evidence.
+    ///
+    /// `situation` is where the open happened, and it is recorded against
+    /// exactly the ids that became opens - #238's accumulation rule, carried by
+    /// the write that already decides which ids count. Passing
+    /// [`Situation::new`] records no situation, which is what a caller with
+    /// nothing connected passes.
     fn record_opened(
         &self,
         conversation_id: String,
         entry_ids: Vec<String>,
+        situation: Situation,
     ) -> impl Future<Output = Result<usize, CoreError>> + Send;
+
+    /// Record that `entry_ids` were seen in `situation` (#1125).
+    ///
+    /// The write path's half of the same rule, for the moment an entry is
+    /// observed rather than the moment it is reused. Idempotent by key: a value
+    /// the entry's record already holds moves its counters and changes nothing
+    /// the ranking reads, which is what stops the retrieve-record-retrieve loop
+    /// after one step.
+    ///
+    /// Entries the caller does not own, retired entries, and an empty situation
+    /// all write nothing, and none of them is an error.
+    fn record_situation(
+        &self,
+        entry_ids: Vec<String>,
+        situation: Situation,
+    ) -> impl Future<Output = Result<usize, CoreError>> + Send;
+
+    /// Everything one lookup needs of the situation: what each candidate has
+    /// been seen in, and what the present situation is worth over this store.
+    ///
+    /// **One call rather than two, because it is one connection rather than
+    /// two.** This read sits on the pre-prompt recall path, which already runs
+    /// the pad arm and the use-log read at the same time, and the default
+    /// connection pool holds five. Two more concurrent reads per turn would let
+    /// one turn hold the whole pool, and a second turn would then wait on
+    /// acquisition - which no statement timeout bounds. The two halves also
+    /// describe one instant this way, so a fan can never be counted against a
+    /// population that has already moved.
+    ///
+    /// Ids with no record are absent from [`SituationSignal::records`] rather
+    /// than returned empty, on the same terms as [`Self::records`]. The cue is
+    /// `None` where the store cannot grade one - see [`SituationCue::measured`] -
+    /// and the caller then ranks the way it ranked before the cue existed.
+    ///
+    /// The cue is measured over the source and never over one lookup's
+    /// candidates, for the reason [`crate::ports::recall::RecallDispersion`]
+    /// states.
+    fn situation_signal(
+        &self,
+        entry_ids: Vec<String>,
+        situation: Situation,
+    ) -> impl Future<Output = Result<SituationSignal, CoreError>> + Send;
 
     /// Set the standing mark for `request.source` on each owned entry named,
     /// and report the ids that were marked.
@@ -196,12 +262,44 @@ pub type KnowledgeOfferedFn = Arc<
 >;
 
 /// Boxed async closure that records opens for a conversation's standing
-/// offers. Args: `(conversation_id, entry_ids)`.
+/// offers. Args: `(conversation_id, entry_ids, situation)`.
 pub type KnowledgeOpenedFn = Arc<
-    dyn Fn(String, Vec<String>) -> Pin<Box<dyn Future<Output = Result<usize, CoreError>> + Send>>
+    dyn Fn(
+            String,
+            Vec<String>,
+            Situation,
+        ) -> Pin<Box<dyn Future<Output = Result<usize, CoreError>> + Send>>
         + Send
         + Sync,
 >;
+
+/// Boxed async closure that records the situation an entry was observed in
+/// (#1125). Args: `(entry_ids, situation)`.
+pub type KnowledgeSituationFn = Arc<
+    dyn Fn(Vec<String>, Situation) -> Pin<Box<dyn Future<Output = Result<usize, CoreError>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// The situation this request is happening in, read off the clock and the
+/// client's own report (#549).
+///
+/// The one place the wire's field names are mapped onto the domain's, so a
+/// write path and a read path cannot disagree about what "the situation" means.
+/// [`Situation::observe`] holds every rule; this holds only the mapping and the
+/// clock.
+///
+/// An empty answer is ordinary: a client that reported no context, or a caller
+/// outside any request scope, produces one, and every path downstream treats it
+/// as "nothing connected".
+pub fn current_situation() -> Situation {
+    let client = current_client_context();
+    let sources = SituationSources {
+        host: client.as_ref().and_then(|c| c.hostname.as_deref()),
+        timezone: client.as_ref().and_then(|c| c.timezone.as_deref()),
+    };
+    Situation::observe(chrono::Utc::now(), &sources)
+}
 
 /// Boxed async closure that sets a standing mark and reports the ids marked.
 pub type KnowledgeMarkFn = Arc<

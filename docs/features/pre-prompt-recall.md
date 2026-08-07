@@ -239,12 +239,14 @@ offered; activation says in what order, and it is one function rather than a
 blend of multipliers:
 
 ```text
-A_i = semantic + reinforcement
+A_i = semantic + reinforcement + situation
 ```
 
 `semantic` is the same dimensionless deviation count the bar reads - never a raw
 distance, so a source added later joins on the same scale without refitting
-anything. `reinforcement` is what the use log knows
+anything. `situation` is how well the entry's own record matches the situation
+the prompt arrived in, and it has its own section below. `reinforcement` is what
+the use log knows
 (`docs/features/knowledge-use-log.md`), read as
 `use_lift * ln(1 + S / S_ref)` and carrying `S`'s sign, where `S` is the ACT-R
 base-level sum over the entry's opens and marks and `S_ref` is the sum one use a
@@ -327,6 +329,139 @@ the nearest rows, so their spread is the near tail's and not the store's, and
 normalizing inside a truncated set inflates every score.
 `PgKnowledgeBaseStore::nearest_by_embedding` measures the median and the median
 absolute deviation over every row the scan could reach.
+
+## The situation as a cue
+
+Retrieval is keyed on prompt text, which for a life assistant is the weakest cue
+available: people describe life events vaguely, and rarely in the words an entry
+was written with. Encoding specificity says recall depends on the overlap
+between the cue present when a memory was written and the cue present when it is
+sought - which is why walking into a room brings back what was thought there.
+The situation is the strongest cue the system holds, and it costs nothing to
+collect, because the system already knows it without asking.
+
+**What a situation is.** Three fields today, each optional and each read only
+where its source is connected: the host the client reported (#549), and the part
+of the local day and the day of the local week, both computed in the person's
+own time zone. A field with no source contributes nothing rather than a
+placeholder, and the two clock fields are gated on knowing the zone - a time of
+day computed in the daemon's zone is a wrong value rather than a missing one, and
+a wrong value costs every entry that recorded the same instant honestly. Adding
+a dimension is a variant on `SituationField` and one arm in `Situation::observe`.
+
+**When it is recorded.** An entry written by the model inside a turn acquires
+the situation it was written in, and every entry adds to its record each time it
+proves useful somewhere new - #238's accumulation rule. An entry the dream cycle
+extracts has no client context to read, because no client is present when the
+cycle runs, so it carries no situation until the first time it is reused. The
+reuse write runs against the ids the open transaction counted, so an entry that
+was not standing offered accumulates nothing, exactly as it accrues no open.
+Neither write touches `knowledge_base`: an entry that had to be rewritten to
+learn where it is useful would restate its own content, move its `updated_at`,
+and put itself back in the embedding backfill queue.
+
+**Presence is the match, not how often.** The record holds how many times each
+value has been seen, and no ranking rule reads it. The use log already measures
+how much an entry has been used, so weighting the match by a count would put that
+signal into `A_i` twice - and it would leave the loop open, because an entry that
+ranks up in a situation gets opened there, which records the situation. A binary
+match closes that after one step: recording a value the record already holds
+changes nothing at all.
+
+**Each cue value is weighted by what it separates.** A plain overlap fraction has
+a defect that only shows on a real store. Most deployments have one host, so
+every entry carries it, every prompt matches it, and the term becomes a constant
+added to every entry that happens to have a record - reordering nothing among
+them and sinking every entry written before the feature shipped. The cue would be
+measuring when the code landed. So each value is weighted by its own
+self-information over the store, `ln(population / fan)`:
+
+- A value every entry carries is worth **zero**. Your only host tells nobody
+  anything.
+- A value one entry carries is worth `ln(population)`, the most the store can
+  offer.
+- A value **no** entry carries is worth zero as well, and for the same reason: a
+  field on which no candidate can match separates nobody. Without that rule, a
+  cue value the store has never met would be maximally informative and would
+  silence the fields that did match.
+
+**Both counts are per field.** Which fields an observation can read depends on
+the client that made it, so a store's coverage is uneven: a host may sit on a
+third of the entries while the weekday sits on all of them. Divided by one
+store-wide count, the only host in a store would come out informative merely
+because two thirds of the entries record no host at all - the very error the
+weight exists to prevent, displaced from "before or after the feature shipped"
+onto "which client wrote it".
+
+This is Anderson's fan effect, arriving as the definition of the weight rather
+than as a correction bolted onto one.
+
+**The term is a ratio, so it cannot grow with the fields connected.** Coverage is
+the information the cue carries on the fields this entry could have matched,
+divided by the information it carries on the fields it did:
+
+```text
+coverage = sum(information of matched fields) / sum(information of comparable fields)
+```
+
+A field the entry has never been seen with is in neither half, so a missing field
+neither matches nor penalises. That choice has a price worth stating: an entry
+that knows one thing about itself and gets it right reaches full coverage on less
+evidence than one that knows three. The alternative - dividing by the whole cue -
+scores "we do not know" the same as "we know, and it was somewhere else", and
+conflating an unknown with a mismatch is the worse error for a store whose older
+half was written before any of this was recorded. A field the entry knows and
+disagrees on is in the denominator only, so a mismatch forfeits the lift rather
+than subtracting from the score.
+
+**The bound is a scale, not a fit.** A full match is worth exactly what one use
+at the reference age is worth, computed from the reinforcement term rather than
+restated. It introduces no coefficient of its own, it carries no unit of its own
+- it works out to `use_lift * ln 2` whatever the decay exponent and whatever unit
+the use log's ages are counted in - and a deployment that fits `use_lift` from
+its own log moves both terms together. At the shipped weights that is about a
+third of a deviation: a ninth of the reinforcement ceiling, so the situation can
+settle a near-tie and can never overturn a semantic lead. Its influence is
+largest where the admitted band is narrowest, which is the weakly cued prompt.
+
+**It ranks and never admits.** The cue is read after the bar, over the set the
+bar admitted, so it permutes the block and cannot change its membership. That is
+what keeps the "and N more entries also matched" hedge true.
+
+**A field too thinly recorded to measure is weighted at zero.** A fan over a
+handful of entries is noise, and noise in the weight makes the ratio
+meaningless, so a field recorded on fewer than `SITUATION_MIN_POPULATION`
+entries contributes nothing while the fields beside it keep what they are worth.
+A cue whose every field is below the floor is no cue at all, and every entry
+then ranks the way it ranked before this existed. The same holds for a
+deployment with nothing connected - where the read is skipped rather than run
+and discarded - and for a read that fails or overruns its half-second ceiling,
+where the block loses the order, never the lines, and says so once in the
+journal.
+
+**A value a client chooses never becomes a value the database refuses.** The
+host is self-reported and nothing upstream bounds it - `sanitize_client_field`
+runs at the prompt renderer, not at the transport - and it becomes part of a
+primary key and a btree index. So every situation value is trimmed, lowercased,
+stripped of control characters and cut to `MAX_SITUATION_VALUE_CHARS` before it
+is stored, the trade a mark's reason already makes. The cleaner is idempotent,
+because a value read back out of the store passes through it again. Lowercasing
+earns its place on its own: one machine answering `Workshop` to one client and
+`workshop` to another would hold two values, halve its own fan, and match
+neither prompt in full.
+
+**Recording the situation of a reuse cannot cost the reuse.** The write runs
+after the transaction that counts the open has committed, in its own
+transaction, and its failure becomes a warning. Inside that transaction an
+unmigrated database or a missing grant would roll back the open and the counter
+with it, taking out the strongest signal in the use log for as long as the cause
+lasted, and saying so only in a log line. What is given up is atomicity between
+the two, which costs nothing: the record is idempotent by key, so the next reuse
+in the same situation records what this one missed.
+
+The rule is `crates/core/src/domain/situation.rs`; the table is
+`knowledge_situation`, created by `047_knowledge_situation.sql` and bounded per
+entry per field with the least recently seen value evicted first.
 
 **One scan states both.** The candidates and the spread are functions of the same
 query vector: the spread says what a distance from this store is worth, and the
@@ -599,6 +734,7 @@ measured.
 | Floors, caps, and the block text | `crates/core/src/recall.rs` |
 | The activation score | `crates/core/src/domain/activation.rs` |
 | The base-level sum it reads | `KnowledgeUseRecord::use_sum`, `crates/core/src/domain/knowledge_use.rs` |
+| The situation cue, and what it is worth | `crates/core/src/domain/situation.rs` |
 | The standing guidance for the block | `crates/core/src/prompts/sections/knowledge_base.txt` |
 | The port the daemon fills | `crates/core/src/ports/recall.rs` |
 | Looked up once per turn | `ConversationHandler::recall_lookup`, `crates/core/src/service.rs` |
@@ -606,6 +742,8 @@ measured.
 | Rendered on the first round | `surfaced_blocks`, `crates/core/src/context/mod.rs` |
 | Embedding, every query, degradation | `crates/daemon/src/recall.rs` |
 | The bounded use-log read | `recall::use_records`, same file |
+| The bounded situation read | `recall::situation_signal`, same file |
+| The situation writes and the fan count | `crates/storage/src/knowledge_use.rs` |
 | The knowledge query, and the spread it states | `PgKnowledgeBaseStore::nearest_by_embedding`, `crates/storage/src/knowledge.rs` |
 | Its degraded form | `PgKnowledgeBaseStore::search_text_any_term`, same file |
 | The scratchpad query | `PgScratchpadStore::nearest_by_embedding`, `crates/storage/src/scratchpad.rs` |

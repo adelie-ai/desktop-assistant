@@ -35,6 +35,7 @@ use desktop_assistant_core::domain::knowledge_use::{
     KnowledgeUseRecord, MARK_REASON_MAX_CHARS, MarkPolarity, MarkSource, RECENT_USE_WINDOW,
     UseScoreWeights,
 };
+use desktop_assistant_core::domain::situation::Situation;
 use desktop_assistant_core::ports::knowledge::KnowledgeBaseStore;
 use desktop_assistant_core::ports::knowledge_use::{
     KnowledgeUseLog, MAX_STANDING_OFFERS, MarkRequest, OfferScope,
@@ -147,7 +148,7 @@ async fn offering_opening_and_marking_are_recorded_separately() {
                 .await
                 .expect("offer recorded");
         }
-        log.record_opened(CONV.to_string(), vec!["kb-1".to_string()])
+        log.record_opened(CONV.to_string(), vec!["kb-1".to_string()], Situation::new())
             .await
             .expect("open recorded");
         log.record_mark(MarkRequest {
@@ -190,6 +191,7 @@ async fn a_fetch_records_an_open_only_for_an_entry_offered_in_the_same_turn() {
             .record_opened(
                 CONV.to_string(),
                 vec!["kb-offered".to_string(), "kb-unrelated".to_string()],
+                Situation::new(),
             )
             .await
             .expect("open recorded");
@@ -198,7 +200,11 @@ async fn a_fetch_records_an_open_only_for_an_entry_offered_in_the_same_turn() {
         // The same fetch again, inside the same turn. The offer is already
         // taken up, so the second read adds nothing.
         let again = log
-            .record_opened(CONV.to_string(), vec!["kb-offered".to_string()])
+            .record_opened(
+                CONV.to_string(),
+                vec!["kb-offered".to_string()],
+                Situation::new(),
+            )
             .await
             .expect("repeat read succeeds");
         assert_eq!(again, 0, "a repeated fetch is one open, not two");
@@ -231,7 +237,11 @@ async fn an_offer_in_one_conversation_is_not_taken_up_in_another() {
             .await
             .expect("offer recorded");
         let elsewhere = log
-            .record_opened("conv-b".to_string(), vec!["kb-1".to_string()])
+            .record_opened(
+                "conv-b".to_string(),
+                vec!["kb-1".to_string()],
+                Situation::new(),
+            )
             .await
             .expect("read succeeds");
         assert_eq!(
@@ -240,7 +250,11 @@ async fn an_offer_in_one_conversation_is_not_taken_up_in_another() {
         );
 
         let here = log
-            .record_opened("conv-a".to_string(), vec!["kb-1".to_string()])
+            .record_opened(
+                "conv-a".to_string(),
+                vec!["kb-1".to_string()],
+                Situation::new(),
+            )
             .await
             .expect("read succeeds");
         assert_eq!(here, 1);
@@ -268,16 +282,24 @@ async fn a_new_recall_block_replaces_the_previous_turns_standing_offers() {
             .expect("offer recorded");
 
         assert_eq!(
-            log.record_opened(CONV.to_string(), vec!["kb-last-turn".to_string()])
-                .await
-                .expect("read succeeds"),
+            log.record_opened(
+                CONV.to_string(),
+                vec!["kb-last-turn".to_string()],
+                Situation::new()
+            )
+            .await
+            .expect("read succeeds"),
             0,
             "last turn's offer must not still be standing"
         );
         assert_eq!(
-            log.record_opened(CONV.to_string(), vec!["kb-this-turn".to_string()])
-                .await
-                .expect("read succeeds"),
+            log.record_opened(
+                CONV.to_string(),
+                vec!["kb-this-turn".to_string()],
+                Situation::new()
+            )
+            .await
+            .expect("read succeeds"),
             1
         );
     })
@@ -304,7 +326,7 @@ async fn a_turn_that_offered_nothing_still_ends_the_previous_turns_offers() {
             .expect("empty offer recorded");
 
         assert_eq!(
-            log.record_opened(CONV.to_string(), vec!["kb-1".to_string()])
+            log.record_opened(CONV.to_string(), vec!["kb-1".to_string()], Situation::new())
                 .await
                 .expect("read succeeds"),
             0,
@@ -337,6 +359,7 @@ async fn a_search_inside_a_turn_adds_to_what_the_block_already_offered() {
             .record_opened(
                 CONV.to_string(),
                 vec!["kb-recalled".to_string(), "kb-searched".to_string()],
+                Situation::new(),
             )
             .await
             .expect("read succeeds");
@@ -366,16 +389,24 @@ async fn an_offer_standing_in_two_conversations_can_be_taken_up_in_either() {
             .expect("offer recorded");
 
         assert_eq!(
-            log.record_opened("conv-a".to_string(), vec!["kb-broad".to_string()])
-                .await
-                .expect("read succeeds"),
+            log.record_opened(
+                "conv-a".to_string(),
+                vec!["kb-broad".to_string()],
+                Situation::new()
+            )
+            .await
+            .expect("read succeeds"),
             1,
             "the first conversation's offer must still stand"
         );
         assert_eq!(
-            log.record_opened("conv-b".to_string(), vec!["kb-broad".to_string()])
-                .await
-                .expect("read succeeds"),
+            log.record_opened(
+                "conv-b".to_string(),
+                vec!["kb-broad".to_string()],
+                Situation::new()
+            )
+            .await
+            .expect("read succeeds"),
             1,
             "and so must the second's"
         );
@@ -423,14 +454,18 @@ async fn a_conversation_cannot_accumulate_standing_offers_without_limit() {
     // The cap keeps the newest, which is where a take-up would come from.
     with_user_id(UserId::new(ALICE), async {
         assert_eq!(
-            log.record_opened(CONV.to_string(), vec![ids[over - 1].clone()])
-                .await
-                .expect("read succeeds"),
+            log.record_opened(
+                CONV.to_string(),
+                vec![ids[over - 1].clone()],
+                Situation::new()
+            )
+            .await
+            .expect("read succeeds"),
             1,
             "the newest offer must survive the trim"
         );
         assert_eq!(
-            log.record_opened(CONV.to_string(), vec![ids[0].clone()])
+            log.record_opened(CONV.to_string(), vec![ids[0].clone()], Situation::new())
                 .await
                 .expect("read succeeds"),
             0,
@@ -454,7 +489,7 @@ async fn a_negative_mark_is_recordable_and_lowers_the_score() {
             log.record_offered(OfferScope::recall(CONV), vec![id.to_string()])
                 .await
                 .expect("offer recorded");
-            log.record_opened(CONV.to_string(), vec![id.to_string()])
+            log.record_opened(CONV.to_string(), vec![id.to_string()], Situation::new())
                 .await
                 .expect("open recorded");
         }
@@ -560,7 +595,7 @@ async fn the_recent_use_window_does_not_grow_without_limit() {
             log.record_offered(OfferScope::recall(CONV), vec!["kb-1".to_string()])
                 .await
                 .expect("offer recorded");
-            log.record_opened(CONV.to_string(), vec!["kb-1".to_string()])
+            log.record_opened(CONV.to_string(), vec!["kb-1".to_string()], Situation::new())
                 .await
                 .expect("open recorded");
         }
@@ -594,9 +629,13 @@ async fn a_cross_tenant_read_of_a_use_record_returns_nothing() {
         log.record_offered(OfferScope::recall(CONV), vec!["kb-alice".to_string()])
             .await
             .expect("offer recorded");
-        log.record_opened(CONV.to_string(), vec!["kb-alice".to_string()])
-            .await
-            .expect("open recorded");
+        log.record_opened(
+            CONV.to_string(),
+            vec!["kb-alice".to_string()],
+            Situation::new(),
+        )
+        .await
+        .expect("open recorded");
         log.record_mark(MarkRequest {
             entry_ids: vec!["kb-alice".to_string()],
             polarity: MarkPolarity::Positive,
@@ -621,9 +660,13 @@ async fn a_cross_tenant_read_of_a_use_record_returns_nothing() {
     );
 
     let bobs_open = with_user_id(UserId::new(BOB), async {
-        log.record_opened(CONV.to_string(), vec!["kb-alice".to_string()])
-            .await
-            .expect("read succeeds")
+        log.record_opened(
+            CONV.to_string(),
+            vec!["kb-alice".to_string()],
+            Situation::new(),
+        )
+        .await
+        .expect("read succeeds")
     })
     .await;
     assert_eq!(bobs_open, 0, "bob must not take up alice's standing offer");
@@ -699,7 +742,7 @@ async fn an_empty_batch_is_a_successful_no_op() {
             0
         );
         assert_eq!(
-            log.record_opened(CONV.to_string(), vec![])
+            log.record_opened(CONV.to_string(), vec![], Situation::new())
                 .await
                 .expect("empty open succeeds"),
             0
