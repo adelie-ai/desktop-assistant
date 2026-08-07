@@ -21,9 +21,9 @@ use crate::ports::llm::{
 };
 use crate::ports::recall::{RecallRequest, RecallSearchFn};
 use crate::ports::scratchpad::{
-    MAX_NOTE_BYTES, NewScratchpadNote, PINNED_BLOCK_BYTE_BUDGET, SCRATCHPAD_GOAL_KEY,
-    ScratchpadDeleteSubtreeFn, ScratchpadGetManyFn, ScratchpadListFn,
-    ScratchpadReleaseReferencesFn, ScratchpadWriteFn,
+    MAX_KEYS_PER_CALL, MAX_NOTE_BYTES, MAX_RESULTS_CEILING, NewScratchpadNote,
+    PINNED_BLOCK_BYTE_BUDGET, SCRATCHPAD_GOAL_KEY, ScratchpadDeleteSubtreeFn, ScratchpadGetManyFn,
+    ScratchpadListFn, ScratchpadReleaseReferencesFn, ScratchpadWriteFn,
 };
 use crate::ports::scratchpad_scope::{
     SPAWN_SUBAGENT_TOOL, SubagentScope, current_ancestors, current_owner_todo,
@@ -865,15 +865,25 @@ impl<S, L, T> ConversationHandler<S, L, T> {
     ) {
         let from = window_start(&conv.messages, MAX_CONTEXT_MESSAGES);
         let in_view = &conv.messages[from..];
-        let keys = planning::distilled_note_keys(in_view);
+        let mut keys = planning::distilled_note_keys(in_view);
         if keys.is_empty() {
             return;
         }
         let Some(read) = &self.scratchpad_get_many else {
             return;
         };
+        // The window already bounds this well below the cap; hold it to the
+        // port's documented per-call limit anyway, so the bound is the read's
+        // and not an accident of the window size.
+        keys.truncate(MAX_KEYS_PER_CALL);
         let wanted = keys.len();
-        let notes = match read(conversation_id.0.clone(), keys, wanted).await {
+        // Rows, not keys. One key can name a note under more than one subagent
+        // scope (`scratchpads` is unique on conversation + owner_todo + key),
+        // and a limit of `wanted` would then cut a later key and read it as
+        // missing. Reading a live note as missing costs only the saving, but
+        // the ceiling is free.
+        let row_limit = MAX_RESULTS_CEILING.max(wanted);
+        let notes = match read(conversation_id.0.clone(), keys, row_limit).await {
             Ok(notes) => notes,
             Err(e) => {
                 tracing::warn!(
