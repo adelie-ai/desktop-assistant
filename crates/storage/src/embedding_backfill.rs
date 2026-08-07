@@ -24,6 +24,26 @@ pub type BackfillEmbedFn = Box<
 
 const BATCH_SIZE: i64 = 32;
 
+/// Normalize a vector list before it is written, so a zero-length list is
+/// never persisted as a zero-length `vector[]` array.
+///
+/// Postgres distinguishes an empty array from no array the same way it
+/// distinguishes an empty string from `NULL`: an empty `vector[]` still
+/// satisfies `embedding IS NOT NULL`. A row written that way would pass every
+/// backfill's own re-selection predicate (all of which test `IS NULL` /
+/// `IS NOT NULL`, never the array's length) while contributing zero chunks to
+/// search, and the orphan branch of [`invalidate_stale_embeddings`] -- the
+/// repair that exists to find exactly this -- would not catch it either,
+/// because that branch also keys on `embedding IS NULL`. The row would be
+/// silently unsearchable and silently unrepaired: the same failure class this
+/// whole module exists to close, just reached by an empty array instead of a
+/// truncated one. Folding the check in here, at the single place every
+/// vector list is written, closes it regardless of which caller or which
+/// future change to chunking produced the empty list.
+fn normalize_embedding(vectors: Option<Vec<Vector>>) -> Option<Vec<Vector>> {
+    vectors.filter(|v| !v.is_empty())
+}
+
 /// What a stale-embedding sweep cleared, per table.
 ///
 /// Reported per table rather than as one number so an operator can tell "the
@@ -324,12 +344,30 @@ pub async fn backfill_knowledge_embeddings(
 /// over a retained vector would declare it current and put it permanently
 /// beyond [`invalidate_stale_embeddings`], which acts only on mismatched
 /// stamps.
+///
+/// That reasoning is airtight for a row selected on a model mismatch: its old
+/// vector has the wrong dimension for the new model, so keeping it is never
+/// safe. It costs more on the *other* selection reason this table has and the
+/// other two tables do not -- content changed since the last embed
+/// (`embeddings_updated_at < updated_at`). A row selected that way already
+/// holds a same-model vector for its *previous* content: dimensionally fine,
+/// only a little stale. Clearing it on a merely transient failure (a
+/// rate-limited or momentarily down backend, not a real mismatch) throws that
+/// still-usable vector away for nothing, and the row is stamped fresh enough
+/// that this backfill will not reselect it again on its own -- it stays
+/// without a vector arm until its content changes again, or until the next
+/// daemon start runs [`invalidate_stale_embeddings`]'s orphan sweep, which
+/// clears the stamp and lets this backfill pick it back up. Accepted here as
+/// a real but bounded cost: convergence (never retrying a permanently failing
+/// row in a tight loop) is worth more than keeping one release's worth of
+/// stale-but-working vectors alive through a transient blip.
 async fn write_knowledge_embedding(
     pool: &PgPool,
     id: &str,
     vectors: Option<Vec<Vector>>,
     current_model: &str,
 ) -> Result<(), String> {
+    let vectors = normalize_embedding(vectors);
     sqlx::query(
         "UPDATE knowledge_base
          SET embedding = $1::vector[], embedding_model = $2,
@@ -472,6 +510,7 @@ async fn write_tool_embedding(
     vectors: Option<Vec<Vector>>,
     current_model: &str,
 ) -> Result<(), String> {
+    let vectors = normalize_embedding(vectors);
     sqlx::query(
         "UPDATE tool_definitions
          SET embedding = $1::vector[], embedding_model = $2
@@ -615,6 +654,7 @@ async fn write_skill_embedding(
     vectors: Option<Vec<Vector>>,
     current_model: &str,
 ) -> Result<(), String> {
+    let vectors = normalize_embedding(vectors);
     sqlx::query(
         "UPDATE skill_index \
          SET embedding = $1::vector[], embedding_model = $2 \
@@ -771,13 +811,16 @@ pub async fn backfill_scratchpad_embeddings(
 /// Clearing rather than keeping the old vector matters, for the reason
 /// [`write_tag_embedding`] gives -- stamping the current model over a retained
 /// stale vector would declare it current and put it permanently beyond
-/// [`invalidate_stale_embeddings`], which acts only on mismatched stamps.
+/// [`invalidate_stale_embeddings`], which acts only on mismatched stamps. See
+/// [`normalize_embedding`] for why an empty (but `Some`) list is treated the
+/// same as `None` here too.
 async fn write_scratchpad_embedding(
     pool: &PgPool,
     id: &str,
     vectors: Option<Vec<Vector>>,
     current_model: &str,
 ) -> Result<(), String> {
+    let vectors = normalize_embedding(vectors);
     sqlx::query(
         "UPDATE scratchpads \
          SET embedding = $1::vector[], embedding_model = $2 \
@@ -990,4 +1033,32 @@ async fn write_tag_embedding(
     .await
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Acceptance (#1108 review): an empty vector list must never reach the
+    /// database as an empty `vector[]` array -- it has to become `None`
+    /// (`NULL`), the same as a hard embedder failure, or the row would pass
+    /// `embedding IS NOT NULL` while holding nothing search can use.
+    #[test]
+    fn an_empty_vector_list_normalizes_to_none_not_an_empty_array() {
+        assert_eq!(normalize_embedding(Some(Vec::new())), None);
+    }
+
+    #[test]
+    fn none_stays_none() {
+        assert_eq!(normalize_embedding(None), None);
+    }
+
+    #[test]
+    fn a_populated_vector_list_is_left_unchanged() {
+        let vecs = vec![
+            Vector::from(vec![0.1, 0.2, 0.3]),
+            Vector::from(vec![0.4, 0.5, 0.6]),
+        ];
+        assert_eq!(normalize_embedding(Some(vecs.clone())), Some(vecs));
+    }
 }
