@@ -698,9 +698,15 @@ mod tests {
             learning.contains("belongs in a skill"),
             "and send a method with ordered steps to a skill: {learning}"
         );
+        // One sentence, not two adjacent claims: the subject has to be the
+        // skill's own preferences, or "stays in the knowledge base" could be
+        // satisfied by a sentence about something else entirely.
         assert!(
-            learning.contains("stays in the knowledge base"),
-            "while what tunes a run stays knowledge: {learning}"
+            learning.contains(
+                "A skill's own preferences - which sources, what to skip, what \"done\" \
+                 looks like - stay in the knowledge base"
+            ),
+            "while a skill's own preferences stay knowledge: {learning}"
         );
     }
 
@@ -716,6 +722,27 @@ mod tests {
         assert!(
             learning.contains("knowledge base"),
             "and the section must still name the store it goes to: {learning}"
+        );
+    }
+
+    #[test]
+    fn knowledge_base_tagging_example_no_longer_endorses_the_instruction_kind() {
+        // Moving the boundary in one section is not enough. The knowledge
+        // section's worked tagging example held up "instruction" as the good
+        // KIND to write, which pulls a finished procedure straight back into
+        // the store the Learning section just sent to a skill (#1156).
+        //
+        // The KIND stays in the reading vocabulary above it, because entries
+        // written before this carry it and a search still has to find them.
+        // What goes is the invitation to write another one.
+        let kb = section_body(&assemble(&static_sections()), "== Knowledge base ==");
+        assert!(
+            !kb.contains("Good: \"instruction\""),
+            "the worked example must not hold up the procedural KIND: {kb}"
+        );
+        assert!(
+            kb.contains("Good: \"memory\", \"project:adelie-ai\", \"topic:deploy\""),
+            "and must still show a KIND plus a specific facet: {kb}"
         );
     }
 
@@ -785,8 +812,17 @@ mod tests {
             "the prompt must promote a script that earns its keep: {skills}"
         );
         assert!(
-            skills.contains("configured skills roots") && skills.contains("SKILL.md"),
+            skills.contains("a directory holding a SKILL.md"),
             "and say where a skill lives: {skills}"
+        );
+        // Naming the tool matters: the write root the server picks is writable,
+        // and a global root the daemon indexes need not be. Told only to "write
+        // the script into that directory", the model can aim at a read-only
+        // shared root and fail with nowhere to fall back to.
+        assert!(
+            skills.contains("skills_create_skill")
+                && skills.contains("writes the SKILL.md into a writable skills root"),
+            "and name the tool that puts it somewhere writable: {skills}"
         );
         assert!(
             skills.contains("the files beside it travel with it"),

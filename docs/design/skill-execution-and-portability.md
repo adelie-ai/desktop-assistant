@@ -118,7 +118,7 @@ for a few tokens, but a wrongly followed procedure *acts*, with steps that were
 right for the situation it was written for. The risk grows as the library fills
 and as skills are put in front of the model unasked.
 
-So the prompt directs a fit check before a skill is followed — what it is for,
+So the prompt directs a fit check before a skill is followed - what it is for,
 what it is not for, what it assumes is already true. A near-miss is named and
 adapted to on purpose rather than silently, because the part that did not fit is
 the axis along which the skill wants generalizing.
