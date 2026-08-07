@@ -33,8 +33,10 @@
 //!   a strong cue produces an index.
 //! - **One activation score decides the order.** The bar says which candidates
 //!   are offered; [`crate::domain::activation`] says in what order, over the
-//!   semantic signal the bar already read and what the use log knows about each
-//!   entry. An entry nothing has used contributes nothing of its own, so a store
+//!   semantic signal the bar already read, what the use log knows about each
+//!   entry, and how well each entry's own record matches the situation the
+//!   prompt arrived in ([`crate::domain::situation`]). An entry nothing has used
+//!   and nothing has seen anywhere contributes nothing of its own, so a store
 //!   with no history renders the block its distances alone would have rendered.
 //! - **A line budget, derived from a token budget.**
 //!   [`RECALL_BLOCK_TOKEN_BUDGET`] pays for [`BUDGETED_MAX_RECALL_ENTRIES`]
@@ -66,7 +68,8 @@
 
 use std::sync::OnceLock;
 
-use crate::domain::activation::{ActivationWeights, activation};
+use crate::domain::activation::{ActivationWeights, NO_SITUATION, activation};
+use crate::domain::situation::SituationCue;
 use crate::ports::recall::{RecallCandidates, RecallDispersion, RecallEntry, RecallNote};
 use crate::ports::scratchpad::NOTE_KEY_MAX_CHARS;
 
@@ -549,7 +552,12 @@ fn render_recall_with_width(
             (!line.is_empty()).then_some((*hit, line))
         })
         .collect();
-    let showable = rank_by_activation(showable, entry_dispersion, surface.now);
+    let showable = rank_by_activation(
+        showable,
+        entry_dispersion,
+        candidates.situation_cue.as_ref(),
+        surface.now,
+    );
 
     // The pad is its own source and carries its own spread. A note embeds
     // `"<key> <content>"`, which is terser and more telegraphic than an entry's
@@ -665,18 +673,26 @@ fn render_recall_with_width(
 /// lookup uses one mode, so in practice the set is all of one kind.
 ///
 /// **It never decides admission.** The bar did that, above, on distance alone.
-fn rank_by_activation(
-    showable: Vec<(&RecallEntry, String)>,
+/// The situation term (#1125) is inside this function for that reason and no
+/// other: a signal that could admit an entry the bar refused would break the
+/// block's "and N more entries also matched" hedge, which counts what cleared a
+/// distance test over a nearest-first list. Nothing in this function is
+/// reachable from that test.
+fn rank_by_activation<'a>(
+    showable: Vec<(&'a RecallEntry, String)>,
     dispersion: RecallDispersion,
+    situation: Option<&SituationCue>,
     now: chrono::DateTime<chrono::Utc>,
-) -> Vec<(&RecallEntry, String)> {
+) -> Vec<(&'a RecallEntry, String)> {
     let weights = ActivationWeights::default();
     let scored: Vec<Option<f64>> = showable
         .iter()
         .map(|(hit, _)| {
-            hit.relevance
-                .semantic_signal(dispersion)
-                .map(|semantic| activation(semantic, hit.use_record.as_ref(), now, &weights))
+            let coverage = situation
+                .map_or(NO_SITUATION, |cue| cue.coverage(&hit.situation));
+            hit.relevance.semantic_signal(dispersion).map(|semantic| {
+                activation(semantic, hit.use_record.as_ref(), coverage, now, &weights)
+            })
         })
         .collect();
     let with_signal = scored.iter().filter(|score| score.is_some()).count();
@@ -981,11 +997,7 @@ mod tests {
             tags.iter().map(|t| (*t).to_string()).collect(),
         );
         entry.summary = Some(summary.to_string());
-        RecallEntry {
-            entry,
-            relevance: RecallRelevance::Distance(distance),
-            use_record: None,
-        }
+        RecallEntry::new(entry, RecallRelevance::Distance(distance))
     }
 
     /// The instant every test's lookup ran. Fixed, so a use record's age is the
@@ -1630,6 +1642,7 @@ mod tests {
             entry,
             relevance: RecallRelevance::Distance(0.10),
             use_record: None,
+            situation: crate::domain::SituationRecord::new(),
         }
     }
 
@@ -1670,6 +1683,7 @@ mod tests {
                 entry,
                 relevance: RecallRelevance::Distance(0.10),
                 use_record: None,
+            situation: crate::domain::SituationRecord::new(),
             }
         };
         RecallCandidates {
@@ -2054,6 +2068,7 @@ mod tests {
                 entry,
                 relevance: RecallRelevance::Distance(0.12),
                 use_record: None,
+            situation: crate::domain::SituationRecord::new(),
             }],
             ..RecallCandidates::default()
         };
@@ -2512,6 +2527,170 @@ mod tests {
         );
     }
 
+    // --- The situation as a cue (#1125) -------------------------------------
+
+    /// A store of two hundred entries in which each named value is carried by a
+    /// quarter of them, so every cue field is informative and none dominates.
+    fn a_gradeable_cue(situation: crate::domain::Situation) -> crate::domain::SituationCue {
+        let fan = situation.iter().map(|(field, _)| (field, 50)).collect();
+        crate::domain::SituationCue::measured(situation, 200, &fan)
+            .expect("two hundred entries is a gradeable store")
+    }
+
+    /// The present situation used by the tests below: a Thursday at the
+    /// workshop.
+    fn here_and_now() -> crate::domain::Situation {
+        crate::domain::Situation::new()
+            .with(crate::domain::SituationField::Host, "workshop")
+            .with(crate::domain::SituationField::Weekday, "thursday")
+    }
+
+    /// The same candidate, having been seen in `situation`.
+    fn seen_in(hit: RecallEntry, situation: &crate::domain::Situation) -> RecallEntry {
+        let record = situation.iter().fold(
+            crate::domain::SituationRecord::new(),
+            |record, (field, value)| record.with(field, value),
+        );
+        hit.with_situation(record)
+    }
+
+    /// Acceptance (#1125): an entry seen in the present situation is ranked
+    /// above an equally similar entry seen elsewhere, when the situation
+    /// recurs.
+    #[test]
+    fn an_entry_seen_in_the_recurring_situation_is_ranked_above_one_seen_elsewhere() {
+        let source = seeded_source();
+        let here = here_and_now();
+        let elsewhere = crate::domain::Situation::new()
+            .with(crate::domain::SituationField::Host, "the-road")
+            .with(crate::domain::SituationField::Weekday, "sunday");
+
+        let candidates = RecallCandidates {
+            entries: vec![
+                seen_in(
+                    hit(
+                        "kb-elsewhere",
+                        "a fact first met on the road",
+                        &["topic"],
+                        source.distance_at(9.0),
+                    ),
+                    &elsewhere,
+                ),
+                seen_in(
+                    hit(
+                        "kb-here",
+                        "a fact this room keeps producing",
+                        &["topic"],
+                        source.distance_at(8.9),
+                    ),
+                    &here,
+                ),
+            ],
+            entry_dispersion: Some(source),
+            situation_cue: Some(a_gradeable_cue(here)),
+            ..RecallCandidates::default()
+        };
+
+        assert_eq!(
+            shown_ids(&candidates),
+            vec!["kb-here".to_string(), "kb-elsewhere".to_string()],
+            "the entry this situation keeps producing must lead one a tenth of a deviation \
+             nearer that belongs somewhere else"
+        );
+    }
+
+    /// Acceptance (#1125): a situation match cannot admit an entry the bar
+    /// refused. It ranks the admitted set and never changes its membership, so
+    /// the block's "and N more entries also matched" hedge stays true.
+    #[test]
+    fn a_situation_match_cannot_admit_an_entry_the_bar_refused() {
+        let source = seeded_source();
+        let here = here_and_now();
+        let admitted = DEFAULT_MAX_RECALL_ENTRIES + 4;
+
+        let mut entries: Vec<RecallEntry> = (0..admitted)
+            .map(|i| {
+                hit(
+                    &format!("kb-{i}"),
+                    "a stored fact",
+                    &["topic"],
+                    source.distance_at(RECALL_BAR + 2.0 - (i as f64) * 0.05),
+                )
+            })
+            .collect();
+        // Well below the bar, and a perfect match for the present situation. A
+        // term that could admit would put it in the block, and would make the
+        // count below wrong by one.
+        entries.push(seen_in(
+            hit(
+                "kb-below-the-bar",
+                "an unrelated fact this room keeps producing",
+                &["topic"],
+                source.distance_at(RECALL_BAR - 2.0),
+            ),
+            &here,
+        ));
+
+        let candidates = RecallCandidates {
+            entries,
+            entry_dispersion: Some(source),
+            situation_cue: Some(a_gradeable_cue(here)),
+            ..RecallCandidates::default()
+        };
+        let block = render(&candidates).expect("a block");
+
+        assert!(
+            !block.contains("kb-below-the-bar"),
+            "the bar admits on distance; the situation only orders what it admitted: {block}"
+        );
+        assert!(
+            block.contains("...and 4 more entries also matched."),
+            "the hedge counts what cleared the bar, which the situation cannot move: {block}"
+        );
+    }
+
+    /// Acceptance (#1125): with no situation sources connected, the block is
+    /// byte for byte the block the same candidates rendered before the cue
+    /// existed.
+    ///
+    /// Both ways a deployment reaches that state: no cue measured at all, and a
+    /// cue over entries that carry no record of their own.
+    #[test]
+    fn with_no_situation_sources_connected_the_block_is_unchanged() {
+        let source = seeded_source();
+        let entries: Vec<RecallEntry> = STRONG_CUE
+            .iter()
+            .enumerate()
+            .map(|(i, score)| {
+                hit(
+                    &format!("kb-c{i}"),
+                    "a stored fact",
+                    &["topic"],
+                    source.distance_at(*score),
+                )
+            })
+            .collect();
+
+        let without = RecallCandidates {
+            entries: entries.clone(),
+            entry_dispersion: Some(source),
+            ..RecallCandidates::default()
+        };
+        let with_a_cue_nothing_matches = RecallCandidates {
+            entries,
+            entry_dispersion: Some(source),
+            situation_cue: Some(a_gradeable_cue(here_and_now())),
+            ..RecallCandidates::default()
+        };
+
+        assert_eq!(
+            render(&without),
+            render(&with_a_cue_nothing_matches),
+            "entries that carry no situation record must render the block their distances \
+             alone would have rendered"
+        );
+    }
+
     /// Acceptance (#1123), hazard 1: the count is still exact when the scan read
     /// past the bar, and still a lower bound when it filled with rows that all
     /// cleared - under activation ranking, and with the ranking scrambling the
@@ -2638,11 +2817,13 @@ mod tests {
                     entry: hostile_id,
                     relevance: RecallRelevance::Distance(0.10),
                     use_record: None,
+            situation: crate::domain::SituationRecord::new(),
                 },
                 RecallEntry {
                     entry: hostile_tag,
                     relevance: RecallRelevance::Distance(0.11),
                     use_record: None,
+            situation: crate::domain::SituationRecord::new(),
                 },
             ],
             ..RecallCandidates::default()
@@ -2689,6 +2870,7 @@ mod tests {
                 entry,
                 relevance: RecallRelevance::Distance(0.10),
                 use_record: None,
+            situation: crate::domain::SituationRecord::new(),
             }],
             ..RecallCandidates::default()
         };
@@ -2733,6 +2915,7 @@ mod tests {
                     entry,
                     relevance: RecallRelevance::Distance(0.10),
                     use_record: None,
+            situation: crate::domain::SituationRecord::new(),
                 }],
                 ..RecallCandidates::default()
             };
@@ -2770,6 +2953,7 @@ mod tests {
                 entry,
                 relevance: RecallRelevance::Distance(0.10),
                 use_record: None,
+            situation: crate::domain::SituationRecord::new(),
             }],
             ..RecallCandidates::default()
         };
@@ -2815,6 +2999,7 @@ mod tests {
                     entry: KnowledgeEntry::new("kb-empty", "   \n\t ", vec![]),
                     relevance: RecallRelevance::Distance(0.10),
                     use_record: None,
+            situation: crate::domain::SituationRecord::new(),
                 },
                 hit("kb-real", "a real fact", &[], 0.11),
             ],
@@ -2839,6 +3024,7 @@ mod tests {
             entry: KnowledgeEntry::new("kb-empty", "", vec![]),
             relevance: RecallRelevance::Distance(0.10),
             use_record: None,
+            situation: crate::domain::SituationRecord::new(),
         };
 
         let candidates = RecallCandidates {
@@ -2946,6 +3132,7 @@ mod tests {
                 entry,
                 relevance: RecallRelevance::Distance(0.10),
                 use_record: None,
+            situation: crate::domain::SituationRecord::new(),
             }],
             ..RecallCandidates::default()
         };
@@ -2963,6 +3150,7 @@ mod tests {
                 entry: KnowledgeEntry::new("kb-empty", "", vec![]),
                 relevance: RecallRelevance::Distance(0.10),
                 use_record: None,
+            situation: crate::domain::SituationRecord::new(),
             }],
             ..RecallCandidates::default()
         };
@@ -3014,6 +3202,7 @@ mod tests {
                 entry,
                 relevance: RecallRelevance::LexicalMatch,
                 use_record: None,
+            situation: crate::domain::SituationRecord::new(),
             }],
             ..RecallCandidates::default()
         };

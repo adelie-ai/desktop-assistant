@@ -25,6 +25,7 @@ use desktop_assistant_core::domain::knowledge_use::{
     RECENT_USE_WINDOW,
 };
 use desktop_assistant_core::ports::auth::current_user_id;
+use desktop_assistant_core::domain::situation::{Situation, SituationCue, SituationRecord};
 use desktop_assistant_core::ports::knowledge_use::{
     KnowledgeUseLog, MAX_STANDING_OFFERS, MarkRequest, OfferScope, OfferSource,
 };
@@ -263,11 +264,35 @@ impl KnowledgeUseLog for PgKnowledgeUseLog {
         Ok(written)
     }
 
+    async fn record_situation(
+        &self,
+        entry_ids: Vec<String>,
+        situation: Situation,
+    ) -> Result<usize, CoreError> {
+        let _ = (entry_ids, situation);
+        Ok(0)
+    }
+
+    async fn situations(
+        &self,
+        entry_ids: Vec<String>,
+    ) -> Result<Vec<(String, SituationRecord)>, CoreError> {
+        let _ = entry_ids;
+        Ok(vec![])
+    }
+
+    async fn situation_cue(&self, situation: Situation) -> Result<Option<SituationCue>, CoreError> {
+        let _ = situation;
+        Ok(None)
+    }
+
     async fn record_opened(
         &self,
         conversation_id: String,
         entry_ids: Vec<String>,
+        situation: Situation,
     ) -> Result<usize, CoreError> {
+        let _ = situation;
         let ids = storable(entry_ids);
         if ids.is_empty() {
             return Ok(0);

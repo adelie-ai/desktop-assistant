@@ -52,8 +52,9 @@ use std::sync::Arc;
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::ScratchpadNote;
 use desktop_assistant_core::domain::knowledge_use::KnowledgeUseRecord;
+use desktop_assistant_core::domain::situation::{SituationCue, SituationRecord};
 use desktop_assistant_core::ports::embedding::{EMBED_TIMEOUT, EmbedFn};
-use desktop_assistant_core::ports::knowledge_use::KnowledgeUseLog;
+use desktop_assistant_core::ports::knowledge_use::{KnowledgeUseLog, current_situation};
 use desktop_assistant_core::ports::recall::{
     RecallCandidates, RecallDispersion, RecallEntry, RecallNote, RecallRelevance, RecallRequest,
     RecallSearchFn,
@@ -182,6 +183,7 @@ async fn lookup(
                         .map(|entry| RecallEntry::new(entry, RecallRelevance::LexicalMatch))
                         .collect(),
                     None,
+                    None,
                 ))
             },
             async {
@@ -222,10 +224,24 @@ async fn lookup(
             // turn including the many where the bar admits nothing and every
             // record read is discarded.
             let ids: Vec<String> = found.entries.iter().map(|(e, _)| e.id.clone()).collect();
-            let mut records = if ids.is_empty() {
-                std::collections::HashMap::new()
+            // The situation this turn arrived in, read once and against the
+            // whole store. It is derived from the clock and what the client
+            // reported, so it costs no model call and no extra work on the
+            // write path - see `desktop_assistant_core::domain::situation`.
+            let here = current_situation();
+            let (mut records, mut situations, cue) = if ids.is_empty() {
+                (
+                    std::collections::HashMap::new(),
+                    std::collections::HashMap::new(),
+                    None,
+                )
             } else {
-                use_records(uses.records(ids)).await
+                let cue_read = uses.situation_cue(here.clone());
+                let (records, (situations, cue)) = tokio::join!(
+                    use_records(uses.records(ids.clone())),
+                    situation_signal(uses.situations(ids), cue_read),
+                );
+                (records, situations, cue)
             };
             // How much of the block's order the use log actually decided. An
             // operator meeting a block that looks different, or one that looks
@@ -236,7 +252,12 @@ async fn lookup(
             tracing::debug!(
                 candidates = found.entries.len(),
                 with_use_record = records.len(),
-                "recall: how many candidates the use log had something to say about"
+                with_situation_record = situations.len(),
+                situation_cue = cue.as_ref().map_or(0, |cue: &SituationCue| {
+                    cue.situation().iter().count()
+                }),
+                "recall: how many candidates the use log and the situation had something to \
+                 say about"
             );
             Ok((
                 found
@@ -244,11 +265,14 @@ async fn lookup(
                     .into_iter()
                     .map(|(entry, distance)| {
                         let record = records.remove(&entry.id);
+                        let seen_in = situations.remove(&entry.id).unwrap_or_default();
                         RecallEntry::new(entry, RecallRelevance::Distance(distance))
                             .with_use_record(record)
+                            .with_situation(seen_in)
                     })
                     .collect(),
                 found.dispersion,
+                cue,
             ))
         },
         async {
@@ -310,6 +334,46 @@ async fn use_records(
         .collect()
 }
 
+/// The situations each candidate has been seen in, and the present situation
+/// read against the store (#1125).
+///
+/// The same bargain [`use_records`] makes, for the same reason and under the
+/// same ceiling: a read that fails costs the order of the lines and never the
+/// lines. Without it every entry ranks on its distance and its use log alone,
+/// which is how every entry ranked before the cue existed.
+///
+/// Both halves degrade together. They are two views of one signal - a record
+/// nothing can grade scores zero, and a cue nothing carries a record for scores
+/// zero as well - so half an answer is worth exactly what no answer is worth,
+/// and there is nothing to be gained by keeping one when the other is gone.
+///
+/// Generic over the reads, and separate from [`lookup`], so what it guarantees
+/// is provable without a database.
+async fn situation_signal(
+    records: impl Future<Output = Result<Vec<(String, SituationRecord)>, CoreError>>,
+    cue: impl Future<Output = Result<Option<SituationCue>, CoreError>>,
+) -> (
+    std::collections::HashMap<String, SituationRecord>,
+    Option<SituationCue>,
+) {
+    let both = async { tokio::join!(records, cue) };
+    let (records, cue) = match tokio::time::timeout(USE_LOG_READ_CEILING, both).await {
+        Ok(pair) => pair,
+        Err(_) => {
+            tracing::warn!(
+                timeout = ?USE_LOG_READ_CEILING,
+                "recall: the situation read timed out; ranking without the situation cue"
+            );
+            return (std::collections::HashMap::new(), None);
+        }
+    };
+    let (Ok(records), Ok(cue)) = (records, cue) else {
+        tracing::warn!("recall: the situation could not be read; ranking without the cue");
+        return (std::collections::HashMap::new(), None);
+    };
+    (records.into_iter().collect(), cue)
+}
+
 /// Run the two arms together and fold what they answered into one candidate
 /// set.
 ///
@@ -330,12 +394,21 @@ async fn use_records(
 /// The knowledge arm answers with the store's own spread beside its candidates,
 /// because one scan states both.
 async fn gather(
-    entries: impl Future<Output = Result<(Vec<RecallEntry>, Option<RecallDispersion>), CoreError>>,
+    entries: impl Future<
+        Output = Result<
+            (
+                Vec<RecallEntry>,
+                Option<RecallDispersion>,
+                Option<SituationCue>,
+            ),
+            CoreError,
+        >,
+    >,
     notes: impl Future<Output = Result<Vec<RecallNote>, CoreError>>,
 ) -> Result<RecallCandidates, CoreError> {
     let (entries, notes) = tokio::join!(entries, notes);
     let notes = notes_or_none(notes);
-    let (entries, entry_dispersion) = entries?;
+    let (entries, entry_dispersion, situation_cue) = entries?;
     // Which sources stated their own geometry, and which the block will read by
     // a stated estimate. Without this an operator meeting a block that is
     // quieter than expected cannot tell whether the dimensionless bar is in
@@ -355,6 +428,7 @@ async fn gather(
         // be a measurement rather than noise, and the pad read is already the
         // block's most expensive query - see #1146.
         note_dispersion: None,
+        situation_cue,
     })
 }
 
@@ -550,7 +624,7 @@ mod tests {
     #[tokio::test]
     async fn recall_block_survives_the_scratchpad_arm_failing() {
         let candidates = gather(
-            async { Ok((vec![an_entry()], Some(a_dispersion()))) },
+            async { Ok((vec![an_entry()], Some(a_dispersion()), None)) },
             async { Err(CoreError::Storage("the pad read failed".into())) },
         )
         .await
@@ -569,7 +643,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_scratchpad_arm_passes_its_rows_through_when_it_answers() {
-        let candidates = gather(async { Ok((vec![], Some(a_dispersion()))) }, async {
+        let candidates = gather(async { Ok((vec![], Some(a_dispersion()), None)) }, async {
             Ok(vec![a_note()])
         })
         .await
@@ -601,7 +675,7 @@ mod tests {
     #[tokio::test]
     async fn the_measured_dispersion_travels_with_the_candidates() {
         let candidates = gather(
-            async { Ok((vec![an_entry()], Some(a_dispersion()))) },
+            async { Ok((vec![an_entry()], Some(a_dispersion()), None)) },
             async { Ok(vec![]) },
         )
         .await
@@ -615,7 +689,7 @@ mod tests {
     /// estimate.
     #[tokio::test]
     async fn a_store_that_cannot_be_measured_still_answers_with_its_candidates() {
-        let candidates = gather(async { Ok((vec![an_entry()], None)) }, async { Ok(vec![]) })
+        let candidates = gather(async { Ok((vec![an_entry()], None, None)) }, async { Ok(vec![]) })
             .await
             .expect("a measurement is not what the lookup is for");
 
@@ -648,7 +722,7 @@ mod tests {
         gather(
             async move {
                 tokio::time::sleep(hold).await;
-                Ok((vec![an_entry()], Some(a_dispersion())))
+                Ok((vec![an_entry()], Some(a_dispersion()), None))
             },
             async move {
                 tokio::time::sleep(hold).await;

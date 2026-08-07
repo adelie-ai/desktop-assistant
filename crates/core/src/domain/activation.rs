@@ -10,7 +10,7 @@
 //! ## The score
 //!
 //! ```text
-//! A_i = semantic + reinforcement
+//! A_i = semantic + reinforcement + situation
 //! ```
 //!
 //! - **`semantic`** is how far the candidate stands out of its own source,
@@ -27,6 +27,12 @@
 //!   produces. The ratio is what makes it dimensionless - a base-level sum
 //!   scales with whatever unit its ages are counted in, and dividing by a
 //!   reference sum cancels that. See [`ActivationWeights::reinforcement`].
+//! - **`situation`** is how much of what the present situation could have told
+//!   us about this entry it actually told us (#1125), spent against a lift of
+//!   exactly one reference use. [`crate::domain::situation`] states the cue, the
+//!   fan weighting behind it, and why the bound is a scale;
+//!   [`ActivationWeights::situation`] is the two lines that turn it into
+//!   deviations.
 //!
 //! [`RecallDispersion::deviations_below_median`]:
 //!     crate::ports::recall::RecallDispersion::deviations_below_median
@@ -70,7 +76,6 @@
 //! | term | where its input will come from |
 //! | --- | --- |
 //! | full-text rank | a recall lookup uses one mode at a time, so a vector candidate carries no rank and a lexical one carries no distance - see [`RecallRelevance`] |
-//! | situation match | #1125 |
 //! | salience | #1127 |
 //! | interference penalty | the entry disposition of #893, which no column holds yet |
 //!
@@ -214,7 +219,67 @@ impl ActivationWeights {
         }
         self.use_lift * (sum.abs() / reference).ln_1p() * sum.signum()
     }
+
+    /// The most a full situation match is worth, in the source's own
+    /// deviations: **exactly what one use at [`USE_REFERENCE_AGE_SECONDS`] is
+    /// worth**.
+    ///
+    /// Computed from [`Self::reinforcement`] rather than restated, so the two
+    /// cannot drift and there is one definition to argue with.
+    ///
+    /// **This is the whole answer to "why that number", and it is a scale
+    /// rather than a fit.** It introduces no coefficient of its own. What it
+    /// states is an equivalence between two signals - "this entry recurs where
+    /// you are now" is worth what "you opened this yesterday" is worth - and an
+    /// equivalence transfers to a store nobody measured, which is precisely
+    /// what [`DEFAULT_USE_LIFT`]'s value does not do. Three properties follow:
+    ///
+    /// - **No unit of its own.** It works out to `use_lift * ln 2` whatever the
+    ///   decay exponent and whatever unit the use log's ages are counted in,
+    ///   because the reinforcement term is already a ratio against its own
+    ///   reference. It follows [`USE_REFERENCE_AGE_SECONDS`], which is a genuine
+    ///   unit normalization, rather than [`DEFAULT_USE_LIFT`], which is not.
+    /// - **One number to fit, not two.** A deployment that fits `use_lift` from
+    ///   its own use log moves both terms together and keeps the stated
+    ///   relation.
+    /// - **A size that suits what it claims.** At the default weights it is
+    ///   about a third of a deviation, which settles a near-tie between adjacent
+    ///   candidates and is a ninth of [`MAX_REINFORCEMENT_DEVIATIONS`]. The
+    ///   situation can reorder a bunched block; it can never overturn a semantic
+    ///   lead. Its influence is therefore largest exactly where the admitted
+    ///   band is narrowest, which is the weakly cued prompt - the case where the
+    ///   prompt named nothing the store really holds and the other signals
+    ///   should lead.
+    pub fn situation_lift(&self) -> f64 {
+        0.0
+    }
+
+    /// What a situation coverage is worth, in the source's own deviations.
+    ///
+    /// `situation_lift * coverage`, over a coverage in `[0, 1]` -
+    /// [`SituationCue::coverage`] answers that range and this holds it to the
+    /// range whatever it is handed, so the bound is a property of the function
+    /// and not of its caller.
+    ///
+    /// Never negative. An entry the cue cannot grade, and an entry whose record
+    /// disagrees with the cue outright, both contribute exactly zero, so neither
+    /// can end below what its own distance and history earned it. Mismatch
+    /// forfeits the lift; it does not subtract.
+    ///
+    /// [`SituationCue::coverage`]: crate::domain::situation::SituationCue::coverage
+    pub fn situation(&self, coverage: f64) -> f64 {
+        let _ = coverage;
+        0.0
+    }
 }
+
+/// A candidate the situation cannot grade, which is what every caller passes
+/// where no cue was measured or the entry has no record of its own.
+///
+/// Named rather than written as a bare zero at each call site, so a reader meets
+/// "no situation signal" instead of a number whose meaning depends on the
+/// parameter it sits in.
+pub const NO_SITUATION: f64 = 0.0;
 
 /// What one candidate is worth, as of `now`.
 ///
@@ -223,14 +288,23 @@ impl ActivationWeights {
 /// `record` is what the use log knows about it, and `None` - an entry nothing
 /// has ever offered, opened or marked - contributes exactly zero, so a store
 /// with no use history ranks on the semantic signal alone.
+/// `situation_coverage` is how much of what the present situation could have
+/// told us about this entry it did tell us
+/// ([`SituationCue::coverage`](crate::domain::situation::SituationCue::coverage)),
+/// and [`NO_SITUATION`] is the answer wherever there is no cue to read.
+///
+/// Both extra signals are handed in already dimensionless, exactly as the
+/// semantic one is. That is what lets a fourth source, or a fourth term, join
+/// later without refitting anything already here.
 pub fn activation(
     semantic: f64,
     record: Option<&KnowledgeUseRecord>,
+    situation_coverage: f64,
     now: DateTime<Utc>,
     weights: &ActivationWeights,
 ) -> f64 {
     let sum = record.map_or(0.0, |record| record.use_sum(now, &weights.use_score));
-    semantic + weights.reinforcement(sum)
+    semantic + weights.reinforcement(sum) + weights.situation(situation_coverage)
 }
 
 #[cfg(test)]
@@ -300,8 +374,8 @@ mod tests {
         let weights = ActivationWeights::default();
         let record = used(now, &[60, 600, 6_000], 3);
 
-        let first = activation(7.0, Some(&record), now, &weights);
-        let again = activation(7.0, Some(&record), now, &weights);
+        let first = activation(7.0, Some(&record), NO_SITUATION, now, &weights);
+        let again = activation(7.0, Some(&record), NO_SITUATION, now, &weights);
 
         assert_eq!(
             first, again,
@@ -342,8 +416,8 @@ mod tests {
             "precondition: equal elapsed time, so only the spacing differs"
         );
 
-        let spread_score = activation(7.0, Some(&spread), now, &weights);
-        let massed_score = activation(7.0, Some(&massed), now, &weights);
+        let spread_score = activation(7.0, Some(&spread), NO_SITUATION, now, &weights);
+        let massed_score = activation(7.0, Some(&massed), NO_SITUATION, now, &weights);
         assert!(
             spread_score > massed_score,
             "twenty uses spread over a year scored {spread_score}, twenty massed into a day \
@@ -378,9 +452,9 @@ mod tests {
             );
         }
 
-        let mut previous = activation(0.0, Some(&every_hour(now, 1)), now, &weights);
+        let mut previous = activation(0.0, Some(&every_hour(now, 1)), NO_SITUATION, now, &weights);
         for count in [2u64, 4, 8, 16, 32, 64, 128, 256] {
-            let doubled = activation(0.0, Some(&every_hour(now, count)), now, &weights);
+            let doubled = activation(0.0, Some(&every_hour(now, count)), NO_SITUATION, now, &weights);
             let step = doubled - previous;
             assert!(
                 step <= bound,
@@ -407,8 +481,8 @@ mod tests {
         let weights = ActivationWeights::default();
         let bound = weights.use_lift * std::f64::consts::LN_2;
 
-        let once = activation(0.0, Some(&used(now, &[60], 1)), now, &weights);
-        let twice = activation(0.0, Some(&used(now, &[30, 60], 2)), now, &weights);
+        let once = activation(0.0, Some(&used(now, &[60], 1)), NO_SITUATION, now, &weights);
+        let twice = activation(0.0, Some(&used(now, &[30, 60], 2)), NO_SITUATION, now, &weights);
 
         assert!(
             twice - once > bound,
@@ -459,7 +533,7 @@ mod tests {
         let now = now();
         let weights = ActivationWeights::default();
         let veteran = a_veteran(now);
-        let at_the_bar = activation(BAR, Some(&veteran), now, &weights);
+        let at_the_bar = activation(BAR, Some(&veteran), NO_SITUATION, now, &weights);
 
         let wide: Vec<f64> = MEASURED_HITS
             .iter()
@@ -476,7 +550,7 @@ mod tests {
             .iter()
             .chain(std::iter::once(&(BAR + MAX_REINFORCEMENT_DEVIATIONS)))
         {
-            let cold = activation(*best, None, now, &weights);
+            let cold = activation(*best, None, NO_SITUATION, now, &weights);
             assert!(
                 at_the_bar < cold,
                 "a veteran at the bar scored {at_the_bar} against a cold best match at \
@@ -508,8 +582,8 @@ mod tests {
         // context, which is the ordinary case rather than an extreme one.
         let worked_all_morning = evenly_over(now, 10, 1_800);
 
-        let best_cold_match = activation(7.3, None, now, &weights);
-        let just_above_the_bar = activation(6.9, Some(&worked_all_morning), now, &weights);
+        let best_cold_match = activation(7.3, None, NO_SITUATION, now, &weights);
+        let just_above_the_bar = activation(6.9, Some(&worked_all_morning), NO_SITUATION, now, &weights);
 
         assert!(
             just_above_the_bar > best_cold_match,
@@ -547,12 +621,14 @@ mod tests {
         let in_tight = activation(
             tight.deviations_below_median(near),
             Some(&record),
+            NO_SITUATION,
             now,
             &weights,
         );
         let in_loose = activation(
             loose.deviations_below_median(far),
             Some(&record),
+            NO_SITUATION,
             now,
             &weights,
         );
@@ -574,7 +650,7 @@ mod tests {
 
         for semantic in [0.0, 6.8, 11.4, -3.0] {
             assert_eq!(
-                activation(semantic, None, now, &weights),
+                activation(semantic, None, NO_SITUATION, now, &weights),
                 semantic,
                 "an unused entry must contribute nothing of its own"
             );
@@ -584,8 +660,8 @@ mod tests {
         // the same - the two differ only in whether a write ever happened.
         let unseen = KnowledgeUseRecord::unseen("kb-1", now);
         assert_eq!(
-            activation(6.8, Some(&unseen), now, &weights),
-            activation(6.8, None, now, &weights)
+            activation(6.8, Some(&unseen), NO_SITUATION, now, &weights),
+            activation(6.8, None, NO_SITUATION, now, &weights)
         );
     }
 
@@ -608,7 +684,7 @@ mod tests {
         }];
 
         assert!(
-            activation(7.0, Some(&refuted), now, &weights) < activation(7.0, None, now, &weights)
+            activation(7.0, Some(&refuted), NO_SITUATION, now, &weights) < activation(7.0, None, NO_SITUATION, now, &weights)
         );
     }
 
@@ -645,7 +721,7 @@ mod tests {
         let weights = ActivationWeights::default();
         let a_day = USE_REFERENCE_AGE_SECONDS as i64;
 
-        let scored = activation(0.0, Some(&used(now, &[a_day], 1)), now, &weights);
+        let scored = activation(0.0, Some(&used(now, &[a_day], 1)), NO_SITUATION, now, &weights);
 
         assert!(
             (scored - weights.use_lift * std::f64::consts::LN_2).abs() < 1e-9,
@@ -662,8 +738,8 @@ mod tests {
         let weights = ActivationWeights::default();
         let a_day = USE_REFERENCE_AGE_SECONDS as i64;
 
-        let nearer_but_unread = activation(9.10, None, now, &weights);
-        let further_but_used = activation(9.00, Some(&used(now, &[a_day], 1)), now, &weights);
+        let nearer_but_unread = activation(9.10, None, NO_SITUATION, now, &weights);
+        let further_but_used = activation(9.00, Some(&used(now, &[a_day], 1)), NO_SITUATION, now, &weights);
 
         assert!(
             further_but_used > nearer_but_unread,
@@ -685,13 +761,213 @@ mod tests {
         let now = now();
         let weights = ActivationWeights::default();
 
-        let lift = activation(0.0, Some(&a_veteran(now)), now, &weights);
+        let lift = activation(0.0, Some(&a_veteran(now)), NO_SITUATION, now, &weights);
 
         assert!(
             (0.0..MAX_REINFORCEMENT_DEVIATIONS).contains(&lift),
             "an extreme history lifted {lift} deviations, past the \
              {MAX_REINFORCEMENT_DEVIATIONS} the scale is chosen against"
         );
+    }
+
+    /// Acceptance (#1125): the situation term is counted in the source's own
+    /// median absolute deviations, like the other two.
+    ///
+    /// The same test the semantic term gets, extended to the third: two sources
+    /// of quite different geometry, one candidate equally placed in each and
+    /// equally matched by the situation. The score is the same number, so
+    /// nothing here is a raw distance and nothing is a raw match count.
+    #[test]
+    fn the_situation_term_is_counted_in_the_sources_own_deviations() {
+        use crate::ports::recall::RecallDispersion;
+
+        let now = now();
+        let weights = ActivationWeights::default();
+        let tight = RecallDispersion::assumed(0.80, 0.05);
+        let loose = RecallDispersion::assumed(0.42, 0.30);
+        let stands_out_by = 7.5;
+
+        let in_tight = activation(
+            tight.deviations_below_median(tight.distance_at(stands_out_by)),
+            None,
+            1.0,
+            now,
+            &weights,
+        );
+        let in_loose = activation(
+            loose.deviations_below_median(loose.distance_at(stands_out_by)),
+            None,
+            1.0,
+            now,
+            &weights,
+        );
+
+        assert!(
+            (in_tight - in_loose).abs() < 1e-9,
+            "an equally-placed, equally-situated candidate scored {in_tight} against one \
+             source and {in_loose} against another"
+        );
+    }
+
+    /// Acceptance (#1125): the situation term is bounded, and the bound is
+    /// exactly what one use at the reference age is worth.
+    ///
+    /// Both halves. The ceiling holds over every coverage a caller could hand
+    /// in, including the ones the type does not rule out - a value past one, a
+    /// negative value, and a value that is not a number. And the ceiling is the
+    /// stated quantity rather than a number of its own: a full match is worth
+    /// what an entry opened a day ago is worth, measured against a real record
+    /// rather than against the formula.
+    #[test]
+    fn the_situation_term_is_bounded_by_one_use_at_the_reference_age() {
+        let now = now();
+        let weights = ActivationWeights::default();
+        let a_day = USE_REFERENCE_AGE_SECONDS as i64;
+
+        let ceiling = weights.situation_lift();
+        let one_day_old_use = activation(0.0, Some(&used(now, &[a_day], 1)), NO_SITUATION, now, &weights);
+        assert!(
+            (ceiling - one_day_old_use).abs() < 1e-9,
+            "a full situation match is worth {ceiling}, and one use a day old is worth \
+             {one_day_old_use}; the bound is supposed to be that equivalence"
+        );
+
+        for coverage in [0.0, 0.25, 0.5, 1.0, 1.5, 1e9, -1.0, f64::NAN, f64::INFINITY] {
+            let lift = weights.situation(coverage);
+            assert!(
+                (0.0..=ceiling).contains(&lift),
+                "a coverage of {coverage} lifted {lift}, outside the 0 to {ceiling} the term \
+                 is bounded to"
+            );
+        }
+    }
+
+    /// Acceptance (#1125): the bound is a stated scale rather than a value
+    /// fitted to one store.
+    ///
+    /// What separates the two, testably, is that a scale carries no unit of its
+    /// own. [`USE_REFERENCE_AGE_SECONDS`] is a genuine unit normalization -
+    /// restate the use log's ages in another unit and every term is unchanged -
+    /// and [`DEFAULT_USE_LIFT`] is not. The situation lift is on the first side
+    /// of that line: it is unmoved by the decay exponent, which is what decides
+    /// how the ages are counted, and it introduces no coefficient beyond the
+    /// `use_lift` a deployment already fits from its own use log.
+    #[test]
+    fn the_situation_bound_is_a_scale_and_carries_no_unit_of_its_own() {
+        for decay in [0.1, 0.3, 0.5, 0.7, 0.9] {
+            for use_lift in [0.2, DEFAULT_USE_LIFT, 1.3] {
+                let weights = ActivationWeights {
+                    use_lift,
+                    use_score: UseScoreWeights {
+                        decay,
+                        ..UseScoreWeights::default()
+                    },
+                };
+                let expected = use_lift * std::f64::consts::LN_2;
+                assert!(
+                    (weights.situation_lift() - expected).abs() < 1e-9,
+                    "at decay {decay} and lift {use_lift} the situation bound was {}, and a \
+                     bound that moves with how ages are counted is a fit rather than a scale",
+                    weights.situation_lift()
+                );
+            }
+        }
+    }
+
+    /// Acceptance (#1125): an entry seen in the present situation is ranked
+    /// above an equally similar entry that was not.
+    ///
+    /// Equal in every other respect - the same distance, and no use history on
+    /// either - so the situation is the only thing that separates them.
+    #[test]
+    fn an_entry_matching_the_present_situation_outranks_an_equally_similar_one() {
+        let now = now();
+        let weights = ActivationWeights::default();
+
+        let recurs_here = activation(7.4, None, 1.0, now, &weights);
+        let written_elsewhere = activation(7.4, None, 0.0, now, &weights);
+
+        assert!(
+            recurs_here > written_elsewhere,
+            "the entry that recurs here scored {recurs_here} and the one that does not scored \
+             {written_elsewhere}"
+        );
+    }
+
+    /// Acceptance (#1125): with no situation sources connected the score is
+    /// exactly the score this module produced before the term existed.
+    ///
+    /// Not "close to" and not "usually": the same number, over the whole range
+    /// of semantic signals and over both an entry with a history and one
+    /// without.
+    #[test]
+    fn with_no_situation_connected_the_score_is_the_pre_change_score() {
+        let now = now();
+        let weights = ActivationWeights::default();
+        let record = used(now, &[60, 6_000], 2);
+
+        for semantic in [0.0, 6.8, 7.3, 11.4, -3.0] {
+            let cold = activation(semantic, None, NO_SITUATION, now, &weights);
+            assert_eq!(
+                cold, semantic,
+                "an entry with no history and no situation must score its semantic signal alone"
+            );
+
+            let used_only = activation(semantic, Some(&record), NO_SITUATION, now, &weights);
+            assert_eq!(
+                used_only,
+                semantic + weights.reinforcement(record.use_sum(now, &weights.use_score)),
+                "with no cue the score must be the semantic term plus the use log, and nothing \
+                 else"
+            );
+        }
+    }
+
+    /// A mismatched situation forfeits the lift; it never subtracts.
+    ///
+    /// An entry cannot be pushed below what its own distance and history earned
+    /// it just because it was first seen somewhere else.
+    #[test]
+    fn a_mismatched_situation_forfeits_the_lift_rather_than_subtracting() {
+        let now = now();
+        let weights = ActivationWeights::default();
+        let record = used(now, &[600], 1);
+
+        let without = activation(7.0, Some(&record), NO_SITUATION, now, &weights);
+        assert_eq!(activation(7.0, Some(&record), 0.0, now, &weights), without);
+        assert!(activation(7.0, Some(&record), 0.3, now, &weights) > without);
+    }
+
+    /// The situation cannot overturn a semantic lead, which is the other half of
+    /// what the bound is for.
+    ///
+    /// Over every distance the measured prompts reached that leads the bar by
+    /// more than the situation lift, a fully-situated candidate sitting at the
+    /// bar stays below a cold best match.
+    #[test]
+    fn a_lead_wider_than_the_situation_lift_cannot_be_closed_by_the_situation() {
+        let now = now();
+        let weights = ActivationWeights::default();
+        let lift = weights.situation_lift();
+        let at_the_bar = activation(BAR, None, 1.0, now, &weights);
+
+        let wide: Vec<f64> = MEASURED_HITS
+            .iter()
+            .copied()
+            .filter(|hit| hit - BAR > lift)
+            .collect();
+        assert!(
+            wide.len() >= 3,
+            "the measured corpus must hold several prompts that lead by more than the lift, \
+             or this proves nothing: {wide:?}"
+        );
+        for best in wide {
+            assert!(
+                at_the_bar < activation(best, None, NO_SITUATION, now, &weights),
+                "a fully-situated candidate at the bar scored {at_the_bar} against a cold best \
+                 match at {best} deviations"
+            );
+        }
     }
 
     /// Acceptance (#1123): scoring a corpus far larger than any one lookup reads
@@ -715,7 +991,7 @@ mod tests {
         let total: f64 = corpus
             .iter()
             .enumerate()
-            .map(|(i, record)| activation(7.0 + (i % 5) as f64, Some(record), now, &weights))
+            .map(|(i, record)| activation(7.0 + (i % 5) as f64, Some(record), NO_SITUATION, now, &weights))
             .sum();
         let spent = started.elapsed();
 

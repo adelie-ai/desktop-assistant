@@ -4101,11 +4101,10 @@ mod tests {
     fn recall_entry(id: &str, summary: &str) -> crate::ports::recall::RecallEntry {
         let mut entry = crate::domain::KnowledgeEntry::new(id, "body", vec![]);
         entry.summary = Some(summary.to_string());
-        crate::ports::recall::RecallEntry {
+        crate::ports::recall::RecallEntry::new(
             entry,
-            relevance: crate::ports::recall::RecallRelevance::Distance(0.10),
-            use_record: None,
-        }
+            crate::ports::recall::RecallRelevance::Distance(0.10),
+        )
     }
 
     /// One scratchpad candidate, near enough to render.

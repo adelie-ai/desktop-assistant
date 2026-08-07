@@ -21,6 +21,11 @@ chrono = { workspace = true, features = ["serde"] }
 tokio = { workspace = true, features = ["time"] }
 tokio-util.workspace = true
 uuid = { version = "1", features = ["v4", "v7"] }
+# The IANA time-zone database, for `domain::situation`. A situation's time of
+# day and weekday are read in the person's own zone (#549 reports the name), and
+# a time of day computed in the daemon's zone would be a wrong value rather than
+# a missing one. Neither the standard library nor `chrono` carries the database.
+chrono-tz = "0.10.4"
 
 [features]
 # Exposes `ports::skill_index::conformance`, the executable contract every

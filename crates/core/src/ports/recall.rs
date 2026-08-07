@@ -32,6 +32,13 @@
 //!   means nothing until it is read against the spread of the source it came
 //!   from - see [`RecallDispersion`]. The adapter measures that over the whole
 //!   source, not over the rows it returned, and answers `None` when it cannot.
+//! - **The present situation, read against the source.** A candidate carries
+//!   the situations it has been seen in ([`RecallEntry::situation`]), and the
+//!   answer carries one [`SituationCue`] for the whole lookup: the present
+//!   situation, plus how much each of its values separates one entry of this
+//!   store from another. That second half is a property of the source in the
+//!   same way a dispersion is, so it is measured over the source and answered
+//!   as `None` when it cannot be - see [`crate::domain::situation`].
 //! - **One user, and one conversation's pad.** Row-level security is a backstop
 //!   the table owner bypasses, so every query behind this port carries its own
 //!   `WHERE user_id` predicate. The scratchpad arm carries a `conversation_id`
@@ -47,6 +54,7 @@ use std::sync::Arc;
 use crate::CoreError;
 use crate::domain::KnowledgeEntry;
 use crate::domain::knowledge_use::KnowledgeUseRecord;
+use crate::domain::situation::{SituationCue, SituationRecord};
 
 /// How near a candidate is to the prompt, and in which sense.
 ///
@@ -225,6 +233,15 @@ pub struct RecallEntry {
     /// read the log this turn. Either way the entry is ranked on its semantic
     /// signal alone, which is how every entry ranked before the log existed.
     pub use_record: Option<KnowledgeUseRecord>,
+    /// The situations this entry has been seen in (#1125), and the third term
+    /// of its activation score.
+    ///
+    /// Empty is an ordinary answer, with the same two causes and the same
+    /// consequence as an absent `use_record`: an entry written before any of
+    /// this was recorded, or an adapter that could not read the table. Either
+    /// way [`SituationCue::coverage`] answers zero and the entry ranks the way
+    /// it ranked before the cue existed.
+    pub situation: SituationRecord,
 }
 
 impl RecallEntry {
@@ -237,12 +254,21 @@ impl RecallEntry {
             entry,
             relevance,
             use_record: None,
+            situation: SituationRecord::new(),
         }
     }
 
     /// The same candidate, carrying what the log knows about it.
+    #[must_use]
     pub fn with_use_record(mut self, record: Option<KnowledgeUseRecord>) -> Self {
         self.use_record = record;
+        self
+    }
+
+    /// The same candidate, carrying the situations it has been seen in.
+    #[must_use]
+    pub fn with_situation(mut self, situation: SituationRecord) -> Self {
+        self.situation = situation;
         self
     }
 }
@@ -302,6 +328,17 @@ pub struct RecallCandidates {
     pub entry_dispersion: Option<RecallDispersion>,
     /// The scratchpad source's own dispersion, on the same terms.
     pub note_dispersion: Option<RecallDispersion>,
+    /// The present situation, read against the knowledge source (#1125).
+    ///
+    /// The same split as [`Self::entry_dispersion`], and for the same reason:
+    /// how much a situation value separates one entry from another is a property
+    /// of the whole source, so only the adapter can measure it, and a count
+    /// taken over the candidates one lookup returned would describe the near
+    /// tail instead. `None` where the adapter measured none - a store below its
+    /// population floor, a deployment with nothing connected, or a read that
+    /// failed - and every entry then ranks the way it ranked before the cue
+    /// existed.
+    pub situation_cue: Option<SituationCue>,
 }
 
 /// Boxed async closure that runs one recall lookup.

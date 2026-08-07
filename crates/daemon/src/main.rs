@@ -1645,15 +1645,23 @@ async fn main() -> Result<()> {
                 let log = Arc::clone(&offered);
                 Box::pin(async move { log.record_offered(scope, ids).await })
             }),
-            Arc::new(move |conversation_id, ids| {
+            Arc::new(move |conversation_id, ids, situation| {
                 let log = Arc::clone(&opened);
-                Box::pin(async move { log.record_opened(conversation_id, ids).await })
+                Box::pin(async move { log.record_opened(conversation_id, ids, situation).await })
             }),
             Arc::new(move |request| {
                 let log = Arc::clone(&marked);
                 Box::pin(async move { log.record_mark(request).await })
             }),
         );
+        // The situation an entry is written in (#1125). Separate from the three
+        // above because it is not a use: it is the write path's own half of the
+        // cue, and a deployment can have one without the other.
+        let situated = Arc::clone(log);
+        builtin_tools = builtin_tools.with_knowledge_situation(Arc::new(move |ids, situation| {
+            let log = Arc::clone(&situated);
+            Box::pin(async move { log.record_situation(ids, situation).await })
+        }));
     }
 
     // Desktop notifications (builtin_notify). Capability-gated: only wired when
