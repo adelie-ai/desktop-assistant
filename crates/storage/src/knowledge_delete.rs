@@ -219,6 +219,30 @@ impl DeleteRefusal {
         line
     }
 
+    /// Did this refusal actually save anything?
+    ///
+    /// A refused statement that matched no row is the ordinary tick of a
+    /// periodic pass. The trash sweep runs on its own clock whether or not
+    /// dreaming is on, so under the safety flag every tick takes the refusal
+    /// branch, and on a store with no expired tombstone it spares nothing.
+    pub const fn spared_anything(&self) -> bool {
+        self.total > 0
+    }
+
+    /// Write the refusal to the log, at the level its content deserves.
+    ///
+    /// A refusal that spared entries is worth an operator's attention, because
+    /// the record exists to make the volume measurable before the flag is
+    /// relaxed. A refusal that spared nothing has no volume to report, and an
+    /// hourly warning that announces it would bury the ones that do.
+    fn record(&self) {
+        if self.spared_anything() {
+            tracing::warn!("{}", self.log_line());
+        } else {
+            tracing::debug!("{}", self.log_line());
+        }
+    }
+
     /// The refusal as a rules-based decline a caller can act on: a stable
     /// code, a description for the log, and a message fit to show a person.
     pub fn into_core_error(self) -> CoreError {
@@ -245,25 +269,26 @@ impl HardDeleteOutcome {
     /// The row count, turning a refusal into a rules-based decline. Use this
     /// where a caller asked for the delete and must learn why nothing went.
     ///
-    /// The refusal is logged as well as returned. Every refusal is logged
+    /// The refusal is recorded as well as returned. Every refusal is recorded
     /// whichever path reached it, because the point of the record is to make
     /// the volume of what would have gone measurable before the flag is
-    /// relaxed, and a caller may swallow the error it receives.
+    /// relaxed, and a caller may swallow the error it receives. The level
+    /// follows [`DeleteRefusal::spared_anything`].
     pub fn into_removed_or_refusal(self) -> Result<u64, CoreError> {
         match self.refusal {
             Some(refusal) => {
-                tracing::warn!("{}", refusal.log_line());
+                refusal.record();
                 Err(refusal.into_core_error())
             }
             None => Ok(self.removed),
         }
     }
 
-    /// The row count, logging a refusal and reporting zero. Use this in a
+    /// The row count, recording a refusal and reporting zero. Use this in a
     /// background pass, where a configured safety must not fail the run.
     pub fn into_removed_or_log(self) -> u64 {
         if let Some(refusal) = self.refusal {
-            tracing::warn!("{}", refusal.log_line());
+            refusal.record();
             return 0;
         }
         self.removed
@@ -512,6 +537,20 @@ mod tests {
         assert!(line.contains("kb-b"), "{line}");
         assert!(line.contains("entries=2"), "{line}");
         assert!(!line.contains("first"), "nothing was truncated: {line}");
+    }
+
+    #[test]
+    fn a_refusal_that_spared_nothing_is_not_worth_a_warning() {
+        // The trash sweep runs hourly and is independent of dreaming, so under
+        // the safety flag it refuses on every tick. On a store with nothing
+        // aged past retention that refusal reports no entries, and an hourly
+        // warning saying so would bury the refusals that matter.
+        assert!(!refusal(vec![], 0).spared_anything());
+    }
+
+    #[test]
+    fn a_refusal_that_spared_entries_is_worth_a_warning() {
+        assert!(refusal(vec!["kb-a".into()], 1).spared_anything());
     }
 
     #[test]

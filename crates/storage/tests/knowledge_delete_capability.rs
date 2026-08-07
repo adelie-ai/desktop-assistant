@@ -674,3 +674,33 @@ async fn a_large_refusal_reports_the_true_count_and_lists_a_bounded_sample() {
 
     fx.cleanup().await;
 }
+
+#[test]
+fn a_refused_sweep_that_spared_nothing_does_not_log_a_warning() {
+    let rt = capture_runtime();
+    let Some(fx) = rt.block_on(support::DbFixture::try_new("kb1122")) else {
+        return;
+    };
+
+    // One tombstone, still inside the retention window. The user holds trash,
+    // so the sweep runs and the flag refuses it - but nothing is aged past
+    // retention, so the refusal spares nothing. This is what an instance with
+    // the flag set does on most hourly ticks, and a warning each time would
+    // bury the refusals that carry entries.
+    rt.block_on(seed_tombstone(&fx.pool, ALICE, "not-yet-expired", 1));
+
+    let (reaped, log) =
+        run_capturing_logs(&rt, sweep_expired_trash(&fx.pool, person_only_policy()));
+
+    assert_eq!(reaped.expect("sweep"), 0, "the refusal still frees nothing");
+    assert!(
+        !log.contains("WARN"),
+        "a refusal that spared nothing must not warn: {log}"
+    );
+    assert!(
+        rt.block_on(kb_exists(&fx.pool, "not-yet-expired")),
+        "the tombstone is kept"
+    );
+
+    rt.block_on(fx.cleanup());
+}

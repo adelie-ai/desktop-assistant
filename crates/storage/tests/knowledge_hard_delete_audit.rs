@@ -8,31 +8,41 @@
 //! `knowledge_base` row lives in one module, and this scan fails when a second
 //! one appears.
 //!
-//! The scan reads every `.rs` file under each workspace crate's `src`
-//! directory and every `.sql` file under its `migrations` directory, folds
-//! away Rust string continuations and repeated whitespace, and looks for a
-//! destructive verb whose operand is the knowledge table. Anything found
-//! outside the guard module is reported with its file and line.
+//! The scan folds away Rust string continuations and repeated whitespace, then
+//! looks for a destructive verb whose operand is the knowledge table. Anything
+//! found outside the guard module is reported with its file and line. It reads:
+//!
+//! - every `.rs` file under a crate's `src` directory;
+//! - every `.sql` file under a crate's `migrations` directory, and every file
+//!   under its `bootstrap` directory;
+//! - every file under the repository's `scripts` and `deploy` directories, and
+//!   the root `justfile`.
 //!
 //! Migrations are in scope because they run automatically on the next boot of
 //! every daemon. A one-time repair that reclaims disk space by deleting old
 //! tombstones would reach past the policy exactly the way a new Rust call site
-//! would.
+//! would. Scripts, deployment manifests and `just` recipes are in scope for the
+//! same reason: a statement in any of them destroys rows without passing
+//! through the guard, and an operator running one has no way to see that.
 //!
 //! A verb whose operand is a Rust interpolation - `DELETE FROM {table}` - is
 //! reported too, whatever the table turns out to be at run time. The scanner
 //! cannot tell, and a generic per-table sweep is the natural refactor that
 //! would otherwise carry the knowledge table out of reach of this test.
 //!
-//! Test code is out of scope. A test may write any SQL it likes, including the
-//! statements the `db_query` tool must refuse, and no test is a production
-//! deletion path.
-//!
 //! ## What it does not reach
+//!
+//! Two things, both named so a green run is not read as more than it is.
 //!
 //! SQL assembled from pieces that never sit next to each other in one file.
 //! The workspace has no query builder and forbids string-built SQL, so the
 //! remaining route is a deliberate one, not a slip.
+//!
+//! Anything outside the directories listed above. Test code is deliberately
+//! excluded: a test may write any SQL it likes, including the statements the
+//! `db_query` tool must refuse, and no test is a production deletion path. A
+//! new top-level directory that can reach the database is not covered until it
+//! is added to `scanned_files`.
 //!
 //! This runs without a database, so `just check` covers it.
 //!
@@ -280,22 +290,42 @@ fn crates_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// Every `.rs` file under `crates/*/src` and every `.sql` file under
-/// `crates/*/migrations`.
+/// The repository root, one level above `crates/`.
+fn repo_root() -> PathBuf {
+    crates_root()
+        .parent()
+        .expect("crates/ sits at the repository root")
+        .to_path_buf()
+}
+
+/// Every file the audit reads. The module header lists them and says what is
+/// deliberately left out.
 fn scanned_files() -> Vec<PathBuf> {
     let mut acc = Vec::new();
-    let Ok(read) = std::fs::read_dir(crates_root()) else {
-        return acc;
-    };
-    for entry in read.flatten() {
-        walk_files(&entry.path().join("src"), "rs", &mut acc);
-        walk_files(&entry.path().join("migrations"), "sql", &mut acc);
+    if let Ok(read) = std::fs::read_dir(crates_root()) {
+        for entry in read.flatten() {
+            walk_files(&entry.path().join("src"), Some("rs"), &mut acc);
+            walk_files(&entry.path().join("migrations"), Some("sql"), &mut acc);
+            // DBA-run SQL: not a migration, but it reaches the same database.
+            walk_files(&entry.path().join("bootstrap"), None, &mut acc);
+        }
+    }
+    // A shell script, a deployment Job and a `just` recipe all reach the
+    // database without compiling, so none of them would be caught by anything
+    // else in the gate.
+    let repo = repo_root();
+    walk_files(&repo.join("scripts"), None, &mut acc);
+    walk_files(&repo.join("deploy"), None, &mut acc);
+    let justfile = repo.join("justfile");
+    if justfile.is_file() {
+        acc.push(justfile);
     }
     acc.sort();
     acc
 }
 
-fn walk_files(dir: &Path, extension: &str, acc: &mut Vec<PathBuf>) {
+/// Collect files under `dir`, filtered to `extension` when one is given.
+fn walk_files(dir: &Path, extension: Option<&str>, acc: &mut Vec<PathBuf>) {
     let Ok(read) = std::fs::read_dir(dir) else {
         return;
     };
@@ -303,7 +333,9 @@ fn walk_files(dir: &Path, extension: &str, acc: &mut Vec<PathBuf>) {
         let path = entry.path();
         if path.is_dir() {
             walk_files(&path, extension, acc);
-        } else if path.extension().and_then(|e| e.to_str()) == Some(extension) {
+        } else if extension
+            .is_none_or(|want| path.extension().and_then(|e| e.to_str()) == Some(want))
+        {
             acc.push(path);
         }
     }
