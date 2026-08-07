@@ -960,7 +960,8 @@ async fn vector_arm_truncates_to_the_nearest_candidates_not_an_arbitrary_subset(
     with_fixture(
         "vector_arm_truncates_to_the_nearest_candidates_not_an_arbitrary_subset",
         |fx| async move {
-            let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+            let store =
+                PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
             // 20 rows -- more than fetch_limit (limit=6 -> fetch_limit=12).
             with_user_id(UserId::new("alice"), async {
@@ -1022,7 +1023,8 @@ async fn text_arm_truncates_to_the_highest_ranked() {
     with_fixture(
         "text_arm_truncates_to_the_highest_ranked",
         |fx| async move {
-            let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+            let store =
+                PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
             // 20 rows -- more than fetch_limit (limit=6 -> fetch_limit=12).
             with_user_id(UserId::new("alice"), async {
@@ -1101,7 +1103,8 @@ async fn fused_search_truncates_to_a_defined_row_when_rrf_scores_tie() {
     with_fixture(
         "fused_search_truncates_to_a_defined_row_when_rrf_scores_tie",
         |fx| async move {
-            let store = PgKnowledgeBaseStore::new(fx.pool.clone());
+            let store =
+                PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
             with_user_id(UserId::new("alice"), async {
                 store
