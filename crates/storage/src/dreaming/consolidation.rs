@@ -41,6 +41,26 @@
 //! hundred entries overruns the output allowance and the answer arrives cut off
 //! mid-array. That is a size fault, not a formatting fault, so it is told apart
 //! from malformed JSON and the slice is halved and recomputed rather than lost.
+//!
+//! One malformed detail must not discard the whole answer either, because a
+//! slice is an expensive call and a lost slice waits for the next run. So the
+//! answer is read leniently in its encoding and strictly in its values:
+//!
+//! - A repeated `operations` key is an encoding accident. The arrays are joined
+//!   rather than the answer rejected.
+//! - Each element is read on its own. One element that is not an operation is
+//!   set aside; the operations around it still apply, and each is still
+//!   validated against the slice downstream.
+//! - What was kept and what was set aside are both counted and logged. Salvage
+//!   that quietly returns less than the model proposed is the same loss in a
+//!   smaller number.
+//!
+//! Two shapes stay unrecoverable, and both keep their own verdict. An answer
+//! that ended early has no complete envelope to read elements out of, so it
+//! stays a truncation and takes the halve-and-recompute path. An answer whose
+//! JSON does not parse, or every one of whose operations is unreadable, stays a
+//! failure: a plan that produced no work must not look like a model that kept
+//! everything.
 
 use std::collections::HashSet;
 
@@ -584,7 +604,9 @@ fn build_system_prompt() -> String {
          \n\
          ## Output format\n\
          \n\
-         Return a JSON object with an `operations` array. Each operation is one of:\n\
+         Return a JSON object holding exactly one `operations` array. Put every operation in \
+         that one array; do not give the `operations` key more than once. Each operation is \
+         one of:\n\
          - {\"op\":\"delete\",\"ids\":[\"<id>\",...],\"reason\":\"<why, short>\"}\n\
          - {\"op\":\"merge\",\"ids\":[\"<id>\",\"<id>\",...],\"content\":\"<unified self-contained prose>\",\"scope\":{<dim>:<value>}|null}\n\
          - {\"op\":\"edit\",\"id\":\"<id>\",\"content\":\"<rewritten prose, optional>\",\"scope\":{<dim>:<value>}|null}\n\
@@ -662,10 +684,63 @@ enum RawOp {
     Keep,
 }
 
-#[derive(Debug, Deserialize)]
+/// The object the model wraps its plan in, read one key at a time.
+///
+/// Not derived, for two reasons. Serde rejects a repeated field, and a model
+/// that gives `operations` twice is making an encoding mistake, not proposing
+/// nothing - so the arrays are joined instead of the answer discarded. And the
+/// elements are held as raw JSON values rather than as [`RawOp`], so one
+/// element that is not an operation is set aside on its own instead of failing
+/// the whole document.
+#[derive(Debug, Default)]
 struct OpsEnvelope {
-    #[serde(default)]
-    operations: Vec<RawOp>,
+    /// Every element of every `operations` array, in the order they were read.
+    elements: Vec<serde_json::Value>,
+    /// How many `operations` keys the object carried. More than one is the
+    /// encoding mistake above.
+    operations_keys: usize,
+}
+
+impl<'de> Deserialize<'de> for OpsEnvelope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct EnvelopeVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for EnvelopeVisitor {
+            type Value = OpsEnvelope;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a JSON object holding an `operations` array")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<OpsEnvelope, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut envelope = OpsEnvelope::default();
+                while let Some(key) = map.next_key::<String>()? {
+                    if key != "operations" {
+                        map.next_value::<serde::de::IgnoredAny>()?;
+                        continue;
+                    }
+                    envelope.operations_keys += 1;
+                    match map.next_value::<serde_json::Value>()? {
+                        serde_json::Value::Array(items) => envelope.elements.extend(items),
+                        // Anything else under this key is not a list of
+                        // operations. It becomes one unreadable element rather
+                        // than a hard failure, so it is reported by the same
+                        // path as every other shape the parser cannot use.
+                        other => envelope.elements.push(other),
+                    }
+                }
+                Ok(envelope)
+            }
+        }
+
+        deserializer.deserialize_map(EnvelopeVisitor)
+    }
 }
 
 /// Why a consolidation response could not be turned into operations.
@@ -702,6 +777,11 @@ impl std::fmt::Display for ParseFailure {
 struct DroppedOperation {
     /// Position in the answer's operations array, counting from zero.
     index: usize,
+    /// The element's `op` tag, when it has one. Named on its own rather than
+    /// left to the excerpt: `serde_json` writes an object's keys in
+    /// alphabetical order, so a long field ahead of `op` would push the one
+    /// thing that says what the model was attempting out of a bounded quote.
+    op: Option<String>,
     /// What serde said was wrong with the element.
     reason: String,
     /// The element itself, bounded so one long merge body cannot fill the log.
@@ -712,10 +792,12 @@ impl std::fmt::Display for DroppedOperation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let Self {
             index,
+            op,
             reason,
             excerpt,
         } = self;
-        write!(f, "operation #{index} ({reason}): {excerpt}")
+        let op = op.as_deref().unwrap_or("unstated");
+        write!(f, "operation #{index} [op={op}]: {reason} -- {excerpt}")
     }
 }
 
@@ -731,21 +813,116 @@ struct ParsedOperations {
     operations_keys: usize,
 }
 
+/// The first few dropped operations as one line, so an error or a log names
+/// what came back without listing every element of a long answer.
+fn summarize_dropped(dropped: &[DroppedOperation]) -> String {
+    const SHOWN: usize = 3;
+    let mut line = dropped
+        .iter()
+        .take(SHOWN)
+        .map(DroppedOperation::to_string)
+        .collect::<Vec<_>>()
+        .join("; ");
+    if let Some(rest) = dropped.len().checked_sub(SHOWN).filter(|r| *r > 0) {
+        line.push_str(&format!("; and {rest} more"));
+    }
+    line
+}
+
+/// A bounded rendering of one element, so the report names the shape that came
+/// back without carrying a whole merge body with it.
+fn excerpt_of(element: &serde_json::Value) -> String {
+    let text = element.to_string();
+    // Bounded by characters, not bytes, so a multi-byte element cannot be cut
+    // mid-codepoint.
+    if text.chars().count() <= MAX_DROPPED_OP_EXCERPT_CHARS {
+        return text;
+    }
+    let mut cut: String = text.chars().take(MAX_DROPPED_OP_EXCERPT_CHARS).collect();
+    cut.push_str("...");
+    cut
+}
+
+/// Read one consolidation answer into the operations it proposes.
+///
+/// Pure: it reports what it could not read rather than logging it, so the
+/// caller decides how loud that is.
+///
+/// Three faults are told apart, because they need three different responses.
+/// An answer that ended early is a size fault and the slice is halved. An
+/// answer whose JSON does not parse at all is a formatting fault and repeating
+/// it smaller only spends calls. An answer that parses but holds an element
+/// that is not an operation is neither: the rest of it is still the work of an
+/// expensive call, so the readable operations are kept and the others are
+/// reported. An answer where nothing at all was readable stays a failure - a
+/// plan that produced no work must not look like a model that kept everything.
 fn parse_operations(response: &str) -> Result<ParsedOperations, ParseFailure> {
     let payload = extract_json_payload(response);
-    match serde_json::from_str::<OpsEnvelope>(&payload) {
-        Ok(env) => Ok(ParsedOperations {
-            ops: env.operations,
-            dropped: Vec::new(),
-            operations_keys: 0,
-        }),
+    let envelope = match serde_json::from_str::<OpsEnvelope>(&payload) {
+        Ok(envelope) => envelope,
         // `classify` is the structured signal for "the input ended early".
         // Reading it off the message text would break on any serde_json wording
         // change.
         Err(e) if e.classify() == serde_json::error::Category::Eof => {
-            Err(ParseFailure::Truncated(e.to_string()))
+            return Err(ParseFailure::Truncated(e.to_string()));
         }
-        Err(e) => Err(ParseFailure::Malformed(e.to_string())),
+        Err(e) => return Err(ParseFailure::Malformed(e.to_string())),
+    };
+
+    let mut parsed = ParsedOperations {
+        operations_keys: envelope.operations_keys,
+        ..ParsedOperations::default()
+    };
+    for (index, element) in envelope.elements.iter().enumerate() {
+        // Deserializing from `&Value` rather than from the owned value leaves
+        // the element in hand for the excerpt when it does not read.
+        match RawOp::deserialize(element) {
+            Ok(op) => parsed.ops.push(op),
+            Err(e) => parsed.dropped.push(DroppedOperation {
+                index,
+                op: element
+                    .get("op")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                reason: e.to_string(),
+                excerpt: excerpt_of(element),
+            }),
+        }
+    }
+
+    if parsed.ops.is_empty() && !parsed.dropped.is_empty() {
+        return Err(ParseFailure::Malformed(format!(
+            "none of the {} proposed operation(s) could be read: {}",
+            parsed.dropped.len(),
+            summarize_dropped(&parsed.dropped)
+        )));
+    }
+    Ok(parsed)
+}
+
+/// Log what one answer needed doing to it, so a repaired answer is visible
+/// rather than quietly smaller than the one the model sent.
+///
+/// Both cases are warnings, not errors. The answer was usable, so the run
+/// carries on; but a model that keeps mis-encoding its plan is losing work, and
+/// nobody can see that from an info line that only counts what applied.
+fn report_salvage(parsed: &ParsedOperations) {
+    if parsed.operations_keys > 1 {
+        tracing::warn!(
+            "dreaming: the consolidation answer gave `operations` {} times; the arrays were \
+             joined into one plan of {} operation(s) rather than the slice discarded",
+            parsed.operations_keys,
+            parsed.ops.len()
+        );
+    }
+    if !parsed.dropped.is_empty() {
+        tracing::warn!(
+            "dreaming: consolidation salvaged {} operation(s) from the answer and dropped {} \
+             it could not read; the entries those named stay unchanged until the next run: {}",
+            parsed.ops.len(),
+            parsed.dropped.len(),
+            summarize_dropped(&parsed.dropped)
+        );
     }
 }
 
@@ -781,6 +958,7 @@ async fn operations_for_slice(
         let failure = match llm_fn(build_system_prompt(), build_user_prompt(chunk)).await {
             Ok(response) => match parse_operations(&response) {
                 Ok(mut parsed) => {
+                    report_salvage(&parsed);
                     dropped += parsed.dropped.len();
                     ops.append(&mut parsed.ops);
                     answered += 1;
@@ -1247,9 +1425,12 @@ mod tests {
             report.chars().count() < huge.chars().count(),
             "one long element must not carry its whole body into the log"
         );
+        // `serde_json` writes an object's keys in alphabetical order, so `body`
+        // precedes `op` and a bounded quote alone would cut the one field that
+        // says what the model was attempting.
         assert!(
-            report.contains("merge"),
-            "a bounded quote must still name the shape that came back: {report}"
+            report.contains("op=merge"),
+            "a bounded report must still name what the operation was: {report}"
         );
     }
 

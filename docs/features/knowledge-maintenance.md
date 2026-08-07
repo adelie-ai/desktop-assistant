@@ -165,6 +165,44 @@ signal about whether an entry was ever retrieved or cited. Four rules bound it
    own text on its tombstone. Merges are taken before edits, since merging
    duplicates is the work consolidation exists to do.
 
+### Reading an answer that is not quite right
+
+A slice is one expensive call, it runs on a long interval, and a lost slice is
+not retried until the next run. So the answer is read leniently in its encoding
+and strictly in its values. Three things follow.
+
+**A repeated `operations` key is joined, not rejected.** Serde rejects a
+repeated field by default, so an answer that gives the key twice used to lose
+every operation in it, including the ones before the repeat. The arrays are now
+concatenated. The system prompt also asks for exactly one array, which is the
+weakest of the measures and replaces none of them.
+
+**One unreadable operation does not discard the ones around it.** Each element
+of the array is read on its own. An element that is not an operation - a merge
+with no `content`, an object with no `op`, a bare value where an object belongs
+- is set aside, and the rest of the plan applies. Every surviving operation is
+still validated against the slice, so leniency about encoding buys nothing about
+what an operation may do.
+
+**What was kept and what was set aside are both counted and logged**, at
+`WARN`, with the position, the `op` tag and a bounded quote of each element that
+could not be read. A run that changed nothing after dropping operations logs at
+`WARN` too, rather than at the `DEBUG` level a genuine no-op run uses. Salvage
+that quietly returns less than the model proposed is the same loss in a smaller
+number, so the counts reach the log rather than only the code.
+
+Two shapes stay unrecoverable, and each keeps its own verdict:
+
+- **An answer that ended early** has no complete envelope to read elements out
+  of, so the operations before the cut are not salvaged. It stays classified as
+  truncated - a size fault - and takes the halve-and-recompute path, which is
+  the response that actually fits. The classification reads serde's structured
+  `Category::Eof` signal, never its message text.
+- **An answer whose JSON does not parse at all**, or every one of whose
+  operations is unreadable, stays a failure and names why. A plan that produced
+  no work must not look like a model that kept everything, which is the very
+  confusion this whole section exists to prevent.
+
 ## The trash: soft delete, retention, reaping
 
 Consolidation retires an entry by stamping `deleted_at`, not by deleting the
