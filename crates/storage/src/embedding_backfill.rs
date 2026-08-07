@@ -1037,6 +1037,9 @@ async fn write_tag_embedding(
 
 #[cfg(test)]
 mod tests {
+    use sqlx::postgres::PgPoolOptions;
+    use uuid::Uuid;
+
     use super::*;
 
     /// Acceptance (#1108 review): an empty vector list must never reach the
@@ -1060,5 +1063,223 @@ mod tests {
             Vector::from(vec![0.4, 0.5, 0.6]),
         ];
         assert_eq!(normalize_embedding(Some(vecs.clone())), Some(vecs));
+    }
+
+    // -----------------------------------------------------------------------
+    // Write-path guards (#1108 review round 2)
+    //
+    // The three tests above pin `normalize_embedding` itself, but nothing
+    // stops a `write_*_embedding` function from dropping its call to it --
+    // the write helpers are private, so no integration test under `tests/`
+    // can reach them directly, and removing the call from just one of the
+    // four leaves `normalize_embedding` still used by the other three, so no
+    // dead-code lint fires either. The tests below call each private write
+    // helper directly and read the row back, which is the only way to prove
+    // the call site itself still normalizes, not just the function it calls.
+    //
+    // This is why they live here rather than in `tests/`: they need to see
+    // `write_knowledge_embedding` and its siblings, which are private to this
+    // module.
+    // -----------------------------------------------------------------------
+
+    /// A fresh private Postgres schema, migrated, for the write-path tests
+    /// below. Mirrors `tests/support::DbFixture`, reimplemented locally
+    /// because that module lives under `tests/` and is unreachable from a
+    /// `src/`-level unit test. Skips (returns `None`) when
+    /// `TEST_DATABASE_URL` is unset, the same gate every DB-touching
+    /// integration suite uses; `just test-db` sets it.
+    async fn test_pool(prefix: &str) -> Option<(PgPool, String, String)> {
+        let url = std::env::var("TEST_DATABASE_URL")
+            .ok()
+            .filter(|u| !u.trim().is_empty())?;
+        let schema = format!("{prefix}_{}", Uuid::now_v7().simple());
+
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .expect("connect to TEST_DATABASE_URL");
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA \"{schema}\"")))
+            .execute(&admin)
+            .await
+            .expect("create test schema");
+        admin.close().await;
+
+        let schema_for_hook = schema.clone();
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .after_connect(move |conn, _meta| {
+                let schema = schema_for_hook.clone();
+                Box::pin(async move {
+                    let sql = format!("SET search_path TO \"{schema}\", public");
+                    sqlx::query(sqlx::AssertSqlSafe(sql)).execute(conn).await?;
+                    Ok(())
+                })
+            })
+            .connect(&url)
+            .await
+            .expect("connect per-test pool");
+
+        crate::run_migrations(&pool)
+            .await
+            .expect("run_migrations succeeds against test schema");
+
+        Some((pool, schema, url))
+    }
+
+    /// Best-effort schema teardown; a failure here would only mask the real
+    /// assertion, and the ephemeral `just test-db` container is torn down
+    /// after the whole run regardless.
+    async fn drop_test_schema(schema: &str, admin_url: &str) {
+        if let Ok(admin) = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(admin_url)
+            .await
+        {
+            let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DROP SCHEMA \"{schema}\" CASCADE"
+            )))
+            .execute(&admin)
+            .await;
+            admin.close().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn write_knowledge_embedding_clears_rather_than_writes_an_empty_array() {
+        let Some((pool, schema, admin_url)) = test_pool("normalize_kb").await else {
+            return;
+        };
+        sqlx::query(
+            "INSERT INTO knowledge_base (id, user_id, content) VALUES ($1, 'default', 'x')",
+        )
+        .bind("row-1")
+        .execute(&pool)
+        .await
+        .expect("seed knowledge_base row");
+
+        write_knowledge_embedding(&pool, "row-1", Some(Vec::new()), "model-A")
+            .await
+            .expect("write succeeds");
+
+        let is_null: bool =
+            sqlx::query_scalar("SELECT embedding IS NULL FROM knowledge_base WHERE id = $1")
+                .bind("row-1")
+                .fetch_one(&pool)
+                .await
+                .expect("read back embedding");
+        assert!(
+            is_null,
+            "write_knowledge_embedding must normalize an empty vector list to NULL, \
+             not write it as an empty array"
+        );
+
+        drop_test_schema(&schema, &admin_url).await;
+    }
+
+    #[tokio::test]
+    async fn write_tool_embedding_clears_rather_than_writes_an_empty_array() {
+        let Some((pool, schema, admin_url)) = test_pool("normalize_tool").await else {
+            return;
+        };
+        sqlx::query(
+            "INSERT INTO tool_definitions (name, description, parameters, source, is_core) \
+             VALUES ($1, 'd', '{}'::jsonb, 'test', false)",
+        )
+        .bind("tool-1")
+        .execute(&pool)
+        .await
+        .expect("seed tool_definitions row");
+
+        write_tool_embedding(&pool, "tool-1", Some(Vec::new()), "model-A")
+            .await
+            .expect("write succeeds");
+
+        let is_null: bool =
+            sqlx::query_scalar("SELECT embedding IS NULL FROM tool_definitions WHERE name = $1")
+                .bind("tool-1")
+                .fetch_one(&pool)
+                .await
+                .expect("read back embedding");
+        assert!(
+            is_null,
+            "write_tool_embedding must normalize an empty vector list to NULL, \
+             not write it as an empty array"
+        );
+
+        drop_test_schema(&schema, &admin_url).await;
+    }
+
+    #[tokio::test]
+    async fn write_skill_embedding_clears_rather_than_writes_an_empty_array() {
+        let Some((pool, schema, admin_url)) = test_pool("normalize_skill").await else {
+            return;
+        };
+        sqlx::query(
+            "INSERT INTO skill_index (name, description, disk_path, content_hash) \
+             VALUES ($1, 'd', '/dev/null', 'deadbeef')",
+        )
+        .bind("skill-1")
+        .execute(&pool)
+        .await
+        .expect("seed skill_index row");
+
+        write_skill_embedding(&pool, "skill-1", "", Some(Vec::new()), "model-A")
+            .await
+            .expect("write succeeds");
+
+        let is_null: bool = sqlx::query_scalar(
+            "SELECT embedding IS NULL FROM skill_index WHERE name = $1 AND owner_key = ''",
+        )
+        .bind("skill-1")
+        .fetch_one(&pool)
+        .await
+        .expect("read back embedding");
+        assert!(
+            is_null,
+            "write_skill_embedding must normalize an empty vector list to NULL, \
+             not write it as an empty array"
+        );
+
+        drop_test_schema(&schema, &admin_url).await;
+    }
+
+    #[tokio::test]
+    async fn write_scratchpad_embedding_clears_rather_than_writes_an_empty_array() {
+        let Some((pool, schema, admin_url)) = test_pool("normalize_pad").await else {
+            return;
+        };
+        sqlx::query("INSERT INTO conversations (id, title) VALUES ($1, 'test')")
+            .bind("conv-1")
+            .execute(&pool)
+            .await
+            .expect("seed conversation row");
+        sqlx::query(
+            "INSERT INTO scratchpads (id, user_id, conversation_id, note_key, content) \
+             VALUES ($1, 'default', $2, 'k', 'v')",
+        )
+        .bind("note-1")
+        .bind("conv-1")
+        .execute(&pool)
+        .await
+        .expect("seed scratchpads row");
+
+        write_scratchpad_embedding(&pool, "note-1", Some(Vec::new()), "model-A")
+            .await
+            .expect("write succeeds");
+
+        let is_null: bool =
+            sqlx::query_scalar("SELECT embedding IS NULL FROM scratchpads WHERE id = $1")
+                .bind("note-1")
+                .fetch_one(&pool)
+                .await
+                .expect("read back embedding");
+        assert!(
+            is_null,
+            "write_scratchpad_embedding must normalize an empty vector list to NULL, \
+             not write it as an empty array"
+        );
+
+        drop_test_schema(&schema, &admin_url).await;
     }
 }
