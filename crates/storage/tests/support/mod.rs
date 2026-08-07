@@ -250,15 +250,46 @@ static PERMISSIVE_GLOBAL_DEFAULT: Once = Once::new();
 /// cap explicitly to `TRACE` here removes the level as a variable entirely,
 /// rather than leaving this module's coverage keyed to whichever levels its
 /// current callers happen to use.
+/// Build the permissive baseline subscriber's configuration. Factored out of
+/// [`ensure_permissive_global_default`] so [`permissive_global_default_max_level`]
+/// can inspect it directly through the public `Subscriber::max_level_hint`
+/// trait method, rather than through `Dispatch`, whose own `max_level_hint`
+/// wrapper is private to `tracing-core` and unreachable from a test.
+fn build_permissive_subscriber() -> impl tracing::Subscriber + Send + Sync + 'static {
+    tracing_subscriber::fmt()
+        .with_max_level(Level::TRACE)
+        .with_writer(io::sink)
+        .finish()
+}
+
 fn ensure_permissive_global_default() {
     PERMISSIVE_GLOBAL_DEFAULT.call_once(|| {
-        let sink = tracing_subscriber::fmt()
-            .with_max_level(Level::TRACE)
-            .with_writer(io::sink)
-            .finish();
-        tracing::subscriber::set_global_default(sink)
+        tracing::subscriber::set_global_default(build_permissive_subscriber())
             .expect("install the permissive global default subscriber exactly once");
     });
+}
+
+/// Test-only: the level cap [`build_permissive_subscriber`] declares -- the
+/// same configuration [`ensure_permissive_global_default`] installs.
+///
+/// This is a deliberately narrow, white-box seam onto an otherwise-private
+/// function. A *behavioral* test -- capture a `debug!`/`trace!` line and
+/// check it arrived -- cannot mutation-kill a dropped `with_max_level` on
+/// the global default specifically, and not because the cap stopped
+/// mattering: `Interest::and` resolves disagreement between two dispatchers
+/// as `Sometimes` (ask again dynamically), not `Never`, so as long as
+/// *some* dispatcher active at event time -- typically `capture_tracing`'s
+/// own per-call one -- has a high enough cap, the event still gets through
+/// even when the global default's cap is low. The global default's cap
+/// only decides the outcome in the narrower, scheduling-dependent race it
+/// was added for (a callsite whose *very first* evaluation, on some other
+/// thread, happens before any correctly-capped dispatcher has ever
+/// registered) -- which a single deterministic test cannot reliably force.
+/// Reading the declared cap directly instead pins the one thing a dropped
+/// `with_max_level` here actually changes.
+pub fn permissive_global_default_max_level() -> Option<tracing::level_filters::LevelFilter> {
+    use tracing::Subscriber;
+    build_permissive_subscriber().max_level_hint()
 }
 
 /// Run `f` under a `fmt` subscriber that writes every emitted event into a

@@ -445,3 +445,45 @@ async fn skill_index_short_answer_row_is_stamped_so_the_backfill_converges() {
 
     fx.cleanup().await;
 }
+
+// ---------------------------------------------------------------------------
+// capture_tracing itself (#1108 review round 2)
+//
+// Needs no database: `capture_tracing` is a test-support utility, not part of
+// the backfill logic. Every log-line assertion above only ever captures a
+// `warn!` call, and WARN is more severe than fmt's own INFO default -- it
+// would pass an INFO cap on its own. That is why removing
+// `with_max_level(Level::TRACE)` from `capture_tracing`'s subscribers left
+// every test above green: none of them exercise a level the INFO default
+// would actually filter out. This test captures a `debug!` line instead, so
+// the cap itself is pinned by something that fails without it.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn capture_tracing_sees_a_debug_line_an_info_cap_would_swallow() {
+    let (_, log) = support::capture_tracing(|| async {
+        tracing::debug!("a debug-level line an INFO cap would filter out");
+    })
+    .await;
+
+    assert!(
+        log.contains("a debug-level line an INFO cap would filter out"),
+        "capture_tracing must see a debug! line, not only warn!/info!/error!; got: {log}"
+    );
+}
+
+/// Companion to the test above, for the *other* `with_max_level` call
+/// (`ensure_permissive_global_default`'s). Dropping that one specifically
+/// does not fail the behavioral test above -- see
+/// `support::permissive_global_default_max_level`'s doc comment for why --
+/// so it needs its own, more direct check on the declared cap.
+#[test]
+fn permissive_global_default_accepts_trace_not_just_info() {
+    let hint = support::permissive_global_default_max_level();
+    assert_eq!(
+        hint,
+        Some(tracing::level_filters::LevelFilter::TRACE),
+        "the permissive global default must declare an uncapped (TRACE) max level; \
+         got {hint:?} -- fmt()'s own DEFAULT_MAX_LEVEL is INFO"
+    );
+}
