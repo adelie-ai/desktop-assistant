@@ -216,19 +216,21 @@ impl PgSkillIndexStore {
     /// conversation permanently. An installed skill stays reachable through
     /// `builtin_skill_search`, which taints correctly.
     ///
-    /// The predicate sits on the final join rather than inside `d`, so it
-    /// applies after a name has resolved to one row. Filtering earlier would
-    /// let a local global skill be offered while the fetch returned the
-    /// non-local personal one that shadows it.
+    /// The predicate applies after a name has resolved to one row, and before
+    /// the spread is measured. Filtering earlier would let a local global skill
+    /// be offered while the fetch returned the non-local personal one that
+    /// shadows it; filtering later would grade the offerable rows against a
+    /// spread measured over rows the arm can never show.
     ///
     /// **One row per name, and it is the row the fetch returns.** The catalog
     /// can hold a global skill and this user's own under one name. Two lines
     /// for one openable procedure would be two lines the model cannot tell
     /// apart, and a line describing a procedure other than the one
     /// `builtin_skill_get` hands back would be worse - the model would be
-    /// briefed on one method and given another's steps. So `pick` applies that
-    /// tool's own rule: the user's own row when its files are on disk, else
-    /// the global one, else the user's own tombstone.
+    /// briefed on one method and given another's steps. So the scan applies
+    /// that tool's own rule, over every approved row a name has rather than
+    /// over the ones this query happened to match: the user's own row when its
+    /// files are on disk, else the global one, else the user's own tombstone.
     ///
     /// **The body is not read.** The arm renders a name and one line of what
     /// the skill is for; the body is the widest column on the row and nothing
@@ -313,24 +315,23 @@ impl PgSkillIndexStore {
                  SELECT to_tsquery('english', string_agg(quote_literal(lexeme), ' | ')) AS query
                  FROM unnest(to_tsvector('english', $1))
              ),
-             matched AS (
-                 SELECT DISTINCT ON (s.name)
-                        s.name, s.description, s.present_on_disk, s.trust_tier,
-                        ts_rank_cd(s.tsv, q.query) AS rank
-                 FROM skill_index s, q
-                 WHERE (s.owner_user_id IS NULL OR s.owner_user_id = $3)
-                   AND s.approved_at IS NOT NULL
-                   AND q.query IS NOT NULL
-                   AND s.tsv @@ q.query
-                 ORDER BY s.name,
-                          CASE WHEN s.owner_key <> '' AND s.present_on_disk THEN 0
-                               WHEN s.owner_key = '' THEN 1
+             resolved AS (
+                 SELECT DISTINCT ON (name) name, owner_key, trust_tier
+                 FROM skill_index
+                 WHERE (owner_user_id IS NULL OR owner_user_id = $3)
+                   AND approved_at IS NOT NULL
+                 ORDER BY name,
+                          CASE WHEN owner_key <> '' AND present_on_disk THEN 0
+                               WHEN owner_key = '' THEN 1
                                ELSE 2 END
              )
-             SELECT name, description, present_on_disk
-             FROM matched
-             WHERE trust_tier = 'local'
-             ORDER BY rank DESC, name
+             SELECT si.name, si.description, si.present_on_disk
+             FROM resolved r
+             JOIN skill_index si ON si.name = r.name AND si.owner_key = r.owner_key, q
+             WHERE r.trust_tier = 'local'
+               AND q.query IS NOT NULL
+               AND si.tsv @@ q.query
+             ORDER BY ts_rank_cd(si.tsv, q.query) DESC, si.name
              LIMIT $2",
         )
         .bind(query)
@@ -638,19 +639,32 @@ pub const SKILL_RECALL_SCAN_STATEMENT_TIMEOUT: std::time::Duration =
 
 /// What [`PgSkillIndexStore::nearest_by_embedding`] reads.
 ///
-/// One scan, four uses. `d` computes one distance per catalog row and carries
-/// only what resolving a name needs. `pick` cuts that to one row per name,
-/// keeping the row `builtin_skill_get` would return - its own row when the
-/// files are on disk, else the global one, else its own tombstone. `m` and `s`
-/// then take the median of those distances and the median of each distance's
-/// own distance from it, so the pass that measures the catalog's spread reads
-/// no description and no body. The rows the block may show are read last, by
-/// name and owner, and only those.
+/// **The order of the passes is the whole design here.** `resolved` cuts the
+/// approved scope to one row per name, by `builtin_skill_get`'s own rule - its
+/// own row when the files are on disk, else the global one, else its own
+/// tombstone. `offerable` then drops a name whose resolved row is not local.
+/// Only after that does `d` measure a distance, and `m` and `s` the spread.
 ///
-/// The approval predicate sits inside `d`, so an unapproved skill is absent
-/// from the candidates *and* from the spread they are graded against. The
-/// trust predicate sits on the final join instead, because it must apply to
-/// the row a name resolved to rather than to the set a name resolves from.
+/// Each step has to be where it is:
+///
+/// - **Resolution comes before matching**, not after. A name resolves over
+///   every approved row it has, including one the match would have dropped -
+///   a personal row whose embedding the backfill has not written yet is the
+///   ordinary case. Resolving over the matched set instead would let the block
+///   offer the global row's line while the fetch handed back the personal
+///   row's body.
+/// - **Trust comes after resolution.** A non-local row shadowing a local one
+///   must drop the name outright; filtering earlier would offer the row
+///   underneath, which is again not the row the fetch returns.
+/// - **The spread is measured after both.** It has to describe the set the arm
+///   draws from, or the bar grades a candidate against rows it could never
+///   show - and `RECALL_DISPERSION_MIN_ROWS` would count them too, so a
+///   catalog of three offerable skills among twenty-five would report a
+///   measurement where it has none.
+///
+/// The pass that measures reads one distance per row and no description and no
+/// body; the rows the block may show are read last, by name and owner, and
+/// only those.
 ///
 /// Every returned row carries the same spread, which is the price of stating it
 /// in the same answer as the candidates - three numbers on at most
@@ -668,50 +682,54 @@ pub const SKILL_RECALL_SCAN_STATEMENT_TIMEOUT: std::time::Duration =
 /// Held as its own string so the projection can be asserted on without a
 /// database - see `the_skill_recall_scan_does_not_read_the_body`.
 const NEAREST_SKILLS_BY_EMBEDDING_SQL: &str = "\
-    WITH d AS (
-         SELECT name, owner_key, present_on_disk, MIN(chunk <=> $1) AS distance
-         FROM skill_index, unnest(embedding) AS chunk
+    WITH resolved AS (
+         SELECT DISTINCT ON (name) name, owner_key, trust_tier
+         FROM skill_index
          WHERE (owner_user_id IS NULL OR owner_user_id = $2)
            AND approved_at IS NOT NULL
-           AND embedding IS NOT NULL
-           AND embedding_model IS NOT NULL
-           AND (embedding_model = $3
-                OR (split_part($3, '@', 2) <> ''
-                    AND split_part(embedding_model, '@', 2)
-                        = split_part($3, '@', 2)))
-         GROUP BY name, owner_key, present_on_disk
-     ),
-     pick AS (
-         SELECT DISTINCT ON (name) name, owner_key, distance
-         FROM d
          ORDER BY name,
                   CASE WHEN owner_key <> '' AND present_on_disk THEN 0
                        WHEN owner_key = '' THEN 1
                        ELSE 2 END
      ),
+     offerable AS (
+         SELECT name, owner_key FROM resolved WHERE trust_tier = 'local'
+     ),
+     d AS (
+         SELECT si.name, si.owner_key, MIN(chunk <=> $1) AS distance
+         FROM offerable o
+         JOIN skill_index si ON si.name = o.name AND si.owner_key = o.owner_key
+         CROSS JOIN LATERAL unnest(si.embedding) AS chunk
+         WHERE si.embedding IS NOT NULL
+           AND si.embedding_model IS NOT NULL
+           AND (si.embedding_model = $3
+                OR (split_part($3, '@', 2) <> ''
+                    AND split_part(si.embedding_model, '@', 2)
+                        = split_part($3, '@', 2)))
+         GROUP BY si.name, si.owner_key
+     ),
      m AS (
          SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY distance) AS median,
                 count(*) AS rows_read
-         FROM pick
+         FROM d
      ),
      s AS (
          SELECT m.median,
                 m.rows_read,
-                percentile_cont(0.5) WITHIN GROUP (ORDER BY abs(pick.distance - m.median))
+                percentile_cont(0.5) WITHIN GROUP (ORDER BY abs(d.distance - m.median))
                     AS deviation
-         FROM pick CROSS JOIN m
+         FROM d CROSS JOIN m
          GROUP BY m.median, m.rows_read
      )
      SELECT si.name, si.description, si.present_on_disk,
-            pick.distance, s.median, s.rows_read, s.deviation
-     FROM pick
+            d.distance, s.median, s.rows_read, s.deviation
+     FROM d
      JOIN skill_index si
-       ON si.name = pick.name
-      AND si.owner_key = pick.owner_key
+       ON si.name = d.name
+      AND si.owner_key = d.owner_key
       AND (si.owner_user_id IS NULL OR si.owner_user_id = $2)
-      AND si.trust_tier = 'local'
      CROSS JOIN s
-     ORDER BY pick.distance, si.name
+     ORDER BY d.distance, si.name
      LIMIT $4";
 
 /// One skill the recall scan ranked: what a line needs, and nothing else.

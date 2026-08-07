@@ -544,8 +544,10 @@ async fn a_name_whose_resolved_row_came_from_outside_is_dropped_rather_than_fall
 ///
 /// `builtin_skill_get` prefers the caller's own row only while it is usable -
 /// on disk and approved - and falls back to the global one otherwise. The scan
-/// resolves a duplicated name by that same rule. Three states where a naive
-/// "the personal row always wins" would disagree.
+/// resolves a duplicated name by that same rule. Two states where a naive "the
+/// personal row always wins" would disagree; the third, where the resolved row
+/// is not local, is
+/// `a_name_whose_resolved_row_came_from_outside_is_dropped_rather_than_falling_through`.
 #[tokio::test]
 async fn the_scan_resolves_a_duplicated_name_the_way_a_fetch_does() {
     let Some(fx) = fixture().await else { return };
@@ -621,6 +623,106 @@ async fn the_scan_resolves_a_duplicated_name_the_way_a_fetch_does() {
             .map(|s| s.description.as_str())
             .collect();
         assert_eq!(rotate, vec!["The host-global copy, approved."]);
+    })
+    .await;
+
+    fx.cleanup().await;
+}
+
+/// A name resolves over every approved row it has, not over the rows this
+/// query happened to match.
+///
+/// The embedding backfill is a periodic sweep, so a row the assistant just
+/// wrote carries no vector for a while, and every model change restamps the
+/// catalog incrementally. Resolving over the matched set would let the block
+/// offer the global row's line while `builtin_skill_get` handed back the
+/// personal row's body - the model briefed on one method and given another's
+/// steps.
+#[tokio::test]
+async fn a_name_resolves_over_the_catalog_rather_than_over_the_rows_that_matched() {
+    let Some(fx) = fixture().await else { return };
+    let store = PgSkillIndexStore::new(fx.pool.clone());
+
+    with_user_id(UserId::new(USER), async {
+        seed(
+            &store,
+            &fx.pool,
+            &a_skill("deploy", "The host-global copy.", None),
+            axis(0),
+            true,
+        )
+        .await;
+        // The caller's own row: approved, on disk, and not embedded yet - so a
+        // fetch prefers it and the distance scan cannot see it.
+        let mine = a_skill("deploy", "My own copy, not embedded yet.", Some(USER));
+        store.upsert(&mine, now()).await.expect("seed the catalog");
+        store
+            .set_approval(
+                &SkillScope::Owner(USER.to_string()),
+                &["deploy".to_string()],
+                Some(SkillApproval {
+                    at: now(),
+                    by: Some("a-person".to_string()),
+                }),
+            )
+            .await
+            .expect("approve the personal row");
+
+        let found = store
+            .nearest_by_embedding(axis(0), MODEL, 10)
+            .await
+            .expect("the scan answers");
+
+        assert!(
+            found.skills.is_empty(),
+            "the name resolves to the personal row, which has no distance to offer - so the \
+             global line must not stand in for it: {:?}",
+            found.skills
+        );
+    })
+    .await;
+
+    fx.cleanup().await;
+}
+
+/// The spread describes the set the arm draws from.
+///
+/// A catalog of mostly installed skills would otherwise report a measurement
+/// taken over rows the arm can never show: `RECALL_DISPERSION_MIN_ROWS` would
+/// count them, so a handful of local skills among a large installed library
+/// would be graded against the installed library's geometry rather than left
+/// on the caller's stated estimate.
+#[tokio::test]
+async fn the_spread_is_measured_over_the_skills_the_arm_can_offer() {
+    let Some(fx) = fixture().await else { return };
+    let store = PgSkillIndexStore::new(fx.pool.clone());
+
+    with_user_id(UserId::new(USER), async {
+        // Well past the minimum sample, but only three of them are offerable.
+        for i in 0..(RECALL_DISPERSION_MIN_ROWS + 5) {
+            let radians = 0.05 + (i as f32) * 0.03;
+            let mut row = a_skill(
+                &format!("procedure-{i:02}"),
+                "A procedure in a catalog of procedures.",
+                None,
+            );
+            if i >= 3 {
+                row.trust_tier = TrustTier::Github;
+            }
+            seed(&store, &fx.pool, &row, at_angle(radians), true).await;
+        }
+
+        let found = store
+            .nearest_by_embedding(axis(0), MODEL, 10)
+            .await
+            .expect("the scan answers");
+
+        assert_eq!(found.skills.len(), 3, "only the local skills are offerable");
+        assert_eq!(
+            found.dispersion, None,
+            "three rows is no sample at all, so the caller falls back to its stated estimate \
+             rather than being handed the installed library's geometry"
+        );
     })
     .await;
 

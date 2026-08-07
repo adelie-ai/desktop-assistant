@@ -2062,6 +2062,15 @@ impl BuiltinToolService {
         let usable =
             |s: &desktop_assistant_core::domain::IndexedSkill| s.present_on_disk && s.is_approved();
         let mine = get_fn(name.clone(), Some(SKILL_GET_OWN_SCOPE.to_string())).await?;
+        // Reaching past the caller's own unapproved row must not make it
+        // disappear. Standing the global row in its place is the right answer
+        // to "which procedure may be followed", and it is the wrong answer to
+        // "where did my draft go" - the draft is one the assistant itself
+        // wrote under a name it chose, and nothing else would ever mention it.
+        // So the success payload says a draft was passed over, by name.
+        let passed_over_own_draft = mine
+            .as_ref()
+            .is_some_and(|s| !s.is_approved() && s.present_on_disk);
         let found = if mine.as_ref().is_some_and(usable) {
             mine
         } else {
@@ -2096,6 +2105,12 @@ impl BuiltinToolService {
                 // hands over nothing, and counting it would make an
                 // unfollowable skill look taken up.
                 self.record_skill_open(s.name.clone());
+                let note = (passed_over_own_draft && s.owner_user_id.is_none()).then(|| {
+                    format!(
+                        "this is the shared skill named {name}; your own draft of that name is \
+                         awaiting approval and was not used"
+                    )
+                });
                 Ok(serde_json::json!({
                     "ok": true,
                     "name": s.name,
@@ -2107,6 +2122,7 @@ impl BuiltinToolService {
                     "present_on_disk": s.present_on_disk,
                     "last_seen_at": s.last_seen_at.map(|ts| ts.to_rfc3339()),
                     "tags": s.tags,
+                    "note": note,
                     "body": s.body,
                 })
                 .to_string())
@@ -8859,6 +8875,81 @@ mod tests {
             json["description"], "global",
             "an unapproved personal draft must not hide a blessed global skill"
         );
+    }
+
+    /// Reaching past the caller's own unapproved draft says so, by name.
+    ///
+    /// The draft is one the assistant wrote under a name it chose, so nothing
+    /// else would ever mention it: the fetch now silently answers with the
+    /// shared skill, and `builtin_skill_search` reports only a count of what it
+    /// held back. The note is what lets the model tell the user their draft is
+    /// waiting on somebody.
+    #[tokio::test]
+    async fn skill_get_says_when_it_passed_over_the_callers_own_unapproved_draft() {
+        use desktop_assistant_core::ports::skill_index::{SkillGetFn, SkillSearchFn};
+        use std::sync::Arc;
+
+        let get_fn: SkillGetFn = Arc::new(|name, owner| {
+            Box::pin(async move {
+                if name != "deploy" {
+                    return Ok(None);
+                }
+                Ok(Some(match owner {
+                    Some(_) => {
+                        let mut draft = deploy_skill("caller's own draft", true);
+                        draft.approved_at = None;
+                        draft.owner_user_id = Some("someone".to_string());
+                        draft
+                    }
+                    None => deploy_skill("global", true),
+                }))
+            })
+        });
+        let search_fn: SkillSearchFn =
+            Arc::new(|_q, _emb, _model, _limit| Box::pin(async { Ok(Vec::new()) }));
+        let service = BuiltinToolService::new().with_skills(search_fn, get_fn);
+
+        let out = service
+            .execute_tool(TOOL_SKILL_GET, serde_json::json!({"name": "deploy"}))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(json["description"], "global");
+        assert!(
+            json["note"]
+                .as_str()
+                .unwrap_or("")
+                .contains("awaiting approval"),
+            "the draft that was passed over must be named, not silently dropped: {json}"
+        );
+    }
+
+    /// And it stays quiet when there was no draft to pass over, so the note
+    /// means something when it does appear.
+    #[tokio::test]
+    async fn skill_get_carries_no_draft_note_when_the_caller_has_no_draft() {
+        use desktop_assistant_core::ports::skill_index::{SkillGetFn, SkillSearchFn};
+        use std::sync::Arc;
+
+        let get_fn: SkillGetFn = Arc::new(|name, owner| {
+            Box::pin(async move {
+                if name != "deploy" || owner.is_some() {
+                    return Ok(None);
+                }
+                Ok(Some(deploy_skill("global", true)))
+            })
+        });
+        let search_fn: SkillSearchFn =
+            Arc::new(|_q, _emb, _model, _limit| Box::pin(async { Ok(Vec::new()) }));
+        let service = BuiltinToolService::new().with_skills(search_fn, get_fn);
+
+        let out = service
+            .execute_tool(TOOL_SKILL_GET, serde_json::json!({"name": "deploy"}))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(json["description"], "global");
+        assert!(json["note"].is_null(), "{json}");
     }
 
     /// The fallback reaches past an unusable personal row only to an APPROVED

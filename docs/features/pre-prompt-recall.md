@@ -284,9 +284,20 @@ row shadowed a live global skill of the same name for every later fetch - and
 assistant chose. The fallback now reaches past an unusable personal row for
 either reason, on the argument the tombstone case already carried.
 
-The trust rule is applied after that resolution rather than before it, so a
-non-local row shadowing a local one drops the name outright instead of letting
-the block offer a line the fetch will not return.
+The order of the passes is the whole design. A name resolves over every
+approved row it has - including one this query would not have matched, since a
+row the embedding backfill has not reached yet is the ordinary case. The trust
+rule applies to the row that resolution landed on, so a non-local row shadowing
+a local one drops the name outright instead of letting the block offer a line
+the fetch will not return. Only then is the spread measured, over the set the
+arm can actually draw from: a handful of local skills inside a large installed
+library would otherwise be graded against the installed library's geometry, and
+the minimum-sample rule would count those rows too.
+
+Reaching past the caller's own unapproved draft also says so. The draft is one
+the assistant wrote under a name it chose, so nothing else would mention it -
+`builtin_skill_get` returns the shared skill and names the draft it passed
+over.
 
 **Offers and opens are recorded.** The block's own skill lines are written to the
 skill use log as an offer, and a `builtin_skill_get` that hands the body back
