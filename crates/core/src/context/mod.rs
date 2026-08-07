@@ -281,6 +281,14 @@ pub(crate) struct AssembledTurn {
     /// can shrink the window further than the caller asked for, and the whole
     /// point of reporting this is that the caller cannot know that.
     pub window_from: usize,
+    /// The knowledge entries the `[Recall]` block put in front of the model,
+    /// in the order it rendered them. Empty on any round but a turn's first,
+    /// where the block does not render at all.
+    ///
+    /// Reported rather than re-derived, because only the renderer knows what it
+    /// showed: it applies the floor, the width, and every "already in view"
+    /// drop. The use log (#698) records these as offered.
+    pub recalled_entry_ids: Vec<String>,
 }
 
 /// Build the message list for a single turn, optionally enforcing a
@@ -333,9 +341,10 @@ pub(crate) fn assemble_turn_within_budget(
             estimate,
         )
     };
-    let finish = |messages: Vec<Message>, max: usize| AssembledTurn {
-        messages,
+    let finish = |pass: TurnMessages, max: usize| AssembledTurn {
+        messages: pass.messages,
         window_from: window_start(conversation.messages, max),
+        recalled_entry_ids: pass.recalled_entry_ids,
     };
 
     let mut current_max = max_messages;
@@ -362,7 +371,11 @@ pub(crate) fn assemble_turn_within_budget(
         tool_schema_estimate(tools.tool_defs, tools.deferred_namespaces, estimate);
 
     for _ in 0..MAX_PREFLIGHT_SHRINK_ITERATIONS {
-        let message_tokens: u64 = assembled.iter().map(|m| estimate(&m.content)).sum();
+        let message_tokens: u64 = assembled
+            .messages
+            .iter()
+            .map(|m| estimate(&m.content))
+            .sum();
         let assembled_tokens = message_tokens + tool_schema_tokens;
         if assembled_tokens <= threshold {
             return finish(assembled, current_max);
@@ -859,7 +872,7 @@ fn assemble_turn(
     max_messages: usize,
     budget: Option<ContextBudget>,
     estimate: &dyn Fn(&str) -> u64,
-) -> Vec<Message> {
+) -> TurnMessages {
     let system_instruction = system_block(tools, ambient, budget, estimate);
 
     // Apply context windowing: if the conversation exceeds the limit, keep
@@ -881,16 +894,17 @@ fn assemble_turn(
     // Assemble as a pipeline: the cached system instruction, then the per-turn
     // `[..]` re-surfaced context blocks, then the windowed history (with
     // collapsed runs replaced by summary markers).
-    let mut messages = Vec::with_capacity(windowed.len() + 2);
-    messages.push(Message::new(Role::System, system_instruction));
-    messages.extend(surfaced_blocks(
+    let surfaced = surfaced_blocks(
         anchors,
         ambient,
         conversation.context_summary,
         is_windowed,
         windowed,
         &active_summary_ids,
-    ));
+    );
+    let mut messages = Vec::with_capacity(windowed.len() + 2);
+    messages.push(Message::new(Role::System, system_instruction));
+    messages.extend(surfaced.blocks);
     messages.extend(expand_history(
         windowed,
         start,
@@ -898,7 +912,21 @@ fn assemble_turn(
         &active_summary_ids,
         projection,
     ));
-    messages
+    TurnMessages {
+        messages,
+        recalled_entry_ids: surfaced.recalled_entry_ids,
+    }
+}
+
+/// One assembly pass: the prompt, and what its `[Recall]` block offered.
+///
+/// The shrink loop repeats the pass at a smaller window, so the ids are a
+/// per-pass value rather than something accumulated: the pass that is finally
+/// returned is the prompt that ships, and its ids are the ones recorded.
+struct TurnMessages {
+    messages: Vec<Message>,
+    /// See [`AssembledTurn::recalled_entry_ids`].
+    recalled_entry_ids: Vec<String>,
 }
 
 /// Build the turn's system-instruction string: the assembled prompt sections
@@ -952,6 +980,14 @@ fn system_block(
     demoted_system
 }
 
+/// The turn's re-surfaced context blocks, and what the `[Recall]` block among
+/// them offered.
+struct SurfacedBlocks {
+    blocks: Vec<Message>,
+    /// See [`AssembledTurn::recalled_entry_ids`].
+    recalled_entry_ids: Vec<String>,
+}
+
 /// Build the per-turn `[..]` system messages that re-surface durable context so
 /// the model stays oriented across windowing and compaction. Returned in
 /// display order; each block is gated independently:
@@ -988,8 +1024,9 @@ fn surfaced_blocks(
     is_windowed: bool,
     windowed: &[Message],
     active_summary_ids: &std::collections::HashSet<&str>,
-) -> Vec<Message> {
+) -> SurfacedBlocks {
     let mut blocks = Vec::new();
+    let mut recalled_entry_ids = Vec::new();
 
     // Ambient "now": a tiny, always-present line giving the assistant a sense of
     // the current date/time without spending a `builtin_sys_props` tool round.
@@ -1112,11 +1149,18 @@ fn surfaced_blocks(
             ..surface
         };
         if let Some(recall) = crate::recall::render_recall(&surface) {
-            blocks.push(Message::new(Role::System, format!("[Recall] {recall}")));
+            blocks.push(Message::new(
+                Role::System,
+                format!("[Recall] {}", recall.text),
+            ));
+            recalled_entry_ids = recall.entry_ids;
         }
     }
 
-    blocks
+    SurfacedBlocks {
+        blocks,
+        recalled_entry_ids,
+    }
 }
 
 /// Expand the windowed message slice into final history: live messages pass

@@ -26,7 +26,7 @@ use desktop_assistant_core::domain::knowledge_use::{
 };
 use desktop_assistant_core::ports::auth::current_user_id;
 use desktop_assistant_core::ports::knowledge_use::{
-    KnowledgeUseLog, MarkRequest, OfferScope, OfferSource,
+    KnowledgeUseLog, MAX_STANDING_OFFERS, MarkRequest, OfferScope, OfferSource,
 };
 use sqlx::PgPool;
 
@@ -176,32 +176,23 @@ impl KnowledgeUseLog for PgKnowledgeUseLog {
         // belonged to the previous turn. A search runs inside a turn that is
         // already going, so it adds instead.
         if scope.source == OfferSource::Recall {
-            sqlx::query(
-                "UPDATE knowledge_use_stats \
-                 SET offer_conversation_id = NULL, offered_at = NULL \
-                 WHERE user_id = $1 AND offer_conversation_id = $2",
-            )
-            .bind(user_id.as_str())
-            .bind(&scope.conversation_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| CoreError::Storage(e.to_string()))?;
+            sqlx::query("DELETE FROM knowledge_offers WHERE user_id = $1 AND conversation_id = $2")
+                .bind(user_id.as_str())
+                .bind(&scope.conversation_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| CoreError::Storage(e.to_string()))?;
         }
 
         let written = if ids.is_empty() {
             0
         } else {
-            sqlx::query(
-                "INSERT INTO knowledge_use_stats \
-                     (user_id, entry_id, offered_count, first_seen_at, last_offered_at, \
-                      offer_conversation_id, offered_at) \
-                 SELECT kb.user_id, kb.id, 1, NOW(), NOW(), $3, NOW() \
+            let offered = sqlx::query(
+                "INSERT INTO knowledge_offers (user_id, conversation_id, entry_id, offered_at) \
+                 SELECT kb.user_id, $3, kb.id, NOW() \
                  FROM knowledge_base kb \
                  WHERE kb.user_id = $1 AND kb.id = ANY($2) AND kb.deleted_at IS NULL \
-                 ON CONFLICT (user_id, entry_id) DO UPDATE SET \
-                     offered_count = knowledge_use_stats.offered_count + 1, \
-                     last_offered_at = NOW(), \
-                     offer_conversation_id = EXCLUDED.offer_conversation_id, \
+                 ON CONFLICT (user_id, conversation_id, entry_id) DO UPDATE SET \
                      offered_at = NOW()",
             )
             .bind(user_id.as_str())
@@ -210,7 +201,48 @@ impl KnowledgeUseLog for PgKnowledgeUseLog {
             .execute(&mut *tx)
             .await
             .map_err(|e| CoreError::Storage(e.to_string()))?
-            .rows_affected() as usize
+            .rows_affected() as usize;
+
+            // The counters and the first-seen stamp, which are per entry rather
+            // than per conversation.
+            sqlx::query(
+                "INSERT INTO knowledge_use_stats \
+                     (user_id, entry_id, offered_count, first_seen_at, last_offered_at) \
+                 SELECT kb.user_id, kb.id, 1, NOW(), NOW() \
+                 FROM knowledge_base kb \
+                 WHERE kb.user_id = $1 AND kb.id = ANY($2) AND kb.deleted_at IS NULL \
+                 ON CONFLICT (user_id, entry_id) DO UPDATE SET \
+                     offered_count = knowledge_use_stats.offered_count + 1, \
+                     last_offered_at = NOW()",
+            )
+            .bind(user_id.as_str())
+            .bind(&ids)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
+
+            // A search adds to what stands rather than replacing it, so nothing
+            // else bounds this conversation's rows on a deployment that renders
+            // no [Recall] block. Trim to the newest, here rather than in a
+            // reaper: an offer that has fallen this far behind is one the model
+            // is not going to take up.
+            sqlx::query(
+                "DELETE FROM knowledge_offers o \
+                 WHERE o.user_id = $1 AND o.conversation_id = $2 \
+                   AND o.ctid NOT IN ( \
+                       SELECT k.ctid FROM knowledge_offers k \
+                       WHERE k.user_id = $1 AND k.conversation_id = $2 \
+                       ORDER BY k.offered_at DESC, k.entry_id \
+                       LIMIT $3)",
+            )
+            .bind(user_id.as_str())
+            .bind(&scope.conversation_id)
+            .bind(MAX_STANDING_OFFERS as i64)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
+
+            offered
         };
 
         tx.commit()
@@ -230,29 +262,47 @@ impl KnowledgeUseLog for PgKnowledgeUseLog {
         }
         let user_id = current_user_id();
 
-        // The offer is taken down in the same statement that counts the open,
-        // so a second fetch of the same entry in the same turn is one open and
-        // a retried tool call adds nothing.
-        let written = sqlx::query(
-            "UPDATE knowledge_use_stats SET \
-                 opened_count = opened_count + 1, \
-                 recent_uses = (ARRAY[NOW()] || recent_uses)[1:$4::int], \
-                 offer_conversation_id = NULL, \
-                 offered_at = NULL \
-             WHERE user_id = $1 \
-               AND entry_id = ANY($2) \
-               AND offer_conversation_id = $3",
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
+
+        // Taking the offer down is what makes the count idempotent: a second
+        // fetch of the same entry in the same turn finds no standing offer, so a
+        // retried tool call adds nothing. The delete decides which ids count,
+        // and the update below counts exactly those.
+        let taken: Vec<String> = sqlx::query_scalar(
+            "DELETE FROM knowledge_offers \
+             WHERE user_id = $1 AND conversation_id = $2 AND entry_id = ANY($3) \
+             RETURNING entry_id",
         )
         .bind(user_id.as_str())
-        .bind(&ids)
         .bind(&conversation_id)
-        .bind(RECENT_USE_WINDOW as i32)
-        .execute(&self.pool)
+        .bind(&ids)
+        .fetch_all(&mut *tx)
         .await
-        .map_err(|e| CoreError::Storage(e.to_string()))?
-        .rows_affected() as usize;
+        .map_err(|e| CoreError::Storage(e.to_string()))?;
 
-        Ok(written)
+        if !taken.is_empty() {
+            sqlx::query(
+                "UPDATE knowledge_use_stats SET \
+                     opened_count = opened_count + 1, \
+                     recent_uses = (ARRAY[NOW()] || recent_uses)[1:$3::int] \
+                 WHERE user_id = $1 AND entry_id = ANY($2)",
+            )
+            .bind(user_id.as_str())
+            .bind(&taken)
+            .bind(RECENT_USE_WINDOW as i32)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
+        Ok(taken.len())
     }
 
     async fn record_mark(&self, request: MarkRequest) -> Result<Vec<String>, CoreError> {

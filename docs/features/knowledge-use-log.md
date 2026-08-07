@@ -39,24 +39,28 @@ with it is what a later reader needs.
 
 | act | where | what it records |
 | --- | --- | --- |
-| offered by `[Recall]` | `crates/daemon/src/knowledge_use.rs` | the entries the block will show |
+| offered by `[Recall]` | `ConversationHandler::send_prompt` | the entries the block rendered |
 | offered by a search | `kb_search`, `crates/mcp-client/src/builtin.rs` | every entry on the page |
 | opened | `kb_get`, same file | the entries the response delivered |
 | marked | `builtin_knowledge_base_mark`, same file | one standing judgement per entry |
 
-The `[Recall]` offer is recorded by a decorator around the recall lookup, rather
-than inside the renderer. The block is assembled during prompt building, where
-no tool runs, so the decorator applies the renderer's own rules -
-`RecallRelevance::clears_floor`, `KnowledgeEntry::display_line` and
-`max_recall_entries` - to the candidates the lookup returned.
+**The renderer reports what it rendered.** `render_recall` returns the ids of
+the lines it emitted alongside the block text, and the turn records those. There
+is no second implementation of the selection: the floor, the width, and every
+"already in view" drop are applied in one place, and the ids come out of it.
 
-One rule it cannot apply. The renderer also drops an entry `[Pinned]` is already
-carrying in full, and whether a pin resolved is decided later in assembly. On a
-turn where a pinned note attaches an entry that also ranks near the prompt, the
-decorator records that entry - which was in front of the model, under another
-block - and misses the entry that took its place in the line budget. The case
-needs a pinned attachment and a near-prompt rank together, and it moves the
-count by one.
+That matters most for a pinned entry. `[Pinned]` carries such an entry in full,
+so the block drops it and shows one further entry instead - and a pin is made
+precisely for an entry that keeps ranking near the prompt, so the drop repeats
+turn after turn. Recording the pinned id would accrue offers against
+structurally zero opens, because the model has no reason to fetch an entry it
+can already read whole. That is the exact profile of the cleanest prune
+candidate, so the strongest endorsement the system holds would read as evidence
+to delete.
+
+The block renders on a turn's first round only, so the offer is recorded there
+and nowhere else. An empty list recorded on a later round would take down the
+offers the turn had just made.
 
 ## An open is a taken-up offer
 
@@ -75,9 +79,22 @@ had standing. A search runs inside a turn that is already going, so an offer it
 makes is added. "Offered in the same turn" therefore needs no turn identifier:
 the standing set is this turn's set, because the turn's first block replaced it.
 
-The one degraded case is a deployment with pre-prompt recall switched off.
-Nothing then replaces the set at a turn boundary, so an offer made by a search
-stands until it is taken up. That is a wider window than a turn, never a
+The turn records its offer whether or not the block showed anything, and whether
+or not the lookup succeeded. A lookup that timed out, or whose knowledge arm
+failed, would otherwise leave the previous turn's offers standing - and the
+model still has that block in its transcript, so a fetch on a later turn would
+read as taking one up. The window would be "since the last successful lookup"
+rather than one turn.
+
+**An offer is keyed on the conversation.** One entry can stand offered in two
+conversations at once, and a single column would let the second offer overwrite
+the first and drop the open made against it - undercounting exactly the entries
+broad enough to surface in two places at once.
+
+The one degraded case is a deployment with pre-prompt recall switched off, where
+the block never renders and nothing replaces the set at a turn boundary. An
+offer made by a search then stands until it is taken up or until
+`MAX_STANDING_OFFERS` pushes it out. That is a wider window than a turn, never a
 narrower one, and it still refuses the read that nothing offered.
 
 ## Marking
@@ -109,6 +126,16 @@ still lands. On the retry the row is definitively gone and the remaining ids are
 marked. The check reads the SQLSTATE, not the message.
 
 ## Bounded per entry
+
+`044_knowledge_use_log.sql` creates three tables, each bounded by how it is
+written. `knowledge_use_stats` holds one row per entry, `knowledge_offers` one
+row per `(conversation, entry)` currently in front of the model, and
+`knowledge_use_marks` one standing judgement per source per entry.
+
+A `[Recall]` block deletes its conversation's offer rows before inserting its
+own, so a conversation normally holds one turn's worth. Where no block runs, the
+writer trims to the newest `MAX_STANDING_OFFERS`. The foreign key to
+`knowledge_base` frees a reaped entry's rows with it.
 
 A spacing term needs per-use timestamps, because when the uses fell is the half
 of the signal a lifetime counter cannot express. Keeping every event for ever is
@@ -154,9 +181,10 @@ and pass them in.
 
 ## Multi-tenancy
 
-Both tables carry `user_id`, both are on the RLS policy list, and both are
-registered in `PERSONAL_DATA_TABLES` so the `db_query` tool grafts a `user_id`
-predicate onto any model-supplied SQL that names them.
+All three tables carry `user_id`, each enables its own RLS policy in the
+migration that creates it, and all three are registered in
+`PERSONAL_DATA_TABLES` so the `db_query` tool grafts a `user_id` predicate onto
+any model-supplied SQL that names them.
 
 `knowledge_base.id` is a global primary key, so an id another user owns is an id
 this user can name. Every write therefore selects the entry out of
@@ -174,17 +202,22 @@ offered often and never opened.
 
 Recording never fails a read. An offer and an open are measurements of a read,
 and a measurement must not be able to break what it measures, so both run off
-the caller's path in their own task and their errors become log lines. The one
-exception is the mark, which the caller asked for.
+the caller's path in their own task and their errors become log lines. Those go
+out at `warn`, because a write that fails is a fault rather than an expected
+decline: an unmigrated database or an exhausted pool makes every write fail, and
+a log the daemon never mentions leaves the tables empty while ranking scores
+every entry alike on the use terms - a ranking that looks like a working
+ranking, which is the failure this substrate exists to prevent. The one
+exception to running off the path is the mark, which the caller asked for.
 
 Running off the path costs one guarantee worth stating: a spawned write may
 still be in flight when the tool returns. In practice an offer is recorded when
 the lookup answers and taken up a model round trip later, which is seconds.
 
-A `[Recall]` lookup that found nothing is recorded too, as an offer of no
-entries, because a recall offer replaces the conversation's standing offers and
-an empty one is what ends the previous turn's. A lookup that failed outright
-records nothing, so on that turn the previous turn's offers stand.
+A turn whose block showed nothing records an offer of no entries, because a
+recall offer replaces the conversation's standing offers and an empty one is
+what ends the previous turn's. A turn whose lookup failed records the same, for
+the same reason.
 
 The log is capability-gated like every other knowledge closure. Without a
 database the tools behave exactly as they did before it existed, and
@@ -196,8 +229,9 @@ database the tools behave exactly as they did before it existed, and
 | --- | --- |
 | The records, the window, and the score | `crates/core/src/domain/knowledge_use.rs` |
 | The port, and the off-the-path write | `crates/core/src/ports/knowledge_use.rs` |
-| The two tables | `crates/storage/migrations/044_knowledge_use_log.sql` |
+| The three tables | `crates/storage/migrations/044_knowledge_use_log.sql` |
 | The adapter | `crates/storage/src/knowledge_use.rs` |
-| The `[Recall]` offer decorator | `crates/daemon/src/knowledge_use.rs` |
+| What the block reported it offered | `render_recall`, `crates/core/src/recall.rs` |
+| Recording it, once per turn | `ConversationHandler::send_prompt`, `crates/core/src/service.rs` |
 | The search offer, the open, and the mark | `crates/mcp-client/src/builtin.rs` |
 | Multi-tenant and correlation tests | `crates/storage/tests/knowledge_use_log.rs` |

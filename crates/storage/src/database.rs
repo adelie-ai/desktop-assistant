@@ -115,6 +115,7 @@ const PERSONAL_DATA_TABLES: &[&str] = &[
     // as much about the person as the entries themselves do.
     "knowledge_use_stats",
     "knowledge_use_marks",
+    "knowledge_offers",
 ];
 
 /// The canonical set of personal-data tables (see `PERSONAL_DATA_TABLES`).

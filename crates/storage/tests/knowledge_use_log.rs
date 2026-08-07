@@ -12,6 +12,13 @@
 //! - `the_recent_use_window_does_not_grow_without_limit`
 //! - `a_cross_tenant_read_of_a_use_record_returns_nothing`
 //!
+//! Plus guards beyond that list:
+//!
+//! - `an_offer_standing_in_two_conversations_can_be_taken_up_in_either` - the
+//!   standing offer is keyed on the conversation, so one conversation's offer
+//!   cannot overwrite another's and silently drop the open made against it.
+//! - `a_conversation_cannot_accumulate_standing_offers_without_limit`
+//!
 //! ## Running locally
 //!
 //! ```sh
@@ -29,7 +36,10 @@ use desktop_assistant_core::domain::knowledge_use::{
     UseScoreWeights,
 };
 use desktop_assistant_core::ports::knowledge::KnowledgeBaseStore;
-use desktop_assistant_core::ports::knowledge_use::{KnowledgeUseLog, MarkRequest, OfferScope};
+use desktop_assistant_core::ports::knowledge_use::{
+    KnowledgeUseLog, MAX_STANDING_OFFERS, MarkRequest, OfferScope,
+};
+use desktop_assistant_storage::knowledge_delete::KnowledgeDeletePolicy;
 use desktop_assistant_storage::{PgKnowledgeBaseStore, PgKnowledgeUseLog, UserId, with_user_id};
 use sqlx::PgPool;
 
@@ -46,7 +56,7 @@ async fn fixture() -> Option<support::DbFixture> {
 /// Write one entry as `user`, so the log has something it is allowed to record
 /// against.
 async fn write_as(pool: &PgPool, user: &str, id: &str) {
-    let store = PgKnowledgeBaseStore::new(pool.clone());
+    let store = PgKnowledgeBaseStore::new(pool.clone(), KnowledgeDeletePolicy::default());
     with_user_id(UserId::new(user), async {
         store
             .write(KnowledgeEntry::new(id, "a fact worth keeping", vec![]))
@@ -331,6 +341,101 @@ async fn a_search_inside_a_turn_adds_to_what_the_block_already_offered() {
             .await
             .expect("read succeeds");
         assert_eq!(opened, 2, "both offers must still stand");
+    })
+    .await;
+
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn an_offer_standing_in_two_conversations_can_be_taken_up_in_either() {
+    let Some(fx) = fixture().await else { return };
+    let log = PgKnowledgeUseLog::new(fx.pool.clone());
+    write_as(&fx.pool, ALICE, "kb-broad").await;
+
+    with_user_id(UserId::new(ALICE), async {
+        // An entry broad enough to rank near two different prompts is offered
+        // in both conversations. Neither offer may displace the other: the
+        // entries that surface in two places at once are exactly the ones a
+        // single-conversation column would undercount.
+        log.record_offered(OfferScope::recall("conv-a"), vec!["kb-broad".to_string()])
+            .await
+            .expect("offer recorded");
+        log.record_offered(OfferScope::recall("conv-b"), vec!["kb-broad".to_string()])
+            .await
+            .expect("offer recorded");
+
+        assert_eq!(
+            log.record_opened("conv-a".to_string(), vec!["kb-broad".to_string()])
+                .await
+                .expect("read succeeds"),
+            1,
+            "the first conversation's offer must still stand"
+        );
+        assert_eq!(
+            log.record_opened("conv-b".to_string(), vec!["kb-broad".to_string()])
+                .await
+                .expect("read succeeds"),
+            1,
+            "and so must the second's"
+        );
+    })
+    .await;
+
+    let record = record_of(&log, ALICE, "kb-broad").await.expect("a record");
+    assert_eq!(record.offered_count, 2);
+    assert_eq!(record.opened_count, 2);
+
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_conversation_cannot_accumulate_standing_offers_without_limit() {
+    let Some(fx) = fixture().await else { return };
+    let log = PgKnowledgeUseLog::new(fx.pool.clone());
+
+    // A deployment that renders no [Recall] block never clears at a turn
+    // boundary, so only the cap bounds a long conversation's standing offers.
+    let over = MAX_STANDING_OFFERS + 20;
+    let ids: Vec<String> = (0..over).map(|i| format!("kb-{i:04}")).collect();
+    for id in &ids {
+        write_as(&fx.pool, ALICE, id).await;
+    }
+    with_user_id(UserId::new(ALICE), async {
+        for id in &ids {
+            log.record_offered(OfferScope::search(CONV), vec![id.clone()])
+                .await
+                .expect("offer recorded");
+        }
+    })
+    .await;
+
+    let standing: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM knowledge_offers WHERE user_id = $1 AND conversation_id = $2",
+    )
+    .bind(ALICE)
+    .bind(CONV)
+    .fetch_one(&fx.pool)
+    .await
+    .expect("count standing offers");
+    assert_eq!(standing, MAX_STANDING_OFFERS as i64);
+
+    // The cap keeps the newest, which is where a take-up would come from.
+    with_user_id(UserId::new(ALICE), async {
+        assert_eq!(
+            log.record_opened(CONV.to_string(), vec![ids[over - 1].clone()])
+                .await
+                .expect("read succeeds"),
+            1,
+            "the newest offer must survive the trim"
+        );
+        assert_eq!(
+            log.record_opened(CONV.to_string(), vec![ids[0].clone()])
+                .await
+                .expect("read succeeds"),
+            0,
+            "the oldest was pushed out"
+        );
     })
     .await;
 
@@ -689,11 +794,14 @@ async fn reaping_an_entry_frees_its_use_records() {
         .expect("hard delete");
 
     assert!(record_of(&log, ALICE, "kb-1").await.is_none());
-    let marks: i64 = sqlx::query_scalar("SELECT count(*) FROM knowledge_use_marks")
-        .fetch_one(&fx.pool)
-        .await
-        .expect("count marks");
-    assert_eq!(marks, 0);
+    for table in ["knowledge_use_marks", "knowledge_offers"] {
+        let left: i64 =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM {table}")))
+                .fetch_one(&fx.pool)
+                .await
+                .unwrap_or_else(|e| panic!("count {table}: {e}"));
+        assert_eq!(left, 0, "{table} must not outlive the entry it describes");
+    }
 
     fx.cleanup().await;
 }

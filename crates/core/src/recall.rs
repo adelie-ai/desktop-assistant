@@ -448,13 +448,33 @@ impl<'a> RecallSurface<'a> {
 /// vocabulary. Every candidate list is taken in the order it arrives - nearest
 /// first - and is never reordered: a cosine distance and a lexical match are
 /// not comparable, and one lookup only ever produces one of the two.
-pub(crate) fn render_recall(surface: &RecallSurface<'_>) -> Option<String> {
+pub(crate) fn render_recall(surface: &RecallSurface<'_>) -> Option<RenderedRecall> {
     render_recall_with_width(surface, max_recall_entries())
+}
+
+/// A rendered `[Recall]` block, and the entries it put in front of the model.
+///
+/// The ids travel with the text because the use log (#698) records an offer,
+/// and only this function knows what was offered: the floor, the width, and
+/// every "already in view" drop are applied here. A second implementation of
+/// the same selection would agree until one of those rules changed - and the
+/// rule most likely to change is the one it could not see. An entry `[Pinned]`
+/// carries is dropped here and shows no line, so it must not be recorded as
+/// offered; a pin is the strongest endorsement the system holds, and offers it
+/// can never take up would read as evidence to retire it.
+pub(crate) struct RenderedRecall {
+    /// The block body. The caller prefixes `[Recall] `.
+    pub text: String,
+    /// The entries whose lines this block carries, in the order they render.
+    pub entry_ids: Vec<String>,
 }
 
 /// [`render_recall`] at a stated width, so the width can be varied without
 /// varying the deployment's own setting.
-fn render_recall_with_width(surface: &RecallSurface<'_>, max_entries: usize) -> Option<String> {
+fn render_recall_with_width(
+    surface: &RecallSurface<'_>,
+    max_entries: usize,
+) -> Option<RenderedRecall> {
     let candidates = surface.candidates;
 
     let above_floor: Vec<&RecallEntry> = candidates
@@ -545,9 +565,11 @@ fn render_recall_with_width(surface: &RecallSurface<'_>, max_entries: usize) -> 
         block.push_str(RECALL_ENTRY_HINT);
     }
 
+    let mut entry_ids = Vec::new();
     for (hit, line) in showable.iter().take(max_entries) {
         block.push('\n');
         block.push_str(&entry_line(hit, line));
+        entry_ids.push(hit.entry.id.clone());
     }
 
     let dropped = showable.len().saturating_sub(max_entries);
@@ -577,7 +599,10 @@ fn render_recall_with_width(surface: &RecallSurface<'_>, max_entries: usize) -> 
         block.push_str(&tags);
     }
 
-    Some(block)
+    Some(RenderedRecall {
+        text: block,
+        entry_ids,
+    })
 }
 
 /// Whether `values` names `wanted`.
@@ -817,6 +842,11 @@ mod tests {
     /// The same, at a stated width. Every test states the width it means, so no
     /// test depends on what a deployment happened to configure.
     fn render_at(candidates: &RecallCandidates, max_entries: usize) -> Option<String> {
+        render_at_full(candidates, max_entries).map(|r| r.text)
+    }
+
+    /// The same, keeping the ids the block reported alongside its text.
+    fn render_at_full(candidates: &RecallCandidates, max_entries: usize) -> Option<RenderedRecall> {
         render_recall_with_width(
             &RecallSurface::new(candidates, RECALL_ENTRY_SCAN_LIMIT, RECALL_NOTE_SCAN_LIMIT),
             max_entries,
@@ -840,11 +870,97 @@ mod tests {
         planned_keys: &[String],
         pinned_entry_ids: &[String],
     ) -> Option<String> {
+        render_planned_full(candidates, indexed_keys, planned_keys, pinned_entry_ids)
+            .map(|r| r.text)
+    }
+
+    /// The same, keeping the ids the block reported alongside its text.
+    fn render_planned_full(
+        candidates: &RecallCandidates,
+        indexed_keys: &[String],
+        planned_keys: &[String],
+        pinned_entry_ids: &[String],
+    ) -> Option<RenderedRecall> {
         render_recall_with_width(
             &RecallSurface::new(candidates, RECALL_ENTRY_SCAN_LIMIT, RECALL_NOTE_SCAN_LIMIT)
                 .already_in_view(indexed_keys, planned_keys, pinned_entry_ids),
             DEFAULT_MAX_RECALL_ENTRIES,
         )
+    }
+
+    // -- what the block reports as offered (#698) ----------------------------
+
+    #[test]
+    fn the_block_reports_exactly_the_entry_ids_it_rendered() {
+        // The use log records an offer from this list, so it has to be the
+        // lines the model actually sees - not the candidates that reached the
+        // renderer.
+        let candidates = RecallCandidates {
+            entries: near_hits(DEFAULT_MAX_RECALL_ENTRIES + 3),
+            ..Default::default()
+        };
+        let rendered =
+            render_at_full(&candidates, DEFAULT_MAX_RECALL_ENTRIES).expect("the block renders");
+        assert_eq!(rendered.entry_ids.len(), DEFAULT_MAX_RECALL_ENTRIES);
+        assert_eq!(
+            rendered.entry_ids.len(),
+            entry_lines(&rendered.text).len(),
+            "one reported id per rendered line"
+        );
+        for id in &rendered.entry_ids {
+            assert!(
+                rendered.text.contains(id.as_str()),
+                "reported {id}, which the block does not show"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pinned_entry_is_never_reported_as_offered() {
+        // `[Pinned]` carries the entry in full, so the block drops it and shows
+        // one further entry instead. Reporting the pinned id would accrue an
+        // offer the model has no reason to take up - turn after turn, because a
+        // pin is made precisely for an entry that keeps ranking near - and the
+        // log would read the system's strongest endorsement as the profile of
+        // its cleanest prune candidate.
+        let candidates = RecallCandidates {
+            entries: near_hits(DEFAULT_MAX_RECALL_ENTRIES + 1),
+            ..Default::default()
+        };
+        let pinned = owned(&["kb-0"]);
+        let rendered =
+            render_planned_full(&candidates, &[], &[], &pinned).expect("the block renders");
+
+        assert!(
+            !rendered.entry_ids.contains(&"kb-0".to_string()),
+            "a pinned entry shows no line, so it was not offered here"
+        );
+        assert_eq!(
+            rendered.entry_ids.len(),
+            DEFAULT_MAX_RECALL_ENTRIES,
+            "the entry that took the pinned one's place is reported"
+        );
+        assert!(
+            rendered
+                .entry_ids
+                .contains(&format!("kb-{DEFAULT_MAX_RECALL_ENTRIES}")),
+            "the last entry moved into the budget and must be reported: {:?}",
+            rendered.entry_ids
+        );
+    }
+
+    #[test]
+    fn an_entry_below_the_floor_or_with_no_line_is_not_reported_as_offered() {
+        let mut entries = near_hits(1);
+        entries.push(hit("kb-far", "too distant", &["topic"], 0.99));
+        entries.push(hit("kb-blank", "   ", &[], 0.10));
+        let candidates = RecallCandidates {
+            entries,
+            ..Default::default()
+        };
+        let rendered =
+            render_at_full(&candidates, DEFAULT_MAX_RECALL_ENTRIES).expect("the block renders");
+        assert_eq!(rendered.entry_ids, vec!["kb-0".to_string()]);
     }
 
     /// The block's knowledge lines: the `- ` lines before the scratchpad label.
@@ -1234,7 +1350,7 @@ mod tests {
         .expect("a block");
 
         assert_eq!(
-            entry_lines(&block).len(),
+            entry_lines(&block.text).len(),
             wanted,
             "render_recall must read the configured width, not the derived default"
         );

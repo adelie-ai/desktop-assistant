@@ -22,7 +22,6 @@ mod embedding_probe;
 #[cfg(test)]
 mod hosted_search_probe;
 mod knowledge_service;
-mod knowledge_use;
 mod maintenance_service;
 mod mcp_token_store;
 mod model_defaults;
@@ -2816,6 +2815,19 @@ async fn main() -> Result<()> {
             Box::pin(async move { store.get_many(&ids).await })
         }));
     }
+    // #698: the `[Recall]` block puts entries in front of the model outside any
+    // tool call, so the turn records the offer itself, from the ids the renderer
+    // reports. Gated on a database only - a deployment with no embedding backend
+    // renders no block, and then records an empty offer, which is what ends the
+    // previous turn's.
+    if let Some(log) = &kb_use_log {
+        use desktop_assistant_core::ports::knowledge_use::KnowledgeUseLog;
+        let log = Arc::clone(log);
+        handler = handler.with_knowledge_offer_log(Arc::new(move |scope, ids| {
+            let log = Arc::clone(&log);
+            Box::pin(async move { log.record_offered(scope, ids).await })
+        }));
+    }
     if let Some(release_fn) = scratchpad_release_references_fn {
         handler = handler.with_scratchpad_release_references(release_fn);
     }
@@ -2852,19 +2864,12 @@ async fn main() -> Result<()> {
                 }
                 None => desktop_assistant_core::recall::max_recall_entries(),
             };
-            let lookup = recall::build_recall_search(
+            handler = handler.with_recall_search(recall::build_recall_search(
                 Arc::clone(kb),
                 pool.clone(),
                 Arc::clone(embed),
                 embedding_model_id.clone(),
-            );
-            // The block puts entries in front of the model outside any tool
-            // call, so the use log learns about the offer here (#698).
-            let lookup = match &kb_use_log {
-                Some(log) => knowledge_use::with_offer_recording(lookup, Arc::clone(log)),
-                None => lookup,
-            };
-            handler = handler.with_recall_search(lookup);
+            ));
             tracing::info!(
                 entry_lines,
                 "pre-prompt recall wired: prompts are looked up against memory"

@@ -27,10 +27,19 @@
 //! is that "offered in the same turn" needs no turn identifier: the standing
 //! set is this turn's set, because the turn's first block replaced it.
 //!
-//! The one degraded case is a deployment with recall switched off. Nothing then
-//! replaces the set at a turn boundary, so an offer made by a search stands
-//! until it is taken up. That is a wider window than a turn, never a narrower
-//! one, and it still refuses the read that nothing offered.
+//! The turn records its offer whether or not the block showed anything, and
+//! whether or not the lookup succeeded. That is load-bearing rather than tidy:
+//! a lookup that timed out, or whose knowledge arm failed, would otherwise
+//! leave the previous turn's offers standing, and the model - which still has
+//! the previous turn's block in its transcript - could take one up on a later
+//! turn. The window would then be "since the last successful lookup" rather
+//! than one turn, and it would inflate the highest-quality signal in the log.
+//!
+//! The one degraded case is a deployment with recall switched off, where the
+//! block never renders and nothing replaces the set at a turn boundary. An
+//! offer made by a search then stands until it is taken up or until
+//! [`MAX_STANDING_OFFERS`] pushes it out. That is a wider window than a turn,
+//! never a narrower one, and it still refuses the read that nothing offered.
 //!
 //! ## Recording never fails a read
 //!
@@ -46,6 +55,18 @@ use std::sync::Arc;
 use crate::CoreError;
 use crate::domain::knowledge_use::{KnowledgeUseRecord, MarkPolarity, MarkSource};
 use crate::ports::auth::{current_user_id, with_user_id};
+
+/// How many offers one conversation may have standing.
+///
+/// A `[Recall]` block clears the conversation before it makes its own offers,
+/// so on an ordinary deployment a conversation holds one turn's worth and this
+/// is never reached. It bounds the case nothing else does: a deployment that
+/// renders no block, where a search adds offers and nothing clears them, and a
+/// long conversation would otherwise accumulate one row per entry it ever saw.
+///
+/// The figure is a storage bound, not a ranking coefficient. An offer that has
+/// fallen this far behind is one the model is not going to take up.
+pub const MAX_STANDING_OFFERS: usize = 256;
 
 /// Which kind of surface put the entries in front of the model.
 ///
@@ -212,7 +233,13 @@ where
         match with_user_id(user_id, write).await {
             Ok(0) => {}
             Ok(rows) => tracing::debug!(target: "knowledge_use", what, rows, "use log written"),
-            Err(error) => tracing::debug!(
+            // A failing write is a fault, not an expected decline: an
+            // unmigrated database, an exhausted pool or a missing grant makes
+            // every write fail, and at debug the daemon would say nothing while
+            // the tables stayed empty. Ranking would then score every entry
+            // alike on the use terms - a ranking that looks like a working one,
+            // which is the failure this log exists to prevent.
+            Err(error) => tracing::warn!(
                 target: "knowledge_use",
                 what,
                 %error,

@@ -14,6 +14,15 @@
 -- the tail - and it is why there is no per-event table here. An unbounded event
 -- log would grow with every prompt and hold nothing the score reads.
 --
+-- `knowledge_offers` holds the standing offers: which entries are currently in
+-- front of the model, and in which conversation. It is keyed on the
+-- conversation as well as the entry, and that is the point - one entry can be
+-- standing offered in two conversations at once, and a single column on the
+-- stats row would let the second offer overwrite the first. The open made
+-- against the overwritten one would then record nothing. That undercounts
+-- exactly the entries broad enough to surface in two places at once, which is a
+-- bias in the signal even though it is a safe one.
+--
 -- `knowledge_use_marks` is bounded the same way: the primary key includes the
 -- source, so each entry holds at most one standing mark per source. A mark is a
 -- current opinion, not an event, so a second mark from the same source replaces
@@ -22,7 +31,7 @@
 -- Both tables are personal data. Each carries `user_id`, every query scopes by
 -- it, and both are added to the RLS backstop below - migration 029's policy
 -- list is static, so a user-scoped table added later must enable its own.
--- Both names are also registered in `PERSONAL_DATA_TABLES`
+-- All three names are also registered in `PERSONAL_DATA_TABLES`
 -- (crates/storage/src/database.rs) so the db_query tool grafts a `user_id`
 -- predicate onto any LLM-supplied SQL that names them.
 --
@@ -53,21 +62,33 @@ CREATE TABLE IF NOT EXISTS knowledge_use_stats (
     -- The most recent use timestamps, newest first. The writer caps the length,
     -- so this array is bounded however long the entry lives.
     recent_uses     TIMESTAMPTZ[] NOT NULL DEFAULT '{}',
-    -- The conversation this entry is currently standing offered in, and when
-    -- the offer was made. An open counts only against a standing offer, and
-    -- counting it takes the offer down - so a second fetch in the same turn is
-    -- one open, and a read of an entry nothing offered is not an open at all.
-    offer_conversation_id TEXT,
-    offered_at      TIMESTAMPTZ,
     PRIMARY KEY (user_id, entry_id)
 );
 
--- The [Recall] block clears a conversation's standing offers before it makes
--- its own, which is a write keyed on the conversation rather than the entry.
--- Partial, because a row with no standing offer is never the target.
-CREATE INDEX IF NOT EXISTS knowledge_use_stats_offer_idx
-    ON knowledge_use_stats (user_id, offer_conversation_id)
-    WHERE offer_conversation_id IS NOT NULL;
+-- The standing offers: what is in front of the model right now, and where.
+--
+-- An open counts only against a standing offer, and counting it deletes the
+-- row - so a second fetch in the same turn is one open, and a read of an entry
+-- nothing offered is not an open at all.
+--
+-- Bounded by how it is written rather than by a reaper. A [Recall] block is
+-- rendered once per turn and deletes this conversation's rows before inserting
+-- its own, so a conversation holds one turn's offers. The foreign key frees a
+-- reaped entry's rows with it. What is left is a conversation whose deployment
+-- runs no [Recall] block: nothing then clears at a turn boundary, so the search
+-- tool's own offers accumulate, and the writer caps them.
+CREATE TABLE IF NOT EXISTS knowledge_offers (
+    user_id         TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    entry_id        TEXT NOT NULL REFERENCES knowledge_base(id) ON DELETE CASCADE,
+    offered_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (user_id, conversation_id, entry_id)
+);
+
+-- Both writes that are not keyed on the entry: the per-turn clear, and the cap
+-- that trims a conversation to its newest offers.
+CREATE INDEX IF NOT EXISTS knowledge_offers_conversation_idx
+    ON knowledge_offers (user_id, conversation_id, offered_at DESC);
 
 CREATE TABLE IF NOT EXISTS knowledge_use_marks (
     user_id     TEXT NOT NULL,
@@ -102,4 +123,9 @@ CREATE POLICY knowledge_use_stats_user_isolation ON knowledge_use_stats
 DROP POLICY IF EXISTS knowledge_use_marks_user_isolation ON knowledge_use_marks;
 ALTER TABLE knowledge_use_marks ENABLE ROW LEVEL SECURITY;
 CREATE POLICY knowledge_use_marks_user_isolation ON knowledge_use_marks
+    USING (user_id = current_setting('app.user_id', true));
+
+DROP POLICY IF EXISTS knowledge_offers_user_isolation ON knowledge_offers;
+ALTER TABLE knowledge_offers ENABLE ROW LEVEL SECURITY;
+CREATE POLICY knowledge_offers_user_isolation ON knowledge_offers
     USING (user_id = current_setting('app.user_id', true));

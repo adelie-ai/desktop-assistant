@@ -14,6 +14,7 @@ use crate::ports::client_tools::current_client_tools;
 use crate::ports::conversation_ctx::with_conversation_id;
 use crate::ports::inbound::ConversationService;
 use crate::ports::knowledge::KnowledgeGetManyFn;
+use crate::ports::knowledge_use::{KnowledgeOfferedFn, OfferScope, record_in_background};
 use crate::ports::llm::{
     ChunkCallback, LlmClient, ReasoningConfig, StatusCallback, current_cancellation_token,
     current_context_budget, current_tool_allowlist, current_tool_gate_disabled,
@@ -516,6 +517,9 @@ pub struct ConversationHandler<S, L, T = NoopToolExecutor> {
     /// store, or the feature switched off - leaves the turn exactly as it was
     /// before the block existed.
     recall_search: Option<RecallSearchFn>,
+    /// Optional use-log write for what the `[Recall]` block offered (#698).
+    /// `None` - no database, and the turn records nothing.
+    knowledge_offered: Option<KnowledgeOfferedFn>,
     /// Maximum byte length a single tool result may occupy before it is
     /// truncated at ingestion (issue #174). Defaults to
     /// [`DEFAULT_MAX_TOOL_RESULT_BYTES`]; override via
@@ -571,6 +575,7 @@ impl<S, L> ConversationHandler<S, L, NoopToolExecutor> {
             knowledge_get_many: None,
             descendant_task_probe: None,
             recall_search: None,
+            knowledge_offered: None,
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             host: DEFAULT_HOST_LABEL.to_string(),
             on_workstation: true,
@@ -665,6 +670,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             knowledge_get_many: None,
             descendant_task_probe: None,
             recall_search: None,
+            knowledge_offered: None,
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             host: DEFAULT_HOST_LABEL.to_string(),
             on_workstation: true,
@@ -772,6 +778,17 @@ impl<S, L, T> ConversationHandler<S, L, T> {
     /// block existed.
     pub fn with_recall_search(mut self, recall_search: RecallSearchFn) -> Self {
         self.recall_search = Some(recall_search);
+        self
+    }
+
+    /// Wire the use log's record of what the `[Recall]` block offered (#698).
+    ///
+    /// Separate from [`Self::with_recall_search`] because the two are gated on
+    /// different things: recall needs an embedding backend, the log needs only
+    /// a database. Unwired, the block behaves exactly as it did before the log
+    /// existed and nothing is recorded.
+    pub fn with_knowledge_offer_log(mut self, offered: KnowledgeOfferedFn) -> Self {
+        self.knowledge_offered = Some(offered);
         self
     }
 
@@ -2016,6 +2033,29 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
             // because the pre-flight budget check inside assembly can narrow
             // the window past `target_window` and nothing else here would know.
             let window_from = assembled.window_from;
+            // What the `[Recall]` block put in front of the model, recorded as
+            // an offer (#698). Only on a turn's first round, because that is
+            // the only round the block renders on - recording an empty list on
+            // a later round would take down the offers this turn just made.
+            //
+            // An empty list on the first round is recorded, and it matters: a
+            // recall offer replaces this conversation's standing offers, so the
+            // empty write is what ends the previous turn's. Without it a turn
+            // whose prompt had nothing near it - or whose lookup timed out, or
+            // whose knowledge arm failed - would leave the last turn's offers
+            // standing, and a fetch made for some other reason would read as
+            // taking one up.
+            if tool_rounds_since_anchor == 0
+                && let Some(record) = &self.knowledge_offered
+            {
+                let record = Arc::clone(record);
+                let scope = OfferScope::recall(conversation_id.0.clone());
+                let offered = assembled.recalled_entry_ids;
+                record_in_background(
+                    "recall_offered",
+                    async move { record(scope, offered).await },
+                );
+            }
             let llm_messages = assembled.messages;
             // Incremental sanitizer: carries think-block parser state across
             // chunks so each byte is scanned once, instead of re-sanitizing
@@ -6493,6 +6533,157 @@ mod tests {
             .flatten()
             .find(|m| m.role == Role::System && m.content.starts_with("[Recall]"))
             .map(|m| m.content.clone())
+    }
+
+    // --- the use log's record of what the block offered (#698) --------------
+
+    /// Every offer the turn recorded, in order.
+    type OfferProbe = Arc<Mutex<Vec<(crate::ports::knowledge_use::OfferScope, Vec<String>)>>>;
+
+    fn recording_offer_log() -> (crate::ports::knowledge_use::KnowledgeOfferedFn, OfferProbe) {
+        let seen: OfferProbe = Arc::new(Mutex::new(Vec::new()));
+        let probe = Arc::clone(&seen);
+        let log: crate::ports::knowledge_use::KnowledgeOfferedFn =
+            Arc::new(move |scope, ids: Vec<String>| {
+                let probe = Arc::clone(&probe);
+                Box::pin(async move {
+                    let count = ids.len();
+                    probe.lock().unwrap().push((scope, ids));
+                    Ok(count)
+                })
+            });
+        (log, seen)
+    }
+
+    /// Let the spawned recording task finish before the probe is read.
+    async fn settle_recording() {
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn the_turn_records_the_entries_the_block_actually_showed() {
+        let (log, offers) = recording_offer_log();
+        capture_rounds("where does the registry live?", |h| {
+            h.with_recall_search(recall_hit())
+                .with_knowledge_offer_log(log)
+        })
+        .await;
+        settle_recording().await;
+
+        let seen = offers.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "one offer per turn, on its first round");
+        assert_eq!(
+            seen[0].0.source,
+            crate::ports::knowledge_use::OfferSource::Recall
+        );
+        assert_eq!(seen[0].1, vec!["kb-registry".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_recall_lookup_still_ends_the_previous_turns_offers() {
+        // A recall offer replaces the conversation's standing set, so the empty
+        // write is what ends the previous turn's. Without it a lookup that timed
+        // out or whose knowledge arm failed would leave the last turn's offers
+        // standing - and the model, which still has that block in its
+        // transcript, could fetch one and have it counted as a taken-up offer.
+        let failing: crate::ports::recall::RecallSearchFn = Arc::new(move |_request| {
+            Box::pin(async move { Err(CoreError::Storage("embedding backend down".into())) })
+        });
+        let (log, offers) = recording_offer_log();
+        capture_rounds("where does the registry live?", |h| {
+            h.with_recall_search(failing).with_knowledge_offer_log(log)
+        })
+        .await;
+        settle_recording().await;
+
+        let seen = offers.lock().unwrap().clone();
+        assert_eq!(
+            seen.len(),
+            1,
+            "a failed lookup must still record, or the previous turn's offers stand"
+        );
+        assert!(
+            seen[0].1.is_empty(),
+            "it offered nothing, and saying so is what clears"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_prompt_with_nothing_near_it_records_an_empty_offer() {
+        let (lookup, _seen) = recording_recall();
+        let (log, offers) = recording_offer_log();
+        capture_rounds("thanks", |h| {
+            h.with_recall_search(lookup).with_knowledge_offer_log(log)
+        })
+        .await;
+        settle_recording().await;
+
+        let seen = offers.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].1.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_turn_records_its_offer_once_however_many_rounds_it_runs() {
+        // The block renders on the first round only. A later round reports no
+        // ids, and recording that would take down the offers this turn made.
+        let (log, offers) = recording_offer_log();
+        let captured: Arc<Mutex<Vec<Vec<Message>>>> = Arc::new(Mutex::new(Vec::new()));
+        let llm = PlanContextCapturingLlm {
+            responses: Mutex::new(vec![
+                LlmResponse::with_tool_calls("", vec![ToolCall::new("t1", "probe", "{}")]),
+                LlmResponse::with_tool_calls("", vec![ToolCall::new("t2", "probe", "{}")]),
+                LlmResponse::text("done"),
+            ]),
+            captured: Arc::clone(&captured),
+        };
+        let mut results = HashMap::new();
+        results.insert("probe".to_string(), "ok".to_string());
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            llm,
+            MockToolExecutor::new(
+                vec![ToolDefinition::new("probe", "Probe", serde_json::json!({}))],
+                results,
+            ),
+            id_gen(),
+        )
+        .with_recall_search(recall_hit())
+        .with_knowledge_offer_log(log);
+
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(
+                &conv.id,
+                "where does the registry live?".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await
+            .unwrap();
+        settle_recording().await;
+
+        let seen = offers.lock().unwrap().clone();
+        assert!(
+            captured.lock().unwrap().len() >= 3,
+            "precondition: the turn ran more than one round"
+        );
+        assert_eq!(seen.len(), 1, "recorded once, not once per round: {seen:?}");
+        assert_eq!(seen[0].1, vec!["kb-registry".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_turn_with_no_use_log_wired_still_runs() {
+        let rounds = capture_rounds("where does the registry live?", |h| {
+            h.with_recall_search(recall_hit())
+        })
+        .await;
+        assert!(recall_block(&rounds).is_some());
     }
 
     #[tokio::test]
