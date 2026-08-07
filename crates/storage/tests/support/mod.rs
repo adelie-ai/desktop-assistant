@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
+use tracing::Level;
 use uuid::Uuid;
 
 static SKIP_BANNER: Once = Once::new();
@@ -239,11 +240,22 @@ static PERMISSIVE_GLOBAL_DEFAULT: Once = Once::new();
 /// don't, never when run alone.
 ///
 /// The fix is to make every subscriber this module ever installs -- this one
-/// and the per-call one below -- accept everything unconditionally, so no
-/// concurrent cache rebuild can ever regress a callsite back to "never".
+/// and the per-call one below -- accept everything down to `TRACE`, with an
+/// explicit `with_max_level`. `tracing_subscriber::fmt()` defaults to
+/// `LevelFilter::INFO` (its own `DEFAULT_MAX_LEVEL`), so without this call a
+/// `warn!` line still gets through -- WARN is more severe than INFO, so it
+/// passes an INFO cap -- but a `debug!` or `trace!` line would not: its
+/// callsite could still latch "never" on a thread with no override, and this
+/// module's own subscribers would never lift that cap back up. Setting the
+/// cap explicitly to `TRACE` here removes the level as a variable entirely,
+/// rather than leaving this module's coverage keyed to whichever levels its
+/// current callers happen to use.
 fn ensure_permissive_global_default() {
     PERMISSIVE_GLOBAL_DEFAULT.call_once(|| {
-        let sink = tracing_subscriber::fmt().with_writer(io::sink).finish();
+        let sink = tracing_subscriber::fmt()
+            .with_max_level(Level::TRACE)
+            .with_writer(io::sink)
+            .finish();
         tracing::subscriber::set_global_default(sink)
             .expect("install the permissive global default subscriber exactly once");
     });
@@ -269,6 +281,7 @@ where
     let buf = SharedBuf(Arc::new(Mutex::new(Vec::new())));
     let for_writer = buf.clone();
     let subscriber = tracing_subscriber::fmt()
+        .with_max_level(Level::TRACE)
         .with_writer(move || for_writer.clone())
         .with_ansi(false)
         .with_level(false)
