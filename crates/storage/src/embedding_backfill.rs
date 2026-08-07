@@ -24,6 +24,26 @@ pub type BackfillEmbedFn = Box<
 
 const BATCH_SIZE: i64 = 32;
 
+/// Normalize a vector list before it is written, so a zero-length list is
+/// never persisted as a zero-length `vector[]` array.
+///
+/// Postgres distinguishes an empty array from no array the same way it
+/// distinguishes an empty string from `NULL`: an empty `vector[]` still
+/// satisfies `embedding IS NOT NULL`. A row written that way would pass every
+/// backfill's own re-selection predicate (all of which test `IS NULL` /
+/// `IS NOT NULL`, never the array's length) while contributing zero chunks to
+/// search, and the orphan branch of [`invalidate_stale_embeddings`] -- the
+/// repair that exists to find exactly this -- would not catch it either,
+/// because that branch also keys on `embedding IS NULL`. The row would be
+/// silently unsearchable and silently unrepaired: the same failure class this
+/// whole module exists to close, just reached by an empty array instead of a
+/// truncated one. Folding the check in here, at the single place every
+/// vector list is written, closes it regardless of which caller or which
+/// future change to chunking produced the empty list.
+fn normalize_embedding(vectors: Option<Vec<Vector>>) -> Option<Vec<Vector>> {
+    vectors.filter(|v| !v.is_empty())
+}
+
 /// What a stale-embedding sweep cleared, per table.
 ///
 /// Reported per table rather than as one number so an operator can tell "the
@@ -231,7 +251,23 @@ pub async fn backfill_knowledge_embeddings(
         }
 
         let texts: Vec<String> = all_chunks.iter().map(|(_, t)| t.clone()).collect();
-        match embed_fn(texts).await {
+        // A short batch is a failed batch, not a partial success. Zipping a
+        // short answer would drop the tail chunks, or -- when the shortfall
+        // lands mid-batch -- pair a chunk's vector with the wrong row, and
+        // nothing downstream would detect it. Route a mismatch through the
+        // per-row retry, which stamps every row it touches and therefore
+        // always converges.
+        let batch = match embed_fn(texts).await {
+            Ok(embeddings) if embeddings.len() == all_chunks.len() => Ok(embeddings),
+            Ok(embeddings) => Err(format!(
+                "embedder returned {} vector(s) for {} chunk(s)",
+                embeddings.len(),
+                all_chunks.len()
+            )),
+            Err(e) => Err(e),
+        };
+
+        match batch {
             Ok(embeddings) => {
                 consecutive_failures = 0;
                 // Group embeddings back by row index.
@@ -241,18 +277,7 @@ pub async fn backfill_knowledge_embeddings(
                 }
 
                 for ((id, _), vecs) in rows.iter().zip(row_embeddings) {
-                    sqlx::query(
-                        "UPDATE knowledge_base
-                         SET embedding = $1::vector[], embedding_model = $2,
-                             embeddings_updated_at = NOW()
-                         WHERE id = $3",
-                    )
-                    .bind(&vecs)
-                    .bind(current_model)
-                    .bind(id)
-                    .execute(pool)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                    write_knowledge_embedding(pool, id, Some(vecs), current_model).await?;
                 }
                 total += rows.len();
             }
@@ -262,39 +287,33 @@ pub async fn backfill_knowledge_embeddings(
                 let mut any_succeeded = false;
                 for (id, content) in &rows {
                     let chunks = chunk_text(content, CHUNK_MAX_CHARS, CHUNK_OVERLAP);
+                    let expected = chunks.len();
                     match embed_fn(chunks).await {
-                        Ok(embeddings) => {
+                        Ok(embeddings) if embeddings.len() == expected => {
                             let vecs: Vec<Vector> =
                                 embeddings.into_iter().map(Vector::from).collect();
-                            sqlx::query(
-                                "UPDATE knowledge_base
-                                 SET embedding = $1::vector[], embedding_model = $2,
-                                     embeddings_updated_at = NOW()
-                                 WHERE id = $3",
-                            )
-                            .bind(&vecs)
-                            .bind(current_model)
-                            .bind(id)
-                            .execute(pool)
-                            .await
-                            .map_err(|e| e.to_string())?;
+                            write_knowledge_embedding(pool, id, Some(vecs), current_model).await?;
                             total += 1;
                             any_succeeded = true;
                         }
+                        // Both remaining arms clear the vector and stamp the
+                        // model without one, so a permanently failing entry is
+                        // retried once per content change rather than on every
+                        // pass. They are kept apart because the operator's next
+                        // step differs: a short answer points at a provider
+                        // that silently caps its batch, an error at a backend
+                        // that is down or rate-limiting.
+                        Ok(embeddings) => {
+                            tracing::warn!(
+                                "skipping knowledge entry {id}: embedder returned {} vector(s) \
+                                 for {expected} chunk(s)",
+                                embeddings.len()
+                            );
+                            write_knowledge_embedding(pool, id, None, current_model).await?;
+                        }
                         Err(e2) => {
                             tracing::warn!("skipping knowledge entry {id}: {e2}");
-                            // Stamp both markers so a persistently failing row is
-                            // not retried until its content changes again.
-                            sqlx::query(
-                                "UPDATE knowledge_base
-                                 SET embedding_model = $1, embeddings_updated_at = NOW()
-                                 WHERE id = $2",
-                            )
-                            .bind(current_model)
-                            .bind(id)
-                            .execute(pool)
-                            .await
-                            .map_err(|e| e.to_string())?;
+                            write_knowledge_embedding(pool, id, None, current_model).await?;
                         }
                     }
                 }
@@ -314,6 +333,54 @@ pub async fn backfill_knowledge_embeddings(
     }
 
     Ok(total)
+}
+
+/// Write one knowledge-base row's vectors and model stamp.
+///
+/// `vectors: None` records a failed attempt: the vector is cleared and the
+/// model stamped, which marks the row attempted so it is not retried in a
+/// tight loop. Clearing rather than keeping a partial or stale vector matters,
+/// for the reason [`write_tag_embedding`] gives -- stamping the current model
+/// over a retained vector would declare it current and put it permanently
+/// beyond [`invalidate_stale_embeddings`], which acts only on mismatched
+/// stamps.
+///
+/// That reasoning is airtight for a row selected on a model mismatch: its old
+/// vector has the wrong dimension for the new model, so keeping it is never
+/// safe. It costs more on the *other* selection reason this table has and the
+/// other two tables do not -- content changed since the last embed
+/// (`embeddings_updated_at < updated_at`). A row selected that way already
+/// holds a same-model vector for its *previous* content: dimensionally fine,
+/// only a little stale. Clearing it on a merely transient failure (a
+/// rate-limited or momentarily down backend, not a real mismatch) throws that
+/// still-usable vector away for nothing, and the row is stamped fresh enough
+/// that this backfill will not reselect it again on its own -- it stays
+/// without a vector arm until its content changes again, or until the next
+/// daemon start runs [`invalidate_stale_embeddings`]'s orphan sweep, which
+/// clears the stamp and lets this backfill pick it back up. Accepted here as
+/// a real but bounded cost: convergence (never retrying a permanently failing
+/// row in a tight loop) is worth more than keeping one release's worth of
+/// stale-but-working vectors alive through a transient blip.
+async fn write_knowledge_embedding(
+    pool: &PgPool,
+    id: &str,
+    vectors: Option<Vec<Vector>>,
+    current_model: &str,
+) -> Result<(), String> {
+    let vectors = normalize_embedding(vectors);
+    sqlx::query(
+        "UPDATE knowledge_base
+         SET embedding = $1::vector[], embedding_model = $2,
+             embeddings_updated_at = NOW()
+         WHERE id = $3",
+    )
+    .bind(&vectors)
+    .bind(current_model)
+    .bind(id)
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Backfill embeddings for `tool_definitions` rows that are missing or stale.
@@ -359,7 +426,19 @@ pub async fn backfill_tool_embeddings(
         }
 
         let texts: Vec<String> = all_chunks.iter().map(|(_, t)| t.clone()).collect();
-        match embed_fn(texts).await {
+        // A short batch is a failed batch, not a partial success -- see the
+        // matching comment in `backfill_knowledge_embeddings`.
+        let batch = match embed_fn(texts).await {
+            Ok(embeddings) if embeddings.len() == all_chunks.len() => Ok(embeddings),
+            Ok(embeddings) => Err(format!(
+                "embedder returned {} vector(s) for {} chunk(s)",
+                embeddings.len(),
+                all_chunks.len()
+            )),
+            Err(e) => Err(e),
+        };
+
+        match batch {
             Ok(embeddings) => {
                 consecutive_failures = 0;
                 // Group embeddings back by row index.
@@ -369,17 +448,7 @@ pub async fn backfill_tool_embeddings(
                 }
 
                 for ((name, _), vecs) in rows.iter().zip(row_embeddings) {
-                    sqlx::query(
-                        "UPDATE tool_definitions
-                         SET embedding = $1::vector[], embedding_model = $2
-                         WHERE name = $3",
-                    )
-                    .bind(&vecs)
-                    .bind(current_model)
-                    .bind(name)
-                    .execute(pool)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                    write_tool_embedding(pool, name, Some(vecs), current_model).await?;
                 }
                 total += rows.len();
             }
@@ -388,36 +457,26 @@ pub async fn backfill_tool_embeddings(
                 let mut any_succeeded = false;
                 for (name, text) in &rows {
                     let chunks = chunk_text(text, CHUNK_MAX_CHARS, CHUNK_OVERLAP);
+                    let expected = chunks.len();
                     match embed_fn(chunks).await {
-                        Ok(embeddings) => {
+                        Ok(embeddings) if embeddings.len() == expected => {
                             let vecs: Vec<Vector> =
                                 embeddings.into_iter().map(Vector::from).collect();
-                            sqlx::query(
-                                "UPDATE tool_definitions
-                                 SET embedding = $1::vector[], embedding_model = $2
-                                 WHERE name = $3",
-                            )
-                            .bind(&vecs)
-                            .bind(current_model)
-                            .bind(name)
-                            .execute(pool)
-                            .await
-                            .map_err(|e| e.to_string())?;
+                            write_tool_embedding(pool, name, Some(vecs), current_model).await?;
                             total += 1;
                             any_succeeded = true;
                         }
+                        Ok(embeddings) => {
+                            tracing::warn!(
+                                "skipping tool {name}: embedder returned {} vector(s) for \
+                                 {expected} chunk(s)",
+                                embeddings.len()
+                            );
+                            write_tool_embedding(pool, name, None, current_model).await?;
+                        }
                         Err(e2) => {
                             tracing::warn!("skipping tool {name}: {e2}");
-                            sqlx::query(
-                                "UPDATE tool_definitions
-                                 SET embedding_model = $1
-                                 WHERE name = $2",
-                            )
-                            .bind(current_model)
-                            .bind(name)
-                            .execute(pool)
-                            .await
-                            .map_err(|e| e.to_string())?;
+                            write_tool_embedding(pool, name, None, current_model).await?;
                         }
                     }
                 }
@@ -437,6 +496,33 @@ pub async fn backfill_tool_embeddings(
     }
 
     Ok(total)
+}
+
+/// Write one tool's vectors and model stamp.
+///
+/// `vectors: None` records a failed attempt: the vector is cleared and the
+/// model stamped, which marks the row attempted so it is not retried in a
+/// tight loop. See [`write_knowledge_embedding`] for why clearing (rather than
+/// keeping a partial or stale vector) matters.
+async fn write_tool_embedding(
+    pool: &PgPool,
+    name: &str,
+    vectors: Option<Vec<Vector>>,
+    current_model: &str,
+) -> Result<(), String> {
+    let vectors = normalize_embedding(vectors);
+    sqlx::query(
+        "UPDATE tool_definitions
+         SET embedding = $1::vector[], embedding_model = $2
+         WHERE name = $3",
+    )
+    .bind(&vectors)
+    .bind(current_model)
+    .bind(name)
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Backfill NULL / stale-model embeddings for `skill_index` rows (#573),
@@ -481,7 +567,19 @@ pub async fn backfill_skill_embeddings(
         }
 
         let texts: Vec<String> = all_chunks.iter().map(|(_, t)| t.clone()).collect();
-        match embed_fn(texts).await {
+        // A short batch is a failed batch, not a partial success -- see the
+        // matching comment in `backfill_knowledge_embeddings`.
+        let batch = match embed_fn(texts).await {
+            Ok(embeddings) if embeddings.len() == all_chunks.len() => Ok(embeddings),
+            Ok(embeddings) => Err(format!(
+                "embedder returned {} vector(s) for {} chunk(s)",
+                embeddings.len(),
+                all_chunks.len()
+            )),
+            Err(e) => Err(e),
+        };
+
+        match batch {
             Ok(embeddings) => {
                 consecutive_failures = 0;
                 let mut row_embeddings: Vec<Vec<Vector>> = vec![Vec::new(); rows.len()];
@@ -490,18 +588,7 @@ pub async fn backfill_skill_embeddings(
                 }
 
                 for ((name, owner_key, _), vecs) in rows.iter().zip(row_embeddings) {
-                    sqlx::query(
-                        "UPDATE skill_index \
-                         SET embedding = $1::vector[], embedding_model = $2 \
-                         WHERE name = $3 AND owner_key = $4",
-                    )
-                    .bind(&vecs)
-                    .bind(current_model)
-                    .bind(name)
-                    .bind(owner_key)
-                    .execute(pool)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                    write_skill_embedding(pool, name, owner_key, Some(vecs), current_model).await?;
                 }
                 total += rows.len();
             }
@@ -510,38 +597,29 @@ pub async fn backfill_skill_embeddings(
                 let mut any_succeeded = false;
                 for (name, owner_key, text) in &rows {
                     let chunks = chunk_text(text, CHUNK_MAX_CHARS, CHUNK_OVERLAP);
+                    let expected = chunks.len();
                     match embed_fn(chunks).await {
-                        Ok(embeddings) => {
+                        Ok(embeddings) if embeddings.len() == expected => {
                             let vecs: Vec<Vector> =
                                 embeddings.into_iter().map(Vector::from).collect();
-                            sqlx::query(
-                                "UPDATE skill_index \
-                                 SET embedding = $1::vector[], embedding_model = $2 \
-                                 WHERE name = $3 AND owner_key = $4",
-                            )
-                            .bind(&vecs)
-                            .bind(current_model)
-                            .bind(name)
-                            .bind(owner_key)
-                            .execute(pool)
-                            .await
-                            .map_err(|e| e.to_string())?;
+                            write_skill_embedding(pool, name, owner_key, Some(vecs), current_model)
+                                .await?;
                             total += 1;
                             any_succeeded = true;
                         }
+                        Ok(embeddings) => {
+                            tracing::warn!(
+                                "skipping skill {name}: embedder returned {} vector(s) for \
+                                 {expected} chunk(s)",
+                                embeddings.len()
+                            );
+                            write_skill_embedding(pool, name, owner_key, None, current_model)
+                                .await?;
+                        }
                         Err(e2) => {
                             tracing::warn!("skipping skill {name}: {e2}");
-                            sqlx::query(
-                                "UPDATE skill_index \
-                                 SET embedding_model = $1 \
-                                 WHERE name = $2 AND owner_key = $3",
-                            )
-                            .bind(current_model)
-                            .bind(name)
-                            .bind(owner_key)
-                            .execute(pool)
-                            .await
-                            .map_err(|e| e.to_string())?;
+                            write_skill_embedding(pool, name, owner_key, None, current_model)
+                                .await?;
                         }
                     }
                 }
@@ -561,6 +639,35 @@ pub async fn backfill_skill_embeddings(
     }
 
     Ok(total)
+}
+
+/// Write one skill's vectors and model stamp.
+///
+/// `vectors: None` records a failed attempt: the vector is cleared and the
+/// model stamped, which marks the row attempted so it is not retried in a
+/// tight loop. See [`write_knowledge_embedding`] for why clearing (rather than
+/// keeping a partial or stale vector) matters.
+async fn write_skill_embedding(
+    pool: &PgPool,
+    name: &str,
+    owner_key: &str,
+    vectors: Option<Vec<Vector>>,
+    current_model: &str,
+) -> Result<(), String> {
+    let vectors = normalize_embedding(vectors);
+    sqlx::query(
+        "UPDATE skill_index \
+         SET embedding = $1::vector[], embedding_model = $2 \
+         WHERE name = $3 AND owner_key = $4",
+    )
+    .bind(&vectors)
+    .bind(current_model)
+    .bind(name)
+    .bind(owner_key)
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Backfill NULL / stale-model embeddings for `scratchpads` rows (#717),
@@ -704,13 +811,16 @@ pub async fn backfill_scratchpad_embeddings(
 /// Clearing rather than keeping the old vector matters, for the reason
 /// [`write_tag_embedding`] gives -- stamping the current model over a retained
 /// stale vector would declare it current and put it permanently beyond
-/// [`invalidate_stale_embeddings`], which acts only on mismatched stamps.
+/// [`invalidate_stale_embeddings`], which acts only on mismatched stamps. See
+/// [`normalize_embedding`] for why an empty (but `Some`) list is treated the
+/// same as `None` here too.
 async fn write_scratchpad_embedding(
     pool: &PgPool,
     id: &str,
     vectors: Option<Vec<Vector>>,
     current_model: &str,
 ) -> Result<(), String> {
+    let vectors = normalize_embedding(vectors);
     sqlx::query(
         "UPDATE scratchpads \
          SET embedding = $1::vector[], embedding_model = $2 \
@@ -923,4 +1033,253 @@ async fn write_tag_embedding(
     .await
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use sqlx::postgres::PgPoolOptions;
+    use uuid::Uuid;
+
+    use super::*;
+
+    /// Acceptance (#1108 review): an empty vector list must never reach the
+    /// database as an empty `vector[]` array -- it has to become `None`
+    /// (`NULL`), the same as a hard embedder failure, or the row would pass
+    /// `embedding IS NOT NULL` while holding nothing search can use.
+    #[test]
+    fn an_empty_vector_list_normalizes_to_none_not_an_empty_array() {
+        assert_eq!(normalize_embedding(Some(Vec::new())), None);
+    }
+
+    #[test]
+    fn none_stays_none() {
+        assert_eq!(normalize_embedding(None), None);
+    }
+
+    #[test]
+    fn a_populated_vector_list_is_left_unchanged() {
+        let vecs = vec![
+            Vector::from(vec![0.1, 0.2, 0.3]),
+            Vector::from(vec![0.4, 0.5, 0.6]),
+        ];
+        assert_eq!(normalize_embedding(Some(vecs.clone())), Some(vecs));
+    }
+
+    // -----------------------------------------------------------------------
+    // Write-path guards (#1108 review round 2)
+    //
+    // The three tests above pin `normalize_embedding` itself, but nothing
+    // stops a `write_*_embedding` function from dropping its call to it --
+    // the write helpers are private, so no integration test under `tests/`
+    // can reach them directly, and removing the call from just one of the
+    // four leaves `normalize_embedding` still used by the other three, so no
+    // dead-code lint fires either. The tests below call each private write
+    // helper directly and read the row back, which is the only way to prove
+    // the call site itself still normalizes, not just the function it calls.
+    //
+    // This is why they live here rather than in `tests/`: they need to see
+    // `write_knowledge_embedding` and its siblings, which are private to this
+    // module.
+    // -----------------------------------------------------------------------
+
+    /// A fresh private Postgres schema, migrated, for the write-path tests
+    /// below. Mirrors `tests/support::DbFixture`, reimplemented locally
+    /// because that module lives under `tests/` and is unreachable from a
+    /// `src/`-level unit test. Skips (returns `None`) when
+    /// `TEST_DATABASE_URL` is unset, the same gate every DB-touching
+    /// integration suite uses; `just test-db` sets it.
+    async fn test_pool(prefix: &str) -> Option<(PgPool, String, String)> {
+        let url = std::env::var("TEST_DATABASE_URL")
+            .ok()
+            .filter(|u| !u.trim().is_empty())?;
+        let schema = format!("{prefix}_{}", Uuid::now_v7().simple());
+
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .expect("connect to TEST_DATABASE_URL");
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA \"{schema}\"")))
+            .execute(&admin)
+            .await
+            .expect("create test schema");
+        admin.close().await;
+
+        let schema_for_hook = schema.clone();
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .after_connect(move |conn, _meta| {
+                let schema = schema_for_hook.clone();
+                Box::pin(async move {
+                    let sql = format!("SET search_path TO \"{schema}\", public");
+                    sqlx::query(sqlx::AssertSqlSafe(sql)).execute(conn).await?;
+                    Ok(())
+                })
+            })
+            .connect(&url)
+            .await
+            .expect("connect per-test pool");
+
+        crate::run_migrations(&pool)
+            .await
+            .expect("run_migrations succeeds against test schema");
+
+        Some((pool, schema, url))
+    }
+
+    /// Best-effort schema teardown; a failure here would only mask the real
+    /// assertion, and the ephemeral `just test-db` container is torn down
+    /// after the whole run regardless.
+    async fn drop_test_schema(schema: &str, admin_url: &str) {
+        if let Ok(admin) = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(admin_url)
+            .await
+        {
+            let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DROP SCHEMA \"{schema}\" CASCADE"
+            )))
+            .execute(&admin)
+            .await;
+            admin.close().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn write_knowledge_embedding_clears_rather_than_writes_an_empty_array() {
+        let Some((pool, schema, admin_url)) = test_pool("normalize_kb").await else {
+            return;
+        };
+        sqlx::query(
+            "INSERT INTO knowledge_base (id, user_id, content) VALUES ($1, 'default', 'x')",
+        )
+        .bind("row-1")
+        .execute(&pool)
+        .await
+        .expect("seed knowledge_base row");
+
+        write_knowledge_embedding(&pool, "row-1", Some(Vec::new()), "model-A")
+            .await
+            .expect("write succeeds");
+
+        let is_null: bool =
+            sqlx::query_scalar("SELECT embedding IS NULL FROM knowledge_base WHERE id = $1")
+                .bind("row-1")
+                .fetch_one(&pool)
+                .await
+                .expect("read back embedding");
+        assert!(
+            is_null,
+            "write_knowledge_embedding must normalize an empty vector list to NULL, \
+             not write it as an empty array"
+        );
+
+        drop_test_schema(&schema, &admin_url).await;
+    }
+
+    #[tokio::test]
+    async fn write_tool_embedding_clears_rather_than_writes_an_empty_array() {
+        let Some((pool, schema, admin_url)) = test_pool("normalize_tool").await else {
+            return;
+        };
+        sqlx::query(
+            "INSERT INTO tool_definitions (name, description, parameters, source, is_core) \
+             VALUES ($1, 'd', '{}'::jsonb, 'test', false)",
+        )
+        .bind("tool-1")
+        .execute(&pool)
+        .await
+        .expect("seed tool_definitions row");
+
+        write_tool_embedding(&pool, "tool-1", Some(Vec::new()), "model-A")
+            .await
+            .expect("write succeeds");
+
+        let is_null: bool =
+            sqlx::query_scalar("SELECT embedding IS NULL FROM tool_definitions WHERE name = $1")
+                .bind("tool-1")
+                .fetch_one(&pool)
+                .await
+                .expect("read back embedding");
+        assert!(
+            is_null,
+            "write_tool_embedding must normalize an empty vector list to NULL, \
+             not write it as an empty array"
+        );
+
+        drop_test_schema(&schema, &admin_url).await;
+    }
+
+    #[tokio::test]
+    async fn write_skill_embedding_clears_rather_than_writes_an_empty_array() {
+        let Some((pool, schema, admin_url)) = test_pool("normalize_skill").await else {
+            return;
+        };
+        sqlx::query(
+            "INSERT INTO skill_index (name, description, disk_path, content_hash) \
+             VALUES ($1, 'd', '/dev/null', 'deadbeef')",
+        )
+        .bind("skill-1")
+        .execute(&pool)
+        .await
+        .expect("seed skill_index row");
+
+        write_skill_embedding(&pool, "skill-1", "", Some(Vec::new()), "model-A")
+            .await
+            .expect("write succeeds");
+
+        let is_null: bool = sqlx::query_scalar(
+            "SELECT embedding IS NULL FROM skill_index WHERE name = $1 AND owner_key = ''",
+        )
+        .bind("skill-1")
+        .fetch_one(&pool)
+        .await
+        .expect("read back embedding");
+        assert!(
+            is_null,
+            "write_skill_embedding must normalize an empty vector list to NULL, \
+             not write it as an empty array"
+        );
+
+        drop_test_schema(&schema, &admin_url).await;
+    }
+
+    #[tokio::test]
+    async fn write_scratchpad_embedding_clears_rather_than_writes_an_empty_array() {
+        let Some((pool, schema, admin_url)) = test_pool("normalize_pad").await else {
+            return;
+        };
+        sqlx::query("INSERT INTO conversations (id, title) VALUES ($1, 'test')")
+            .bind("conv-1")
+            .execute(&pool)
+            .await
+            .expect("seed conversation row");
+        sqlx::query(
+            "INSERT INTO scratchpads (id, user_id, conversation_id, note_key, content) \
+             VALUES ($1, 'default', $2, 'k', 'v')",
+        )
+        .bind("note-1")
+        .bind("conv-1")
+        .execute(&pool)
+        .await
+        .expect("seed scratchpads row");
+
+        write_scratchpad_embedding(&pool, "note-1", Some(Vec::new()), "model-A")
+            .await
+            .expect("write succeeds");
+
+        let is_null: bool =
+            sqlx::query_scalar("SELECT embedding IS NULL FROM scratchpads WHERE id = $1")
+                .bind("note-1")
+                .fetch_one(&pool)
+                .await
+                .expect("read back embedding");
+        assert!(
+            is_null,
+            "write_scratchpad_embedding must normalize an empty vector list to NULL, \
+             not write it as an empty array"
+        );
+
+        drop_test_schema(&schema, &admin_url).await;
+    }
 }
