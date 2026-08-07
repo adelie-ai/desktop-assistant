@@ -255,6 +255,58 @@ async fn tool_usage_survives_compaction() {
     fx.cleanup().await;
 }
 
+/// #1144 acceptance: `evicted_results` counts what the new marker records.
+///
+/// A completed step now records the DECISION on the row and leaves the output
+/// alone, so the count must read the marker as well as the historical pointer
+/// content - otherwise the Context Inspector would show zero evictions for
+/// every conversation compacted since.
+#[tokio::test]
+async fn tool_usage_counts_the_eviction_marker() {
+    let Some(fx) = Fixture::try_new().await else {
+        eprintln!("skipping: TEST_DATABASE_URL unset");
+        return;
+    };
+    let store = PgToolUsageStore::new(fx.pool.clone());
+    with_user_id(UserId::from("u1"), async {
+        let raw = "z".repeat(4000);
+        let conv_store = PgConversationStore::new(fx.pool.clone());
+        let mut conv = Conversation::new("c1", "usage");
+        conv.created_at = "2026-06-03 00:00:00".to_string();
+        conv.updated_at = "2026-06-03 00:00:00".to_string();
+        for call_id in ["a1", "a2"] {
+            let mut m = Message::new(Role::Assistant, String::new());
+            m.tool_calls = vec![ToolCall::new(call_id, "fetch", "{}")];
+            conv.messages.push(m);
+        }
+        // One result a completed step evicted; one it did not.
+        let mut evicted = Message::new(Role::Tool, raw.clone());
+        evicted.tool_call_id = Some("a1".to_string());
+        evicted.distilled_into = vec!["outcome:1".to_string()];
+        conv.messages.push(evicted);
+        let mut live = Message::new(Role::Tool, raw.clone());
+        live.tool_call_id = Some("a2".to_string());
+        conv.messages.push(live);
+        conv_store.create(conv).await.expect("seed");
+
+        let rows = store.tool_usage("c1").await.expect("aggregate");
+        let fetch = by_name(&rows, "fetch");
+        assert_eq!(fetch.call_count, 2);
+        assert_eq!(
+            fetch.evicted_results, 1,
+            "the marker records an eviction, so the count must show one"
+        );
+        assert_eq!(
+            fetch.result_bytes,
+            2 * raw.len() as u64,
+            "the marker keeps the output, so the bytes stay resident - what \
+             shrank is what the model reads, not what the conversation holds"
+        );
+    })
+    .await;
+    fx.cleanup().await;
+}
+
 #[tokio::test]
 async fn tool_usage_scoped_to_user_and_conversation() {
     let Some(fx) = Fixture::try_new().await else {

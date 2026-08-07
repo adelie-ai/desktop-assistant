@@ -1,9 +1,10 @@
 use crate::CoreError;
 use crate::context::{
     COMPACTION_TOKEN_RATIO, ContextProjection, ConversationView, DEFAULT_MAX_TOOL_RESULT_BYTES,
-    MAX_CONTEXT_MESSAGES, MAX_OVERFLOW_RETRIES, MIN_CONTEXT_MESSAGES, RecoveryOutcome, ToolContext,
-    ToolLocalityContext, TurnAnchors, assemble_turn_within_budget, cap_tool_result,
-    compact_into_summary, recover_from_overflow,
+    MAX_CONTEXT_MESSAGES, MAX_OVERFLOW_RETRIES, MIN_CONTEXT_MESSAGES, PreflightFold,
+    RecoveryOutcome, ToolContext, ToolLocalityContext, TurnAnchors, assemble_turn_within_budget,
+    cap_tool_result, compact_into_summary, compact_preflight_shrink, recover_from_overflow,
+    window_start,
 };
 use crate::domain::{
     Conversation, ConversationId, ConversationSummary, Message, Role, ToolCall, ToolDefinition,
@@ -21,9 +22,9 @@ use crate::ports::llm::{
 };
 use crate::ports::recall::{RecallRequest, RecallSearchFn};
 use crate::ports::scratchpad::{
-    MAX_NOTE_BYTES, NewScratchpadNote, PINNED_BLOCK_BYTE_BUDGET, SCRATCHPAD_GOAL_KEY,
-    ScratchpadDeleteSubtreeFn, ScratchpadGetManyFn, ScratchpadListFn,
-    ScratchpadReleaseReferencesFn, ScratchpadWriteFn,
+    MAX_KEYS_PER_CALL, MAX_NOTE_BYTES, MAX_RESULTS_CEILING, NewScratchpadNote,
+    PINNED_BLOCK_BYTE_BUDGET, SCRATCHPAD_GOAL_KEY, ScratchpadDeleteSubtreeFn, ScratchpadGetManyFn,
+    ScratchpadListFn, ScratchpadReleaseReferencesFn, ScratchpadWriteFn,
 };
 use crate::ports::scratchpad_scope::{
     SPAWN_SUBAGENT_TOOL, SubagentScope, current_ancestors, current_owner_todo,
@@ -470,12 +471,13 @@ pub struct ConversationHandler<S, L, T = NoopToolExecutor> {
     /// the tool set has one hash at a time, and a hash change just means the next
     /// miss recomputes under the same guard.
     categorize_lock: tokio::sync::Mutex<()>,
-    /// Optional reader for the reserved scratchpad `goal` note. When set, the
-    /// dispatch loop reads it each round and prefers it over the verbatim
-    /// user prompt as the task anchor, so a model-maintained goal survives
-    /// windowing/compaction. `None` (the default) preserves the prior
-    /// verbatim-prompt-only anchor behaviour.
-    scratchpad_goal_read: Option<ScratchpadGetManyFn>,
+    /// Optional reader for scratchpad notes by key. Two turn paths use it: the
+    /// dispatch loop reads the reserved `goal` note each round and prefers it
+    /// over the verbatim user prompt as the task anchor, and turn entry reads
+    /// the notes earlier turns distilled tool results into, to decide which
+    /// evictions it may carry (#1144). `None` (the default) leaves the anchor
+    /// on the verbatim prompt and every stored result read in full.
+    scratchpad_get_many: Option<ScratchpadGetManyFn>,
     /// Optional writer for scratchpad notes. When set, the planning tools
     /// (`begin_step`/`complete_step`, #240) are advertised each turn and the
     /// dispatch loop uses this to record plan todos + distilled step outcomes.
@@ -567,7 +569,7 @@ impl<S, L> ConversationHandler<S, L, NoopToolExecutor> {
             id_generator,
             namespace_cache: std::sync::Mutex::new(None),
             categorize_lock: tokio::sync::Mutex::new(()),
-            scratchpad_goal_read: None,
+            scratchpad_get_many: None,
             scratchpad_write: None,
             scratchpad_list: None,
             scratchpad_delete_subtree: None,
@@ -662,7 +664,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             id_generator,
             namespace_cache: std::sync::Mutex::new(None),
             categorize_lock: tokio::sync::Mutex::new(()),
-            scratchpad_goal_read: None,
+            scratchpad_get_many: None,
             scratchpad_write: None,
             scratchpad_list: None,
             scratchpad_delete_subtree: None,
@@ -707,13 +709,21 @@ impl<S, L, T> ConversationHandler<S, L, T> {
         self
     }
 
-    /// Wire a reader for the reserved scratchpad `goal` note. The dispatch
-    /// loop reads it once per tool round (a bounded single-key fetch) and,
-    /// when present, surfaces it as the conversation's task anchor in
-    /// preference to the verbatim user prompt — so a model-maintained,
-    /// evolving goal keeps showing up even after history is compacted away.
-    pub fn with_scratchpad_goal(mut self, goal_read: ScratchpadGetManyFn) -> Self {
-        self.scratchpad_goal_read = Some(goal_read);
+    /// Wire a reader for scratchpad notes by key. Two turn paths use it, and
+    /// both are bounded fetches:
+    ///
+    /// - once per tool round, the reserved `goal` note, surfaced as the
+    ///   conversation's task anchor in preference to the verbatim user prompt,
+    ///   so a model-maintained, evolving goal keeps showing up even after
+    ///   history is compacted away;
+    /// - once at turn entry, the notes earlier turns distilled tool results
+    ///   into, so a result already distilled reads as a pointer again instead
+    ///   of costing its whole payload a second time (#1144).
+    ///
+    /// Without it the anchor stays the verbatim prompt and every stored result
+    /// is read in full.
+    pub fn with_scratchpad_get_many(mut self, get_many: ScratchpadGetManyFn) -> Self {
+        self.scratchpad_get_many = Some(get_many);
         self
     }
 
@@ -826,6 +836,94 @@ impl<S, L, T> ConversationHandler<S, L, T> {
         self.turn_locks.lock().unwrap().len()
     }
 
+    /// Seed a fresh turn's projection from the eviction decisions earlier turns
+    /// recorded on the message rows (#1144).
+    ///
+    /// A completed step drops its raw tool results from the model's view and
+    /// names the scratchpad note it distilled them into on each row. Without
+    /// this the saving would end with the turn that made it: the next turn
+    /// loads the stored output and pays for the whole payload again, on every
+    /// turn until windowing carries it out of view.
+    ///
+    /// The pointer is rebuilt, never stored, so `conv.messages` keeps every byte
+    /// the tool returned - and it is rebuilt only for notes the scratchpad still
+    /// holds. Three cases fall back to the stored output, which is always safe
+    /// because it is the real thing:
+    ///
+    /// - no row carries a decision (the common case, and it costs no read),
+    /// - no scratchpad reader is wired,
+    /// - the read failed, or the note is no longer there.
+    ///
+    /// Only the rows the prompt can reach are considered, so the read stays a
+    /// single bounded fetch however long the conversation is. A row before the
+    /// widest window this turn can assemble is in no prompt, so a pointer for
+    /// it would save nothing.
+    async fn carry_recorded_evictions(
+        &self,
+        conversation_id: &ConversationId,
+        conv: &Conversation,
+        projection: &mut ContextProjection,
+    ) {
+        let from = window_start(&conv.messages, MAX_CONTEXT_MESSAGES);
+        let in_view = &conv.messages[from..];
+        let mut keys = planning::distilled_note_keys(in_view);
+        if keys.is_empty() {
+            return;
+        }
+        let Some(read) = &self.scratchpad_get_many else {
+            return;
+        };
+        // The window bounds this well below the cap today - at most one key per
+        // in-window row. Hold it to the port's documented per-call limit anyway,
+        // so the bound belongs to the read rather than to an accident of the
+        // window size or of how many notes one step may distil into.
+        keys.truncate(MAX_KEYS_PER_CALL);
+        let wanted = keys.len();
+        // The limit counts ROWS, not keys, and the two differ: one key can name
+        // a note under more than one subagent scope (`scratchpads` is unique on
+        // conversation + owner_todo + key) and this read is scope-blind. A
+        // limit of `wanted` would let duplicates crowd out a later key and read
+        // a live note as missing, which costs only the saving - but the
+        // ceiling, which is above the key cap, is free.
+        let notes = match read(conversation_id.0.clone(), keys, MAX_RESULTS_CEILING).await {
+            Ok(notes) => notes,
+            Err(e) => {
+                tracing::warn!(
+                    conversation_id = %conversation_id.0,
+                    error = %e,
+                    "could not read the notes an earlier turn distilled results into; \
+                     this turn reads the stored output instead"
+                );
+                return;
+            }
+        };
+        let live: std::collections::HashSet<String> =
+            notes.into_iter().map(|note| note.key).collect();
+        let (carried, saved) = planning::carry_evictions(in_view, projection, &live);
+        if carried > 0 {
+            tracing::info!(
+                conversation_id = %conversation_id.0,
+                carried,
+                saved_bytes = saved,
+                notes_asked = wanted,
+                notes_found = live.len(),
+                "carried earlier turns' tool-result evictions into this turn"
+            );
+        } else {
+            // Rows carry a decision and none of it could be honoured. The
+            // saving has stopped working for this conversation and every turn
+            // is paying the full payload again, which otherwise looks exactly
+            // like a conversation that never completed a step.
+            tracing::info!(
+                conversation_id = %conversation_id.0,
+                notes_asked = wanted,
+                notes_found = live.len(),
+                "the notes earlier turns distilled results into are gone; this \
+                 turn reads the stored output"
+            );
+        }
+    }
+
     /// Handle a `begin_step` / `complete_step` control call (#240).
     ///
     /// These are core-loop tools, not tool-executor tools: only the dispatch
@@ -849,7 +947,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
     #[allow(clippy::too_many_arguments)]
     async fn handle_step_control(
         &self,
-        conv: &Conversation,
+        conv: &mut Conversation,
         projection: &mut ContextProjection,
         stack: &mut StepStack,
         call: &ToolCall,
@@ -965,6 +1063,10 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             knowledge_entry_id: None,
         }];
         let mut note_keys: Vec<String> = Vec::new();
+        // Whether the outcome note carries the step's own account of the scope,
+        // as opposed to the placeholder a tainted turn records (#741). A
+        // placeholder says a step happened and nothing about what it found.
+        let mut outcome_is_a_trace = false;
         if let Some(o) = outcome {
             let okey = format!("{}{}", planning::OUTCOME_KEY_PREFIX, frame.key);
             let body = if abandoned {
@@ -973,6 +1075,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
                 o.to_string()
             };
             let body = step_text_to_record(&body, provenance);
+            outcome_is_a_trace = body != WITHHELD_STEP_TEXT;
             notes.push(NewScratchpadNote {
                 key: okey.clone(),
                 content: planning::truncate_on_char_boundary(&body, MAX_NOTE_BYTES),
@@ -984,9 +1087,28 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             });
             note_keys.push(okey);
         }
-        if let Err(e) = write(conv_id, notes).await {
+        let saved = write(conv_id, notes).await;
+        if let Err(e) = &saved {
             tracing::warn!(step = %frame.key, error = %e, "failed to record step completion notes");
         }
+
+        // Whether a LATER turn may read these results as a pointer. Three
+        // things have to hold, and each one is a way #798's loss comes back if
+        // it is assumed instead: the step named an outcome note, the note holds
+        // the step's own account rather than a placeholder, and the write
+        // landed. The pointer THIS turn reads is unaffected - it dies with the
+        // turn, and the model that reads it also ran the step.
+        let trace = match &saved {
+            Ok(written)
+                if outcome_is_a_trace
+                    && note_keys
+                        .iter()
+                        .all(|k| written.iter().any(|n| &n.key == k)) =>
+            {
+                planning::DistilledTrace::Written
+            }
+            _ => planning::DistilledTrace::Absent,
+        };
 
         // Drop the step's raw tool results from the turn's view, leaving a
         // pointer to the outcome note. This is what stops the per-round
@@ -994,8 +1116,13 @@ impl<S, L, T> ConversationHandler<S, L, T> {
         // the conversation's stored transcript keeps the raw output whether or
         // not the note write above succeeded and whether or not the model
         // supplied an outcome.
-        let (evicted, freed) =
-            planning::evict_tool_results(&conv.messages, projection, frame.watermark, &note_keys);
+        let (evicted, freed) = planning::evict_tool_results(
+            &mut conv.messages,
+            projection,
+            frame.watermark,
+            &note_keys,
+            trace,
+        );
         tracing::info!(
             step = %frame.key,
             evicted_results = evicted,
@@ -1549,7 +1676,18 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         // `conv.messages` - the transcript this turn persists - keeps the raw
         // output. The projection is turn-scoped and is dropped when the turn
         // ends.
+        //
+        // Turn-scoped is why it is seeded rather than started empty. The
+        // decisions earlier turns recorded on the rows are read back here, so a
+        // result already distilled into a note reads as a pointer from this
+        // turn's first round instead of costing its whole payload again.
         let mut projection = ContextProjection::default();
+        self.carry_recorded_evictions(conversation_id, &conv, &mut projection)
+            .await;
+
+        // Whether this turn has already spent its one attempt at folding what
+        // the assembler's pre-flight shrink dropped. See the call site.
+        let mut preflight_folded = false;
 
         // Count of in-turn ContextOverflow recoveries. Bounded so a
         // persistently-oversized request doesn't loop indefinitely.
@@ -1958,7 +2096,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
             // a model-maintained goal then keeps showing up even after history
             // is windowed/compacted away. Reading per round means a goal the
             // model wrote mid-turn surfaces on the next round.
-            let goal = match &self.scratchpad_goal_read {
+            let goal = match &self.scratchpad_get_many {
                 Some(read) => read(
                     conversation_id.0.clone(),
                     vec![SCRATCHPAD_GOAL_KEY.to_string()],
@@ -1971,7 +2109,10 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 .filter(|content| !content.trim().is_empty()),
                 None => None,
             };
-            let anchor = goal.as_deref().or(conv.active_task.as_deref());
+            // Owned, because the assembly below runs from a closure that
+            // takes the conversation as an argument - the fold between the two
+            // passes needs it mutably.
+            let anchor: Option<String> = goal.or_else(|| conv.active_task.clone());
 
             // Re-read the pad and render its surfaces for this round: the open
             // plan as a compact tree (#240), the free-form note-key index
@@ -2003,31 +2144,78 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
             // The estimator borrows `&self.llm` so the closure is built
             // each iteration; constructing it is cheap (no allocation).
             let estimate = |text: &str| self.llm.estimate_tokens(text);
-            let assembled = assemble_turn_within_budget(
-                &ConversationView {
-                    messages: &conv.messages,
-                    summaries: &conv.summaries,
-                    context_summary: &conv.context_summary,
-                },
-                &ToolContext {
-                    tool_defs: &tool_defs,
-                    deferred_namespaces: deferred_ns,
-                    locality: Some(&tool_locality),
-                },
-                &TurnAnchors {
-                    active_task: anchor,
-                    plan: surfaces.plan.as_deref(),
-                    scratchpad_index: surfaces.scratchpad_index.as_deref(),
-                    working_state: surfaces.working_state,
-                    pinned: surfaces.pinned.as_deref(),
-                    recall: recall_surface,
-                    tool_rounds_since_anchor,
-                },
-                &projection,
-                target_window,
-                current_context_budget(),
-                &estimate,
-            );
+            let tool_ctx = ToolContext {
+                tool_defs: &tool_defs,
+                deferred_namespaces: deferred_ns,
+                locality: Some(&tool_locality),
+            };
+            let anchors = TurnAnchors {
+                active_task: anchor.as_deref(),
+                plan: surfaces.plan.as_deref(),
+                scratchpad_index: surfaces.scratchpad_index.as_deref(),
+                working_state: surfaces.working_state,
+                pinned: surfaces.pinned.as_deref(),
+                recall: recall_surface,
+                tool_rounds_since_anchor,
+            };
+            // Assembly is a pure function of its inputs, and this round may run
+            // it twice, so it takes the conversation as an argument rather than
+            // capturing it - the fold between the two passes needs it mutably.
+            // `assembly_window` is a copy of `target_window` for the same
+            // reason: overflow recovery shrinks that one later in the round.
+            // Read it here, before anything in this iteration can change it: the
+            // fold compares against the window the prompt was actually asked
+            // for, and a stale copy would fold a range nothing dropped.
+            let assembly_window = target_window;
+            let assemble = |conv: &Conversation| {
+                assemble_turn_within_budget(
+                    &ConversationView {
+                        messages: &conv.messages,
+                        summaries: &conv.summaries,
+                        context_summary: &conv.context_summary,
+                    },
+                    &tool_ctx,
+                    &anchors,
+                    &projection,
+                    assembly_window,
+                    current_context_budget(),
+                    &estimate,
+                )
+            };
+            let mut assembled = assemble(&conv);
+            // The pre-flight budget check inside assembly can narrow the window
+            // past what this loop asked for, and turn-entry compaction ran
+            // against the wider one. Whatever sits between the two window
+            // starts is then in neither the prompt nor the rolling summary, so
+            // fold it in and assemble again before the call. A no-op on a turn
+            // the check did not shrink, which is the normal case.
+            //
+            // At most one attempt per turn. Every round appends messages, so a
+            // shrunk window keeps sliding forward and the fold's guards keep
+            // passing; run per round it would spend a summariser call per round
+            // on the turns that are already the most expensive, and re-merge
+            // the rolling summary from itself as many times. The rounds' own
+            // drift needs no fold - the next turn assembles at the full window
+            // again and carries those messages itself. A summariser that
+            // declined uses up the attempt too, so one that is down costs one
+            // call rather than one per round.
+            if !preflight_folded {
+                match compact_preflight_shrink(
+                    &mut conv,
+                    assembled.window_from,
+                    assembly_window,
+                    self.task_llm(),
+                )
+                .await
+                {
+                    PreflightFold::NotNeeded => {}
+                    PreflightFold::Folded => {
+                        preflight_folded = true;
+                        assembled = assemble(&conv);
+                    }
+                    PreflightFold::Declined => preflight_folded = true,
+                }
+            }
             // Where the assembled prompt starts. Overflow recovery needs it,
             // because the pre-flight budget check inside assembly can narrow
             // the window past `target_window` and nothing else here would know.
@@ -2427,7 +2615,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                     }
                     let ack = self
                         .handle_step_control(
-                            &conv,
+                            &mut conv,
                             &mut projection,
                             &mut step_stack,
                             tool_call,
@@ -2818,7 +3006,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
 
         // Recompute the light task anchors so the wind-down prompt carries the
         // same [Current task]/[Plan] context the loop rounds did.
-        let goal = match &self.scratchpad_goal_read {
+        let goal = match &self.scratchpad_get_many {
             Some(read) => read(
                 conversation_id.0.clone(),
                 vec![SCRATCHPAD_GOAL_KEY.to_string()],
@@ -5862,6 +6050,339 @@ mod tests {
         // third-party read and this turn therefore ingested outside content
         // (#741). The step structure is recorded; the model's wording is not.
         assert_eq!(outcome.content, WITHHELD_STEP_TEXT);
+    }
+
+    /// A `ScratchpadGetManyFn` reading the same map [`in_memory_scratchpad`]
+    /// writes to, so a test can wire the note reader the carry consults and
+    /// delete a note between turns.
+    fn scratchpad_get_many_over(
+        store: Arc<Mutex<HashMap<String, crate::domain::ScratchpadNote>>>,
+    ) -> ScratchpadGetManyFn {
+        Arc::new(move |_conv: String, keys: Vec<String>, _limit: usize| {
+            let store = Arc::clone(&store);
+            Box::pin(async move {
+                let map = store.lock().unwrap();
+                Ok(keys.iter().filter_map(|k| map.get(k).cloned()).collect())
+            })
+        })
+    }
+
+    /// A tool whose results are trusted, so a step over it leaves the turn
+    /// clean and the outcome note records the model's own account of the
+    /// scope. A tainted turn records a placeholder instead, which is no trace
+    /// at all - see `a_tainted_turns_eviction_is_not_carried_across_turns`.
+    const CLEAN_TOOL: &str = "builtin_conversation_search";
+
+    /// The four LLM answers a turn needs to run one step over one big result
+    /// from `tool`: begin, call it, complete the step, answer.
+    fn one_step_turn_responses(tool: &str, answer: &str) -> Vec<LlmResponse> {
+        vec![
+            LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new(
+                    "b1",
+                    "begin_step",
+                    r#"{"goal":"look it up"}"#,
+                )],
+            ),
+            LlmResponse::with_tool_calls("", vec![ToolCall::new("t1", tool, "{}")]),
+            LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new(
+                    "c1",
+                    "complete_step",
+                    r#"{"outcome":"three matches, all in the archive"}"#,
+                )],
+            ),
+            LlmResponse::text(answer),
+        ]
+    }
+
+    /// The fixture both carry tests share: one step over one big result from
+    /// `tool`, then a second turn. Answers the payload, the tool set, the
+    /// results and the LLM script.
+    #[allow(clippy::type_complexity)]
+    fn carry_fixture(
+        tool: &str,
+    ) -> (
+        String,
+        Vec<ToolDefinition>,
+        HashMap<String, String>,
+        Vec<LlmResponse>,
+    ) {
+        let big = "DATA".repeat(2000); // ~8 KB, well above the eviction threshold
+        let mut results = HashMap::new();
+        results.insert(tool.to_string(), big.clone());
+        let mut responses = one_step_turn_responses(tool, "Three matches.");
+        responses.push(LlmResponse::text("Still three."));
+        (big, vec![tool_def(tool)], results, responses)
+    }
+
+    /// #1144 acceptance: a conversation whose step completed on an earlier turn
+    /// assembles the pointer, not the raw result, while the message is still in
+    /// the window - and the stored transcript still holds every byte. Both
+    /// halves in one run, because the whole point is that one does not cost the
+    /// other (#798).
+    #[tokio::test]
+    async fn a_later_turn_reads_the_pointer_while_storage_keeps_the_raw_output() {
+        let (big, tools, tool_results, responses) = carry_fixture(CLEAN_TOOL);
+
+        let (write, list, sp) = in_memory_scratchpad();
+        let llm = ToolCallingLlm::new(responses);
+        let prompts = llm.prompts();
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            llm,
+            MockToolExecutor::new(tools, tool_results),
+            id_gen(),
+        )
+        .with_scratchpad_write(write)
+        .with_scratchpad_list(list)
+        .with_scratchpad_get_many(scratchpad_get_many_over(Arc::clone(&sp)));
+
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "search?".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+
+        // A second turn, which loads the conversation back from storage and
+        // starts with an empty projection of its own.
+        handler
+            .send_prompt(
+                &conv.id,
+                "and again?".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await
+            .unwrap();
+
+        let read_by_model = last_prompt_result(&prompts, "t1");
+        assert!(
+            read_by_model.starts_with("<compacted to scratchpad"),
+            "a later turn must still read the pointer, got: {read_by_model}"
+        );
+        assert!(
+            read_by_model.contains("outcome:1"),
+            "the rebuilt pointer names the note: {read_by_model}"
+        );
+        assert!(
+            !read_by_model.contains("DATADATA"),
+            "the payload must not come back into working context on a later turn"
+        );
+
+        let stored = handler.get_conversation(&conv.id).await.unwrap();
+        let result = stored
+            .messages
+            .iter()
+            .find(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some("t1"))
+            .expect("the tool result message must still exist");
+        assert_eq!(
+            result.content, big,
+            "the stored transcript must keep what the tool returned"
+        );
+        assert_eq!(
+            result.distilled_into,
+            vec!["outcome:1".to_string()],
+            "the row carries the decision that rebuilt the pointer"
+        );
+    }
+
+    /// #798's failure mode must not return through the marker. A best-effort
+    /// note write followed by an unconditional eviction is how raw output was
+    /// lost; a decision whose note is gone falls back to the stored output.
+    #[tokio::test]
+    async fn a_later_turn_reads_the_raw_output_when_the_distilling_note_is_gone() {
+        let (big, tools, tool_results, responses) = carry_fixture(CLEAN_TOOL);
+
+        let (write, list, sp) = in_memory_scratchpad();
+        let llm = ToolCallingLlm::new(responses);
+        let prompts = llm.prompts();
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            llm,
+            MockToolExecutor::new(tools, tool_results),
+            id_gen(),
+        )
+        .with_scratchpad_write(write)
+        .with_scratchpad_list(list)
+        .with_scratchpad_get_many(scratchpad_get_many_over(Arc::clone(&sp)));
+
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "search?".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+
+        // The distilled trace goes away between turns - a user cleared the pad,
+        // or the model deleted the note.
+        sp.lock().unwrap().remove("outcome:1");
+
+        handler
+            .send_prompt(
+                &conv.id,
+                "and again?".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await
+            .unwrap();
+
+        let read_by_model = last_prompt_result(&prompts, "t1");
+        assert_eq!(
+            read_by_model, big,
+            "with no note left to point at, the turn must read the stored output"
+        );
+    }
+
+    /// #798 again, by the other door. A turn that reads outside content records
+    /// a placeholder in place of the model's wording (#741), so its outcome
+    /// note says a step happened and nothing about what the step found. That is
+    /// no distilled trace, and a pointer to it would send every later turn to a
+    /// note holding nothing while the output sat out of view. The eviction
+    /// stays turn-local, and the next turn reads the stored output.
+    #[tokio::test]
+    async fn a_tainted_turns_eviction_is_not_carried_across_turns() {
+        // `weather_` results are externally controlled, so this turn is tainted.
+        let (big, tools, tool_results, responses) = carry_fixture("weather_forecast");
+
+        let (write, list, sp) = in_memory_scratchpad();
+        let llm = ToolCallingLlm::new(responses);
+        let prompts = llm.prompts();
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            llm,
+            MockToolExecutor::new(tools, tool_results),
+            id_gen(),
+        )
+        .with_scratchpad_write(write)
+        .with_scratchpad_list(list)
+        .with_scratchpad_get_many(scratchpad_get_many_over(Arc::clone(&sp)));
+
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "weather?".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+
+        // The note exists, so a liveness check on the key alone would pass it.
+        assert_eq!(
+            sp.lock()
+                .unwrap()
+                .get("outcome:1")
+                .map(|n| n.content.clone()),
+            Some(WITHHELD_STEP_TEXT.to_string()),
+            "the fixture must produce a placeholder outcome note"
+        );
+
+        let stored = handler.get_conversation(&conv.id).await.unwrap();
+        let result = stored
+            .messages
+            .iter()
+            .find(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some("t1"))
+            .expect("the tool result message must still exist");
+        assert!(
+            result.distilled_into.is_empty(),
+            "a placeholder is not a trace, so no decision may reach the row"
+        );
+
+        handler
+            .send_prompt(
+                &conv.id,
+                "and tomorrow?".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            last_prompt_result(&prompts, "t1"),
+            big,
+            "the later turn must read the stored output, not a pointer to an \
+             empty note"
+        );
+    }
+
+    /// The write is best-effort and always has been. #798 records that a
+    /// best-effort note write followed by an unconditional eviction is one of
+    /// the two ways raw output was lost outright, so a write that did not land
+    /// must not leave a decision behind for later turns to act on.
+    #[tokio::test]
+    async fn a_failed_note_write_records_no_eviction_decision() {
+        let (big, tools, tool_results, responses) = carry_fixture(CLEAN_TOOL);
+
+        // A pad that refuses every write, and a reader that answers as if the
+        // note were there - so only the write check can stop the decision.
+        let failing_write: ScratchpadWriteFn = Arc::new(|_conv, _notes| {
+            Box::pin(async { Err(CoreError::Storage("pad is down".into())) })
+        });
+        let generous_read: ScratchpadGetManyFn = Arc::new(|conv: String, keys: Vec<String>, _| {
+            Box::pin(async move {
+                Ok(keys
+                    .iter()
+                    .map(|k| crate::domain::ScratchpadNote::new("id", &conv, k, "a real outcome"))
+                    .collect())
+            })
+        });
+        let (_w, list, _sp) = in_memory_scratchpad();
+
+        let llm = ToolCallingLlm::new(responses);
+        let prompts = llm.prompts();
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            llm,
+            MockToolExecutor::new(tools, tool_results),
+            id_gen(),
+        )
+        .with_scratchpad_write(failing_write)
+        .with_scratchpad_list(list)
+        .with_scratchpad_get_many(generous_read);
+
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "search?".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+
+        let stored = handler.get_conversation(&conv.id).await.unwrap();
+        let result = stored
+            .messages
+            .iter()
+            .find(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some("t1"))
+            .expect("the tool result message must still exist");
+        assert!(
+            result.distilled_into.is_empty(),
+            "the note write failed, so no decision may reach the row"
+        );
+
+        handler
+            .send_prompt(
+                &conv.id,
+                "and again?".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            last_prompt_result(&prompts, "t1"),
+            big,
+            "the later turn must read the stored output"
+        );
     }
 
     // #287 slice 6: the hard-coded complete_step cascade + its lifecycle gate.
@@ -9025,6 +9546,274 @@ mod tests {
         );
     }
 
+    /// #1144's second cost, end to end. The carry removes one common reason a
+    /// prompt is oversized; it does not remove the pre-flight shrink itself.
+    /// A conversation whose tool results carry no eviction decision - the model
+    /// never completed a step, or planning was never wired - still assembles a
+    /// prompt the check has to narrow. Turn-entry compaction ran against the
+    /// wider window, so without the fold the range between the two window
+    /// starts is in neither the prompt nor the rolling summary.
+    #[tokio::test]
+    async fn a_shrunk_turn_folds_what_the_preflight_check_dropped() {
+        use crate::ports::llm::{BudgetSource, ContextBudget, with_context_budget};
+
+        let handler = ConversationHandler::new(
+            MockStore::new(),
+            TokenReportingLlm {
+                text: "ok".into(),
+                // Far under the threshold, so the post-call token-pressure
+                // path never runs and only the pre-flight fold can move the
+                // marker past what turn entry covered.
+                input_tokens: 10,
+                max_context: Some(200_000),
+            },
+            id_gen(),
+        );
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        let mut stored = handler.get_conversation(&conv.id).await.unwrap();
+        for i in 0..30 {
+            stored
+                .messages
+                .push(Message::new(Role::User, format!("u-{i}")));
+            stored
+                .messages
+                .push(Message::assistant_with_tool_calls(vec![ToolCall::new(
+                    format!("c{i}"),
+                    "read_file",
+                    "{}",
+                )]));
+            stored
+                .messages
+                .push(Message::tool_result(format!("c{i}"), "PAYLOAD".repeat(500)));
+        }
+        // No row carries a decision: nothing for the carry to rebuild.
+        assert!(
+            stored.messages.iter().all(|m| m.distilled_into.is_empty()),
+            "the fixture must give the carry nothing to do"
+        );
+        handler.store.update(stored.clone()).await.unwrap();
+
+        // What turn-entry compaction alone can reach: the start of the window
+        // the loop asks for. Anything past this came from the fold.
+        let entry_marker = window_start(&stored.messages, MAX_CONTEXT_MESSAGES);
+
+        let budget = ContextBudget {
+            max_input_tokens: 4_000,
+            source: BudgetSource::ConnectorTable,
+        };
+        with_context_budget(budget, async {
+            handler
+                .send_prompt(&conv.id, "next".into(), noop_callback(), noop_status())
+                .await
+                .unwrap();
+        })
+        .await;
+
+        let after = handler.get_conversation(&conv.id).await.unwrap();
+        assert!(
+            after.compacted_through > entry_marker,
+            "the pre-flight shrink dropped messages past the compaction marker \
+             ({entry_marker}); the marker must cover them, got {}",
+            after.compacted_through
+        );
+        assert!(
+            !after.context_summary.is_empty(),
+            "the marker may only step over a range the summary describes"
+        );
+    }
+
+    /// A mock that drives `rounds` tool rounds then answers, recording every
+    /// prompt so a test can count how many were summariser calls.
+    struct RoundCountingLlm {
+        rounds: std::sync::atomic::AtomicU32,
+        /// Whether the summariser answers with nothing, so every fold declines.
+        summariser_down: bool,
+        seen: Arc<Mutex<Vec<Vec<Message>>>>,
+    }
+
+    /// Opening of the rolling summariser's system message. No turn prompt
+    /// starts with it, so it separates a fold from a round.
+    const SUMMARISER_OPENING: &str = "You are a conversation summarizer.";
+
+    impl RoundCountingLlm {
+        fn new(rounds: u32) -> Self {
+            Self {
+                rounds: std::sync::atomic::AtomicU32::new(rounds),
+                summariser_down: false,
+                seen: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn with_summariser_down(rounds: u32) -> Self {
+            Self {
+                summariser_down: true,
+                ..Self::new(rounds)
+            }
+        }
+
+        fn prompts(&self) -> Arc<Mutex<Vec<Vec<Message>>>> {
+            Arc::clone(&self.seen)
+        }
+    }
+
+    /// How many recorded prompts were rolling-summary calls.
+    fn summariser_calls(prompts: &Arc<Mutex<Vec<Vec<Message>>>>) -> usize {
+        prompts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| {
+                p.first()
+                    .is_some_and(|m| m.content.starts_with(SUMMARISER_OPENING))
+            })
+            .count()
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for RoundCountingLlm {
+        async fn stream_completion(
+            &self,
+            messages: Vec<Message>,
+            _tools: &[ToolDefinition],
+            _reasoning: ReasoningConfig,
+            mut on_chunk: ChunkCallback,
+        ) -> Result<LlmResponse, CoreError> {
+            let summariser = messages
+                .first()
+                .is_some_and(|m| m.content.starts_with(SUMMARISER_OPENING));
+            self.seen.lock().unwrap().push(messages);
+            if summariser {
+                if self.summariser_down {
+                    return Ok(LlmResponse::text("   "));
+                }
+                return Ok(LlmResponse::text("Active task: keep going\n- earlier work"));
+            }
+            let left = self
+                .rounds
+                .fetch_update(
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                    |n| Some(n.saturating_sub(1)),
+                )
+                .unwrap_or(0);
+            if left == 0 {
+                on_chunk("done".to_string());
+                return Ok(LlmResponse::text("done"));
+            }
+            Ok(LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new(format!("r{left}"), CLEAN_TOOL, "{}")],
+            ))
+        }
+    }
+
+    /// #1144: the fold costs one summariser call per TURN, not one per round.
+    ///
+    /// Every round appends messages, so a shrunk window keeps sliding forward
+    /// and the fold's own guards keep passing. Run per round on a long agentic
+    /// turn it would spend a summariser call per round - on exactly the turns
+    /// that are already the most expensive - and re-merge the rolling summary
+    /// from itself as many times, which squeezes out what it recorded first.
+    #[tokio::test]
+    async fn the_preflight_fold_costs_one_summariser_call_per_turn() {
+        // Two turns of the same shape, one three times as long as the other. A
+        // per-round fold scales with the round count; a per-turn one does not.
+        let short = summariser_calls_for_a_shrunk_turn(4).await;
+        let long = summariser_calls_for_a_shrunk_turn(12).await;
+        assert_eq!(
+            (short, long),
+            (2, 2),
+            "one turn-entry compaction plus one fold, however many rounds the \
+             turn runs"
+        );
+    }
+
+    /// Run one budget-pressured agentic turn of `rounds` tool rounds over a
+    /// history long enough to window, and answer how many summariser calls it
+    /// made. Asserts on the way through that the turn really shrank and really
+    /// folded, so a count of zero cannot pass for thrift.
+    async fn summariser_calls_for_a_shrunk_turn(rounds: u32) -> usize {
+        run_a_shrunk_turn(RoundCountingLlm::new(rounds), rounds, true).await
+    }
+
+    async fn run_a_shrunk_turn(
+        llm: RoundCountingLlm,
+        rounds: u32,
+        expect_the_marker_to_move: bool,
+    ) -> usize {
+        use crate::ports::llm::{BudgetSource, ContextBudget, with_context_budget};
+
+        let prompts = llm.prompts();
+        let mut results = HashMap::new();
+        results.insert(CLEAN_TOOL.to_string(), "PAYLOAD".repeat(500));
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            llm,
+            MockToolExecutor::new(vec![tool_def(CLEAN_TOOL)], results),
+            id_gen(),
+        );
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        let mut stored = handler.get_conversation(&conv.id).await.unwrap();
+        for i in 0..30 {
+            stored
+                .messages
+                .push(Message::new(Role::User, format!("u-{i}")));
+            stored
+                .messages
+                .push(Message::new(Role::Assistant, "PAYLOAD".repeat(300)));
+        }
+        handler.store.update(stored.clone()).await.unwrap();
+        let entry_marker = window_start(&stored.messages, MAX_CONTEXT_MESSAGES);
+
+        let budget = ContextBudget {
+            max_input_tokens: 4_000,
+            source: BudgetSource::ConnectorTable,
+        };
+        with_context_budget(budget, async {
+            handler
+                .send_prompt(&conv.id, "next".into(), noop_callback(), noop_status())
+                .await
+                .unwrap();
+        })
+        .await;
+
+        let turn_prompts = prompts.lock().unwrap().len();
+        assert!(
+            turn_prompts > rounds as usize,
+            "the fixture must actually run {rounds} rounds, saw {turn_prompts} prompts"
+        );
+        let after = handler.get_conversation(&conv.id).await.unwrap();
+        assert_eq!(
+            after.compacted_through > entry_marker,
+            expect_the_marker_to_move,
+            "marker {} vs entry {entry_marker}",
+            after.compacted_through
+        );
+        summariser_calls(&prompts)
+    }
+
+    /// A summariser that is down must cost one call per turn, not one per
+    /// round. The declined fold uses up the turn's attempt for exactly this
+    /// reason: retrying it every round is the per-round cost by another name,
+    /// and it lands on a turn that is already failing to summarise.
+    #[tokio::test]
+    async fn a_declined_fold_uses_up_the_turns_one_attempt() {
+        let short = run_a_shrunk_turn(RoundCountingLlm::with_summariser_down(4), 4, false).await;
+        let long = run_a_shrunk_turn(RoundCountingLlm::with_summariser_down(12), 12, false).await;
+        assert_eq!(
+            (short, long),
+            (2, 2),
+            "one turn-entry attempt plus one declined fold, however many rounds \
+             the turn runs"
+        );
+    }
+
     #[tokio::test]
     async fn send_prompt_no_shrink_when_tokens_under_threshold() {
         use crate::ports::llm::{BudgetSource, ContextBudget, with_context_budget};
@@ -10585,7 +11374,7 @@ mod tests {
             NoopToolExecutor,
             Box::new(|| "conv-goal-1".to_string()),
         )
-        .with_scratchpad_goal(goal_reader("Ship the scratchpad, then promote learnings"));
+        .with_scratchpad_get_many(goal_reader("Ship the scratchpad, then promote learnings"));
 
         let conv = handler
             .create_conversation("t".into(), vec![])
@@ -10629,7 +11418,7 @@ mod tests {
             NoopToolExecutor,
             Box::new(|| "conv-goal-2".to_string()),
         )
-        .with_scratchpad_goal(empty_reader);
+        .with_scratchpad_get_many(empty_reader);
 
         let conv = handler
             .create_conversation("t".into(), vec![])

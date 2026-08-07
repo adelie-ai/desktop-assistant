@@ -206,6 +206,11 @@ const MIGRATIONS: &[Migration] = &[
     // opened, and what was marked, so a deployment can measure the weights
     // its retrieval path uses instead of carrying values fitted elsewhere.
     migration!("044_knowledge_use_log.sql"),
+    // #1144: the scratchpad notes a completed step distilled a tool result
+    // into, recorded on the result's own row. The decision, not the
+    // replacement - `content` still holds every byte the tool returned - so a
+    // later turn rebuilds the pointer instead of reading the payload again.
+    migration!("045_message_distilled_into.sql"),
 ];
 
 /// Second half of the advisory-lock key: the schema the migrations write to.

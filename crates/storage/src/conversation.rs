@@ -303,7 +303,7 @@ impl ConversationStore for PgConversationStore {
 
         let msg_rows: Vec<MsgRow> = sqlx::query_as(
             "SELECT id, ordinal, role, content, tool_calls, tool_call_id, summary_id, \
-                    idempotency_key \
+                    idempotency_key, distilled_into \
              FROM messages \
              WHERE user_id = $1 AND conversation_id = $2 \
              ORDER BY ordinal",
@@ -429,7 +429,8 @@ impl ConversationStore for PgConversationStore {
         // id included. Every statement stays scoped by user_id as
         // defense-in-depth.
         let existing: Vec<ExistingMsgRow> = sqlx::query_as(
-            "SELECT id, ordinal, role, content, tool_calls, tool_call_id, summary_id \
+            "SELECT id, ordinal, role, content, tool_calls, tool_call_id, summary_id, \
+                    distilled_into \
              FROM messages \
              WHERE user_id = $1 AND conversation_id = $2 \
              ORDER BY ordinal",
@@ -635,6 +636,18 @@ fn tool_calls_json(msg: &Message) -> Option<serde_json::Value> {
     }
 }
 
+/// Column value for a message's eviction decision (#1144). No decision maps to
+/// SQL `NULL` rather than an empty array, so a row written before the column
+/// existed and a row no step has evicted compare equal in
+/// `ExistingMsgRow::matches` - otherwise every load would restate every row.
+fn distilled_into_column(msg: &Message) -> Option<Vec<String>> {
+    if msg.distilled_into.is_empty() {
+        None
+    } else {
+        Some(msg.distilled_into.clone())
+    }
+}
+
 async fn insert_message(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     user_id: &str,
@@ -647,8 +660,8 @@ async fn insert_message(
     sqlx::query(
         "INSERT INTO messages \
             (id, user_id, conversation_id, ordinal, role, content, \
-             tool_calls, tool_call_id, summary_id, idempotency_key) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+             tool_calls, tool_call_id, summary_id, idempotency_key, distilled_into) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
     )
     // Persist the message's own monotonic UUIDv7 (assigned at creation) rather
     // than minting a fresh one here, so the id is a single source of truth from
@@ -667,6 +680,9 @@ async fn insert_message(
     // message across an ordinal shift, because `update` rewrites a shifted slot
     // from the message that now holds it rather than editing the row in place.
     .bind(&msg.idempotency_key)
+    // #1144: the eviction decision, recorded beside the output rather than in
+    // place of it. NULL for every row no completed step has evicted.
+    .bind(distilled_into_column(msg))
     .execute(&mut **tx)
     .await
     .map_err(|e| CoreError::Storage(e.to_string()))?;
@@ -689,6 +705,9 @@ fn msg_from_row(r: MsgRow) -> Message {
     // Surface the persisted key (#570 Phase 1b) so a reconnecting client dedups
     // by exact match rather than a content compare.
     msg.idempotency_key = r.idempotency_key;
+    // The eviction decision (#1144), so the loading turn can rebuild the
+    // pointer for the notes that are still there.
+    msg.distilled_into = r.distilled_into.unwrap_or_default();
     msg
 }
 
@@ -755,6 +774,9 @@ struct MsgRow {
     /// The client idempotency key (#570 Phase 1b); carried onto the domain
     /// `Message` on load. Populated on USER rows only, else NULL.
     idempotency_key: Option<String>,
+    /// The scratchpad notes a completed step distilled this result into
+    /// (#1144). NULL on every row no step has evicted.
+    distilled_into: Option<Vec<String>>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -777,6 +799,7 @@ struct ExistingMsgRow {
     tool_calls: Option<serde_json::Value>,
     tool_call_id: Option<String>,
     summary_id: Option<String>,
+    distilled_into: Option<Vec<String>>,
 }
 
 impl ExistingMsgRow {
@@ -791,6 +814,13 @@ impl ExistingMsgRow {
     /// the time it was created out of it. A slot that holds a different
     /// message therefore has to take that message's id, so the comparison has
     /// to see the difference.
+    ///
+    /// So is `distilled_into` (#1144), for a different reason: a turn that
+    /// evicts a result records the decision on a row whose content it does not
+    /// touch. A comparison blind to it would call the row unchanged, skip the
+    /// write, and the decision would never reach storage - the saving would
+    /// then end with the turn that made it, which is the whole point of
+    /// recording it.
     fn matches(&self, msg: &Message) -> bool {
         self.id == msg.id
             && self.role == role_to_str(&msg.role)
@@ -798,5 +828,6 @@ impl ExistingMsgRow {
             && self.tool_call_id == msg.tool_call_id
             && self.summary_id == msg.summary_id
             && self.tool_calls == tool_calls_json(msg)
+            && self.distilled_into == distilled_into_column(msg)
     }
 }

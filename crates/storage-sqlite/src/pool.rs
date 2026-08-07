@@ -80,6 +80,9 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     )
     .await?;
     ensure_column(pool, "background_tasks", "spawn_marker", "TEXT").await?;
+    // #1144: the eviction decision on a message row. A fresh DB gets it from
+    // 001 above; this ALTER upgrades a dev DB created before it landed.
+    ensure_column(pool, "messages", "distilled_into", "TEXT").await?;
     // Skill index (#594): relational + FTS5 (the repo's first FTS5 table).
     sqlx::raw_sql(include_str!("../migrations/002_skill_index.sql"))
         .execute(pool)

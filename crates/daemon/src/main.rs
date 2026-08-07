@@ -1675,10 +1675,11 @@ async fn main() -> Result<()> {
         }
     };
 
-    // Reader for the reserved scratchpad `goal` note, wired into the
-    // conversation handler below so the evolving goal is surfaced as the task
-    // anchor each turn. Populated only when a Postgres pool is available.
-    let mut scratchpad_goal_fn: Option<
+    // Reader for scratchpad notes by key, wired into the conversation handler
+    // below: the evolving `goal` note becomes the task anchor each turn, and
+    // turn entry checks the notes earlier turns distilled tool results into.
+    // Populated only when a Postgres pool is available.
+    let mut scratchpad_get_many_handler_fn: Option<
         desktop_assistant_core::ports::scratchpad::ScratchpadGetManyFn,
     > = None;
 
@@ -1970,9 +1971,9 @@ async fn main() -> Result<()> {
             clear_fn,
         ));
 
-        // Reader for the reserved goal note (a bounded single-key fetch),
-        // consumed by `ConversationHandler::with_scratchpad_goal` below.
-        scratchpad_goal_fn = Some(get_many_fn);
+        // Bounded read-by-key, consumed by
+        // `ConversationHandler::with_scratchpad_get_many` below.
+        scratchpad_get_many_handler_fn = Some(get_many_fn);
     }
 
     if let Some(tr) = &tool_registry_store {
@@ -2791,9 +2792,10 @@ async fn main() -> Result<()> {
     }
 
     // Surface the evolving scratchpad `goal` note as the per-turn task anchor
-    // (#184). No-op when no Postgres pool is available.
-    if let Some(goal_fn) = scratchpad_goal_fn {
-        handler = handler.with_scratchpad_goal(goal_fn);
+    // (#184), and let turn entry check the notes earlier turns distilled tool
+    // results into (#1144). No-op when no Postgres pool is available.
+    if let Some(get_many_fn) = scratchpad_get_many_handler_fn {
+        handler = handler.with_scratchpad_get_many(get_many_fn);
     }
 
     // Enable step-planning + context compaction (#240): the writer records plan

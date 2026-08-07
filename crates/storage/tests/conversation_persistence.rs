@@ -825,3 +825,99 @@ async fn cross_user_update_is_not_found_and_writes_nothing() {
     )
     .await;
 }
+
+// --- The eviction decision on a message row (#1144) ---------------------------
+
+/// The `distilled_into` column in ordinal order, read straight from the rows.
+async fn distilled_into_column(pool: &PgPool, conversation_id: &str) -> Vec<Option<Vec<String>>> {
+    let rows: Vec<(Option<Vec<String>>,)> = sqlx::query_as(
+        "SELECT distilled_into FROM messages WHERE conversation_id = $1 ORDER BY ordinal",
+    )
+    .bind(conversation_id)
+    .fetch_all(pool)
+    .await
+    .expect("fetch distilled_into");
+    rows.into_iter().map(|(d,)| d).collect()
+}
+
+/// A turn that evicts a tool result changes no message CONTENT, so the
+/// structural diff must see the decision itself. Blind to it, the diff would
+/// call the row unchanged, skip the write, and the decision would never leave
+/// memory - the saving would end with the turn that made it.
+#[tokio::test]
+async fn recording_an_eviction_decision_reaches_the_row_and_survives_a_reload() {
+    with_fixture(
+        "recording_an_eviction_decision_reaches_the_row_and_survives_a_reload",
+        |fx| async move {
+            let store = PgConversationStore::new(fx.pool.clone());
+            let raw = "RAW".repeat(4000);
+            let mut conv = Conversation::new("conv-distilled", "eviction");
+            conv.created_at = "2026-01-01 00:00:00".to_string();
+            conv.updated_at = "2026-01-01 00:00:00".to_string();
+            conv.messages.push(Message::new(Role::User, "look it up"));
+            conv.messages
+                .push(Message::assistant_with_tool_calls(vec![ToolCall::new(
+                    "call-1",
+                    "read_file",
+                    r#"{"path":"/tmp/a"}"#,
+                )]));
+            conv.messages.push(Message::tool_result("call-1", &raw));
+
+            with_user_id(UserId::new("u1"), async {
+                store.create(conv.clone()).await.expect("create");
+            })
+            .await;
+            assert_eq!(
+                distilled_into_column(&fx.pool, "conv-distilled").await,
+                vec![None, None, None],
+                "nothing carries a decision before a step evicts anything"
+            );
+
+            // The turn completes a step: the decision lands on the row, the
+            // content does not move.
+            conv.messages[2].distilled_into = vec!["outcome:1".to_string()];
+            with_user_id(UserId::new("u1"), async {
+                store.update(conv.clone()).await.expect("update");
+            })
+            .await;
+
+            assert_eq!(
+                distilled_into_column(&fx.pool, "conv-distilled").await,
+                vec![None, None, Some(vec!["outcome:1".to_string()])],
+                "the decision must reach the row even though no content changed"
+            );
+
+            let loaded = with_user_id(UserId::new("u1"), async {
+                store
+                    .get(&ConversationId("conv-distilled".into()))
+                    .await
+                    .expect("get")
+            })
+            .await;
+            assert_eq!(
+                loaded.messages[2].distilled_into,
+                vec!["outcome:1".to_string()],
+                "the loading turn must read the decision back"
+            );
+            assert_eq!(
+                loaded.messages[2].content, raw,
+                "the row still holds every byte the tool returned"
+            );
+
+            // A reload-and-resave finds nothing to change, so no row churns.
+            let ids_before = message_ids(&fx.pool, "conv-distilled").await;
+            with_user_id(UserId::new("u1"), async {
+                store.update(loaded.clone()).await.expect("re-save");
+            })
+            .await;
+            assert_eq!(
+                message_ids(&fx.pool, "conv-distilled").await,
+                ids_before,
+                "a re-diff on load must cause no update churn"
+            );
+
+            fx
+        },
+    )
+    .await;
+}

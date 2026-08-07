@@ -1069,11 +1069,21 @@ pub struct ToolUsageView {
     /// Largest single resident result — distinguishes a steady trickle from one
     /// enormous dump.
     pub max_result_bytes: u64,
-    /// Stored results whose content is a compaction pointer rather than the
-    /// tool's own output. Compaction now shapes the model's view and leaves the
-    /// stored transcript alone, so this counts conversations compacted by an
-    /// earlier version. Their original size is NOT recoverable, so a non-zero
-    /// count means `result_bytes` under-reports what this tool actually cost.
+    /// Stored results the model reads as a compaction pointer rather than as
+    /// the tool's own output. Two shapes count here, and they report their
+    /// bytes differently.
+    ///
+    /// A completed step records the eviction on the result's own row and
+    /// leaves the output alone, so a later turn rebuilds the pointer while the
+    /// transcript keeps every byte. Those rows count here AND count their full
+    /// bytes in `result_bytes` - what shrank is what the model reads, not what
+    /// the conversation holds. This is the normal state for any conversation
+    /// whose model completed a step.
+    ///
+    /// The other shape is history: a conversation compacted by a version that
+    /// overwrote the row, whose content IS the pointer. Their original size is
+    /// NOT recoverable, so those rows count zero bytes and `result_bytes`
+    /// under-reports what the tool once cost.
     pub evicted_results: u32,
     /// Message ordinals of the first and last call, so a client can navigate to
     /// where the tool entered the conversation.

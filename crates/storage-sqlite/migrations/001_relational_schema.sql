@@ -78,6 +78,12 @@ CREATE TABLE IF NOT EXISTS messages (
     -- reload/reconnect surfaces it; NULL for assistant/tool rows and keyless
     -- sends.
     idempotency_key TEXT,
+    -- #1144: the scratchpad notes a completed step distilled this result into,
+    -- as a JSON array (SQLite has no array type). The eviction DECISION, never
+    -- the replacement text - `content` keeps every byte the tool returned, and
+    -- the turn rebuilds the pointer from these keys. NULL on every row no step
+    -- has evicted.
+    distilled_into  TEXT,
     UNIQUE (conversation_id, ordinal)
 );
 

@@ -220,7 +220,7 @@ impl ConversationStore for SqliteConversationStore {
 
         let msg_rows: Vec<MsgRow> = sqlx::query_as(
             "SELECT id, ordinal, role, content, tool_calls, tool_call_id, summary_id, \
-                    idempotency_key \
+                    idempotency_key, distilled_into \
              FROM messages \
              WHERE user_id = ? AND conversation_id = ? \
              ORDER BY ordinal",
@@ -335,7 +335,8 @@ impl ConversationStore for SqliteConversationStore {
         // Structural diff-and-write (DS-5): load existing rows inside this
         // transaction and write only what changed. Mirrors the Postgres store.
         let existing: Vec<ExistingMsgRow> = sqlx::query_as(
-            "SELECT id, ordinal, role, content, tool_calls, tool_call_id, summary_id \
+            "SELECT id, ordinal, role, content, tool_calls, tool_call_id, summary_id, \
+                    distilled_into \
              FROM messages \
              WHERE user_id = ? AND conversation_id = ? \
              ORDER BY ordinal",
@@ -608,6 +609,18 @@ fn canonical_ts(s: &str) -> String {
     }
 }
 
+/// Column value for a message's eviction decision (#1144), as a JSON array.
+/// No decision maps to SQL `NULL` rather than `"[]"`, so a row written before
+/// the column existed and a row no step has evicted compare equal in
+/// [`ExistingMsgRow::matches`] - otherwise every load would restate every row.
+fn distilled_into_column(msg: &Message) -> Option<String> {
+    if msg.distilled_into.is_empty() {
+        None
+    } else {
+        serde_json::to_string(&msg.distilled_into).ok()
+    }
+}
+
 async fn insert_message(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     user_id: &str,
@@ -618,8 +631,8 @@ async fn insert_message(
     sqlx::query(
         "INSERT INTO messages \
             (id, user_id, conversation_id, ordinal, role, content, \
-             tool_calls, tool_call_id, summary_id, idempotency_key) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             tool_calls, tool_call_id, summary_id, idempotency_key, distilled_into) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     // Persist the message's own monotonic UUIDv7 (assigned at creation) so the
     // id is a single source of truth from creation through storage (#1).
@@ -634,6 +647,9 @@ async fn insert_message(
     .bind(&msg.summary_id)
     // #570 Phase 1b: carried on USER rows only; NULL otherwise.
     .bind(&msg.idempotency_key)
+    // #1144: the eviction decision, beside the output rather than in place of
+    // it. NULL for every row no completed step has evicted.
+    .bind(distilled_into_column(msg))
     .execute(&mut **tx)
     .await
     .map_err(|e| CoreError::Storage(e.to_string()))?;
@@ -655,6 +671,13 @@ fn msg_from_row(r: MsgRow) -> Message {
     // Surface the persisted key (#570 Phase 1b) so a reconnecting client dedups
     // by exact match rather than a content compare.
     msg.idempotency_key = r.idempotency_key;
+    // The eviction decision (#1144), so the loading turn can rebuild the
+    // pointer for the notes that are still there.
+    msg.distilled_into = r
+        .distilled_into
+        .as_deref()
+        .and_then(|json| serde_json::from_str(json).ok())
+        .unwrap_or_default();
     msg
 }
 
@@ -696,6 +719,10 @@ struct MsgRow {
     /// The client idempotency key (#570 Phase 1b); carried onto the domain
     /// `Message` on load. Populated on USER rows only, else NULL.
     idempotency_key: Option<String>,
+    /// The scratchpad notes a completed step distilled this result into
+    /// (#1144), as a JSON array. NULL on every row no step has evicted.
+    /// SQLite has no array type, so the encoding matches `tool_calls`.
+    distilled_into: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -716,6 +743,7 @@ struct ExistingMsgRow {
     tool_calls: Option<serde_json::Value>,
     tool_call_id: Option<String>,
     summary_id: Option<String>,
+    distilled_into: Option<String>,
 }
 
 impl ExistingMsgRow {
@@ -724,7 +752,10 @@ impl ExistingMsgRow {
     /// `serde_json::Value` so key-order normalization can't cause a false
     /// mismatch; empty tool calls are stored as SQL `NULL` on both sides. The
     /// id is part of the comparison because it belongs to the message, not to
-    /// the slot.
+    /// the slot, and `distilled_into` (#1144) because a turn that evicts a
+    /// result records the decision on a row whose content it does not touch -
+    /// a comparison blind to it would skip the write and the decision would
+    /// never reach storage.
     fn matches(&self, msg: &Message) -> bool {
         self.id == msg.id
             && self.role == role_to_str(&msg.role)
@@ -732,5 +763,6 @@ impl ExistingMsgRow {
             && self.tool_call_id == msg.tool_call_id
             && self.summary_id == msg.summary_id
             && self.tool_calls == tool_calls_json(msg)
+            && self.distilled_into == distilled_into_column(msg)
     }
 }

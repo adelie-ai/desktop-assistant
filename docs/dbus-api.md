@@ -116,6 +116,35 @@ closed-gate line. Fails closed everywhere a lookup can fail: an unset value,
 a missing conversation row, a cross-user row, or a store error all resolve
 to the gate staying enforced.
 
+### `evicted_results` on `ToolUsageView` (behaviour change)
+
+**This changes what an existing reader of the tool-usage aggregate sees.**
+
+A completed agentic step drops its large tool results from the model's view
+and reads them as a short pointer to the scratchpad note it distilled them
+into. That decision is now recorded on the message row, so every later turn
+reads the pointer while the stored transcript keeps every byte the tool
+returned. Those rows are counted in `evicted_results`.
+
+Before, `evicted_results` could only be non-zero for a conversation compacted
+by an old build that overwrote the row. A non-zero count therefore meant "the
+bytes are gone and `result_bytes` under-reports what this tool cost". That is
+no longer what it means on its own.
+
+What an integrator must do:
+
+- Read `evicted_results` as "results the model reads as a pointer", not as
+  "results whose bytes are lost".
+- Do not add `evicted_results` to `result_bytes` to reconstruct an original
+  size. For a row evicted by a completed step the bytes are already counted in
+  full, because the conversation still holds them; for a row from an old build
+  they are unrecoverable and count zero. The two cannot be told apart in this
+  view.
+- A rising `evicted_results` with steady `result_bytes` is the normal, healthy
+  shape for a conversation doing long agentic work. It is not data loss.
+
+No field was added or removed, and the wire bytes are unchanged.
+
 ## Quick `busctl` examples
 
 ```bash
