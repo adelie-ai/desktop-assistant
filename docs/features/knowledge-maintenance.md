@@ -165,6 +165,85 @@ signal about whether an entry was ever retrieved or cited. Four rules bound it
    own text on its tombstone. Merges are taken before edits, since merging
    duplicates is the work consolidation exists to do.
 
+### Reading an answer that is not quite right
+
+A slice is one expensive call, it runs on a long interval, and a lost slice is
+not retried until the next run. So the answer is read leniently in its encoding
+and strictly in its values. Three things follow.
+
+**A repeated `operations` key is joined, not rejected.** Serde rejects a
+repeated field by default, so an answer that gives the key twice used to lose
+every operation in it, including the ones before the repeat. The arrays are now
+concatenated. The system prompt also asks for exactly one array, which is the
+weakest of the measures and replaces none of them.
+
+**One unreadable operation does not discard the ones around it.** Each element
+of the array is read on its own. An element that is not an operation - a merge
+with no `content`, an object with no `op`, a bare value where an object belongs
+- is set aside, and the rest of the plan applies. Every surviving operation is
+still validated against the slice, so leniency about encoding buys nothing about
+what an operation may do.
+
+**What was kept and what was set aside are both counted and logged.** The `WARN`
+line gives the two counts and, for each element it could not read, where the
+element sat, what the model said it was attempting, and what serde objected to.
+A run that changed nothing after dropping operations logs at `WARN` too, rather
+than at the `DEBUG` level a genuine no-op run uses. Salvage that quietly returns
+less than the model proposed is the same loss in a smaller number, so the counts
+reach the log rather than only the code.
+
+The element **itself** is quoted at `DEBUG`, in a bounded excerpt. A rejected
+merge or edit carries the prose the model wrote for the entry, which is a
+fragment of the user's own knowledge base, and the journal is world-readable and
+is shipped on. So the quote sits at the same level this pass already keeps a
+model-supplied delete reason at.
+
+Keeping the quote out of the `WARN` line is not enough on its own, because serde
+reports a wrong type by quoting the value: ``invalid type: string "<the whole
+value>", expected a sequence``, unbounded. A model that string-encodes an array
+instead of nesting it is an ordinary mistake, so that path is a likely one. The
+reason is therefore taken from a re-read of a copy of the element in which every
+string the model wrote has been replaced, leaving the `op` tag alone. The
+verdict is the same, the field name and the failure kind survive, and no value
+reaches the default stream. Reading the value back out of serde's message text
+would mean pattern-matching on an error string, which this codebase does not do.
+
+Serde quotes a wrong **top-level** type the same way, and there the value is the
+whole answer: an answer that is one JSON string, either fenced or bare, comes
+back as ``invalid type: string "<the entire answer>", expected ...``. Bounding
+that is not a fix, because a bounded quote is still a quote. So a wrong envelope
+type is named by its JSON type alone - "the answer is a string" - read back from
+the payload with a streaming reader, which carries no content at all. An answer
+holding no JSON value keeps serde's own message, which states a reason and a
+position and quotes nothing.
+
+The `op` tag is the one part of an element that reaches the default stream as
+the model wrote it, so it is bounded where it is rendered. Nothing can make it
+long today, because `#[serde(other)]` folds every unrecognised tag into a no-op
+that reads cleanly and never reaches the dropped path - but that is a coupling
+between two distant decisions, not a guarantee, and the bound holds if the
+coupling goes.
+
+Named tests hold each of these, driving the routes that leak rather than
+asserting the values the log line is built from.
+
+Every dropped operation is counted exactly once, whatever the outcome: when the
+rest of the answer applies, when the whole answer is unreadable, and when the
+slice fails outright. Operations lost to a truncated answer are not counted,
+because that slice is halved and recomputed and the same operations come back.
+
+Two shapes stay unrecoverable, and each keeps its own verdict:
+
+- **An answer that ended early** has no complete envelope to read elements out
+  of, so the operations before the cut are not salvaged. It stays classified as
+  truncated - a size fault - and takes the halve-and-recompute path, which is
+  the response that actually fits. The classification reads serde's structured
+  `Category::Eof` signal, never its message text.
+- **An answer whose JSON does not parse at all**, or every one of whose
+  operations is unreadable, stays a failure and names why. A plan that produced
+  no work must not look like a model that kept everything, which is the very
+  confusion this whole section exists to prevent.
+
 ## The trash: soft delete, retention, reaping
 
 Consolidation retires an entry by stamping `deleted_at`, not by deleting the
