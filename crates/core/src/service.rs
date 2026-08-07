@@ -873,18 +873,19 @@ impl<S, L, T> ConversationHandler<S, L, T> {
         let Some(read) = &self.scratchpad_get_many else {
             return;
         };
-        // The window already bounds this well below the cap; hold it to the
-        // port's documented per-call limit anyway, so the bound is the read's
-        // and not an accident of the window size.
+        // The window bounds this well below the cap today - at most one key per
+        // in-window row. Hold it to the port's documented per-call limit anyway,
+        // so the bound belongs to the read rather than to an accident of the
+        // window size or of how many notes one step may distil into.
         keys.truncate(MAX_KEYS_PER_CALL);
         let wanted = keys.len();
-        // Rows, not keys. One key can name a note under more than one subagent
-        // scope (`scratchpads` is unique on conversation + owner_todo + key),
-        // and a limit of `wanted` would then cut a later key and read it as
-        // missing. Reading a live note as missing costs only the saving, but
-        // the ceiling is free.
-        let row_limit = MAX_RESULTS_CEILING.max(wanted);
-        let notes = match read(conversation_id.0.clone(), keys, row_limit).await {
+        // The limit counts ROWS, not keys, and the two differ: one key can name
+        // a note under more than one subagent scope (`scratchpads` is unique on
+        // conversation + owner_todo + key) and this read is scope-blind. A
+        // limit of `wanted` would let duplicates crowd out a later key and read
+        // a live note as missing, which costs only the saving - but the
+        // ceiling, which is above the key cap, is free.
+        let notes = match read(conversation_id.0.clone(), keys, MAX_RESULTS_CEILING).await {
             Ok(notes) => notes,
             Err(e) => {
                 tracing::warn!(
@@ -2111,7 +2112,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
             // Owned, because the assembly below runs from a closure that
             // takes the conversation as an argument - the fold between the two
             // passes needs it mutably.
-            let anchor: Option<String> = goal.clone().or_else(|| conv.active_task.clone());
+            let anchor: Option<String> = goal.or_else(|| conv.active_task.clone());
 
             // Re-read the pad and render its surfaces for this round: the open
             // plan as a compact tree (#240), the free-form note-key index
@@ -6313,6 +6314,77 @@ mod tests {
         );
     }
 
+    /// The write is best-effort and always has been. #798 records that a
+    /// best-effort note write followed by an unconditional eviction is one of
+    /// the two ways raw output was lost outright, so a write that did not land
+    /// must not leave a decision behind for later turns to act on.
+    #[tokio::test]
+    async fn a_failed_note_write_records_no_eviction_decision() {
+        let (big, tools, tool_results, responses) = carry_fixture(CLEAN_TOOL);
+
+        // A pad that refuses every write, and a reader that answers as if the
+        // note were there - so only the write check can stop the decision.
+        let failing_write: ScratchpadWriteFn = Arc::new(|_conv, _notes| {
+            Box::pin(async { Err(CoreError::Storage("pad is down".into())) })
+        });
+        let generous_read: ScratchpadGetManyFn = Arc::new(|conv: String, keys: Vec<String>, _| {
+            Box::pin(async move {
+                Ok(keys
+                    .iter()
+                    .map(|k| crate::domain::ScratchpadNote::new("id", &conv, k, "a real outcome"))
+                    .collect())
+            })
+        });
+        let (_w, list, _sp) = in_memory_scratchpad();
+
+        let llm = ToolCallingLlm::new(responses);
+        let prompts = llm.prompts();
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            llm,
+            MockToolExecutor::new(tools, tool_results),
+            id_gen(),
+        )
+        .with_scratchpad_write(failing_write)
+        .with_scratchpad_list(list)
+        .with_scratchpad_get_many(generous_read);
+
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "search?".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+
+        let stored = handler.get_conversation(&conv.id).await.unwrap();
+        let result = stored
+            .messages
+            .iter()
+            .find(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some("t1"))
+            .expect("the tool result message must still exist");
+        assert!(
+            result.distilled_into.is_empty(),
+            "the note write failed, so no decision may reach the row"
+        );
+
+        handler
+            .send_prompt(
+                &conv.id,
+                "and again?".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            last_prompt_result(&prompts, "t1"),
+            big,
+            "the later turn must read the stored output"
+        );
+    }
+
     // #287 slice 6: the hard-coded complete_step cascade + its lifecycle gate.
     /// Shared record of `(conversation, owner_todo)` args the fake cascade
     /// delete was called with.
@@ -9557,6 +9629,8 @@ mod tests {
     /// prompt so a test can count how many were summariser calls.
     struct RoundCountingLlm {
         rounds: std::sync::atomic::AtomicU32,
+        /// Whether the summariser answers with nothing, so every fold declines.
+        summariser_down: bool,
         seen: Arc<Mutex<Vec<Vec<Message>>>>,
     }
 
@@ -9568,7 +9642,15 @@ mod tests {
         fn new(rounds: u32) -> Self {
             Self {
                 rounds: std::sync::atomic::AtomicU32::new(rounds),
+                summariser_down: false,
                 seen: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn with_summariser_down(rounds: u32) -> Self {
+            Self {
+                summariser_down: true,
+                ..Self::new(rounds)
             }
         }
 
@@ -9604,6 +9686,9 @@ mod tests {
                 .is_some_and(|m| m.content.starts_with(SUMMARISER_OPENING));
             self.seen.lock().unwrap().push(messages);
             if summariser {
+                if self.summariser_down {
+                    return Ok(LlmResponse::text("   "));
+                }
                 return Ok(LlmResponse::text("Active task: keep going\n- earlier work"));
             }
             let left = self
@@ -9651,9 +9736,16 @@ mod tests {
     /// made. Asserts on the way through that the turn really shrank and really
     /// folded, so a count of zero cannot pass for thrift.
     async fn summariser_calls_for_a_shrunk_turn(rounds: u32) -> usize {
+        run_a_shrunk_turn(RoundCountingLlm::new(rounds), rounds, true).await
+    }
+
+    async fn run_a_shrunk_turn(
+        llm: RoundCountingLlm,
+        rounds: u32,
+        expect_the_marker_to_move: bool,
+    ) -> usize {
         use crate::ports::llm::{BudgetSource, ContextBudget, with_context_budget};
 
-        let llm = RoundCountingLlm::new(rounds);
         let prompts = llm.prompts();
         let mut results = HashMap::new();
         results.insert(CLEAN_TOOL.to_string(), "PAYLOAD".repeat(500));
@@ -9697,12 +9789,29 @@ mod tests {
             "the fixture must actually run {rounds} rounds, saw {turn_prompts} prompts"
         );
         let after = handler.get_conversation(&conv.id).await.unwrap();
-        assert!(
+        assert_eq!(
             after.compacted_through > entry_marker,
-            "the fold must still happen, marker {} vs entry {entry_marker}",
+            expect_the_marker_to_move,
+            "marker {} vs entry {entry_marker}",
             after.compacted_through
         );
         summariser_calls(&prompts)
+    }
+
+    /// A summariser that is down must cost one call per turn, not one per
+    /// round. The declined fold uses up the turn's attempt for exactly this
+    /// reason: retrying it every round is the per-round cost by another name,
+    /// and it lands on a turn that is already failing to summarise.
+    #[tokio::test]
+    async fn a_declined_fold_uses_up_the_turns_one_attempt() {
+        let short = run_a_shrunk_turn(RoundCountingLlm::with_summariser_down(4), 4, false).await;
+        let long = run_a_shrunk_turn(RoundCountingLlm::with_summariser_down(12), 12, false).await;
+        assert_eq!(
+            (short, long),
+            (2, 2),
+            "one turn-entry attempt plus one declined fold, however many rounds \
+             the turn runs"
+        );
     }
 
     #[tokio::test]

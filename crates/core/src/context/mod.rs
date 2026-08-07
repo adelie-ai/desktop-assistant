@@ -1629,7 +1629,22 @@ pub(crate) async fn compact_into_summary<L: LlmClient>(
     let Some((from, to)) = compaction_range(conv, max_messages) else {
         return false;
     };
-    compact_range_into_summary(conv, from, to, llm).await
+    compact_range_into_summary(conv, from, to, llm).await == FoldResult::Moved
+}
+
+/// What one fold of a message range did.
+///
+/// [`FoldResult::Nothing`] is not a failure and costs no LLM call: the range
+/// held nothing a summary could describe, so nothing was lost by leaving it.
+/// Callers that ration fold attempts must not spend one on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FoldResult {
+    /// A summary was produced and the marker moved over the range.
+    Moved,
+    /// The range rendered to an empty transcript. No call was made.
+    Nothing,
+    /// A call was made and produced no summary. The marker stays put.
+    Failed,
 }
 
 /// Fold `conv.messages[from..to]` into the rolling summary, and advance
@@ -1643,23 +1658,23 @@ async fn compact_range_into_summary<L: LlmClient>(
     from: usize,
     to: usize,
     llm: &L,
-) -> bool {
+) -> FoldResult {
     // Bounded so one long-running summariser failure cannot grow the fold past
     // what the task model can read. The marker lands on the capped end, so
     // nothing is skipped - the rest is offered again next turn.
     let to = to.min(from + MAX_COMPACTION_SPAN).min(conv.messages.len());
     if from >= to {
-        return false;
+        return FoldResult::Nothing;
     }
     match generate_context_summary(&conv.context_summary, &conv.messages[from..to], llm).await {
         SummaryOutcome::Summarised(summary) => {
             conv.context_summary = summary;
             conv.compacted_through = to;
-            true
+            FoldResult::Moved
         }
         SummaryOutcome::NothingToSummarise => {
             tracing::debug!(from, to, "compaction range held nothing to summarise");
-            false
+            FoldResult::Nothing
         }
         SummaryOutcome::Failed => {
             tracing::warn!(
@@ -1667,7 +1682,7 @@ async fn compact_range_into_summary<L: LlmClient>(
                 to,
                 "context summary failed; the range stays uncompacted and is retried"
             );
-            false
+            FoldResult::Failed
         }
     }
 }
@@ -1680,8 +1695,9 @@ async fn compact_range_into_summary<L: LlmClient>(
 /// summariser that is down costs one call per round.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PreflightFold {
-    /// The budget check did not narrow the window past the marker. Nothing was
-    /// dropped that the summary does not already describe, and no call was made.
+    /// Nothing to do, and no call was made: either the budget check did not
+    /// narrow the window past the marker, or the range it dropped held nothing
+    /// a summary could describe. Neither spends the caller's one attempt.
     NotNeeded,
     /// The dropped range was folded in and the marker moved over it.
     Folded,
@@ -1723,6 +1739,11 @@ pub(crate) enum PreflightFold {
 /// turn assembles at the full window again and carries those messages itself.
 /// The caller assembles again after a [`PreflightFold::Folded`], so the prompt
 /// this turn sends carries the summary of what it dropped.
+///
+/// The turn's closing wind-down assembles without this. It is one message with
+/// no tools, at the point the turn is already ending, so a summariser call
+/// there would cost the user a wait for context the next turn recovers on its
+/// own.
 pub(crate) async fn compact_preflight_shrink<L: LlmClient>(
     conv: &mut Conversation,
     window_from: usize,
@@ -1741,14 +1762,16 @@ pub(crate) async fn compact_preflight_shrink<L: LlmClient>(
         from,
         window_from,
         requested_window,
-        folded,
+        ?folded,
         "the pre-flight budget check narrowed the window past the compaction \
          marker; folding what it dropped into the rolling summary"
     );
-    if folded {
-        PreflightFold::Folded
-    } else {
-        PreflightFold::Declined
+    match folded {
+        FoldResult::Moved => PreflightFold::Folded,
+        // No call was made and the range held nothing to lose, so this does not
+        // spend the turn's one attempt.
+        FoldResult::Nothing => PreflightFold::NotNeeded,
+        FoldResult::Failed => PreflightFold::Declined,
     }
 }
 
