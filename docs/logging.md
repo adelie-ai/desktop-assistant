@@ -233,6 +233,16 @@ would capture each argument by default.
 reads span fields back in process, and it reads console text, because neither
 can see what the other does.
 
+A third thing that only an in-process reader can see is **where a span ends**.
+A span's extent is decided by where its last handle drops, and the code that
+measures the same work sits somewhere else; when the two part company the
+histogram reports one number and the exported trace draws another, and only the
+trace is wrong - in the direction that blames whatever the span is named after.
+Nothing on the console shows it. `each_instrumented_call_closes_its_span_with_its_own_measurement`
+asserts each span closes before the work that follows its measurement, as an
+order rather than as a duration, because the two elapsed times overlap and a
+timing assertion would pass whichever way the code was written.
+
 One field in the turn path is written by the model: the tool name. It goes
 through `adelie_telemetry::Safe`, which caps it and replaces the characters
 that change what a reader sees. Without that, a newline in a name produces what

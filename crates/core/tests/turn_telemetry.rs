@@ -211,6 +211,21 @@ struct SpanRecord {
     name: &'static str,
     parent: Option<Id>,
     fields: HashMap<String, String>,
+    /// When the span was created.
+    opened: std::time::Instant,
+    /// How long it stayed open, once it closed. `None` while it is still open.
+    lifetime: Option<std::time::Duration>,
+    /// Where the close fell in the run's sequence of spans and events. `None`
+    /// while the span is still open.
+    ///
+    /// This is the half the harness was missing, and it is a sequence rather
+    /// than a duration on purpose. A span's *extent* is what an exported trace
+    /// draws, and it is decided by where the last handle drops - which is not
+    /// where the code measuring the same work sits. Comparing the two by
+    /// elapsed time needs the work between them to be slow enough to see, so
+    /// the assertion would be a race. Comparing *order* against a log line the
+    /// later work writes is exact.
+    closed_at: Option<usize>,
 }
 
 impl SpanRecord {
@@ -219,14 +234,34 @@ impl SpanRecord {
     }
 }
 
-/// A `tracing` layer that keeps every span it sees, with its fields and its
-/// parent, so a test can read back what a span recorded.
+/// Everything one run's subscriber saw, in order.
+#[derive(Default)]
+struct Seen {
+    spans: Vec<SpanRecord>,
+    /// `(sequence, message)` for each event, so a span's close can be placed
+    /// against the lines written before and after it.
+    events: Vec<(usize, String)>,
+    /// Monotonic across both, which is what makes the ordering comparable.
+    next_seq: usize,
+}
+
+impl Seen {
+    fn tick(&mut self) -> usize {
+        self.next_seq += 1;
+        self.next_seq
+    }
+}
+
+/// A `tracing` layer that keeps every span it sees - fields, parent, and when
+/// it closed relative to the events around it - so a test can read back both
+/// what a span recorded and how far it reached.
 #[derive(Clone, Default)]
-struct SpanCapture(Arc<Mutex<Vec<SpanRecord>>>);
+struct SpanCapture(Arc<Mutex<Seen>>);
 
 impl SpanCapture {
-    fn spans(&self) -> Vec<SpanRecord> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    fn seen(&self) -> (Vec<SpanRecord>, Vec<(usize, String)>) {
+        let seen = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        (seen.spans.clone(), seen.events.clone())
     }
 }
 
@@ -267,23 +302,49 @@ where
         // runs, so asking it is more reliable than reading the attributes -
         // which carry a parent only when the call site named one explicitly.
         let parent = ctx.span(id).and_then(|s| s.parent().map(|p| p.id()));
-        self.0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(SpanRecord {
-                id: id.clone(),
-                name: attrs.metadata().name(),
-                parent,
-                fields,
-            });
+        let mut seen = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        seen.spans.push(SpanRecord {
+            id: id.clone(),
+            name: attrs.metadata().name(),
+            parent,
+            fields,
+            opened: std::time::Instant::now(),
+            lifetime: None,
+            closed_at: None,
+        });
+    }
+
+    fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+        let mut fields = HashMap::new();
+        event.record(&mut FieldVisitor(&mut fields));
+        let message = fields.remove("message").unwrap_or_default();
+        let mut seen = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let seq = seen.tick();
+        seen.events.push((seq, message));
     }
 
     fn on_record(&self, id: &Id, values: &Record<'_>, _ctx: Context<'_, S>) {
-        let mut spans = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut seen = self.0.lock().unwrap_or_else(|e| e.into_inner());
         // Newest first: span ids are reused once a span closes, so an older
         // closed span can share this id.
-        if let Some(span) = spans.iter_mut().rev().find(|s| s.id == *id) {
+        if let Some(span) = seen.spans.iter_mut().rev().find(|s| s.id == *id) {
             values.record(&mut FieldVisitor(&mut span.fields));
+        }
+    }
+
+    fn on_close(&self, id: Id, _ctx: Context<'_, S>) {
+        let closed = std::time::Instant::now();
+        let mut seen = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let seq = seen.tick();
+        // Newest still-open span with this id: ids are reused after a close.
+        if let Some(span) = seen
+            .spans
+            .iter_mut()
+            .rev()
+            .find(|s| s.id == id && s.closed_at.is_none())
+        {
+            span.lifetime = Some(closed.saturating_duration_since(span.opened));
+            span.closed_at = Some(seq);
         }
     }
 }
@@ -292,6 +353,9 @@ where
 struct Captured {
     console: String,
     spans: Vec<SpanRecord>,
+    /// `(sequence, message)` for each event, in order, interleaved with the
+    /// span closes recorded on [`SpanRecord::closed_at`].
+    events: Vec<(usize, String)>,
     before: Summary,
     after: Summary,
 }
@@ -315,6 +379,36 @@ impl Captured {
 
     fn span_names(&self) -> Vec<&'static str> {
         self.spans.iter().map(|s| s.name).collect()
+    }
+
+    /// Where the first span of this name closed in the run's sequence.
+    fn closed_at(&self, name: &str) -> usize {
+        let spans = self.spans_named(name);
+        assert!(
+            !spans.is_empty(),
+            "no `{name}` span opened, so there is no close to place"
+        );
+        spans[0]
+            .closed_at
+            .unwrap_or_else(|| panic!("a `{name}` span never closed"))
+    }
+
+    /// Where the first event whose message contains `needle` fell in the run's
+    /// sequence.
+    fn event_at(&self, needle: &str) -> usize {
+        self.events
+            .iter()
+            .find(|(_, message)| message.contains(needle))
+            .map(|(seq, _)| *seq)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no event said {needle:?}; the run wrote {:?}",
+                    self.events
+                        .iter()
+                        .map(|(_, m)| m.as_str())
+                        .collect::<Vec<_>>()
+                )
+            })
     }
 
     fn counter_delta(&self, name: &str, label_contains: &[&str]) -> u64 {
@@ -410,9 +504,11 @@ fn capture<F: Future<Output = ()>>(level: Level, future: F) -> Captured {
     subscriber.set_default_and(|| runtime.block_on(future));
     let after = adelie_telemetry::metrics::global().dump_now();
 
+    let (spans, events) = spans.seen();
     Captured {
         console: console.text(),
-        spans: spans.spans(),
+        spans,
+        events,
         before,
         after,
     }
@@ -572,6 +668,9 @@ struct ScriptedTools {
     /// through per-turn activation. So a fleet tool the model learned about in
     /// an earlier turn is one this turn never offered and still executes.
     unadvertised: Vec<ToolDefinition>,
+    /// When set, the tool returns a multi-megabyte payload, so the loop's
+    /// post-measurement truncation costs measurable time.
+    oversized_output: bool,
 }
 
 impl ScriptedTools {
@@ -581,6 +680,7 @@ impl ScriptedTools {
             failure: None,
             cancel_after_first: false,
             unadvertised: Vec::new(),
+            oversized_output: false,
         }
     }
 
@@ -595,6 +695,7 @@ impl ScriptedTools {
                 "a fleet tool this turn never offered",
                 serde_json::json!({"type": "object"}),
             )],
+            oversized_output: false,
         }
     }
 
@@ -604,6 +705,19 @@ impl ScriptedTools {
             failure: Some(TOOL_ERROR_SENTINEL.to_string()),
             cancel_after_first: false,
             unadvertised: Vec::new(),
+            oversized_output: false,
+        }
+    }
+
+    /// A tool whose output is large enough that capping it afterwards costs
+    /// real time, which is what separates a span from its own measurement.
+    fn oversized() -> Self {
+        Self {
+            tools: vec![write_note()],
+            failure: None,
+            cancel_after_first: false,
+            unadvertised: Vec::new(),
+            oversized_output: true,
         }
     }
 
@@ -615,6 +729,7 @@ impl ScriptedTools {
             failure: None,
             cancel_after_first: true,
             unadvertised: Vec::new(),
+            oversized_output: false,
         }
     }
 }
@@ -658,6 +773,9 @@ impl ToolExecutor for ScriptedTools {
             desktop_assistant_core::ports::llm::current_cancellation_token()
                 .expect("the turn installs a cancellation token")
                 .cancel();
+        }
+        if self.oversized_output {
+            return Ok("x".repeat(OVERSIZED_TOOL_RESULT_BYTES));
         }
         match &self.failure {
             Some(message) => Err(CoreError::ToolExecution(message.clone())),
@@ -1191,6 +1309,73 @@ fn a_failing_tool_is_measured_as_a_failure() {
 }
 
 // ---------------------------------------------------------------------------
+// A span must end with the work it measures.
+// ---------------------------------------------------------------------------
+
+/// Enough tool output to make the post-measurement truncation cost real time.
+const OVERSIZED_TOOL_RESULT_BYTES: usize = 8 * 1024 * 1024;
+
+/// A cap far below that, so `cap_tool_result` genuinely truncates.
+const TOOL_RESULT_CAP_BYTES: usize = 4_096;
+
+#[test]
+fn each_instrumented_call_closes_its_span_with_its_own_measurement() {
+    let _serialised = serialised();
+    // A span's extent is decided by where its last handle drops, and the code
+    // that measures the same work sits somewhere else. When the two part
+    // company the histogram says one number and the exported trace draws
+    // another - and only the trace is wrong, in the direction that blames
+    // whatever the span is named after.
+    //
+    // Asserted as an *order*, not as a duration. The work that separates them
+    // - capping an oversized tool result - is fast enough that the two
+    // elapsed times overlap, so a timing assertion would be a race that passes
+    // whichever way the code is written. Where the close falls against a line
+    // the later work writes is exact.
+    //
+    // The tool arm needs an oversized result because the truncation line only
+    // appears when there is something to truncate.
+    let tools = ScriptedTools::oversized();
+    let captured = capture(Level::INFO, async move {
+        let handler = ConversationHandler::with_tools(
+            MemStore::default(),
+            ScriptedLlm::new(two_round_script()),
+            tools,
+            Box::new(|| CONVERSATION_ID.to_string()),
+        )
+        .with_max_tool_result_bytes(TOOL_RESULT_CAP_BYTES);
+        one_turn(&handler).await;
+    });
+
+    // The tool span must close before the loop caps its result, which happens
+    // after the measurement and costs more the larger the payload is.
+    assert!(
+        captured.closed_at("tool.call") < captured.event_at("ingestion cap"),
+        "the tool span was still open while the loop capped the result, so it \
+         reaches past the work its metric measured"
+    );
+
+    // The provider span must close before the loop reads the response it
+    // returned, which is the first thing the round does with it.
+    assert!(
+        captured.closed_at("llm.call") < captured.event_at("LLM requested"),
+        "the provider span was still open while the round processed the \
+         response, so it reaches past the call its metric measured"
+    );
+
+    // And every instrumented span must actually close, or the two assertions
+    // above are comparing against a span that is simply never accounted for.
+    for name in ["turn", "turn.round", "llm.call", "tool.call"] {
+        for span in captured.spans_named(name) {
+            assert!(
+                span.lifetime.is_some(),
+                "a `{name}` span never closed, so nothing exports its duration"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The level contract (epic D10), on the new surface.
 // ---------------------------------------------------------------------------
 
@@ -1431,6 +1616,7 @@ fn a_model_chosen_tool_name_cannot_forge_a_log_line() {
         failure: None,
         cancel_after_first: false,
         unadvertised: Vec::new(),
+        oversized_output: false,
     };
     let captured = run(Level::INFO, script, tools);
 
