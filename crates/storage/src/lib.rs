@@ -44,7 +44,7 @@ pub use database::{
 };
 pub use error_classifications::PgErrorClassificationStore;
 pub use idempotency_keys::PgIdempotencyKeyStore;
-pub use knowledge::PgKnowledgeBaseStore;
+pub use knowledge::{NearestEntries, PgKnowledgeBaseStore, RECALL_SCAN_STATEMENT_TIMEOUT};
 pub use knowledge_use::PgKnowledgeUseLog;
 pub use migrate_json::{
     is_conversations_table_empty, is_knowledge_base_table_empty, migrate_conversations,

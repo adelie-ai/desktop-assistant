@@ -542,10 +542,11 @@ impl PgScratchpadStore {
     /// distance that put them there, nearest first.
     ///
     /// A plain vector search rather than the hybrid [`ScratchpadStore::search`],
-    /// because the block applies a relevance floor and a fused RRF score is not
-    /// a quantity a floor can be set against: over a hybrid search every row
-    /// scores non-zero against any query. A cosine distance is comparable, so a
-    /// floor over it means something.
+    /// because the block reads each candidate against the spread of its
+    /// source's own distances, and a fused RRF score is not a quantity that has
+    /// a spread of that kind: over a hybrid search every row scores non-zero
+    /// against any query. A cosine distance is comparable, so a distribution
+    /// over it means something.
     ///
     /// Scoped by an explicit `WHERE user_id` **and** `conversation_id`
     /// predicate, plus the caller's `owner_todo` read snapshot - the same three

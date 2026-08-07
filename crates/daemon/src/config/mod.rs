@@ -180,8 +180,8 @@ pub struct DaemonConfig {
 /// assistant's memory before the model sees it.
 ///
 /// On by default. The lookup costs one embedding and two indexed reads per
-/// turn, and the block it produces stays silent unless something clears its
-/// relevance floor - but it does fire on every prompt, so an operator who does
+/// turn, and the block it produces stays silent unless something stands out
+/// from the store - but it does fire on every prompt, so an operator who does
 /// not want that spend has one switch for it.
 ///
 /// Turning it off restores exactly the behaviour that preceded the feature: the
@@ -193,14 +193,14 @@ pub struct RecallConfig {
     /// configured.
     #[serde(default = "default_recall_enabled")]
     pub enabled: bool,
-    /// How many knowledge lines the `[Recall]` block may show.
+    /// The most knowledge lines the `[Recall]` block may show.
     ///
-    /// Absent means the built-in default. That default is held below the width
-    /// the block's token budget derives, because the relevance floor admits
-    /// candidates for a prompt that asks nothing - see
-    /// `desktop_assistant_core::recall`, which states both numbers. State a
-    /// value here to take the wider index now, or to hold a narrower block on a
-    /// model with a small context window.
+    /// Absent means the built-in default, which is the width the block's token
+    /// budget pays for - see `desktop_assistant_core::recall`. It is a safety
+    /// cap rather than a target: how many lines a prompt renders is decided by
+    /// how far its candidates stand out from the store, and most prompts render
+    /// fewer. State a value here to hold a narrower block on a model with a
+    /// small context window.
     ///
     /// The value is held to what the block can honestly render: at least one
     /// line, and never more lines than the lookup reads, because a block that

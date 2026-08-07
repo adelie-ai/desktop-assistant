@@ -1,26 +1,33 @@
 //! Adapter behind the pre-prompt recall port (#1100, #1101).
 //!
-//! One user prompt, one embedding, three indexes. The knowledge base answers
-//! with the entries nearest the prompt and how near each is; this
-//! conversation's scratchpad answers the same way about its own notes; the tag
-//! registry answers with the names of the tags nearest the prompt, read from
-//! vectors the near-duplicate check already built. The core decides what clears
-//! its relevance floor and how the `[Recall]` block reads.
+//! One user prompt, one embedding, two indexes. The knowledge base answers with
+//! the entries nearest the prompt and how near each is; this conversation's
+//! scratchpad answers the same way about its own notes. The core decides what
+//! clears the bar and how the `[Recall]` block reads.
+//!
+//! ## What a distance is worth, and who says so
+//!
+//! A cosine distance means nothing on its own, so the core reads each candidate
+//! against the spread of the source it came from. Only the store can say what
+//! its own geometry is, so the knowledge arm's read answers with both: the
+//! candidates, and the spread of the same query's distances over every row the
+//! scan could reach. One scan states both, so the spread always describes the
+//! query whose candidates it grades.
 //!
 //! ## Recall never fails a turn
 //!
 //! The embedding call is bounded by [`EMBED_TIMEOUT`], the same ceiling the
 //! knowledge-base search tool already applies. On timeout, or on an embedding
-//! error, the knowledge and scratchpad arms degrade to full-text search (the
-//! precedent is #195) and the tag arm goes quiet, because the registry carries
-//! no full-text index to fall back to. A degradation is logged once, here,
-//! rather than once per arm.
+//! error, both arms degrade to full-text search (the precedent is #195) and no
+//! dispersion is measured, because a full-text match carries no distance to read
+//! against one. A degradation is logged once, here, rather than once per arm.
 //!
 //! An arm that fails outright is a narrower loss than a lookup that fails. The
-//! scratchpad arm reads a different table from the other two, so it can fail on
-//! its own, and when it does it costs its own lines and nothing else - see
-//! [`notes_or_none`]. If a degraded read fails as well, the error travels to the
-//! caller, which drops the block and runs the turn.
+//! scratchpad arm reads a different table from the knowledge arm, so it can fail
+//! on its own, and when it does it costs its own lines and nothing else - see
+//! [`notes_or_none`]. The measurement carries its own ceiling for the same
+//! reason. If a degraded read fails as well, the error travels to the caller,
+//! which drops the block and runs the turn.
 //!
 //! The whole lookup carries a second ceiling, [`RECALL_CALL_CEILING`], because
 //! the embedding timeout bounds only the embedding: the database round trips
@@ -36,8 +43,8 @@ use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::ScratchpadNote;
 use desktop_assistant_core::ports::embedding::{EMBED_TIMEOUT, EmbedFn};
 use desktop_assistant_core::ports::recall::{
-    RecallCandidates, RecallEntry, RecallNote, RecallRelevance, RecallRequest, RecallSearchFn,
-    RecallTag,
+    RecallCandidates, RecallDispersion, RecallEntry, RecallNote, RecallRelevance, RecallRequest,
+    RecallSearchFn,
 };
 use desktop_assistant_storage::{PgKnowledgeBaseStore, PgPool, PgScratchpadStore};
 
@@ -71,19 +78,10 @@ pub fn build_recall_search(
     Arc::new(move |request: RecallRequest| {
         let kb_store = Arc::clone(&kb_store);
         let pad = Arc::clone(&pad);
-        let pool = pool.clone();
         let embed = Arc::clone(&embed);
         let embedding_model = embedding_model.clone();
         Box::pin(async move {
-            within_ceiling(lookup(
-                &kb_store,
-                &pad,
-                &pool,
-                &embed,
-                &embedding_model,
-                request,
-            ))
-            .await
+            within_ceiling(lookup(&kb_store, &pad, &embed, &embedding_model, request)).await
         })
     })
 }
@@ -108,31 +106,32 @@ async fn within_ceiling(
 async fn lookup(
     kb_store: &PgKnowledgeBaseStore,
     pad: &PgScratchpadStore,
-    pool: &PgPool,
     embed: &EmbedFn,
     embedding_model: &str,
     request: RecallRequest,
 ) -> Result<RecallCandidates, CoreError> {
     let Some(vector) = embed_prompt(embed, &request.prompt).await else {
-        // Degraded: full-text for the entries and the notes, silence for the
-        // tags.
+        // Degraded: full-text for both arms, and no dispersion. A full-text row
+        // carries no distance, so there is nothing to read against a spread.
         //
         // `search_text_any_term` on both, not the trait's `search_text`: that
         // one joins the query's lexemes with AND, which asks a whole user
         // sentence to appear in one row and answers almost nothing.
         return gather(
             async {
-                Ok(kb_store
-                    .search_text_any_term(&request.prompt, request.entry_limit)
-                    .await?
-                    .into_iter()
-                    .map(|entry| RecallEntry {
-                        entry,
-                        relevance: RecallRelevance::LexicalMatch,
-                    })
-                    .collect())
+                Ok((
+                    kb_store
+                        .search_text_any_term(&request.prompt, request.entry_limit)
+                        .await?
+                        .into_iter()
+                        .map(|entry| RecallEntry {
+                            entry,
+                            relevance: RecallRelevance::LexicalMatch,
+                        })
+                        .collect(),
+                    None,
+                ))
             },
-            async { Ok(Vec::new()) },
             async {
                 Ok(pad
                     .search_text_any_term(
@@ -149,35 +148,24 @@ async fn lookup(
         .await;
     };
 
-    // Every arm shares the one vector, and none depends on another.
-    let vector_for_tags = vector.clone();
+    // Both arms share the one vector, and neither depends on the other.
     let vector_for_notes = vector.clone();
     gather(
         async {
-            Ok(kb_store
+            let found = kb_store
                 .nearest_by_embedding(vector, embedding_model, request.entry_limit)
-                .await?
-                .into_iter()
-                .map(|(entry, distance)| RecallEntry {
-                    entry,
-                    relevance: RecallRelevance::Distance(distance),
-                })
-                .collect())
-        },
-        async {
-            Ok(desktop_assistant_storage::tag_registry::nearest_tags(
-                pool,
-                vector_for_tags,
-                embedding_model,
-                request.tag_limit,
-            )
-            .await?
-            .into_iter()
-            .map(|(name, distance)| RecallTag {
-                name,
-                relevance: RecallRelevance::Distance(distance),
-            })
-            .collect())
+                .await?;
+            Ok((
+                found
+                    .entries
+                    .into_iter()
+                    .map(|(entry, distance)| RecallEntry {
+                        entry,
+                        relevance: RecallRelevance::Distance(distance),
+                    })
+                    .collect(),
+                found.dispersion,
+            ))
         },
         async {
             Ok(pad
@@ -196,7 +184,7 @@ async fn lookup(
     .await
 }
 
-/// Run the three arms together and fold what they answered into one candidate
+/// Run the two arms together and fold what they answered into one candidate
 /// set.
 ///
 /// Generic over the futures, and separate from [`lookup`], so both halves of
@@ -204,26 +192,57 @@ async fn lookup(
 /// hold either to anything.
 ///
 /// **`join!`, never `try_join!`.** The arms do not depend on each other, and one
-/// arm's error must not cancel the two that were answering.
+/// arm's error must not cancel the one that was answering.
 ///
-/// **The scratchpad arm's error is absorbed; the other two propagate.** A
+/// **The scratchpad arm's error is absorbed; the knowledge arm's propagates.** A
 /// knowledge arm that cannot read is the block's whole point failing, and the
 /// caller drops the block and runs the turn anyway; losing the pad lines is the
 /// smaller loss, so it is taken here rather than passed on. The absorbed arm
-/// resolves first, so its failure is logged even on the turn where another
+/// resolves first, so its failure is logged even on the turn where the other
 /// arm's error is about to end the lookup.
+///
+/// The knowledge arm answers with the store's own spread beside its candidates,
+/// because one scan states both.
 async fn gather(
-    entries: impl Future<Output = Result<Vec<RecallEntry>, CoreError>>,
-    tags: impl Future<Output = Result<Vec<RecallTag>, CoreError>>,
+    entries: impl Future<Output = Result<(Vec<RecallEntry>, Option<RecallDispersion>), CoreError>>,
     notes: impl Future<Output = Result<Vec<RecallNote>, CoreError>>,
 ) -> Result<RecallCandidates, CoreError> {
-    let (entries, tags, notes) = tokio::join!(entries, tags, notes);
+    let (entries, notes) = tokio::join!(entries, notes);
     let notes = notes_or_none(notes);
+    let (entries, entry_dispersion) = entries?;
+    // Which sources stated their own geometry, and which the block will read by
+    // a stated estimate. Without this an operator meeting a block that is
+    // quieter than expected cannot tell whether the dimensionless bar is in
+    // force or whether a fixed distance is deciding, and the whole point of the
+    // bar is that no fixed distance decides.
+    tracing::debug!(
+        knowledge = how_the_distances_are_read(entry_dispersion),
+        scratchpad = how_the_distances_are_read(None),
+        "recall: how each source's distances are read"
+    );
     Ok(RecallCandidates {
-        entries: entries?,
+        entries,
         notes,
-        tags: tags?,
+        entry_dispersion,
+        // The pad is read against the stated estimate. One conversation's pad
+        // rarely holds enough rows for a median absolute deviation over it to
+        // be a measurement rather than noise, and the pad read is already the
+        // block's most expensive query - see #1146.
+        note_dispersion: None,
     })
+}
+
+/// Whether the block will read a source by what that source measured, or by the
+/// stated estimate it falls back to.
+///
+/// Two static words, and nothing of what the source holds: this line runs on
+/// every turn, and a log that carried a key or a line of an entry would put
+/// personal content in the journal for the sake of an operational fact.
+fn how_the_distances_are_read(dispersion: Option<RecallDispersion>) -> &'static str {
+    match dispersion {
+        Some(_) => "measured",
+        None => "estimated",
+    }
 }
 
 /// One stored note as a recall candidate.
@@ -242,11 +261,11 @@ fn to_recall_note(note: ScratchpadNote, relevance: RecallRelevance) -> RecallNot
 
 /// The scratchpad arm's rows, or none.
 ///
-/// The arm reads a different table from the other two, so it fails on its own -
-/// and when it does it must cost its own lines and nothing else. The knowledge
-/// and tag arms still render, and the turn never sees the error.
+/// The arm reads a different table from the knowledge arm, so it fails on its
+/// own - and when it does it must cost its own lines and nothing else. The
+/// knowledge arm still renders, and the turn never sees the error.
 ///
-/// This is deliberately narrower than the treatment the other two arms get: a
+/// This is deliberately narrower than the treatment the knowledge arm gets: a
 /// knowledge arm that cannot read is the block's whole point failing, so that
 /// error travels to the caller, which drops the block and runs the turn anyway.
 /// Losing the pad lines is a smaller loss than losing the block.
@@ -271,14 +290,14 @@ async fn embed_prompt(embed: &EmbedFn, prompt: &str) -> Option<Vec<f32>> {
         Ok(Err(e)) => {
             tracing::warn!(
                 error = %e,
-                "recall: embedding failed; degrading to full-text and skipping the tag arm"
+                "recall: embedding failed; degrading to full-text and measuring no dispersion"
             );
             None
         }
         Err(_) => {
             tracing::warn!(
                 timeout = ?EMBED_TIMEOUT,
-                "recall: embedding timed out; degrading to full-text and skipping the tag arm"
+                "recall: embedding timed out; degrading to full-text and measuring no dispersion"
             );
             None
         }
@@ -288,6 +307,7 @@ async fn embed_prompt(embed: &EmbedFn, prompt: &str) -> Option<Vec<f32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use desktop_assistant_storage::RECALL_SCAN_STATEMENT_TIMEOUT;
 
     /// An embedding backend that answers with `answer`, after `delay`.
     fn backend(answer: Result<Vec<Vec<f32>>, CoreError>, delay: std::time::Duration) -> EmbedFn {
@@ -364,17 +384,14 @@ mod tests {
         let answer = within_ceiling(async {
             tokio::time::sleep(RECALL_CALL_CEILING / 2).await;
             Ok(RecallCandidates {
-                tags: vec![RecallTag {
-                    name: "topic:mine".into(),
-                    relevance: RecallRelevance::Distance(0.1),
-                }],
+                entries: vec![an_entry()],
                 ..RecallCandidates::default()
             })
         })
         .await
         .expect("inside the ceiling the answer travels");
 
-        assert_eq!(answer.tags.len(), 1);
+        assert_eq!(answer.entries.len(), 1);
     }
 
     fn an_entry() -> RecallEntry {
@@ -384,11 +401,9 @@ mod tests {
         }
     }
 
-    fn a_tag() -> RecallTag {
-        RecallTag {
-            name: "topic:mine".into(),
-            relevance: RecallRelevance::Distance(0.12),
-        }
+    /// A store that measured its own geometry.
+    fn a_dispersion() -> RecallDispersion {
+        RecallDispersion::measured(0.80, 0.06, 400).expect("a store's own statistics")
     }
 
     fn a_note() -> RecallNote {
@@ -401,14 +416,13 @@ mod tests {
     }
 
     /// Acceptance (#1101): the scratchpad arm reads a different table from the
-    /// other two, so it fails on its own. When it does it costs its own lines
-    /// and nothing else - the knowledge and tag arms still render, and the turn
+    /// knowledge arm, so it fails on its own. When it does it costs its own
+    /// lines and nothing else - the knowledge arm still renders, and the turn
     /// never sees the error.
     #[tokio::test]
     async fn recall_block_survives_the_scratchpad_arm_failing() {
         let candidates = gather(
-            async { Ok(vec![an_entry()]) },
-            async { Ok(vec![a_tag()]) },
+            async { Ok((vec![an_entry()], Some(a_dispersion()))) },
             async { Err(CoreError::Storage("the pad read failed".into())) },
         )
         .await
@@ -419,7 +433,6 @@ mod tests {
             1,
             "the knowledge arm still renders"
         );
-        assert_eq!(candidates.tags.len(), 1, "and so does the tag arm");
         assert!(
             candidates.notes.is_empty(),
             "the failed arm contributes none"
@@ -428,7 +441,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_scratchpad_arm_passes_its_rows_through_when_it_answers() {
-        let candidates = gather(async { Ok(vec![]) }, async { Ok(vec![]) }, async {
+        let candidates = gather(async { Ok((vec![], Some(a_dispersion()))) }, async {
             Ok(vec![a_note()])
         })
         .await
@@ -438,6 +451,50 @@ mod tests {
         assert_eq!(candidates.notes[0].key, "deploy-window");
     }
 
+    /// The log an operator reads to tell whether the bar is in force: two
+    /// static words, one per source, and nothing of what either holds.
+    #[test]
+    fn the_log_says_which_sources_measured_and_which_were_estimated() {
+        assert_eq!(
+            how_the_distances_are_read(Some(a_dispersion())),
+            "measured",
+            "a source that stated its own geometry is read by it"
+        );
+        assert_eq!(
+            how_the_distances_are_read(None),
+            "estimated",
+            "and a source that stated none is read by a fixed distance, which is the fact \
+             worth surfacing"
+        );
+    }
+
+    /// The spread the core reads a distance against travels with the candidates
+    /// it grades, so one turn's block is graded by one turn's geometry.
+    #[tokio::test]
+    async fn the_measured_dispersion_travels_with_the_candidates() {
+        let candidates = gather(
+            async { Ok((vec![an_entry()], Some(a_dispersion()))) },
+            async { Ok(vec![]) },
+        )
+        .await
+        .expect("every arm answered");
+
+        assert_eq!(candidates.entry_dispersion, Some(a_dispersion()));
+    }
+
+    /// A store that could not be measured costs the block its unit and nothing
+    /// else: the candidates still travel, and the core falls back to its stated
+    /// estimate.
+    #[tokio::test]
+    async fn a_store_that_cannot_be_measured_still_answers_with_its_candidates() {
+        let candidates = gather(async { Ok((vec![an_entry()], None)) }, async { Ok(vec![]) })
+            .await
+            .expect("a measurement is not what the lookup is for");
+
+        assert_eq!(candidates.entries.len(), 1);
+        assert_eq!(candidates.entry_dispersion, None);
+    }
+
     /// The asymmetry, stated as a test so it cannot be levelled by accident.
     /// The knowledge arm is the block's whole point, so its error ends the
     /// lookup and the caller drops the block.
@@ -445,7 +502,6 @@ mod tests {
     async fn a_failing_knowledge_arm_ends_the_lookup() {
         let answer = gather(
             async { Err(CoreError::Storage("the store is down".into())) },
-            async { Ok(vec![a_tag()]) },
             async { Ok(vec![a_note()]) },
         )
         .await;
@@ -453,9 +509,9 @@ mod tests {
         assert!(answer.is_err());
     }
 
-    /// The arms must run together, not one after another: three reads and an
-    /// embedding sit inside a ten-second whole-lookup ceiling, and a serial
-    /// fold would spend the budget three times over.
+    /// The arms must run together, not one after another: two reads and an
+    /// embedding sit inside a ten-second whole-lookup ceiling, and a serial fold
+    /// would spend the budget twice over.
     #[tokio::test(start_paused = true)]
     async fn the_arms_run_together_rather_than_one_after_another() {
         let hold = std::time::Duration::from_secs(4);
@@ -464,11 +520,7 @@ mod tests {
         gather(
             async move {
                 tokio::time::sleep(hold).await;
-                Ok(vec![an_entry()])
-            },
-            async move {
-                tokio::time::sleep(hold).await;
-                Ok(vec![a_tag()])
+                Ok((vec![an_entry()], Some(a_dispersion())))
             },
             async move {
                 tokio::time::sleep(hold).await;
@@ -476,12 +528,30 @@ mod tests {
             },
         )
         .await
-        .expect("all three answered");
+        .expect("both arms answered");
 
         assert!(
             started.elapsed() < hold * 2,
-            "three arms took {:?}, which is serial rather than concurrent",
+            "two reads took {:?}, which is serial rather than concurrent",
             started.elapsed()
+        );
+    }
+
+    // --- The ceilings the reads sit inside (#1121) --------------------------
+
+    /// The embedding and the scan run one after the other - the arms cannot
+    /// start until the vector exists - so what the whole lookup has to hold is
+    /// their sum. Three constants in three crates, and nothing but this says
+    /// they add up: raising either of the first two is what would break it, and
+    /// neither sits beside this ceiling.
+    #[test]
+    fn the_embedding_and_the_scan_together_stay_inside_the_lookups_ceiling() {
+        let worst = EMBED_TIMEOUT + RECALL_SCAN_STATEMENT_TIMEOUT;
+        assert!(
+            worst < RECALL_CALL_CEILING,
+            "an embedding at {EMBED_TIMEOUT:?} and a scan at \
+             {RECALL_SCAN_STATEMENT_TIMEOUT:?} spend {worst:?} of the {RECALL_CALL_CEILING:?} \
+             the whole lookup has, so the lookup is what gives up first and the block is dropped"
         );
     }
 
