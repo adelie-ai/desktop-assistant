@@ -1,0 +1,69 @@
+# What the daemon needs in order to export, added to its pod only when this
+# component is enabled.
+#
+# It lives here rather than in the base because every line of it is about the
+# collector this component deploys. `OTEL_EXPORTER_OTLP_ENDPOINT` names the
+# `otel-collector` Service, which does not exist without this component - in the
+# base it would be a manifest describing something that is not there. The grace
+# period protects the flush, and with the component off there is nothing to
+# flush.
+#
+# So an overlay that does not opt in renders no telemetry at all, not even a pod
+# template that mentions it, and applying this change to such an overlay restarts
+# nothing.
+#
+# The variables do nothing unless the image was built with `--build-arg OTEL=1`,
+# because a default image contains no exporter. See ../../README.md
+# ("Telemetry").
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: adele-daemon
+spec:
+  template:
+    spec:
+      # Stated rather than inherited. Kubernetes stops every pod with SIGTERM,
+      # and the daemon handles it: it stops accepting work, and the telemetry
+      # guard drops after the shutdown completes, flushing whatever the three
+      # OTLP pipelines still hold. That flush has a 5-second budget, so 30
+      # seconds is ample - but 30 is also the current default, and a cluster
+      # that changed its default would silently start discarding the last window
+      # of every rollout, eviction and restart.
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: daemon
+          env:
+            # The node-local collector: the Service sets
+            # internalTrafficPolicy: Local, so this plain name resolves to the
+            # DaemonSet pod on this pod's own node.
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://otel-collector:4317"
+            # gRPC needs a Tokio runtime at telemetry init. The daemon is a
+            # Tokio binary, so this holds; a workload that is not sets
+            # http/protobuf and port 4318 instead.
+            - name: OTEL_EXPORTER_OTLP_PROTOCOL
+              value: "grpc"
+            # OTEL_SERVICE_NAME is deliberately absent. Each binary sets its own
+            # service.name in code (the daemon reports `adele-daemon`), and the
+            # SDK's resource builder lets that override the variable, so setting
+            # it here would look meaningful and change nothing. Which instance a
+            # signal came from is carried by the attributes below instead, which
+            # keeps one backend query working across every namespace.
+            - name: K8S_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: K8S_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: K8S_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            # Interpolated from the three variables defined above it, the same
+            # way DESKTOP_ASSISTANT_DATABASE_URL is in the base. Kubernetes
+            # expands $(VAR) only from entries that come earlier in the final
+            # list, so the order here is load-bearing.
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: "k8s.namespace.name=$(K8S_NAMESPACE),k8s.pod.name=$(K8S_POD_NAME),k8s.node.name=$(K8S_NODE_NAME)"

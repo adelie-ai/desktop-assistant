@@ -1,0 +1,110 @@
+# An OpenTelemetry Collector, one pod per node, receiving OTLP from the
+# workloads on that node and forwarding all three signals to the backend an
+# overlay names in otel-collector-config.yaml.
+#
+# A DaemonSet rather than a Deployment: every node's telemetry then leaves the
+# node through an agent on that node, so the hop is local, the fan-in to the
+# backend is one connection per node instead of one per pod, and a collector pod
+# restarting costs one node rather than the instance.
+#
+# Nothing here is needed to run the daemon. A namespace with no collector, or
+# with the collector deleted, runs exactly as before: export fails, the console
+# layer and the periodic metrics summary carry on.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: otel-collector
+spec:
+  selector:
+    matchLabels:
+      app: otel-collector
+  template:
+    metadata:
+      labels:
+        app: otel-collector
+    spec:
+      containers:
+        - name: collector
+          # The core distribution, not contrib: this pipeline uses only the otlp
+          # receiver, the batch and memory_limiter processors and the otlp
+          # exporter, all of which core carries. An overlay that needs a
+          # vendor-specific exporter swaps the image for contrib.
+          image: otel/opentelemetry-collector:0.158.0
+          args: ["--config=/conf/config.yaml"]
+          # Where this collector forwards to. The pipeline reads both through
+          # `${env:...}`, so an overlay names its backend by patching these two
+          # values rather than by copying the whole pipeline file.
+          #
+          # BOTH ARE PLACEHOLDERS. An overlay that does not replace them gets a
+          # collector that starts, looks healthy, and drops everything at the
+          # last hop - the exporter dials the backend only when it has data, so
+          # nothing complains until telemetry is already being lost. See
+          # ../../README.md ("Telemetry").
+          env:
+            - name: OTLP_BACKEND_ENDPOINT
+              value: "otlp-backend.example.com:4317"
+            - name: OTLP_BACKEND_INSECURE
+              value: "false"
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+            - name: otlp-http
+              containerPort: 4318
+          # Deliberately no hostPort. A host port is a node-wide claim, so a
+          # second instance of this base in the same cluster would never
+          # schedule: its DaemonSet pods stay Pending with "didn't have free
+          # ports for the requested pod ports". The Service below keeps the hop
+          # on the node without claiming anything outside the namespace.
+          volumeMounts:
+            - name: config
+              mountPath: /conf
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              # Above memory_limiter's limit_mib + spike_limit_mib, so the
+              # processor sheds load before the kernel kills the container.
+              memory: 512Mi
+          # A TCP probe rather than the health-check extension, which the core
+          # distribution does not carry. The port answering is what a workload
+          # needs to be true.
+          readinessProbe:
+            tcpSocket:
+              port: 4317
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 4317
+            initialDelaySeconds: 15
+            periodSeconds: 20
+      volumes:
+        - name: config
+          configMap:
+            name: otel-collector-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collector
+spec:
+  selector:
+    app: otel-collector
+  # Route only to the collector pod on the caller's own node. This is what makes
+  # a plain Service name behave like a node-local agent address, so a workload
+  # needs no downward API and the manifest needs no host port.
+  #
+  # The cost is stated rather than hidden: while a node has no ready collector
+  # pod - during a collector rollout, or on a node the DaemonSet cannot schedule
+  # on - telemetry from that node is dropped rather than sent elsewhere. That is
+  # the same failure a node-local agent has always had, and it costs telemetry
+  # only; the workload is unaffected.
+  internalTrafficPolicy: Local
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: 4317
+    - name: otlp-http
+      port: 4318
+      targetPort: 4318

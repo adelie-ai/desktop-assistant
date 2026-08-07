@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
-# Named-check assertions for the telemetry deploy (deploy/k8s/base/otel-collector.yaml,
-# deploy/k8s/base/otel-collector-config.yaml and the OTEL_* wiring in
-# deploy/k8s/base/daemon.yaml). These are manifest-shape tests, not a live-cluster
-# run: they read the manifests and assert the deploy exports all three signals to a
-# node-local collector that an overlay points at a backend. Never contacts the API
-# server.
+# Named-check assertions for the telemetry deploy: the opt-in component under
+# deploy/k8s/components/telemetry/, its collector, its pipeline, and
+# the patch it carries for the daemon. These are manifest-shape tests, not a live-cluster
+# run: they read the manifests and assert that an overlay which opts in exports all
+# three signals to a node-local collector, and that one which does not gets no
+# collector at all. Never contacts the API server.
 #
 # Named checks (legible from output, one requirement each):
 #   otel_collector_receives_otlp_over_grpc_and_http
 #   otel_collector_pipes_all_three_signals
 #   otel_collector_batches_before_it_exports
 #   otel_collector_backend_is_an_overlay_placeholder
-#   otel_collector_is_a_daemonset_registered_in_the_base
+#   the_base_alone_carries_no_telemetry
+#   otel_collector_is_a_component_an_overlay_opts_into
 #   otel_collector_config_change_rolls_the_pods
 #   daemon_exports_to_the_node_local_collector
 #   daemon_labels_its_telemetry_with_namespace_pod_and_node
@@ -40,25 +41,37 @@ while [ $# -gt 0 ]; do
 done
 
 base="${repo_root}/deploy/k8s/base"
-collector="${base}/otel-collector.yaml"
-collector_config="${base}/otel-collector-config.yaml"
-daemon="${base}/daemon.yaml"
+component="${repo_root}/deploy/k8s/components/telemetry"
+collector="${component}/otel-collector.yaml"
+collector_config="${component}/otel-collector-config.yaml"
+component_kustomization="${component}/kustomization.yaml"
+daemon="${component}/daemon-telemetry.yaml"
+base_daemon="${base}/daemon.yaml"
 kustomization="${base}/kustomization.yaml"
 
-for f in "${collector}" "${collector_config}" "${daemon}" "${kustomization}"; do
+for f in "${collector}" "${collector_config}" "${component_kustomization}" "${daemon}" \
+         "${base_daemon}" "${kustomization}"; do
     if [ ! -f "${f}" ]; then
         echo "FAIL: required file missing: ${f}" >&2
         exit 1
     fi
 done
 
-python3 - "${collector}" "${collector_config}" "${daemon}" "${kustomization}" <<'PY'
+python3 - "${collector}" "${collector_config}" "${daemon}" "${kustomization}" \
+    "${component_kustomization}" "${base_daemon}" <<'PY'
 import re
 import sys
 
 import yaml
 
-collector_path, collector_config_path, daemon_path, kustomization_path = sys.argv[1:5]
+(
+    collector_path,
+    collector_config_path,
+    daemon_path,
+    kustomization_path,
+    component_kustomization_path,
+    base_daemon_path,
+) = sys.argv[1:7]
 
 failures = []
 
@@ -86,6 +99,9 @@ def only(items, what, path):
 collector_docs = docs(collector_path)
 daemon_docs = docs(daemon_path)
 kustomization = only(docs(kustomization_path), "kustomization", kustomization_path)
+component = only(
+    docs(component_kustomization_path), "component", component_kustomization_path
+)
 
 daemonset = only(
     [d for d in collector_docs if d.get("kind") == "DaemonSet"], "DaemonSet", collector_path
@@ -104,6 +120,7 @@ with open(collector_config_path) as fh:
 daemon_deployment = only(
     [d for d in daemon_docs if d.get("kind") == "Deployment"], "Deployment", daemon_path
 )
+base_daemon_text = open(base_daemon_path).read()
 daemon_pod = daemon_deployment["spec"]["template"]["spec"]
 daemon_container = only(
     [c for c in daemon_pod.get("containers", []) if c.get("name") == "daemon"],
@@ -145,20 +162,31 @@ check(
 )
 
 # --- otel_collector_pipes_all_three_signals ----------------------------------
+# The exporter is followed by name rather than assumed to be called `otlp`: the
+# collector renamed that one to `otlp_grpc` and kept the old name as a
+# deprecated alias, and an overlay may use `otlphttp` instead.
 pipelines = pipeline.get("service", {}).get("pipelines", {})
-wired = {
-    signal: pipelines.get(signal, {})
-    for signal in ("traces", "metrics", "logs")
-}
+declared_exporters = pipeline.get("exporters", {})
+wired = {signal: pipelines.get(signal, {}) for signal in ("traces", "metrics", "logs")}
+
+
+def exporters_of(one_pipeline):
+    return [
+        name
+        for name in (one_pipeline.get("exporters") or [])
+        if name.startswith("otlp") and name in declared_exporters
+    ]
+
+
 all_three = all(
-    "otlp" in (p.get("receivers") or []) and "otlp" in (p.get("exporters") or [])
-    for p in wired.values()
+    "otlp" in (p.get("receivers") or []) and exporters_of(p) for p in wired.values()
 )
 check(
     "otel_collector_pipes_all_three_signals",
     all_three,
-    "traces, metrics and logs must each run from the otlp receiver to the otlp "
-    f"exporter; found {sorted(pipelines)}",
+    "traces, metrics and logs must each run from the otlp receiver to a declared "
+    f"OTLP exporter; found pipelines {sorted(pipelines)} and exporters "
+    f"{sorted(declared_exporters)}",
 )
 
 # --- otel_collector_batches_before_it_exports --------------------------------
@@ -169,24 +197,80 @@ check(
 )
 
 # --- otel_collector_backend_is_an_overlay_placeholder ------------------------
-# The base names no backend. An overlay replaces this file with its own, so the
-# endpoint here must be a placeholder rather than a reachable host.
-endpoint = str(pipeline.get("exporters", {}).get("otlp", {}).get("endpoint", ""))
+# This repo names no backend. Every endpoint a pipeline can reach comes from the
+# environment, so an overlay supplies it by patching the DaemonSet rather than by
+# copying this file - and the default that ships here is a placeholder rather
+# than a reachable host.
+used = sorted({name for p in wired.values() for name in exporters_of(p)})
+endpoints = [str(declared_exporters[name].get("endpoint", "")) for name in used]
+from_environment = [e for e in endpoints if e.startswith("${env:")]
+collector_env = {
+    e["name"]: str(e.get("value", "")) for e in collector_container.get("env", [])
+}
+defaults = [
+    collector_env.get(e[len("${env:") : -1], "<unset>") for e in from_environment
+]
 check(
     "otel_collector_backend_is_an_overlay_placeholder",
-    endpoint.endswith(".example.com:4317") or endpoint.endswith(".example.com:4318"),
-    f"the exporter endpoint must be an example.com placeholder, found {endpoint!r}",
+    bool(endpoints)
+    and from_environment == endpoints
+    and all(
+        default.endswith(".example.com:4317") or default.endswith(".example.com:4318")
+        for default in defaults
+    ),
+    "every exporter endpoint must read from ${env:...} and default to an "
+    f"example.com placeholder; endpoints {endpoints!r}, defaults {defaults!r}",
 )
 
-# --- otel_collector_is_a_daemonset_registered_in_the_base --------------------
-# A Deployment would put the collector on one node and every other node's
-# telemetry on a cross-node hop. A file absent from `resources:` renders as
-# nothing at all.
+# --- the_base_alone_carries_no_telemetry -------------------------------------
+# The ticket's goal is that an existing install is unaffected until it opts in.
+# Anything telemetry-shaped in the base defeats that, and the two ways it can
+# happen fail differently, so both are read here.
+#
+# A collector in `resources:` would render into every namespace the base renders
+# into - including private overlays this repo cannot see - pointing at a
+# placeholder backend that nobody chose.
+#
+# An OTEL_* variable or a grace period on the daemon is quieter and still wrong:
+# it changes the pod template, so the next apply for any unrelated reason
+# restarts the daemon, and `OTEL_EXPORTER_OTLP_ENDPOINT` in the base names a
+# Service that only the component creates - a manifest describing something that
+# is not there.
+base_resources = kustomization.get("resources") or []
+base_generators = [
+    f
+    for g in (kustomization.get("configMapGenerator") or [])
+    for f in (g.get("files") or [])
+]
+base_leaks = [name for name in base_resources if "otel" in name] + [
+    name for name in base_generators if "otel" in name
+]
+for pattern, what in (
+    (r"OTEL_\w+", "an OTEL_* variable"),
+    (r"terminationGracePeriodSeconds", "a termination grace period"),
+    (r"K8S_(?:NAMESPACE|POD_NAME|NODE_NAME)", "a telemetry downward-API variable"),
+):
+    if re.search(pattern, base_daemon_text):
+        base_leaks.append(f"{what} in {base_daemon_path.split('/')[-1]}")
 check(
-    "otel_collector_is_a_daemonset_registered_in_the_base",
-    daemonset["kind"] == "DaemonSet"
-    and "otel-collector.yaml" in (kustomization.get("resources") or []),
-    "otel-collector.yaml must hold a DaemonSet and be listed in the base's resources",
+    "the_base_alone_carries_no_telemetry",
+    not base_leaks,
+    "the base must name no collector and put no telemetry on the daemon's pod - "
+    f"all of it belongs to the component; found {base_leaks}",
+)
+
+# --- otel_collector_is_a_component_an_overlay_opts_into ----------------------
+# A kustomize Component is what an overlay lists explicitly. A Deployment rather
+# than a DaemonSet would put the collector on one node and every other node's
+# telemetry on a cross-node hop.
+check(
+    "otel_collector_is_a_component_an_overlay_opts_into",
+    component.get("kind") == "Component"
+    and "otel-collector.yaml" in (component.get("resources") or [])
+    and daemonset["kind"] == "DaemonSet",
+    "the telemetry directory must be a kustomize Component listing "
+    "otel-collector.yaml, and that file must hold a DaemonSet; found kind "
+    f"{component.get('kind')!r}",
 )
 
 # --- otel_collector_config_change_rolls_the_pods -----------------------------
@@ -199,13 +283,13 @@ check(
 # global `generatorOptions` into every generator and a local `false` cannot win
 # against a global `true` - the two are the same value once folded. A global
 # setting therefore silences this quietly, and the manifest still looks right.
-generators = kustomization.get("configMapGenerator") or []
+generators = component.get("configMapGenerator") or []
 collector_generator = [
     g
     for g in generators
     if any("otel-collector-config.yaml" in f for f in (g.get("files") or []))
 ]
-globally_off = (kustomization.get("generatorOptions") or {}).get(
+globally_off = (component.get("generatorOptions") or {}).get(
     "disableNameSuffixHash"
 ) is True
 locally_off = bool(collector_generator) and (

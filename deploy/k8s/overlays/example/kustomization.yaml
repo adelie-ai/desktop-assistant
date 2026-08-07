@@ -22,6 +22,22 @@ resources:
   - namespace.yaml
   - ../../base
 
+# Telemetry collection, opted into. Remove these two lines and this overlay
+# renders byte for byte what it rendered before telemetry existed - no
+# collector, and no telemetry on the daemon's pod either.
+#
+# The component brings the collector DaemonSet, its Service, its pipeline, and
+# the patch that puts the daemon's OTEL_* variables on its pod. The pipeline
+# names a placeholder backend, so opting in is only half the job - replace it
+# below. See ../../README.md ("Telemetry").
+components:
+  - ../../components/telemetry
+
+# Naming the backend is the other half of opting in. Two values, patched onto
+# the collector, rather than a copy of its whole pipeline.
+patches:
+  - path: otel-backend.yaml
+
 # Pin the image your cluster actually pulls. Prefer an immutable tag (a digest
 # or a content-addressed tag) over a moving one so a rollout is reproducible;
 # the base sets imagePullPolicy: Always for the mutable-tag case.
