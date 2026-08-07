@@ -388,11 +388,17 @@ async fn write_extracted_fact(
     .await
     .map_err(|e| CoreError::Storage(format!("dreaming: insert fact failed: {e}")))?;
 
+    // An extracted fact is personal by construction - the extraction prompt
+    // asks for preferences and personal context - so INFO carries only what
+    // identifies the row. The body goes to DEBUG.
     tracing::info!(
-        "dreaming: wrote fact id={id} (scope={:?}): {}",
-        metadata.effective_scope(),
-        &proposal.content[..proposal.content.len().min(80)]
+        id = %id,
+        scope = ?metadata.effective_scope(),
+        tag_count = tags_vec.len(),
+        content_bytes = proposal.content.len(),
+        "dreaming: wrote fact"
     );
+    tracing::debug!(id = %id, content = %proposal.content, "dreaming: fact content");
 
     Ok(true)
 }

@@ -2499,11 +2499,18 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 // Text-only response — we're done
                 let mut visible_text = sanitize_assistant_text(&response.text);
                 if visible_text.is_empty() {
+                    // The reply itself is content, so the warning carries only
+                    // its size and the round. The text goes to DEBUG, which is
+                    // where an operator asks for it deliberately.
                     tracing::warn!(
                         raw_len = response.text.len(),
-                        raw_first_100 = %response.text.chars().take(100).collect::<String>(),
                         round,
                         "LLM returned empty visible text after sanitization"
+                    );
+                    tracing::debug!(
+                        raw = %response.text,
+                        round,
+                        "the reply that sanitized to nothing"
                     );
                     if round > 0 {
                         visible_text =
@@ -2581,7 +2588,16 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                         }
                     }
                 };
-                tracing::info!(tool = %tool_call.name, %arguments, "executing tool");
+                // A tool call's arguments are content: the model puts the
+                // user's document, file path or credential in them. INFO
+                // carries the tool name and the size; the arguments go to
+                // DEBUG, beside the tool result that already lives there.
+                tracing::info!(
+                    tool = %tool_call.name,
+                    arg_bytes = tool_call.arguments.len(),
+                    "executing tool"
+                );
+                tracing::debug!(tool = %tool_call.name, %arguments, "tool arguments");
 
                 // Step-planning + compaction control (#240) is handled here in
                 // the loop, not by the tool executor: only the loop owns

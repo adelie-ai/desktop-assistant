@@ -1809,7 +1809,16 @@ impl BuiltinToolService {
             .unwrap_or(10)
             .clamp(1, KB_SEARCH_MAX_LIMIT) as usize;
 
-        tracing::info!(query = %query, ?tags, ?exclude_tags, limit, "knowledge base search");
+        // The query is what the user asked, so INFO carries its size and the
+        // filters, and the query itself goes to DEBUG.
+        tracing::info!(
+            query_bytes = query.len(),
+            ?tags,
+            ?exclude_tags,
+            limit,
+            "knowledge base search"
+        );
+        tracing::debug!(query = %query, "knowledge base search query");
 
         let (query_embedding, embedding_model) = self.embed_query(&query).await;
 
@@ -2015,7 +2024,15 @@ impl BuiltinToolService {
                 _ => None,
             });
 
-        tracing::info!(query = %query, limit, ?role_filter, "conversation search");
+        // The query is what the user asked, so INFO carries its size and the
+        // filters, and the query itself goes to DEBUG.
+        tracing::info!(
+            query_bytes = query.len(),
+            limit,
+            ?role_filter,
+            "conversation search"
+        );
+        tracing::debug!(query = %query, "conversation search query");
 
         let hits = search_fn(query, limit, role_filter).await?;
 
@@ -2415,7 +2432,10 @@ impl BuiltinToolService {
             .ok_or_else(|| CoreError::ToolExecution("tool registry not configured".to_string()))?;
 
         let query = required_string(&arguments, "query")?;
-        tracing::info!(query = %query, "tool search");
+        // The query is what the model asked for on the user's behalf, so INFO
+        // carries its size and the query itself goes to DEBUG.
+        tracing::info!(query_bytes = query.len(), "tool search");
+        tracing::debug!(query = %query, "tool search query");
 
         let query_embedding = self.embed_text(&query).await.unwrap_or_default();
 
