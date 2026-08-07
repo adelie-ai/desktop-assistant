@@ -56,6 +56,12 @@ pub(crate) fn offered_entry_ids(candidates: &RecallCandidates) -> Vec<String> {
 /// The record is written off the turn's path and its failure is dropped, so a
 /// use log that cannot be written costs the measurement and never the block -
 /// see `desktop_assistant_core::ports::knowledge_use::record_in_background`.
+///
+/// A lookup that found nothing is recorded too, as an offer of no entries. That
+/// is not a wasted write: a recall offer replaces the conversation's standing
+/// offers, and it is what ends the previous turn's. Skipping it would leave last
+/// turn's offers standing through a prompt with nothing near it - and a fetch
+/// two turns later would then read as a taken-up offer.
 pub fn with_offer_recording(inner: RecallSearchFn, log: Arc<PgKnowledgeUseLog>) -> RecallSearchFn {
     Arc::new(move |request: RecallRequest| {
         let inner = Arc::clone(&inner);
@@ -64,12 +70,10 @@ pub fn with_offer_recording(inner: RecallSearchFn, log: Arc<PgKnowledgeUseLog>) 
         Box::pin(async move {
             let candidates = inner(request).await?;
             let offered = offered_entry_ids(&candidates);
-            if !offered.is_empty() {
-                let scope = OfferScope::recall(conversation_id);
-                record_in_background("recall_offered", async move {
-                    log.record_offered(scope, offered).await
-                });
-            }
+            let scope = OfferScope::recall(conversation_id);
+            record_in_background("recall_offered", async move {
+                log.record_offered(scope, offered).await
+            });
             Ok(candidates)
         })
     })

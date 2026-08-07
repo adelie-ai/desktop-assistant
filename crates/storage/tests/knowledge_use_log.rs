@@ -276,6 +276,36 @@ async fn a_new_recall_block_replaces_the_previous_turns_standing_offers() {
 }
 
 #[tokio::test]
+async fn a_turn_that_offered_nothing_still_ends_the_previous_turns_offers() {
+    let Some(fx) = fixture().await else { return };
+    let log = PgKnowledgeUseLog::new(fx.pool.clone());
+    write_as(&fx.pool, ALICE, "kb-1").await;
+
+    with_user_id(UserId::new(ALICE), async {
+        log.record_offered(OfferScope::recall(CONV), vec!["kb-1".to_string()])
+            .await
+            .expect("offer recorded");
+        // The next prompt had nothing near it, so the block showed no entry.
+        // That is still this turn's whole offer set, and it is what ends the
+        // previous turn's.
+        log.record_offered(OfferScope::recall(CONV), vec![])
+            .await
+            .expect("empty offer recorded");
+
+        assert_eq!(
+            log.record_opened(CONV.to_string(), vec!["kb-1".to_string()])
+                .await
+                .expect("read succeeds"),
+            0,
+            "an offer must not outlive the turn that made it"
+        );
+    })
+    .await;
+
+    fx.cleanup().await;
+}
+
+#[tokio::test]
 async fn a_search_inside_a_turn_adds_to_what_the_block_already_offered() {
     let Some(fx) = fixture().await else { return };
     let log = PgKnowledgeUseLog::new(fx.pool.clone());
