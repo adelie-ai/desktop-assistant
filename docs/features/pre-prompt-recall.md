@@ -254,6 +254,12 @@ The scan states a `statement_timeout` of four seconds, so the ceiling the caller
 keeps is a ceiling the database keeps too. Abandoning a query stops the daemon
 waiting and leaves the backend scanning, and recall runs before every turn.
 
+**Which sources measured, and which did not, is logged.** A source that states no
+spread is read by the stated estimate, which admits at a fixed cosine distance -
+the mechanism this design exists to remove, and it must not apply in silence. One
+debug line per lookup names each source and which of the two applied, and carries
+nothing of what either source holds.
+
 Before a source can measure its own, the block reads it by a stated estimate,
 which is deliberately narrow. A measurement is refused, and the estimate stands,
 when the sample is under 20 rows, when a value is not a number, or when the

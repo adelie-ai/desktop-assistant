@@ -210,6 +210,16 @@ async fn gather(
     let (entries, notes) = tokio::join!(entries, notes);
     let notes = notes_or_none(notes);
     let (entries, entry_dispersion) = entries?;
+    // Which sources stated their own geometry, and which the block will read by
+    // a stated estimate. Without this an operator meeting a block that is
+    // quieter than expected cannot tell whether the dimensionless bar is in
+    // force or whether a fixed distance is deciding, and the whole point of the
+    // bar is that no fixed distance decides.
+    tracing::debug!(
+        knowledge = how_the_distances_are_read(entry_dispersion),
+        scratchpad = how_the_distances_are_read(None),
+        "recall: how each source's distances are read"
+    );
     Ok(RecallCandidates {
         entries,
         notes,
@@ -220,6 +230,19 @@ async fn gather(
         // block's most expensive query - see #1146.
         note_dispersion: None,
     })
+}
+
+/// Whether the block will read a source by what that source measured, or by the
+/// stated estimate it falls back to.
+///
+/// Two static words, and nothing of what the source holds: this line runs on
+/// every turn, and a log that carried a key or a line of an entry would put
+/// personal content in the journal for the sake of an operational fact.
+fn how_the_distances_are_read(dispersion: Option<RecallDispersion>) -> &'static str {
+    match dispersion {
+        Some(_) => "measured",
+        None => "estimated",
+    }
 }
 
 /// One stored note as a recall candidate.
@@ -426,6 +449,23 @@ mod tests {
 
         assert_eq!(candidates.notes.len(), 1);
         assert_eq!(candidates.notes[0].key, "deploy-window");
+    }
+
+    /// The log an operator reads to tell whether the bar is in force: two
+    /// static words, one per source, and nothing of what either holds.
+    #[test]
+    fn the_log_says_which_sources_measured_and_which_were_estimated() {
+        assert_eq!(
+            how_the_distances_are_read(Some(a_dispersion())),
+            "measured",
+            "a source that stated its own geometry is read by it"
+        );
+        assert_eq!(
+            how_the_distances_are_read(None),
+            "estimated",
+            "and a source that stated none is read by a fixed distance, which is the fact \
+             worth surfacing"
+        );
     }
 
     /// The spread the core reads a distance against travels with the candidates
