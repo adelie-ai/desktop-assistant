@@ -9,16 +9,17 @@ pub mod oauth;
 #[cfg(feature = "http")]
 pub mod url_policy;
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use desktop_assistant_core::domain::ToolDefinition;
 #[cfg(feature = "http")]
 use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
+use tokio::task::JoinHandle;
 
 use jsonrpc::{JsonRpcRequest, JsonRpcResponse};
 
@@ -40,6 +41,35 @@ const INIT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Anything larger is a protocol violation (or a runaway tool result) and is
 /// surfaced as an error instead of buffering unbounded memory (DS-4).
 const MAX_LINE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// How many of a stdio MCP server's most recent stderr lines are kept for the
+/// failure path (see [`StdioTransport::enrich_with_exit_status`]).
+///
+/// The tail is what a person reads inside one log line and one settings-panel
+/// field, so it is sized for a diagnosis, not for a log file. Ten lines holds
+/// an argument-parser complaint, a panic message with a short backtrace
+/// header, or a startup error plus the two or three lines of context around
+/// it. Keeping the *last* lines rather than the first is deliberate: a
+/// process that is about to die says why at the end, after its banner.
+const STDERR_TAIL_LINES: usize = 10;
+
+/// Maximum bytes kept from a single stderr line, including
+/// [`STDERR_TAIL_TRUNCATED`].
+///
+/// The line count alone bounds nothing: stderr is a byte stream, and a server
+/// is free to write a megabyte with no newline in it. 512 bytes is well past
+/// a normal diagnostic line and holds the whole tail — a full ring of capped
+/// lines — near 5 KB.
+const STDERR_TAIL_LINE_BYTES: usize = 512;
+
+/// Marks a line that [`STDERR_TAIL_LINE_BYTES`] cut short, so a reader can
+/// tell a truncated line from a server that really said only that much.
+const STDERR_TAIL_TRUNCATED: &str = "...";
+
+/// Joins the tail lines into the one-line failure message. The message flows
+/// into a log line and into `McpServerStatusInfo::detail`, neither of which
+/// renders an embedded newline usefully.
+const STDERR_TAIL_SEPARATOR: &str = " | ";
 
 /// Cap on a remote (HTTP) response body — the streamable-HTTP analogue of
 /// [`MAX_LINE_BYTES`]. A remote server (or a hostile endpoint impersonating
@@ -77,6 +107,9 @@ pub enum McpError {
 
     #[error("MCP server stdout not available")]
     NoStdout,
+
+    #[error("MCP server stderr not available")]
+    NoStderr,
 
     #[error("I/O error communicating with MCP server: {0}")]
     Io(#[from] std::io::Error),
@@ -759,11 +792,135 @@ impl Transport {
     }
 }
 
+/// The last few lines a spawned MCP server wrote to stderr, newest last.
+///
+/// Shared between the draining task and the failure path that reads it.
+type StderrTail = Arc<Mutex<VecDeque<String>>>;
+
+/// Read `stderr` to end-of-file, keeping the last [`STDERR_TAIL_LINES`] lines
+/// in `tail`.
+///
+/// Runs as its own task for as long as the child lives, and that is the
+/// point: a piped stream nobody reads fills its kernel buffer (64 KB on
+/// Linux) and then blocks the writing process forever. Without a continuous
+/// drain, a healthy server that logs at all would wedge as soon as it filled
+/// the buffer — so the diagnostic buys a deadlock. Reading always, and
+/// throwing all but the tail away, is what makes the buffer safe to pipe.
+///
+/// Nothing here is logged, at any level. A server's stderr is its own
+/// unfiltered output: it can carry a credential inside an error message, a
+/// file path, or a fragment of the user's own content. Surfacing it on the
+/// one error a person is already reading is a bounded, deliberate exposure;
+/// streaming it into the daemon's logs is not.
+async fn drain_stderr(mut stderr: ChildStderr, tail: StderrTail) {
+    // Read raw chunks and split on newlines by hand rather than through a
+    // line reader: a line reader grows its buffer to whatever the writer sends
+    // before it sees a newline, and a server is free to send a megabyte
+    // without one. Splitting here caps the held bytes at one chunk plus one
+    // capped line.
+    let mut chunk = [0u8; 4096];
+    let mut line: Vec<u8> = Vec::with_capacity(STDERR_TAIL_LINE_BYTES);
+    let mut cut = false;
+
+    loop {
+        let read = match stderr.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(error) => {
+                // The pipe itself failed (not the server's output). There is
+                // no caller to tell — this task has no result — and the only
+                // cost is a shorter tail on a path that may never run, so it
+                // is recorded and the drain ends. The message describes the
+                // pipe, never its contents.
+                tracing::debug!(%error, "stopped reading MCP server stderr");
+                break;
+            }
+        };
+        for &byte in &chunk[..read] {
+            if byte == b'\n' {
+                push_stderr_line(&tail, &line, cut);
+                line.clear();
+                cut = false;
+            } else if line.len() < STDERR_TAIL_LINE_BYTES {
+                line.push(byte);
+            } else {
+                cut = true;
+            }
+        }
+    }
+
+    // A process that dies mid-line leaves its last line unterminated, and
+    // that line is often the one that names the cause.
+    push_stderr_line(&tail, &line, cut);
+}
+
+/// Add one stderr line to `tail`, evicting the oldest once the ring is full.
+///
+/// `cut` says the reader already discarded bytes from this line. Surrounding
+/// whitespace is trimmed, and a line left blank by that is dropped rather than
+/// stored: it says nothing, and each one would evict a line that does.
+fn push_stderr_line(tail: &Mutex<VecDeque<String>>, raw: &[u8], cut: bool) {
+    // Lossy, never fallible: stderr is a byte stream, and a server with a
+    // mis-set locale (or one relaying a binary dependency's output) must
+    // cost the operator a replacement character, not the whole diagnostic.
+    let decoded = String::from_utf8_lossy(raw);
+    // Control characters become spaces. The tail lands in a log line and in a
+    // settings-panel field, and a server that emits a carriage return or an
+    // ANSI escape sequence would otherwise rewrite the line it was put in.
+    // Never lengthens the text: every control character is one or two bytes
+    // and one space replaces it, so the cap below still holds.
+    let cleaned: String = decoded
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let text = cleaned.trim();
+    if text.is_empty() {
+        return;
+    }
+
+    // Bound the stored line, not the raw bytes: lossy decoding expands each
+    // undecodable byte to three, so a cap applied before decoding would not
+    // hold. Cutting on a char boundary keeps the result valid UTF-8.
+    let line = if cut || text.len() > STDERR_TAIL_LINE_BYTES {
+        let mut end = (STDERR_TAIL_LINE_BYTES - STDERR_TAIL_TRUNCATED.len()).min(text.len());
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}{STDERR_TAIL_TRUNCATED}", &text[..end])
+    } else {
+        text.to_string()
+    };
+
+    // `PoisonError::into_inner`, not `unwrap`: the guarded section cannot
+    // panic, and a poisoned ring would still hold usable lines. Losing the
+    // diagnostic to a panic in the diagnostic is the worst outcome here.
+    let mut ring = tail.lock().unwrap_or_else(PoisonError::into_inner);
+    if ring.len() == STDERR_TAIL_LINES {
+        ring.pop_front();
+    }
+    ring.push_back(line);
+}
+
+/// The tail as one line, oldest first, or `None` if the server said nothing.
+fn stderr_tail_message(tail: &Mutex<VecDeque<String>>) -> Option<String> {
+    let ring = tail.lock().unwrap_or_else(PoisonError::into_inner);
+    if ring.is_empty() {
+        return None;
+    }
+    let lines: Vec<&str> = ring.iter().map(String::as_str).collect();
+    Some(lines.join(STDERR_TAIL_SEPARATOR))
+}
+
 /// JSON-RPC over the stdio of a spawned MCP server child process.
 struct StdioTransport {
     child: Child,
     stdin: ChildStdin,
     reader: BufReader<ChildStdout>,
+    /// The child's most recent stderr lines, kept for the failure path.
+    stderr_tail: StderrTail,
+    /// The task filling [`Self::stderr_tail`]. Held so the failure path can
+    /// wait for the last bytes to land, and so teardown can end it.
+    stderr_drain: JoinHandle<()>,
 }
 
 impl StdioTransport {
@@ -778,6 +935,10 @@ impl StdioTransport {
     /// configured `env`/`env_secrets`, already resolved by the caller) on
     /// top — so a server's own config always wins over an ambient value it
     /// shares a name with.
+    ///
+    /// stderr is piped and drained by [`drain_stderr`] from the moment the
+    /// child starts, so a server that fails at startup still has its own
+    /// account of why. The drain is not optional: see that function.
     fn spawn(
         command: &str,
         args: &[String],
@@ -789,7 +950,7 @@ impl StdioTransport {
         cmd.args(args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
             // DS-2: make the kernel reap the server if this transport is
             // dropped without an explicit `shutdown` (panic, cancelled task,
             // error mid-connect).
@@ -812,11 +973,18 @@ impl StdioTransport {
         let stdin = child.stdin.take().ok_or(McpError::NoStdin)?;
         let stdout = child.stdout.take().ok_or(McpError::NoStdout)?;
         let reader = BufReader::new(stdout);
+        let stderr = child.stderr.take().ok_or(McpError::NoStderr)?;
+
+        let stderr_tail: StderrTail =
+            Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL_LINES)));
+        let stderr_drain = tokio::spawn(drain_stderr(stderr, Arc::clone(&stderr_tail)));
 
         Ok(Self {
             child,
             stdin,
             reader,
+            stderr_tail,
+            stderr_drain,
         })
     }
 
@@ -905,7 +1073,13 @@ impl StdioTransport {
 
         match tokio::try_join!(write_fut, read_fut) {
             Ok(((), result)) => Ok(result),
-            Err(err) => Err(Self::enrich_with_exit_status(&mut self.child, err).await),
+            Err(err) => Err(Self::enrich_with_exit_status(
+                &mut self.child,
+                &mut self.stderr_drain,
+                &self.stderr_tail,
+                err,
+            )
+            .await),
         }
     }
 
@@ -918,30 +1092,68 @@ impl StdioTransport {
     /// since this whole wait runs inside that outer bound.
     const EXIT_STATUS_WAIT: Duration = Duration::from_secs(10);
 
+    /// Bound on waiting for [`drain_stderr`] to finish, once the child has
+    /// been reaped in [`Self::enrich_with_exit_status`].
+    ///
+    /// A much smaller sibling of [`Self::EXIT_STATUS_WAIT`], not a reuse of
+    /// it, because the two wait for different things. By this point the child
+    /// is gone and its own write end of the pipe is closed, so the drain has
+    /// only to read what is already in the kernel buffer and see
+    /// end-of-file — microseconds of work, and a second is generous. What the
+    /// bound guards against is the case where end-of-file never comes at all:
+    /// a grandchild that inherited the write end and is still running holds
+    /// the pipe open indefinitely, and the operator should not wait ten
+    /// seconds for a tail that will not arrive. Whatever lines did land are
+    /// read either way.
+    const STDERR_DRAIN_WAIT: Duration = Duration::from_secs(1);
+
     /// If `err` is the generic "server closed stdout" error and the child has
-    /// exited (or exits promptly), replace it with one naming the exit status.
+    /// exited (or exits promptly), replace it with one naming the exit status
+    /// and quoting what the server last wrote to stderr.
     ///
-    /// Why: a spawned server that exits immediately (missing dependency, bad
-    /// config, or — since #910 — an environment variable it needed that
-    /// isn't on [`ENV_PASSTHROUGH_ALLOWLIST`] or its own configured `env`)
-    /// used to surface only "MCP server closed stdout", which does not say
-    /// the process is even gone. This message flows verbatim into
-    /// `McpServerStatusInfo::detail` (the settings/KCM panel's honest-state
-    /// field) and the daemon's `ERROR failed to connect to MCP server` log
-    /// line, so naming the exit status here is what makes a too-tight
-    /// allowlist diagnosable instead of a silent "server just isn't there".
+    /// Why: a spawned server that exits immediately used to surface only
+    /// "MCP server closed stdout", which does not say the process is even
+    /// gone. This message flows verbatim into `McpServerStatusInfo::detail`
+    /// (the settings/KCM panel's honest-state field) and the daemon's
+    /// `ERROR failed to connect to MCP server` log line, so it is the whole
+    /// of what an operator gets.
     ///
-    /// Uses `wait()` rather than the non-blocking `try_wait()`: the pipe's
-    /// read end closes (which is what produced `err`) as soon as the kernel
-    /// tears down the process's file descriptors, but tokio's own SIGCHLD
-    /// -driven reaping runs on its own background task and can lag that under
-    /// scheduler contention — `try_wait()` observed here raced `Ok(None)`
-    /// ("still running") under a fully parallel `cargo test --workspace` run,
-    /// though the process had in fact already exited. `wait()` blocks until
-    /// the reap actually completes, bounded by [`Self::EXIT_STATUS_WAIT`] so
-    /// this can never hang the caller if stdout closed for some other reason
-    /// and the process is still alive.
-    async fn enrich_with_exit_status(child: &mut Child, err: McpError) -> McpError {
+    /// A server that fails at startup normally says why: a rejected command
+    /// line, a missing file, a refused credential. That sentence goes to
+    /// stderr, so stderr is what this reports — [`drain_stderr`] has been
+    /// keeping the last [`STDERR_TAIL_LINES`] lines since the process
+    /// started. Evidence beats inference, so when there is any stderr it is
+    /// the message; the suggestion to check the server's own `env` config is
+    /// the fallback for a server that died in silence, where a variable it
+    /// needed and did not get (see [`ENV_PASSTHROUGH_ALLOWLIST`]) is a fair
+    /// guess and there is nothing better to offer.
+    ///
+    /// Two waits, in order, and both bounded:
+    ///
+    /// 1. `child.wait()`, not the non-blocking `try_wait()`. The pipe's read
+    ///    end closes (which is what produced `err`) as soon as the kernel
+    ///    tears down the process's file descriptors, but tokio's own SIGCHLD
+    ///    -driven reaping runs on its own background task and can lag that
+    ///    under scheduler contention — `try_wait()` observed here raced
+    ///    `Ok(None)` ("still running") under a fully parallel
+    ///    `cargo test --workspace` run, though the process had in fact
+    ///    already exited. `wait()` blocks until the reap actually completes,
+    ///    bounded by [`Self::EXIT_STATUS_WAIT`] so this can never hang the
+    ///    caller if stdout closed for some other reason and the process is
+    ///    still alive.
+    /// 2. The stderr drain, bounded by [`Self::STDERR_DRAIN_WAIT`]. Reaping
+    ///    the process does not mean its final stderr bytes have been read:
+    ///    the drain is a separate task, and the bytes it has not yet taken
+    ///    out of the pipe are exactly the last ones the server wrote — the
+    ///    ones that say why it died. Reading the ring without this wait
+    ///    races that task and reports a message that is intermittently short
+    ///    of its own point.
+    async fn enrich_with_exit_status(
+        child: &mut Child,
+        stderr_drain: &mut JoinHandle<()>,
+        stderr_tail: &Mutex<VecDeque<String>>,
+        err: McpError,
+    ) -> McpError {
         let McpError::UnexpectedResponse(ref msg) = err else {
             return err;
         };
@@ -952,16 +1164,34 @@ impl StdioTransport {
         else {
             return err;
         };
+        // Guarded, not simply awaited: `child.wait()` above is fused and
+        // answers a second call from its cached status, so this function can
+        // run twice against one transport (a server whose grandchild holds
+        // the stdin read end open keeps the writes succeeding while stdout
+        // stays closed). A `JoinHandle` panics when it is polled after it has
+        // already yielded its output, which would turn a diagnostic into a
+        // crash. Once the drain is finished there is nothing left to wait for
+        // anyway — the ring already has every line.
+        if !stderr_drain.is_finished() {
+            let _ = tokio::time::timeout(Self::STDERR_DRAIN_WAIT, &mut *stderr_drain).await;
+        }
+
         let detail = match status.code() {
             Some(code) => format!("exited with status {code}"),
             None => format!("was terminated by a signal ({status})"),
         };
-        McpError::UnexpectedResponse(format!(
-            "MCP server {detail} before completing the handshake; if it needs an \
-             environment variable, set it in this server's own `env` config (see \
-             docs/mcp-services.md#environment-variables) rather than relying on it \
-             being inherited"
-        ))
+        match stderr_tail_message(stderr_tail) {
+            Some(tail) => McpError::UnexpectedResponse(format!(
+                "MCP server {detail} before completing the handshake; it last wrote \
+                 this to stderr: {tail}"
+            )),
+            None => McpError::UnexpectedResponse(format!(
+                "MCP server {detail} before completing the handshake and wrote nothing \
+                 to stderr; if it needs an environment variable, set it in this server's \
+                 own `env` config (see docs/mcp-services.md#environment-variables) rather \
+                 than relying on it being inherited"
+            )),
+        }
     }
 
     async fn send_notification(
@@ -985,8 +1215,13 @@ impl Drop for StdioTransport {
     /// the runtime to reap the child, but issuing `start_kill()` here sends the
     /// signal immediately even if the runtime is shutting down. Harmless if the
     /// process already exited or `shutdown()` was called.
+    ///
+    /// The stderr drain is aborted rather than left to notice end-of-file: a
+    /// grandchild that inherited the write end keeps the pipe open after the
+    /// server itself is gone, and nothing would ever read the tail again.
     fn drop(&mut self) {
         let _ = self.child.start_kill();
+        self.stderr_drain.abort();
     }
 }
 

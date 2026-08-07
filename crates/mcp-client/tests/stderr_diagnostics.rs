@@ -333,6 +333,89 @@ done
     let _ = std::fs::remove_file(&path);
 }
 
+// --- Failing twice on one transport ---------------------------------------
+
+/// A transport that reports a dead server once must report it again, not
+/// panic.
+///
+/// `enrich_with_exit_status` runs per failed round trip, so it can run twice
+/// against the same transport. Both of its waits have to survive that: the
+/// wait on the child is fused and answers from a cached status, and the wait
+/// on the stderr drain would panic if its handle were polled a second time
+/// after yielding.
+///
+/// Reaching the second run needs the client's writes to keep succeeding after
+/// the server is gone, which is what the backgrounded process in the fixture
+/// arranges: it inherits the read end of the pipe the client writes to, so a
+/// request still lands somewhere even though nothing will ever answer it. A
+/// real server that forks a worker and exits behaves exactly this way.
+#[tokio::test]
+async fn a_second_failing_round_trip_reports_again_instead_of_panicking() {
+    let script = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf %s "$line" | sed 's/.*"id":\([0-9]*\).*/\1/')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"forker","version":"0.0"}}}\n' "$id"
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"echo tool","inputSchema":{"type":"object"}}]}}\n' "$id"
+      ;;
+    *'"method":"tools/call"'*)
+      printf '%s\n' 'fatal: the server gave up' >&2
+      # Hand the read end of stdin to a background process, so the client's
+      # later writes still succeed. `<&0` is required: an asynchronous list
+      # otherwise gets /dev/null for stdin. stdout and stderr are redirected
+      # away from it, so the client still sees end-of-file on both.
+      sleep 5 <&0 >/dev/null 2>/dev/null &
+      exec 1>&-
+      exit 6
+      ;;
+    *) : ;;
+  esac
+done
+"#;
+
+    let path = temp_path("forks-then-dies");
+    std::fs::write(&path, script).expect("write forking server script");
+    let args = [path.display().to_string()];
+
+    let mut client = McpClient::connect("/bin/sh", &args, &HashMap::new())
+        .await
+        .expect("handshake should succeed");
+    client
+        .list_tools()
+        .await
+        .expect("tools/list should succeed");
+
+    let first = client.call_tool("echo", serde_json::json!({})).await;
+    match first {
+        Err(McpError::UnexpectedResponse(msg)) => {
+            assert!(
+                msg.contains("exited with status 6") && msg.contains("fatal: the server gave up"),
+                "the first failure must name the exit status and the stderr, got: {msg}"
+            );
+        }
+        other => {
+            panic!("expected the first call to fail with the enriched message, got: {other:?}")
+        }
+    }
+
+    let second = tokio::time::timeout(
+        Duration::from_secs(20),
+        client.call_tool("echo", serde_json::json!({})),
+    )
+    .await
+    .expect("the second call must return, not hang");
+    assert!(
+        second.is_err(),
+        "the second call to a dead server must fail, got: {second:?}"
+    );
+
+    client.shutdown().await;
+    let _ = std::fs::remove_file(&path);
+}
+
 // --- Bytes that are not text ----------------------------------------------
 
 /// Stderr is a byte stream, not a UTF-8 stream. A server that emits a raw byte
@@ -359,6 +442,32 @@ exit 4
     assert!(
         msg.contains("exited with status 4"),
         "the exit status must still be named, got: {msg}"
+    );
+}
+
+/// The message is one line, and a server cannot make it otherwise. Stderr is
+/// whatever the server chose to print, so it can hold a carriage return or an
+/// ANSI escape sequence — enough to overwrite the log line or the panel field
+/// the message is put in, and to hide the rest of it from the reader.
+#[tokio::test]
+async fn control_characters_in_stderr_cannot_rewrite_the_message_line() {
+    let msg = handshake_failure(
+        "control-characters",
+        r#"#!/bin/sh
+read -r line
+printf 'visible-head\rHIDDEN-BY-CARRIAGE-RETURN\033[2K\033[31mred\n' >&2
+exit 8
+"#,
+    )
+    .await;
+
+    assert!(
+        msg.contains("visible-head"),
+        "the readable text must survive, got: {msg}"
+    );
+    assert!(
+        !msg.contains('\r') && !msg.contains('\u{1b}') && !msg.contains('\n'),
+        "no control character may reach the message, got: {msg:?}"
     );
 }
 

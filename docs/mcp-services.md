@@ -466,7 +466,23 @@ When the daemon starts:
 3. `tools/list`, `resources/list`, and `prompts/list` are fetched from each server.
 4. A routing table is built mapping tool names → server index.
 
-If a server fails to start, a warning is logged and the daemon continues without that server's tools. No server failure is fatal to the daemon. If the server process exits before completing the handshake — for example because it needed an environment variable that is not on the [pass-through allowlist](#environment-variables) — the logged error names the exit status, so a missing dependency or missing configuration is diagnosable from the log line instead of reading as a generic protocol failure.
+If a server fails to start, a warning is logged and the daemon continues without that server's tools. No server failure is fatal to the daemon.
+
+If the server process exits before completing the handshake, the logged error names the exit status **and quotes what the server last wrote to stderr**, so a rejected command line, a missing file, or a refused credential is diagnosable from the log line instead of reading as a generic protocol failure:
+
+```
+MCP server exited with status 2 before completing the handshake; it last wrote this to stderr: error: the following required arguments were not provided: --config <CONFIG>
+```
+
+The quoted tail is bounded: the last 10 lines, each capped at 512 bytes and marked with `...` where it was cut, joined with ` | ` onto one line. Lines beyond that are discarded as they arrive, so a server that floods stderr cannot enlarge the message. A server's stderr appears **only** in this failure message. It is never streamed to the log as it arrives, at any level, because it is the server's own unfiltered output and can carry a credential or a fragment of user content — see [Logging](logging.md#what-may-appear-at-each-level).
+
+Where the server exits without writing anything, there is no evidence to quote, and the message instead suggests the most common silent cause — an environment variable the server needed that is not on the [pass-through allowlist](#environment-variables) and not in its own `env`:
+
+```
+MCP server exited with status 7 before completing the handshake and wrote nothing to stderr; if it needs an environment variable, set it in this server's own `env` config (see docs/mcp-services.md#environment-variables) rather than relying on it being inherited
+```
+
+The same message reaches the settings/KCM panel's per-server detail field, so an operator sees it without reading the log.
 
 ## Verifying Loaded Tools
 
