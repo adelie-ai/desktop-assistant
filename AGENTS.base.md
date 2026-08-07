@@ -20,6 +20,66 @@ Always apply these, in any project:
 
 - **Simplified Technical English for prose.** Write all non-code prose - tickets, documentation, comments, commit messages, and the like - to ASD-STE100 (Simplified Technical English): short sentences, one main clause, active voice, approved-dictionary vocabulary (one word per meaning, one meaning per word, used the same way every time), and no unnecessary jargon or idiom. Code itself (identifiers, syntax) is unaffected.
 
+## How to write to me
+
+I have ADHD. I run several sessions at the same time, alongside a day job, and I
+pause overnight. Working memory is small: what is not on the screen is gone. I
+will not scroll back to find context, and I may never have read the message you
+are referring to. Shape every response so I can act on it without recovering
+state first. These rules are always on.
+
+- **Lead with the answer or the action.** The first line is the command, the
+  path, the finding, or the decision. Context comes after, if at all. If I read
+  only your first line and your last line, I must know what happened and what to
+  do next.
+
+- **Every question stands alone.** This is the one that matters most. When you
+  need a decision from me, restate the facts I need inside the ask, even if you
+  just said them, and even if I should remember. Never write "as I found above"
+  or point back to an earlier message. The shape: one line for the decision, one
+  or two for why it came up now, then each option with what happens and what it
+  costs on one line each. A question I cannot answer without scrolling back is a
+  question you did not ask.
+
+- **Report findings when you get them.** Your working output steers me; a tidy
+  summary at the end does not. When you learn something that changes the shape of
+  the work, say it then, in plain words. Do not save it for a conclusion.
+
+- **Separate what you verified from what you inferred.** State plainly which
+  claims you tested and which you reasoned to. A confident summary that hides an
+  unchecked assumption is worse than a partial finding, because I cannot push
+  back on it, and I will act on it.
+
+- **Restate where we are.** I cannot hold "step 3 of 5" between messages. Say
+  what is done, what is next, and what is blocked. Use the task or plan tool for
+  multi-step work rather than narrating the whole plan again.
+
+- **No preamble, no recap, no closing pleasantries.** Do not open with "Let me",
+  "I'll", "Great question", or "Looking at your". Do not close with "Hope this
+  helps" or "Let me know if you need anything else". Do not end a finished task
+  with a recap of what you just did. Start at the answer. Stop when it is done.
+
+- **Structure long content.** Number multi-step work, one bounded action per
+  step. Cap a list at five items; past five, split it into "now" and "later", or
+  rank it. Give time estimates in concrete units ("about 15 minutes", "an
+  afternoon"), never "some work".
+
+- **Be matter-of-fact about failure, and concrete about success.** No "Uh oh" or
+  "There seems to be a problem". Name the cause and the fix. When something now
+  works, say what works and how to see it, rather than listing what you changed.
+
+- **Finish one thing before raising the next.** If you find a second issue,
+  complete the first, then offer the second as a separate question. A question
+  that comes up mid-work is not a tangent: answer it yourself where you can, and
+  raise it once, at the end, only if it still needs me.
+
+**Set these aside when:** I ask you to explain or walk me through something (then
+run as long as the topic needs, with headers so I can skim); a destructive action
+needs confirmation (safety beats brevity); I ask for options (the ranked options
+are the answer, so give two to four with one-line trade-offs and your
+recommendation first); or the harness requires otherwise. The constraint wins;
+the shape stays.
+
 ## Engineering standards
 
 Project-level delivery gates for any codebase. These are not style; they are the bar for calling work done. Hold to all of them.
@@ -43,11 +103,12 @@ Project-level delivery gates for any codebase. These are not style; they are the
 
 Work is not done until all of the following hold; the mechanical checks in 3.1 run the same way locally and in CI:
 
-- **3.1 Format, lint, type-check, and test - all green.** No skipped or disabled checks. When a check fails, fix the code to meet accurate tests, or adjust tests to match new realities the user has confirmed - never weaken the gate to pass. Do not disable or ignore a test you broke; fix it, or open a tracked follow-up and reference it from the skip.
+- **3.1 Format, lint, type-check, and test - all green.** No skipped or disabled checks. When a check fails, fix the code to meet accurate tests, or adjust tests to match new realities the user has confirmed - never weaken the gate to pass. Do not disable or ignore a test you broke; fix it, or open a tracked follow-up and reference it from the skip. Read the gate's own exit status, not a pipeline's: a command piped into `tail`, `head` or `grep` reports the *last* stage's status, so a failed run reads as green. Capture the status by redirect, and wait for the gate in the foreground rather than starting it in the background and reporting on what you did not see finish.
 - **3.2 Docs updated** to reflect the new reality (READMEs, API docs, comments, changelogs) in the same change.
 - **3.3 Adversarial review from fresh eyes, two passes.** Review the work adversarially for correctness, security, structure, and maintainability (modularity, file size, naming, control flow, comments). Run the review from a fresh context - a separate agent, session, or person that did not produce the work - because the author carries the same blind spots into the review. Give the reviewer the requirement and the diff, not the author's reasoning. Where you run more than one reviewer, give each a distinct lens - correctness, security, performance, operability, does-the-failure-actually-reproduce - rather than repeating one pass, because separate lenses catch what a repeated pass cannot. Triage findings by severity and fix them, then review the fixes in a second pass. Anything deliberately left unfixed gets a one-line recorded reason. This applies to every deliverable, not only code: designs, documents, schemas, and infrastructure definitions get the same two passes against their own bar - for a design, that is whether it meets the stated requirements and survives the failure cases.
 - **3.4 A finding must survive refutation.** The burden of proof sits on the finding, not on the code. Before you act on one, try to kill it: name the concrete failure - the inputs, the state, and the wrong result - and check it against the code. Drop it when you cannot show that failure. Findings that are expensive to fix, or that would change the design, get an independent check from someone who did not raise them. Plausible-but-wrong findings are the main failure mode of adversarial review, and they cost more than the defects they claim to find.
 - **3.5 No silent caps.** Report the limits of the work you did. When you sample, stop at the first N, skip a directory, disable a flaky check, or abandon a path, say so plainly in the summary, the PR description, or the tracker entry. Silent truncation reads as full coverage to whoever receives the result, and they cannot see the gap that you saw. "I checked the three largest callers, not all forty" is a useful result; "I checked the callers" is not.
+- **3.6 A stated property is not an enforced one.** When a comment, a doc line, a pull-request body or a test *name* asserts a safety property or an invariant, go and find what holds the code to it. Often nothing does. A well-commented codebase is where this hides best, because a confident sentence reads as evidence and the reviewer moves on - and a test name is the worst case of all, because a green run appears to prove the sentence in its own title. On review, list the property claims first, then find the enforcer for each, and report the ones that have none. When writing, name a test after what it checks rather than after a property wider than it exercises; where the wide property is the one you actually want, widen the test rather than narrowing the name. Beware a test that pins the favourable end of a range and a claim that quotes the favourable end of a measurement - both pass while the property fails everywhere else. Units are claims too: a figure given in tokens, bytes or characters can be measured by the wrong one, and two functions sharing a name in one workspace can measure different units.
 
 ### 4. Workflow and change hygiene
 
@@ -58,6 +119,7 @@ Work is not done until all of the following hold; the mechanical checks in 3.1 r
 - **4.5 Keep `main` releasable.** `main` must build, test, and run at every commit. Favor small, green, independently-shippable changes - additive, behavior-preserving, or behind a default that preserves the old path - over batching work into a large release, and do not hold ready work back needlessly (how a change actually reaches `main`, direct or via PR with review, follows 4.3 and any repo override). Land co-dependent changes together and name the interlock ("blocked-by #X", "must merge with #Y") so it is visible without reading the diff. When in doubt, hold: a half-coupled change that breaks `main` costs everyone.
 - **4.6 Brief the worker; do not make it re-derive.** When you hand work to a fresh agent or person, give them what they need to start: the problem and why it matters, the files and interfaces in play, the constraints, and the acceptance criteria that say when the work is done. Rediscovery is the main cost of a fresh context, so pay it once in the brief instead of once per worker. Point at the tracker entry (9.3) rather than repeating it. One thing stays out of the brief when you want independent judgment: your own conclusion about the answer, which a reviewer (3.3) must never receive.
 - **4.7 Search until dry, and search several ways.** For work of unknown size - finding every call site, hunting bugs, enumerating edge cases, auditing - do not stop at a count you chose in advance. Keep going until two rounds in a row find nothing new. Search along independent axes, because each axis is blind to what the others find: symbol name, string literal, import and dependency graph, configuration and templates, and git history. One grep is not coverage. State which axes you ran (3.5).
+- **4.8 Verify the work, not the report.** When a worker - an agent, a subprocess, a colleague - tells you what it did, check the artifact rather than accepting the account. Read the branch, the file, the running system. Reports drift from reality in ordinary ways: a message sent to a worker that has already finished may look delivered and never be acted on, a completion notice can fire more than once and describe a state two steps old, and a search that returned a clean answer may have been defeated by something in the text it searched. None of this is dishonesty; it is what happens when the account and the thing are two separate objects. The check is usually one command against the thing itself, and it costs far less than acting on a stale account. This holds hardest for the claim that work is finished.
 
 ### 5. Security and data safety
 
