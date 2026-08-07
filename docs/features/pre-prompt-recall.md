@@ -6,8 +6,8 @@ notice, the knowledge base is a store nobody reads, and a note it stashed on its
 own scratchpad an hour ago may as well not exist.
 
 Pre-prompt recall makes memory arrive unasked. When a user prompt lands, the
-daemon embeds it once, asks the two indexes that share that embedding space what
-is near it, and puts a short list of candidates in front of the model as a
+daemon embeds it once, asks every index that shares that embedding space what is
+near it, and puts a short list of candidates in front of the model as a
 `[Recall]` system block, before the model's first move.
 
 The block is a hint. Nothing is asserted, and the model decides whether any of
@@ -19,11 +19,14 @@ it matters.
 [Recall] Memory that may relate to what was just asked. It may not fit; ignore what does not. Each line is one entry: its id, its tags, and one line of what it says - not the entry itself. Look one up before you rely on it.
 - kb-1a2b [preference, ui] Prefers dark themes in every editor
 - kb-9f31 [infra, deploy] The deploy target is the lab cluster
-...and 17 more entries were also relevant.
+...and 17 more entries also matched.
 Notes on this conversation's scratchpad. Each line is one note: its key, then the start of what it says - not the whole note.
 - deploy-window: Fridays after 18:00, never before
-...and 2 more notes were also relevant.
+...and 2 more notes also matched.
 Tags the entries above carry: infra, deploy, ui, preference
+Procedures on file that may fit this situation. Each line is one skill: its name, then what it is for - not the procedure itself. None of these is chosen for you; check that one fits before you follow it.
+- deploy-the-lab: Roll a new image out to the cluster and watch it settle.
+- rotate-a-key [files missing]: Replace a credential and update every consumer.
 ```
 
 Each entry line carries the entry id, the entry's tags, and the one line that
@@ -42,9 +45,18 @@ renders, as the key alone: a key is the pad's own unit of recognition, which is
 the whole trade the `[Scratchpad]` index makes. A note with no key is skipped -
 it names nothing the model could look up.
 
-The two kinds of `- ` line are separated by the scratchpad label, because they
-carry different authority: an entry is what the assistant chose to keep across
-conversations, a note is what this conversation happens to have written down.
+Each skill line carries the skill's name - the handle it is fetched by - and its
+own "when to use" description, capped at the same 200 characters. **The body
+never appears.** A skill body is a whole playbook, and the arm's economy is that
+recognition costs less than recall: a line says a procedure exists, and the model
+reads it only if it decides to. A skill whose files have left disk carries
+`[files missing]`: the body still reads and the steps are still good, but the
+skill's directory is gone, so any script it bundles cannot be run.
+
+The three kinds of `- ` line are separated by their labels, because they carry
+different authority: an entry is what the assistant chose to keep across
+conversations, a note is what this conversation happens to have written down, and
+a skill is something to *do*.
 
 The tag names are the tags the entries above them carry, most-carried first.
 They are not searched for; they light up from the entries that surfaced.
@@ -95,6 +107,15 @@ does not take one. `builtin_scratchpad_search` reads the note back. A note
 another block is already showing is left out, so what appears there is material
 nothing else in the turn is showing.
 
+**What a skill line is.** A procedure on file that may fit the situation, under
+its own heading - a name and one line of what it is for, never the procedure. It
+is not a recommendation: nothing chose it, and standing near the prompt is not
+the same as applying to the work. The model reads it with `builtin_skill_get` and
+checks it against the work in hand before following any of it, because a fact
+that does not fit costs a few tokens to ignore and a procedure that does not fit
+gets carried out. Only skills a person has approved appear, so an absent skill is
+not evidence that the library has nothing.
+
 **What the tag names are for.** They are the tags the entries above them carry,
 so they are real names of this store and not guesses - the same vocabulary
 `available_tags` reports after a search, offered before the model makes one. A
@@ -110,13 +131,14 @@ The same text also lives in `runtime_system_instruction.txt`, the legacy
 monolith that `assembled_static_sections_match_original` byte-compares the
 assembled sections against. Both files carry it or the gate fails.
 
-## Two arms, one embedding, and a vocabulary that lights up from them
+## The arms, one embedding, and a vocabulary that lights up from one of them
 
 | Arm | Index | What it offers |
 | --- | --- | --- |
 | Knowledge | `knowledge_base.embedding` | The entries nearest the prompt, best first. |
 | Scratchpad | `scratchpads.embedding` | This conversation's notes nearest the prompt. |
 | Tags | none | The tags the surfaced entries carry, most-carried first. |
+| Skills | `skill_index.embedding` | The approved procedures nearest the prompt, best first. |
 
 The point of the tag names is vocabulary: the model's first knowledge search is
 otherwise a guess at what words this user's tags use, and `available_tags`
@@ -167,6 +189,125 @@ cap - and a note that has left the tree is durable and invisible, which is the
 condition this arm exists for. What the turn *actually showed* is decided at
 render time instead.
 
+## The skill arm: procedural memory
+
+The three arms above are all **declarative** memory - what is true, and what
+happened. A skill is **procedural**: how to do a thing. It is a different kind of
+memory, and it wants a different cue.
+
+Before this arm, a skill was reachable only through `builtin_skill_search`, which
+is free recall and has the failure mode free recall always has: the model must
+first suspect that a relevant skill exists. If it does not think to look, the
+skill is invisible, however good it is and however many times it has helped.
+`[Recall]` had already solved that for facts - recognition instead of free
+recall - and skills got none of it.
+
+**Procedural memory is cued by the situation, not by the query.** Nobody
+retrieves how to ride a bicycle by searching their memory for it; the bicycle
+cues it. "Deploy this" is a weak query and a strong situation. So the
+prompt-cued arm here is the first half of the answer and not the whole of it -
+the situation signal widens the cue later, and the arm reads it when it exists.
+
+**Only a skill somebody wrote on this machine and approved is offered**, and
+the two conditions answer different questions.
+
+Approval (`approved_at`) records that a person agreed the procedure may be
+followed. It is deliberately a separate axis from `trust_tier`, which records
+where the skill came from: a skill Adele wrote for herself is
+`TrustTier::Local`, the most trusted provenance the catalog has, and must still
+not be followed until somebody says so.
+
+An unapproved skill is **excluded**, not marked, and the reason is specific
+rather than general. `builtin_skill_get` refuses an unapproved skill's body, so a
+line offering one is a line the model can only fail on. Worse, it would accrue an
+offer every turn it ranked near a prompt and could never accrue an open, because
+the open is recorded by the read that is being refused - and "surfaced often,
+never opened" is precisely the profile ranking treats as evidence to retire a
+skill. Marking would therefore poison the use signal for exactly the skills the
+assistant authored. The exclusion happens inside the scan, so an unapproved row
+is absent from the spread as well as from the candidates.
+
+What tells anyone those skills exist, then. `builtin_skill_search` says so in
+words - "N matching skill(s) are awaiting approval and are not shown" - whenever
+the model does search, and the catalog's `approved_at` column is indexed for a
+browse surface to filter on. The block spends nothing on it, because it renders
+on every prompt and a standing line about a procedure nobody can approve yet is a
+nag with no resolution.
+
+**A skill from outside this machine is excluded too**, and this one is about
+provenance rather than consent. A skill installed from a repository or a
+`.well-known` source carries a description its author wrote, and the platform
+already rules that such text is third-party content: `builtin_skill_search`
+returns the same field and is classified `Declared(SkillTrustTier)`, so a
+non-local hit taints the turn and closes the tool gate. This block has no tool
+call in it, so nothing would taint - the text would land in a system message,
+ahead of the user prompt, with the Egress, Mutate and Execution tiers all still
+open, and with no model choice and no attacker step needed.
+
+Dropping is the answer rather than tainting, for exactly the reason the
+scratchpad arm drops a note stamped as external: a catalog row lives
+indefinitely, and closing the gate whenever one happened to rank near the prompt
+would degrade the conversation permanently. An installed skill stays reachable
+through `builtin_skill_search`, which taints correctly - the same shape as a
+subagent's external answer, which the block never carries and
+`get_subagent_status` does.
+
+**The cost, stated plainly.** A library that is mostly installed rather than
+written locally gets little from this arm today. Widening it needs either a way
+for the block to taint the turn it opens, or a person's judgement on the
+description itself - neither of which belongs in this arm.
+
+**A skill whose files are gone is marked, not excluded**, and the asymmetry is
+the same test applied twice: can the model act on the line? It can. The catalog
+is cumulative, so the body still reads and `builtin_skill_get` still returns it.
+Only the bundled scripts are unreachable, and `[files missing]` says so.
+
+**The arm calibrates against its own dispersion.** A skill row embeds a name, a
+short "when to use" line and a playbook body; a knowledge row embeds a fact, and
+a pad row a telegraphic note. The three put their distances in different places,
+so one bar means the same in all three only when each is read against its own
+spread. The skill catalog is the case that makes the rule visible: it is small,
+and its rows are shaped unlike anything else the block reads.
+
+**One name, one line, and it is the line a fetch would open.** The catalog can
+hold a global skill and a user's own under one name. Two lines for one openable
+procedure would be two the model cannot tell apart, and a line describing a
+procedure other than the one `builtin_skill_get` hands back would be worse - the
+model briefed on one method and given another's steps. So the scan applies that
+tool's own resolution: the user's own row while it is usable (on disk and
+approved), else the global one, else the user's own tombstone.
+
+Making the two agree also closed a defect in the tool. It used to prefer the
+caller's own row whenever the files were on disk, so an **unapproved** personal
+row shadowed a live global skill of the same name for every later fetch - and
+`promote_plan_to_skill` writes unapproved personal rows under a name the
+assistant chose. The fallback now reaches past an unusable personal row for
+either reason, on the argument the tombstone case already carried.
+
+The order of the passes is the whole design. A name resolves over every
+approved row it has - including one this query would not have matched, since a
+row the embedding backfill has not reached yet is the ordinary case. The trust
+rule applies to the row that resolution landed on, so a non-local row shadowing
+a local one drops the name outright instead of letting the block offer a line
+the fetch will not return. Only then is the spread measured, over the set the
+arm can actually draw from: a handful of local skills inside a large installed
+library would otherwise be graded against the installed library's geometry, and
+the minimum-sample rule would count those rows too.
+
+Reaching past the caller's own unapproved draft also says so. The draft is one
+the assistant wrote under a name it chose, so nothing else would mention it -
+`builtin_skill_get` returns the shared skill and names the draft it passed
+over.
+
+**Offers and opens are recorded.** The block's own skill lines are written to the
+skill use log as an offer, and a `builtin_skill_get` that hands the body back
+records an open against a standing offer. A skill surfaced often and opened never
+is therefore visible as such, and a skill opened repeatedly outranks a nearer one
+nothing has read. The log has its own tables (`skill_use_stats`, `skill_offers`)
+rather than the knowledge log's, whose foreign key to `knowledge_base(id)` a
+skill has no row for. It records two acts and not three: no tool sets a mark on a
+skill, so there is no marks table waiting for a writer.
+
 ## Nothing already in view
 
 A second look at the same pad would otherwise pay twice for one memory, so the
@@ -191,7 +332,7 @@ is rendered there, after that decision. On a short turn where the index stays
 silent, no key is dropped for it - which is the case the arm exists for. The two
 `[Pinned]` rules apply on every turn, because that block is ungated.
 
-A dropped candidate is not counted in the "were also relevant" line either.
+A dropped candidate is not counted in the "also matched" line either.
 That line promises the model something it has not been given.
 
 ## Nothing stamped as external content
@@ -496,16 +637,24 @@ daemon drives usually carry - spent once per turn, on the first round only, on a
 hint the model is told it may ignore.
 
 Every part of every line is capped: 64 of id, 120 of an entry's tags, 200 of
-summary, 128 of a note key, 200 of a note's content, and 240 for the whole tag
-line. So a worst-case line costs a known size, and the width is arithmetic
-rather than a choice:
+summary, 128 of a note key, 200 of a note's content, 64 of a skill name, 200 of a
+skill's description, and 240 for the whole tag line. So a worst-case line costs a
+known size, and the width is arithmetic rather than a choice:
 
 | Part | Worst case |
 | --- | --- |
 | One knowledge line | `"\n- " + id + " [" + tags + "] " + summary` = 391 bytes |
-| The fixed part | prefix, header, entry hint, five pad lines and their label, the tag line, and both "did not fit" lines = 2,417 bytes |
+| One skill line | `"- " + name + marker + ": " + description` = 284 bytes |
+| The fixed part | prefix, header, entry hint, five pad lines and their label, the tag line, three skill lines and their label, and all three "did not fit" lines = 3,519 bytes |
 | The budget | 2,560 tokens at four bytes a token = 10,240 bytes |
-| **The width the budget buys** | **(10,240 - 2,417) / 391 = 20 lines** |
+| **The width the budget buys** | **(10,240 - 3,519) / 391 = 17 lines** |
+
+**A new arm is paid for out of the quotient, never out of the budget.** The skill
+arm took the block from twenty knowledge lines to seventeen. What a turn pays for
+the block is the number the model's context notices, so it is the number held
+fixed; the width is derived from it, and a width that moves is the mechanism
+working. Raising the budget to keep the old width would have made the block cost
+more on every prompt to spare an arithmetic result.
 
 **The shipped width is the width the budget pays for.** The bar decides how many
 lines render, which leaves this number protecting the token budget and nothing
@@ -531,9 +680,12 @@ four-byte script, and the usual case, each at the shipped width and at a
 narrower one - so a later change to the line format cannot inflate the block in
 silence.
 
-Five scratchpad lines and five tag names, unchanged. Those are not what the
-budget buys: the pad holds one conversation's notes, and the tag line hands over
-a vocabulary rather than listing one.
+Five scratchpad lines, five tag names, and three skill lines. Those are not what
+the budget buys: the pad holds one conversation's notes, the tag line hands over
+a vocabulary rather than listing one, and a skill line is the strongest nudge the
+block can make - a long list of procedures reads as a plan rather than as a hint.
+All three are safety caps on the worst case; the bar still decides how many
+render.
 
 **One round.** Every other per-turn block re-renders each round, because each is
 answering "is this still in view?". `[Recall]` answers "what might this prompt be
@@ -554,19 +706,22 @@ non-zero against any query - the same trap that produced `scope_size` instead of
 a match count in the search tool.
 
 Each arm counts its own, and says which. The knowledge lookup reads at most 50
-rows and the scratchpad lookup at most 25 - fewer, because it reads one
-conversation's pad rather than the whole store, so the tail it would be counting
-is short. When a scan fills up *and* every row it read cleared the bar, that
-arm's count is a lower bound and says so: "and 42 or more entries were also
-relevant." When the scan read past the bar, the count is exact and carries no
-hedge. When nothing was dropped, there is no line.
+rows; the scratchpad and skill lookups read at most 25 each - fewer, because one
+reads a single conversation's pad and the other a catalog of tens of rows, so the
+tail either would be counting is short. When a scan fills up *and* every row it
+read cleared the bar, that arm's count is a lower bound and says so: "and 42 or
+more entries also matched." When the scan read past the bar, the count is exact
+and carries no hedge. When nothing was dropped, there is no line.
 
-**The line says "were also relevant", not "matched less closely".** The count has
-always been the number that cleared the bar, and "relevant" is what the bar
-names. Distance decided the *order* as well, until activation ranking landed - so
-an entry that did not fit may now have matched more closely than one that did,
-and the scratchpad arm, which activation does not rank, would be described one
-way and the entry arm another. One wording is true of both, and of a capped scan.
+**The line says "also matched", and neither ranks nor asserts.** It must not
+rank: distance decided the order until activation ranking landed, so an entry
+that did not fit may now have matched more closely than one that did, and the
+scratchpad arm, which activation does not rank, would then be described one way
+and the entry arm another. It must not assert: the standing guidance beside this
+block says nothing in it is asserted to be true, current, or relevant, so a line
+calling the remainder relevant would contradict the block it closes. What is
+left is the fact the count is made of - these rows cleared the bar, and there was
+no room for them - which is true of every arm, and of a capped scan.
 
 Activation ranking does not touch the count or the hedge, and the reason is worth
 stating because it is easy to assume otherwise. The rule the hedge rests on is
@@ -583,10 +738,11 @@ best that exists, which is what the hedge already says.
 Recall never fails a turn.
 
 The embedding call is bounded at five seconds, the same ceiling the
-knowledge-base search tool applies. On timeout or an embedding error both arms
-degrade to full-text search, and no dispersion is measured - a full-text row
+knowledge-base search tool applies. On timeout or an embedding error every arm
+degrades to full-text search, and no dispersion is measured - a full-text row
 carries no distance to read against a spread. The degradation is logged once, not
-once per arm.
+once per arm. The degraded skill read applies the same approval rule as the
+scan: a backend outage must not turn into an offer of something nobody approved.
 
 The whole lookup carries a second ceiling of ten seconds. The embedding timeout
 bounds only the embedding; the database round trips around it are bounded by the
@@ -697,7 +853,18 @@ Measured against a populated store, the whole query costs a few milliseconds.
 
 **It fires on every turn, including agent and subagent runs.** Any turn that goes
 through `send_prompt` gets a lookup, so a spawned agent working from a
-machine-written brief pays one embedding and two reads as well.
+machine-written brief pays one embedding and three reads as well.
+
+**The skill scan is a scan.** `skill_index.embedding` is a `vector[]` column and
+takes no ANN index, the same structural limit the knowledge base has, so the arm
+unnests every approved row's chunks on every turn. A skill catalog holds tens of
+rows where a knowledge base holds thousands, so this is the cheapest of the three
+reads today - and it grows with the catalog. Not measured.
+
+**The skill use log is read on every turn that finds a candidate**, on the same
+terms as the knowledge one: a batched primary-key read after the scan, bounded at
+half a second, whose failure costs the order of the skill lines and never the
+lines.
 
 **A pin the `[Pinned]` byte budget cut short is still suppressed.** The knowledge
 arm drops the attachments the turn *resolved*, which is a superset of what
@@ -748,4 +915,8 @@ measured.
 | Its degraded form | `PgKnowledgeBaseStore::search_text_any_term`, same file |
 | The scratchpad query | `PgScratchpadStore::nearest_by_embedding`, `crates/storage/src/scratchpad.rs` |
 | Its degraded form | `PgScratchpadStore::search_text_any_term`, same file |
+| The skill query, and the spread it states | `PgSkillIndexStore::nearest_by_embedding`, `crates/storage/src/skill_index.rs` |
+| Its degraded form | `PgSkillIndexStore::search_text_any_term`, same file |
+| The skill use log | `crates/core/src/ports/skill_use.rs`, `crates/storage/src/skill_use.rs` |
+| Where a skill open is recorded | `BuiltinToolService::record_skill_open`, `crates/mcp-client/src/builtin.rs` |
 | The tag names | `recall::carried_tags`, `crates/core/src/recall.rs` |

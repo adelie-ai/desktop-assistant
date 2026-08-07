@@ -140,6 +140,11 @@ The column would be decoration if nothing read it, so the read path enforces it:
   `ok: false`, `awaiting_approval: true`, and **no body**. The body is what gets
   followed. The refusal names the reason rather than pretending the skill does
   not exist, so the model does not simply ask again.
+- The `[Recall]` block's skill arm never offers one (#1154). It cannot be
+  marked and shown instead: `builtin_skill_get` refuses it, so the line is one
+  the model can only fail on, and it would accrue an offer every turn it ranked
+  near a prompt and never an open - the profile ranking reads as evidence to
+  retire a skill. See `docs/features/pre-prompt-recall.md`.
 
 Both descriptions advertised to the model say so, because a schema that promises
 what the code does not honour is a false contract.
@@ -200,6 +205,35 @@ only bundled scripts would fail to resolve, and an authored skill has none.
 The dream cycle writes candidates the same way. See
 `docs/features/knowledge-maintenance.md`, "A method is not a fact".
 
+## Skills surface without being searched for
+
+Search is free recall: the model has to suspect a relevant skill exists before it
+can find one. The `[Recall]` block's fourth arm (#1154) closes that gap. When a
+user prompt lands, the daemon embeds it once and asks the catalog what is near
+it, then offers the approved matches as one line each - a name and what the skill
+is for, never the body - before the model's first move.
+
+Three things follow for the catalog, and the whole design is in
+`docs/features/pre-prompt-recall.md`:
+
+- **Only an approved skill is offered**, and the exclusion happens inside the
+  scan, so an unapproved row is absent from the catalog's measured spread as
+  well as from the candidates.
+- **Only a locally authored one, too.** A skill installed from a repository or
+  a web source carries a description its author wrote, and
+  `builtin_skill_search` is classified `Declared(SkillTrustTier)` precisely
+  because that text is third-party content. The block has no tool call in it,
+  so nothing would taint; the arm drops such a skill rather than putting its
+  author's prose in a system message with every tool tier open. It stays
+  reachable through the search tool, which taints correctly.
+- **A skill whose files are gone is offered and marked** `[files missing]`. The
+  body still reads, so the procedure is still followable; only its bundled
+  scripts are unreachable.
+- **Offers and opens are recorded** in `skill_use_stats` and `skill_offers`
+  (migration `048_skill_use_log.sql`), so a skill surfaced often and opened never
+  is visible as such, and one opened repeatedly ranks above a nearer skill
+  nothing has read.
+
 ## Tools the model sees
 
 Capability-gated (advertised only when the index is wired), in the `skills`
@@ -231,6 +265,8 @@ provider group:
 | Trigger + `promote_plan_to_skill` handler | `crates/core/src/service.rs` (`plan_promotion_offer`, `handle_promote_plan`) |
 | Extraction's skill arm | `crates/storage/src/dreaming/skills.rs` |
 | Postgres store + migrations + backfill | `crates/storage/src/skill_index.rs`, `migrations/033_skill_index.sql`, `035_skill_presence.sql`, `046_skill_approval.sql`, `embedding_backfill.rs` |
+| The `[Recall]` skill arm | `crates/core/src/recall.rs`, `PgSkillIndexStore::nearest_by_embedding` |
+| The skill use log | `crates/core/src/ports/skill_use.rs`, `crates/storage/src/skill_use.rs`, `migrations/048_skill_use_log.sql` |
 | SQLite store + migrations | `crates/storage-sqlite/src/skill_index.rs`, `migrations/002_skill_index.sql`, `003_skill_approval.sql` |
 | Startup scanner | `crates/daemon/src/skill_scanner.rs` |
 | Config | `crates/daemon/src/config/mod.rs` (`SkillsConfig`) |

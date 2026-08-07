@@ -1,9 +1,17 @@
-//! Adapter behind the pre-prompt recall port (#1100, #1101).
+//! Adapter behind the pre-prompt recall port (#1100, #1101, #1154).
 //!
-//! One user prompt, one embedding, two indexes. The knowledge base answers with
-//! the entries nearest the prompt and how near each is; this conversation's
-//! scratchpad answers the same way about its own notes. The core decides what
-//! clears the bar and how the `[Recall]` block reads.
+//! One user prompt, one embedding, three indexes. The knowledge base answers
+//! with the entries nearest the prompt and how near each is; this
+//! conversation's scratchpad answers the same way about its own notes; and the
+//! skill catalog answers with the approved procedures nearest the prompt. The
+//! core decides what clears the bar and how the `[Recall]` block reads.
+//!
+//! ## The skill arm is optional, and absent is not an error
+//!
+//! A deployment with no skill catalog wires no skill store, and the arm then
+//! contributes no candidates and no spread. That is the same absence as a
+//! catalog holding nothing near the prompt, and the block renders its other
+//! arms either way.
 //!
 //! ## What a distance is worth, and who says so
 //!
@@ -33,11 +41,12 @@
 //! against one. A degradation is logged once, here, rather than once per arm.
 //!
 //! An arm that fails outright is a narrower loss than a lookup that fails. The
-//! scratchpad arm reads a different table from the knowledge arm, so it can fail
-//! on its own, and when it does it costs its own lines and nothing else - see
-//! [`notes_or_none`]. The measurement carries its own ceiling for the same
-//! reason. If a degraded read fails as well, the error travels to the caller,
-//! which drops the block and runs the turn.
+//! scratchpad arm and the skill arm each read a different table from the
+//! knowledge arm, so either can fail on its own, and when one does it costs its
+//! own lines and nothing else - see [`notes_or_none`] and [`skills_or_none`].
+//! The measurement carries its own ceiling for the same reason. If a degraded
+//! read fails as well, the error travels to the caller, which drops the block
+//! and runs the turn.
 //!
 //! The whole lookup carries a second ceiling, [`RECALL_CALL_CEILING`], because
 //! the embedding timeout bounds only the embedding: the database round trips
@@ -59,10 +68,12 @@ use desktop_assistant_core::ports::knowledge_use::{
 };
 use desktop_assistant_core::ports::recall::{
     RecallCandidates, RecallDispersion, RecallEntry, RecallNote, RecallRelevance, RecallRequest,
-    RecallSearchFn,
+    RecallSearchFn, RecallSkill,
 };
+use desktop_assistant_core::ports::skill_use::SkillUseLog;
 use desktop_assistant_storage::{
-    PgKnowledgeBaseStore, PgKnowledgeUseLog, PgPool, PgScratchpadStore,
+    NearestSkill, PgKnowledgeBaseStore, PgKnowledgeUseLog, PgPool, PgScratchpadStore,
+    PgSkillIndexStore, PgSkillUseLog,
 };
 
 /// How long one whole recall lookup may take before the turn gives up on it.
@@ -108,26 +119,32 @@ const USE_LOG_READ_CEILING: std::time::Duration = std::time::Duration::from_mill
 /// vector dimensions.
 pub fn build_recall_search(
     kb_store: Arc<PgKnowledgeBaseStore>,
+    skill_store: Option<Arc<PgSkillIndexStore>>,
     pool: PgPool,
     embed: EmbedFn,
     embedding_model: String,
 ) -> RecallSearchFn {
-    // The pad adapter and the use log are handles on the same pool, built once
-    // here rather than threaded in: nothing else in the daemon holds the pad
-    // one, and the reads behind these arms are inherent to them.
+    // The pad adapter and the two use logs are handles on the same pool, built
+    // once here rather than threaded in: nothing else in the daemon holds the
+    // pad one, and the reads behind these arms are inherent to them.
     let pad = Arc::new(PgScratchpadStore::new(pool.clone()));
     let uses = Arc::new(PgKnowledgeUseLog::new(pool.clone()));
+    let skill_uses = Arc::new(PgSkillUseLog::new(pool.clone()));
     Arc::new(move |request: RecallRequest| {
         let kb_store = Arc::clone(&kb_store);
+        let skill_store = skill_store.clone();
         let pad = Arc::clone(&pad);
         let uses = Arc::clone(&uses);
+        let skill_uses = Arc::clone(&skill_uses);
         let embed = Arc::clone(&embed);
         let embedding_model = embedding_model.clone();
         Box::pin(async move {
             within_ceiling(lookup(
                 &kb_store,
+                skill_store.as_deref(),
                 &pad,
                 &uses,
+                &skill_uses,
                 &embed,
                 &embedding_model,
                 request,
@@ -154,19 +171,22 @@ async fn within_ceiling(
 }
 
 /// One lookup: embed once, then ask every index.
+#[allow(clippy::too_many_arguments)]
 async fn lookup(
     kb_store: &PgKnowledgeBaseStore,
+    skill_store: Option<&PgSkillIndexStore>,
     pad: &PgScratchpadStore,
     uses: &PgKnowledgeUseLog,
+    skill_uses: &PgSkillUseLog,
     embed: &EmbedFn,
     embedding_model: &str,
     request: RecallRequest,
 ) -> Result<RecallCandidates, CoreError> {
     let Some(vector) = embed_prompt(embed, &request.prompt).await else {
-        // Degraded: full-text for both arms, and no dispersion. A full-text row
+        // Degraded: full-text for every arm, and no dispersion. A full-text row
         // carries no distance, so there is nothing to read against a spread.
         //
-        // `search_text_any_term` on both, not the trait's `search_text`: that
+        // `search_text_any_term` on each, not the store's own `search`: that
         // one joins the query's lexemes with AND, which asks a whole user
         // sentence to appear in one row and answers almost nothing.
         return gather(
@@ -200,12 +220,29 @@ async fn lookup(
                     .map(|note| to_recall_note(note, RecallRelevance::LexicalMatch))
                     .collect())
             },
+            async {
+                let Some(skills) = skill_store else {
+                    return Ok((Vec::new(), None));
+                };
+                Ok((
+                    skills
+                        .search_text_any_term(&request.prompt, request.skill_limit)
+                        .await?
+                        .into_iter()
+                        // No use records here either, for the reason the
+                        // knowledge arm above states.
+                        .map(to_recall_skill)
+                        .collect(),
+                    None,
+                ))
+            },
         )
         .await;
     };
 
-    // Both arms share the one vector, and neither depends on the other.
+    // Every arm shares the one vector, and none depends on another.
     let vector_for_notes = vector.clone();
+    let vector_for_skills = vector.clone();
     gather(
         async {
             let found = kb_store
@@ -299,8 +336,65 @@ async fn lookup(
                 .map(|(note, distance)| to_recall_note(note, RecallRelevance::Distance(distance)))
                 .collect())
         },
+        async {
+            let Some(skills) = skill_store else {
+                return Ok((Vec::new(), None));
+            };
+            let found = skills
+                .nearest_by_embedding(vector_for_skills, embedding_model, request.skill_limit)
+                .await?;
+            // One batched read after the scan, on the same terms and for the
+            // same reasons as the knowledge arm's above: a slow or broken log
+            // costs the order of the skill lines and never the lines.
+            let names: Vec<String> = found.skills.iter().map(|s| s.name.clone()).collect();
+            let mut records = if names.is_empty() {
+                std::collections::HashMap::new()
+            } else {
+                use_records(skill_uses.records(names)).await
+            };
+            tracing::debug!(
+                candidates = found.skills.len(),
+                with_use_record = records.len(),
+                "recall: how many skill candidates the use log had something to say about"
+            );
+            Ok((
+                found
+                    .skills
+                    .into_iter()
+                    .map(|skill| {
+                        let record = records.remove(&skill.name);
+                        to_recall_skill(skill).with_use_record(record)
+                    })
+                    .collect(),
+                found.dispersion,
+            ))
+        },
     )
     .await
+}
+
+/// One scanned skill as a recall candidate.
+///
+/// The name, the description and the presence flag travel; nothing is rendered
+/// here, and the body was never read. How much of a description a line may
+/// spend, and how a skill whose files are gone is marked, are the core's
+/// decisions.
+fn to_recall_skill(skill: NearestSkill) -> RecallSkill {
+    // The row states which kind of relevance it carries, rather than the call
+    // site stating it: the measured read and the degraded one answer with the
+    // same type, and a call site that assumed the wrong one would render a
+    // lexical row as a perfect distance - clearing any bar and being ranked by
+    // activation as though it held a semantic signal.
+    let relevance = match skill.distance {
+        Some(distance) => RecallRelevance::Distance(distance),
+        None => RecallRelevance::LexicalMatch,
+    };
+    RecallSkill::new(
+        skill.name,
+        skill.description,
+        skill.present_on_disk,
+        relevance,
+    )
 }
 
 /// What the use log knows about `ids`, keyed by id, and an empty map where it
@@ -390,25 +484,26 @@ async fn situation_signal(
     (signal.records.into_iter().collect(), signal.cue)
 }
 
-/// Run the two arms together and fold what they answered into one candidate
+/// Run the three arms together and fold what they answered into one candidate
 /// set.
 ///
-/// Generic over the futures, and separate from [`lookup`], so both halves of
-/// what it guarantees are provable without a database - which is the only way to
-/// hold either to anything.
+/// Generic over the futures, and separate from [`lookup`], so everything it
+/// guarantees is provable without a database - which is the only way to hold
+/// any of it to anything.
 ///
 /// **`join!`, never `try_join!`.** The arms do not depend on each other, and one
-/// arm's error must not cancel the one that was answering.
+/// arm's error must not cancel one that was answering.
 ///
-/// **The scratchpad arm's error is absorbed; the knowledge arm's propagates.** A
-/// knowledge arm that cannot read is the block's whole point failing, and the
-/// caller drops the block and runs the turn anyway; losing the pad lines is the
-/// smaller loss, so it is taken here rather than passed on. The absorbed arm
-/// resolves first, so its failure is logged even on the turn where the other
-/// arm's error is about to end the lookup.
+/// **The pad arm's and the skill arm's errors are absorbed; the knowledge arm's
+/// propagates.** A knowledge arm that cannot read is the block's whole point
+/// failing, and the caller drops the block and runs the turn anyway; losing the
+/// pad lines or the skill lines is the smaller loss, so it is taken here rather
+/// than passed on. The absorbed arms resolve first, so their failures are
+/// logged even on the turn where the knowledge arm's error is about to end the
+/// lookup.
 ///
-/// The knowledge arm answers with the store's own spread beside its candidates,
-/// because one scan states both.
+/// The knowledge arm and the skill arm each answer with their own source's
+/// spread beside their candidates, because one scan states both.
 async fn gather(
     entries: impl Future<
         Output = Result<
@@ -421,9 +516,11 @@ async fn gather(
         >,
     >,
     notes: impl Future<Output = Result<Vec<RecallNote>, CoreError>>,
+    skills: impl Future<Output = Result<(Vec<RecallSkill>, Option<RecallDispersion>), CoreError>>,
 ) -> Result<RecallCandidates, CoreError> {
-    let (entries, notes) = tokio::join!(entries, notes);
+    let (entries, notes, skills) = tokio::join!(entries, notes, skills);
     let notes = notes_or_none(notes);
+    let (skills, skill_dispersion) = skills_or_none(skills);
     let (entries, entry_dispersion, situation_cue) = entries?;
     // Which sources stated their own geometry, and which the block will read by
     // a stated estimate. Without this an operator meeting a block that is
@@ -433,11 +530,13 @@ async fn gather(
     tracing::debug!(
         knowledge = how_the_distances_are_read(entry_dispersion),
         scratchpad = how_the_distances_are_read(None),
+        skills = how_the_distances_are_read(skill_dispersion),
         "recall: how each source's distances are read"
     );
     Ok(RecallCandidates {
         entries,
         notes,
+        skills,
         entry_dispersion,
         // The pad is read against the stated estimate. One conversation's pad
         // rarely holds enough rows for a median absolute deviation over it to
@@ -445,6 +544,7 @@ async fn gather(
         // block's most expensive query - see #1146.
         note_dispersion: None,
         situation_cue,
+        skill_dispersion,
     })
 }
 
@@ -494,6 +594,28 @@ fn notes_or_none(found: Result<Vec<RecallNote>, CoreError>) -> Vec<RecallNote> {
                 "recall: the scratchpad arm failed; the other arms still render"
             );
             Vec::new()
+        }
+    }
+}
+
+/// The skill arm's rows and its spread, or neither.
+///
+/// The same treatment [`notes_or_none`] gives the pad, and for the same reason:
+/// the arm reads its own table, so it fails on its own, and losing the skill
+/// lines is a smaller loss than losing the block. The spread goes with them -
+/// a spread with no candidates to grade is nothing, and it must not be left
+/// standing as though the catalog had been measured.
+fn skills_or_none(
+    found: Result<(Vec<RecallSkill>, Option<RecallDispersion>), CoreError>,
+) -> (Vec<RecallSkill>, Option<RecallDispersion>) {
+    match found {
+        Ok(answer) => answer,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "recall: the skill arm failed; the other arms still render"
+            );
+            (Vec::new(), None)
         }
     }
 }
@@ -624,6 +746,21 @@ mod tests {
         RecallDispersion::measured(0.80, 0.06, 400).expect("a store's own statistics")
     }
 
+    fn a_skill() -> RecallSkill {
+        RecallSkill::new(
+            "publish-a-crate",
+            "Cut a release and push it to the registry.",
+            true,
+            RecallRelevance::Distance(0.12),
+        )
+    }
+
+    /// The skill arm answering with nothing, for a test whose subject is one of
+    /// the other two.
+    async fn no_skills() -> Result<(Vec<RecallSkill>, Option<RecallDispersion>), CoreError> {
+        Ok((Vec::new(), None))
+    }
+
     fn a_note() -> RecallNote {
         RecallNote {
             key: "deploy-window".into(),
@@ -642,6 +779,7 @@ mod tests {
         let candidates = gather(
             async { Ok((vec![an_entry()], Some(a_dispersion()), None)) },
             async { Err(CoreError::Storage("the pad read failed".into())) },
+            no_skills(),
         )
         .await
         .expect("a failed pad read must not fail the lookup");
@@ -659,9 +797,11 @@ mod tests {
 
     #[tokio::test]
     async fn the_scratchpad_arm_passes_its_rows_through_when_it_answers() {
-        let candidates = gather(async { Ok((vec![], Some(a_dispersion()), None)) }, async {
-            Ok(vec![a_note()])
-        })
+        let candidates = gather(
+            async { Ok((vec![], Some(a_dispersion()), None)) },
+            async { Ok(vec![a_note()]) },
+            no_skills(),
+        )
         .await
         .expect("an arm that answers is not a failure");
 
@@ -693,6 +833,7 @@ mod tests {
         let candidates = gather(
             async { Ok((vec![an_entry()], Some(a_dispersion()), None)) },
             async { Ok(vec![]) },
+            no_skills(),
         )
         .await
         .expect("every arm answered");
@@ -705,9 +846,11 @@ mod tests {
     /// estimate.
     #[tokio::test]
     async fn a_store_that_cannot_be_measured_still_answers_with_its_candidates() {
-        let candidates = gather(async { Ok((vec![an_entry()], None, None)) }, async {
-            Ok(vec![])
-        })
+        let candidates = gather(
+            async { Ok((vec![an_entry()], None, None)) },
+            async { Ok(vec![]) },
+            no_skills(),
+        )
         .await
         .expect("a measurement is not what the lookup is for");
 
@@ -723,15 +866,16 @@ mod tests {
         let answer = gather(
             async { Err(CoreError::Storage("the store is down".into())) },
             async { Ok(vec![a_note()]) },
+            no_skills(),
         )
         .await;
 
         assert!(answer.is_err());
     }
 
-    /// The arms must run together, not one after another: two reads and an
-    /// embedding sit inside a ten-second whole-lookup ceiling, and a serial fold
-    /// would spend the budget twice over.
+    /// The arms must run together, not one after another: three reads and an
+    /// embedding sit inside a ten-second whole-lookup ceiling, and a serial
+    /// fold would spend the budget three times over.
     #[tokio::test(start_paused = true)]
     async fn the_arms_run_together_rather_than_one_after_another() {
         let hold = std::time::Duration::from_secs(4);
@@ -746,13 +890,17 @@ mod tests {
                 tokio::time::sleep(hold).await;
                 Ok(vec![a_note()])
             },
+            async move {
+                tokio::time::sleep(hold).await;
+                Ok((vec![a_skill()], Some(a_dispersion())))
+            },
         )
         .await
-        .expect("both arms answered");
+        .expect("every arm answered");
 
         assert!(
             started.elapsed() < hold * 2,
-            "two reads took {:?}, which is serial rather than concurrent",
+            "three reads took {:?}, which is serial rather than concurrent",
             started.elapsed()
         );
     }

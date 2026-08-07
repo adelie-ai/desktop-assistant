@@ -250,6 +250,26 @@ The log is capability-gated like every other knowledge closure. Without a
 database the tools behave exactly as they did before it existed, and
 `builtin_knowledge_base_mark` reports that the knowledge base is not configured.
 
+## Skills keep their own log
+
+The `[Recall]` block also offers skills (#1154), and the same two questions apply
+to a procedure: was it put in front of the model, and was it taken up. They are
+recorded in `skill_use_stats` and `skill_offers` rather than here, because
+`knowledge_use_stats` and `knowledge_offers` carry a foreign key to
+`knowledge_base(id)` - the key that frees an entry's use rows when the entry is
+reaped - and a skill has no row in that table.
+
+Everything above the key is shared. `OfferScope` decides whether an offer
+replaces the conversation's standing set or adds to it, on the rules stated here;
+an open counts only against a standing offer and takes it down; and the read
+comes back as the same `KnowledgeUseRecord`, so `activation` computes the
+reinforcement term with the same arithmetic. A skill record's identifier field
+carries the skill's name, which is what `builtin_skill_get` takes.
+
+One act is missing: no tool sets a mark on a skill, so the skill log records
+offers and opens and has no marks table. The act arrives with the tool that
+performs it, not as a column waiting for one.
+
 ## Where the code is
 
 | Piece | Path |
@@ -262,3 +282,6 @@ database the tools behave exactly as they did before it existed, and
 | Recording it, once per turn | `ConversationHandler::send_prompt`, `crates/core/src/service.rs` |
 | The search offer, the open, and the mark | `crates/mcp-client/src/builtin.rs` |
 | Multi-tenant and correlation tests | `crates/storage/tests/knowledge_use_log.rs` |
+| The skill log's port and adapter | `crates/core/src/ports/skill_use.rs`, `crates/storage/src/skill_use.rs` |
+| Its two tables | `crates/storage/migrations/048_skill_use_log.sql` |
+| Its tests | `crates/storage/tests/skill_recall.rs` |

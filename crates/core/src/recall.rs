@@ -12,7 +12,7 @@
 //! line per entry costs about a tenth as much, and the model keeps its own
 //! judgement about whether any of it matters.
 //!
-//! ## Two arms, and a vocabulary that lights up from them
+//! ## The arms, and a vocabulary that lights up from one of them
 //!
 //! - **The knowledge base**, the durable memory across conversations.
 //! - **This conversation's scratchpad** (#1101), the working pad. `[Scratchpad]`
@@ -22,6 +22,13 @@
 //! - **The tags those entries carry**, a working vocabulary for the model's
 //!   first search. Derived from what surfaced rather than searched for, so it
 //!   cannot speak when nothing surfaced - see `carried_tags`.
+//! - **The skill catalog** (#1154), procedural memory. The three arms above are
+//!   all declarative - what is true, and what happened. A skill is how to do a
+//!   thing, and it is cued differently: nobody retrieves how to ride a bicycle
+//!   by searching their memory for it. Until this arm existed a skill was
+//!   reachable only by free recall, so the model had to suspect one existed
+//!   before it could find it, and a good skill nobody suspected was invisible
+//!   however often it had helped.
 //!
 //! ## What bounds it
 //!
@@ -40,9 +47,10 @@
 //!   with no history renders the block its distances alone would have rendered.
 //! - **A line budget, derived from a token budget.**
 //!   [`RECALL_BLOCK_TOKEN_BUDGET`] pays for [`BUDGETED_MAX_RECALL_ENTRIES`]
-//!   entry lines, [`MAX_RECALL_NOTES`] note lines and [`MAX_RECALL_TAGS`] tag
-//!   names. That width is a safety cap on the worst case rather than the
-//!   mechanism, and a deployment may state its own.
+//!   entry lines, [`MAX_RECALL_NOTES`] note lines, [`MAX_RECALL_SKILLS`] skill
+//!   lines and [`MAX_RECALL_TAGS`] tag names. Those widths are safety caps on
+//!   the worst case rather than the mechanism, and a deployment may state its
+//!   own entry width.
 //! - **Nothing already in view.** A note `[Pinned]` renders in full, a key the
 //!   `[Scratchpad]` index has just listed, a step or finding `[Plan]` has just
 //!   named, and a knowledge entry a pin attaches (#1104) are all dropped here.
@@ -68,9 +76,11 @@
 
 use std::sync::OnceLock;
 
-use crate::domain::activation::{ActivationWeights, NO_SITUATION, activation};
+use crate::domain::activation::{ActivationWeights, activation};
 use crate::domain::situation::SituationCue;
-use crate::ports::recall::{RecallCandidates, RecallDispersion, RecallEntry, RecallNote};
+use crate::ports::recall::{
+    Activatable, RecallCandidates, RecallDispersion, RecallEntry, RecallNote, RecallSkill,
+};
 use crate::ports::scratchpad::NOTE_KEY_MAX_CHARS;
 
 /// The token budget for the whole `[Recall]` block, worst case.
@@ -127,6 +137,19 @@ const RECALL_ENTRY_LINE_MAX_BYTES: usize = 2
 /// [`RECALL_NOTE_MAX_CHARS`] read as bytes.
 const RECALL_NOTE_LINE_MAX_BYTES: usize = 2 + NOTE_KEY_MAX_CHARS + 2 + RECALL_NOTE_MAX_CHARS;
 
+/// What one skill line may cost, in bytes, its newline apart.
+///
+/// The shape is `"- " + name + marker + ": " + description`, where the marker
+/// is [`RECALL_SKILL_ABSENT_MARKER`] on a skill whose files are gone and empty
+/// otherwise. The name is held to [`RECALL_ID_MAX_CHARS`], because it is the
+/// handle the skill is fetched by and so it is an id in every sense that
+/// matters here.
+const RECALL_SKILL_LINE_MAX_BYTES: usize = 2
+    + RECALL_ID_MAX_CHARS
+    + RECALL_SKILL_ABSENT_MARKER.len()
+    + 2
+    + RECALL_SKILL_DESCRIPTION_MAX_CHARS;
+
 /// What one "did not fit" line costs, worst case.
 ///
 /// The newline, `"...and "` (7), the digits of any `usize` (20), the hedge
@@ -139,7 +162,8 @@ const RECALL_DROPPED_LINE_MAX_BYTES: usize = 1 + 7 + 20 + 8 + 1 + 7 + 14;
 /// What the block costs before its first knowledge line, worst case: the
 /// prefix, the header and its entry hint, the entry arm's "did not fit" line,
 /// the pad label with [`MAX_RECALL_NOTES`] lines and its own "did not fit"
-/// line, and the tag label with a full tag line.
+/// line, the tag label with a full tag line, and the skill label with
+/// [`MAX_RECALL_SKILLS`] lines and its own "did not fit" line.
 const RECALL_FIXED_MAX_BYTES: usize = RECALL_BLOCK_PREFIX_BYTES
     + RECALL_HEADER.len()
     + 1
@@ -152,7 +176,11 @@ const RECALL_FIXED_MAX_BYTES: usize = RECALL_BLOCK_PREFIX_BYTES
     + 1
     + RECALL_TAG_LABEL.len()
     + 1
-    + RECALL_TAG_LINE_MAX_BYTES;
+    + RECALL_TAG_LINE_MAX_BYTES
+    + 1
+    + RECALL_SKILL_LABEL.len()
+    + MAX_RECALL_SKILLS * (1 + RECALL_SKILL_LINE_MAX_BYTES)
+    + RECALL_DROPPED_LINE_MAX_BYTES;
 
 /// How many knowledge lines [`RECALL_BLOCK_TOKEN_BUDGET`] pays for, once the
 /// fixed part of the block is taken.
@@ -162,6 +190,13 @@ const RECALL_FIXED_MAX_BYTES: usize = RECALL_BLOCK_PREFIX_BYTES
 /// budget buys an index instead of a handful of extracts. Breadth is the point:
 /// a title the model can see but has not opened still says that something
 /// exists, and an entry that never appears cannot be asked for.
+///
+/// **A new arm is paid for out of this quotient, never out of the budget.** The
+/// skill arm (#1154) took the block from twenty knowledge lines to seventeen,
+/// because what a turn pays for the block is the number the model's window
+/// notices and the width is derived from it. Raising
+/// [`RECALL_BLOCK_TOKEN_BUDGET`] to keep the old width would have made the
+/// block cost more every prompt to spare an arithmetic result.
 pub const BUDGETED_MAX_RECALL_ENTRIES: usize =
     (RECALL_BLOCK_MAX_BYTES - RECALL_FIXED_MAX_BYTES) / (1 + RECALL_ENTRY_LINE_MAX_BYTES);
 
@@ -291,6 +326,49 @@ pub const RECALL_NOTE_MAX_CHARS: usize = crate::domain::knowledge::SUMMARY_MAX_C
 /// closely" is a count rather than a guess.
 pub const RECALL_NOTE_SCAN_LIMIT: usize = 25;
 
+/// How many skill lines the block may show (#1154).
+///
+/// **A safety cap, not the mechanism.** [`RECALL_BAR`] decides how many skill
+/// lines render, exactly as it does for the knowledge arm: a prompt that names
+/// nothing procedural clears none, and a prompt that cues a procedure clears
+/// one or two. What this bounds is the worst case the token budget has to pay
+/// for.
+///
+/// Three, and fewer than [`MAX_RECALL_NOTES`], for two reasons that point the
+/// same way. Surfacing a procedure unprompted is the strongest nudge the block
+/// can make, because a procedure says what to *do* rather than what is true, so
+/// a long list of them reads as a plan rather than as a hint. And every line
+/// here is bought from [`BUDGETED_MAX_RECALL_ENTRIES`]: at this cap the block
+/// keeps seventeen knowledge lines, where a cap of five would leave sixteen.
+pub const MAX_RECALL_SKILLS: usize = 3;
+
+/// How much of a skill's description a line may spend.
+///
+/// The same width a knowledge line and a note line get
+/// ([`crate::domain::knowledge::SUMMARY_MAX_CHARS`]), because all three do the
+/// same job: enough to answer "is this the thing I want?", never the whole of
+/// it. A `SKILL.md` description is meant to be a sentence or two, but nothing
+/// on the write path enforces that, so this is a real bound.
+pub const RECALL_SKILL_DESCRIPTION_MAX_CHARS: usize = crate::domain::knowledge::SUMMARY_MAX_CHARS;
+
+/// What a skill line carries when the skill's files are no longer on disk.
+///
+/// Marked rather than dropped, because such a skill is still usable: the
+/// catalog is cumulative (#639), so the body still reads and the procedure is
+/// still good. What is gone is the on-disk directory, so any script the skill
+/// bundles cannot be run. The marker says which state the line is in; what the
+/// state means is taught once, in the standing instruction, rather than paid
+/// for in every block.
+pub const RECALL_SKILL_ABSENT_MARKER: &str = " [files missing]";
+
+/// How many skill rows one lookup reads before it stops counting.
+///
+/// The same figure as [`RECALL_NOTE_SCAN_LIMIT`] and for the same reason: a
+/// skill catalog holds tens of rows rather than thousands, so the tail this
+/// would be counting is short, and it is still far past [`MAX_RECALL_SKILLS`],
+/// so "and N more also matched" is a count rather than a guess.
+pub const RECALL_SKILL_SCAN_LIMIT: usize = 25;
+
 /// How far a candidate must stand out from its own source to be shown, counted
 /// in that source's median absolute deviations below its median.
 ///
@@ -355,6 +433,25 @@ const RECALL_NOTE_LABEL: &str = "Notes on this conversation's scratchpad. Each l
 /// Label on the tag line.
 const RECALL_TAG_LABEL: &str = "Tags the entries above carry:";
 
+/// Opens the skill lines (#1154).
+///
+/// **The wording has to make a procedure read as available, never as chosen.**
+/// Every other line in this block offers a fact, and a fact that does not fit
+/// costs a few tokens to ignore. A procedure that does not fit gets carried
+/// out, with steps meant for another situation, so an arm that surfaces one
+/// unasked is a stronger nudge than anything else here and its label has to
+/// pull the other way. Three phrases do that work. "May fit" states a
+/// possibility rather than a match. "Not the procedure itself" says the line
+/// cannot be acted on as it stands. And "none of these is chosen for you" names
+/// the inference the block must not invite - that something put a procedure
+/// here because it applies - then hands the decision back with the fit check
+/// the standing instruction already requires of any skill.
+///
+/// It names no tool, for the reason [`RECALL_ENTRY_HINT`] gives.
+const RECALL_SKILL_LABEL: &str = "Procedures on file that may fit this situation. Each line is one skill: its name, then \
+     what it is for - not the procedure itself. None of these is chosen for you; check that \
+     one fits before you follow it.";
+
 /// One turn's recall input: what the lookup found, how far it read, and what
 /// the rest of this turn's prompt already shows.
 ///
@@ -377,6 +474,8 @@ pub(crate) struct RecallSurface<'a> {
     /// The ceiling the scratchpad arm was asked to read to, for the same
     /// reason.
     pub note_scan_limit: usize,
+    /// The ceiling the skill arm was asked to read to, for the same reason.
+    pub skill_scan_limit: usize,
     /// The note keys the `[Scratchpad]` index lists **when it speaks**. Empty
     /// when it is silent, which is the case this arm exists for.
     pub indexed_keys: &'a [String],
@@ -414,12 +513,14 @@ impl<'a> RecallSurface<'a> {
         candidates: &'a RecallCandidates,
         entry_scan_limit: usize,
         note_scan_limit: usize,
+        skill_scan_limit: usize,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Self {
         Self {
             candidates,
             entry_scan_limit,
             note_scan_limit,
+            skill_scan_limit,
             now,
             indexed_keys: &[],
             planned_keys: &[],
@@ -449,7 +550,13 @@ impl<'a> RecallSurface<'a> {
 ///
 /// The arms render in order of how far the material is from the turn: the
 /// durable knowledge base, then this conversation's own pad, then the
-/// vocabulary those entries carry.
+/// vocabulary those entries carry, and last the skill catalog.
+///
+/// The skill arm is last for two reasons rather than one. The tag line is
+/// derived from the entry lines and says "the entries above", so nothing may
+/// come between the two. And a skill line is the only line in the block that
+/// offers something to *do*, so it is set apart from the material it might
+/// otherwise be read as a part of, under a label of its own.
 ///
 /// Every candidate list arrives nearest-first, and the bar reads it in that
 /// order. The knowledge arm is then reordered by activation, over the
@@ -476,6 +583,10 @@ pub(crate) struct RenderedRecall {
     pub text: String,
     /// The entries whose lines this block carries, in the order they render.
     pub entry_ids: Vec<String>,
+    /// The skills whose lines this block carries, in the order they render
+    /// (#1154). Recorded as offered against the skill use log, on the same
+    /// terms and for the same reason as `entry_ids`.
+    pub skill_names: Vec<String>,
 }
 
 /// [`render_recall`] at a stated width, so the width can be varied without
@@ -600,7 +711,61 @@ fn render_recall_with_width(
         .filter_map(|note| note_line(note))
         .collect();
 
-    if showable.is_empty() && showable_notes.is_empty() {
+    // The skill catalog is its own source and carries its own spread (#1154).
+    // A skill row embeds a name, a "when to use" line and a playbook body; a
+    // knowledge row embeds a fact and a scratchpad row a telegraphic note. The
+    // three put their distances in different places, and reading each against
+    // its own dispersion is the only thing that makes one bar mean the same in
+    // all three.
+    let skill_dispersion = candidates
+        .skill_dispersion
+        .unwrap_or(RECALL_ASSUMED_DISPERSION);
+    let skills_above_bar: Vec<&RecallSkill> = candidates
+        .skills
+        .iter()
+        .filter(|skill| skill.relevance.clears_bar(skill_dispersion, RECALL_BAR))
+        .collect();
+    let skills_capped = candidates.skills.len() >= surface.skill_scan_limit
+        && skills_above_bar.len() == candidates.skills.len();
+
+    // Two later filters, neither ordered by distance, so neither reaches the
+    // `capped` decision above - the same rule the entry arm's drops follow.
+    //
+    // * A skill whose name does not survive `bounded`. The name is the handle
+    //   the model fetches the skill by, and a line can carry only
+    //   `RECALL_ID_MAX_CHARS` characters of it with its whitespace collapsed, so
+    //   a longer or whitespace-bearing name renders as a string no fetch can
+    //   resolve. Offering it would accrue an offer every turn it ranked near a
+    //   prompt and never an open.
+    // * A skill with no description left after bounding. The name alone says
+    //   the procedure exists and nothing about when it applies, which is the
+    //   half of the line a reader decides on.
+    //
+    // An unapproved skill is not filtered here, because it never arrives: the
+    // adapter excludes it from the scan, so it is absent from the spread as
+    // well as from the candidates. See `ports::recall::RecallSkill`.
+    let showable_skills: Vec<(&RecallSkill, String)> = skills_above_bar
+        .iter()
+        .filter(|skill| bounded(&skill.name, RECALL_ID_MAX_CHARS) == skill.name)
+        .filter_map(|skill| {
+            let line = bounded(&skill.description, RECALL_SKILL_DESCRIPTION_MAX_CHARS);
+            (!line.is_empty()).then_some((*skill, line))
+        })
+        .collect();
+    // The cue travels, and the skill arm answers `NO_SITUATION` for every
+    // candidate through `Activatable::situation_coverage`: no situation record
+    // names a skill yet (#1125 keys them on a knowledge entry). Passing the cue
+    // rather than `None` keeps that a property of the source instead of a
+    // decision this call site made, so the day a skill carries a record the
+    // term lights up here without a change.
+    let showable_skills = rank_by_activation(
+        showable_skills,
+        skill_dispersion,
+        candidates.situation_cue.as_ref(),
+        surface.now,
+    );
+
+    if showable.is_empty() && showable_notes.is_empty() && showable_skills.is_empty() {
         return None;
     }
 
@@ -646,18 +811,41 @@ fn render_recall_with_width(
         block.push_str(&tags);
     }
 
+    let mut skill_names = Vec::new();
+    if !showable_skills.is_empty() {
+        block.push('\n');
+        block.push_str(RECALL_SKILL_LABEL);
+        for (skill, description) in showable_skills.iter().take(MAX_RECALL_SKILLS) {
+            block.push('\n');
+            block.push_str(&skill_line(skill, description));
+            skill_names.push(skill.name.clone());
+        }
+        let dropped_skills = showable_skills.len().saturating_sub(MAX_RECALL_SKILLS);
+        if let Some(line) = dropped_line(dropped_skills, skills_capped, "skills") {
+            block.push('\n');
+            block.push_str(&line);
+        }
+    }
+
     Some(RenderedRecall {
         text: block,
         entry_ids,
+        skill_names,
     })
 }
 
-/// Order the admitted entries by activation, best first (#1123).
+/// Order the admitted candidates of one arm by activation, best first (#1123).
 ///
 /// One score, over the two signals retrieval actually holds: how far the
 /// candidate stands out of its own source, and what the use log knows about it.
 /// [`crate::domain::activation`] states the score and why it has that shape;
 /// what belongs here is what it means for a block.
+///
+/// **One function for every arm that has a use log.** The knowledge arm and the
+/// skill arm (#1154) rank on the same two signals, so they rank through the
+/// same code: two implementations would agree until one of the rules below
+/// changed, and the rule most likely to change is the one the second copy could
+/// not see. `dispersion` is the arm's own, never another's.
 ///
 /// **Stable, so distance breaks a tie.** Candidates arrive nearest-first, and a
 /// stable sort leaves two of equal activation in that order - which is the right
@@ -678,20 +866,25 @@ fn render_recall_with_width(
 /// block's "and N more entries also matched" hedge, which counts what cleared a
 /// distance test over a nearest-first list. Nothing in this function is
 /// reachable from that test.
-fn rank_by_activation<'a>(
-    showable: Vec<(&'a RecallEntry, String)>,
+///
+/// A source that keeps no situation record answers
+/// [`NO_SITUATION`](crate::domain::activation::NO_SITUATION) through
+/// [`Activatable::situation_coverage`] and the term contributes zero - see the
+/// skill arm's implementation, which says why it has nothing to read yet.
+fn rank_by_activation<'a, T: Activatable>(
+    showable: Vec<(&'a T, String)>,
     dispersion: RecallDispersion,
     situation: Option<&SituationCue>,
     now: chrono::DateTime<chrono::Utc>,
-) -> Vec<(&'a RecallEntry, String)> {
+) -> Vec<(&'a T, String)> {
     let weights = ActivationWeights::default();
     let scored: Vec<Option<f64>> = showable
         .iter()
         .map(|(hit, _)| {
-            let coverage = situation.map_or(NO_SITUATION, |cue| cue.coverage(&hit.situation));
-            hit.relevance.semantic_signal(dispersion).map(|semantic| {
-                activation(semantic, hit.use_record.as_ref(), coverage, now, &weights)
-            })
+            let coverage = hit.situation_coverage(situation);
+            hit.relevance()
+                .semantic_signal(dispersion)
+                .map(|semantic| activation(semantic, hit.use_record(), coverage, now, &weights))
         })
         .collect();
     let with_signal = scored.iter().filter(|score| score.is_some()).count();
@@ -712,7 +905,7 @@ fn rank_by_activation<'a>(
     }
     let scores: Vec<f64> = scored.into_iter().flatten().collect();
 
-    let mut ranked: Vec<(f64, (&RecallEntry, String))> = scores.into_iter().zip(showable).collect();
+    let mut ranked: Vec<(f64, (&'a T, String))> = scores.into_iter().zip(showable).collect();
     // `total_cmp` rather than `partial_cmp`, so the comparator is a total order
     // and the sort cannot depend on which pair it happened to visit first. A
     // score that is not a number cannot reach here: the bar compares the same
@@ -944,6 +1137,32 @@ fn note_line(note: &RecallNote) -> Option<String> {
     Some(bounded_bytes(rendered, RECALL_NOTE_LINE_MAX_BYTES))
 }
 
+/// One skill line: the name the skill is fetched by, whether its files are
+/// gone, and what it is for.
+///
+/// **The body is never here**, and that is the arm's whole economy. A playbook
+/// runs to hundreds of lines, and one line saying the procedure exists costs a
+/// fraction of it; the model reads the body only once it decides the procedure
+/// is worth reading.
+///
+/// `description` is the skill's own "when to use" line, already bounded to one
+/// physical line by the caller. The name passes [`bounded`] here as well,
+/// because a stored value on a line of a system message forges a line if it
+/// carries a newline - the rule every other part of every other line in this
+/// block passes.
+fn skill_line(skill: &RecallSkill, description: &str) -> String {
+    let name = bounded(&skill.name, RECALL_ID_MAX_CHARS);
+    let marker = if skill.present_on_disk {
+        ""
+    } else {
+        RECALL_SKILL_ABSENT_MARKER
+    };
+    bounded_bytes(
+        format!("- {name}{marker}: {description}"),
+        RECALL_SKILL_LINE_MAX_BYTES,
+    )
+}
+
 /// The "did not fit" line for one arm, or `None` when nothing was dropped.
 ///
 /// `capped` renders the count as a lower bound. Reporting a capped number as if
@@ -1072,6 +1291,16 @@ mod tests {
         }
     }
 
+    /// One skill candidate at a stated distance.
+    fn skill(name: &str, description: &str, present_on_disk: bool, distance: f64) -> RecallSkill {
+        RecallSkill::new(
+            name,
+            description,
+            present_on_disk,
+            RecallRelevance::Distance(distance),
+        )
+    }
+
     /// The same note, pinned - so its full content is already under `[Pinned]`.
     fn pinned(key: &str, content: &str, distance: f64) -> RecallNote {
         RecallNote {
@@ -1117,6 +1346,7 @@ mod tests {
                 candidates,
                 RECALL_ENTRY_SCAN_LIMIT,
                 RECALL_NOTE_SCAN_LIMIT,
+                RECALL_SKILL_SCAN_LIMIT,
                 test_now(),
             ),
             max_entries,
@@ -1156,6 +1386,7 @@ mod tests {
                 candidates,
                 RECALL_ENTRY_SCAN_LIMIT,
                 RECALL_NOTE_SCAN_LIMIT,
+                RECALL_SKILL_SCAN_LIMIT,
                 test_now(),
             )
             .already_in_view(indexed_keys, planned_keys, pinned_entry_ids),
@@ -1535,20 +1766,32 @@ mod tests {
         assert_eq!(rendered.entry_ids, vec!["kb-0".to_string()]);
     }
 
-    /// The block's knowledge lines: the `- ` lines before the scratchpad label.
+    /// The block's knowledge lines: the `- ` lines before any other arm's
+    /// label.
     fn entry_lines(block: &str) -> Vec<&str> {
         block
             .lines()
-            .take_while(|l| !l.starts_with(RECALL_NOTE_LABEL))
+            .take_while(|l| !l.starts_with(RECALL_NOTE_LABEL) && !l.starts_with(RECALL_SKILL_LABEL))
             .filter(|l| l.starts_with("- "))
             .collect()
     }
 
-    /// The block's scratchpad lines: the `- ` lines after the scratchpad label.
+    /// The block's scratchpad lines: the `- ` lines between the scratchpad
+    /// label and the skill label.
     fn note_lines(block: &str) -> Vec<&str> {
         block
             .lines()
             .skip_while(|l| !l.starts_with(RECALL_NOTE_LABEL))
+            .take_while(|l| !l.starts_with(RECALL_SKILL_LABEL))
+            .filter(|l| l.starts_with("- "))
+            .collect()
+    }
+
+    /// The block's skill lines: the `- ` lines after the skill label.
+    fn skill_lines(block: &str) -> Vec<&str> {
+        block
+            .lines()
+            .skip_while(|l| !l.starts_with(RECALL_SKILL_LABEL))
             .filter(|l| l.starts_with("- "))
             .collect()
     }
@@ -1660,6 +1903,18 @@ mod tests {
                     )
                 })
                 .collect(),
+            skills: (0..=MAX_RECALL_SKILLS)
+                .map(|i| {
+                    // Files missing, because that is the line that carries the
+                    // marker and so the wider of the two shapes.
+                    skill(
+                        &format!("{i:0>width$}", width = RECALL_ID_MAX_CHARS),
+                        &filler(RECALL_SKILL_DESCRIPTION_MAX_CHARS),
+                        false,
+                        0.10,
+                    )
+                })
+                .collect(),
             ..RecallCandidates::default()
         }
     }
@@ -1692,6 +1947,23 @@ mod tests {
                     note(
                         &wide_filler(NOTE_KEY_MAX_CHARS),
                         &wide_filler(RECALL_NOTE_MAX_CHARS),
+                        0.10,
+                    )
+                })
+                .collect(),
+            skills: (0..=MAX_RECALL_SKILLS)
+                .map(|i| {
+                    // The name has to stay unique or the arm would render one
+                    // line where the budget counted several, so an ASCII suffix
+                    // rides on a name of four-byte characters.
+                    let suffix = format!("-{i}");
+                    skill(
+                        &format!(
+                            "{}{suffix}",
+                            wide_filler((RECALL_ID_MAX_CHARS - suffix.len()) / 4)
+                        ),
+                        &wide_filler(RECALL_SKILL_DESCRIPTION_MAX_CHARS),
+                        false,
                         0.10,
                     )
                 })
@@ -1740,6 +2012,13 @@ mod tests {
             BUDGETED_MAX_RECALL_ENTRIES,
         ] {
             let block = render_at(&worst_case_candidates(width), width).expect("every arm is full");
+            // The fixture has to fill the skill arm, or this stops covering it
+            // the moment a later change stops the arm rendering.
+            assert_eq!(
+                skill_lines(&block).len(),
+                MAX_RECALL_SKILLS,
+                "the worst case is every arm at its cap: {block}"
+            );
             let tokens = block_tokens(&block);
 
             assert!(
@@ -1782,9 +2061,15 @@ mod tests {
         // arithmetic runs on the length of the block's own fixed text, so a
         // longer header or label narrows the index by a whole line, and that
         // fails here rather than in a deployment.
+        //
+        // The floor moved from twenty to seventeen when the skill arm arrived
+        // (#1154), and it moved deliberately: the block's cost to a turn is
+        // fixed, so a fourth arm is paid for out of the quotient. It is set at
+        // the value the arithmetic actually produces, so any further creep in
+        // the fixed text trips it.
         let budgeted = BUDGETED_MAX_RECALL_ENTRIES;
         assert!(
-            budgeted >= 20,
+            budgeted >= 17,
             "an index of one-line summaries exists for breadth; the budget pays for {budgeted} \
              lines, and the fixed part of the block is what took the rest"
         );
@@ -1875,7 +2160,7 @@ mod tests {
         // The constant carries the line's own newline, so the text itself has
         // one character less to spend.
         let bound = RECALL_DROPPED_LINE_MAX_BYTES - 1;
-        for noun in ["entries", "notes"] {
+        for noun in ["entries", "notes", "skills"] {
             let line = dropped_line(usize::MAX, true, noun).expect("a count that dropped rows");
             assert!(
                 line.chars().count() <= bound,
@@ -1896,6 +2181,8 @@ mod tests {
             RECALL_ENTRY_HINT,
             RECALL_NOTE_LABEL,
             RECALL_TAG_LABEL,
+            RECALL_SKILL_LABEL,
+            RECALL_SKILL_ABSENT_MARKER,
         ] {
             assert!(
                 !text.contains('\n'),
@@ -1947,6 +2234,19 @@ mod tests {
                 line.len()
             );
         }
+        let skills = skill_lines(&block);
+        assert_eq!(
+            skills.len(),
+            MAX_RECALL_SKILLS,
+            "the fixture must fill the skill arm, or this covers nothing: {block}"
+        );
+        for line in skills {
+            assert!(
+                line.len() <= RECALL_SKILL_LINE_MAX_BYTES,
+                "skill line is {} bytes, over {RECALL_SKILL_LINE_MAX_BYTES}",
+                line.len()
+            );
+        }
     }
 
     /// Acceptance (#1124): the configured width reaches the renderer the
@@ -1973,6 +2273,7 @@ mod tests {
             &candidates,
             RECALL_ENTRY_SCAN_LIMIT,
             RECALL_NOTE_SCAN_LIMIT,
+            RECALL_SKILL_SCAN_LIMIT,
             test_now(),
         ))
         .expect("a block");
@@ -3714,5 +4015,494 @@ mod tests {
             entries_at < notes_at,
             "the durable memory reads before this conversation's own notes: {block}"
         );
+    }
+
+    // --- The skill arm: procedural memory (#1154) ---------------------------
+
+    /// A skill candidate that has been opened `opens` times, the newest of them
+    /// `seconds_ago` and the rest at one-minute intervals before it.
+    fn skill_opened(skill: RecallSkill, opens: u64, seconds_ago: i64) -> RecallSkill {
+        let now = test_now();
+        let ages: Vec<i64> = (0..opens as i64).map(|i| seconds_ago + i * 60).collect();
+        let record = crate::domain::KnowledgeUseRecord {
+            entry_id: skill.name.clone(),
+            offered_count: opens,
+            opened_count: opens,
+            marked_count: 0,
+            first_seen_at: now
+                - chrono::TimeDelta::seconds(ages.iter().copied().max().unwrap_or(1)),
+            last_offered_at: Some(now - chrono::TimeDelta::seconds(seconds_ago)),
+            recent_uses: ages
+                .iter()
+                .take(crate::domain::RECENT_USE_WINDOW)
+                .map(|a| now - chrono::TimeDelta::seconds(*a))
+                .collect(),
+            marks: Vec::new(),
+        };
+        skill.with_use_record(Some(record))
+    }
+
+    /// One prompt that cues `count` skills, each one deviation apart, the
+    /// nearest at `best`.
+    fn cued_skills(count: usize, best: f64) -> Vec<RecallSkill> {
+        (0..count)
+            .map(|i| {
+                skill(
+                    &format!("procedure-{i}"),
+                    &format!("How to carry out procedure {i}."),
+                    true,
+                    at(best - i as f64),
+                )
+            })
+            .collect()
+    }
+
+    /// Acceptance (#1154): a prompt matching a skill renders it in `[Recall]`,
+    /// with no search of the skill library anywhere in the turn.
+    ///
+    /// Nothing here calls `builtin_skill_search`: the block is built from the
+    /// prompt's own embedding, before the model's first move, which is the
+    /// whole point of the arm. Free recall required the model to suspect a
+    /// skill existed first.
+    #[test]
+    fn a_prompt_matching_a_skill_renders_it_in_recall_without_any_search() {
+        let candidates = RecallCandidates {
+            skills: vec![skill(
+                "publish-a-crate",
+                "Cut a release and push it to the registry.",
+                true,
+                at(RECALL_BAR + 2.0),
+            )],
+            ..RecallCandidates::default()
+        };
+
+        let block = render(&candidates).expect("a cued skill produces a block");
+
+        assert_eq!(skill_lines(&block).len(), 1, "{block}");
+        assert!(block.contains("publish-a-crate"), "{block}");
+        assert!(
+            block.contains("Cut a release and push it to the registry."),
+            "{block}"
+        );
+    }
+
+    /// A skill line spends a name and one bounded description, and nothing
+    /// else.
+    ///
+    /// One half of "the body is never rendered". The other half is structural
+    /// and cannot fail here - `RecallSkill` has no body field and the scan does
+    /// not read the column, which `the_skill_recall_scan_does_not_read_the_body`
+    /// pins against the statement itself.
+    #[test]
+    fn a_skill_line_spends_a_name_and_one_bounded_description_and_no_more() {
+        let long_description = format!(
+            "{} {}",
+            "When you need to cut a release.",
+            "x".repeat(RECALL_SKILL_DESCRIPTION_MAX_CHARS * 2)
+        );
+        let candidates = RecallCandidates {
+            skills: vec![skill(
+                "publish-a-crate",
+                &long_description,
+                true,
+                at(RECALL_BAR + 2.0),
+            )],
+            ..RecallCandidates::default()
+        };
+
+        let block = render(&candidates).expect("a block");
+        let line = skill_lines(&block)
+            .first()
+            .copied()
+            .expect("the skill line renders")
+            .to_string();
+
+        assert!(
+            line.chars().count()
+                <= 2 + RECALL_ID_MAX_CHARS + 2 + RECALL_SKILL_DESCRIPTION_MAX_CHARS,
+            "a skill line spends at most a name and one bounded description: {line}"
+        );
+        assert!(
+            !block.contains(&long_description),
+            "the whole of what the skill says must never reach the block: {block}"
+        );
+    }
+
+    /// Acceptance (#1154): the arm reads the skill catalog's own dispersion,
+    /// never the knowledge arm's.
+    ///
+    /// One distance, two sources. It stands well clear of the bar against a
+    /// catalog whose rows vary little, and nowhere near it against a knowledge
+    /// base whose rows vary a lot - so a block that read the wrong spread would
+    /// show the line in one case and hide it in the other.
+    #[test]
+    fn the_skill_arm_reads_its_own_dispersion_and_not_the_knowledge_arms() {
+        let tight = RecallDispersion::assumed(0.78, 0.02);
+        let loose = RecallDispersion::assumed(0.78, 0.30);
+        let distance = tight.distance_at(RECALL_BAR + 1.0);
+        assert!(
+            !RecallRelevance::Distance(distance).clears_bar(loose, RECALL_BAR),
+            "precondition: the same distance is ordinary against the wider source"
+        );
+
+        let cued = RecallCandidates {
+            skills: vec![skill("deploy-the-lab", "How to deploy.", true, distance)],
+            skill_dispersion: Some(tight),
+            // The knowledge arm's spread is the one that must not be consulted.
+            entry_dispersion: Some(loose),
+            ..RecallCandidates::default()
+        };
+        let read_by_the_wrong_source = RecallCandidates {
+            skill_dispersion: Some(loose),
+            ..cued.clone()
+        };
+
+        let shown = render(&cued).expect("the catalog's own spread admits it");
+        assert_eq!(skill_lines(&shown).len(), 1, "{shown}");
+        assert!(
+            render(&read_by_the_wrong_source).is_none(),
+            "read against the wider source the same distance is ordinary, so nothing renders"
+        );
+    }
+
+    /// Acceptance (#1154): a prompt that matches nothing in the catalog renders
+    /// no skill lines.
+    #[test]
+    fn a_prompt_matching_no_skill_renders_no_skill_lines() {
+        let candidates = RecallCandidates {
+            entries: vec![hit(
+                "kb-1",
+                "a durable fact",
+                &["topic"],
+                at(RECALL_BAR + 2.0),
+            )],
+            skills: vec![
+                skill("publish-a-crate", "Cut a release.", true, far()),
+                skill("rotate-a-key", "Roll a credential.", true, far()),
+            ],
+            ..RecallCandidates::default()
+        };
+
+        let block = render(&candidates).expect("the knowledge arm still renders");
+
+        assert!(skill_lines(&block).is_empty(), "{block}");
+        assert!(
+            !block.contains(RECALL_SKILL_LABEL),
+            "an arm with nothing to say spends nothing, not even its label: {block}"
+        );
+    }
+
+    /// Acceptance (#1154): the skill width follows the bar rather than a fixed
+    /// count. One cued skill renders one line, and three render three.
+    #[test]
+    fn the_skill_width_follows_the_bar_and_is_not_a_fixed_count() {
+        let widths: Vec<usize> = [1usize, 2, 3]
+            .into_iter()
+            .map(|cued| {
+                let candidates = RecallCandidates {
+                    // Every candidate past `cued` sits well under the bar, so
+                    // only the bar decides how many render.
+                    skills: cued_skills(cued, RECALL_BAR + 2.0)
+                        .into_iter()
+                        .chain((0..4).map(|i| skill(&format!("far-{i}"), "Not this.", true, far())))
+                        .collect(),
+                    ..RecallCandidates::default()
+                };
+                render(&candidates)
+                    .map(|block| skill_lines(&block).len())
+                    .unwrap_or(0)
+            })
+            .collect();
+
+        assert_eq!(
+            widths,
+            vec![1, 2, 3],
+            "the number of lines is the number of candidates that cleared the bar"
+        );
+    }
+
+    /// Acceptance (#1154): a skill whose `disk_path` no longer resolves is
+    /// marked, not excluded.
+    ///
+    /// It stays because it is still usable - the catalog is cumulative, so the
+    /// body still reads and the procedure is still good - and it is marked
+    /// because what is gone changes what can be done with it: the bundled
+    /// scripts cannot be run.
+    #[test]
+    fn a_skill_whose_files_are_missing_is_marked_rather_than_excluded() {
+        let candidates = RecallCandidates {
+            skills: vec![
+                skill("on-disk", "Still installed.", true, at(RECALL_BAR + 2.0)),
+                skill("files-gone", "Indexed only.", false, at(RECALL_BAR + 1.5)),
+            ],
+            ..RecallCandidates::default()
+        };
+
+        let block = render(&candidates).expect("a block");
+        let lines = skill_lines(&block);
+
+        assert_eq!(lines.len(), 2, "both skills render: {block}");
+        assert_eq!(
+            lines[0], "- on-disk: Still installed.",
+            "an installed skill carries no marker"
+        );
+        assert_eq!(
+            lines[1],
+            format!("- files-gone{RECALL_SKILL_ABSENT_MARKER}: Indexed only."),
+            "a skill whose files are gone says so on its own line"
+        );
+    }
+
+    /// Acceptance (#1154): offers reach the use log. The block reports the
+    /// skills it showed, by name, in the order it showed them, and only those.
+    #[test]
+    fn the_block_reports_the_skills_it_showed_as_offered() {
+        let candidates = RecallCandidates {
+            skills: cued_skills(MAX_RECALL_SKILLS + 2, RECALL_BAR + 4.0),
+            ..RecallCandidates::default()
+        };
+
+        let rendered =
+            render_at_full(&candidates, DEFAULT_MAX_RECALL_ENTRIES).expect("the block renders");
+
+        assert_eq!(
+            rendered.skill_names,
+            vec![
+                "procedure-0".to_string(),
+                "procedure-1".to_string(),
+                "procedure-2".to_string()
+            ],
+            "a skill the width dropped is not in front of the model, so it was not offered"
+        );
+    }
+
+    /// A skill nobody can fetch is not offered: the name a line can carry is
+    /// bounded, so a longer one would render as a string `builtin_skill_get`
+    /// cannot resolve - and would then accrue an offer every turn and never an
+    /// open.
+    #[test]
+    fn a_skill_whose_name_a_line_cannot_carry_is_dropped_rather_than_cut() {
+        let too_long = "x".repeat(RECALL_ID_MAX_CHARS + 1);
+        let candidates = RecallCandidates {
+            skills: vec![
+                skill(
+                    &too_long,
+                    "Unreachable by name.",
+                    true,
+                    at(RECALL_BAR + 3.0),
+                ),
+                skill(
+                    "reachable",
+                    "Fetchable by name.",
+                    true,
+                    at(RECALL_BAR + 2.0),
+                ),
+            ],
+            ..RecallCandidates::default()
+        };
+
+        let rendered =
+            render_at_full(&candidates, DEFAULT_MAX_RECALL_ENTRIES).expect("the block renders");
+
+        assert_eq!(skill_lines(&rendered.text).len(), 1, "{}", rendered.text);
+        assert_eq!(rendered.skill_names, vec!["reachable".to_string()]);
+    }
+
+    /// A skill line says what the procedure is for, so a candidate with no
+    /// description left says nothing and is dropped rather than spending a line
+    /// on a name.
+    #[test]
+    fn a_skill_with_no_description_is_dropped_rather_than_rendered_as_a_name() {
+        let candidates = RecallCandidates {
+            skills: vec![
+                skill("nameless-purpose", "   ", true, at(RECALL_BAR + 3.0)),
+                skill(
+                    "stated-purpose",
+                    "Roll a credential.",
+                    true,
+                    at(RECALL_BAR + 2.0),
+                ),
+            ],
+            ..RecallCandidates::default()
+        };
+
+        let block = render(&candidates).expect("a block");
+
+        assert_eq!(skill_lines(&block).len(), 1, "{block}");
+        assert!(block.contains("stated-purpose"), "{block}");
+    }
+
+    /// Acceptance (#1154): a procedure followed all week comes up on a prompt
+    /// that only brushes it. Activation ranks the skill arm on its own
+    /// dispersion and its own use log, exactly as it ranks the knowledge arm.
+    #[test]
+    fn a_skill_opened_repeatedly_outranks_a_nearer_skill_nothing_has_opened() {
+        let untouched = skill(
+            "never-opened",
+            "A procedure nobody has read.",
+            true,
+            at(RECALL_BAR + 0.4),
+        );
+        let familiar = skill_opened(
+            skill(
+                "opened-all-week",
+                "A procedure followed again and again.",
+                true,
+                at(RECALL_BAR + 0.1),
+            ),
+            30,
+            600,
+        );
+        let candidates = RecallCandidates {
+            skills: vec![untouched, familiar],
+            ..RecallCandidates::default()
+        };
+
+        let rendered =
+            render_at_full(&candidates, DEFAULT_MAX_RECALL_ENTRIES).expect("the block renders");
+
+        assert_eq!(
+            rendered.skill_names,
+            vec!["opened-all-week".to_string(), "never-opened".to_string()],
+            "a weakly cued prompt lets use history lead, which is what the log is for"
+        );
+    }
+
+    /// The "did not fit" count is the skill arm's own, and it names skills.
+    #[test]
+    fn the_skill_arm_reports_its_own_count_of_what_did_not_fit() {
+        let candidates = RecallCandidates {
+            skills: cued_skills(MAX_RECALL_SKILLS + 2, RECALL_BAR + 4.0),
+            ..RecallCandidates::default()
+        };
+
+        let block = render(&candidates).expect("a block");
+
+        assert!(
+            block.contains("...and 2 more skills also matched."),
+            "{block}"
+        );
+    }
+
+    /// A scan that filled up hedges its count, so the arm never reports a lower
+    /// bound as though it were exact.
+    #[test]
+    fn a_filled_skill_scan_reports_its_count_as_a_lower_bound() {
+        let candidates = RecallCandidates {
+            skills: cued_skills(RECALL_SKILL_SCAN_LIMIT, RECALL_BAR + 30.0),
+            ..RecallCandidates::default()
+        };
+
+        let block = render(&candidates).expect("a block");
+
+        let dropped = RECALL_SKILL_SCAN_LIMIT - MAX_RECALL_SKILLS;
+        assert!(
+            block.contains(&format!("...and {dropped} or more skills also matched.")),
+            "{block}"
+        );
+    }
+
+    /// The arm is a hint, not an instruction, and the label is where that is
+    /// said. Surfacing a procedure unprompted tells the model what to *do*, so
+    /// the wording has to state a possibility, deny that anything was chosen,
+    /// and require a fit check before the procedure is followed.
+    #[test]
+    fn the_skill_label_offers_a_procedure_without_choosing_it() {
+        let candidates = RecallCandidates {
+            skills: vec![skill(
+                "deploy-the-lab",
+                "How to deploy.",
+                true,
+                at(RECALL_BAR + 2.0),
+            )],
+            ..RecallCandidates::default()
+        };
+
+        let block = render(&candidates).expect("a block");
+
+        assert!(
+            block.contains("may fit"),
+            "the line states a possibility: {block}"
+        );
+        assert!(
+            block.contains("None of these is chosen for you"),
+            "the block denies having chosen anything: {block}"
+        );
+        assert!(
+            block.contains("check that one fits before you follow it"),
+            "the block requires a fit check before the procedure is followed: {block}"
+        );
+        assert!(
+            block.contains("not the procedure itself"),
+            "the block says a line cannot be acted on as it stands: {block}"
+        );
+    }
+
+    /// The block names no tool, in this arm as in every other: which read
+    /// fetches a skill is a property of the tool set on the day the block
+    /// renders.
+    #[test]
+    fn the_skill_label_names_no_tool() {
+        assert!(
+            !RECALL_SKILL_LABEL.contains("builtin_"),
+            "a block that names a tool the model cannot call costs it a round: \
+             {RECALL_SKILL_LABEL}"
+        );
+    }
+
+    /// The arms stay apart. All three render `- ` lines, and a reader that
+    /// could not tell them apart would take a procedure for a fact.
+    #[test]
+    fn the_skill_arm_renders_under_its_own_label_after_the_other_arms() {
+        let candidates = RecallCandidates {
+            entries: vec![hit(
+                "kb-1",
+                "a durable fact",
+                &["topic:mine"],
+                at(RECALL_BAR + 2.0),
+            )],
+            notes: vec![note("finding", "a working note", at(RECALL_BAR + 2.0))],
+            skills: vec![skill(
+                "a-procedure",
+                "How to do it.",
+                true,
+                at(RECALL_BAR + 2.0),
+            )],
+            ..RecallCandidates::default()
+        };
+
+        let block = render(&candidates).expect("a block");
+
+        assert_eq!(entry_lines(&block).len(), 1, "{block}");
+        assert_eq!(note_lines(&block).len(), 1, "{block}");
+        assert_eq!(skill_lines(&block).len(), 1, "{block}");
+        let tags_at = block.find(RECALL_TAG_LABEL).expect("the tag line renders");
+        let skills_at = block.find(RECALL_SKILL_LABEL).expect("the skill label");
+        assert!(
+            tags_at < skills_at,
+            "the tag line says \"the entries above\", so nothing comes between them: {block}"
+        );
+    }
+
+    /// A skill arm on its own is a block: a prompt may cue a procedure and no
+    /// fact at all, and an arm that could not speak alone would lose exactly
+    /// the case this feature exists for.
+    #[test]
+    fn a_cued_skill_renders_a_block_with_no_other_arm_speaking() {
+        let candidates = RecallCandidates {
+            skills: vec![skill(
+                "deploy-the-lab",
+                "How to deploy.",
+                true,
+                at(RECALL_BAR + 2.0),
+            )],
+            ..RecallCandidates::default()
+        };
+
+        let block = render(&candidates).expect("the skill arm alone produces a block");
+
+        assert!(entry_lines(&block).is_empty(), "{block}");
+        assert!(note_lines(&block).is_empty(), "{block}");
+        assert_eq!(skill_lines(&block).len(), 1, "{block}");
     }
 }

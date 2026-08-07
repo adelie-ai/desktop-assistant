@@ -50,6 +50,7 @@ pub mod request_scope;
 pub mod scratchpad_scope;
 pub mod session;
 pub mod skill_index;
+pub mod skill_use;
 pub mod tool_observer;
 pub mod tool_usage;
 pub mod transport;

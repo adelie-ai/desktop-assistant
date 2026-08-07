@@ -28,6 +28,7 @@ use desktop_assistant_core::domain::{
     IndexedSkill, Locality, SkillApproval, SkillKind, SkillScope, TrustTier,
 };
 use desktop_assistant_core::ports::auth::current_user_id;
+use desktop_assistant_core::ports::recall::RecallDispersion;
 use desktop_assistant_core::ports::skill_index::SkillIndexStore;
 use pgvector::Vector;
 use sqlx::PgPool;
@@ -184,6 +185,163 @@ impl PgSkillIndexStore {
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;
         Ok(())
+    }
+
+    /// The skills nearest a prompt embedding, nearest first, with what a
+    /// distance from this catalog is worth (#1154).
+    ///
+    /// The read behind the `[Recall]` block's skill arm, and deliberately not a
+    /// [`SkillIndexStore`] method: `vector[]` is a Postgres column with no
+    /// SQLite counterpart, and the shared contract would then hold a method one
+    /// adapter cannot answer.
+    ///
+    /// **Only approved skills take part, in the candidates and in the spread.**
+    /// A skill nobody has consented to cannot be followed - `builtin_skill_get`
+    /// refuses its body - so offering one would put a line in front of the
+    /// model that it can only fail on, and would accrue an offer every turn and
+    /// never an open. Filtering inside the scan also keeps the spread a
+    /// statement about the catalog the arm actually draws from.
+    ///
+    /// **Only a locally authored skill is offered.** A skill from a GitHub or
+    /// `.well-known` source carries a description its author wrote, and the
+    /// platform already rules that such text is third-party content:
+    /// `builtin_skill_search` returns the same field and is classified
+    /// `Declared(SkillTrustTier)`, so a non-local hit taints the turn and
+    /// closes the tool gate. This block has no tool call in it, so nothing
+    /// would taint - the text would land in a system message, ahead of the
+    /// user prompt, with every tier still open. Dropping is the answer rather
+    /// than tainting, for the reason the scratchpad arm drops a note stamped
+    /// as external: a catalog row lives indefinitely, and closing the gate
+    /// whenever one happened to rank near the prompt would degrade the
+    /// conversation permanently. An installed skill stays reachable through
+    /// `builtin_skill_search`, which taints correctly.
+    ///
+    /// The predicate applies after a name has resolved to one row, and before
+    /// the spread is measured. Filtering earlier would let a local global skill
+    /// be offered while the fetch returned the non-local personal one that
+    /// shadows it; filtering later would grade the offerable rows against a
+    /// spread measured over rows the arm can never show.
+    ///
+    /// **One row per name, and it is the row the fetch returns.** The catalog
+    /// can hold a global skill and this user's own under one name. Two lines
+    /// for one openable procedure would be two lines the model cannot tell
+    /// apart, and a line describing a procedure other than the one
+    /// `builtin_skill_get` hands back would be worse - the model would be
+    /// briefed on one method and given another's steps. So the scan applies
+    /// that tool's own rule, over every approved row a name has rather than
+    /// over the ones this query happened to match: the user's own row when its
+    /// files are on disk, else the global one, else the user's own tombstone.
+    ///
+    /// **The body is not read.** The arm renders a name and one line of what
+    /// the skill is for; the body is the widest column on the row and nothing
+    /// downstream of this call looks at it.
+    ///
+    /// An empty `query_embedding` yields no rows and no spread: the vector
+    /// operator raises on a zero-dimension vector, and the caller with no
+    /// embedding has [`Self::search_text_any_term`] to fall back to.
+    ///
+    /// `embedding_model` scopes the comparison the same way the store's own
+    /// `search_hybrid` does, and for the same reason: a comparison across
+    /// models is a comparison across vector dimensions.
+    ///
+    /// The scan carries [`SKILL_RECALL_SCAN_STATEMENT_TIMEOUT`], so the
+    /// database stops working when the caller stops waiting.
+    pub async fn nearest_by_embedding(
+        &self,
+        query_embedding: Vec<f32>,
+        embedding_model: &str,
+        limit: usize,
+    ) -> Result<NearestSkills, CoreError> {
+        if query_embedding.is_empty() {
+            return Ok(NearestSkills::default());
+        }
+        let user = current_user_id();
+
+        // A transaction, for one statement, because `SET LOCAL` is scoped to
+        // one: it is what makes the ceiling the caller keeps a ceiling the
+        // database keeps too.
+        let mut scan = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
+        sqlx::query("SELECT set_config('statement_timeout', $1, true)")
+            .bind(SKILL_RECALL_SCAN_STATEMENT_TIMEOUT.as_millis().to_string())
+            .execute(&mut *scan)
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
+        let rows: Vec<SkillNearestRow> = sqlx::query_as(NEAREST_SKILLS_BY_EMBEDDING_SQL)
+            .bind(Vector::from(query_embedding))
+            .bind(user.as_str())
+            .bind(embedding_model)
+            .bind(limit as i64)
+            .fetch_all(&mut *scan)
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
+        scan.commit()
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
+
+        // Every row carries the same spread, so the first one states it.
+        let dispersion = rows.first().and_then(SkillNearestRow::dispersion);
+        Ok(NearestSkills {
+            skills: rows
+                .into_iter()
+                .map(SkillNearestRow::into_candidate)
+                .collect(),
+            dispersion,
+        })
+    }
+
+    /// Approved skills carrying **any** of a prompt's terms, best match first
+    /// (#1154).
+    ///
+    /// The degraded arm of the block's skill lookup, on the same terms as
+    /// [`crate::PgKnowledgeBaseStore::search_text_any_term`]: the store's own
+    /// `search` joins a query's lexemes with `AND`, which is right for a
+    /// model-authored query of two or three words and wrong for a whole user
+    /// sentence. A fallback that answers nothing is not a fallback.
+    ///
+    /// The same approval filter and the same one-row-per-name rule as
+    /// [`Self::nearest_by_embedding`], for the same reasons.
+    pub async fn search_text_any_term(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<NearestSkill>, CoreError> {
+        let user = current_user_id();
+        let rows: Vec<SkillTextRow> = sqlx::query_as(
+            "WITH q AS (
+                 SELECT to_tsquery('english', string_agg(quote_literal(lexeme), ' | ')) AS query
+                 FROM unnest(to_tsvector('english', $1))
+             ),
+             resolved AS (
+                 SELECT DISTINCT ON (name) name, owner_key, trust_tier
+                 FROM skill_index
+                 WHERE (owner_user_id IS NULL OR owner_user_id = $3)
+                   AND approved_at IS NOT NULL
+                 ORDER BY name,
+                          CASE WHEN owner_key <> '' AND present_on_disk THEN 0
+                               WHEN owner_key = '' THEN 1
+                               ELSE 2 END
+             )
+             SELECT si.name, si.description, si.present_on_disk
+             FROM resolved r
+             JOIN skill_index si ON si.name = r.name AND si.owner_key = r.owner_key, q
+             WHERE r.trust_tier = 'local'
+               AND q.query IS NOT NULL
+               AND si.tsv @@ q.query
+             ORDER BY ts_rank_cd(si.tsv, q.query) DESC, si.name
+             LIMIT $2",
+        )
+        .bind(query)
+        .bind(limit as i64)
+        .bind(user.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CoreError::Storage(e.to_string()))?;
+
+        Ok(rows.into_iter().map(SkillTextRow::into_candidate).collect())
     }
 
     async fn search_fts_only(
@@ -469,6 +627,190 @@ impl SkillIndexStore for PgSkillIndexStore {
     }
 }
 
+/// How long the skill recall scan may run before the database stops it.
+///
+/// The same figure and the same reasoning as the knowledge base's
+/// [`RECALL_SCAN_STATEMENT_TIMEOUT`](crate::RECALL_SCAN_STATEMENT_TIMEOUT): a
+/// ceiling the caller keeps is not a ceiling the database keeps, and recall
+/// runs before every turn's first round. The two arms run together, so they
+/// share one ceiling rather than adding to each other.
+pub const SKILL_RECALL_SCAN_STATEMENT_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(4);
+
+/// What [`PgSkillIndexStore::nearest_by_embedding`] reads.
+///
+/// **The order of the passes is the whole design here.** `resolved` cuts the
+/// approved scope to one row per name, by `builtin_skill_get`'s own rule - its
+/// own row when the files are on disk, else the global one, else its own
+/// tombstone. `offerable` then drops a name whose resolved row is not local.
+/// Only after that does `d` measure a distance, and `m` and `s` the spread.
+///
+/// Each step has to be where it is:
+///
+/// - **Resolution comes before matching**, not after. A name resolves over
+///   every approved row it has, including one the match would have dropped -
+///   a personal row whose embedding the backfill has not written yet is the
+///   ordinary case. Resolving over the matched set instead would let the block
+///   offer the global row's line while the fetch handed back the personal
+///   row's body.
+/// - **Trust comes after resolution.** A non-local row shadowing a local one
+///   must drop the name outright; filtering earlier would offer the row
+///   underneath, which is again not the row the fetch returns.
+/// - **The spread is measured after both.** It has to describe the set the arm
+///   draws from, or the bar grades a candidate against rows it could never
+///   show - and `RECALL_DISPERSION_MIN_ROWS` would count them too, so a
+///   catalog of three offerable skills among twenty-five would report a
+///   measurement where it has none.
+///
+/// The pass that measures reads one distance per row and no description and no
+/// body; the rows the block may show are read last, by name and owner, and
+/// only those.
+///
+/// Every returned row carries the same spread, which is the price of stating it
+/// in the same answer as the candidates - three numbers on at most
+/// `MAX_RECALL_SKILLS` rows.
+///
+/// The scope predicate is repeated on the final join rather than trusted from
+/// `pick`. The composite is unique, so the join can only resolve to the row
+/// `pick` came from - but a scope predicate that appears once is a scope
+/// predicate one refactor can lose, and this is a host-global table.
+///
+/// An empty catalog yields no rows at all: `pick` is empty, so `s` is empty,
+/// and the cross join answers with nothing rather than with a spread of
+/// nothing.
+///
+/// Held as its own string so the projection can be asserted on without a
+/// database - see `the_skill_recall_scan_does_not_read_the_body`.
+const NEAREST_SKILLS_BY_EMBEDDING_SQL: &str = "\
+    WITH resolved AS (
+         SELECT DISTINCT ON (name) name, owner_key, trust_tier
+         FROM skill_index
+         WHERE (owner_user_id IS NULL OR owner_user_id = $2)
+           AND approved_at IS NOT NULL
+         ORDER BY name,
+                  CASE WHEN owner_key <> '' AND present_on_disk THEN 0
+                       WHEN owner_key = '' THEN 1
+                       ELSE 2 END
+     ),
+     offerable AS (
+         SELECT name, owner_key FROM resolved WHERE trust_tier = 'local'
+     ),
+     d AS (
+         SELECT si.name, si.owner_key, MIN(chunk <=> $1) AS distance
+         FROM offerable o
+         JOIN skill_index si ON si.name = o.name AND si.owner_key = o.owner_key
+         CROSS JOIN LATERAL unnest(si.embedding) AS chunk
+         WHERE si.embedding IS NOT NULL
+           AND si.embedding_model IS NOT NULL
+           AND (si.embedding_model = $3
+                OR (split_part($3, '@', 2) <> ''
+                    AND split_part(si.embedding_model, '@', 2)
+                        = split_part($3, '@', 2)))
+         GROUP BY si.name, si.owner_key
+     ),
+     m AS (
+         SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY distance) AS median,
+                count(*) AS rows_read
+         FROM d
+     ),
+     s AS (
+         SELECT m.median,
+                m.rows_read,
+                percentile_cont(0.5) WITHIN GROUP (ORDER BY abs(d.distance - m.median))
+                    AS deviation
+         FROM d CROSS JOIN m
+         GROUP BY m.median, m.rows_read
+     )
+     SELECT si.name, si.description, si.present_on_disk,
+            d.distance, s.median, s.rows_read, s.deviation
+     FROM d
+     JOIN skill_index si
+       ON si.name = d.name
+      AND si.owner_key = d.owner_key
+      AND (si.owner_user_id IS NULL OR si.owner_user_id = $2)
+     CROSS JOIN s
+     ORDER BY d.distance, si.name
+     LIMIT $4";
+
+/// One skill the recall scan ranked: what a line needs, and nothing else.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NearestSkill {
+    /// The catalog name, which is the handle the skill is fetched by.
+    pub name: String,
+    /// The skill's own "when to use" line.
+    pub description: String,
+    /// Whether the skill's files were on disk at the last scan of its scope.
+    pub present_on_disk: bool,
+    /// The cosine distance that ranked it. `None` from the degraded full-text
+    /// read, which carries no distance to state.
+    pub distance: Option<f64>,
+}
+
+/// What [`PgSkillIndexStore::nearest_by_embedding`] answers with: the skills the
+/// block may show, and what a distance from this catalog is worth.
+#[derive(Debug, Default)]
+pub struct NearestSkills {
+    /// The nearest skills, nearest first.
+    pub skills: Vec<NearestSkill>,
+    /// The spread of this query's distances over the approved catalog, or
+    /// `None` where there was nothing to measure. The caller then reads the
+    /// source by a stated estimate.
+    pub dispersion: Option<RecallDispersion>,
+}
+
+/// One row of [`NEAREST_SKILLS_BY_EMBEDDING_SQL`]: a candidate, its distance,
+/// and the spread every row of the answer repeats.
+#[derive(sqlx::FromRow)]
+struct SkillNearestRow {
+    name: String,
+    description: String,
+    present_on_disk: bool,
+    distance: f64,
+    median: Option<f64>,
+    rows_read: i64,
+    deviation: Option<f64>,
+}
+
+impl SkillNearestRow {
+    fn into_candidate(self) -> NearestSkill {
+        NearestSkill {
+            name: self.name,
+            description: self.description,
+            present_on_disk: self.present_on_disk,
+            distance: Some(self.distance),
+        }
+    }
+
+    /// What this row says the catalog's spread is, where it says one it can be
+    /// trusted for - see [`RecallDispersion::measured`].
+    fn dispersion(&self) -> Option<RecallDispersion> {
+        RecallDispersion::measured(
+            self.median?,
+            self.deviation?,
+            self.rows_read.max(0) as usize,
+        )
+    }
+}
+
+/// One row of the degraded full-text read, which carries no distance.
+#[derive(sqlx::FromRow)]
+struct SkillTextRow {
+    name: String,
+    description: String,
+    present_on_disk: bool,
+}
+
+impl SkillTextRow {
+    fn into_candidate(self) -> NearestSkill {
+        NearestSkill {
+            name: self.name,
+            description: self.description,
+            present_on_disk: self.present_on_disk,
+            distance: None,
+        }
+    }
+}
+
 /// A row read from `skill_index`, decoded straight from the projected columns.
 #[derive(sqlx::FromRow)]
 struct SkillRow {
@@ -519,4 +861,77 @@ impl SkillRow {
 /// shape mismatch (a malformed stored value must not fail a whole search).
 fn json_to_string_vec(v: serde_json::Value) -> Vec<String> {
     serde_json::from_value(v).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Acceptance (#1154): the block never carries a skill body, and the scan
+    /// behind it never reads one. The body is the widest column on the row, and
+    /// the arm's whole economy is that recognition costs less than recall.
+    #[test]
+    fn the_skill_recall_scan_does_not_read_the_body() {
+        let projection = NEAREST_SKILLS_BY_EMBEDDING_SQL
+            .rsplit("SELECT si.name")
+            .next()
+            .expect("the scan selects the rows it will show after it measures the spread");
+        assert!(
+            !projection.contains("body"),
+            "the recall scan selects a column the block never renders: \
+             \n{NEAREST_SKILLS_BY_EMBEDDING_SQL}"
+        );
+        assert!(
+            !NEAREST_SKILLS_BY_EMBEDDING_SQL.contains("si.body"),
+            "the recall scan selects a column the block never renders: \
+             \n{NEAREST_SKILLS_BY_EMBEDDING_SQL}"
+        );
+    }
+
+    /// The pass that measures the catalog's spread reads the geometry and none
+    /// of the content: one distance per row, and no column of the skill itself.
+    #[test]
+    fn the_pass_that_measures_the_skill_spread_reads_no_skill_content() {
+        let measured = NEAREST_SKILLS_BY_EMBEDDING_SQL
+            .split("     SELECT si.name")
+            .next()
+            .expect("the scan selects the rows it will show after it measures the spread");
+
+        for column in ["description", "body", "tags", "metadata"] {
+            assert!(
+                !measured.contains(column),
+                "the pass that measures the spread reads {column}, which it has no use for"
+            );
+        }
+    }
+
+    /// Acceptance (#1154): a skill nobody approved is excluded inside the scan,
+    /// so it reaches neither the candidates nor the spread they are graded
+    /// against. Proven against a real database in `tests/skill_recall.rs`; this
+    /// pins where the predicate sits, which no behavioural test can see.
+    #[test]
+    fn the_approval_predicate_sits_inside_the_pass_that_measures_the_spread() {
+        let measured = NEAREST_SKILLS_BY_EMBEDDING_SQL
+            .split("     SELECT si.name")
+            .next()
+            .expect("the scan measures the spread before it reads the rows");
+        assert!(
+            measured.contains("approved_at IS NOT NULL"),
+            "an unapproved skill must be absent from the spread as well as from the \
+             candidates: \n{NEAREST_SKILLS_BY_EMBEDDING_SQL}"
+        );
+    }
+
+    /// The scan's stated timeout is a real one. In PostgreSQL a
+    /// `statement_timeout` of zero means no timeout at all, so the constant
+    /// being positive is what makes the ceiling exist - and abandoning a query
+    /// future leaves the backend scanning, on a path that runs before every
+    /// turn.
+    #[test]
+    fn the_skill_recall_scans_statement_timeout_is_not_zero() {
+        assert!(
+            SKILL_RECALL_SCAN_STATEMENT_TIMEOUT > std::time::Duration::ZERO,
+            "a zero timeout means no timeout at all in PostgreSQL"
+        );
+    }
 }

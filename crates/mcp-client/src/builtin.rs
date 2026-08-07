@@ -31,6 +31,7 @@ use desktop_assistant_core::ports::scratchpad::{
     ScratchpadWriteFn, plan_pin,
 };
 use desktop_assistant_core::ports::skill_index::{SkillGetFn, SkillSearchFn};
+use desktop_assistant_core::ports::skill_use::SkillOpenedFn;
 use desktop_assistant_core::ports::tool_registry::{ToolDefinitionFn, ToolSearchFn};
 use desktop_assistant_core::ports::transport::{
     current_client_context, current_client_label, current_co_location, current_transport_kind,
@@ -360,6 +361,7 @@ pub struct BuiltinToolService {
     kb_opened_fn: Option<KnowledgeOpenedFn>,
     kb_situation_fn: Option<KnowledgeSituationFn>,
     kb_mark_fn: Option<KnowledgeMarkFn>,
+    skill_opened_fn: Option<SkillOpenedFn>,
     tool_search_fn: Option<ToolSearchFn>,
     #[allow(dead_code)]
     tool_definition_fn: Option<ToolDefinitionFn>,
@@ -407,6 +409,7 @@ impl BuiltinToolService {
             kb_opened_fn: None,
             kb_situation_fn: None,
             kb_mark_fn: None,
+            skill_opened_fn: None,
             tool_search_fn: None,
             tool_definition_fn: None,
             db_query_fn: None,
@@ -534,6 +537,23 @@ impl BuiltinToolService {
     /// entry acquires its first situation the next time it is reused.
     pub fn with_knowledge_situation(mut self, situation_fn: KnowledgeSituationFn) -> Self {
         self.kb_situation_fn = Some(situation_fn);
+        self
+    }
+
+    /// Wire the skill use log's record of an open (#1154), so a skill the
+    /// `[Recall]` block offered and the model then read is recorded as taken
+    /// up.
+    ///
+    /// Only the open half. Nothing here offers a skill:
+    /// `builtin_skill_search` is free recall - the model already knew to look -
+    /// and the block is what makes the offer this measures. Recording a search
+    /// hit as an offer would credit the block for a skill the model found on
+    /// its own.
+    ///
+    /// Capability-gated, like every other closure here. Without it
+    /// `builtin_skill_get` behaves exactly as it did before the log existed.
+    pub fn with_skill_open_log(mut self, opened_fn: SkillOpenedFn) -> Self {
+        self.skill_opened_fn = Some(opened_fn);
         self
     }
 
@@ -2016,22 +2036,48 @@ impl BuiltinToolService {
         // `builtin_skill_search` presents without asking the caller to pick
         // a scope either.
         //
-        // A live personal row wins outright, with no second lookup. A
-        // personal row that is a TOMBSTONE (`present_on_disk: false` -- its
-        // files are gone, but the append-only catalog keeps it) must not
-        // permanently shadow a live global skill of the same name: there is
-        // no `owner` argument any more for the caller to reach past it with,
-        // so the fallback has to reach past a dead personal row on its own.
-        // Only when the global lookup also comes up empty does the personal
-        // tombstone stand, since it is then the only record that ever
-        // existed for this name.
+        // A personal row wins outright when it is USABLE, with no second
+        // lookup. A personal row that is not must not permanently shadow a
+        // live global skill of the same name: there is no `owner` argument any
+        // more for the caller to reach past it with, so the fallback has to
+        // reach past an unusable personal row on its own.
+        //
+        // Two states make a personal row unusable, and they need the same
+        // answer. A TOMBSTONE (`present_on_disk: false` -- its files are gone,
+        // but the append-only catalog keeps it) cannot run its scripts. And an
+        // UNAPPROVED row cannot be followed at all, which matters more than it
+        // reads: `promote_plan_to_skill` writes unapproved personal rows under
+        // a name the assistant chose, so one draft could otherwise hide a
+        // blessed global skill of that name from every later fetch.
+        //
+        // The global row stands in only where it is itself approved. Otherwise
+        // the personal row stands, because it is the caller's own and the
+        // refusal below then names the state the caller can act on. When
+        // neither exists the answer is a miss.
+        //
+        // The `[Recall]` skill arm's scan applies this same rule when it cuts
+        // the catalog to one row per name (#1154). The two must agree: a block
+        // that described one procedure while this handed back another's steps
+        // would brief the model on the wrong method.
+        let usable =
+            |s: &desktop_assistant_core::domain::IndexedSkill| s.present_on_disk && s.is_approved();
         let mine = get_fn(name.clone(), Some(SKILL_GET_OWN_SCOPE.to_string())).await?;
-        let found = if mine.as_ref().is_some_and(|s| s.present_on_disk) {
+        // Reaching past the caller's own unapproved row must not make it
+        // disappear. Standing the global row in its place is the right answer
+        // to "which procedure may be followed", and it is the wrong answer to
+        // "where did my draft go" - the draft is one the assistant itself
+        // wrote under a name it chose, and nothing else would ever mention it.
+        // So the success payload says a draft was passed over, by name.
+        let passed_over_own_draft = mine
+            .as_ref()
+            .is_some_and(|s| !s.is_approved() && s.present_on_disk);
+        let found = if mine.as_ref().is_some_and(usable) {
             mine
         } else {
-            match get_fn(name.clone(), None).await? {
-                Some(global) => Some(global),
-                None => mine,
+            match (get_fn(name.clone(), None).await?, mine) {
+                (Some(global), Some(own)) if !global.is_approved() => Some(own),
+                (Some(global), _) => Some(global),
+                (None, own) => own,
             }
         };
 
@@ -2053,20 +2099,34 @@ impl BuiltinToolService {
         }
 
         match found {
-            Some(s) => Ok(serde_json::json!({
-                "ok": true,
-                "name": s.name,
-                "description": s.description,
-                "kind": s.kind.as_str(),
-                "trust_tier": s.trust_tier.as_str(),
-                "disk_path": s.disk_path,
-                "attachments": s.attachments,
-                "present_on_disk": s.present_on_disk,
-                "last_seen_at": s.last_seen_at.map(|ts| ts.to_rfc3339()),
-                "tags": s.tags,
-                "body": s.body,
-            })
-            .to_string()),
+            Some(s) => {
+                // The body is going back, so this read is a real open (#1154).
+                // Recorded here and not above the approval check: a refusal
+                // hands over nothing, and counting it would make an
+                // unfollowable skill look taken up.
+                self.record_skill_open(s.name.clone());
+                let note = (passed_over_own_draft && s.owner_user_id.is_none()).then(|| {
+                    format!(
+                        "this is the shared skill named {name}; your own draft of that name is \
+                         awaiting approval and was not used"
+                    )
+                });
+                Ok(serde_json::json!({
+                    "ok": true,
+                    "name": s.name,
+                    "description": s.description,
+                    "kind": s.kind.as_str(),
+                    "trust_tier": s.trust_tier.as_str(),
+                    "disk_path": s.disk_path,
+                    "attachments": s.attachments,
+                    "present_on_disk": s.present_on_disk,
+                    "last_seen_at": s.last_seen_at.map(|ts| ts.to_rfc3339()),
+                    "tags": s.tags,
+                    "note": note,
+                    "body": s.body,
+                })
+                .to_string())
+            }
             None => Ok(
                 serde_json::json!({ "ok": false, "reason": format!("no skill named {name}") })
                     .to_string(),
@@ -2280,6 +2340,25 @@ impl BuiltinToolService {
         let situation = current_situation();
         record_in_background("get_opened", async move {
             record(conversation_id, entry_ids, situation).await
+        });
+    }
+
+    /// Record that the skill named `name` was read by id (#1154).
+    ///
+    /// Only a name standing offered in this conversation becomes an open, and
+    /// the log applies that rule - so a skill the model found through
+    /// `builtin_skill_search` and read is not credited to the `[Recall]` block.
+    /// Off the tool's path and never fatal, for the reason
+    /// [`Self::record_open`] is.
+    fn record_skill_open(&self, name: String) {
+        let (Some(record), Some(conversation)) = (&self.skill_opened_fn, current_conversation_id())
+        else {
+            return;
+        };
+        let record = Arc::clone(record);
+        let conversation_id = conversation.0;
+        record_in_background("skill_get_opened", async move {
+            record(conversation_id, vec![name]).await
         });
     }
 
@@ -8750,6 +8829,169 @@ mod tests {
             "a personal tombstone must not shadow a live global skill of the same name"
         );
         assert_eq!(json["present_on_disk"], true);
+    }
+
+    /// An UNAPPROVED personal row must not shadow a live global skill either,
+    /// and this is the case that bites in practice: `promote_plan_to_skill`
+    /// writes unapproved personal rows under a name the assistant chose, so one
+    /// draft would otherwise hide a blessed global skill of that name from
+    /// every later fetch.
+    ///
+    /// The `[Recall]` skill arm resolves a duplicated name by this same rule
+    /// (#1154), and the two must agree - a block that described one procedure
+    /// while this handed back another's steps would brief the model on the
+    /// wrong method.
+    #[tokio::test]
+    async fn skill_get_an_unapproved_personal_skill_does_not_shadow_a_live_global_skill() {
+        use desktop_assistant_core::ports::skill_index::{SkillGetFn, SkillSearchFn};
+        use std::sync::Arc;
+
+        let get_fn: SkillGetFn = Arc::new(|name, owner| {
+            Box::pin(async move {
+                if name != "deploy" {
+                    return Ok(None);
+                }
+                Ok(Some(match owner {
+                    Some(_) => {
+                        let mut draft = deploy_skill("caller's own draft", true);
+                        draft.approved_at = None;
+                        draft
+                    }
+                    None => deploy_skill("global", true),
+                }))
+            })
+        });
+        let search_fn: SkillSearchFn =
+            Arc::new(|_q, _emb, _model, _limit| Box::pin(async { Ok(Vec::new()) }));
+        let service = BuiltinToolService::new().with_skills(search_fn, get_fn);
+
+        let out = service
+            .execute_tool(TOOL_SKILL_GET, serde_json::json!({"name": "deploy"}))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(json["ok"], true, "{json}");
+        assert_eq!(
+            json["description"], "global",
+            "an unapproved personal draft must not hide a blessed global skill"
+        );
+    }
+
+    /// Reaching past the caller's own unapproved draft says so, by name.
+    ///
+    /// The draft is one the assistant wrote under a name it chose, so nothing
+    /// else would ever mention it: the fetch now silently answers with the
+    /// shared skill, and `builtin_skill_search` reports only a count of what it
+    /// held back. The note is what lets the model tell the user their draft is
+    /// waiting on somebody.
+    #[tokio::test]
+    async fn skill_get_says_when_it_passed_over_the_callers_own_unapproved_draft() {
+        use desktop_assistant_core::ports::skill_index::{SkillGetFn, SkillSearchFn};
+        use std::sync::Arc;
+
+        let get_fn: SkillGetFn = Arc::new(|name, owner| {
+            Box::pin(async move {
+                if name != "deploy" {
+                    return Ok(None);
+                }
+                Ok(Some(match owner {
+                    Some(_) => {
+                        let mut draft = deploy_skill("caller's own draft", true);
+                        draft.approved_at = None;
+                        draft.owner_user_id = Some("someone".to_string());
+                        draft
+                    }
+                    None => deploy_skill("global", true),
+                }))
+            })
+        });
+        let search_fn: SkillSearchFn =
+            Arc::new(|_q, _emb, _model, _limit| Box::pin(async { Ok(Vec::new()) }));
+        let service = BuiltinToolService::new().with_skills(search_fn, get_fn);
+
+        let out = service
+            .execute_tool(TOOL_SKILL_GET, serde_json::json!({"name": "deploy"}))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(json["description"], "global");
+        assert!(
+            json["note"]
+                .as_str()
+                .unwrap_or("")
+                .contains("awaiting approval"),
+            "the draft that was passed over must be named, not silently dropped: {json}"
+        );
+    }
+
+    /// And it stays quiet when there was no draft to pass over, so the note
+    /// means something when it does appear.
+    #[tokio::test]
+    async fn skill_get_carries_no_draft_note_when_the_caller_has_no_draft() {
+        use desktop_assistant_core::ports::skill_index::{SkillGetFn, SkillSearchFn};
+        use std::sync::Arc;
+
+        let get_fn: SkillGetFn = Arc::new(|name, owner| {
+            Box::pin(async move {
+                if name != "deploy" || owner.is_some() {
+                    return Ok(None);
+                }
+                Ok(Some(deploy_skill("global", true)))
+            })
+        });
+        let search_fn: SkillSearchFn =
+            Arc::new(|_q, _emb, _model, _limit| Box::pin(async { Ok(Vec::new()) }));
+        let service = BuiltinToolService::new().with_skills(search_fn, get_fn);
+
+        let out = service
+            .execute_tool(TOOL_SKILL_GET, serde_json::json!({"name": "deploy"}))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(json["description"], "global");
+        assert!(json["note"].is_null(), "{json}");
+    }
+
+    /// The fallback reaches past an unusable personal row only to an APPROVED
+    /// global one. Where the global row is itself unapproved, the caller's own
+    /// row stands and the refusal names the state the caller can act on.
+    #[tokio::test]
+    async fn skill_get_keeps_the_callers_own_row_when_the_global_one_is_unapproved() {
+        use desktop_assistant_core::ports::skill_index::{SkillGetFn, SkillSearchFn};
+        use std::sync::Arc;
+
+        let get_fn: SkillGetFn = Arc::new(|name, owner| {
+            Box::pin(async move {
+                if name != "deploy" {
+                    return Ok(None);
+                }
+                Ok(Some(match owner {
+                    // Approved, but its files are gone - so not "usable", and
+                    // the fallback is consulted.
+                    Some(_) => deploy_skill("caller's own (removed)", false),
+                    None => {
+                        let mut draft = deploy_skill("global draft", true);
+                        draft.approved_at = None;
+                        draft
+                    }
+                }))
+            })
+        });
+        let search_fn: SkillSearchFn =
+            Arc::new(|_q, _emb, _model, _limit| Box::pin(async { Ok(Vec::new()) }));
+        let service = BuiltinToolService::new().with_skills(search_fn, get_fn);
+
+        let out = service
+            .execute_tool(TOOL_SKILL_GET, serde_json::json!({"name": "deploy"}))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(json["ok"], true, "{json}");
+        assert_eq!(
+            json["description"], "caller's own (removed)",
+            "an unapproved global row is not a usable stand-in, so the caller's own stands"
+        );
+        assert_eq!(json["present_on_disk"], false);
     }
 
     /// The mirror case: when the caller's personal row is a tombstone and
