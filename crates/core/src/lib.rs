@@ -12,13 +12,11 @@ pub mod prompts;
 pub mod recall;
 pub mod sanitize;
 pub mod service;
-// Documented with its own `//!` header, so no `///` summary here: the two
-// merge and the merged text resolves the header's links against this module.
-pub(crate) mod telemetry;
 pub mod skill_catalog;
 pub mod skill_promotion;
 pub mod system_id;
 pub mod tag_normalize;
+pub(crate) mod telemetry;
 pub mod tool_provenance;
 pub mod tools;
 

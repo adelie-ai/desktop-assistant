@@ -329,17 +329,23 @@ pub(crate) fn record_tool_call(
     );
 }
 
+/// One of the four token counts: what to call it in a label, what metric it
+/// accumulates into, and how to read it off a provider's report.
+type TokenCount = (&'static str, &'static str, fn(&TokenUsage) -> Option<u64>);
+
 /// The four counts, and the name each is recorded under.
 ///
 /// One list, read by both the recording below and the span fields, so a count
 /// cannot be recorded to the facade and left off the span.
-const COUNTS: [(&str, &str, fn(&TokenUsage) -> Option<u64>); 4] = [
+const COUNTS: [TokenCount; 4] = [
     ("input", TOKENS_INPUT, |u| u.input_tokens),
     ("output", TOKENS_OUTPUT, |u| u.output_tokens),
     ("cache_write", TOKENS_CACHE_WRITE, |u| {
         u.cache_creation_input_tokens
     }),
-    ("cache_read", TOKENS_CACHE_READ, |u| u.cache_read_input_tokens),
+    ("cache_read", TOKENS_CACHE_READ, |u| {
+        u.cache_read_input_tokens
+    }),
 ];
 
 /// Record one round's token usage, and count what the provider left out.
@@ -583,8 +589,7 @@ mod tests {
             "the round that reported an output count still contributes it"
         );
         assert_eq!(
-            totals.cache_read,
-            None,
+            totals.cache_read, None,
             "a count no round reported stays absent rather than becoming zero"
         );
     }

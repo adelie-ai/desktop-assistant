@@ -2400,8 +2400,10 @@ async fn main() -> Result<()> {
             );
             // Wrap each resolved client in the same retry chain the
             // foreground/turn paths use, erased to `Arc<dyn LlmClient>`.
-            let dreaming_llm: Arc<dyn LlmClient> =
-                Arc::new(RetryingLlmClient::new(build_llm_client(resolved_dreaming), 3));
+            let dreaming_llm: Arc<dyn LlmClient> = Arc::new(RetryingLlmClient::new(
+                build_llm_client(resolved_dreaming),
+                3,
+            ));
             let consolidation_llm: Arc<dyn LlmClient> = Arc::new(RetryingLlmClient::new(
                 build_llm_client(resolved_consolidation),
                 3,

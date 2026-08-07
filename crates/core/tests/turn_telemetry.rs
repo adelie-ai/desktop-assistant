@@ -120,7 +120,12 @@ fn histograms(summary: &Summary) -> HashMap<(String, String), u64> {
     summary
         .histograms
         .iter()
-        .map(|h| ((h.name.to_string(), render_labels(&h.labels)), h.total.count))
+        .map(|h| {
+            (
+                (h.name.to_string(), render_labels(&h.labels)),
+                h.total.count,
+            )
+        })
         .collect()
 }
 
@@ -134,12 +139,7 @@ fn render_labels(labels: &[Label]) -> String {
 
 /// What one metric's counter rose by across a turn, summed over label sets
 /// whose rendering contains every fragment in `label_contains`.
-fn counter_delta(
-    before: &Summary,
-    after: &Summary,
-    name: &str,
-    label_contains: &[&str],
-) -> u64 {
+fn counter_delta(before: &Summary, after: &Summary, name: &str, label_contains: &[&str]) -> u64 {
     let before = counters(before);
     let mut delta = 0;
     for ((series, labels), total) in counters(after) {
@@ -824,7 +824,7 @@ fn turn_completion_line_carries_duration_model_rounds_and_tokens() {
         "outcome=\"answered\"",
     ] {
         assert!(
-            line.contains(field.as_ref() as &str),
+            line.contains(field),
             "the completion line must carry `{field}` as a field, not interpolated \
              into the message:\n  {line}"
         );
@@ -882,14 +882,12 @@ fn missing_token_counts_are_not_recorded_as_zero() {
     // A connector that reports input but not output. Recording `0` for the
     // absence would silently understate every total that includes it, with no
     // way afterwards to tell a real zero from a missing number.
-    let script = vec![
-        LlmResponse::text(REPLY_SENTINEL).with_usage(TokenUsage {
-            input_tokens: Some(100),
-            output_tokens: None,
-            cache_creation_input_tokens: None,
-            cache_read_input_tokens: None,
-        }),
-    ];
+    let script = vec![LlmResponse::text(REPLY_SENTINEL).with_usage(TokenUsage {
+        input_tokens: Some(100),
+        output_tokens: None,
+        cache_creation_input_tokens: None,
+        cache_read_input_tokens: None,
+    })];
     let captured = run(Level::INFO, script, ScriptedTools::ok());
 
     assert_eq!(
@@ -926,14 +924,12 @@ fn cache_token_counts_are_recorded_when_present() {
     // On a caching provider the cache counts are the whole cost story: a cache
     // read costs a fraction of a fresh input token, so reporting input alone
     // makes a well-cached turn look identical to a cold one.
-    let script = vec![
-        LlmResponse::text(REPLY_SENTINEL).with_usage(TokenUsage {
-            input_tokens: Some(100),
-            output_tokens: Some(10),
-            cache_creation_input_tokens: Some(40),
-            cache_read_input_tokens: Some(4_000),
-        }),
-    ];
+    let script = vec![LlmResponse::text(REPLY_SENTINEL).with_usage(TokenUsage {
+        input_tokens: Some(100),
+        output_tokens: Some(10),
+        cache_creation_input_tokens: Some(40),
+        cache_read_input_tokens: Some(4_000),
+    })];
     let captured = run(Level::INFO, script, ScriptedTools::ok());
 
     assert_eq!(captured.counter_delta("llm.tokens.cache_write", &[]), 40);
@@ -1168,9 +1164,5 @@ fn profiling_llm_client_is_gone() {
         .join("src")
         .join("ports")
         .join("llm_profiling.rs");
-    assert!(
-        !module.exists(),
-        "{} still exists",
-        module.display()
-    );
+    assert!(!module.exists(), "{} still exists", module.display());
 }

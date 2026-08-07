@@ -1980,15 +1980,10 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         // future. A caller composes several task-local scopes around this
         // call, and each one embeds what it wraps by value, which is the
         // accounting that overflowed a worker thread's stack in #205/#206.
-        let result = Box::pin(self.run_turn(
-            conversation_id,
-            prompt,
-            on_chunk,
-            on_status,
-            &mut report,
-        ))
-        .instrument(span.clone())
-        .await;
+        let result =
+            Box::pin(self.run_turn(conversation_id, prompt, on_chunk, on_status, &mut report))
+                .instrument(span.clone())
+                .await;
 
         // An error the body never classified is read from the result rather
         // than guessed at: cancellation is the user's own signal, anything
@@ -2499,7 +2494,8 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
             // another lap - because the paths that would forget are the ones
             // worth measuring.
             report.rounds = round + 1;
-            let mut round_report = crate::telemetry::RoundGuard::new(round + 1, current_turn_route());
+            let mut round_report =
+                crate::telemetry::RoundGuard::new(round + 1, current_turn_route());
 
             // The narration floor is checked here, once per round, and nowhere
             // else. This is the one point in the loop where neither keepalive is
@@ -2789,24 +2785,24 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
             // keep the stall alive on their own; this covers the pre-first-token
             // window. Mirrors the tool-exec keepalive (#584). Cancellation is
             // unaffected: the call still resolves and breaks the loop.
-            let llm_call =
-                if use_hosted_search && !namespaces.is_empty() && !hosted_search_demoted {
-                    Box::pin(crate::ports::llm::dispatch_namespaced(
-                        &self.llm,
-                        llm_messages,
-                        &tool_defs,
-                        &namespaces,
-                        reasoning,
-                        filtered_chunk_callback,
-                    ))
-                } else {
-                    self.llm.stream_completion(
-                        llm_messages,
-                        &tool_defs,
-                        reasoning,
-                        filtered_chunk_callback,
-                    )
-                };
+            let llm_call = if use_hosted_search && !namespaces.is_empty() && !hosted_search_demoted
+            {
+                Box::pin(crate::ports::llm::dispatch_namespaced(
+                    &self.llm,
+                    llm_messages,
+                    &tool_defs,
+                    &namespaces,
+                    reasoning,
+                    filtered_chunk_callback,
+                ))
+            } else {
+                self.llm.stream_completion(
+                    llm_messages,
+                    &tool_defs,
+                    reasoning,
+                    filtered_chunk_callback,
+                )
+            };
             // The provider call is its own child span of the round, so a slow
             // provider is one hop from the turn in a trace and one label in a
             // histogram. `instrument` enters the span only while the call is
@@ -2828,15 +2824,8 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
             // Measured before the arms below branch, because two of them leave
             // the turn and one retries: a measurement written inside an arm
             // would be missing from whichever arm nobody thought about.
-            crate::telemetry::record_llm_call(
-                llm_started.elapsed(),
-                &route,
-                llm_result.is_ok(),
-            );
-            llm_span.record(
-                "outcome",
-                if llm_result.is_ok() { "ok" } else { "error" },
-            );
+            crate::telemetry::record_llm_call(llm_started.elapsed(), &route, llm_result.is_ok());
+            llm_span.record("outcome", if llm_result.is_ok() { "ok" } else { "error" });
             match &llm_result {
                 Ok(_) => {}
                 Err(CoreError::Cancelled) => {
