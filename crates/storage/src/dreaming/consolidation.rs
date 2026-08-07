@@ -1567,6 +1567,31 @@ mod tests {
     }
 
     #[test]
+    fn a_single_operation_given_without_its_array_is_still_read() {
+        // One operation object where a one-element array belongs is the same
+        // class of encoding accident as the repeated key, so it is read rather
+        // than rejected.
+        let answer = r#"{"operations":{"op":"delete","ids":["kb-001"],"reason":"trivial"}}"#;
+        let parsed =
+            parse_operations(answer).expect("one un-arrayed operation is still an operation");
+        assert_eq!(parsed.ops.len(), 1);
+        assert!(parsed.dropped.is_empty());
+    }
+
+    #[test]
+    fn an_operations_value_that_is_not_a_list_is_reported_not_swallowed() {
+        // Leniency about the container does not extend to accepting a plan that
+        // says nothing. A null where the operations belong is a fault, and
+        // reading it as "kept everything" would hide it.
+        let err = parse_operations(r#"{"operations":null}"#)
+            .expect_err("a null plan is not an empty plan");
+        assert!(
+            matches!(err, ParseFailure::Malformed { .. }),
+            "expected a malformed verdict, got: {err:?}"
+        );
+    }
+
+    #[test]
     fn an_answer_with_no_operations_at_all_is_still_an_empty_success() {
         // A model that keeps everything proposes nothing, which is a real
         // outcome and must not be confused with an unreadable answer.
