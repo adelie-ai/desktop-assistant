@@ -1931,12 +1931,13 @@ impl BuiltinToolService {
         tracing::debug!(query = %query, "skill search query");
 
         let (query_embedding, embedding_model) = self.embed_query(&query).await;
-        // Over-fetch when filtering by kind, then trim to the requested limit.
-        let fetch = if kind_filter.is_some() {
-            limit.saturating_mul(3)
-        } else {
-            limit
-        };
+        // Over-fetch, then trim to the requested limit. Both filters below run
+        // in this process rather than in the store, so a page sized exactly to
+        // `limit` would return fewer approved results than the caller asked
+        // for whenever an unapproved or wrong-kind row ranks inside it. Three
+        // times is a heuristic, not a guarantee: a catalog whose top matches
+        // are overwhelmingly unapproved can still come back short.
+        let fetch = limit.saturating_mul(3);
         let mut results = search_fn(query, query_embedding, embedding_model, fetch).await?;
         // An unapproved skill is not offered (#1155). Approval is the axis that
         // says a person agreed this may be followed, and a skill nobody agreed
@@ -8491,6 +8492,67 @@ mod tests {
         let allowed_json: serde_json::Value = serde_json::from_str(&allowed).unwrap();
         assert_eq!(allowed_json["ok"], true);
         assert!(allowed_json["body"].as_str().unwrap().contains("## Steps"));
+    }
+
+    /// Approval is filtered in this process, not in the store, so a page sized
+    /// exactly to `limit` would hand back fewer approved skills than asked for
+    /// whenever an unapproved row ranks inside it.
+    #[tokio::test]
+    async fn unapproved_rows_do_not_eat_the_result_limit() {
+        use desktop_assistant_core::domain::{IndexedSkill, Locality, SkillKind, TrustTier};
+        use desktop_assistant_core::ports::skill_index::{SkillGetFn, SkillSearchFn};
+        use std::sync::Arc;
+
+        fn row(name: &str, approved: bool) -> IndexedSkill {
+            IndexedSkill {
+                name: name.to_string(),
+                description: "d".to_string(),
+                kind: SkillKind::Skill,
+                disk_path: String::new(),
+                owner_user_id: None,
+                locality: Locality::Daemon,
+                content_hash: "h".to_string(),
+                trust_tier: TrustTier::Local,
+                source: None,
+                tags: vec![],
+                attachments: vec![],
+                body: "b".to_string(),
+                metadata: serde_json::Value::Null,
+                present_on_disk: false,
+                last_seen_at: None,
+                approved_at: approved.then(chrono::Utc::now),
+                approved_by: None,
+            }
+        }
+
+        // The store honours whatever page size it is given: two unapproved rows
+        // rank ahead of the approved ones.
+        let search_fn: SkillSearchFn = Arc::new(|_q, _emb, _model, limit| {
+            Box::pin(async move {
+                let mut rows = vec![row("draft-a", false), row("draft-b", false)];
+                for i in 0..10 {
+                    rows.push(row(&format!("live-{i}"), true));
+                }
+                rows.truncate(limit);
+                Ok(rows)
+            })
+        });
+        let get_fn: SkillGetFn = Arc::new(|_n, _o| Box::pin(async { Ok(None) }));
+        let service = BuiltinToolService::new().with_skills(search_fn, get_fn);
+
+        let out = service
+            .execute_tool(
+                TOOL_SKILL_SEARCH,
+                serde_json::json!({"query": "anything", "limit": 3}),
+            )
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            json["results"].as_array().unwrap().len(),
+            3,
+            "three approved skills were available and three were asked for: {json}"
+        );
     }
 
     /// Build a same-named "deploy" `IndexedSkill` for the `skill_get`
