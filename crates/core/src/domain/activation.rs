@@ -251,7 +251,7 @@ impl ActivationWeights {
     ///   prompt named nothing the store really holds and the other signals
     ///   should lead.
     pub fn situation_lift(&self) -> f64 {
-        0.0
+        self.reinforcement(self.reference_sum())
     }
 
     /// What a situation coverage is worth, in the source's own deviations.
@@ -268,8 +268,10 @@ impl ActivationWeights {
     ///
     /// [`SituationCue::coverage`]: crate::domain::situation::SituationCue::coverage
     pub fn situation(&self, coverage: f64) -> f64 {
-        let _ = coverage;
-        0.0
+        if !coverage.is_finite() || coverage <= 0.0 {
+            return 0.0;
+        }
+        self.situation_lift() * coverage.min(1.0)
     }
 }
 
@@ -454,7 +456,13 @@ mod tests {
 
         let mut previous = activation(0.0, Some(&every_hour(now, 1)), NO_SITUATION, now, &weights);
         for count in [2u64, 4, 8, 16, 32, 64, 128, 256] {
-            let doubled = activation(0.0, Some(&every_hour(now, count)), NO_SITUATION, now, &weights);
+            let doubled = activation(
+                0.0,
+                Some(&every_hour(now, count)),
+                NO_SITUATION,
+                now,
+                &weights,
+            );
             let step = doubled - previous;
             assert!(
                 step <= bound,
@@ -482,7 +490,13 @@ mod tests {
         let bound = weights.use_lift * std::f64::consts::LN_2;
 
         let once = activation(0.0, Some(&used(now, &[60], 1)), NO_SITUATION, now, &weights);
-        let twice = activation(0.0, Some(&used(now, &[30, 60], 2)), NO_SITUATION, now, &weights);
+        let twice = activation(
+            0.0,
+            Some(&used(now, &[30, 60], 2)),
+            NO_SITUATION,
+            now,
+            &weights,
+        );
 
         assert!(
             twice - once > bound,
@@ -583,7 +597,8 @@ mod tests {
         let worked_all_morning = evenly_over(now, 10, 1_800);
 
         let best_cold_match = activation(7.3, None, NO_SITUATION, now, &weights);
-        let just_above_the_bar = activation(6.9, Some(&worked_all_morning), NO_SITUATION, now, &weights);
+        let just_above_the_bar =
+            activation(6.9, Some(&worked_all_morning), NO_SITUATION, now, &weights);
 
         assert!(
             just_above_the_bar > best_cold_match,
@@ -684,7 +699,8 @@ mod tests {
         }];
 
         assert!(
-            activation(7.0, Some(&refuted), NO_SITUATION, now, &weights) < activation(7.0, None, NO_SITUATION, now, &weights)
+            activation(7.0, Some(&refuted), NO_SITUATION, now, &weights)
+                < activation(7.0, None, NO_SITUATION, now, &weights)
         );
     }
 
@@ -721,7 +737,13 @@ mod tests {
         let weights = ActivationWeights::default();
         let a_day = USE_REFERENCE_AGE_SECONDS as i64;
 
-        let scored = activation(0.0, Some(&used(now, &[a_day], 1)), NO_SITUATION, now, &weights);
+        let scored = activation(
+            0.0,
+            Some(&used(now, &[a_day], 1)),
+            NO_SITUATION,
+            now,
+            &weights,
+        );
 
         assert!(
             (scored - weights.use_lift * std::f64::consts::LN_2).abs() < 1e-9,
@@ -739,7 +761,13 @@ mod tests {
         let a_day = USE_REFERENCE_AGE_SECONDS as i64;
 
         let nearer_but_unread = activation(9.10, None, NO_SITUATION, now, &weights);
-        let further_but_used = activation(9.00, Some(&used(now, &[a_day], 1)), NO_SITUATION, now, &weights);
+        let further_but_used = activation(
+            9.00,
+            Some(&used(now, &[a_day], 1)),
+            NO_SITUATION,
+            now,
+            &weights,
+        );
 
         assert!(
             further_but_used > nearer_but_unread,
@@ -825,7 +853,13 @@ mod tests {
         let a_day = USE_REFERENCE_AGE_SECONDS as i64;
 
         let ceiling = weights.situation_lift();
-        let one_day_old_use = activation(0.0, Some(&used(now, &[a_day], 1)), NO_SITUATION, now, &weights);
+        let one_day_old_use = activation(
+            0.0,
+            Some(&used(now, &[a_day], 1)),
+            NO_SITUATION,
+            now,
+            &weights,
+        );
         assert!(
             (ceiling - one_day_old_use).abs() < 1e-9,
             "a full situation match is worth {ceiling}, and one use a day old is worth \
@@ -991,7 +1025,15 @@ mod tests {
         let total: f64 = corpus
             .iter()
             .enumerate()
-            .map(|(i, record)| activation(7.0 + (i % 5) as f64, Some(record), NO_SITUATION, now, &weights))
+            .map(|(i, record)| {
+                activation(
+                    7.0 + (i % 5) as f64,
+                    Some(record),
+                    NO_SITUATION,
+                    now,
+                    &weights,
+                )
+            })
             .sum();
         let spent = started.elapsed();
 

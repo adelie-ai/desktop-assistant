@@ -107,7 +107,9 @@ async fn a_situation_record_is_written_with_every_observation_and_every_field_is
     })
     .await;
 
-    let both = situation_of(&log, ALICE, "kb-both").await.expect("a record");
+    let both = situation_of(&log, ALICE, "kb-both")
+        .await
+        .expect("a record");
     assert!(both.holds(SituationField::Host, "workshop"));
     assert!(both.holds(SituationField::Weekday, "thursday"));
 

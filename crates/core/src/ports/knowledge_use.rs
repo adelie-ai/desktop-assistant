@@ -259,10 +259,7 @@ pub type KnowledgeOpenedFn = Arc<
 /// Boxed async closure that records the situation an entry was observed in
 /// (#1125). Args: `(entry_ids, situation)`.
 pub type KnowledgeSituationFn = Arc<
-    dyn Fn(
-            Vec<String>,
-            Situation,
-        ) -> Pin<Box<dyn Future<Output = Result<usize, CoreError>> + Send>>
+    dyn Fn(Vec<String>, Situation) -> Pin<Box<dyn Future<Output = Result<usize, CoreError>> + Send>>
         + Send
         + Sync,
 >;

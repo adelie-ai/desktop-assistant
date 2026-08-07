@@ -688,8 +688,7 @@ fn rank_by_activation<'a>(
     let scored: Vec<Option<f64>> = showable
         .iter()
         .map(|(hit, _)| {
-            let coverage = situation
-                .map_or(NO_SITUATION, |cue| cue.coverage(&hit.situation));
+            let coverage = situation.map_or(NO_SITUATION, |cue| cue.coverage(&hit.situation));
             hit.relevance.semantic_signal(dispersion).map(|semantic| {
                 activation(semantic, hit.use_record.as_ref(), coverage, now, &weights)
             })
@@ -1683,7 +1682,7 @@ mod tests {
                 entry,
                 relevance: RecallRelevance::Distance(0.10),
                 use_record: None,
-            situation: crate::domain::SituationRecord::new(),
+                situation: crate::domain::SituationRecord::new(),
             }
         };
         RecallCandidates {
@@ -2068,7 +2067,7 @@ mod tests {
                 entry,
                 relevance: RecallRelevance::Distance(0.12),
                 use_record: None,
-            situation: crate::domain::SituationRecord::new(),
+                situation: crate::domain::SituationRecord::new(),
             }],
             ..RecallCandidates::default()
         };
@@ -2817,13 +2816,13 @@ mod tests {
                     entry: hostile_id,
                     relevance: RecallRelevance::Distance(0.10),
                     use_record: None,
-            situation: crate::domain::SituationRecord::new(),
+                    situation: crate::domain::SituationRecord::new(),
                 },
                 RecallEntry {
                     entry: hostile_tag,
                     relevance: RecallRelevance::Distance(0.11),
                     use_record: None,
-            situation: crate::domain::SituationRecord::new(),
+                    situation: crate::domain::SituationRecord::new(),
                 },
             ],
             ..RecallCandidates::default()
@@ -2870,7 +2869,7 @@ mod tests {
                 entry,
                 relevance: RecallRelevance::Distance(0.10),
                 use_record: None,
-            situation: crate::domain::SituationRecord::new(),
+                situation: crate::domain::SituationRecord::new(),
             }],
             ..RecallCandidates::default()
         };
@@ -2915,7 +2914,7 @@ mod tests {
                     entry,
                     relevance: RecallRelevance::Distance(0.10),
                     use_record: None,
-            situation: crate::domain::SituationRecord::new(),
+                    situation: crate::domain::SituationRecord::new(),
                 }],
                 ..RecallCandidates::default()
             };
@@ -2953,7 +2952,7 @@ mod tests {
                 entry,
                 relevance: RecallRelevance::Distance(0.10),
                 use_record: None,
-            situation: crate::domain::SituationRecord::new(),
+                situation: crate::domain::SituationRecord::new(),
             }],
             ..RecallCandidates::default()
         };
@@ -2999,7 +2998,7 @@ mod tests {
                     entry: KnowledgeEntry::new("kb-empty", "   \n\t ", vec![]),
                     relevance: RecallRelevance::Distance(0.10),
                     use_record: None,
-            situation: crate::domain::SituationRecord::new(),
+                    situation: crate::domain::SituationRecord::new(),
                 },
                 hit("kb-real", "a real fact", &[], 0.11),
             ],
@@ -3132,7 +3131,7 @@ mod tests {
                 entry,
                 relevance: RecallRelevance::Distance(0.10),
                 use_record: None,
-            situation: crate::domain::SituationRecord::new(),
+                situation: crate::domain::SituationRecord::new(),
             }],
             ..RecallCandidates::default()
         };
@@ -3150,7 +3149,7 @@ mod tests {
                 entry: KnowledgeEntry::new("kb-empty", "", vec![]),
                 relevance: RecallRelevance::Distance(0.10),
                 use_record: None,
-            situation: crate::domain::SituationRecord::new(),
+                situation: crate::domain::SituationRecord::new(),
             }],
             ..RecallCandidates::default()
         };
@@ -3202,7 +3201,7 @@ mod tests {
                 entry,
                 relevance: RecallRelevance::LexicalMatch,
                 use_record: None,
-            situation: crate::domain::SituationRecord::new(),
+                situation: crate::domain::SituationRecord::new(),
             }],
             ..RecallCandidates::default()
         };

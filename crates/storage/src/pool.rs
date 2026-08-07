@@ -216,6 +216,10 @@ const MIGRATIONS: &[Migration] = &[
     // `indexed_at`, since every skill already in the catalog arrived by a
     // person putting a file in a skill root.
     migration!("046_skill_approval.sql"),
+    // #1125: the situations an entry has been seen in -- where it was written
+    // and where it has proved useful -- so a recurring situation can reach it
+    // again. One row per (entry, field, value), bounded per entry by the writer.
+    migration!("047_knowledge_situation.sql"),
 ];
 
 /// Second half of the advisory-lock key: the schema the migrations write to.

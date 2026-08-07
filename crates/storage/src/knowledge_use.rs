@@ -1,10 +1,25 @@
-//! Postgres adapter for the knowledge use log (#698).
+//! Postgres adapter for the knowledge use log (#698) and the situation record
+//! (#1125).
 //!
-//! Two tables, created by `044_knowledge_use_log.sql`. `knowledge_use_stats`
-//! holds one row per entry - the counters, the first-seen stamp, the recent-use
-//! window, and the entry's standing offer. `knowledge_use_marks` holds one
-//! standing mark per source per entry. Both are bounded per entry by design;
-//! the module doc on [`desktop_assistant_core::domain::knowledge_use`] says why.
+//! Three tables. `044_knowledge_use_log.sql` creates `knowledge_use_stats` -
+//! one row per entry, holding the counters, the first-seen stamp and the
+//! recent-use window - and `knowledge_use_marks`, one standing mark per source
+//! per entry. `047_knowledge_situation.sql` creates `knowledge_situation`, one
+//! row per situation value an entry has been seen in. All three are bounded per
+//! entry by design; the module docs on
+//! [`desktop_assistant_core::domain::knowledge_use`] and
+//! [`desktop_assistant_core::domain::situation`] say why.
+//!
+//! ## Why the situation lives with the use log
+//!
+//! It is a fact about what happened to an entry, which is what this log holds,
+//! and half of it *is* a use: #238's accumulation rule says an entry records
+//! where it proved useful, so the write rides
+//! [`KnowledgeUseLog::record_opened`]'s own transaction and against exactly the
+//! ids that transaction counted as opens. The other half - the situation an
+//! entry was written in - has no use behind it and arrives through
+//! [`KnowledgeUseLog::record_situation`]. Both land in one table, because from
+//! the reader's side they are one question.
 //!
 //! ## Every write is guarded by ownership, not only scoped by it
 //!
@@ -24,8 +39,10 @@ use desktop_assistant_core::domain::knowledge_use::{
     KnowledgeMark, KnowledgeUseRecord, MARK_REASON_MAX_CHARS, MarkPolarity, MarkSource,
     RECENT_USE_WINDOW,
 };
+use desktop_assistant_core::domain::situation::{
+    MAX_SITUATION_VALUES_PER_FIELD, Situation, SituationCue, SituationField, SituationRecord,
+};
 use desktop_assistant_core::ports::auth::current_user_id;
-use desktop_assistant_core::domain::situation::{Situation, SituationCue, SituationRecord};
 use desktop_assistant_core::ports::knowledge_use::{
     KnowledgeUseLog, MAX_STANDING_OFFERS, MarkRequest, OfferScope, OfferSource,
 };
@@ -107,7 +124,132 @@ struct MarkRow {
     marked_at: DateTime<Utc>,
 }
 
+/// One `knowledge_situation` row as it comes back (#1125).
+#[derive(sqlx::FromRow)]
+struct SituationRow {
+    entry_id: String,
+    field: String,
+    value: String,
+}
+
+/// What the store says one cue value is worth: how many entries carry it, and
+/// how many entries the store holds records for at all.
+#[derive(sqlx::FromRow)]
+struct FanRow {
+    field: String,
+    entries: i64,
+    fan: i64,
+}
+
+/// Record `situation` against every one of `ids` the caller owns, and hold each
+/// entry's record inside its per-field bound (#1125).
+///
+/// Shared by the two writes that produce one - the observation
+/// ([`KnowledgeUseLog::record_situation`]) and the reuse
+/// ([`KnowledgeUseLog::record_opened`]) - because they differ only in which ids
+/// they arrive with, and a second copy of an upsert-then-evict pair is a second
+/// place for the bound to be forgotten.
+///
+/// **Idempotent by key.** A value the entry's record already holds moves `times`
+/// and `last_seen_at` and changes nothing any ranking reads, so a retried write
+/// is safe and the retrieve-record-retrieve loop closes after one step.
+///
+/// **Guarded by ownership, not only scoped by it.** The insert selects the entry
+/// out of `knowledge_base` under the caller's `user_id`, so an id another user
+/// owns, and an id that has been retired, both match nothing and record nothing.
+async fn write_situation(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    ids: &[String],
+    situation: &Situation,
+) -> Result<usize, CoreError> {
+    if ids.is_empty() || situation.is_empty() {
+        return Ok(0);
+    }
+    let user_id = current_user_id();
+    let fields: Vec<String> = situation
+        .iter()
+        .map(|(field, _)| field.as_str().to_string())
+        .collect();
+    let values: Vec<String> = situation
+        .iter()
+        .map(|(_, value)| value.to_string())
+        .collect();
+
+    let written = sqlx::query(
+        "INSERT INTO knowledge_situation (user_id, entry_id, field, value) \
+         SELECT kb.user_id, kb.id, seen.field, seen.value \
+         FROM knowledge_base kb \
+         CROSS JOIN UNNEST($3::text[], $4::text[]) AS seen(field, value) \
+         WHERE kb.user_id = $1 AND kb.id = ANY($2) AND kb.deleted_at IS NULL \
+         ON CONFLICT (user_id, entry_id, field, value) DO UPDATE SET \
+             times = knowledge_situation.times + 1, \
+             last_seen_at = NOW()",
+    )
+    .bind(user_id.as_str())
+    .bind(ids)
+    .bind(&fields)
+    .bind(&values)
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| CoreError::Storage(e.to_string()))?
+    .rows_affected() as usize;
+
+    // The bound, applied where the growth happens. Two of the three fields are
+    // closed sets, so in practice this only ever trims a host: an entry that has
+    // been useful from more machines than this has stopped saying anything about
+    // where it is useful. Least recently seen goes first, and the value breaks a
+    // tie so the trim is the same trim every time.
+    sqlx::query(
+        "DELETE FROM knowledge_situation \
+         WHERE (user_id, entry_id, field, value) IN ( \
+             SELECT user_id, entry_id, field, value FROM ( \
+                 SELECT user_id, entry_id, field, value, \
+                        row_number() OVER ( \
+                            PARTITION BY entry_id, field \
+                            ORDER BY last_seen_at DESC, value DESC \
+                        ) AS rank \
+                 FROM knowledge_situation \
+                 WHERE user_id = $1 AND entry_id = ANY($2) \
+             ) ranked WHERE ranked.rank > $3::int \
+         )",
+    )
+    .bind(user_id.as_str())
+    .bind(ids)
+    .bind(MAX_SITUATION_VALUES_PER_FIELD as i32)
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| CoreError::Storage(e.to_string()))?;
+
+    Ok(written)
+}
+
 impl PgKnowledgeUseLog {
+    /// A transaction whose statements the database gives up on at
+    /// [`USE_LOG_READ_STATEMENT_TIMEOUT`].
+    ///
+    /// A transaction for one reason: `SET LOCAL` is scoped to one, and it is
+    /// what makes the ceiling the caller keeps a ceiling the database keeps too.
+    /// Every read behind this adapter sits on the pre-prompt recall path, whose
+    /// caller gives up after half a second - and abandoning a future stops the
+    /// daemon waiting while leaving the backend working. Recall runs before
+    /// every turn, so a database slow enough to exceed the caller's ceiling
+    /// would otherwise accumulate abandoned reads at the rate turns arrive.
+    /// Same rule, and the same reason, as
+    /// `PgKnowledgeBaseStore::nearest_by_embedding`.
+    async fn bounded_read(&self) -> Result<sqlx::Transaction<'_, sqlx::Postgres>, CoreError> {
+        let mut read = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
+        sqlx::query("SELECT set_config('statement_timeout', $1, true)")
+            .bind(USE_LOG_READ_STATEMENT_TIMEOUT.as_millis().to_string())
+            .execute(&mut *read)
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
+        Ok(read)
+    }
+
     /// One attempt at the mark write, in its own transaction.
     ///
     /// Returns the raw `sqlx::Error` so the caller can tell a vanished entry
@@ -269,21 +411,114 @@ impl KnowledgeUseLog for PgKnowledgeUseLog {
         entry_ids: Vec<String>,
         situation: Situation,
     ) -> Result<usize, CoreError> {
-        let _ = (entry_ids, situation);
-        Ok(0)
+        let ids = storable(entry_ids);
+        if ids.is_empty() || situation.is_empty() {
+            return Ok(0);
+        }
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
+        let written = write_situation(&mut tx, &ids, &situation).await?;
+        tx.commit()
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
+        Ok(written)
     }
 
     async fn situations(
         &self,
         entry_ids: Vec<String>,
     ) -> Result<Vec<(String, SituationRecord)>, CoreError> {
-        let _ = entry_ids;
-        Ok(vec![])
+        let ids = storable(entry_ids);
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let user_id = current_user_id();
+        let mut read = self.bounded_read().await?;
+        let rows: Vec<SituationRow> = sqlx::query_as(
+            "SELECT entry_id, field, value \
+             FROM knowledge_situation \
+             WHERE user_id = $1 AND entry_id = ANY($2)",
+        )
+        .bind(user_id.as_str())
+        .bind(&ids)
+        .fetch_all(&mut *read)
+        .await
+        .map_err(|e| CoreError::Storage(e.to_string()))?;
+        read.commit()
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
+
+        // A field name this version does not know is skipped rather than
+        // refused: it is a dimension a later writer recorded, not a corrupt row.
+        let mut by_entry: std::collections::HashMap<String, SituationRecord> =
+            std::collections::HashMap::new();
+        for row in rows {
+            let Some(field) = SituationField::parse(&row.field) else {
+                continue;
+            };
+            let record = by_entry.entry(row.entry_id).or_default();
+            *record = std::mem::take(record).with(field, row.value);
+        }
+        Ok(by_entry.into_iter().collect())
     }
 
     async fn situation_cue(&self, situation: Situation) -> Result<Option<SituationCue>, CoreError> {
-        let _ = situation;
-        Ok(None)
+        if situation.is_empty() {
+            return Ok(None);
+        }
+        let user_id = current_user_id();
+        let fields: Vec<String> = situation
+            .iter()
+            .map(|(field, _)| field.as_str().to_string())
+            .collect();
+        let values: Vec<String> = situation
+            .iter()
+            .map(|(_, value)| value.to_string())
+            .collect();
+
+        let mut read = self.bounded_read().await?;
+        // One statement: the population every fan is read against, and each
+        // cue value's fan, so the two describe one store at one instant. A
+        // population counted in a second round trip could disagree with a fan
+        // by however many entries landed between them, and a fan larger than
+        // its own population is an information quantity below zero.
+        let rows: Vec<FanRow> = sqlx::query_as(
+            "WITH population AS ( \
+                 SELECT count(DISTINCT entry_id) AS entries \
+                 FROM knowledge_situation WHERE user_id = $1 \
+             ), \
+             cue AS (SELECT * FROM UNNEST($2::text[], $3::text[]) AS c(field, value)) \
+             SELECT cue.field, \
+                    population.entries, \
+                    (SELECT count(*) FROM knowledge_situation ks \
+                     WHERE ks.user_id = $1 \
+                       AND ks.field = cue.field \
+                       AND ks.value = cue.value) AS fan \
+             FROM cue CROSS JOIN population",
+        )
+        .bind(user_id.as_str())
+        .bind(&fields)
+        .bind(&values)
+        .fetch_all(&mut *read)
+        .await
+        .map_err(|e| CoreError::Storage(e.to_string()))?;
+        read.commit()
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
+
+        let Some(population) = rows.first().map(|row| row.entries.max(0) as u64) else {
+            return Ok(None);
+        };
+        let fan: std::collections::BTreeMap<SituationField, u64> = rows
+            .into_iter()
+            .filter_map(|row| {
+                SituationField::parse(&row.field).map(|field| (field, row.fan.max(0) as u64))
+            })
+            .collect();
+        Ok(SituationCue::measured(situation, population, &fan))
     }
 
     async fn record_opened(
@@ -292,7 +527,6 @@ impl KnowledgeUseLog for PgKnowledgeUseLog {
         entry_ids: Vec<String>,
         situation: Situation,
     ) -> Result<usize, CoreError> {
-        let _ = situation;
         let ids = storable(entry_ids);
         if ids.is_empty() {
             return Ok(0);
@@ -334,6 +568,14 @@ impl KnowledgeUseLog for PgKnowledgeUseLog {
             .execute(&mut *tx)
             .await
             .map_err(|e| CoreError::Storage(e.to_string()))?;
+
+            // #238's accumulation rule, carried by the write that already
+            // decided which ids count. It runs against `taken` rather than
+            // `ids`, so a read nothing offered accumulates nothing - the same
+            // rule the open counter keeps, and for the same reason. In the same
+            // transaction, so an entry can never end up with an open it has no
+            // situation for or a situation it has no open for.
+            write_situation(&mut tx, &taken, &situation).await?;
         }
 
         tx.commit()
@@ -381,16 +623,7 @@ impl KnowledgeUseLog for PgKnowledgeUseLog {
         // otherwise accumulate abandoned reads at the rate turns arrive. Same
         // rule, and the same reason, as
         // `PgKnowledgeBaseStore::nearest_by_embedding`.
-        let mut read = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| CoreError::Storage(e.to_string()))?;
-        sqlx::query("SELECT set_config('statement_timeout', $1, true)")
-            .bind(USE_LOG_READ_STATEMENT_TIMEOUT.as_millis().to_string())
-            .execute(&mut *read)
-            .await
-            .map_err(|e| CoreError::Storage(e.to_string()))?;
+        let mut read = self.bounded_read().await?;
 
         let stats: Vec<StatsRow> = sqlx::query_as(
             "SELECT entry_id, offered_count, opened_count, marked_count, first_seen_at, \

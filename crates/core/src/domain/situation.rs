@@ -123,7 +123,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Timelike, Utc};
 
 /// How many entries a store must hold records for before a fan count is read as
 /// information.
@@ -306,8 +306,19 @@ impl Situation {
     ///   wrong value costs every entry that recorded the same instant honestly.
     ///   An unparseable zone name is treated as an absent one.
     pub fn observe(now: DateTime<Utc>, sources: &SituationSources<'_>) -> Self {
-        let _ = (now, sources);
-        Self::new()
+        let mut situation = Self::new();
+        if let Some(host) = sources.host {
+            situation = situation.with(SituationField::Host, host.trim());
+        }
+        let Some(local) = sources.timezone.and_then(|zone| local_time(now, zone)) else {
+            return situation;
+        };
+        situation
+            .with(
+                SituationField::TimeOfDay,
+                TimeOfDay::at_hour(local.hour()).as_str(),
+            )
+            .with(SituationField::Weekday, weekday_name(local))
     }
 
     /// Whether no field is stated.
@@ -360,7 +371,9 @@ impl SituationRecord {
     {
         pairs
             .into_iter()
-            .fold(Self::new(), |record, (field, value)| record.with(field, value))
+            .fold(Self::new(), |record, (field, value)| {
+                record.with(field, value)
+            })
     }
 
     /// Whether this entry has ever been seen with a value for `field`.
@@ -428,8 +441,20 @@ impl SituationCue {
         population: u64,
         fan: &BTreeMap<SituationField, u64>,
     ) -> Option<Self> {
-        let _ = (situation, population, fan);
-        None
+        if situation.is_empty() || population < SITUATION_MIN_POPULATION {
+            return None;
+        }
+        let information: BTreeMap<SituationField, f64> = situation
+            .iter()
+            .map(|(field, _)| {
+                let held = fan.get(&field).copied().unwrap_or(0);
+                (field, self_information(population, held))
+            })
+            .collect();
+        Some(Self {
+            situation,
+            information,
+        })
     }
 
     /// The present situation this cue reads.
@@ -479,9 +504,61 @@ impl SituationCue {
     /// the store below its population floor, and the deployment with nothing
     /// connected.
     pub fn coverage(&self, record: &SituationRecord) -> f64 {
-        let _ = record;
-        0.0
+        let mut matched = 0.0;
+        let mut comparable = 0.0;
+        for (field, value) in self.situation.iter() {
+            if !record.knows(field) {
+                continue;
+            }
+            let information = self.information(field);
+            comparable += information;
+            if record.holds(field, value) {
+                matched += information;
+            }
+        }
+        if comparable <= 0.0 || !comparable.is_finite() {
+            return 0.0;
+        }
+        (matched / comparable).clamp(0.0, 1.0)
     }
+}
+
+/// The local wall clock at `now` in `zone`, or `None` for a zone name no
+/// database entry claims.
+fn local_time(now: DateTime<Utc>, zone: &str) -> Option<chrono::NaiveDateTime> {
+    let zone: chrono_tz::Tz = zone.trim().parse().ok()?;
+    Some(now.with_timezone(&zone).naive_local())
+}
+
+/// The weekday's English name, lowercase, so a stored value does not depend on
+/// a locale the reader does not share.
+fn weekday_name(local: chrono::NaiveDateTime) -> &'static str {
+    match local.weekday() {
+        chrono::Weekday::Mon => "monday",
+        chrono::Weekday::Tue => "tuesday",
+        chrono::Weekday::Wed => "wednesday",
+        chrono::Weekday::Thu => "thursday",
+        chrono::Weekday::Fri => "friday",
+        chrono::Weekday::Sat => "saturday",
+        chrono::Weekday::Sun => "sunday",
+    }
+}
+
+/// What knowing one value is worth over a store of `population` entries, in
+/// nats, when `fan` of them carry it.
+///
+/// `ln(population / fan)`, the value's own self-information. Two populations sit
+/// outside the formula and both are worth nothing, for one reason rather than
+/// two: a value that separates nobody tells nobody anything.
+///
+/// - `fan == population`: every entry carries it.
+/// - `fan == 0`: no entry carries it, so no candidate can match on the field and
+///   it discriminates among none of them.
+fn self_information(population: u64, fan: u64) -> f64 {
+    if fan == 0 || fan >= population {
+        return 0.0;
+    }
+    (population as f64 / fan as f64).ln().max(0.0)
 }
 
 #[cfg(test)]

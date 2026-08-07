@@ -116,6 +116,10 @@ const PERSONAL_DATA_TABLES: &[&str] = &[
     "knowledge_use_stats",
     "knowledge_use_marks",
     "knowledge_offers",
+    // 047 — where one person's assistant has found each entry useful. A host
+    // name and the hours somebody works are personal data in their own right,
+    // before any entry is read.
+    "knowledge_situation",
 ];
 
 /// The canonical set of personal-data tables (see `PERSONAL_DATA_TABLES`).

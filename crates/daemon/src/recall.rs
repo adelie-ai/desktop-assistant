@@ -253,9 +253,9 @@ async fn lookup(
                 candidates = found.entries.len(),
                 with_use_record = records.len(),
                 with_situation_record = situations.len(),
-                situation_cue = cue.as_ref().map_or(0, |cue: &SituationCue| {
-                    cue.situation().iter().count()
-                }),
+                situation_cue = cue
+                    .as_ref()
+                    .map_or(0, |cue: &SituationCue| { cue.situation().iter().count() }),
                 "recall: how many candidates the use log and the situation had something to \
                  say about"
             );
@@ -689,9 +689,11 @@ mod tests {
     /// estimate.
     #[tokio::test]
     async fn a_store_that_cannot_be_measured_still_answers_with_its_candidates() {
-        let candidates = gather(async { Ok((vec![an_entry()], None, None)) }, async { Ok(vec![]) })
-            .await
-            .expect("a measurement is not what the lookup is for");
+        let candidates = gather(async { Ok((vec![an_entry()], None, None)) }, async {
+            Ok(vec![])
+        })
+        .await
+        .expect("a measurement is not what the lookup is for");
 
         assert_eq!(candidates.entries.len(), 1);
         assert_eq!(candidates.entry_dispersion, None);

@@ -21,8 +21,7 @@ use desktop_assistant_core::ports::knowledge::{
 };
 use desktop_assistant_core::ports::knowledge_use::{
     KnowledgeMarkFn, KnowledgeOfferedFn, KnowledgeOpenedFn, KnowledgeSituationFn, MarkRequest,
-    OfferScope, current_situation,
-    record_in_background,
+    OfferScope, current_situation, record_in_background,
 };
 use desktop_assistant_core::ports::notify::{NotifyFn, NotifyUrgency};
 use desktop_assistant_core::ports::scratchpad::{
