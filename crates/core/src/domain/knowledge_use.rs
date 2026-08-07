@@ -339,6 +339,17 @@ impl KnowledgeUseRecord {
     /// window it reduces to `n / (1 - d) * T^-d`, whose logarithm is the
     /// familiar `ln(n / (1 - d)) - d * ln(T)`.
     pub fn usefulness(&self, now: DateTime<Utc>, weights: &UseScoreWeights) -> f64 {
+        self.use_sum(now, weights).max(MIN_ACTIVATION_SUM).ln()
+    }
+
+    /// STUB - not implemented yet.
+    pub fn use_sum(&self, now: DateTime<Utc>, weights: &UseScoreWeights) -> f64 {
+        let _ = (now, weights);
+        0.0
+    }
+
+    #[allow(dead_code)]
+    fn unimplemented_use_sum(&self, now: DateTime<Utc>, weights: &UseScoreWeights) -> f64 {
         let d = weights.safe_decay();
 
         let window: Vec<f64> = self
@@ -359,7 +370,7 @@ impl KnowledgeUseRecord {
             })
             .sum();
 
-        (recent + tail + marks).max(MIN_ACTIVATION_SUM).ln()
+        recent + tail + marks
     }
 
     /// The approximated contribution of the uses that fell out of the recent

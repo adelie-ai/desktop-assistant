@@ -1,3 +1,4 @@
+pub mod activation;
 mod conversation;
 pub mod knowledge;
 pub mod knowledge_use;
@@ -6,6 +7,7 @@ pub mod scratchpad;
 pub mod skill;
 pub mod tool;
 
+pub use activation::{ActivationWeights, activation};
 pub use conversation::{
     Conversation, ConversationId, ConversationSummary, MessageSummary, RESERVED_SUBAGENT_TAG,
 };

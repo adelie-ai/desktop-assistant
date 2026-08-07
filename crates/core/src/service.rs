@@ -621,15 +621,20 @@ struct ScratchpadSurfaces {
 /// What this turn's one recall lookup produced, and how far it was asked to
 /// read (#1100, #1101).
 ///
-/// The ceilings travel with the answer because the block's "and N more matched
-/// less closely" line is a lower bound exactly when a scan filled up. A count
-/// that reports itself as exact when the scan actually filled is the one
-/// dishonesty the block must not commit, so the request's limits and the
-/// render's are the same values rather than two constants that happen to agree.
+/// The ceilings travel with the answer because the block's "and N more ... did
+/// not fit" line is a lower bound exactly when a scan filled up. A count that
+/// reports itself as exact when the scan actually filled is the one dishonesty
+/// the block must not commit, so the request's limits and the render's are the
+/// same values rather than two constants that happen to agree.
 struct RecallLookup {
     candidates: crate::ports::recall::RecallCandidates,
     entry_scan_limit: usize,
     note_scan_limit: usize,
+    /// When the lookup ran, and so the instant every use record it carries is a
+    /// statement about (#1123). Captured once here rather than read again at
+    /// render time, because the block renders on every round of the turn and a
+    /// candidate must not shift rank between two rounds that read one lookup.
+    looked_up_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// The text a step note records: the model's own wording in a clean turn, a
@@ -1385,11 +1390,13 @@ impl<S, L, T> ConversationHandler<S, L, T> {
         };
         let entry_scan_limit = request.entry_limit;
         let note_scan_limit = request.note_limit;
+        let looked_up_at = chrono::Utc::now();
         match lookup(request).await {
             Ok(candidates) => Some(RecallLookup {
                 candidates,
                 entry_scan_limit,
                 note_scan_limit,
+                looked_up_at,
             }),
             Err(e) => {
                 tracing::warn!(error = %e, "pre-prompt recall lookup failed; continuing without it");
@@ -2133,6 +2140,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                     &found.candidates,
                     found.entry_scan_limit,
                     found.note_scan_limit,
+                    found.looked_up_at,
                 )
                 .already_in_view(
                     &surfaces.indexed_keys,
@@ -7024,10 +7032,10 @@ mod tests {
                 );
                 entry.summary = Some("The registry runs on the storage host".to_string());
                 Ok(RecallCandidates {
-                    entries: vec![RecallEntry {
+                    entries: vec![RecallEntry::new(
                         entry,
-                        relevance: RecallRelevance::Distance(0.12),
-                    }],
+                        RecallRelevance::Distance(0.12),
+                    )],
                     ..RecallCandidates::default()
                 })
             })
