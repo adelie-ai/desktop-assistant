@@ -1,25 +1,29 @@
 //! Pre-prompt recall port (#1100, #1101): the lookup behind the `[Recall]`
 //! block.
 //!
-//! When a user prompt lands, the daemon embeds it once and asks three indexes
-//! that share that embedding space - the knowledge base, this conversation's
-//! scratchpad, and the tag registry - what is near it. The answer travels back
-//! through this port as candidates, and [`crate::recall`] decides which of them
-//! clear the relevance floor and how they render.
+//! When a user prompt lands, the daemon embeds it once and asks the two indexes
+//! that share that embedding space - the knowledge base and this conversation's
+//! scratchpad - what is near it. The answer travels back through this port as
+//! candidates, and [`crate::recall`] decides which of them clear the bar and how
+//! they render.
 //!
-//! ## Why the floor is not applied here
+//! ## Why the bar is not applied here
 //!
 //! The adapter owns the embedding call, the SQL, and the degradation to
-//! full-text when the embedding is unavailable. The core owns the floor, the
-//! caps, and the wording. Splitting it that way keeps every rule the block's
-//! honesty rests on - what counts as relevant, how many lines fit, what the
-//! "did not fit" count may claim - testable without a database.
+//! full-text when the embedding is unavailable. The core owns the bar, the caps,
+//! and the wording. Splitting it that way keeps every rule the block's honesty
+//! rests on - what counts as relevant, how many lines fit, what the "did not
+//! fit" count may claim - testable without a database.
 //!
 //! ## What the adapter owes this port
 //!
 //! - **Best match first.** Both lists arrive ordered, nearest first. The core
 //!   never reorders them: it cannot compare a cosine distance with a lexical
 //!   match, and it does not have to, because one lookup uses one mode.
+//! - **Each source's own dispersion, where it can measure one.** A distance
+//!   means nothing until it is read against the spread of the source it came
+//!   from - see [`RecallDispersion`]. The adapter measures that over the whole
+//!   source, not over the rows it returned, and answers `None` when it cannot.
 //! - **One user, and one conversation's pad.** Row-level security is a backstop
 //!   the table owner bypasses, so every query behind this port carries its own
 //!   `WHERE user_id` predicate. The scratchpad arm carries a `conversation_id`
@@ -67,6 +71,113 @@ impl RecallRelevance {
             Self::Distance(distance) => distance <= max_distance,
             Self::LexicalMatch => true,
         }
+    }
+
+    /// Whether this candidate stands out from its source far enough to show.
+    ///
+    /// `bar` is dimensionless: how many median absolute deviations below the
+    /// source's own median a candidate must sit - see
+    /// [`RecallDispersion::deviations_below_median`]. A [`Self::LexicalMatch`]
+    /// always clears, because the database applied its own floor before the row
+    /// travelled and there is no distance to read.
+    pub fn clears_bar(self, dispersion: RecallDispersion, bar: f64) -> bool {
+        match self {
+            Self::Distance(distance) => dispersion.deviations_below_median(distance) >= bar,
+            Self::LexicalMatch => true,
+        }
+    }
+}
+
+/// How spread out one source's distances are, so a distance from that source
+/// can be read in the source's own terms.
+///
+/// A cosine distance carries no meaning on its own. What counts as near depends
+/// on the embedding model, on how much text a row holds, and on how wide the
+/// subject matter of the store is, so a number fitted to one deployment says
+/// nothing about the next one. What does carry is the shape of the
+/// distribution: over any store, a query with a real cue produces a few rows far
+/// below the store's usual distance, and a query with no cue produces none.
+///
+/// The median and the median absolute deviation state that shape. Both are
+/// robust to the near tail - which is exactly the part a cued prompt moves - so
+/// they describe the store's ordinary geometry rather than the answer to one
+/// query.
+///
+/// **Measured over the source, never over the candidates.** A lookup reads only
+/// the nearest rows, so their spread is the near tail's and not the source's,
+/// and normalizing inside it inflates every score.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RecallDispersion {
+    /// The distance a middling row of this source sits at.
+    median: f64,
+    /// The median absolute deviation of those distances: the unit the bar is
+    /// stated in.
+    deviation: f64,
+}
+
+/// How many rows a dispersion must be measured over before it is used.
+///
+/// A median absolute deviation over a handful of rows is noise, and a noisy
+/// unit makes a dimensionless bar meaningless. A source below this count has no
+/// measurable geometry yet, and the caller falls back to a stated estimate.
+pub const RECALL_DISPERSION_MIN_ROWS: usize = 20;
+
+/// The narrowest spread a measurement may claim, as a fraction of its own
+/// median.
+///
+/// A degenerate store - one where most rows carry near-identical text - reports
+/// a deviation close to zero, and dividing by it puts every row a shade nearer
+/// than the median far past any bar. That would render half the store on every
+/// prompt. The rule is a ratio rather than a distance so that it carries across
+/// models the same way the bar does.
+pub const RECALL_DISPERSION_MIN_RELATIVE_SPREAD: f64 = 0.02;
+
+impl RecallDispersion {
+    /// A stated estimate, for a source whose own geometry is not known yet.
+    ///
+    /// Const so a fallback can be a constant. Nothing is checked here, because
+    /// the values are the caller's own and not a measurement - see
+    /// [`Self::measured`] for the checked path.
+    pub const fn assumed(median: f64, deviation: f64) -> Self {
+        Self { median, deviation }
+    }
+
+    /// A measurement of one source, or `None` where it cannot be trusted.
+    ///
+    /// `rows` is how many rows the two statistics were measured over. The
+    /// answer is `None` for a sample under [`RECALL_DISPERSION_MIN_ROWS`], for a
+    /// value that is not finite, and for a spread under
+    /// [`RECALL_DISPERSION_MIN_RELATIVE_SPREAD`] of the median. Every one of
+    /// those leaves the caller on its stated estimate, which is the quiet
+    /// answer rather than the loud one.
+    pub fn measured(median: f64, deviation: f64, rows: usize) -> Option<Self> {
+        if rows < RECALL_DISPERSION_MIN_ROWS
+            || !median.is_finite()
+            || !deviation.is_finite()
+            || median <= 0.0
+            || deviation < median * RECALL_DISPERSION_MIN_RELATIVE_SPREAD
+        {
+            return None;
+        }
+        Some(Self::assumed(median, deviation))
+    }
+
+    /// How far below this source's median `distance` sits, counted in the
+    /// source's own median absolute deviations.
+    ///
+    /// Higher is nearer. The quantity is dimensionless, so one bar reads the
+    /// same against any source and any embedding model.
+    pub fn deviations_below_median(self, distance: f64) -> f64 {
+        (self.median - distance) / self.deviation
+    }
+
+    /// The distance a candidate that stands `deviations` out of this source
+    /// sits at: the inverse of [`Self::deviations_below_median`].
+    ///
+    /// It states a position in one source's geometry as the distance that
+    /// source would report, so a fixed set of positions describes any source.
+    pub fn distance_at(self, deviations: f64) -> f64 {
+        self.median - deviations * self.deviation
     }
 }
 
@@ -132,17 +243,24 @@ pub struct RecallRequest {
     pub tag_limit: usize,
 }
 
-/// What one recall lookup found, each list nearest-first.
+/// What one recall lookup found, each list nearest-first, and how spread out
+/// the source each list came from is.
 ///
-/// Empty lists are an ordinary answer: a prompt with nothing near it is the
-/// case the relevance floor exists to keep quiet. So is one arm empty and the
-/// others full - an arm that could not answer contributes nothing and the rest
-/// of the block still renders.
+/// Empty lists are an ordinary answer: a prompt with nothing near it is the case
+/// the bar exists to keep quiet. So is one arm empty and the others full - an
+/// arm that could not answer contributes nothing and the rest of the block still
+/// renders.
 #[derive(Debug, Clone, Default)]
 pub struct RecallCandidates {
     pub entries: Vec<RecallEntry>,
     pub notes: Vec<RecallNote>,
     pub tags: Vec<RecallTag>,
+    /// The knowledge source's own dispersion, measured over the whole source.
+    /// `None` where the adapter could not measure one, which leaves the block on
+    /// its stated estimate.
+    pub entry_dispersion: Option<RecallDispersion>,
+    /// The scratchpad source's own dispersion, on the same terms.
+    pub note_dispersion: Option<RecallDispersion>,
 }
 
 /// Boxed async closure that runs one recall lookup.
@@ -161,21 +279,95 @@ pub type RecallSearchFn = Arc<
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_distance_at_the_floor_still_clears_it() {
-        // The floor is a ceiling on distance, and the boundary belongs to the
-        // side that shows the entry: a hit exactly at the tuned value is the
-        // weakest one the tuning meant to keep.
-        assert!(RecallRelevance::Distance(0.45).clears_floor(0.45));
-        assert!(RecallRelevance::Distance(0.44).clears_floor(0.45));
-        assert!(!RecallRelevance::Distance(0.46).clears_floor(0.45));
+    /// A source whose middling row sits at 0.80 and whose distances vary by
+    /// 0.05. One deviation is then 0.05 of cosine distance.
+    fn a_source() -> RecallDispersion {
+        RecallDispersion::assumed(0.80, 0.05)
     }
 
     #[test]
-    fn a_lexical_match_clears_any_floor() {
+    fn a_candidate_at_the_bar_still_clears_it() {
+        // The bar is a floor on how far a candidate stands out, and the
+        // boundary belongs to the side that shows the entry: a candidate
+        // exactly at the bar is the weakest one the bar meant to keep.
+        let source = a_source();
+        assert!(RecallRelevance::Distance(0.50).clears_bar(source, 6.0));
+        assert!(RecallRelevance::Distance(0.49).clears_bar(source, 6.0));
+        assert!(!RecallRelevance::Distance(0.51).clears_bar(source, 6.0));
+    }
+
+    #[test]
+    fn the_same_distance_reads_differently_against_two_sources() {
+        // The whole point of the unit. 0.50 is six deviations out of a source
+        // whose rows vary by 0.05, and one deviation out of a source whose rows
+        // vary by 0.30 - so it is exceptional in the first and ordinary in the
+        // second, and no distance decides that on its own.
+        let tight = RecallDispersion::assumed(0.80, 0.05);
+        let loose = RecallDispersion::assumed(0.80, 0.30);
+
+        assert!(RecallRelevance::Distance(0.50).clears_bar(tight, 6.0));
+        assert!(!RecallRelevance::Distance(0.50).clears_bar(loose, 6.0));
+    }
+
+    #[test]
+    fn a_lexical_match_clears_any_bar() {
         // Full-text match is binary. A row that did not match is never
         // returned, so there is no distance to compare and nothing to drop.
-        assert!(RecallRelevance::LexicalMatch.clears_floor(0.0));
-        assert!(RecallRelevance::LexicalMatch.clears_floor(2.0));
+        assert!(RecallRelevance::LexicalMatch.clears_bar(a_source(), 0.0));
+        assert!(RecallRelevance::LexicalMatch.clears_bar(a_source(), 1_000.0));
+    }
+
+    #[test]
+    fn a_dispersion_measured_over_too_few_rows_is_refused() {
+        // A median absolute deviation over a handful of rows is noise, and a
+        // noisy unit makes the bar meaningless.
+        assert_eq!(
+            RecallDispersion::measured(0.80, 0.05, RECALL_DISPERSION_MIN_ROWS - 1),
+            None
+        );
+        assert_eq!(
+            RecallDispersion::measured(0.80, 0.05, RECALL_DISPERSION_MIN_ROWS),
+            Some(RecallDispersion::assumed(0.80, 0.05))
+        );
+    }
+
+    #[test]
+    fn a_degenerate_spread_is_refused_rather_than_divided_by() {
+        // A store of near-identical rows reports almost no spread, and dividing
+        // by it would put every row a shade nearer than the median past any
+        // bar - which renders half the store on every prompt.
+        let rows = RECALL_DISPERSION_MIN_ROWS;
+        assert_eq!(RecallDispersion::measured(0.80, 0.0, rows), None);
+        assert_eq!(
+            RecallDispersion::measured(
+                0.80,
+                0.80 * RECALL_DISPERSION_MIN_RELATIVE_SPREAD / 2.0,
+                rows
+            ),
+            None
+        );
+        assert!(
+            RecallDispersion::measured(0.80, 0.80 * RECALL_DISPERSION_MIN_RELATIVE_SPREAD, rows)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_measurement_that_is_not_a_number_is_refused() {
+        let rows = RECALL_DISPERSION_MIN_ROWS;
+        assert_eq!(RecallDispersion::measured(f64::NAN, 0.05, rows), None);
+        assert_eq!(RecallDispersion::measured(0.80, f64::NAN, rows), None);
+        assert_eq!(RecallDispersion::measured(f64::INFINITY, 0.05, rows), None);
+        assert_eq!(RecallDispersion::measured(0.0, 0.05, rows), None);
+    }
+
+    #[test]
+    fn the_score_counts_deviations_below_the_median() {
+        let source = a_source();
+        assert!((source.deviations_below_median(0.80) - 0.0).abs() < 1e-9);
+        assert!((source.deviations_below_median(0.55) - 5.0).abs() < 1e-9);
+        // A row further out than the median scores negative, which no bar
+        // admits.
+        assert!(source.deviations_below_median(0.90) < 0.0);
     }
 }
