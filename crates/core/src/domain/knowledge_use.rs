@@ -38,13 +38,18 @@
 //! streaming approximation over the tail. It is bounded per entry and it loses
 //! nothing the score reads.
 //!
-//! ## The score is a substrate figure
+//! ## One figure, read two ways
 //!
-//! [`KnowledgeUseRecord::usefulness`] states what the log knows, on one scale.
-//! It does not decide what is retrieved: no ranking path reads it yet. The
-//! weights it takes are [`UseScoreWeights`], and their defaults are declared
-//! starting points rather than measured values - which is the whole point of
-//! the log, because a deployment that keeps one can measure its own.
+//! [`KnowledgeUseRecord::use_sum`] states what the log knows, on one scale.
+//! [`KnowledgeUseRecord::usefulness`] is its logarithm, floored, which is the
+//! figure to report or to compare between entries; retrieval reads the sum
+//! itself, because it joins it with a term of its own before either is
+//! compressed - see [`crate::domain::activation`], which is what ranks the
+//! `[Recall]` block.
+//!
+//! The weights the sum takes are [`UseScoreWeights`], and their defaults are
+//! declared starting points rather than measured values - which is the whole
+//! point of the log, because a deployment that keeps one can measure its own.
 
 use chrono::{DateTime, Utc};
 
@@ -238,7 +243,12 @@ impl Default for UseScoreWeights {
 
 impl UseScoreWeights {
     /// The decay exponent, held inside the range the formula is defined over.
-    fn safe_decay(&self) -> f64 {
+    ///
+    /// Public because anything reading [`KnowledgeUseRecord::use_sum`] has to
+    /// use the same exponent the sum was computed with - see
+    /// [`crate::domain::activation::ActivationWeights::reference_sum`], which
+    /// states a reference sum at this exponent.
+    pub fn safe_decay(&self) -> f64 {
         self.decay.clamp(0.01, 0.99)
     }
 
@@ -339,6 +349,20 @@ impl KnowledgeUseRecord {
     /// window it reduces to `n / (1 - d) * T^-d`, whose logarithm is the
     /// familiar `ln(n / (1 - d)) - d * ln(T)`.
     pub fn usefulness(&self, now: DateTime<Utc>, weights: &UseScoreWeights) -> f64 {
+        self.use_sum(now, weights).max(MIN_ACTIVATION_SUM).ln()
+    }
+
+    /// The base-level sum itself: `S` in the formula [`Self::usefulness`]
+    /// documents, before any logarithm.
+    ///
+    /// The sum rather than its logarithm, because the retrieval score composes
+    /// it with a term of its own and the two have to be joined before either is
+    /// compressed - see [`crate::domain::activation`].
+    ///
+    /// It is zero for an entry nothing has used and negative for one whose only
+    /// record is a standing negative mark; both are real states and neither is
+    /// floored here, so a caller can tell them apart.
+    pub fn use_sum(&self, now: DateTime<Utc>, weights: &UseScoreWeights) -> f64 {
         let d = weights.safe_decay();
 
         let window: Vec<f64> = self
@@ -359,7 +383,7 @@ impl KnowledgeUseRecord {
             })
             .sum();
 
-        (recent + tail + marks).max(MIN_ACTIVATION_SUM).ln()
+        recent + tail + marks
     }
 
     /// The approximated contribution of the uses that fell out of the recent

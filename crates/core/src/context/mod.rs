@@ -4104,6 +4104,7 @@ mod tests {
         crate::ports::recall::RecallEntry {
             entry,
             relevance: crate::ports::recall::RecallRelevance::Distance(0.10),
+            use_record: None,
         }
     }
 
@@ -4137,6 +4138,7 @@ mod tests {
             candidates,
             crate::recall::RECALL_ENTRY_SCAN_LIMIT,
             crate::recall::RECALL_NOTE_SCAN_LIMIT,
+            chrono::Utc::now(),
         )
         .already_in_view(indexed_keys, planned_keys, &[])
     }

@@ -17,9 +17,17 @@
 //!
 //! ## What the adapter owes this port
 //!
-//! - **Best match first.** Both lists arrive ordered, nearest first. The core
-//!   never reorders them: it cannot compare a cosine distance with a lexical
-//!   match, and it does not have to, because one lookup uses one mode.
+//! - **Best match first.** Both lists arrive ordered, nearest first. That order
+//!   is what the bar rests on - it drops a suffix only because a nearer row is
+//!   never further down the list - and it is what a list of lexical matches is
+//!   ranked by, because such a row carries no distance to score. The core
+//!   reorders a list of measured candidates by activation once the bar has
+//!   admitted them ([`crate::domain::activation`]), and never mixes the two
+//!   kinds, because one lookup uses one mode.
+//! - **What the use log knows, where it can be read.** A measured candidate
+//!   carries its [`RecallEntry::use_record`], which is the reinforcement half of
+//!   its activation. An adapter that cannot read the log answers `None` and the
+//!   entry ranks on its semantic signal alone.
 //! - **Each source's own dispersion, where it can measure one.** A distance
 //!   means nothing until it is read against the spread of the source it came
 //!   from - see [`RecallDispersion`]. The adapter measures that over the whole
@@ -38,6 +46,7 @@ use std::sync::Arc;
 
 use crate::CoreError;
 use crate::domain::KnowledgeEntry;
+use crate::domain::knowledge_use::KnowledgeUseRecord;
 
 /// How near a candidate is to the prompt, and in which sense.
 ///
@@ -56,6 +65,23 @@ pub enum RecallRelevance {
     ///
     /// This is what the arms degrade to when the embedding backend is
     /// unreachable or too slow (the precedent is #195).
+    ///
+    /// **It carries no semantic signal, so it is not ranked by activation**
+    /// (#1123). There is no distance to read against the source's spread, so
+    /// there is no dimensionless term for an activation score to add to. The
+    /// two alternatives are both worse than leaving it alone:
+    ///
+    /// - Scoring it on the use log alone would order the block by what has been
+    ///   opened most, discarding how well each row matched. The database
+    ///   already ranked these rows by `ts_rank_cd`, which is a statement about
+    ///   the match, and throwing that away would make an outage worse rather
+    ///   than merely different.
+    /// - Standing in a fixed semantic value for every row would say the rows are
+    ///   equally good, which is the same loss written differently.
+    ///
+    /// So a lexical candidate keeps the order the database gave it. One lookup
+    /// uses one mode, so a lexical candidate and a measured one are never in the
+    /// same list and no mixed comparison arises - see the module header.
     LexicalMatch,
 }
 
@@ -71,6 +97,20 @@ impl RecallRelevance {
         match self {
             Self::Distance(distance) => dispersion.deviations_below_median(distance) >= bar,
             Self::LexicalMatch => true,
+        }
+    }
+
+    /// The dimensionless semantic term an activation score adds
+    /// ([`crate::domain::activation`]), or `None` where this candidate has
+    /// none.
+    ///
+    /// The same quantity [`Self::clears_bar`] compares, answered rather than
+    /// tested, so the bar and the score read one number. `None` for a
+    /// [`Self::LexicalMatch`], whose documentation says what follows from it.
+    pub fn semantic_signal(self, dispersion: RecallDispersion) -> Option<f64> {
+        match self {
+            Self::Distance(distance) => Some(dispersion.deviations_below_median(distance)),
+            Self::LexicalMatch => None,
         }
     }
 }
@@ -177,6 +217,34 @@ impl RecallDispersion {
 pub struct RecallEntry {
     pub entry: KnowledgeEntry,
     pub relevance: RecallRelevance,
+    /// What the use log knows about this entry (#698), and the reinforcement
+    /// half of its activation score (#1123).
+    ///
+    /// `None` is an ordinary answer with two causes the core does not have to
+    /// tell apart: the log has never seen the entry, or the adapter could not
+    /// read the log this turn. Either way the entry is ranked on its semantic
+    /// signal alone, which is how every entry ranked before the log existed.
+    pub use_record: Option<KnowledgeUseRecord>,
+}
+
+impl RecallEntry {
+    /// A candidate the use log has nothing to say about.
+    ///
+    /// The degraded read and the cold store both land here, and so does every
+    /// test whose subject is not the use log.
+    pub fn new(entry: KnowledgeEntry, relevance: RecallRelevance) -> Self {
+        Self {
+            entry,
+            relevance,
+            use_record: None,
+        }
+    }
+
+    /// The same candidate, carrying what the log knows about it.
+    pub fn with_use_record(mut self, record: Option<KnowledgeUseRecord>) -> Self {
+        self.use_record = record;
+        self
+    }
 }
 
 /// One scratchpad note offered as a recall candidate (#1101).

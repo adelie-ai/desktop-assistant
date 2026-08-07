@@ -1,3 +1,4 @@
+pub mod activation;
 mod conversation;
 pub mod knowledge;
 pub mod knowledge_use;

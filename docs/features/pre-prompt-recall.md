@@ -19,10 +19,10 @@ it matters.
 [Recall] Memory that may relate to what was just asked. It may not fit; ignore what does not. Each line is one entry: its id, its tags, and one line of what it says - not the entry itself. Look one up before you rely on it.
 - kb-1a2b [preference, ui] Prefers dark themes in every editor
 - kb-9f31 [infra, deploy] The deploy target is the lab cluster
-...and 17 more entries matched less closely.
+...and 17 more entries were also relevant.
 Notes on this conversation's scratchpad. Each line is one note: its key, then the start of what it says - not the whole note.
 - deploy-window: Fridays after 18:00, never before
-...and 2 more notes matched less closely.
+...and 2 more notes were also relevant.
 Tags the entries above carry: infra, deploy, ui, preference
 ```
 
@@ -191,7 +191,7 @@ is rendered there, after that decision. On a short turn where the index stays
 silent, no key is dropped for it - which is the case the arm exists for. The two
 `[Pinned]` rules apply on every turn, because that block is ungated.
 
-A dropped candidate is not counted in the "matched less closely" line either.
+A dropped candidate is not counted in the "were also relevant" line either.
 That line promises the model something it has not been given.
 
 ## Nothing stamped as external content
@@ -233,6 +233,94 @@ The width is then an output rather than an input. A prompt with no cue clears
 nothing, a weak cue clears a line or two, and a strong cue clears a dozen. The
 block is wide exactly when there is something to be wide about, and the
 configured width is a safety cap on the worst case rather than the mechanism.
+
+**One activation score decides the order.** The bar says which candidates are
+offered; activation says in what order, and it is one function rather than a
+blend of multipliers:
+
+```text
+A_i = semantic + reinforcement
+```
+
+`semantic` is the same dimensionless deviation count the bar reads - never a raw
+distance, so a source added later joins on the same scale without refitting
+anything. `reinforcement` is what the use log knows
+(`docs/features/knowledge-use-log.md`), read as
+`use_lift * ln(1 + S / S_ref)` and carrying `S`'s sign, where `S` is the ACT-R
+base-level sum over the entry's opens and marks and `S_ref` is the sum one use a
+day old produces.
+
+**Dividing by a reference use is what makes the term dimensionless**, and it is
+the same property the semantic half gets from reading a distance against its
+source's own spread. Every term of a base-level sum is an age raised to a
+negative power, so the whole sum scales with whatever unit the ages are counted
+in - the same history is about three hundred times larger stated in days than in
+seconds. Adding one straight to a deviation count would let that choice decide
+how much the use log is worth. The ratio cancels it, and leaves one number to
+argue about: `use_lift`.
+
+Four consequences:
+
+- **An entry nothing has used contributes nothing**, so a store with no history
+  renders exactly the block it rendered before this existed. The sort is stable,
+  so distance breaks every tie.
+- **One use a day old is worth `use_lift * ln 2`**, which at the shipped
+  `use_lift` of 0.5 is about a third of a deviation - enough to settle a
+  near-tie, since adjacent rows of a real store sit a few tenths apart.
+- **Doubling the accumulated sum buys at most `use_lift * ln 2`**, however large
+  that sum already is. That is the cap the use log asks for, as a property of
+  the function rather than a clamp: it is what stops the retrieve-mark-retrieve
+  loop compounding. It is a statement about the sum and not about the number of
+  uses - one more use raises the sum by over a factor of two when it is far more
+  recent than everything before it, and that is recency, which this score is
+  meant to carry.
+- **The whole term stays under three deviations** over any history a store
+  produces, because it is a logarithm. That is a bound and nothing more: history
+  cannot run away with the ranking, and a lead wider than three deviations cannot
+  be closed by any history at all.
+
+It does not follow that the best semantic match always keeps the top line, and
+it is worth being exact about when it does not. The bar is 6.8 by construction,
+so the weakest candidate in any block sits there, and the measured prompts put a
+real hit between 7.3 and 11.4 deviations. The best match therefore leads the bar
+by anywhere from half a deviation to 4.6, and only the wide end of that range is
+out of reach of a large history. Ten opens inside the last half hour are worth
+about two and a half deviations, which is enough to lead a best match sitting at
+7.3.
+
+**The narrow end is the design working.** A best match half a deviation above the
+bar means the prompt named nothing the store really holds - and a weakly cued
+prompt is exactly the condition under which what has been used recently should
+lead. An entry the assistant has been reading all morning taking the top line on
+a prompt that brushes it is the behaviour this score was chosen for, and it is
+the reason for base-level activation rather than a tiebreak bolted onto distance.
+When the prompt does name something the store holds, the semantic term is several
+deviations clear and the ceiling keeps that line where it belongs. The use log's
+caution is about the second case, and the second case is what the ceiling
+protects.
+- **A standing negative mark subtracts**, so an entry that was opened and found
+  wrong ends below one nobody has ever opened.
+
+The score is `crates/core/src/domain/activation.rs`. Its weights are a struct
+rather than constants, so a deployment that has kept a use log can fit its own.
+
+**A lexical match is not ranked by activation.** It carries no distance, so it
+has no semantic term - and scoring it on the use log alone would order a
+degraded block by what has been opened most and throw away how well each row
+matched. That is the embedding backend being unreachable, so it is the worst
+moment to make the ranking worse. Such a candidate keeps the order the database
+gave it, and one lookup uses one mode, so the two kinds are never in one list.
+
+**Reading the use log costs the ranking at most.** The ids exist only once the
+scan has answered, so it is one batched read after it, bounded at half a second.
+A read that fails or overruns leaves every candidate on its semantic signal
+alone - which is how they all ranked before the log existed - and says so once in
+the journal. It states the same half second to the database as its own
+`statement_timeout`, for the reason the recall scan does: giving up here has to
+stop the backend working, or a slow database accumulates abandoned reads at the
+rate turns arrive. One debug line per lookup also states how many of the candidates the
+log had anything to say about, so an operator can tell whether reinforcement is
+deciding anything at all.
 
 **Measured over the source, never over the candidates.** The lookup shows only
 the nearest rows, so their spread is the near tail's and not the store's, and
@@ -334,9 +422,26 @@ Each arm counts its own, and says which. The knowledge lookup reads at most 50
 rows and the scratchpad lookup at most 25 - fewer, because it reads one
 conversation's pad rather than the whole store, so the tail it would be counting
 is short. When a scan fills up *and* every row it read cleared the bar, that
-arm's count is a lower bound and says so: "and 42 or more entries matched less
-closely." When the scan read past the bar, the count is exact and carries no
+arm's count is a lower bound and says so: "and 42 or more entries were also
+relevant." When the scan read past the bar, the count is exact and carries no
 hedge. When nothing was dropped, there is no line.
+
+**The line says "were also relevant", not "matched less closely".** The count has
+always been the number that cleared the bar, and "relevant" is what the bar
+names. Distance decided the *order* as well, until activation ranking landed - so
+an entry that did not fit may now have matched more closely than one that did,
+and the scratchpad arm, which activation does not rank, would be described one
+way and the entry arm another. One wording is true of both, and of a capped scan.
+
+Activation ranking does not touch the count or the hedge, and the reason is worth
+stating because it is easy to assume otherwise. The rule the hedge rests on is
+about **admission**: rows arrive nearest-first, the bar is a test on distance, so
+the rows it admits are a prefix - and a scan that read past the bar therefore
+knows there is nothing better beyond it. Activation reorders that admitted set
+and never changes its membership, so the count of it, and whether that count is
+exact, are the numbers they were. What ranking does change is which admitted rows
+*fit*: on a capped scan the lines are the best of what was read rather than the
+best that exists, which is what the hedge already says.
 
 ## Failure
 
@@ -465,7 +570,20 @@ arm drops the attachments the turn *resolved*, which is a superset of what
 that pins did not fit, so the model is not left believing the fact is absent.
 
 **Cancellation waits on the lookup.** A turn cancelled while the lookup is in
-flight still waits for it, bounded by the ten-second whole-lookup ceiling.
+flight still waits for it, bounded by the ten-second whole-lookup ceiling. The
+use-log read added half a second to what that ceiling has to cover, so the slack
+it keeps for what nothing bounds - pool acquisition above all - is now half a
+second rather than one.
+
+**The use log is read on every turn, including the ones with no cue.** The bar is
+the core's decision and the read is the adapter's, so the adapter cannot know
+that nothing will clear. On a prompt that surfaces nothing, two primary-key
+lookups over at most fifty ids are made and every row is discarded.
+
+**No client can write a person's mark.** The use log has no wire surface, and the
+only mark any code path writes is the model's. So `person_mark`, the largest
+coefficient the score carries, is unreachable today, and a person has no way to
+say "this entry was useful" or to ask why a line is at the top.
 
 **The scratchpad arm scans the whole pad, every turn.** The vector query unnests
 each note's chunks and groups on the row, so no vector index applies and the
@@ -479,12 +597,15 @@ measured.
 | Piece | Path |
 | --- | --- |
 | Floors, caps, and the block text | `crates/core/src/recall.rs` |
+| The activation score | `crates/core/src/domain/activation.rs` |
+| The base-level sum it reads | `KnowledgeUseRecord::use_sum`, `crates/core/src/domain/knowledge_use.rs` |
 | The standing guidance for the block | `crates/core/src/prompts/sections/knowledge_base.txt` |
 | The port the daemon fills | `crates/core/src/ports/recall.rs` |
 | Looked up once per turn | `ConversationHandler::recall_lookup`, `crates/core/src/service.rs` |
 | What the other blocks showed | `planning::listed_scratchpad_keys` and `planning::plan_note_keys` |
 | Rendered on the first round | `surfaced_blocks`, `crates/core/src/context/mod.rs` |
 | Embedding, every query, degradation | `crates/daemon/src/recall.rs` |
+| The bounded use-log read | `recall::use_records`, same file |
 | The knowledge query, and the spread it states | `PgKnowledgeBaseStore::nearest_by_embedding`, `crates/storage/src/knowledge.rs` |
 | Its degraded form | `PgKnowledgeBaseStore::search_text_any_term`, same file |
 | The scratchpad query | `PgScratchpadStore::nearest_by_embedding`, `crates/storage/src/scratchpad.rs` |

@@ -163,15 +163,20 @@ taken up, and counting it as one would let ranking feed itself.
 
 ## The score
 
-`KnowledgeUseRecord::usefulness` states what the log knows, on one scale:
+`KnowledgeUseRecord::use_sum` states what the log knows, on one scale:
 
 ```text
 S = sum over the recent window of  age^-d
   + the tail approximation over every older use
   + sum over the marks of  sign * weight * age^-d
-
-score = ln(max(S, MIN_ACTIVATION_SUM))
 ```
+
+Two readings of `S` exist, and they are for different callers.
+`KnowledgeUseRecord::usefulness` answers `ln(max(S, MIN_ACTIVATION_SUM))`, which
+is the figure to report or to compare between entries. Retrieval reads `S`
+itself, because it has to join it with a term of its own before either is
+compressed - see the activation score in
+`docs/features/pre-prompt-recall.md`.
 
 Three properties follow from that shape:
 
@@ -179,15 +184,23 @@ Three properties follow from that shape:
   old use and an old mark both fade.
 - **A negative mark lowers the score.** It subtracts rather than failing to add,
   so an entry that was opened and then found wrong ends below one never opened.
-- **No rich-get-richer.** The logarithm means doubling the uses adds a constant.
-  Marks raise ranking, ranking decides retrieval, and retrieval is a
+- **No rich-get-richer.** The logarithm means doubling the accumulated sum adds
+  a constant. Marks raise ranking, ranking decides retrieval, and retrieval is a
   precondition for being marked - so the growth has to be sub-linear or that
-  loop compounds.
+  loop compounds. The bound is on the sum, not on the count of events: one use
+  far more recent than everything before it more than doubles the sum, and the
+  score follows, which is recency rather than the loop.
 
 The coefficients live in `UseScoreWeights`, and their defaults are declared
 starting points rather than measured values. They are a struct rather than
 constants exactly so that a deployment which has kept a use log can fit its own
 and pass them in.
+
+**Retrieval reads this.** The `[Recall]` block ranks the entries the bar admitted
+by an activation score whose reinforcement half is `S` - so an entry the model
+keeps opening rises above a slightly nearer one nothing has ever taken up. What
+that score is, how the two halves are joined, and what happens when this log
+cannot be read are in `docs/features/pre-prompt-recall.md`.
 
 ## Multi-tenancy
 

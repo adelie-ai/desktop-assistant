@@ -31,6 +31,11 @@
 //!   candidate under the bar is dropped rather than padded out to fill the
 //!   budget, so a prompt with no cue produces no block at all, and a prompt with
 //!   a strong cue produces an index.
+//! - **One activation score decides the order.** The bar says which candidates
+//!   are offered; [`crate::domain::activation`] says in what order, over the
+//!   semantic signal the bar already read and what the use log knows about each
+//!   entry. An entry nothing has used contributes nothing of its own, so a store
+//!   with no history renders the block its distances alone would have rendered.
 //! - **A line budget, derived from a token budget.**
 //!   [`RECALL_BLOCK_TOKEN_BUDGET`] pays for [`BUDGETED_MAX_RECALL_ENTRIES`]
 //!   entry lines, [`MAX_RECALL_NOTES`] note lines and [`MAX_RECALL_TAGS`] tag
@@ -61,6 +66,7 @@
 
 use std::sync::OnceLock;
 
+use crate::domain::activation::{ActivationWeights, activation};
 use crate::ports::recall::{RecallCandidates, RecallDispersion, RecallEntry, RecallNote};
 use crate::ports::scratchpad::NOTE_KEY_MAX_CHARS;
 
@@ -122,10 +128,10 @@ const RECALL_NOTE_LINE_MAX_BYTES: usize = 2 + NOTE_KEY_MAX_CHARS + 2 + RECALL_NO
 ///
 /// The newline, `"...and "` (7), the digits of any `usize` (20), the hedge
 /// `" or more"` (8), a space, the longer of the two nouns - `"entries"` (7) -
-/// and `" matched less closely."` (22). Every part is ASCII, so the figure is
+/// and `" also matched."` (14). Every part is ASCII, so the figure is
 /// bytes as well as characters. `dropped_line` is held to it by
 /// `the_did_not_fit_line_stays_inside_the_bound_the_budget_assumes`.
-const RECALL_DROPPED_LINE_MAX_BYTES: usize = 1 + 7 + 20 + 8 + 1 + 7 + 22;
+const RECALL_DROPPED_LINE_MAX_BYTES: usize = 1 + 7 + 20 + 8 + 1 + 7 + 14;
 
 /// What the block costs before its first knowledge line, worst case: the
 /// prefix, the header and its entry hint, the entry arm's "did not fit" line,
@@ -252,7 +258,7 @@ pub const MAX_RECALL_TAGS: usize = 5;
 /// How many knowledge rows one lookup reads before it stops counting.
 ///
 /// The block shows [`max_recall_entries`]; it reads this far so that "and N
-/// more matched less closely" is a count rather than a guess. Bounding it costs
+/// more also matched" is a count rather than a guess. Bounding it costs
 /// one `LIMIT` rather than a second query, and a scan that fills up makes the
 /// count report itself as a lower bound.
 pub const RECALL_ENTRY_SCAN_LIMIT: usize = 50;
@@ -380,6 +386,13 @@ pub(crate) struct RecallSurface<'a> {
     /// note is durable and invisible - which is the condition this arm exists
     /// for, not a duplicate to suppress.
     pub planned_keys: &'a [String],
+    /// When the lookup behind these candidates ran.
+    ///
+    /// Activation reads the age of every recorded use against it (#1123), so it
+    /// is the instant the use records were read rather than the instant the
+    /// block renders - the two are a round trip apart, and the record is a
+    /// statement about the first.
+    pub now: chrono::DateTime<chrono::Utc>,
     /// The knowledge entries `[Pinned]` already carries, by id (#1104): a
     /// pinned note may attach one, and the block renders that entry's live
     /// content every turn.
@@ -398,11 +411,13 @@ impl<'a> RecallSurface<'a> {
         candidates: &'a RecallCandidates,
         entry_scan_limit: usize,
         note_scan_limit: usize,
+        now: chrono::DateTime<chrono::Utc>,
     ) -> Self {
         Self {
             candidates,
             entry_scan_limit,
             note_scan_limit,
+            now,
             indexed_keys: &[],
             planned_keys: &[],
             pinned_entry_ids: &[],
@@ -431,10 +446,14 @@ impl<'a> RecallSurface<'a> {
 ///
 /// The arms render in order of how far the material is from the turn: the
 /// durable knowledge base, then this conversation's own pad, then the
-/// vocabulary those entries carry. Every candidate list is taken in the order it
-/// arrives - nearest first - and is never reordered: a cosine distance and a
-/// lexical match are not comparable, and one lookup only ever produces one of
-/// the two.
+/// vocabulary those entries carry.
+///
+/// Every candidate list arrives nearest-first, and the bar reads it in that
+/// order. The knowledge arm is then reordered by activation, over the
+/// candidates the bar admitted and never over the two kinds together - a cosine
+/// distance and a lexical match are not comparable, and one lookup only ever
+/// produces one of them. See [`rank_by_activation`]. The pad arm is not
+/// reordered: no use log records a note.
 pub(crate) fn render_recall(surface: &RecallSurface<'_>) -> Option<RenderedRecall> {
     render_recall_with_width(surface, max_recall_entries())
 }
@@ -480,6 +499,21 @@ fn render_recall_with_width(
     // knows only "at least this many". Any later filter that is not ordered by
     // distance must stay out of this decision, or an exact-sounding count would
     // outrun what the scan actually saw.
+    //
+    // Activation ranking (#1123) sorts the admitted set below, and that is not
+    // an exception to the rule above - it is outside it. The rule is about
+    // *admission*: what decides whether a row is counted at all. Admission is
+    // still `clears_bar` on a distance, over a list that still arrives
+    // nearest-first, so the admitted rows are still a prefix and the count of
+    // them is still exact exactly when the scan read past the bar. Ranking
+    // reorders that set and never changes its membership, so it cannot move the
+    // count or the hedge.
+    //
+    // What ranking does change is which admitted rows fit. A row the scan never
+    // read might have activated above one that renders, so on a capped scan the
+    // lines are the best of what was read rather than the best that exists -
+    // which is what the hedge already says, and why the line below no longer
+    // says the remainder "matched less closely".
     let capped = candidates.entries.len() >= surface.entry_scan_limit
         && above_bar.len() == candidates.entries.len();
 
@@ -504,7 +538,7 @@ fn render_recall_with_width(
     //   and the id is the caller's, so the entry is dropped rather than the
     //   bound relaxed - see #1136 for bounding the id where it is written.
     //
-    // All three drop rather than count, because "matched less closely" promises
+    // All three drop rather than count, because "also matched" promises
     // the reader something it has not already been given.
     let showable: Vec<(&RecallEntry, String)> = above_bar
         .iter()
@@ -515,6 +549,7 @@ fn render_recall_with_width(
             (!line.is_empty()).then_some((*hit, line))
         })
         .collect();
+    let showable = rank_by_activation(showable, entry_dispersion, surface.now);
 
     // The pad is its own source and carries its own spread. A note embeds
     // `"<key> <content>"`, which is terser and more telegraphic than an entry's
@@ -609,6 +644,69 @@ fn render_recall_with_width(
     })
 }
 
+/// Order the admitted entries by activation, best first (#1123).
+///
+/// One score, over the two signals retrieval actually holds: how far the
+/// candidate stands out of its own source, and what the use log knows about it.
+/// [`crate::domain::activation`] states the score and why it has that shape;
+/// what belongs here is what it means for a block.
+///
+/// **Stable, so distance breaks a tie.** Candidates arrive nearest-first, and a
+/// stable sort leaves two of equal activation in that order - which is the right
+/// tie-break and is also what keeps a store with no use history rendering
+/// exactly the block it rendered before this existed.
+///
+/// **A set with no semantic term is left alone.** A
+/// [`RecallRelevance`](crate::ports::recall::RecallRelevance) that
+/// carries no distance carries no term to score, and its own documentation says
+/// what follows: the database ranked those rows and the block keeps that order.
+/// The test is over the whole set rather than per candidate, because a block
+/// half ordered by one rule and half by another is ordered by neither. One
+/// lookup uses one mode, so in practice the set is all of one kind.
+///
+/// **It never decides admission.** The bar did that, above, on distance alone.
+fn rank_by_activation(
+    showable: Vec<(&RecallEntry, String)>,
+    dispersion: RecallDispersion,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<(&RecallEntry, String)> {
+    let weights = ActivationWeights::default();
+    let scored: Vec<Option<f64>> = showable
+        .iter()
+        .map(|(hit, _)| {
+            hit.relevance
+                .semantic_signal(dispersion)
+                .map(|semantic| activation(semantic, hit.use_record.as_ref(), now, &weights))
+        })
+        .collect();
+    let with_signal = scored.iter().filter(|score| score.is_some()).count();
+    if with_signal < scored.len() {
+        // A set of all lexical candidates is the ordinary degraded lookup and
+        // says nothing new. A *mixed* set means an adapter fused two modes into
+        // one list, which no adapter does today and which silently turns this
+        // ranking off - so it is worth a line rather than a shrug.
+        if with_signal > 0 {
+            tracing::debug!(
+                candidates = scored.len(),
+                with_semantic_signal = with_signal,
+                "recall: a mixed candidate set carries no one order, so activation ranking is \
+                 off for this block"
+            );
+        }
+        return showable;
+    }
+    let scores: Vec<f64> = scored.into_iter().flatten().collect();
+
+    let mut ranked: Vec<(f64, (&RecallEntry, String))> = scores.into_iter().zip(showable).collect();
+    // `total_cmp` rather than `partial_cmp`, so the comparator is a total order
+    // and the sort cannot depend on which pair it happened to visit first. A
+    // score that is not a number cannot reach here: the bar compares the same
+    // distance and a comparison against NaN is false, so such a candidate was
+    // never admitted.
+    ranked.sort_by(|left, right| right.0.total_cmp(&left.0));
+    ranked.into_iter().map(|(_, hit)| hit).collect()
+}
+
 /// The tag names the entries this block showed carry, most-carried first, and
 /// at most [`MAX_RECALL_TAGS`] of them.
 ///
@@ -625,7 +723,8 @@ fn render_recall_with_width(
 /// front of the model, so its tags did not light up.
 ///
 /// Ranked by how many of those entries carry each name, and names of equal
-/// weight keep the order the entries arrived in - which is nearest first.
+/// weight keep the order the entries rendered in - which is the block's own
+/// ranking, best first.
 ///
 /// **Entries, not occurrences.** A name an entry happens to list twice describes
 /// one entry, and counting it twice would rank it above a name two entries
@@ -838,6 +937,23 @@ fn note_line(note: &RecallNote) -> Option<String> {
 ///
 /// `noun` names what was dropped, because each arm counts its own and a block
 /// that said "entries" under the pad lines would misreport where the rest is.
+///
+/// **"Also matched", not "matched less closely" (#1123).** Two things the line
+/// must not say, and one it must.
+///
+/// It must not rank. Distance decided the order until activation began ranking
+/// the entry arm, so an entry that did not fit may now have matched more closely
+/// than one that did - and the pad arm, which activation does not rank, would
+/// then be described one way and the entry arm another.
+///
+/// It must not assert. The standing guidance beside this block tells the model
+/// that nothing in it is asserted to be true, current, or relevant, so a line
+/// calling the remainder relevant would contradict the block it closes.
+///
+/// What is left is the fact the count is made of: these rows matched the prompt
+/// closely enough to clear the bar, and there was no room for them. That is true
+/// of both arms, and of a capped scan, where the count is a lower bound over the
+/// rows the scan did read.
 fn dropped_line(dropped: usize, capped: bool, noun: &str) -> Option<String> {
     if dropped == 0 {
         return None;
@@ -847,7 +963,7 @@ fn dropped_line(dropped: usize, capped: bool, noun: &str) -> Option<String> {
     } else {
         format!("{dropped} more")
     };
-    Some(format!("...and {quantity} {noun} matched less closely."))
+    Some(format!("...and {quantity} {noun} also matched."))
 }
 
 #[cfg(test)]
@@ -868,7 +984,55 @@ mod tests {
         RecallEntry {
             entry,
             relevance: RecallRelevance::Distance(distance),
+            use_record: None,
         }
+    }
+
+    /// The instant every test's lookup ran. Fixed, so a use record's age is the
+    /// number the test wrote and not the number the clock happened to give.
+    fn test_now() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-08-07T12:00:00Z")
+            .expect("a fixed clock parses")
+            .with_timezone(&chrono::Utc)
+    }
+
+    /// The same candidate, opened `opens` times, the newest of them
+    /// `seconds_ago` and the rest at one-minute intervals before it.
+    fn opened(hit: RecallEntry, opens: u64, seconds_ago: i64) -> RecallEntry {
+        let now = test_now();
+        let ages: Vec<i64> = (0..opens as i64).map(|i| seconds_ago + i * 60).collect();
+        let record = crate::domain::KnowledgeUseRecord {
+            entry_id: hit.entry.id.clone(),
+            offered_count: opens,
+            opened_count: opens,
+            marked_count: 0,
+            first_seen_at: now
+                - chrono::TimeDelta::seconds(ages.iter().copied().max().unwrap_or(1)),
+            last_offered_at: Some(now - chrono::TimeDelta::seconds(seconds_ago)),
+            recent_uses: ages
+                .iter()
+                .take(crate::domain::RECENT_USE_WINDOW)
+                .map(|a| now - chrono::TimeDelta::seconds(*a))
+                .collect(),
+            marks: Vec::new(),
+        };
+        hit.with_use_record(Some(record))
+    }
+
+    /// A lexical candidate: what both arms degrade to when the embedding
+    /// backend is unreachable (#195).
+    fn lexical(id: &str, summary: &str) -> RecallEntry {
+        RecallEntry {
+            relevance: RecallRelevance::LexicalMatch,
+            ..hit(id, summary, &["topic"], 0.10)
+        }
+    }
+
+    /// The entry ids the block rendered, in the order it rendered them.
+    fn shown_ids(candidates: &RecallCandidates) -> Vec<String> {
+        render_at_full(candidates, DEFAULT_MAX_RECALL_ENTRIES)
+            .map(|rendered| rendered.entry_ids)
+            .unwrap_or_default()
     }
 
     /// A distance that stands `deviations` out of the stated estimate, which is
@@ -938,7 +1102,12 @@ mod tests {
     /// The same, keeping the ids the block reported alongside its text.
     fn render_at_full(candidates: &RecallCandidates, max_entries: usize) -> Option<RenderedRecall> {
         render_recall_with_width(
-            &RecallSurface::new(candidates, RECALL_ENTRY_SCAN_LIMIT, RECALL_NOTE_SCAN_LIMIT),
+            &RecallSurface::new(
+                candidates,
+                RECALL_ENTRY_SCAN_LIMIT,
+                RECALL_NOTE_SCAN_LIMIT,
+                test_now(),
+            ),
             max_entries,
         )
     }
@@ -972,8 +1141,13 @@ mod tests {
         pinned_entry_ids: &[String],
     ) -> Option<RenderedRecall> {
         render_recall_with_width(
-            &RecallSurface::new(candidates, RECALL_ENTRY_SCAN_LIMIT, RECALL_NOTE_SCAN_LIMIT)
-                .already_in_view(indexed_keys, planned_keys, pinned_entry_ids),
+            &RecallSurface::new(
+                candidates,
+                RECALL_ENTRY_SCAN_LIMIT,
+                RECALL_NOTE_SCAN_LIMIT,
+                test_now(),
+            )
+            .already_in_view(indexed_keys, planned_keys, pinned_entry_ids),
             DEFAULT_MAX_RECALL_ENTRIES,
         )
     }
@@ -1455,6 +1629,7 @@ mod tests {
         RecallEntry {
             entry,
             relevance: RecallRelevance::Distance(0.10),
+            use_record: None,
         }
     }
 
@@ -1494,6 +1669,7 @@ mod tests {
             RecallEntry {
                 entry,
                 relevance: RecallRelevance::Distance(0.10),
+                use_record: None,
             }
         };
         RecallCandidates {
@@ -1784,6 +1960,7 @@ mod tests {
             &candidates,
             RECALL_ENTRY_SCAN_LIMIT,
             RECALL_NOTE_SCAN_LIMIT,
+            test_now(),
         ))
         .expect("a block");
 
@@ -1876,6 +2053,7 @@ mod tests {
             entries: vec![RecallEntry {
                 entry,
                 relevance: RecallRelevance::Distance(0.12),
+                use_record: None,
             }],
             ..RecallCandidates::default()
         };
@@ -2102,7 +2280,7 @@ mod tests {
         let block = render(&candidates).expect("a block");
 
         assert!(
-            block.contains("...and 4 more entries matched less closely."),
+            block.contains("...and 4 more entries also matched."),
             "{block}"
         );
     }
@@ -2120,9 +2298,7 @@ mod tests {
 
         let dropped = RECALL_ENTRY_SCAN_LIMIT - DEFAULT_MAX_RECALL_ENTRIES;
         assert!(
-            block.contains(&format!(
-                "...and {dropped} or more entries matched less closely."
-            )),
+            block.contains(&format!("...and {dropped} or more entries also matched.")),
             "a capped count must read as a lower bound: {block}"
         );
     }
@@ -2146,7 +2322,7 @@ mod tests {
         let block = render(&candidates).expect("a block");
 
         assert!(
-            block.contains("...and 3 more entries matched less closely."),
+            block.contains("...and 3 more entries also matched."),
             "{block}"
         );
         assert!(
@@ -2186,8 +2362,249 @@ mod tests {
         let block = render(&candidates).expect("a block");
 
         assert!(
-            block.contains("...and 4 more entries matched less closely."),
+            block.contains("...and 4 more entries also matched."),
             "{block}"
+        );
+    }
+
+    // --- Activation ranking (#1123) -----------------------------------------
+
+    /// Acceptance (#1123): what the use log knows reorders the entries the bar
+    /// admitted. A candidate the model has opened repeatedly outranks a nearer
+    /// one nothing has ever taken up.
+    #[test]
+    fn activation_ranks_the_entries_the_bar_admitted() {
+        let source = seeded_source();
+        let mut entries = vec![
+            hit(
+                "kb-nearest",
+                "a fact nobody reads",
+                &["topic"],
+                source.distance_at(9.0),
+            ),
+            hit(
+                "kb-worked",
+                "a fact the work keeps needing",
+                &["topic"],
+                source.distance_at(8.6),
+            ),
+        ];
+        entries[1] = opened(entries[1].clone(), 20, 60);
+
+        let candidates = RecallCandidates {
+            entries,
+            entry_dispersion: Some(source),
+            ..RecallCandidates::default()
+        };
+
+        assert_eq!(
+            shown_ids(&candidates),
+            vec!["kb-worked".to_string(), "kb-nearest".to_string()],
+            "twenty opens inside the hour must outrank four tenths of a deviation of distance"
+        );
+    }
+
+    /// Acceptance (#1123): a store with no use history renders exactly the block
+    /// it rendered before activation existed - the distances decide, in the
+    /// order they arrived.
+    #[test]
+    fn a_cold_store_renders_the_block_in_the_order_its_distances_gave_it() {
+        let source = seeded_source();
+        let candidates = RecallCandidates {
+            entries: STRONG_CUE
+                .iter()
+                .enumerate()
+                .map(|(i, score)| {
+                    hit(
+                        &format!("kb-c{i}"),
+                        "a stored fact",
+                        &["topic"],
+                        source.distance_at(*score),
+                    )
+                })
+                .collect(),
+            entry_dispersion: Some(source),
+            ..RecallCandidates::default()
+        };
+
+        let expected: Vec<String> = (0..STRONG_CUE.len())
+            .take_while(|i| STRONG_CUE[*i] >= RECALL_BAR)
+            .map(|i| format!("kb-c{i}"))
+            .collect();
+        assert_eq!(shown_ids(&candidates), expected);
+    }
+
+    /// Acceptance (#1123), hazard 2: a lexical lookup keeps the order the
+    /// database gave it. There is no distance to normalize, so there is no
+    /// semantic term, and ranking on the use log alone would order an outage's
+    /// block by what has been opened most and discard how well each row matched.
+    #[test]
+    fn a_lexical_match_keeps_the_order_the_database_gave_it() {
+        let mut entries = vec![
+            lexical("kb-best-match", "the row the query's terms are in"),
+            lexical("kb-second", "a row carrying fewer of them"),
+            lexical("kb-worked", "a row the work keeps needing"),
+        ];
+        // The last one has by far the strongest use history, so a score that
+        // read the log would put it first.
+        entries[2] = opened(entries[2].clone(), 40, 30);
+
+        let candidates = RecallCandidates {
+            entries,
+            ..RecallCandidates::default()
+        };
+
+        assert_eq!(
+            shown_ids(&candidates),
+            vec![
+                "kb-best-match".to_string(),
+                "kb-second".to_string(),
+                "kb-worked".to_string()
+            ],
+            "a degraded lookup must render the database's own ranking, unmoved"
+        );
+    }
+
+    /// Acceptance (#1123), hazard 1: activation reorders the admitted set and
+    /// never changes which entries are in it, so the count of what did not fit
+    /// is the same number it was.
+    #[test]
+    fn activation_does_not_change_which_entries_the_bar_admitted() {
+        let source = seeded_source();
+        let admitted = DEFAULT_MAX_RECALL_ENTRIES + 4;
+        let mut entries: Vec<RecallEntry> = (0..admitted)
+            .map(|i| {
+                hit(
+                    &format!("kb-{i}"),
+                    "a stored fact",
+                    &["topic"],
+                    source.distance_at(RECALL_BAR + 2.0 - (i as f64) * 0.05),
+                )
+            })
+            .collect();
+        // A row well below the bar, with a use history that would lift it far
+        // past the bar if activation decided admission. It must not render.
+        entries.push(opened(
+            hit(
+                "kb-below-the-bar",
+                "an unrelated fact the work keeps needing",
+                &["topic"],
+                source.distance_at(RECALL_BAR - 2.0),
+            ),
+            60,
+            30,
+        ));
+
+        let candidates = RecallCandidates {
+            entries,
+            entry_dispersion: Some(source),
+            ..RecallCandidates::default()
+        };
+        let block = render(&candidates).expect("a block");
+
+        assert!(
+            !block.contains("kb-below-the-bar"),
+            "the bar admits on distance; activation only orders what it admitted: {block}"
+        );
+        assert!(
+            block.contains("...and 4 more entries also matched."),
+            "{block}"
+        );
+    }
+
+    /// Acceptance (#1123), hazard 1: the count is still exact when the scan read
+    /// past the bar, and still a lower bound when it filled with rows that all
+    /// cleared - under activation ranking, and with the ranking scrambling the
+    /// distance order it used to rest on.
+    #[test]
+    fn the_did_not_fit_count_is_still_exact_or_hedged_under_activation_ranking() {
+        let source = seeded_source();
+        // Every entry carries a use history, and the histories run the opposite
+        // way to the distances, so activation reverses the block entirely.
+        let scrambled = |count: usize| -> Vec<RecallEntry> {
+            (0..count)
+                .map(|i| {
+                    let candidate = hit(
+                        &format!("kb-{i}"),
+                        "a stored fact",
+                        &["topic"],
+                        source.distance_at(RECALL_BAR + 2.0 - (i as f64) * 0.02),
+                    );
+                    opened(candidate, 1 + i as u64, 60)
+                })
+                .collect()
+        };
+
+        // The scan filled and every row it read cleared the bar: a lower bound.
+        let filled = RecallCandidates {
+            entries: scrambled(RECALL_ENTRY_SCAN_LIMIT),
+            entry_dispersion: Some(source),
+            ..RecallCandidates::default()
+        };
+        let dropped = RECALL_ENTRY_SCAN_LIMIT - DEFAULT_MAX_RECALL_ENTRIES;
+        let block = render(&filled).expect("a block");
+        assert!(
+            block.contains(&format!("...and {dropped} or more entries also matched.")),
+            "a filled scan is a lower bound however the lines are ordered: {block}"
+        );
+
+        // The scan filled, but its tail fell below the bar. Rows still arrive
+        // nearest-first, so nothing beyond the tail could clear it either.
+        let mut entries = scrambled(DEFAULT_MAX_RECALL_ENTRIES + 3);
+        entries.extend(
+            (0..RECALL_ENTRY_SCAN_LIMIT - entries.len())
+                .map(|i| hit(&format!("kb-far-{i}"), "an unrelated fact", &[], far())),
+        );
+        let read_past_the_bar = RecallCandidates {
+            entries,
+            entry_dispersion: Some(source),
+            ..RecallCandidates::default()
+        };
+        let block = render(&read_past_the_bar).expect("a block");
+        assert!(
+            block.contains("...and 3 more entries also matched."),
+            "{block}"
+        );
+        assert!(
+            !block.contains("or more"),
+            "a scan that read past the bar knows the exact count: {block}"
+        );
+    }
+
+    /// Acceptance (#1123), hazard 1: the line no longer says the remainder
+    /// "matched less closely", because under activation ranking that is not
+    /// true - a dropped entry may have matched more closely than one shown.
+    #[test]
+    fn the_did_not_fit_line_never_claims_the_remainder_matched_less_closely() {
+        let source = seeded_source();
+        let entries: Vec<RecallEntry> = (0..DEFAULT_MAX_RECALL_ENTRIES + 2)
+            .map(|i| {
+                let candidate = hit(
+                    &format!("kb-{i}"),
+                    "a stored fact",
+                    &["topic"],
+                    source.distance_at(RECALL_BAR + 2.0 - (i as f64) * 0.02),
+                );
+                opened(candidate, 1 + i as u64, 60)
+            })
+            .collect();
+        let candidates = RecallCandidates {
+            entries,
+            entry_dispersion: Some(source),
+            ..RecallCandidates::default()
+        };
+
+        let block = render(&candidates).expect("a block");
+        let shown = shown_ids(&candidates);
+
+        assert!(
+            !block.contains("matched less closely"),
+            "the nearest entry did not fit, so that wording would be false: {block}"
+        );
+        assert!(
+            !shown.contains(&"kb-0".to_string()),
+            "precondition: the nearest entry is one of the two that did not fit, so the \
+             remainder is not the far tail: {shown:?}"
         );
     }
 
@@ -2220,10 +2637,12 @@ mod tests {
                 RecallEntry {
                     entry: hostile_id,
                     relevance: RecallRelevance::Distance(0.10),
+                    use_record: None,
                 },
                 RecallEntry {
                     entry: hostile_tag,
                     relevance: RecallRelevance::Distance(0.11),
+                    use_record: None,
                 },
             ],
             ..RecallCandidates::default()
@@ -2269,6 +2688,7 @@ mod tests {
             entries: vec![RecallEntry {
                 entry,
                 relevance: RecallRelevance::Distance(0.10),
+                use_record: None,
             }],
             ..RecallCandidates::default()
         };
@@ -2312,6 +2732,7 @@ mod tests {
                 entries: vec![RecallEntry {
                     entry,
                     relevance: RecallRelevance::Distance(0.10),
+                    use_record: None,
                 }],
                 ..RecallCandidates::default()
             };
@@ -2348,6 +2769,7 @@ mod tests {
             entries: vec![RecallEntry {
                 entry,
                 relevance: RecallRelevance::Distance(0.10),
+                use_record: None,
             }],
             ..RecallCandidates::default()
         };
@@ -2392,6 +2814,7 @@ mod tests {
                 RecallEntry {
                     entry: KnowledgeEntry::new("kb-empty", "   \n\t ", vec![]),
                     relevance: RecallRelevance::Distance(0.10),
+                    use_record: None,
                 },
                 hit("kb-real", "a real fact", &[], 0.11),
             ],
@@ -2415,6 +2838,7 @@ mod tests {
         entries[3] = RecallEntry {
             entry: KnowledgeEntry::new("kb-empty", "", vec![]),
             relevance: RecallRelevance::Distance(0.10),
+            use_record: None,
         };
 
         let candidates = RecallCandidates {
@@ -2521,6 +2945,7 @@ mod tests {
             entries: vec![RecallEntry {
                 entry,
                 relevance: RecallRelevance::Distance(0.10),
+                use_record: None,
             }],
             ..RecallCandidates::default()
         };
@@ -2537,6 +2962,7 @@ mod tests {
             entries: vec![RecallEntry {
                 entry: KnowledgeEntry::new("kb-empty", "", vec![]),
                 relevance: RecallRelevance::Distance(0.10),
+                use_record: None,
             }],
             ..RecallCandidates::default()
         };
@@ -2570,9 +2996,7 @@ mod tests {
 
         let dropped = RECALL_ENTRY_SCAN_LIMIT - 1 - DEFAULT_MAX_RECALL_ENTRIES;
         assert!(
-            block.contains(&format!(
-                "...and {dropped} more entries matched less closely."
-            )),
+            block.contains(&format!("...and {dropped} more entries also matched.")),
             "{block}"
         );
         assert!(!block.contains("or more"), "{block}");
@@ -2589,6 +3013,7 @@ mod tests {
             entries: vec![RecallEntry {
                 entry,
                 relevance: RecallRelevance::LexicalMatch,
+                use_record: None,
             }],
             ..RecallCandidates::default()
         };
@@ -2884,7 +3309,7 @@ mod tests {
         let block = render(&candidates).expect("a block");
 
         assert!(
-            block.contains("...and 3 more notes matched less closely."),
+            block.contains("...and 3 more notes also matched."),
             "{block}"
         );
     }
@@ -2900,9 +3325,7 @@ mod tests {
 
         let dropped = RECALL_NOTE_SCAN_LIMIT - MAX_RECALL_NOTES;
         assert!(
-            block.contains(&format!(
-                "...and {dropped} or more notes matched less closely."
-            )),
+            block.contains(&format!("...and {dropped} or more notes also matched.")),
             "a capped count must read as a lower bound: {block}"
         );
     }
@@ -2938,7 +3361,7 @@ mod tests {
         let block = render(&candidates).expect("a block");
 
         assert!(
-            block.contains("...and 2 more notes matched less closely."),
+            block.contains("...and 2 more notes also matched."),
             "{block}"
         );
     }
@@ -2958,7 +3381,7 @@ mod tests {
         let block = render(&candidates).expect("a block");
 
         assert!(
-            block.contains("or more notes matched"),
+            block.contains("or more notes also matched"),
             "a filled scan reports a lower bound whatever else dropped a row: {block}"
         );
     }
