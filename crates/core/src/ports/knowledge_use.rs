@@ -322,29 +322,38 @@ pub type KnowledgeMarkFn = Arc<
 ///
 /// `what` names the write in the log line. It is a static string so a failing
 /// write is greppable without reading the arguments.
+///
+/// The caller's span crosses the spawn as well. A `tracing` span is task-local
+/// like the user id, so without `in_current_span` the warning below would be
+/// the one line of a turn that carries no correlation id - and it is a line an
+/// operator only reads while looking for a turn.
 pub fn record_in_background<F>(what: &'static str, write: F)
 where
     F: Future<Output = Result<usize, CoreError>> + Send + 'static,
 {
+    use tracing::Instrument;
     let user_id = current_user_id();
-    tokio::spawn(async move {
-        match with_user_id(user_id, write).await {
-            Ok(0) => {}
-            Ok(rows) => tracing::debug!(target: "knowledge_use", what, rows, "use log written"),
-            // A failing write is a fault, not an expected decline: an
-            // unmigrated database, an exhausted pool or a missing grant makes
-            // every write fail, and at debug the daemon would say nothing while
-            // the tables stayed empty. Ranking would then score every entry
-            // alike on the use terms - a ranking that looks like a working one,
-            // which is the failure this log exists to prevent.
-            Err(error) => tracing::warn!(
-                target: "knowledge_use",
-                what,
-                %error,
-                "use log write failed; the read it measured is unaffected"
-            ),
+    tokio::spawn(
+        async move {
+            match with_user_id(user_id, write).await {
+                Ok(0) => {}
+                Ok(rows) => tracing::debug!(target: "knowledge_use", what, rows, "use log written"),
+                // A failing write is a fault, not an expected decline: an
+                // unmigrated database, an exhausted pool or a missing grant makes
+                // every write fail, and at debug the daemon would say nothing while
+                // the tables stayed empty. Ranking would then score every entry
+                // alike on the use terms - a ranking that looks like a working one,
+                // which is the failure this log exists to prevent.
+                Err(error) => tracing::warn!(
+                    target: "knowledge_use",
+                    what,
+                    %error,
+                    "use log write failed; the read it measured is unaffected"
+                ),
+            }
         }
-    });
+        .in_current_span(),
+    );
 }
 
 #[cfg(test)]

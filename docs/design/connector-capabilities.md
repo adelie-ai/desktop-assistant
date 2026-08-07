@@ -129,7 +129,7 @@ preserves current behaviour while adoption proceeds, and it is honest: we have
 not determined the answer.
 
 The same caution applies to the decorators. Every wrapper around `LlmClient` -
-routing, classifying, profiling, retrying - forwards trait methods by hand. A
+routing, classifying, retrying - forwards trait methods by hand. A
 decorator that forgets to forward a capability method answers for the wrong
 client. The routing decorator did exactly that for hosted tool search: it
 reported the static fallback's support rather than the selected connection's,
@@ -222,8 +222,8 @@ carries the namespaced path.
 ### The hazard
 
 Wrappers sit between the service layer and the connector, and they divide into
-two kinds. Five are **decorators** with per-call work of their own: retry,
-profiling, error classification, reasoning substitution, and per-turn routing
+two kinds. Four are **decorators** with per-call work of their own: retry,
+error classification, reasoning substitution, and per-turn routing
 (whose two dispatching modes answer the capability separately, so they count as
 two places, not one). Each must stay in the call path for a namespaced turn,
 exactly as it does for an ordinary one. A decorator that answers the capability
@@ -231,11 +231,10 @@ by handing back its **inner** client's dispatch object is bypassed for that turn
 - so the turns carrying the most tools are the ones that lose retry and per-turn
 routing, and nothing else in the workspace notices.
 
-Two are **transparent forwarders** with no per-call work: the `Arc<T>` blanket
-impl, and the profiling-or-not enum, which only selects an arm. These hand back
-their inner object, because inserting a hop could only be neutral. The
-distinction has to be written down, or the next reader adds ceremony to a
-forwarder and believes it bought something.
+One is a **transparent forwarder** with no per-call work: the `Arc<T>` blanket
+impl. It hands back its inner object, because inserting a hop could only be
+neutral. The distinction has to be written down, or the next reader adds
+ceremony to a forwarder and believes it bought something.
 
 ### The choice
 

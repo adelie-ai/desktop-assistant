@@ -61,7 +61,7 @@ pub struct ConnectionStatus {
 /// Registry of per-connection LLM clients plus their status.
 ///
 /// Built at daemon startup via [`build_registry`]. Clients are stored as
-/// `Arc<dyn LlmClient>` (#44) so dispatch can wrap them in retry/profiling
+/// `Arc<dyn LlmClient>` (#44) so dispatch can wrap them in retry
 /// layers without committing to a concrete connector type. `IndexMap`
 /// preserves declaration order so [`ConnectionRegistry::active_connection`]
 /// is stable.

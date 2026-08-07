@@ -1366,6 +1366,7 @@ dependencies = [
 name = "desktop-assistant-core"
 version = "0.1.0"
 dependencies = [
+ "adelie-telemetry",
  "async-trait",
  "backon",
  "chrono",

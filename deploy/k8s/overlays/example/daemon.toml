@@ -80,10 +80,6 @@ model = "replace-me"
 connection = "default"
 model = "nomic-embed-text"
 
-[profiling]
-enabled = false
-full_content = false
-
 [ws_auth]
 methods = ["password"]
 allowed_origins = []

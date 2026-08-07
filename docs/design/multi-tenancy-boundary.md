@@ -138,7 +138,7 @@ inferring it from a decline.
 ### 6. Operator config and tenant config are different things
 
 `[database]`, `[tls]`, `[ws_auth]`, `[connections]` and their credentials,
-`[backend_tasks]`, and `[profiling]` describe how the service runs. A tenant should
+and `[backend_tasks]` describe how the service runs. A tenant should
 neither set nor see them. These do not become per-user; they become admin-gated.
 
 Preferences - model choice per purpose, personality, speech mode - become per-user

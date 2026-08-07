@@ -42,6 +42,9 @@ use crate::ports::turn_capability::{
     Delivery, TurnCapabilityChange, TurnCapabilityReason, notify_turn_capability_change,
 };
 use crate::ports::turn_interactivity::{TurnInteractivity, current_turn_interactivity};
+use crate::ports::turn_telemetry::{
+    UNSET as TURN_TELEMETRY_UNSET, current_request_id, current_turn_route,
+};
 use crate::sanitize::sanitize_assistant_text;
 use crate::skill_promotion::{self, PromotionMode};
 use crate::tool_provenance::{
@@ -52,10 +55,12 @@ use crate::tools::{
     NoopToolExecutor, categorize_tool_namespaces, summarize_tool_name, summarize_tool_text,
     summarize_tool_value, tool_set_hash,
 };
+use adelie_telemetry::Safe;
 use chrono::{Duration, Local};
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 /// Whether the current task's cancellation token (installed by
 /// [`crate::ports::llm::with_cancellation_token`]) has been tripped. `None`
@@ -419,14 +424,16 @@ async fn generate_conversation_title<L: LlmClient>(initial_prompt: &str, llm: &L
             format!("First message in the conversation: {initial_prompt}"),
         ),
     ];
-    match llm
-        .stream_completion(
+    match crate::telemetry::measured_aux_call(
+        crate::telemetry::LlmPurpose::Title,
+        llm.stream_completion(
             messages,
             &[],
             ReasoningConfig::default(),
             Box::new(|_| true),
-        )
-        .await
+        ),
+    )
+    .await
     {
         Ok(response) => sanitize_generated_title(&response.text),
         Err(e) => {
@@ -1484,7 +1491,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
         let existing = match get(req.name.clone(), Some(owner.as_str().to_string())).await {
             Ok(found) => found,
             Err(e) => {
-                tracing::warn!(skill = %req.name, error = %e, "skill name lookup failed");
+                tracing::warn!(skill = %Safe::name(&req.name), error = %e, "skill name lookup failed");
                 return serde_json::json!({
                     "ok": false,
                     "error": format!(
@@ -1532,7 +1539,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
         };
 
         if let Err(e) = write(skill).await {
-            tracing::warn!(skill = %req.name, error = %e, "failed to record promoted skill");
+            tracing::warn!(skill = %Safe::name(&req.name), error = %e, "failed to record promoted skill");
             return serde_json::json!({
                 "ok": false,
                 "error": format!("could not record the skill: {e}"),
@@ -1540,7 +1547,10 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             .to_string();
         }
         tracing::info!(
-            skill = %req.name,
+            // The name comes from the model's own `promote_plan` argument, and
+            // `validate_skill_name` rejects only the path characters - not a
+            // newline, an escape, or any length.
+            skill = %Safe::name(&req.name),
             mode = if req.mode == PromotionMode::Amend { "amend" } else { "new" },
             steps = plan.working_steps().len(),
             "recorded a self-authored skill, unapproved"
@@ -1956,7 +1966,64 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         conversation_id: &ConversationId,
         prompt: String,
         on_chunk: ChunkCallback,
+        on_status: StatusCallback,
+    ) -> Result<String, CoreError> {
+        // The turn is the root of its own trace, and this is the only place
+        // every turn passes through - a foreground send, a voice turn, an
+        // agent run and a subagent all reach the loop through here. The span
+        // wraps the whole body, so every line the turn writes carries the
+        // correlation ids through span scope rather than by hand.
+        let request_id = current_request_id();
+        let user_id = current_user_id();
+        let span = crate::telemetry::turn_span(
+            &conversation_id.0,
+            request_id.as_deref().unwrap_or(TURN_TELEMETRY_UNSET),
+            user_id.as_str(),
+        );
+        // Reports on drop, so a turn that ends by panicking still writes its
+        // completion line and its measurement. The body fills it in as it runs,
+        // for the same reason the round guard exists: an exit that has to
+        // remember to report is an exit that will not.
+        let mut report = crate::telemetry::TurnGuard::new(span.clone());
+        // Boxed so the turn body lives on the heap rather than inside this
+        // future. A caller composes several task-local scopes around this
+        // call, and each one embeds what it wraps by value, which is the
+        // accounting that overflowed a worker thread's stack in #205/#206.
+        let result =
+            Box::pin(self.run_turn(conversation_id, prompt, on_chunk, on_status, &mut report))
+                .instrument(span)
+                .await;
+
+        // An error the body never classified is read from the result rather
+        // than guessed at: cancellation is the user's own signal, anything
+        // else is a failure the caller sees in place of an answer.
+        if let Err(e) = &result {
+            report.outcome = match e {
+                CoreError::Cancelled => crate::telemetry::TurnOutcome::Cancelled,
+                _ => crate::telemetry::TurnOutcome::Failed,
+            };
+        }
+        result
+    }
+}
+
+impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S, L, T> {
+    /// The turn body, run inside the turn span that
+    /// [`ConversationService::send_prompt`] opens.
+    ///
+    /// Separate from the trait method for one reason: a span covers an `async`
+    /// future only through [`tracing::Instrument`], which needs a future to
+    /// wrap. `report` is how the body tells the caller how many rounds it ran,
+    /// what the turn cost and how it ended, because the body has several exits
+    /// and only one completion line is written.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_turn(
+        &self,
+        conversation_id: &ConversationId,
+        prompt: String,
+        on_chunk: ChunkCallback,
         mut on_status: StatusCallback,
+        report: &mut crate::telemetry::TurnGuard,
     ) -> Result<String, CoreError> {
         // Cooperative cancellation checkpoint (issue #109): bail out
         // before any I/O if the caller has already tripped the token.
@@ -2390,7 +2457,13 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         // The block is gated to the first round in `surfaced_blocks`, and
         // rendered there too, because what it may show depends on what the
         // other blocks of that round already show.
-        let recall = self.recall_lookup(&prompt, conversation_id).await;
+        // The recall lookup is where the turn's one embedding round-trip
+        // happens, so it gets its own span: a slow embedding backend is then
+        // one hop from the turn rather than time the trace cannot account for.
+        let recall = self
+            .recall_lookup(&prompt, conversation_id)
+            .instrument(crate::telemetry::recall_span(&conversation_id.0))
+            .await;
 
         for round in 0..MAX_TOOL_ROUNDS {
             // Between-rounds cancellation checkpoint (issue #109): if the
@@ -2404,6 +2477,14 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 self.persist_abandoned_turn(&conv, turn_start).await;
                 return Err(CoreError::Cancelled);
             }
+
+            // This round is now going to run, so it counts. The guard reports
+            // the round on every exit from here on - answer, cancel, error or
+            // another lap - because the paths that would forget are the ones
+            // worth measuring.
+            report.rounds = round + 1;
+            let mut round_report =
+                crate::telemetry::RoundGuard::new(round + 1, current_turn_route());
 
             // The narration floor is checked here, once per round, and nowhere
             // else. This is the one point in the loop where neither keepalive is
@@ -2693,32 +2774,71 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
             // keep the stall alive on their own; this covers the pre-first-token
             // window. Mirrors the tool-exec keepalive (#584). Cancellation is
             // unaffected: the call still resolves and breaks the loop.
-            let mut llm_call =
-                if use_hosted_search && !namespaces.is_empty() && !hosted_search_demoted {
-                    Box::pin(crate::ports::llm::dispatch_namespaced(
-                        &self.llm,
-                        llm_messages,
-                        &tool_defs,
-                        &namespaces,
-                        reasoning,
-                        filtered_chunk_callback,
-                    ))
-                } else {
-                    self.llm.stream_completion(
-                        llm_messages,
-                        &tool_defs,
-                        reasoning,
-                        filtered_chunk_callback,
-                    )
-                };
-            let response = match loop {
+            let llm_call = if use_hosted_search && !namespaces.is_empty() && !hosted_search_demoted
+            {
+                Box::pin(crate::ports::llm::dispatch_namespaced(
+                    &self.llm,
+                    llm_messages,
+                    &tool_defs,
+                    &namespaces,
+                    reasoning,
+                    filtered_chunk_callback,
+                ))
+            } else {
+                self.llm.stream_completion(
+                    llm_messages,
+                    &tool_defs,
+                    reasoning,
+                    filtered_chunk_callback,
+                )
+            };
+            // The provider call is its own child span of the round, so a slow
+            // provider is one hop from the turn in a trace and one label in a
+            // histogram. `instrument` enters the span only while the call is
+            // being polled, so its reported time is the call's and not the
+            // round's.
+            let route = current_turn_route();
+            let llm_span = crate::telemetry::llm_span(round_report.span(), round + 1, &route);
+            let mut llm_call = llm_call.instrument(llm_span.clone());
+            let llm_started = std::time::Instant::now();
+            let llm_result = loop {
                 tokio::select! {
                     r = &mut llm_call => break r,
                     _ = tokio::time::sleep(SERVER_TOOL_KEEPALIVE_INTERVAL) => {
                         on_status("Thinking...".to_string());
                     }
                 }
-            } {
+            };
+            // Measured before the arms below branch, because two of them leave
+            // the turn and one retries: a measurement written inside an arm
+            // would be missing from whichever arm nobody thought about.
+            crate::telemetry::record_llm_call(llm_started.elapsed(), &route, llm_result.is_ok());
+            llm_span.record("outcome", if llm_result.is_ok() { "ok" } else { "error" });
+            // Both handles are dropped here, deliberately and by name. A span
+            // ends when its last handle drops, and these are locals of the
+            // round body - so left alone they would keep `llm.call` open until
+            // the round ended, and an exported trace would draw the provider
+            // call across every tool the round then ran. The console line's
+            // busy time would still be right, which is what makes it easy to
+            // miss: the two signals would disagree and only the trace is
+            // wrong, in the direction that blames the provider.
+            drop(llm_call);
+            drop(llm_span);
+            match &llm_result {
+                Ok(_) => {}
+                Err(CoreError::Cancelled) => {
+                    round_report.set_outcome(crate::telemetry::RoundOutcome::Cancelled)
+                }
+                Err(_) => round_report.set_outcome(crate::telemetry::RoundOutcome::LlmError),
+            }
+            // Only a call that answered can have reported usage. Setting this
+            // before the call would count an outage, a rejected prompt or a
+            // cancellation as four counts the connector failed to report,
+            // which reads as "this provider does not report tokens".
+            if llm_result.is_ok() {
+                round_report.llm_called();
+            }
+            let response = match llm_result {
                 Ok(r) => r,
                 Err(CoreError::ContextOverflow {
                     prompt_tokens,
@@ -2740,6 +2860,9 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                         max_tokens = ?max_tokens,
                         "context overflow — running recovery ladder"
                     );
+                    // Not measured at this boundary: the ladder's first two
+                    // steps free space without reaching the provider at all,
+                    // and its last step measures itself inside the summariser.
                     let outcome = recover_from_overflow(
                         &mut conv,
                         &mut projection,
@@ -2760,7 +2883,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                             attempt = overflow_retries,
                             prompt_tokens = ?prompt_tokens,
                             max_tokens = ?max_tokens,
-                            provider_detail = %detail,
+                            provider_detail = %Safe::message(&detail),
                             "context overflow — recovery exhausted, ending the turn"
                         );
                         let friendly = user_visible_llm_error_message(&CoreError::Llm(
@@ -2803,6 +2926,15 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 }
             };
 
+            // The tokens were spent whatever the turn does next, so they are
+            // recorded here rather than on the answer path: a round that goes
+            // on to fail a tool, or that the user cancels a moment later, cost
+            // exactly as much as one that succeeded.
+            round_report.set_usage(response.usage.clone());
+            if let Some(usage) = &response.usage {
+                report.tokens.add(usage);
+            }
+
             // Post-stream cancellation check (issue #109): the adapter
             // may have returned a partial response because the chunk
             // callback returned `false` after observing cancellation
@@ -2812,6 +2944,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
             // — the partial text is discarded, the completed tool rounds
             // are saved (#731).
             if is_cancelled() {
+                round_report.set_outcome(crate::telemetry::RoundOutcome::Cancelled);
                 self.persist_abandoned_turn(&conv, turn_start).await;
                 return Err(CoreError::Cancelled);
             }
@@ -2885,6 +3018,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                          falling back to builtin_tool_search"
                     );
                     hosted_search_demoted = true;
+                    round_report.set_outcome(crate::telemetry::RoundOutcome::Retried);
                     // Keep the assistant text so the model has context,
                     // then inject a system nudge to use builtin_tool_search.
                     if !response.text.is_empty() {
@@ -2935,11 +3069,19 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                     }
                 }
                 conv.updated_at = now_timestamp();
+                // Classified before the write, not after: a `?` here would
+                // otherwise leave the round at its unclassified default and
+                // report a storage failure as a cancellation. The turn's own
+                // outcome is corrected from the error by the caller.
+                round_report.set_outcome(crate::telemetry::RoundOutcome::Answered);
+                report.outcome = crate::telemetry::TurnOutcome::Answered;
                 self.store.update(conv).await?;
                 return Ok(visible_text);
             }
 
             // LLM wants to call tools — record the assistant message with tool calls
+            round_report.set_outcome(crate::telemetry::RoundOutcome::ToolsCalled);
+            round_report.set_tools(response.tool_calls.iter().map(|c| c.name.clone()));
             tracing::info!(
                 "LLM requested {} tool call(s) (round {}/{})",
                 response.tool_calls.len(),
@@ -2960,6 +3102,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 // side effects already committed by the tools that ran are
                 // recorded before we go (#731).
                 if is_cancelled() {
+                    round_report.set_outcome(crate::telemetry::RoundOutcome::Cancelled);
                     self.persist_abandoned_turn(&conv, turn_start).await;
                     return Err(CoreError::Cancelled);
                 }
@@ -2977,7 +3120,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                         Ok(v) => v,
                         Err(e) => {
                             tracing::warn!(
-                                tool = %tool_call.name,
+                                tool = %Safe::name(&tool_call.name),
                                 error = %e,
                                 "tool call arguments were not valid JSON"
                             );
@@ -2996,12 +3139,16 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 // user's document, file path or credential in them. INFO
                 // carries the tool name and the size; the arguments go to
                 // DEBUG, beside the tool result that already lives there.
+                //
+                // The name is the one field here the model writes, so it goes
+                // through `Safe`: a newline in it produces what reads as a
+                // second genuine log line, with its own timestamp and level.
                 tracing::info!(
-                    tool = %tool_call.name,
+                    tool = %Safe::name(&tool_call.name),
                     arg_bytes = tool_call.arguments.len(),
                     "executing tool"
                 );
-                tracing::debug!(tool = %tool_call.name, %arguments, "tool arguments");
+                tracing::debug!(tool = %Safe::name(&tool_call.name), %arguments, "tool arguments");
 
                 // Step-planning + compaction control (#240) is handled here in
                 // the loop, not by the tool executor: only the loop owns
@@ -3133,7 +3280,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                     && !allowed.iter().any(|t| t == &tool_call.name)
                 {
                     tracing::warn!(
-                        tool = %tool_call.name,
+                        tool = %Safe::name(&tool_call.name),
                         "tool call rejected: not on the subagent's allowlist"
                     );
                     let rejection = format!(
@@ -3171,7 +3318,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                     turn_provenance.check(&tool_call.name, current_turn_interactivity())
                 {
                     tracing::warn!(
-                        tool = %summarize_tool_name(&tool_call.name),
+                        tool = %Safe::name(&tool_call.name),
                         "tool call refused: this turn ingested externally-controlled content"
                     );
                     notify_tool_event(ToolEvent::Started {
@@ -3213,16 +3360,60 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                     _ => None,
                 };
 
+                // Each dispatch is its own child span of the round, labelled by
+                // where it ran: a client tool crosses a socket to the user's
+                // own machine and a server tool does not, so folding the two
+                // into one series would hide the difference that matters.
+                let tool_runner = if client_exec.is_some() {
+                    crate::telemetry::ToolRunner::Client
+                } else {
+                    crate::telemetry::ToolRunner::Server
+                };
+                // Resolved before the clock starts, so the lookup is not
+                // counted as tool time. Whether the name belongs to a set the daemon controls
+                // rather than to the model. That is the only property the
+                // metric label needs, and it is not the same question as "did
+                // this round offer it".
+                //
+                // `activated_tools` is per turn, so a fleet tool the model
+                // learned about in an earlier turn and calls directly now is
+                // offered by nothing this round - and still executes, because
+                // the executor's routing table outlives the turn. Judging on
+                // the offer alone would file every one of those under
+                // `unknown` and quietly empty that tool's latency series,
+                // which is the axis the bound exists to protect.
+                //
+                // So the executor is asked, but only when the cheap answer
+                // says no: `tool_definition` is an in-memory lookup and the
+                // fallthrough is rare, and it is the daemon's own tool list,
+                // which is what bounds the label. A name the model invented is
+                // in neither set.
+                let known = tool_defs.iter().any(|t| t.name == tool_call.name)
+                    || namespaces
+                        .iter()
+                        .any(|ns| ns.tools.iter().any(|t| t.name == tool_call.name))
+                    || self
+                        .tools
+                        .tool_definition(&tool_call.name)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some();
+                let tool_span =
+                    crate::telemetry::tool_span(round_report.span(), &tool_call.name, tool_runner);
+                let tool_started = std::time::Instant::now();
+
                 // `tool_ok` is tracked alongside the result so the observer can
                 // distinguish a successful call from an error the loop folds
                 // into the tool result (and keeps looping on).
                 let (result, tool_ok) = if let Some(port) = client_exec {
                     match port
                         .execute(&tool_call.id, &tool_call.name, arguments)
+                        .instrument(tool_span.clone())
                         .await
                     {
                         Ok(output) => {
-                            tracing::debug!(tool = %tool_call.name, output = %output, "client tool result");
+                            tracing::debug!(tool = %Safe::name(&tool_call.name), output = %output, "client tool result");
                             (output, true)
                         }
                         // Cancellation while a client tool was suspended (e.g.
@@ -3238,6 +3429,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                                 ok: false,
                                 output: "cancelled".to_string(),
                             });
+                            round_report.set_outcome(crate::telemetry::RoundOutcome::Cancelled);
                             self.persist_abandoned_turn(&conv, turn_start).await;
                             return Err(CoreError::Cancelled);
                         }
@@ -3248,12 +3440,12 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                             // carries which tool and which kind; the message
                             // goes to DEBUG, beside the result above.
                             tracing::warn!(
-                                tool = %tool_call.name,
+                                tool = %Safe::name(&tool_call.name),
                                 error_kind = e.kind(),
                                 "client tool execution failed"
                             );
                             tracing::debug!(
-                                tool = %tool_call.name,
+                                tool = %Safe::name(&tool_call.name),
                                 error = %e,
                                 "client tool failure detail"
                             );
@@ -3276,7 +3468,8 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                             Some(scope) => with_pending_child_scope(scope, scoped).await,
                             None => scoped.await,
                         }
-                    };
+                    }
+                    .instrument(tool_span.clone());
                     // Keepalive during long server-side tool execution (#584): a
                     // tool — or a subagent, which runs as a tool — can execute
                     // silently for longer than the client's 90s stall watchdog,
@@ -3307,7 +3500,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                     // `advance_tool_completion_status`.
                     match outcome {
                         Ok(output) => {
-                            tracing::debug!(tool = %tool_call.name, output = %output, "tool result");
+                            tracing::debug!(tool = %Safe::name(&tool_call.name), output = %output, "tool result");
                             on_status(advance_tool_completion_status(
                                 &mut tool_completion_run,
                                 &tool_call.name,
@@ -3323,12 +3516,12 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                             // "failed to read <path>: permission denied"
                             // arrives here intact.
                             tracing::warn!(
-                                tool = %tool_call.name,
+                                tool = %Safe::name(&tool_call.name),
                                 error_kind = e.kind(),
                                 "tool execution failed"
                             );
                             tracing::debug!(
-                                tool = %tool_call.name,
+                                tool = %Safe::name(&tool_call.name),
                                 error = %e,
                                 "tool failure detail"
                             );
@@ -3341,6 +3534,29 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                         }
                     }
                 };
+                let tool_outcome = if tool_ok {
+                    crate::telemetry::ToolOutcome::Ok
+                } else {
+                    crate::telemetry::ToolOutcome::Error
+                };
+                tool_span.record("outcome", tool_outcome.as_label());
+                crate::telemetry::record_tool_call(
+                    tool_started.elapsed(),
+                    &tool_call.name,
+                    known,
+                    tool_outcome,
+                );
+                // The span ends with the work it measures, not with the loop
+                // body. Left to fall out of scope it would stay open across
+                // `cap_tool_result` below, which on a multi-megabyte payload
+                // takes about as long again as the tool did - so the histogram
+                // would say one number, the exported span would draw another,
+                // and the gap would grow with the payload. The same defect was
+                // found and fixed for `llm.call`; this is its twin.
+                drop(tool_span);
+                if !tool_ok {
+                    round_report.set_outcome(crate::telemetry::RoundOutcome::ToolError);
+                }
 
                 // Cap the result at ingestion (issue #174): a runaway tool can
                 // return a multi-megabyte payload that, stored verbatim, wedges
@@ -3353,7 +3569,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 let stored = match cap_tool_result(&result, self.max_tool_result_bytes) {
                     Some(truncated) => {
                         tracing::warn!(
-                            tool = %tool_call.name,
+                            tool = %Safe::name(&tool_call.name),
                             original_bytes = result.len(),
                             kept_bytes = truncated.len(),
                             cap_bytes = self.max_tool_result_bytes,
@@ -3384,7 +3600,10 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                             && !core_tools.iter().any(|t| t.name == name)
                             && let Ok(Some(def)) = self.tools.tool_definition(name).await
                         {
-                            tracing::info!("dynamically activated tool: {}", def.name);
+                            tracing::info!(
+                                tool = %Safe::name(&def.name),
+                                "dynamically activated a tool"
+                            );
                             activated_tools.insert(def.name.clone(), def);
                         }
                     }
@@ -3405,9 +3624,9 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                                     && !core_tools.iter().any(|ct| ct.name == t.name)
                                 {
                                     tracing::info!(
-                                        "activated deferred tool from namespace {:?}: {}",
-                                        ns.name,
-                                        t.name
+                                        namespace = %Safe::name(&ns.name),
+                                        tool = %Safe::name(&t.name),
+                                        "activated a deferred tool from its namespace"
                                     );
                                     activated_tools.insert(t.name.clone(), t.clone());
                                 }
@@ -3555,10 +3774,12 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
             }
         });
         let reasoning = crate::ports::llm::current_reasoning_config();
-        let closing = match self
-            .llm
-            .stream_completion(wind_down_messages, &[], reasoning, wind_down_stream)
-            .await
+        let closing = match crate::telemetry::measured_aux_call(
+            crate::telemetry::LlmPurpose::WindDown,
+            self.llm
+                .stream_completion(wind_down_messages, &[], reasoning, wind_down_stream),
+        )
+        .await
         {
             Ok(response) => {
                 let visible = sanitize_assistant_text(&response.text);
@@ -3583,6 +3804,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
             }
         }
         conv.updated_at = now_timestamp();
+        report.outcome = crate::telemetry::TurnOutcome::RoundsExhausted;
         self.store.update(conv).await?;
         Ok(closing)
     }

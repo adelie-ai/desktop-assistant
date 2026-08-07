@@ -196,6 +196,12 @@ The level contract is a rule, not a preference:
 So `RUST_LOG=debug` puts conversation content in the journal on purpose. Raise
 one target rather than the whole process when you are debugging one thing.
 
+Each turn is one trace: the turn is the root span, each round of the tool loop
+is a child of it, and the provider call and every tool dispatch are children of
+the round. One `request_id` - the same value a client sees on its own event
+stream - is on the turn span and therefore on every line the turn writes, so a
+slow turn is followed to the call that was slow from a single identifier.
+
 Metrics are kept in process and summarized every 10 minutes, with no collector
 needed. Export of traces, metrics and logs to an OpenTelemetry collector is
 available behind an off-by-default `otel` Cargo feature, configured from the

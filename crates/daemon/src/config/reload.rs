@@ -18,7 +18,7 @@
 //!
 //! - **Restart-required** — wired once at process start and not swappable
 //!   live: the database pool/url, embeddings backend, persistence, WS auth,
-//!   TLS, profiling, the administrator allowlist, and pre-prompt recall. A
+//!   TLS, the administrator allowlist, and pre-prompt recall. A
 //!   reload still applies every hot knob in the same edit; these are flagged in
 //!   the plan so the daemon logs that a restart is needed for them to take
 //!   effect, rather than silently ignoring them.
@@ -69,8 +69,6 @@ pub enum RestartArea {
     /// `[tls]`: the certificate resolver is built once, so rotation needs a
     /// restart.
     Tls,
-    /// `[profiling]`: the profiler is installed (or not) at startup.
-    Profiling,
     /// `[authz]`: the remote-administrator allowlist is read into the transport
     /// validators once at startup, so an edit does not reach a live connection.
     Authz,
@@ -91,7 +89,6 @@ impl RestartArea {
             Self::Persistence => "persistence",
             Self::WsAuth => "ws_auth",
             Self::Tls => "tls",
-            Self::Profiling => "profiling",
             Self::Authz => "authz",
             Self::Recall => "recall",
         }
@@ -168,9 +165,6 @@ pub fn plan_reload(old: &DaemonConfig, new: &DaemonConfig) -> ReloadPlan {
     }
     if !areas_eq(&old.tls, &new.tls) {
         plan.restart_required.push(RestartArea::Tls);
-    }
-    if !areas_eq(&old.profiling, &new.profiling) {
-        plan.restart_required.push(RestartArea::Profiling);
     }
     if old.authz != new.authz {
         plan.restart_required.push(RestartArea::Authz);
@@ -524,7 +518,6 @@ mod tests {
         assert_eq!(RestartArea::Persistence.as_key(), "persistence");
         assert_eq!(RestartArea::WsAuth.as_key(), "ws_auth");
         assert_eq!(RestartArea::Tls.as_key(), "tls");
-        assert_eq!(RestartArea::Profiling.as_key(), "profiling");
         assert_eq!(RestartArea::Authz.as_key(), "authz");
         assert_eq!(RestartArea::Recall.as_key(), "recall");
     }

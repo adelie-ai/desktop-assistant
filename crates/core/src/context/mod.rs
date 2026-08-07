@@ -1601,14 +1601,21 @@ pub(crate) async fn generate_context_summary<L: LlmClient>(
         Message::new(Role::User, prompt),
     ];
 
-    match llm
-        .stream_completion(
+    // Measured here rather than around the helpers that call this, because
+    // several of them can return without reaching the provider at all - an
+    // empty compaction range, a recovery ladder that freed enough at step one.
+    // A measurement taken at those boundaries would record a call that never
+    // happened, and the histogram's count is read as "how many calls".
+    match crate::telemetry::measured_aux_call(
+        crate::telemetry::LlmPurpose::Compaction,
+        llm.stream_completion(
             llm_messages,
             &[],
             ReasoningConfig::default(),
             Box::new(|_| true),
-        )
-        .await
+        ),
+    )
+    .await
     {
         Ok(response) if !response.text.trim().is_empty() => {
             SummaryOutcome::Summarised(response.text.trim().to_string())

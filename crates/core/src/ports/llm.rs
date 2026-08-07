@@ -1050,7 +1050,7 @@ pub trait LlmClient: Send + Sync {
     /// **A decorator returns `Some(self)`, never its inner client's object.**
     /// Handing back the inner object drops the decorator from the call path
     /// for exactly the turns that carry the most tools - losing retry,
-    /// profiling, classification, reasoning substitution or per-turn routing.
+    /// classification, reasoning substitution or per-turn routing.
     /// Nothing in the type system stops that, which is why each decorator has
     /// a named test asserting its own effect on a namespaced turn. The shape
     /// to copy:
@@ -1066,9 +1066,8 @@ pub trait LlmClient: Send + Sync {
     ///
     /// A *transparent forwarder* is the exception and hands back its inner
     /// object directly, because it has no per-call work to lose: the `Arc<T>`
-    /// blanket impl below and
-    /// [`MaybeProfiled`](crate::ports::llm_profiling::MaybeProfiled), which
-    /// only selects an arm. Adding a hop there could only be neutral.
+    /// blanket impl below adds no hop of its own, so forwarding there could
+    /// only be neutral.
     fn hosted_tool_search(&self) -> Option<&dyn HostedToolSearch> {
         None
     }
@@ -1122,7 +1121,7 @@ pub trait LlmClient: Send + Sync {
 }
 
 // Blanket impl so generic wrappers — `RetryingLlmClient<L>`,
-// `MaybeProfiled<L>`, `RoutingLlmClient` — accept `Arc<dyn LlmClient>`
+// `RoutingLlmClient` — accept `Arc<dyn LlmClient>`
 // as their inner type. Without this the daemon registry's
 // `Arc<dyn LlmClient>` couldn't be wrapped by the same chain that
 // existed when the inner type was a concrete enum (#44).

@@ -7,7 +7,6 @@ use desktop_assistant_core::CoreError;
 use desktop_assistant_core::ports::embedding::{EmbedFn, EmbeddingClient};
 use desktop_assistant_core::ports::inbound::{EmbeddingHealth, KnowledgeMaintenanceService};
 use desktop_assistant_core::ports::llm::{LlmClient, ReasoningConfig, RetryingLlmClient};
-use desktop_assistant_core::ports::llm_profiling::MaybeProfiled;
 use tokio_util::sync::CancellationToken;
 
 mod api_surface;
@@ -1000,11 +999,6 @@ async fn main() -> Result<()> {
     let transports_config = daemon_config
         .as_ref()
         .map(|c| c.transports.clone())
-        .unwrap_or_default();
-
-    let profiling = daemon_config
-        .as_ref()
-        .map(|c| c.profiling.clone())
         .unwrap_or_default();
 
     // Build the per-connection client registry from the [connections] map
@@ -2404,28 +2398,16 @@ async fn main() -> Result<()> {
                 resolved_consolidation.connector,
                 resolved_consolidation.model,
             );
-            // Wrap each resolved client in the same retry + profiling chain the
+            // Wrap each resolved client in the same retry chain the
             // foreground/turn paths use, erased to `Arc<dyn LlmClient>`.
-            let dreaming_llm: Arc<dyn LlmClient> = {
-                let c = build_llm_client(resolved_dreaming);
-                let c = RetryingLlmClient::new(c, 3);
-                Arc::new(MaybeProfiled::from_config(
-                    c,
-                    profiling.enabled,
-                    profiling.log_path.as_deref(),
-                    profiling.full_content,
-                ))
-            };
-            let consolidation_llm: Arc<dyn LlmClient> = {
-                let c = build_llm_client(resolved_consolidation);
-                let c = RetryingLlmClient::new(c, 3);
-                Arc::new(MaybeProfiled::from_config(
-                    c,
-                    profiling.enabled,
-                    profiling.log_path.as_deref(),
-                    profiling.full_content,
-                ))
-            };
+            let dreaming_llm: Arc<dyn LlmClient> = Arc::new(RetryingLlmClient::new(
+                build_llm_client(resolved_dreaming),
+                3,
+            ));
+            let consolidation_llm: Arc<dyn LlmClient> = Arc::new(RetryingLlmClient::new(
+                build_llm_client(resolved_consolidation),
+                3,
+            ));
             let on_change = maintenance_service::knowledge_change_notifier(Arc::clone(
                 &background_task_registry,
             ));
@@ -2471,32 +2453,11 @@ async fn main() -> Result<()> {
                     // and signature satisfied. Shutdown is handled by the select
                     // between cycles, as before.
                     let result = service.run_extraction(CancellationToken::new()).await;
-                    let elapsed = cycle_start.elapsed();
-                    // The duration is a field, not part of the sentence, so a
-                    // backend can group by it. It is also a measurement, so it
-                    // goes to the metrics facade as well: one slow cycle is a
-                    // log line, a trend is a histogram.
-                    let outcome = if result.is_ok() { "ok" } else { "error" };
-                    adelie_telemetry::metrics::record_duration(
-                        "dreaming.scan.duration",
-                        elapsed,
-                        &[adelie_telemetry::metrics::Label::new("outcome", outcome)],
+                    telemetry::record_scan_cycle(
+                        telemetry::BackendCycle::Dreaming,
+                        cycle_start.elapsed(),
+                        result.map(Some).map_err(|e| e.to_string()),
                     );
-                    match result {
-                        Ok(n) => {
-                            adelie_telemetry::metrics::add("dreaming.facts.written", n as u64, &[]);
-                            tracing::info!(
-                                duration_ms = elapsed.as_millis() as u64,
-                                facts_written = n,
-                                "dreaming: scan cycle finished"
-                            );
-                        }
-                        Err(e) => tracing::warn!(
-                            duration_ms = elapsed.as_millis() as u64,
-                            error = %e,
-                            "dreaming: scan cycle failed"
-                        ),
-                    }
 
                     tokio::select! {
                         _ = tokio::time::sleep(std::time::Duration::from_secs(dreaming_interval_secs)) => {}
@@ -2556,27 +2517,11 @@ async fn main() -> Result<()> {
                     let started = std::time::Instant::now();
                     // Timer runs aren't user-cancellable (see dreaming above).
                     let result = service.run_consolidation(CancellationToken::new()).await;
-                    let elapsed = started.elapsed();
-                    // As with the extraction cycle above: the duration is a
-                    // field, and the same measurement also reaches the metrics
-                    // facade so a trend is visible without reading every line.
-                    let outcome = if result.is_ok() { "ok" } else { "error" };
-                    adelie_telemetry::metrics::record_duration(
-                        "consolidation.scan.duration",
-                        elapsed,
-                        &[adelie_telemetry::metrics::Label::new("outcome", outcome)],
+                    telemetry::record_scan_cycle(
+                        telemetry::BackendCycle::Consolidation,
+                        started.elapsed(),
+                        result.map(|_| None).map_err(|e| e.to_string()),
                     );
-                    match result {
-                        Ok(_) => tracing::info!(
-                            duration_ms = elapsed.as_millis() as u64,
-                            "consolidation: scan finished"
-                        ),
-                        Err(e) => tracing::warn!(
-                            duration_ms = elapsed.as_millis() as u64,
-                            error = %e,
-                            "consolidation: scan failed"
-                        ),
-                    }
 
                     tokio::select! {
                         _ = tokio::time::sleep(std::time::Duration::from_secs(consolidation_interval_secs)) => {}
@@ -2690,7 +2635,7 @@ async fn main() -> Result<()> {
     let llm = backend_reasoning::FixedReasoningLlmClient::new(llm, ReasoningConfig::default());
     let llm = RetryingLlmClient::new(llm, 3);
     // Erase the decorator stack to `Arc<dyn LlmClient>` (#207). The inner
-    // type — `MaybeProfiled<Retrying<FixedReasoning<RoutingLlmClient>>>` —
+    // type — `Retrying<FixedReasoning<RoutingLlmClient>>` —
     // was previously carried by value as the `L` of `ConversationHandler`,
     // so it monomorphized into the per-turn future and was a large part of
     // the multi-MB frame that overflowed the worker stack (#205/#206).
@@ -2698,12 +2643,7 @@ async fn main() -> Result<()> {
     // the primary and backend slots share `L = Arc<dyn LlmClient>` for free
     // (the `FixedReasoning` passthrough above is no longer needed to make
     // the two slots' types match, but is left as a harmless no-op).
-    let llm: Arc<dyn LlmClient> = Arc::new(MaybeProfiled::from_config(
-        llm,
-        profiling.enabled,
-        profiling.log_path.as_deref(),
-        profiling.full_content,
-    ));
+    let llm: Arc<dyn LlmClient> = Arc::new(llm);
     // #287 slice 7: late-set slot letting the subagent tool executor reach the
     // conversation service. Set (below) to a Weak downgrade of the routing
     // handler the instant it exists; a Weak (not Arc) keeps the executor ->
@@ -2808,6 +2748,10 @@ async fn main() -> Result<()> {
     // `send_prompt` scope, so a slot that read either task-local would bill
     // every title to the interactive connection and model.
     let resolved_primary = config::resolve_llm_config(daemon_config.as_ref());
+    // Kept for telemetry: what the primary client below is built with. Read
+    // here, where the resolution already happened, so no turn has to repeat it.
+    let resolved_primary_connector = resolved_primary.connector.clone();
+    let resolved_primary_model = resolved_primary.model.clone();
     let titling_configured = daemon_config
         .as_ref()
         .and_then(|c| c.purposes.get(purposes::PurposeKind::Titling))
@@ -2826,12 +2770,7 @@ async fn main() -> Result<()> {
         let bt_llm =
             backend_reasoning::FixedReasoningLlmClient::new(bt_llm, ReasoningConfig::default());
         let bt_llm = RetryingLlmClient::new(bt_llm, 3);
-        let bt_llm: Arc<dyn LlmClient> = Arc::new(MaybeProfiled::from_config(
-            bt_llm,
-            profiling.enabled,
-            profiling.log_path.as_deref(),
-            profiling.full_content,
-        ));
+        let bt_llm: Arc<dyn LlmClient> = Arc::new(bt_llm);
         handler = handler.with_backend_llm(bt_llm);
     } else {
         let resolved_bt = config::resolve_backend_tasks_llm_config(daemon_config.as_ref());
@@ -2854,12 +2793,7 @@ async fn main() -> Result<()> {
             let bt_llm =
                 backend_reasoning::FixedReasoningLlmClient::new(bt_llm, ReasoningConfig::default());
             let bt_llm = RetryingLlmClient::new(bt_llm, 3);
-            let bt_llm: Arc<dyn LlmClient> = Arc::new(MaybeProfiled::from_config(
-                bt_llm,
-                profiling.enabled,
-                profiling.log_path.as_deref(),
-                profiling.full_content,
-            ));
+            let bt_llm: Arc<dyn LlmClient> = Arc::new(bt_llm);
             handler = handler.with_backend_llm(bt_llm);
         }
     }
@@ -3017,6 +2951,14 @@ async fn main() -> Result<()> {
         Arc::clone(&inner_conv),
         Arc::new(conversation_store),
         Arc::clone(&registry_handle),
+    )
+    // What the static primary client was actually built with, so a turn that
+    // falls through to it still reports a provider and a model. Taken from the
+    // resolution that built it rather than re-read per turn: resolving `[llm]`
+    // reads a credential, and this client is not rebuilt by a reload.
+    .with_primary_route(
+        resolved_primary_connector.clone(),
+        resolved_primary_model.clone(),
     );
     if let Some(pool) = &pg_pool {
         let window_store: Arc<dyn desktop_assistant_core::ports::store::LearnedWindowStore> =

@@ -16,6 +16,7 @@ pub mod skill_catalog;
 pub mod skill_promotion;
 pub mod system_id;
 pub mod tag_normalize;
+pub(crate) mod telemetry;
 pub mod tool_provenance;
 pub mod tools;
 

@@ -31,10 +31,102 @@ pub const SERVICE_NAME: &str = "adele-daemon";
 /// `RUST_LOG=info` to see it.
 pub const DEFAULT_FILTER: &str = "error";
 
+/// Which periodic maintenance loop a cycle belongs to.
+///
+/// An enum rather than a string because the value becomes a metric label, and
+/// the registry caps a metric at 64 label sets with no eviction. A `&'static
+/// str` rendering makes an unbounded value impossible to pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendCycle {
+    /// Fact extraction over recent conversations.
+    Dreaming,
+    /// Consolidation of what extraction wrote.
+    Consolidation,
+}
+
+impl BackendCycle {
+    /// The metric this cycle's duration is recorded under.
+    fn metric(self) -> &'static str {
+        match self {
+            Self::Dreaming => "dreaming.scan.duration",
+            Self::Consolidation => "consolidation.scan.duration",
+        }
+    }
+
+    /// The label and log field naming this cycle.
+    fn as_label(self) -> &'static str {
+        match self {
+            Self::Dreaming => "dreaming",
+            Self::Consolidation => "consolidation",
+        }
+    }
+}
+
+/// Report one finished maintenance cycle.
+///
+/// The duration is a **field**, not part of the sentence, so a backend can
+/// group and sort by it; it is also a measurement, so it reaches the metrics
+/// facade as well. One slow cycle is a log line and a trend is a histogram,
+/// and reading a trend out of interpolated text means parsing English.
+///
+/// `written` is how many facts the cycle wrote, for a cycle that counts them.
+pub fn record_scan_cycle(
+    cycle: BackendCycle,
+    elapsed: std::time::Duration,
+    outcome: Result<Option<usize>, String>,
+) {
+    let label = adelie_telemetry::metrics::Label::new(
+        "outcome",
+        if outcome.is_ok() { "ok" } else { "error" },
+    );
+    adelie_telemetry::metrics::record_duration(cycle.metric(), elapsed, &[label]);
+    let duration_ms = elapsed.as_millis() as u64;
+    match outcome {
+        Ok(written) => {
+            if let Some(n) = written {
+                adelie_telemetry::metrics::add("dreaming.facts.written", n as u64, &[]);
+            }
+            tracing::info!(
+                cycle = cycle.as_label(),
+                duration_ms,
+                // `-` for a cycle that does not count facts, never `0`: the
+                // same rule the token counts follow, for the same reason. A
+                // zero here would read as "consolidation wrote nothing".
+                facts_written = %match written {
+                    Some(n) => n.to_string(),
+                    None => "-".to_string(),
+                },
+                "backend cycle finished"
+            );
+        }
+        Err(error) => tracing::warn!(
+            cycle = cycle.as_label(),
+            duration_ms,
+            error = %error,
+            "backend cycle failed"
+        ),
+    }
+}
+
+/// How many distinct label sets one metric may hold before the rest fold into
+/// a single `cardinality=other` series.
+///
+/// The facade's own default is 64, which is right for a small binary and too
+/// small here: the daemon fronts a fleet of MCP servers, and
+/// `tool.call.duration` carries one label set per (tool, outcome) pair. Thirty
+/// or so tools would exhaust the default and collapse the axis that names
+/// which tool is slow - permanently, because the budget has no eviction.
+///
+/// Not a licence to label with anything. Every label the daemon records is
+/// still bounded at its call site; this only sizes the ceiling to what a
+/// bounded set legitimately needs.
+pub const CARDINALITY_CAP: usize = 512;
+
 /// The daemon's telemetry configuration.
 pub fn config() -> Config {
     Config::new(SERVICE_NAME)
         .with_default_filter(DEFAULT_FILTER)
+        .with_cardinality_cap(CARDINALITY_CAP)
         // A closing span writes how long it was open. That is what makes turn
         // timing readable in `kubectl logs` or `journalctl`, where there is no
         // trace backend to open.
@@ -241,6 +333,126 @@ mod tests {
         assert!(
             text.contains("dreaming.scan.duration"),
             "the summary must name the metric that was recorded\n--- captured at INFO ---\n{text}"
+        );
+    }
+
+    #[test]
+    fn dreaming_cycle_logs_duration_as_a_field() {
+        // The duration used to be interpolated into the message, which reads
+        // fine and cannot be grouped, sorted or aggregated by anything. A
+        // field can.
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            record_scan_cycle(
+                BackendCycle::Dreaming,
+                std::time::Duration::from_millis(1_500),
+                Ok(Some(7)),
+            );
+        });
+
+        let text = captured.text();
+        assert!(
+            text.contains("duration_ms=1500"),
+            "the cycle's duration must be a field\n--- captured at INFO ---\n{text}"
+        );
+        assert!(
+            text.contains("facts_written=7"),
+            "and so must what the cycle did\n--- captured at INFO ---\n{text}"
+        );
+        assert!(
+            !text.contains("facts_written=0"),
+            "a cycle that wrote seven facts must not also report zero\n\
+             --- captured at INFO ---\n{text}"
+        );
+        assert!(
+            text.contains("cycle=\"dreaming\""),
+            "and which loop it was, so one query covers both\n\
+             --- captured at INFO ---\n{text}"
+        );
+        assert!(
+            !text.contains("1.5s") && !text.contains("in 1500ms"),
+            "the duration must not also be interpolated into the sentence\n\
+             --- captured at INFO ---\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_failed_cycle_reports_the_same_duration_field() {
+        // The failure path is a separate log site, so it needs its own case:
+        // the arm that is easiest to leave interpolated is the one nobody
+        // reads until something is wrong.
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            record_scan_cycle(
+                BackendCycle::Consolidation,
+                std::time::Duration::from_millis(900),
+                Err("the backend refused".to_string()),
+            );
+        });
+
+        let text = captured.text();
+        assert!(
+            text.contains("duration_ms=900"),
+            "--- captured at INFO ---\n{text}"
+        );
+        assert!(
+            text.contains("cycle=\"consolidation\""),
+            "--- captured at INFO ---\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_cycle_that_counts_nothing_reports_absence_not_zero() {
+        // Consolidation does not count facts. Reporting `0` would read as "it
+        // wrote nothing", which is a different and wrong statement.
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            record_scan_cycle(
+                BackendCycle::Consolidation,
+                std::time::Duration::from_millis(10),
+                Ok(None),
+            );
+        });
+
+        let text = captured.text();
+        assert!(
+            !text.contains("facts_written=0"),
+            "--- captured at INFO ---\n{text}"
+        );
+        assert!(
+            text.contains("facts_written=-"),
+            "--- captured at INFO ---\n{text}"
+        );
+    }
+
+    #[test]
+    fn the_label_budget_fits_a_tool_fleet() {
+        // `tool.call.duration` spends one label set per (tool, outcome) pair,
+        // so the facade's default of 64 would collapse the tool axis on a
+        // daemon fronting more than about thirty tools. The budget has no
+        // eviction, so that collapse is permanent until the process restarts.
+        assert!(
+            config().cardinality_cap() >= 256,
+            "the daemon's label budget must hold a tool fleet; got {}",
+            config().cardinality_cap()
         );
     }
 

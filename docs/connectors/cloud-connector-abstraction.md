@@ -19,7 +19,7 @@ because these APIs rev frequently.
 Every connector is an `Arc<dyn LlmClient>` (`crates/core/src/ports/llm.rs`). The
 daemon wraps it in the same decorator stack regardless of provider
 (`ClassifyingLlmClient` innermost, then `RoutingLlmClient` -> `FixedReasoningLlmClient`
--> `RetryingLlmClient` -> `MaybeProfiled`), so a connector only implements the
+-> `RetryingLlmClient`), so a connector only implements the
 port and never touches daemon state. Per-turn context (model override, reasoning
 config, cancellation, tool allowlist, context budget) arrives through the
 task-locals in `core::ports::llm`, not through new arguments.

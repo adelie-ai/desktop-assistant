@@ -7,9 +7,6 @@ pub mod outbound;
 /// LLM client port — outbound trait for LLM completion.
 pub mod llm;
 
-/// LLM profiling decorator — captures request/response context to JSONL.
-pub mod llm_profiling;
-
 /// Embedding client port — outbound trait for generating vector embeddings.
 pub mod embedding;
 
@@ -56,6 +53,7 @@ pub mod tool_usage;
 pub mod transport;
 pub mod turn_capability;
 pub mod turn_interactivity;
+pub mod turn_telemetry;
 
 #[cfg(test)]
 mod tests {

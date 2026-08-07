@@ -128,8 +128,6 @@ pub struct DaemonConfig {
     #[serde(default, skip_serializing_if = "Purposes::is_empty")]
     pub purposes: Purposes,
     #[serde(default)]
-    pub profiling: ProfilingConfig,
-    #[serde(default)]
     pub ws_auth: WsAuthConfig,
     #[serde(default)]
     pub tls: TlsConfig,
@@ -778,20 +776,6 @@ pub(super) fn default_embedding_backfill_interval_secs() -> u64 {
 
 pub(super) fn default_consolidation_interval_secs() -> u64 {
     86400
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
-pub struct ProfilingConfig {
-    /// Enable LLM call profiling. Default: false.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Path for the JSONL profile log.
-    /// Defaults to `~/.local/share/desktop-assistant/llm-profile.jsonl`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub log_path: Option<String>,
-    /// Log full message/response content instead of previews. Default: false.
-    #[serde(default)]
-    pub full_content: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

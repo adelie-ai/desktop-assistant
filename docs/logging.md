@@ -103,26 +103,152 @@ RUST_LOG=info,desktop_assistant_mcp_client=debug
 hold the line where content used to leak: `no_content_at_info` and
 `content_appears_at_debug` in `crates/core/tests/log_content_contract.rs`,
 `no_search_query_at_info` in `crates/mcp-client/src/builtin.rs` - which drives
-every search builtin, not a chosen few - and
+every search builtin, not a chosen few -
 `no_extracted_fact_content_at_info` in
-`crates/storage/tests/dreaming_db_paths.rs`.
+`crates/storage/tests/dreaming_db_paths.rs`, and `turn_span_records_no_content`
+in `crates/core/tests/turn_telemetry.rs`, which reads span fields as well as
+console text.
 
 `scripts/tests/systemd-logging.test.sh` holds the shipped systemd units to a
 global `RUST_LOG` of `info` or quieter, and forbids `debug` on the targets that
 carry content. A target that starts logging content belongs on that list the
 same day.
 
-## Span timing
+## Following one turn
 
-Both binaries turn span-close events on, so a closing span writes a line
+A user reports "it took four minutes to answer at 14:20". Everything below
+exists so that report can be followed to the call that was slow, without
+turning anything on and without reproducing the turn.
+
+### The identifier to start from
+
+The daemon mints one `request_id` per turn and stamps it on every event that
+turn streams, so a client already shows it. That value is a field on the turn
+span, and every line the turn writes carries it through span scope:
+
+```text
+INFO turn{request_id="4bf92f35-..." conversation_id="c-91" user_id="alice"}: executing tool tool=web_fetch arg_bytes=214
+```
+
+So one identifier, taken from a client's own event stream, greps the pod log
+and finds the turn. Carrying it *between* processes - client to daemon, daemon
+to an MCP server - is separate work and is not done yet.
+
+### The shape of a turn
+
+```text
+turn                       one turn, the root
+  recall.lookup            the turn's one embedding round-trip
+  turn.round               one iteration of the tool loop
+    llm.call               the provider call for that round
+    tool.call              one tool dispatch, one span each
+  turn.round
+    llm.call
+```
+
+A conversation is deliberately **not** a trace. It lives for days and holds an
+unbounded number of turns, which no backend renders usefully. `conversation_id`
+is an attribute on the turn span instead, so one query still returns every turn
+in a conversation.
+
+Field summary:
+
+| span | fields |
+|---|---|
+| `turn` | `request_id`, `conversation_id`, `user_id`, `connection_id`, `provider`, `model`, then `rounds`, `outcome` and `duration_ms` when it ends |
+| `turn.round` | `round` (one-based), `tools`, `outcome`, and the four token counts the provider reported |
+| `llm.call` | `purpose`, `provider`, `model`, plus `round` and `outcome` for a round's own call |
+| `tool.call` | `tool`, `runner` (`client` or `server`), `outcome` |
+| `recall.lookup` | `conversation_id` |
+
+`connection_id` reads `unset` when routing fell through to the statically
+configured primary client, because there is no configured connection to name.
+`provider` and `model` still say what ran: the primary is built from `[llm]`
+through the same resolver, so a `[llm]`-only install - the ordinary desktop
+shape - is attributed like any other. A sentinel rather than an empty field: an
+empty field renders as nothing and reads as absent.
+
+A turn also spends provider time outside its rounds - naming a new
+conversation, summarising to fit the window, sorting a large tool fleet into
+namespaces, the wind-down when the round budget runs out. Each of those is an
+`llm.call` span too, hung from the turn rather than from a round, and the
+`purpose` field says which it is. Without them a turn whose four minutes went
+into compaction would decompose into a gap.
+
+Each is measured at the provider call itself rather than around the helper that
+makes it, because several of those helpers can return without calling at all -
+an empty compaction range, a recovery ladder that freed enough at its first
+step. A measurement taken at the helper's boundary would record a call that
+never happened, and the histogram's count is read as how many calls there
+were.
+
+### The two lines an operator greps
+
+One per round, and one per turn. Both carry fields, never an interpolated
+sentence, so a backend can group and sort by any of them.
+
+```text
+INFO turn{...}:turn.round{round=2 input_tokens=8120 output_tokens=96 tools="web_fetch" outcome="tools_called"}: round finished round=2 duration_ms=1840 outcome="tools_called" input_tokens=8120 output_tokens=96 cache_write_tokens=- cache_read_tokens=-
+INFO turn{... rounds=17 outcome="answered" duration_ms=241033}: turn finished duration_ms=241033 model="claude-example" rounds=17 input_tokens=214800 output_tokens=3311 cache_write_tokens=- cache_read_tokens=- outcome="answered"
+```
+
+Each line carries its own fields *and* the fields of every span above it, so a
+round line names its round and its turn without either being threaded by hand.
+
+A `-` means the provider did not report that count. It is never `0`, because a
+zero and an absence are different facts and nothing downstream could tell them
+apart afterwards.
+
+### Span timing, and how much of it
+
+Both binaries turn span-close events on, so every closing span writes a line
 carrying how long it was open:
 
 ```text
-INFO turn{turn_id=4bf92f35...}: close time.busy=208ms time.idle=14.9ms
+INFO turn{request_id="4bf92f35-..."}:turn.round{round=2}:llm.call{round=2 provider="anthropic" model="claude-example" outcome="ok"}: close time.busy=1.81s time.idle=74.2µs
 ```
 
-That is what makes turn timing visible to somebody reading a running
-container's log, where there is no trace backend to open.
+That is what makes turn timing readable in `journalctl` or `kubectl logs`,
+where there is no trace backend to open.
+
+A turn may run up to 200 rounds, and each round closes its own span plus one
+for the provider call and one per tool, so a pathological turn writes several
+hundred close lines. **That is a deliberate trade.** The close line *is* the
+per-round duration, which is the one thing the report above needs; a round
+already writes several lines of its own, so the close line is a small addition;
+and putting these spans below INFO would remove the round from the trace in
+every shipped deployment, which is the opposite of what they are for.
+
+### Nothing here is content
+
+Ids, counts, durations, outcomes, and the names of tools, models and providers.
+No prompt, no assembled context, no tool argument, no search query, no model
+reply - on a log line or on a span field. The span half matters more than it
+looks: nothing prints a span field unless an event fires inside the span, so a
+captured argument is invisible locally and still exports over OTLP. Every span
+in the turn path is therefore built by hand. There is no `#[instrument]`, which
+would capture each argument by default.
+
+`crates/core/tests/turn_telemetry.rs` holds that line from both directions: it
+reads span fields back in process, and it reads console text, because neither
+can see what the other does.
+
+A third thing that only an in-process reader can see is **where a span ends**.
+A span's extent is decided by where its last handle drops, and the code that
+measures the same work sits somewhere else; when the two part company the
+histogram reports one number and the exported trace draws another, and only the
+trace is wrong - in the direction that blames whatever the span is named after.
+Nothing on the console shows it. `each_instrumented_call_closes_its_span_with_its_own_measurement`
+asserts each span closes before the work that follows its measurement, as an
+order rather than as a duration, because the two elapsed times overlap and a
+timing assertion would pass whichever way the code was written.
+
+One field in the turn path is written by the model: the tool name. It goes
+through `adelie_telemetry::Safe`, which caps it and replaces the characters
+that change what a reader sees. Without that, a newline in a name produces what
+reads as a second genuine log line - its own timestamp column, its own level -
+and an ANSI escape survives even with colour off.
+`a_model_chosen_tool_name_cannot_forge_a_log_line` holds it.
 
 ## Metrics
 
@@ -158,6 +284,58 @@ Durations go into fixed-bucket histograms rather than a count and a sum,
 because a mean hides the tail: "the average turn took 3 seconds" and "one turn
 in twenty took four minutes" are the same mean, and only the second is the
 report a user files.
+
+### What the turn path records
+
+| metric | kind | labels |
+|---|---|---|
+| `turn.duration` | histogram | `outcome` |
+| `turn.rounds` | counter | `outcome` |
+| `turn.round.duration` | histogram | `outcome` |
+| `llm.call.duration` | histogram | `provider`, `model`, `purpose`, and `outcome` for a round's own call |
+| `tool.call.duration` | histogram | `tool`, `outcome` |
+| `llm.tokens.input` | counter | `provider`, `model` |
+| `llm.tokens.output` | counter | `provider`, `model` |
+| `llm.tokens.cache_write` | counter | `provider`, `model` |
+| `llm.tokens.cache_read` | counter | `provider`, `model` |
+| `llm.tokens.unreported` | counter | `provider`, `count` |
+| `dreaming.scan.duration` | histogram | `outcome` |
+| `dreaming.facts.written` | counter | none |
+| `consolidation.scan.duration` | histogram | `outcome` |
+
+Tokens are recorded **per round**, not per turn, and the turn's total is the
+sum of its rounds. The useful question is not what a turn cost but which round
+blew up: a turn that re-sends a growing transcript ten times has a very
+different shape from one that answers immediately, and only per-round numbers
+show it.
+
+All four counts are recorded separately. The two cache counts are the whole
+cost story on a caching provider, where a cache read costs a fraction of a
+fresh input token, so reporting input alone makes a well-cached turn look
+identical to a cold one.
+
+**A count the provider did not report is not zero.** It is skipped, and
+`llm.tokens.unreported` is incremented instead with a `count` label naming
+which one. So a total that looks low can be checked against how many calls said
+nothing, which a silent `0` would make impossible.
+
+Every `outcome` and `purpose` label is an enum rendering to a `&'static str`,
+so an unbounded value cannot be passed: it has the wrong lifetime. `provider`
+and `model` come from operator configuration.
+
+`tool` is the one label whose value the **model** writes, and it is bounded at
+the call site rather than by its type: a name the daemon's own tool list does
+not contain is recorded as `unknown`. Without that, sixty-four invented names - about
+sixty-four rounds of one conversation, and reachable by prompt injection - fill
+this metric's label budget, which has no eviction, and every real tool
+afterwards folds into `cardinality=other` until the process restarts. `runner`
+is on the `tool.call` span rather than on the metric for the same budget
+reason: a span field has no series key to spend.
+
+The daemon raises that budget from the facade's default of 64 to 512, because
+it fronts a fleet of MCP servers and `tool.call.duration` spends one label set
+per (tool, outcome) pair. A conversation id, a user id or a request id is never
+a label.
 
 ## Export to a collector
 

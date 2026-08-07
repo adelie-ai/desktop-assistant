@@ -55,10 +55,6 @@ model = "llama3.2:1b"
 connection = "default"
 model = "llama3.2:1b"
 
-[profiling]
-enabled = false
-full_content = false
-
 [ws_auth]
 methods = ["password"]
 allowed_origins = []

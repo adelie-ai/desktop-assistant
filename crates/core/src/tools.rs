@@ -258,14 +258,16 @@ pub(crate) async fn categorize_tool_namespaces<L: LlmClient>(
         ),
     ];
 
-    let response = match llm
-        .stream_completion(
+    let response = match crate::telemetry::measured_aux_call(
+        crate::telemetry::LlmPurpose::Categorization,
+        llm.stream_completion(
             messages,
             &[],
             ReasoningConfig::default(),
             Box::new(|_| true),
-        )
-        .await
+        ),
+    )
+    .await
     {
         Ok(r) => r,
         Err(e) => {
