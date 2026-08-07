@@ -561,6 +561,17 @@ struct ScriptedTools {
     tools: Vec<ToolDefinition>,
     /// When set, every dispatch fails with this message instead of succeeding.
     failure: Option<String>,
+    /// When set, the first dispatch trips the turn's cancellation token, so
+    /// the loop's per-tool checkpoint fires on the next call. Nothing else
+    /// reaches that exit: a token the test trips before the turn starts stops
+    /// it before any tool runs.
+    cancel_after_first: bool,
+    /// Tools the executor knows and will run, but does **not** return from
+    /// `core_tools`. This is the real fleet's shape: the daemon's executor
+    /// answers with builtins only, and an MCP tool reaches a turn's tool list
+    /// through per-turn activation. So a fleet tool the model learned about in
+    /// an earlier turn is one this turn never offered and still executes.
+    unadvertised: Vec<ToolDefinition>,
 }
 
 impl ScriptedTools {
@@ -568,6 +579,22 @@ impl ScriptedTools {
         Self {
             tools: vec![write_note()],
             failure: None,
+            cancel_after_first: false,
+            unadvertised: Vec::new(),
+        }
+    }
+
+    /// An executor that knows `name` and will run it, without ever offering it.
+    fn knowing(name: &str) -> Self {
+        Self {
+            tools: vec![write_note()],
+            failure: None,
+            cancel_after_first: false,
+            unadvertised: vec![ToolDefinition::new(
+                name,
+                "a fleet tool this turn never offered",
+                serde_json::json!({"type": "object"}),
+            )],
         }
     }
 
@@ -575,6 +602,19 @@ impl ScriptedTools {
         Self {
             tools: vec![write_note()],
             failure: Some(TOOL_ERROR_SENTINEL.to_string()),
+            cancel_after_first: false,
+            unadvertised: Vec::new(),
+        }
+    }
+
+    /// A tool that succeeds and then cancels the turn, so the loop's per-tool
+    /// cancellation checkpoint is the exit taken.
+    fn cancelling() -> Self {
+        Self {
+            tools: vec![write_note()],
+            failure: None,
+            cancel_after_first: true,
+            unadvertised: Vec::new(),
         }
     }
 }
@@ -597,7 +637,12 @@ impl ToolExecutor for ScriptedTools {
     }
 
     async fn tool_definition(&self, name: &str) -> Result<Option<ToolDefinition>, CoreError> {
-        Ok(self.tools.iter().find(|t| t.name == name).cloned())
+        Ok(self
+            .tools
+            .iter()
+            .chain(self.unadvertised.iter())
+            .find(|t| t.name == name)
+            .cloned())
     }
 
     async fn tool_namespaces(&self) -> Vec<ToolNamespace> {
@@ -609,6 +654,11 @@ impl ToolExecutor for ScriptedTools {
         _name: &str,
         _arguments: serde_json::Value,
     ) -> Result<String, CoreError> {
+        if self.cancel_after_first {
+            desktop_assistant_core::ports::llm::current_cancellation_token()
+                .expect("the turn installs a cancellation token")
+                .cancel();
+        }
         match &self.failure {
             Some(message) => Err(CoreError::ToolExecution(message.clone())),
             // The tool's own output is content and belongs at DEBUG. Returning
@@ -1154,47 +1204,88 @@ const SENTINELS: [(&str, &str); 5] = [
     ("a failing tool's message", TOOL_ERROR_SENTINEL),
 ];
 
+/// One path a turn can take.
+struct TurnPath {
+    /// What the case is, phrased for a failure message.
+    name: &'static str,
+    script: Vec<Reply>,
+    tools: ScriptedTools,
+    /// The round outcome this path must produce. Asserted separately, so a
+    /// "failure" that silently succeeded cannot make a leak test pass
+    /// vacuously by never running the path it claims.
+    outcome: &'static str,
+    /// Whether a tool actually runs on this path. Two of the sentinels can
+    /// only appear when one does, so without this a row that never dispatches
+    /// looks like coverage of them and is not.
+    runs_a_tool: bool,
+}
+
 /// Every path a turn can take, so the content assertion covers the failure
 /// arms and not only the one that works.
-///
-/// Each case names the round outcome it must produce, which is what stops a
-/// case passing vacuously: a "failure" that silently succeeded would assert
-/// that nothing leaked from a path that never ran.
-fn every_turn_path() -> Vec<(&'static str, Vec<Reply>, ScriptedTools, &'static str)> {
+fn every_turn_path() -> Vec<TurnPath> {
     vec![
-        (
-            "the model answers after a tool round",
-            two_round_script(),
-            ScriptedTools::ok(),
-            "answered",
-        ),
-        (
-            "a tool fails and the turn carries on",
-            two_round_script(),
-            ScriptedTools::failing(),
-            "tool_error",
-        ),
-        (
-            "the provider call fails",
-            vec![Reply::Fail(CoreError::Llm(
+        TurnPath {
+            name: "the model answers after a tool round",
+            script: two_round_script(),
+            tools: ScriptedTools::ok(),
+            outcome: "answered",
+            runs_a_tool: true,
+        },
+        TurnPath {
+            name: "a tool fails and the turn carries on",
+            script: two_round_script(),
+            tools: ScriptedTools::failing(),
+            outcome: "tool_error",
+            runs_a_tool: true,
+        },
+        TurnPath {
+            name: "the provider call fails",
+            script: vec![Reply::Fail(CoreError::Llm(
                 "the provider is unreachable".to_string(),
             ))],
-            ScriptedTools::ok(),
-            "llm_error",
-        ),
-        (
-            "the turn is cancelled mid-stream",
-            vec![Reply::Fail(CoreError::Cancelled)],
-            ScriptedTools::ok(),
-            "cancelled",
-        ),
+            tools: ScriptedTools::ok(),
+            outcome: "llm_error",
+            runs_a_tool: false,
+        },
+        TurnPath {
+            name: "the provider call is cancelled",
+            script: vec![Reply::Fail(CoreError::Cancelled)],
+            tools: ScriptedTools::ok(),
+            outcome: "cancelled",
+            runs_a_tool: false,
+        },
+        TurnPath {
+            name: "the user cancels between tool dispatches",
+            // Two calls in one round, because the loop's per-tool checkpoint
+            // runs at the top of each iteration: with a single call there is
+            // no second iteration to reach it, and the cancellation would
+            // instead be seen by the between-rounds check, which is a
+            // different exit.
+            script: vec![
+                LlmResponse::with_tool_calls("", vec![tool_call("c1"), tool_call("c2")])
+                    .with_usage(usage(100, 10))
+                    .into(),
+                LlmResponse::text(REPLY_SENTINEL)
+                    .with_usage(usage(200, 20))
+                    .into(),
+            ],
+            tools: ScriptedTools::cancelling(),
+            outcome: "cancelled",
+            runs_a_tool: true,
+        },
     ]
 }
 
 #[test]
 fn turn_span_records_no_content() {
     let _serialised = serialised();
-    for (name, script, tools, _) in every_turn_path() {
+    for TurnPath {
+        name,
+        script,
+        tools,
+        ..
+    } in every_turn_path()
+    {
         let captured = run(Level::INFO, script, tools);
 
         // Span fields first: an `#[instrument]` without `skip` captures its
@@ -1230,8 +1321,17 @@ fn every_probed_path_really_took_the_path_it_names() {
     let _serialised = serialised();
     // A leak test that drives a "failure" which silently succeeds passes
     // vacuously - it asserts nothing leaked from a path that never ran. This
-    // asserts each case in the table produced the round outcome it claims.
-    for (name, script, tools, outcome) in every_turn_path() {
+    // asserts each case in the table produced the round outcome it claims,
+    // and that the rows claiming to run a tool really dispatched one, which is
+    // what makes the tool-result and tool-error sentinels mean anything.
+    for TurnPath {
+        name,
+        script,
+        tools,
+        outcome,
+        runs_a_tool,
+    } in every_turn_path()
+    {
         let captured = run(Level::INFO, script, tools);
         let rounds = captured.spans_named("turn.round");
         let observed: Vec<Option<&str>> = rounds.iter().map(|r| r.field("outcome")).collect();
@@ -1239,6 +1339,13 @@ fn every_probed_path_really_took_the_path_it_names() {
             observed.contains(&Some(outcome)),
             "the case where {name} must produce a round with outcome \
              `{outcome}`; got {observed:?}"
+        );
+        assert_eq!(
+            !captured.spans_named("tool.call").is_empty(),
+            runs_a_tool,
+            "the case where {name} says runs_a_tool={runs_a_tool}, and the run \
+             disagrees; the sentinels a tool produces are only covered by the \
+             rows that dispatch one"
         );
     }
 }
@@ -1322,6 +1429,8 @@ fn a_model_chosen_tool_name_cannot_forge_a_log_line() {
             serde_json::json!({"type": "object"}),
         )],
         failure: None,
+        cancel_after_first: false,
+        unadvertised: Vec::new(),
     };
     let captured = run(Level::INFO, script, tools);
 
@@ -1400,6 +1509,54 @@ fn an_invented_tool_name_cannot_burn_the_metric_budget() {
         8,
         "the dispatches are still counted - under one bounded name, so an \
          operator can see that unadvertised names are being called at all"
+    );
+}
+
+/// A fleet tool the executor knows, which this turn's round never offered.
+const UNADVERTISED_TOOL: &str = "mcp_calendar_list_events";
+
+#[test]
+fn a_tool_the_daemon_knows_keeps_its_name_even_when_this_round_did_not_offer_it() {
+    let _serialised = serialised();
+    // `activated_tools` is per turn, so a fleet tool the model learned about in
+    // an earlier turn and calls directly now is offered by nothing this round
+    // - and still runs, because the executor's routing outlives the turn.
+    // Judging on the offer alone files every one of those under `unknown` and
+    // quietly empties that tool's latency series, which is the axis the bound
+    // exists to protect.
+    let script = vec![
+        LlmResponse::with_tool_calls(
+            "",
+            vec![ToolCall::new(
+                "c1",
+                UNADVERTISED_TOOL,
+                serde_json::json!({}).to_string(),
+            )],
+        )
+        .with_usage(usage(100, 10))
+        .into(),
+        LlmResponse::text(REPLY_SENTINEL)
+            .with_usage(usage(200, 20))
+            .into(),
+    ];
+    let captured = run(
+        Level::INFO,
+        script,
+        ScriptedTools::knowing(UNADVERTISED_TOOL),
+    );
+
+    assert_eq!(
+        captured.histogram_delta(
+            "tool.call.duration",
+            &[&format!("tool={UNADVERTISED_TOOL}")]
+        ),
+        1,
+        "a tool the daemon's own list contains is recorded under its own name, \
+         whether or not this round advertised it"
+    );
+    assert_eq!(
+        captured.histogram_delta("tool.call.duration", &["tool=unknown"]),
+        0,
     );
 }
 

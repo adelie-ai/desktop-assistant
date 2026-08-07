@@ -169,11 +169,18 @@ shape - is attributed like any other. A sentinel rather than an empty field: an
 empty field renders as nothing and reads as absent.
 
 A turn also spends provider time outside its rounds - naming a new
-conversation, summarising to fit the window, the recovery ladder after an
-overflow, the wind-down when the round budget runs out. Each of those is an
+conversation, summarising to fit the window, sorting a large tool fleet into
+namespaces, the wind-down when the round budget runs out. Each of those is an
 `llm.call` span too, hung from the turn rather than from a round, and the
 `purpose` field says which it is. Without them a turn whose four minutes went
 into compaction would decompose into a gap.
+
+Each is measured at the provider call itself rather than around the helper that
+makes it, because several of those helpers can return without calling at all -
+an empty compaction range, a recovery ladder that freed enough at its first
+step. A measurement taken at the helper's boundary would record a call that
+never happened, and the histogram's count is read as how many calls there
+were.
 
 ### The two lines an operator greps
 
@@ -307,8 +314,8 @@ so an unbounded value cannot be passed: it has the wrong lifetime. `provider`
 and `model` come from operator configuration.
 
 `tool` is the one label whose value the **model** writes, and it is bounded at
-the call site rather than by its type: a name the turn did not advertise this
-round is recorded as `unknown`. Without that, sixty-four invented names - about
+the call site rather than by its type: a name the daemon's own tool list does
+not contain is recorded as `unknown`. Without that, sixty-four invented names - about
 sixty-four rounds of one conversation, and reachable by prompt injection - fill
 this metric's label budget, which has no eviction, and every real tool
 afterwards folds into `cardinality=other` until the process restarts. `runner`

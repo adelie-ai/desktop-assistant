@@ -1108,6 +1108,20 @@ where
     /// per-turn budget DOWN (see [`crate::config::apply_learned_cap`]). `None`
     /// (tests, no database) disables the safety net; resolution is unchanged.
     window_store: Option<Arc<dyn LearnedWindowStore>>,
+    /// `(connector, model)` the statically configured primary client was built
+    /// with, for telemetry only.
+    ///
+    /// Captured when that client was built rather than resolved per turn, for
+    /// two reasons. Resolving `[llm]` reads its credential from the secret
+    /// backend, which on a keyring install is a blocking D-Bus round trip -
+    /// not something to do on every turn for two labels. And the primary
+    /// client is built once in `main` and is *not* rebuilt by a configuration
+    /// reload, so the live configuration can name a model the process is not
+    /// running; reporting what was actually built is the honest answer.
+    ///
+    /// `None` where no caller stated it, which reports as `unset` rather than
+    /// as a guess.
+    primary_route: Option<(String, String)>,
 }
 
 impl<S, Inner> RoutingConversationHandler<S, Inner>
@@ -1121,7 +1135,16 @@ where
             selection_store,
             registry,
             window_store: None,
+            primary_route: None,
         }
+    }
+
+    /// State which `(connector, model)` the statically configured primary
+    /// client was built with, so a turn that falls through to it is still
+    /// attributed. See [`Self::primary_route`].
+    pub fn with_primary_route(mut self, connector: String, model: String) -> Self {
+        self.primary_route = Some((connector, model));
+        self
     }
 
     /// Install the learned context-window cache (issue #343) so budget
@@ -1729,27 +1752,23 @@ where
         // Where this turn dispatches, for its spans and its metrics.
         //
         // When routing resolved a live connection, that is the answer. When it
-        // fell through to the statically configured primary, there is no
-        // connection id - but there is still a connector and a model, because
-        // `main` built that client from `[llm]` through the same resolver read
-        // here. Reporting `unset` for those two would leave every `[llm]`-only
-        // install, which is the ordinary desktop shape, with no provider or
-        // model on any span, any metric or the completion line.
+        // fell through to the statically configured primary there is no
+        // connection id - but there is still a connector and a model, taken
+        // from what `main` actually built that client with. Reporting `unset`
+        // for those two would leave every `[llm]`-only install, which is the
+        // ordinary desktop shape, with no provider or model on any span, any
+        // metric or the completion line.
         let route = match &chosen {
             Some((connection, model)) => desktop_assistant_core::ports::turn_telemetry::TurnRoute {
                 connection_id: Some(connection.clone()),
                 provider: connector,
                 model: Some(model.clone()),
             },
-            None => {
-                let primary =
-                    crate::config::resolve_llm_config(Some(&self.registry.snapshot_config()));
-                desktop_assistant_core::ports::turn_telemetry::TurnRoute {
-                    connection_id: None,
-                    provider: Some(primary.connector),
-                    model: Some(primary.model),
-                }
-            }
+            None => desktop_assistant_core::ports::turn_telemetry::TurnRoute {
+                connection_id: None,
+                provider: self.primary_route.as_ref().map(|(c, _)| c.clone()),
+                model: self.primary_route.as_ref().map(|(_, m)| m.clone()),
+            },
         };
 
         // The turn's tool-discovery mode is NOT logged here, deliberately.

@@ -424,14 +424,16 @@ async fn generate_conversation_title<L: LlmClient>(initial_prompt: &str, llm: &L
             format!("First message in the conversation: {initial_prompt}"),
         ),
     ];
-    match llm
-        .stream_completion(
+    match crate::telemetry::measured_aux_call(
+        crate::telemetry::LlmPurpose::Title,
+        llm.stream_completion(
             messages,
             &[],
             ReasoningConfig::default(),
             Box::new(|_| true),
-        )
-        .await
+        ),
+    )
+    .await
     {
         Ok(response) => sanitize_generated_title(&response.text),
         Err(e) => {
@@ -2858,18 +2860,18 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                         max_tokens = ?max_tokens,
                         "context overflow — running recovery ladder"
                     );
-                    let outcome = crate::telemetry::measured_aux_call(
-                        crate::telemetry::LlmPurpose::OverflowRecovery,
-                        recover_from_overflow(
-                            &mut conv,
-                            &mut projection,
-                            prompt_tokens,
-                            max_tokens,
-                            window_from,
-                            &mut target_window,
-                            self.task_llm(),
-                            &estimate,
-                        ),
+                    // Not measured at this boundary: the ladder's first two
+                    // steps free space without reaching the provider at all,
+                    // and its last step measures itself inside the summariser.
+                    let outcome = recover_from_overflow(
+                        &mut conv,
+                        &mut projection,
+                        prompt_tokens,
+                        max_tokens,
+                        window_from,
+                        &mut target_window,
+                        self.task_llm(),
+                        &estimate,
                     )
                     .await;
                     if outcome == RecoveryOutcome::Exhausted {
@@ -2980,11 +2982,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                             "context pressure — shrinking window and compacting"
                         );
                         target_window = new_window;
-                        crate::telemetry::measured_aux_call(
-                            crate::telemetry::LlmPurpose::Compaction,
-                            compact_into_summary(&mut conv, target_window, self.task_llm()),
-                        )
-                        .await;
+                        compact_into_summary(&mut conv, target_window, self.task_llm()).await;
                         compaction_active = true;
                     } else {
                         tracing::debug!(
@@ -3065,11 +3063,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 // so the conversation list shows meaningful names rather than
                 // timestamp-based placeholders.
                 if is_first_message {
-                    let generated = crate::telemetry::measured_aux_call(
-                        crate::telemetry::LlmPurpose::Title,
-                        generate_conversation_title(&prompt, self.task_llm()),
-                    )
-                    .await;
+                    let generated = generate_conversation_title(&prompt, self.task_llm()).await;
                     if !generated.is_empty() {
                         conv.title = generated;
                     }
@@ -3516,20 +3510,39 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                     crate::telemetry::ToolOutcome::Error
                 };
                 tool_span.record("outcome", tool_outcome.as_label());
-                // Whether this turn actually put the name in front of the
-                // model. Anything else is the model's invention, and it must
-                // not reach the metric as itself - see `UNKNOWN_TOOL`. Read
-                // from what was offered this round rather than from the tool
-                // registry, because the registry would call a real-but-unoffered
-                // name known and that is not the question.
-                let advertised = tool_defs.iter().any(|t| t.name == tool_call.name)
+                // Whether the name belongs to a set the daemon controls
+                // rather than to the model. That is the only property the
+                // metric label needs, and it is not the same question as "did
+                // this round offer it".
+                //
+                // `activated_tools` is per turn, so a fleet tool the model
+                // learned about in an earlier turn and calls directly now is
+                // offered by nothing this round - and still executes, because
+                // the executor's routing table outlives the turn. Judging on
+                // the offer alone would file every one of those under
+                // `unknown` and quietly empty that tool's latency series,
+                // which is the axis the bound exists to protect.
+                //
+                // So the executor is asked, but only when the cheap answer
+                // says no: `tool_definition` is an in-memory lookup and the
+                // fallthrough is rare, and it is the daemon's own tool list,
+                // which is what bounds the label. A name the model invented is
+                // in neither set.
+                let known = tool_defs.iter().any(|t| t.name == tool_call.name)
                     || namespaces
                         .iter()
-                        .any(|ns| ns.tools.iter().any(|t| t.name == tool_call.name));
+                        .any(|ns| ns.tools.iter().any(|t| t.name == tool_call.name))
+                    || self
+                        .tools
+                        .tool_definition(&tool_call.name)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some();
                 crate::telemetry::record_tool_call(
                     tool_started.elapsed(),
                     &tool_call.name,
-                    advertised,
+                    known,
                     tool_outcome,
                 );
                 if !tool_ok {
@@ -3776,11 +3789,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
         // Persist the whole turn: prompt + tool transcript + closing.
         conv.messages.push(Message::new(Role::Assistant, &closing));
         if is_first_message {
-            let generated = crate::telemetry::measured_aux_call(
-                crate::telemetry::LlmPurpose::Title,
-                generate_conversation_title(&prompt, self.task_llm()),
-            )
-            .await;
+            let generated = generate_conversation_title(&prompt, self.task_llm()).await;
             if !generated.is_empty() {
                 conv.title = generated;
             }

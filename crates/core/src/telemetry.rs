@@ -96,7 +96,11 @@ pub(crate) const TOOL_CALL_DURATION: &str = "tool.call.duration";
 /// invented names - about sixty-four rounds of one conversation - fill the
 /// registry's per-metric label budget, which has no eviction, and every real
 /// tool afterwards folds into `cardinality=other` until the process restarts.
-/// So a name the turn did not offer is not a name; it is this.
+/// So a name the daemon does not know is not a name; it is this.
+///
+/// The caller answers by asking what it offered this round and, failing that,
+/// what the executor knows - the daemon's own tool list, which is the set that
+/// bounds this label.
 pub(crate) const UNKNOWN_TOOL: &str = "unknown";
 
 /// Prompt tokens the provider reported, by provider and model.
@@ -273,10 +277,14 @@ pub(crate) enum LlmPurpose {
     Turn,
     /// Naming a new conversation from its first message.
     Title,
-    /// Summarising the transcript to fit the window.
+    /// Summarising the transcript to fit the window. Every path that folds
+    /// the transcript reaches the provider through one function, so they share
+    /// this one purpose: turn-entry compaction, the token-pressure fold, the
+    /// assembler's pre-flight shrink, and the recovery ladder's last step.
     Compaction,
+    /// Sorting a large tool fleet into namespaces the provider can search.
     /// The ladder that runs after the provider rejects an oversized prompt.
-    OverflowRecovery,
+    Categorization,
     /// The closing reply when the round budget is spent.
     WindDown,
 }
@@ -287,7 +295,7 @@ impl LlmPurpose {
             Self::Turn => "turn",
             Self::Title => "title",
             Self::Compaction => "compaction",
-            Self::OverflowRecovery => "overflow_recovery",
+            Self::Categorization => "categorization",
             Self::WindDown => "wind_down",
         }
     }
@@ -421,17 +429,13 @@ pub(crate) fn record_llm_call(elapsed: Duration, route: &TurnRoute, ok: bool) {
 
 /// Record a finished tool dispatch.
 ///
-/// `advertised` is whether this turn actually offered the name. It is the
-/// caller's answer rather than something read here, because only the turn
-/// knows what it put in front of the model this round. A name it did not offer
-/// is recorded as [`UNKNOWN_TOOL`]: see that constant for what it prevents.
-pub(crate) fn record_tool_call(
-    elapsed: Duration,
-    tool: &str,
-    advertised: bool,
-    outcome: ToolOutcome,
-) {
-    let tool = if advertised {
+/// `known` is whether the name belongs to a set the daemon controls: the turn
+/// offered it, or the executor knows it. It is the caller's answer rather than
+/// something read here, because only the turn holds both facts. A name that is
+/// neither is recorded as [`UNKNOWN_TOOL`]: see that constant for what it
+/// prevents.
+pub(crate) fn record_tool_call(elapsed: Duration, tool: &str, known: bool, outcome: ToolOutcome) {
+    let tool = if known {
         Safe::name(tool).to_string()
     } else {
         UNKNOWN_TOOL.to_string()
@@ -667,7 +671,7 @@ impl RoundGuard {
             names.join(",")
         } else {
             format!(
-                "{},and {} more",
+                "{}, and {} more",
                 names[..MAX_TOOLS_ON_SPAN].join(","),
                 names.len() - MAX_TOOLS_ON_SPAN
             )

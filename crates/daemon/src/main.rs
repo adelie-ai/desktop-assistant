@@ -2748,6 +2748,10 @@ async fn main() -> Result<()> {
     // `send_prompt` scope, so a slot that read either task-local would bill
     // every title to the interactive connection and model.
     let resolved_primary = config::resolve_llm_config(daemon_config.as_ref());
+    // Kept for telemetry: what the primary client below is built with. Read
+    // here, where the resolution already happened, so no turn has to repeat it.
+    let resolved_primary_connector = resolved_primary.connector.clone();
+    let resolved_primary_model = resolved_primary.model.clone();
     let titling_configured = daemon_config
         .as_ref()
         .and_then(|c| c.purposes.get(purposes::PurposeKind::Titling))
@@ -2947,6 +2951,14 @@ async fn main() -> Result<()> {
         Arc::clone(&inner_conv),
         Arc::new(conversation_store),
         Arc::clone(&registry_handle),
+    )
+    // What the static primary client was actually built with, so a turn that
+    // falls through to it still reports a provider and a model. Taken from the
+    // resolution that built it rather than re-read per turn: resolving `[llm]`
+    // reads a credential, and this client is not rebuilt by a reload.
+    .with_primary_route(
+        resolved_primary_connector.clone(),
+        resolved_primary_model.clone(),
     );
     if let Some(pool) = &pg_pool {
         let window_store: Arc<dyn desktop_assistant_core::ports::store::LearnedWindowStore> =
