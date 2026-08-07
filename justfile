@@ -55,7 +55,16 @@ build:
 # to precede either. The `-sqlite` and `-mcp-host` steps are separate because
 # that adapter/module is compiled out of the workspace steps entirely; see
 # `lint-sqlite` and `lint-mcp-host`.
-check: audit secret-scan fmt-check lint lint-sqlite lint-mcp-host doc doc-sqlite doc-mcp-host build test test-sqlite test-mcp-host test-scripts
+check: audit secret-scan no-otel fmt-check lint lint-sqlite lint-mcp-host lint-otel doc doc-sqlite doc-mcp-host doc-otel build test test-sqlite test-mcp-host test-otel test-scripts
+
+# Prove a default build resolves no opentelemetry crate. Telemetry export sits
+# behind an off-by-default `otel` feature, and the promise that goes with it is
+# that `cargo install` costs a desktop user nothing extra. One
+# `features = ["otel"]` written on a dependency instead of a passthrough breaks
+# that promise while every other step stays green; see
+# scripts/no-opentelemetry.sh.
+no-otel:
+    ./scripts/no-opentelemetry.sh
 
 # RustSec advisory scan of Cargo.lock. Fails loudly when cargo-audit is missing
 # or the advisory database cannot be fetched, rather than passing on silence
@@ -101,6 +110,15 @@ lint-sqlite:
 lint-mcp-host:
     cargo clippy -p desktop-assistant-client-common --features mcp-host --all-targets -- -D warnings
 
+# Clippy the two telemetry-exporting binaries with their own `otel` feature
+# enabled, for the same reason `lint-sqlite` and `lint-mcp-host` exist: the
+# feature is off by default and nothing in a workspace build turns it on, so
+# the workspace lint above type-checks none of the exporting path. A change
+# that compiles with default features can still fail with `otel` on.
+lint-otel:
+    cargo clippy -p desktop-assistant-daemon --features otel --all-targets -- -D warnings
+    cargo clippy -p desktop-assistant-dbus-bridge --features otel --all-targets -- -D warnings
+
 # Rustdoc across the workspace; warnings are errors (#1046). `clippy` does not
 # evaluate rustdoc lints, so without this step a doc link to a renamed,
 # privatised or deleted item passes the whole gate. Fails loudly when the run
@@ -120,6 +138,12 @@ doc-sqlite:
 # build, so the workspace step documents none of that module.
 doc-mcp-host:
     ./scripts/doc.sh -p desktop-assistant-client-common --features mcp-host
+
+# Rustdoc the two telemetry-exporting binaries with their `otel` feature on,
+# for the same reason `lint-otel` exists.
+doc-otel:
+    ./scripts/doc.sh -p desktop-assistant-daemon --features otel
+    ./scripts/doc.sh -p desktop-assistant-dbus-bridge --features otel
 
 # Run the workspace test suite (excludes #[ignore] integration tests)
 test:
@@ -145,6 +169,13 @@ test-sqlite:
 # uses.
 test-mcp-host:
     cargo test -p desktop-assistant-client-common --features mcp-host
+
+# Run the two telemetry-exporting binaries' suites with `otel` on. The OTLP
+# pipelines are built at `init`, so this is the only step that compiles and
+# runs them; it needs a C compiler and an assembler for the TLS backend.
+test-otel:
+    cargo test -p desktop-assistant-daemon --features otel
+    cargo test -p desktop-assistant-dbus-bridge --features otel
 
 # Real-Secret-Service integration tests (needs a live session bus; mutates + cleans keyring)
 test-integration:

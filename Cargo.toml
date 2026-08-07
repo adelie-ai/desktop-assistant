@@ -47,6 +47,16 @@ anyhow = "1"
 async-trait = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# One telemetry setup for every Adelie Rust binary: the subscriber, the three
+# OTLP pipelines, the metrics registry, the shutdown guard and the
+# trace-context helpers. Shared across repos, so it lives in its own one and is
+# pinned by revision like `mcp-core`.
+#
+# Export is behind that crate's off-by-default `otel` feature; each binary here
+# re-exports it as its own `otel` feature. A default build resolves no
+# opentelemetry crate at all, which `scripts/no-opentelemetry.sh` holds the
+# line on.
+adelie-telemetry = { git = "https://github.com/adelie-ai/adelie-telemetry", rev = "59c152db11f22281ea2ae8f1c67e00389dbf74f8" }
 serde = { version = "1", features = ["derive"] }
 
 desktop-assistant-protocol = { path = "crates/protocol" }

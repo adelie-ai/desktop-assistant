@@ -9,7 +9,6 @@ use desktop_assistant_core::ports::inbound::{EmbeddingHealth, KnowledgeMaintenan
 use desktop_assistant_core::ports::llm::{LlmClient, ReasoningConfig, RetryingLlmClient};
 use desktop_assistant_core::ports::llm_profiling::MaybeProfiled;
 use tokio_util::sync::CancellationToken;
-use tracing_subscriber::EnvFilter;
 
 mod api_surface;
 mod app;
@@ -35,6 +34,7 @@ mod routing_llm;
 mod settings_service;
 mod skill_scanner;
 mod store;
+mod telemetry;
 mod tls;
 mod transports;
 
@@ -820,9 +820,13 @@ async fn run_inline_server_login(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
+    // Held for the whole of `main`. Dropping it flushes and shuts down the
+    // telemetry pipelines; a process that exits without that flush loses
+    // whatever was still buffered, which is usually the part worth having.
+    // Every early return below drops it, so the two command-line escape
+    // hatches flush as well.
+    let _telemetry = adelie_telemetry::init(telemetry::config())?;
+    tracing::info!("desktop-assistant starting");
 
     // DT-3 (#269): operator escape hatch. `desktop-assistant --revoke-token
     // <jwt>` adds the token's `jti` to the WS JWT revocation deny-list and
@@ -842,8 +846,6 @@ async fn main() -> Result<()> {
             return Ok(());
         }
     }
-
-    tracing::info!("desktop-assistant starting");
 
     // Install the rustls crypto provider for TLS support. Returns Err if a
     // provider is already installed — fine on fresh start, but assert success
@@ -2428,13 +2430,30 @@ async fn main() -> Result<()> {
                     // between cycles, as before.
                     let result = service.run_extraction(CancellationToken::new()).await;
                     let elapsed = cycle_start.elapsed();
+                    // The duration is a field, not part of the sentence, so a
+                    // backend can group by it. It is also a measurement, so it
+                    // goes to the metrics facade as well: one slow cycle is a
+                    // log line, a trend is a histogram.
+                    let outcome = if result.is_ok() { "ok" } else { "error" };
+                    adelie_telemetry::metrics::record_duration(
+                        "dreaming.scan.duration",
+                        elapsed,
+                        &[adelie_telemetry::metrics::Label::new("outcome", outcome)],
+                    );
                     match result {
-                        Ok(n) => tracing::info!(
-                            "dreaming: scan cycle finished in {elapsed:.2?}, wrote {n} new fact(s)"
-                        ),
-                        Err(e) => {
-                            tracing::warn!("dreaming: scan cycle failed after {elapsed:.2?}: {e}")
+                        Ok(n) => {
+                            adelie_telemetry::metrics::add("dreaming.facts.written", n as u64, &[]);
+                            tracing::info!(
+                                duration_ms = elapsed.as_millis() as u64,
+                                facts_written = n,
+                                "dreaming: scan cycle finished"
+                            );
                         }
+                        Err(e) => tracing::warn!(
+                            duration_ms = elapsed.as_millis() as u64,
+                            error = %e,
+                            "dreaming: scan cycle failed"
+                        ),
                     }
 
                     tokio::select! {
@@ -2494,14 +2513,26 @@ async fn main() -> Result<()> {
                     tracing::info!("consolidation: starting scan");
                     let started = std::time::Instant::now();
                     // Timer runs aren't user-cancellable (see dreaming above).
-                    match service.run_consolidation(CancellationToken::new()).await {
+                    let result = service.run_consolidation(CancellationToken::new()).await;
+                    let elapsed = started.elapsed();
+                    // As with the extraction cycle above: the duration is a
+                    // field, and the same measurement also reaches the metrics
+                    // facade so a trend is visible without reading every line.
+                    let outcome = if result.is_ok() { "ok" } else { "error" };
+                    adelie_telemetry::metrics::record_duration(
+                        "consolidation.scan.duration",
+                        elapsed,
+                        &[adelie_telemetry::metrics::Label::new("outcome", outcome)],
+                    );
+                    match result {
                         Ok(_) => tracing::info!(
-                            "consolidation: scan finished in {:.2?}",
-                            started.elapsed()
+                            duration_ms = elapsed.as_millis() as u64,
+                            "consolidation: scan finished"
                         ),
                         Err(e) => tracing::warn!(
-                            "consolidation: scan failed after {:.2?}: {e}",
-                            started.elapsed()
+                            duration_ms = elapsed.as_millis() as u64,
+                            error = %e,
+                            "consolidation: scan failed"
                         ),
                     }
 
