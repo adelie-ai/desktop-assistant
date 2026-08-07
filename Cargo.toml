@@ -56,7 +56,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # re-exports it as its own `otel` feature. A default build resolves no
 # opentelemetry crate at all, which `scripts/no-opentelemetry.sh` holds the
 # line on.
-adelie-telemetry = { git = "https://github.com/adelie-ai/adelie-telemetry", rev = "36dcd571c1b2d35a6afc9376e1600766480c4fdc" }
+adelie-telemetry = { git = "https://github.com/adelie-ai/adelie-telemetry", rev = "5c762eca14e43295dd27c5d5adaa658924f5f133" }
 serde = { version = "1", features = ["derive"] }
 
 desktop-assistant-protocol = { path = "crates/protocol" }
