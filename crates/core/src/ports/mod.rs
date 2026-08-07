@@ -56,6 +56,7 @@ pub mod tool_usage;
 pub mod transport;
 pub mod turn_capability;
 pub mod turn_interactivity;
+pub mod turn_telemetry;
 
 #[cfg(test)]
 mod tests {

@@ -5,6 +5,13 @@ edition = "2024"
 license = "AGPL-3.0-or-later"
 
 [dependencies]
+# The metrics facade. The turn loop is where turn, round, LLM-call and
+# tool-call measurements are taken, so the facade is a dependency of the core
+# crate rather than of the binary that hosts it. A default build of this crate
+# resolves no opentelemetry crate: export lives behind `adelie-telemetry`'s own
+# off-by-default `otel` feature, which the daemon's `otel` passthrough turns on
+# for the one shared build of that crate.
+adelie-telemetry.workspace = true
 async-trait.workspace = true
 backon = "1"
 desktop-assistant-auth-jwt.workspace = true
