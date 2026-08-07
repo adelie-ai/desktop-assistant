@@ -21,7 +21,16 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 
 use crate::CoreError;
-use crate::domain::{IndexedSkill, SkillScope};
+use crate::domain::{IndexedSkill, SkillApproval, SkillScope};
+
+/// Boxed-closure boundary for recording a skill the assistant authored from a
+/// completed plan (#1155), wired by the daemon over
+/// [`SkillIndexStore::write_authored`].
+pub type SkillWriteAuthoredFn = Arc<
+    dyn Fn(IndexedSkill) -> Pin<Box<dyn Future<Output = Result<(), CoreError>> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// Boxed-closure boundary for skill search, wired by the daemon over a
 /// [`SkillIndexStore`]. Args: `(query, query_embedding, embedding_model, limit)`,
@@ -80,10 +89,58 @@ pub trait SkillIndexStore: Send + Sync {
     /// cannot write a row that claims to be absent while handing over content it
     /// just read off disk.
     ///
+    /// Approval ([`IndexedSkill::approved_at`] / [`IndexedSkill::approved_by`])
+    /// is **honoured on insert and preserved on update**. A scan re-reads a
+    /// file; it does not re-decide whether a person consented to it, so an
+    /// update never touches the two columns whatever the argument says. On
+    /// insert the argument is taken as written, which is how the scan path
+    /// records "a file in a skill root is a deliberate human act" (see
+    /// [`crate::skill_catalog::reconcile_scan`]) while
+    /// [`Self::write_authored`] records the opposite.
+    ///
     /// An implementation that keeps derived data alongside a row (an embedding,
     /// say) must preserve it when `content_hash` is unchanged and invalidate it
     /// when it changes; nothing else about that data is part of this contract.
     async fn upsert(&self, skill: &IndexedSkill, seen_at: DateTime<Utc>) -> Result<(), CoreError>;
+
+    /// Record a skill the assistant authored from a completed plan (#1155),
+    /// keyed on `(name, owner_user_id)` like [`Self::upsert`].
+    ///
+    /// Two things separate this from a scan, and both are forced rather than
+    /// read off the argument:
+    ///
+    /// - **Unapproved.** `approved_at` and `approved_by` are cleared. This is
+    ///   unattended authoring, so the row lands with no consent recorded, and
+    ///   an amend of an approved skill drops that skill's approval -- the
+    ///   approval was of the old body, not this one. Forcing it in the store
+    ///   rather than in the caller is what makes that atomic: there is no
+    ///   window in which new content wears an old approval.
+    /// - **Not on disk.** Nothing was read from a file, so the row is written
+    ///   absent (`present_on_disk = false`) and `last_seen_at` is left alone.
+    ///   The catalog is the authoritative copy (#639), so the procedure reads
+    ///   and searches normally; only bundled scripts would fail to resolve, and
+    ///   an authored skill has none.
+    ///
+    /// `authored_at` stamps when the skill was written.
+    async fn write_authored(
+        &self,
+        skill: &IndexedSkill,
+        authored_at: DateTime<Utc>,
+    ) -> Result<(), CoreError>;
+
+    /// Record or withdraw approval for the named skills within `scope`,
+    /// leaving every other column untouched (#1155).
+    ///
+    /// `Some(approval)` approves; `None` withdraws, returning the skill to the
+    /// unapproved state. Names not in the scope are ignored rather than being
+    /// an error, and an empty `names` is a no-op -- the same tolerance
+    /// [`Self::set_presence`] has, and for the same reason.
+    async fn set_approval(
+        &self,
+        scope: &SkillScope,
+        names: &[String],
+        approval: Option<SkillApproval>,
+    ) -> Result<(), CoreError>;
 
     /// Every skill in `scope`, present or absent, unfiltered by the calling
     /// user.
@@ -193,6 +250,25 @@ mod tests {
             Ok(())
         }
 
+        async fn write_authored(
+            &self,
+            skill: &IndexedSkill,
+            _authored_at: DateTime<Utc>,
+        ) -> Result<(), CoreError> {
+            let _ = skill;
+            todo!("write_authored")
+        }
+
+        async fn set_approval(
+            &self,
+            scope: &SkillScope,
+            names: &[String],
+            approval: Option<SkillApproval>,
+        ) -> Result<(), CoreError> {
+            let _ = (scope, names, approval);
+            todo!("set_approval")
+        }
+
         async fn list_scope(&self, scope: &SkillScope) -> Result<Vec<IndexedSkill>, CoreError> {
             let rows = self.rows.lock().expect("lock");
             Ok(rows
@@ -289,5 +365,10 @@ mod tests {
         upsert_ignores_caller_supplied_presence,
         get_is_scope_addressed,
         set_presence_tolerates_unknown_and_empty,
+        authored_skill_is_unapproved_until_approved,
+        upsert_preserves_approval_across_a_rescan,
+        a_scanned_skill_arrives_approved,
+        amending_an_approved_skill_withdraws_its_approval,
+        set_approval_tolerates_unknown_and_empty,
     );
 }

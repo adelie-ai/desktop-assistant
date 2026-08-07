@@ -20,7 +20,7 @@
 use chrono::{DateTime, TimeZone, Utc};
 
 use super::SkillIndexStore;
-use crate::domain::{IndexedSkill, Locality, SkillKind, SkillScope, TrustTier};
+use crate::domain::{IndexedSkill, Locality, SkillApproval, SkillKind, SkillScope, TrustTier};
 use crate::ports::auth::{UserId, with_user_id};
 use crate::skill_catalog::reconcile_scan;
 
@@ -61,6 +61,10 @@ pub fn sample_skill(name: &str, owner: Option<&str>, body: &str) -> IndexedSkill
         metadata: serde_json::json!({"author": "conformance"}),
         present_on_disk: true,
         last_seen_at: None,
+        // A scan stamps approval when it inserts (see `reconcile_scan`); the
+        // scan-shaped sample carries none of its own.
+        approved_at: None,
+        approved_by: None,
     }
 }
 
@@ -432,6 +436,195 @@ pub async fn set_presence_tolerates_unknown_and_empty(store: &dyn SkillIndexStor
 
     assert!(
         fetch(store, "alpha", None).await.present_on_disk,
+        "neither call touched an unrelated row"
+    );
+}
+
+// --- the approval axis (#1155) ----------------------------------------------
+
+/// Build a skill the assistant authored from a completed plan: no file on
+/// disk, no attachments, and locally authored provenance.
+pub fn authored_skill(name: &str, owner: Option<&str>, body: &str) -> IndexedSkill {
+    IndexedSkill {
+        name: name.to_string(),
+        description: format!("{name} description"),
+        kind: SkillKind::Workflow,
+        disk_path: String::new(),
+        owner_user_id: owner.map(str::to_string),
+        locality: Locality::Daemon,
+        content_hash: format!("hash-{name}"),
+        trust_tier: TrustTier::Local,
+        source: Some("self-authored".to_string()),
+        tags: Vec::new(),
+        attachments: Vec::new(),
+        body: body.to_string(),
+        metadata: serde_json::json!({}),
+        present_on_disk: true,
+        last_seen_at: None,
+        approved_at: Some(first_scan_at()),
+        approved_by: Some("a-liar".to_string()),
+    }
+}
+
+/// A skill Adele writes for herself is unapproved, and stays unapproved until
+/// somebody approves it -- on an axis distinct from `trust_tier`.
+///
+/// This is the whole point of the second column. The authored skill below is
+/// `TrustTier::Local`, the most trusted provenance the catalog has, because
+/// that is exactly what it is: authored locally. Provenance says nothing about
+/// consent, so it must not be followable yet.
+pub async fn authored_skill_is_unapproved_until_approved(store: &dyn SkillIndexStore) {
+    let skill = authored_skill("promoted", None, "## Steps\n1. do it\n");
+    store
+        .write_authored(&skill, first_scan_at())
+        .await
+        .expect("write_authored must not error");
+
+    let stored = fetch(store, "promoted", None).await;
+    assert_eq!(
+        stored.trust_tier,
+        TrustTier::Local,
+        "authored locally is the provenance, and it is the most trusted one"
+    );
+    assert!(
+        !stored.is_approved(),
+        "and it must still not be followable: the argument's approval is not honoured"
+    );
+    assert_eq!(stored.approved_by, None, "nor its claimed approver");
+    assert!(
+        !stored.present_on_disk,
+        "nothing was read off disk, so the row does not claim to be there"
+    );
+
+    store
+        .set_approval(
+            &SkillScope::Global,
+            &["promoted".to_string()],
+            Some(SkillApproval {
+                at: later(),
+                by: Some("the-user".to_string()),
+            }),
+        )
+        .await
+        .expect("set_approval must not error");
+
+    let approved = fetch(store, "promoted", None).await;
+    assert!(approved.is_approved(), "approval is recorded");
+    assert_eq!(approved.approved_at, Some(later()));
+    assert_eq!(approved.approved_by.as_deref(), Some("the-user"));
+    assert_eq!(
+        approved.body, "## Steps\n1. do it\n",
+        "and approving changed nothing else"
+    );
+}
+
+/// Approval is preserved across a rescan. A scan re-reads a file; it does not
+/// re-decide whether a person consented to it.
+pub async fn upsert_preserves_approval_across_a_rescan(store: &dyn SkillIndexStore) {
+    reconcile_scan(
+        store,
+        &SkillScope::Global,
+        vec![sample_skill("alpha", None, "first body")],
+        first_scan_at(),
+    )
+    .await
+    .expect("first scan");
+
+    store
+        .set_approval(&SkillScope::Global, &["alpha".to_string()], None)
+        .await
+        .expect("withdraw approval");
+    assert!(!fetch(store, "alpha", None).await.is_approved());
+
+    reconcile_scan(
+        store,
+        &SkillScope::Global,
+        vec![sample_skill("alpha", None, "second body")],
+        later(),
+    )
+    .await
+    .expect("second scan");
+
+    let after = fetch(store, "alpha", None).await;
+    assert_eq!(after.body, "second body", "the rescan updated the content");
+    assert!(
+        !after.is_approved(),
+        "but it did not silently re-approve a skill a person had unapproved"
+    );
+}
+
+/// A scan records approval on the rows it creates: putting a file in a skill
+/// root is a deliberate human act, so a skill that arrives that way is
+/// approved, and only that path may say so.
+pub async fn a_scanned_skill_arrives_approved(store: &dyn SkillIndexStore) {
+    reconcile_scan(
+        store,
+        &SkillScope::Global,
+        vec![sample_skill("alpha", None, "body")],
+        first_scan_at(),
+    )
+    .await
+    .expect("first scan");
+
+    let stored = fetch(store, "alpha", None).await;
+    assert!(
+        stored.is_approved(),
+        "a file a person placed in a skill root is approved by that act"
+    );
+    assert_eq!(stored.approved_at, Some(first_scan_at()));
+}
+
+/// Amending an approved skill through the authored path drops its approval:
+/// the approval was of the old body, and nobody has seen the new one.
+pub async fn amending_an_approved_skill_withdraws_its_approval(store: &dyn SkillIndexStore) {
+    reconcile_scan(
+        store,
+        &SkillScope::Global,
+        vec![sample_skill("alpha", None, "the reviewed body")],
+        first_scan_at(),
+    )
+    .await
+    .expect("first scan");
+    assert!(fetch(store, "alpha", None).await.is_approved());
+
+    let mut revised = authored_skill("alpha", None, "## Steps\n1. something new\n");
+    revised.content_hash = "hash-revised".to_string();
+    store
+        .write_authored(&revised, later())
+        .await
+        .expect("amend");
+
+    let after = fetch(store, "alpha", None).await;
+    assert_eq!(after.body, "## Steps\n1. something new\n");
+    assert!(
+        !after.is_approved(),
+        "new content must not wear the old content's approval"
+    );
+}
+
+/// `set_approval` tolerates names that aren't in the scope and an empty name
+/// list, matching `set_presence`.
+pub async fn set_approval_tolerates_unknown_and_empty(store: &dyn SkillIndexStore) {
+    reconcile_scan(
+        store,
+        &SkillScope::Global,
+        vec![sample_skill("alpha", None, "body")],
+        first_scan_at(),
+    )
+    .await
+    .expect("first scan");
+
+    store
+        .set_approval(&SkillScope::Global, &[], None)
+        .await
+        .expect("an empty name list is a no-op, not an error");
+    store
+        .set_approval(&SkillScope::Global, &["ghost".to_string()], None)
+        .await
+        .expect("an unknown name is ignored, not an error");
+
+    assert!(
+        fetch(store, "alpha", None).await.is_approved(),
         "neither call touched an unrelated row"
     );
 }
