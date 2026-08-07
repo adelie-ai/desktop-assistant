@@ -1672,9 +1672,27 @@ async fn compact_range_into_summary<L: LlmClient>(
     }
 }
 
+/// What one call to [`compact_preflight_shrink`] did.
+///
+/// Three outcomes rather than a `bool`, because the caller has to tell "there
+/// was nothing to fold" from "there was, and the summariser declined". The
+/// first must not use up the turn's one attempt; the second must, or a
+/// summariser that is down costs one call per round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreflightFold {
+    /// The budget check did not narrow the window past the marker. Nothing was
+    /// dropped that the summary does not already describe, and no call was made.
+    NotNeeded,
+    /// The dropped range was folded in and the marker moved over it.
+    Folded,
+    /// The range needed folding and the summariser produced no summary. The
+    /// marker stays put, so the range is offered again on a later turn.
+    Declined,
+}
+
 /// Fold what the assembler's pre-flight budget check dropped past the
 /// compaction marker, so no message lands in neither the prompt nor the rolling
-/// summary. Reports whether the marker moved.
+/// summary.
 ///
 /// [`assemble_turn_within_budget`] answers an oversized prompt by halving the
 /// message window, down to [`MIN_CONTEXT_MESSAGES`]. Turn-entry compaction ran
@@ -1684,32 +1702,42 @@ async fn compact_range_into_summary<L: LlmClient>(
 /// standing in for it, and nothing later detects it.
 ///
 /// `window_from` is where the assembler said the prompt starts
-/// (`AssembledTurn::window_from`); `requested_window` is the window the caller
-/// asked for. This is a no-op when the two agree, which is the normal case -
-/// the deliberate lag between the marker and the window start is the compaction
-/// cadence ([`COMPACTION_INTERVAL`]) doing its job, and folding it early would
-/// spend a summariser call every turn.
+/// ([`AssembledTurn::window_from`]); `requested_window` is the window the caller
+/// asked for. This answers [`PreflightFold::NotNeeded`] when the two agree,
+/// which is the normal case - the deliberate lag between the marker and the
+/// window start is the compaction cadence ([`COMPACTION_INTERVAL`]) doing its
+/// job, and folding it early would spend a summariser call every turn.
 ///
-/// The fold covers the whole range from the marker, not only what the shrink
-/// added, because the marker may only move over history a summary describes.
+/// The fold starts at the marker, not at what the shrink added, because the
+/// marker may only move over history a summary describes. It ends at
+/// `window_from` or one `MAX_COMPACTION_SPAN` on from the marker, whichever
+/// comes first - so a very wide range still costs one bounded call. A capped
+/// fold still answers [`PreflightFold::Folded`], and leaves the marker short of
+/// `window_from`; the rest is offered again on a later turn, exactly as the
+/// cadence path leaves it.
 ///
-/// The caller assembles again afterwards, so the prompt this turn sends carries
-/// the summary of what it dropped.
+/// **Call this at most once per turn.** Every round appends messages, so a
+/// shrunk window keeps sliding forward and both guards keep passing; called per
+/// round it would spend a summariser call per round on the turns that are
+/// already the most expensive. The rounds' own drift needs no fold: the next
+/// turn assembles at the full window again and carries those messages itself.
+/// The caller assembles again after a [`PreflightFold::Folded`], so the prompt
+/// this turn sends carries the summary of what it dropped.
 pub(crate) async fn compact_preflight_shrink<L: LlmClient>(
     conv: &mut Conversation,
     window_from: usize,
     requested_window: usize,
     llm: &L,
-) -> bool {
+) -> PreflightFold {
     if window_from <= window_start(&conv.messages, requested_window) {
-        return false;
+        return PreflightFold::NotNeeded;
     }
     if window_from <= conv.compacted_through {
-        return false;
+        return PreflightFold::NotNeeded;
     }
     let from = conv.compacted_through;
     let folded = compact_range_into_summary(conv, from, window_from, llm).await;
-    tracing::warn!(
+    tracing::info!(
         from,
         window_from,
         requested_window,
@@ -1717,7 +1745,11 @@ pub(crate) async fn compact_preflight_shrink<L: LlmClient>(
         "the pre-flight budget check narrowed the window past the compaction \
          marker; folding what it dropped into the rolling summary"
     );
-    folded
+    if folded {
+        PreflightFold::Folded
+    } else {
+        PreflightFold::Declined
+    }
 }
 
 /// What one run of the recovery ladder achieved.
@@ -5115,7 +5147,11 @@ mod tests {
         let folded =
             compact_preflight_shrink(&mut conv, shrunk_start, MAX_CONTEXT_MESSAGES, &llm).await;
 
-        assert!(folded, "the newly-dropped range must be folded in");
+        assert_eq!(
+            folded,
+            PreflightFold::Folded,
+            "the newly-dropped range must be folded in"
+        );
         assert_eq!(
             conv.compacted_through, shrunk_start,
             "the marker must cover everything the shrunk prompt no longer carries"
@@ -5134,8 +5170,9 @@ mod tests {
         let shrunk_start = window_start(&conv.messages, MIN_CONTEXT_MESSAGES);
 
         let llm = CountingSummariser::default();
-        assert!(
-            compact_preflight_shrink(&mut conv, shrunk_start, MAX_CONTEXT_MESSAGES, &llm).await
+        assert_eq!(
+            compact_preflight_shrink(&mut conv, shrunk_start, MAX_CONTEXT_MESSAGES, &llm).await,
+            PreflightFold::Folded
         );
         assert_eq!(
             conv.compacted_through, shrunk_start,
@@ -5162,8 +5199,9 @@ mod tests {
         let folded =
             compact_preflight_shrink(&mut conv, requested_start, MAX_CONTEXT_MESSAGES, &llm).await;
 
-        assert!(
-            !folded,
+        assert_eq!(
+            folded,
+            PreflightFold::NotNeeded,
             "no shrink happened, so there is nothing extra to fold"
         );
         assert_eq!(conv.compacted_through, before);
@@ -5179,7 +5217,10 @@ mod tests {
     async fn a_conversation_that_fits_the_window_never_folds() {
         let mut conv = conv_of_pairs(3);
         let llm = CountingSummariser::default();
-        assert!(!compact_preflight_shrink(&mut conv, 0, MAX_CONTEXT_MESSAGES, &llm).await);
+        assert_eq!(
+            compact_preflight_shrink(&mut conv, 0, MAX_CONTEXT_MESSAGES, &llm).await,
+            PreflightFold::NotNeeded
+        );
         assert_eq!(conv.compacted_through, 0);
         assert_eq!(llm.longest_prompt(), 0);
     }
@@ -5197,7 +5238,12 @@ mod tests {
             compact_preflight_shrink(&mut conv, shrunk_start, MAX_CONTEXT_MESSAGES, &FailingLlm)
                 .await;
 
-        assert!(!folded);
+        assert_eq!(
+            folded,
+            PreflightFold::Declined,
+            "a needed fold the summariser refused is not the same as no fold: it \
+             uses up the turn's one attempt"
+        );
         assert_eq!(conv.compacted_through, requested_start);
         assert_eq!(conv.context_summary, "");
     }

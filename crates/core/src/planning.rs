@@ -283,6 +283,25 @@ fn tool_names_by_call_id(messages: &[Message]) -> std::collections::HashMap<Stri
     names
 }
 
+/// Whether the notes an eviction names hold a distilled trace a LATER turn may
+/// rely on.
+///
+/// The eviction is only sound because something stands in for what left the
+/// model's view. Within the turn that is a judgement the turn makes about its
+/// own pointer. Across turns it is a promise, and it may only be recorded when
+/// the promise is real - #798 was the case where a best-effort note write
+/// followed by an unconditional eviction lost the output outright.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DistilledTrace {
+    /// The step wrote a note holding its own account of the scope, and the
+    /// write landed. The decision is recorded on each evicted row.
+    Written,
+    /// No note holds the scope: the step named none, the write did not land, or
+    /// the turn's provenance withheld the text and left a placeholder. The
+    /// eviction stays turn-local and a later turn reads the stored output.
+    Absent,
+}
+
 /// Read every sizeable `Role::Tool` message in `messages[from..]` as a
 /// [`compaction_pointer`] for the rest of the turn, freeing context while
 /// leaving the message structure (role + `tool_call_id`) intact so provider
@@ -295,12 +314,12 @@ fn tool_names_by_call_id(messages: &[Message]) -> std::collections::HashMap<Stri
 /// the conversation later still finds what the tool returned, whether or not
 /// the distilling note was written.
 ///
-/// What DOES reach the row is the decision: each evicted result records
-/// `note_keys` in `Message::distilled_into`, so a later turn can rebuild the
-/// same pointer with [`carry_evictions`] instead of reading the payload again.
-/// An eviction with no note keys records nothing - there is no distilled trace
-/// to point at, so the next turn reads the stored output rather than a pointer
-/// to a note that was never written.
+/// What reaches the row is the decision, and only under
+/// [`DistilledTrace::Written`]: each evicted result records `note_keys` in
+/// `Message::distilled_into`, so a later turn rebuilds the same pointer with
+/// [`carry_evictions`] instead of reading the payload again. Under
+/// [`DistilledTrace::Absent`] nothing is recorded, so the next turn reads the
+/// stored output rather than a pointer to a note that holds nothing.
 ///
 /// Idempotent: results the round already reads as a pointer are skipped.
 /// `from` is clamped to the slice length. No path removes messages mid-turn,
@@ -311,6 +330,7 @@ pub(crate) fn evict_tool_results(
     projection: &mut ContextProjection,
     from: usize,
     note_keys: &[String],
+    trace: DistilledTrace,
 ) -> (usize, usize) {
     let from = from.min(messages.len());
     let names = tool_names_by_call_id(messages);
@@ -333,7 +353,7 @@ pub(crate) fn evict_tool_results(
         let pointer = compaction_pointer(tool_name, note_keys);
         freed += current.len().saturating_sub(pointer.len());
         evicted += 1;
-        if !note_keys.is_empty() {
+        if trace == DistilledTrace::Written && !note_keys.is_empty() {
             m.distilled_into = note_keys.to_vec();
         }
         projection.replace(m, pointer);
@@ -1180,7 +1200,13 @@ mod tests {
         ];
         let keys = vec!["outcome:1".to_string()];
         let mut projection = ContextProjection::default();
-        let (evicted, freed) = evict_tool_results(&mut messages, &mut projection, 1, &keys);
+        let (evicted, freed) = evict_tool_results(
+            &mut messages,
+            &mut projection,
+            1,
+            &keys,
+            DistilledTrace::Written,
+        );
         assert_eq!(evicted, 1);
         assert!(freed > 4000);
         // Structure preserved: still a Tool message with its tool_call_id.
@@ -1212,6 +1238,7 @@ mod tests {
             &mut projection,
             0,
             &["outcome:1".to_string()],
+            DistilledTrace::Written,
         );
 
         assert_eq!(evicted, 1, "the result still leaves the turn's view");
@@ -1223,6 +1250,19 @@ mod tests {
             messages[1].content, big,
             "the raw output must survive in the record"
         );
+        // `Message`'s equality excludes the eviction decision, so the compare
+        // above cannot speak for it. Name the one field the eviction may touch,
+        // and check the rest by hand, or a later metadata field slips through
+        // the same hole.
+        assert_eq!(messages[1].distilled_into, vec!["outcome:1".to_string()]);
+        for (after, was) in messages.iter().zip(&before) {
+            assert_eq!(after.id, was.id, "ids are the message's identity");
+            assert_eq!(after.role, was.role);
+            assert_eq!(after.tool_call_id, was.tool_call_id);
+            assert_eq!(after.tool_calls, was.tool_calls);
+            assert_eq!(after.summary_id, was.summary_id);
+            assert_eq!(after.idempotency_key, was.idempotency_key);
+        }
     }
 
     /// #1144: the decision reaches the row so a later turn can rebuild the
@@ -1240,6 +1280,7 @@ mod tests {
             &mut projection,
             0,
             &["outcome:1".to_string()],
+            DistilledTrace::Written,
         );
 
         assert_eq!(
@@ -1263,7 +1304,13 @@ mod tests {
             tool_msg("c1", &big),
         ];
         let mut projection = ContextProjection::default();
-        let (evicted, _) = evict_tool_results(&mut messages, &mut projection, 0, &[]);
+        let (evicted, _) = evict_tool_results(
+            &mut messages,
+            &mut projection,
+            0,
+            &[],
+            DistilledTrace::Absent,
+        );
 
         assert_eq!(evicted, 1);
         assert!(
@@ -1296,7 +1343,13 @@ mod tests {
         ];
         let keys = vec!["k".to_string()];
         let mut projection = ContextProjection::default();
-        let (evicted, _) = evict_tool_results(&mut messages, &mut projection, 0, &keys);
+        let (evicted, _) = evict_tool_results(
+            &mut messages,
+            &mut projection,
+            0,
+            &keys,
+            DistilledTrace::Written,
+        );
         assert_eq!(evicted, 1); // only the big one
         assert_eq!(projection.content(&messages[1]), "tiny");
         assert!(
@@ -1305,7 +1358,13 @@ mod tests {
         );
 
         // Second pass over the same range is a no-op (idempotent).
-        let (evicted2, freed2) = evict_tool_results(&mut messages, &mut projection, 0, &keys);
+        let (evicted2, freed2) = evict_tool_results(
+            &mut messages,
+            &mut projection,
+            0,
+            &keys,
+            DistilledTrace::Written,
+        );
         assert_eq!(evicted2, 0);
         assert_eq!(freed2, 0);
     }
@@ -1314,7 +1373,13 @@ mod tests {
     fn evict_clamps_out_of_range_watermark() {
         let mut messages = vec![Message::new(Role::User, "hi")];
         let mut projection = ContextProjection::default();
-        let (evicted, freed) = evict_tool_results(&mut messages, &mut projection, 99, &[]);
+        let (evicted, freed) = evict_tool_results(
+            &mut messages,
+            &mut projection,
+            99,
+            &[],
+            DistilledTrace::Absent,
+        );
         assert_eq!((evicted, freed), (0, 0));
     }
 

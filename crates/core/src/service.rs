@@ -1,9 +1,10 @@
 use crate::CoreError;
 use crate::context::{
     COMPACTION_TOKEN_RATIO, ContextProjection, ConversationView, DEFAULT_MAX_TOOL_RESULT_BYTES,
-    MAX_CONTEXT_MESSAGES, MAX_OVERFLOW_RETRIES, MIN_CONTEXT_MESSAGES, RecoveryOutcome, ToolContext,
-    ToolLocalityContext, TurnAnchors, assemble_turn_within_budget, cap_tool_result,
-    compact_into_summary, compact_preflight_shrink, recover_from_overflow, window_start,
+    MAX_CONTEXT_MESSAGES, MAX_OVERFLOW_RETRIES, MIN_CONTEXT_MESSAGES, PreflightFold,
+    RecoveryOutcome, ToolContext, ToolLocalityContext, TurnAnchors, assemble_turn_within_budget,
+    cap_tool_result, compact_into_summary, compact_preflight_shrink, recover_from_overflow,
+    window_start,
 };
 use crate::domain::{
     Conversation, ConversationId, ConversationSummary, Message, Role, ToolCall, ToolDefinition,
@@ -887,6 +888,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             Ok(notes) => notes,
             Err(e) => {
                 tracing::warn!(
+                    conversation_id = %conversation_id.0,
                     error = %e,
                     "could not read the notes an earlier turn distilled results into; \
                      this turn reads the stored output instead"
@@ -899,11 +901,24 @@ impl<S, L, T> ConversationHandler<S, L, T> {
         let (carried, saved) = planning::carry_evictions(in_view, projection, &live);
         if carried > 0 {
             tracing::info!(
+                conversation_id = %conversation_id.0,
                 carried,
                 saved_bytes = saved,
                 notes_asked = wanted,
                 notes_found = live.len(),
                 "carried earlier turns' tool-result evictions into this turn"
+            );
+        } else {
+            // Rows carry a decision and none of it could be honoured. The
+            // saving has stopped working for this conversation and every turn
+            // is paying the full payload again, which otherwise looks exactly
+            // like a conversation that never completed a step.
+            tracing::info!(
+                conversation_id = %conversation_id.0,
+                notes_asked = wanted,
+                notes_found = live.len(),
+                "the notes earlier turns distilled results into are gone; this \
+                 turn reads the stored output"
             );
         }
     }
@@ -1047,6 +1062,10 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             knowledge_entry_id: None,
         }];
         let mut note_keys: Vec<String> = Vec::new();
+        // Whether the outcome note carries the step's own account of the scope,
+        // as opposed to the placeholder a tainted turn records (#741). A
+        // placeholder says a step happened and nothing about what it found.
+        let mut outcome_is_a_trace = false;
         if let Some(o) = outcome {
             let okey = format!("{}{}", planning::OUTCOME_KEY_PREFIX, frame.key);
             let body = if abandoned {
@@ -1055,6 +1074,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
                 o.to_string()
             };
             let body = step_text_to_record(&body, provenance);
+            outcome_is_a_trace = body != WITHHELD_STEP_TEXT;
             notes.push(NewScratchpadNote {
                 key: okey.clone(),
                 content: planning::truncate_on_char_boundary(&body, MAX_NOTE_BYTES),
@@ -1066,9 +1086,28 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             });
             note_keys.push(okey);
         }
-        if let Err(e) = write(conv_id, notes).await {
+        let saved = write(conv_id, notes).await;
+        if let Err(e) = &saved {
             tracing::warn!(step = %frame.key, error = %e, "failed to record step completion notes");
         }
+
+        // Whether a LATER turn may read these results as a pointer. Three
+        // things have to hold, and each one is a way #798's loss comes back if
+        // it is assumed instead: the step named an outcome note, the note holds
+        // the step's own account rather than a placeholder, and the write
+        // landed. The pointer THIS turn reads is unaffected - it dies with the
+        // turn, and the model that reads it also ran the step.
+        let trace = match &saved {
+            Ok(written)
+                if outcome_is_a_trace
+                    && note_keys
+                        .iter()
+                        .all(|k| written.iter().any(|n| &n.key == k)) =>
+            {
+                planning::DistilledTrace::Written
+            }
+            _ => planning::DistilledTrace::Absent,
+        };
 
         // Drop the step's raw tool results from the turn's view, leaving a
         // pointer to the outcome note. This is what stops the per-round
@@ -1081,6 +1120,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             projection,
             frame.watermark,
             &note_keys,
+            trace,
         );
         tracing::info!(
             step = %frame.key,
@@ -1644,6 +1684,10 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         self.carry_recorded_evictions(conversation_id, &conv, &mut projection)
             .await;
 
+        // Whether this turn has already spent its one attempt at folding what
+        // the assembler's pre-flight shrink dropped. See the call site.
+        let mut preflight_folded = false;
+
         // Count of in-turn ContextOverflow recoveries. Bounded so a
         // persistently-oversized request doesn't loop indefinitely.
         let mut overflow_retries: u32 = 0;
@@ -2118,6 +2162,9 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
             // capturing it - the fold between the two passes needs it mutably.
             // `assembly_window` is a copy of `target_window` for the same
             // reason: overflow recovery shrinks that one later in the round.
+            // Read it here, before anything in this iteration can change it: the
+            // fold compares against the window the prompt was actually asked
+            // for, and a stale copy would fold a range nothing dropped.
             let assembly_window = target_window;
             let assemble = |conv: &Conversation| {
                 assemble_turn_within_budget(
@@ -2141,15 +2188,32 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
             // starts is then in neither the prompt nor the rolling summary, so
             // fold it in and assemble again before the call. A no-op on a turn
             // the check did not shrink, which is the normal case.
-            if compact_preflight_shrink(
-                &mut conv,
-                assembled.window_from,
-                assembly_window,
-                self.task_llm(),
-            )
-            .await
-            {
-                assembled = assemble(&conv);
+            //
+            // At most one attempt per turn. Every round appends messages, so a
+            // shrunk window keeps sliding forward and the fold's guards keep
+            // passing; run per round it would spend a summariser call per round
+            // on the turns that are already the most expensive, and re-merge
+            // the rolling summary from itself as many times. The rounds' own
+            // drift needs no fold - the next turn assembles at the full window
+            // again and carries those messages itself. A summariser that
+            // declined uses up the attempt too, so one that is down costs one
+            // call rather than one per round.
+            if !preflight_folded {
+                match compact_preflight_shrink(
+                    &mut conv,
+                    assembled.window_from,
+                    assembly_window,
+                    self.task_llm(),
+                )
+                .await
+                {
+                    PreflightFold::NotNeeded => {}
+                    PreflightFold::Folded => {
+                        preflight_folded = true;
+                        assembled = assemble(&conv);
+                    }
+                    PreflightFold::Declined => preflight_folded = true,
+                }
             }
             // Where the assembled prompt starts. Overflow recovery needs it,
             // because the pre-flight budget check inside assembly can narrow
@@ -6002,29 +6066,55 @@ mod tests {
         })
     }
 
-    /// The three LLM answers a turn needs to run one step over one big tool
-    /// result: begin, call the tool, complete and answer.
-    fn one_step_turn_responses(answer: &str) -> Vec<LlmResponse> {
+    /// A tool whose results are trusted, so a step over it leaves the turn
+    /// clean and the outcome note records the model's own account of the
+    /// scope. A tainted turn records a placeholder instead, which is no trace
+    /// at all - see `a_tainted_turns_eviction_is_not_carried_across_turns`.
+    const CLEAN_TOOL: &str = "builtin_conversation_search";
+
+    /// The four LLM answers a turn needs to run one step over one big result
+    /// from `tool`: begin, call it, complete the step, answer.
+    fn one_step_turn_responses(tool: &str, answer: &str) -> Vec<LlmResponse> {
         vec![
             LlmResponse::with_tool_calls(
                 "",
                 vec![ToolCall::new(
                     "b1",
                     "begin_step",
-                    r#"{"goal":"get the forecast"}"#,
+                    r#"{"goal":"look it up"}"#,
                 )],
             ),
-            LlmResponse::with_tool_calls("", vec![ToolCall::new("t1", "weather_forecast", "{}")]),
+            LlmResponse::with_tool_calls("", vec![ToolCall::new("t1", tool, "{}")]),
             LlmResponse::with_tool_calls(
                 "",
                 vec![ToolCall::new(
                     "c1",
                     "complete_step",
-                    r#"{"outcome":"7-day: highs low-80s, rain Tue"}"#,
+                    r#"{"outcome":"three matches, all in the archive"}"#,
                 )],
             ),
             LlmResponse::text(answer),
         ]
+    }
+
+    /// The fixture both carry tests share: one step over one big result from
+    /// `tool`, then a second turn. Answers the payload, the tool set, the
+    /// results and the LLM script.
+    #[allow(clippy::type_complexity)]
+    fn carry_fixture(
+        tool: &str,
+    ) -> (
+        String,
+        Vec<ToolDefinition>,
+        HashMap<String, String>,
+        Vec<LlmResponse>,
+    ) {
+        let big = "DATA".repeat(2000); // ~8 KB, well above the eviction threshold
+        let mut results = HashMap::new();
+        results.insert(tool.to_string(), big.clone());
+        let mut responses = one_step_turn_responses(tool, "Three matches.");
+        responses.push(LlmResponse::text("Still three."));
+        (big, vec![tool_def(tool)], results, responses)
     }
 
     /// #1144 acceptance: a conversation whose step completed on an earlier turn
@@ -6034,17 +6124,7 @@ mod tests {
     /// other (#798).
     #[tokio::test]
     async fn a_later_turn_reads_the_pointer_while_storage_keeps_the_raw_output() {
-        let big = "DATA".repeat(2000); // ~8 KB, well above the eviction threshold
-        let tools = vec![ToolDefinition::new(
-            "weather_forecast",
-            "Get a forecast",
-            serde_json::json!({"type": "object"}),
-        )];
-        let mut tool_results = HashMap::new();
-        tool_results.insert("weather_forecast".to_string(), big.clone());
-
-        let mut responses = one_step_turn_responses("Warm, with rain Tuesday.");
-        responses.push(LlmResponse::text("Still warm."));
+        let (big, tools, tool_results, responses) = carry_fixture(CLEAN_TOOL);
 
         let (write, list, sp) = in_memory_scratchpad();
         let llm = ToolCallingLlm::new(responses);
@@ -6064,7 +6144,7 @@ mod tests {
             .await
             .unwrap();
         handler
-            .send_prompt(&conv.id, "weather?".into(), noop_callback(), noop_status())
+            .send_prompt(&conv.id, "search?".into(), noop_callback(), noop_status())
             .await
             .unwrap();
 
@@ -6073,7 +6153,7 @@ mod tests {
         handler
             .send_prompt(
                 &conv.id,
-                "and tomorrow?".into(),
+                "and again?".into(),
                 noop_callback(),
                 noop_status(),
             )
@@ -6116,17 +6196,61 @@ mod tests {
     /// lost; a decision whose note is gone falls back to the stored output.
     #[tokio::test]
     async fn a_later_turn_reads_the_raw_output_when_the_distilling_note_is_gone() {
-        let big = "DATA".repeat(2000);
-        let tools = vec![ToolDefinition::new(
-            "weather_forecast",
-            "Get a forecast",
-            serde_json::json!({"type": "object"}),
-        )];
-        let mut tool_results = HashMap::new();
-        tool_results.insert("weather_forecast".to_string(), big.clone());
+        let (big, tools, tool_results, responses) = carry_fixture(CLEAN_TOOL);
 
-        let mut responses = one_step_turn_responses("Warm, with rain Tuesday.");
-        responses.push(LlmResponse::text("Still warm."));
+        let (write, list, sp) = in_memory_scratchpad();
+        let llm = ToolCallingLlm::new(responses);
+        let prompts = llm.prompts();
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            llm,
+            MockToolExecutor::new(tools, tool_results),
+            id_gen(),
+        )
+        .with_scratchpad_write(write)
+        .with_scratchpad_list(list)
+        .with_scratchpad_get_many(scratchpad_get_many_over(Arc::clone(&sp)));
+
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "search?".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+
+        // The distilled trace goes away between turns - a user cleared the pad,
+        // or the model deleted the note.
+        sp.lock().unwrap().remove("outcome:1");
+
+        handler
+            .send_prompt(
+                &conv.id,
+                "and again?".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await
+            .unwrap();
+
+        let read_by_model = last_prompt_result(&prompts, "t1");
+        assert_eq!(
+            read_by_model, big,
+            "with no note left to point at, the turn must read the stored output"
+        );
+    }
+
+    /// #798 again, by the other door. A turn that reads outside content records
+    /// a placeholder in place of the model's wording (#741), so its outcome
+    /// note says a step happened and nothing about what the step found. That is
+    /// no distilled trace, and a pointer to it would send every later turn to a
+    /// note holding nothing while the output sat out of view. The eviction
+    /// stays turn-local, and the next turn reads the stored output.
+    #[tokio::test]
+    async fn a_tainted_turns_eviction_is_not_carried_across_turns() {
+        // `weather_` results are externally controlled, so this turn is tainted.
+        let (big, tools, tool_results, responses) = carry_fixture("weather_forecast");
 
         let (write, list, sp) = in_memory_scratchpad();
         let llm = ToolCallingLlm::new(responses);
@@ -6150,9 +6274,26 @@ mod tests {
             .await
             .unwrap();
 
-        // The distilled trace goes away between turns - a user cleared the pad,
-        // or the model deleted the note.
-        sp.lock().unwrap().remove("outcome:1");
+        // The note exists, so a liveness check on the key alone would pass it.
+        assert_eq!(
+            sp.lock()
+                .unwrap()
+                .get("outcome:1")
+                .map(|n| n.content.clone()),
+            Some(WITHHELD_STEP_TEXT.to_string()),
+            "the fixture must produce a placeholder outcome note"
+        );
+
+        let stored = handler.get_conversation(&conv.id).await.unwrap();
+        let result = stored
+            .messages
+            .iter()
+            .find(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some("t1"))
+            .expect("the tool result message must still exist");
+        assert!(
+            result.distilled_into.is_empty(),
+            "a placeholder is not a trace, so no decision may reach the row"
+        );
 
         handler
             .send_prompt(
@@ -6164,10 +6305,11 @@ mod tests {
             .await
             .unwrap();
 
-        let read_by_model = last_prompt_result(&prompts, "t1");
         assert_eq!(
-            read_by_model, big,
-            "with no note left to point at, the turn must read the stored output"
+            last_prompt_result(&prompts, "t1"),
+            big,
+            "the later turn must read the stored output, not a pointer to an \
+             empty note"
         );
     }
 
@@ -9409,6 +9551,158 @@ mod tests {
             !after.context_summary.is_empty(),
             "the marker may only step over a range the summary describes"
         );
+    }
+
+    /// A mock that drives `rounds` tool rounds then answers, recording every
+    /// prompt so a test can count how many were summariser calls.
+    struct RoundCountingLlm {
+        rounds: std::sync::atomic::AtomicU32,
+        seen: Arc<Mutex<Vec<Vec<Message>>>>,
+    }
+
+    /// Opening of the rolling summariser's system message. No turn prompt
+    /// starts with it, so it separates a fold from a round.
+    const SUMMARISER_OPENING: &str = "You are a conversation summarizer.";
+
+    impl RoundCountingLlm {
+        fn new(rounds: u32) -> Self {
+            Self {
+                rounds: std::sync::atomic::AtomicU32::new(rounds),
+                seen: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn prompts(&self) -> Arc<Mutex<Vec<Vec<Message>>>> {
+            Arc::clone(&self.seen)
+        }
+    }
+
+    /// How many recorded prompts were rolling-summary calls.
+    fn summariser_calls(prompts: &Arc<Mutex<Vec<Vec<Message>>>>) -> usize {
+        prompts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| {
+                p.first()
+                    .is_some_and(|m| m.content.starts_with(SUMMARISER_OPENING))
+            })
+            .count()
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for RoundCountingLlm {
+        async fn stream_completion(
+            &self,
+            messages: Vec<Message>,
+            _tools: &[ToolDefinition],
+            _reasoning: ReasoningConfig,
+            mut on_chunk: ChunkCallback,
+        ) -> Result<LlmResponse, CoreError> {
+            let summariser = messages
+                .first()
+                .is_some_and(|m| m.content.starts_with(SUMMARISER_OPENING));
+            self.seen.lock().unwrap().push(messages);
+            if summariser {
+                return Ok(LlmResponse::text("Active task: keep going\n- earlier work"));
+            }
+            let left = self
+                .rounds
+                .fetch_update(
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                    |n| Some(n.saturating_sub(1)),
+                )
+                .unwrap_or(0);
+            if left == 0 {
+                on_chunk("done".to_string());
+                return Ok(LlmResponse::text("done"));
+            }
+            Ok(LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new(format!("r{left}"), CLEAN_TOOL, "{}")],
+            ))
+        }
+    }
+
+    /// #1144: the fold costs one summariser call per TURN, not one per round.
+    ///
+    /// Every round appends messages, so a shrunk window keeps sliding forward
+    /// and the fold's own guards keep passing. Run per round on a long agentic
+    /// turn it would spend a summariser call per round - on exactly the turns
+    /// that are already the most expensive - and re-merge the rolling summary
+    /// from itself as many times, which squeezes out what it recorded first.
+    #[tokio::test]
+    async fn the_preflight_fold_costs_one_summariser_call_per_turn() {
+        // Two turns of the same shape, one three times as long as the other. A
+        // per-round fold scales with the round count; a per-turn one does not.
+        let short = summariser_calls_for_a_shrunk_turn(4).await;
+        let long = summariser_calls_for_a_shrunk_turn(12).await;
+        assert_eq!(
+            (short, long),
+            (2, 2),
+            "one turn-entry compaction plus one fold, however many rounds the \
+             turn runs"
+        );
+    }
+
+    /// Run one budget-pressured agentic turn of `rounds` tool rounds over a
+    /// history long enough to window, and answer how many summariser calls it
+    /// made. Asserts on the way through that the turn really shrank and really
+    /// folded, so a count of zero cannot pass for thrift.
+    async fn summariser_calls_for_a_shrunk_turn(rounds: u32) -> usize {
+        use crate::ports::llm::{BudgetSource, ContextBudget, with_context_budget};
+
+        let llm = RoundCountingLlm::new(rounds);
+        let prompts = llm.prompts();
+        let mut results = HashMap::new();
+        results.insert(CLEAN_TOOL.to_string(), "PAYLOAD".repeat(500));
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            llm,
+            MockToolExecutor::new(vec![tool_def(CLEAN_TOOL)], results),
+            id_gen(),
+        );
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        let mut stored = handler.get_conversation(&conv.id).await.unwrap();
+        for i in 0..30 {
+            stored
+                .messages
+                .push(Message::new(Role::User, format!("u-{i}")));
+            stored
+                .messages
+                .push(Message::new(Role::Assistant, "PAYLOAD".repeat(300)));
+        }
+        handler.store.update(stored.clone()).await.unwrap();
+        let entry_marker = window_start(&stored.messages, MAX_CONTEXT_MESSAGES);
+
+        let budget = ContextBudget {
+            max_input_tokens: 4_000,
+            source: BudgetSource::ConnectorTable,
+        };
+        with_context_budget(budget, async {
+            handler
+                .send_prompt(&conv.id, "next".into(), noop_callback(), noop_status())
+                .await
+                .unwrap();
+        })
+        .await;
+
+        let turn_prompts = prompts.lock().unwrap().len();
+        assert!(
+            turn_prompts > rounds as usize,
+            "the fixture must actually run {rounds} rounds, saw {turn_prompts} prompts"
+        );
+        let after = handler.get_conversation(&conv.id).await.unwrap();
+        assert!(
+            after.compacted_through > entry_marker,
+            "the fold must still happen, marker {} vs entry {entry_marker}",
+            after.compacted_through
+        );
+        summariser_calls(&prompts)
     }
 
     #[tokio::test]
