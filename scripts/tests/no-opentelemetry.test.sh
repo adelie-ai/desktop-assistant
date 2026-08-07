@@ -94,6 +94,74 @@ the_scan_fails_loudly_when_the_member_list_cannot_be_read() {
     [ "$RUN_STATUS" -ne 0 ] || fail 'an unreadable member list must fail the step'
 }
 
+# --- cargo talking about itself is not a package -----------------------------
+#
+# cargo writes progress to stderr, and one of those lines appears whenever
+# another cargo invocation holds the package-cache lock:
+#
+#     Blocking waiting for file lock on package cache
+#
+# Merging that stream into the output this step parses turns `Blocking` into
+# the first field of a line, and the parser reads first fields as package
+# names. Two separate wrongs follow, one loud and one silent, so each call
+# gets its own case.
+
+# What cargo prints when another invocation holds the package-cache lock.
+LOCK_LINE='    Blocking waiting for file lock on package cache'
+
+# The clean tree above holds 46 distinct packages: three members, forty
+# `crate-NNN`, and three telemetry-adjacent crates. Asserted by number so a
+# phantom package changes the answer rather than hiding in it.
+CLEAN_TREE_CRATES=46
+
+a_lock_message_on_the_member_list_is_not_a_workspace_member() {
+    # The loud wrong. A phantom member cannot appear in any dependency tree,
+    # so the coverage check reports the workspace as partly unscanned and
+    # hard-fails the gate - naming a lock message where it means to name a
+    # crate that was skipped.
+    with_fake_cargo
+    export FAKE_MEMBERS_STDERR="$LOCK_LINE"
+    run_cmd "$SCAN_SH"
+    assert_eq 0 "$RUN_STATUS" 'a lock message must not fail the step'
+    assert_contains "$RUN_OUT" 'all 3 workspace member(s)' \
+        'the member count must not count a line cargo wrote about itself'
+}
+
+a_lock_message_in_the_resolved_tree_is_not_a_package() {
+    # The silent wrong, and the worse of the two: nothing fails, and the step
+    # reports one package more than it scanned. A green line that overstates
+    # its own coverage is what this whole script exists to prevent.
+    with_fake_cargo
+    export FAKE_TREE_STDERR="$LOCK_LINE"
+    run_cmd "$SCAN_SH"
+    assert_eq 0 "$RUN_STATUS" 'a lock message must not fail the step'
+    assert_contains "$RUN_OUT" "$CLEAN_TREE_CRATES crate(s)" \
+        'the package count must not count a line cargo wrote about itself'
+}
+
+the_scan_still_reports_what_cargo_said_when_the_tree_cannot_be_read() {
+    # Not merging the streams must not cost the diagnostic. cargo explains a
+    # resolution failure on stderr, and that explanation is the whole value of
+    # the failure message, so it has to survive being captured separately.
+    with_fake_cargo
+    export FAKE_TREE_STDOUT='' FAKE_TREE_STATUS=101
+    export FAKE_TREE_STDERR='error: failed to parse manifest at `/w/Cargo.toml`'
+    run_cmd "$SCAN_SH"
+    [ "$RUN_STATUS" -ne 0 ] || fail 'a cargo that could not resolve must fail the step'
+    assert_contains "$RUN_ERR" 'failed to parse manifest' \
+        "cargo's own explanation must reach the failure message"
+}
+
+the_scan_still_reports_what_cargo_said_when_the_member_list_cannot_be_read() {
+    with_fake_cargo
+    export FAKE_MEMBERS_STDOUT='' FAKE_MEMBERS_STATUS=101
+    export FAKE_MEMBERS_STDERR='error: failed to parse manifest at `/w/Cargo.toml`'
+    run_cmd "$SCAN_SH"
+    [ "$RUN_STATUS" -ne 0 ] || fail 'an unreadable member list must fail the step'
+    assert_contains "$RUN_ERR" 'failed to parse manifest' \
+        "cargo's own explanation must reach the failure message"
+}
+
 # --- the step is in the gate -------------------------------------------------
 # Mirrors sqlite-gate.test.sh and mcp-host-gate.test.sh: read the plan
 # `just -n check` would execute, so "the step exists" and "the gate runs it"
@@ -140,6 +208,10 @@ run_test the_scan_fails_when_the_tracing_bridge_is_resolved
 run_test the_scan_fails_loudly_when_cargo_cannot_read_the_tree
 run_test the_scan_fails_when_a_workspace_member_was_not_scanned
 run_test the_scan_fails_loudly_when_the_member_list_cannot_be_read
+run_test a_lock_message_on_the_member_list_is_not_a_workspace_member
+run_test a_lock_message_in_the_resolved_tree_is_not_a_package
+run_test the_scan_still_reports_what_cargo_said_when_the_tree_cannot_be_read
+run_test the_scan_still_reports_what_cargo_said_when_the_member_list_cannot_be_read
 run_test the_gate_runs_the_no_opentelemetry_step
 run_test the_gate_lints_both_binaries_with_the_otel_feature
 run_test the_gate_runs_both_binaries_tests_with_the_otel_feature
