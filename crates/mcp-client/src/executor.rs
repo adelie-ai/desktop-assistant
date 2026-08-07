@@ -390,6 +390,15 @@ pub struct McpServerStatusInfo {
     /// Human-facing connection target: the command (stdio) or url (http).
     pub target: String,
     /// Last connection error, when the server failed to connect.
+    ///
+    /// Untrusted: a renderer must treat this as a remote string, for the same
+    /// reason as `title`, `description` and `website_url` above and one more
+    /// besides. A stdio server that fails to start has the last lines it wrote
+    /// to its own stderr quoted here, so the field carries bytes the server
+    /// chose. The transport strips the characters that would let those bytes
+    /// re-shape the line they land in (`is_display_hazard` in this crate's
+    /// `lib.rs`); a renderer still owns escaping for its own medium, and must
+    /// never treat the field as markup.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
     /// Label for a Configure/Sign-in button, if the server offers one.

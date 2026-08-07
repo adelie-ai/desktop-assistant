@@ -445,29 +445,151 @@ exit 4
     );
 }
 
-/// The message is one line, and a server cannot make it otherwise. Stderr is
-/// whatever the server chose to print, so it can hold a carriage return or an
-/// ANSI escape sequence — enough to overwrite the log line or the panel field
-/// the message is put in, and to hide the rest of it from the reader.
+/// The message is one line of text that reads left to right, and a server
+/// cannot make it otherwise.
+///
+/// Stderr is whatever the server chose to print, and the message it lands in
+/// is rendered by a log reader, by the settings/KCM panel and by the web SPA.
+/// Three separate powers have to be taken away, and `char::is_control` covers
+/// only the first:
+///
+/// - **C0/C1 controls (Cc).** A carriage return rewinds the line and paints
+///   over what came before it; an ANSI escape clears or recolours it.
+/// - **Line and paragraph separators (Zl/Zp).** U+2028 and U+2029 are not
+///   control characters. `serde_json` does not escape them either, so one
+///   reaches the panel intact and is rendered as a line break — giving the
+///   server a second line of its own text, positioned as though the UI had
+///   written it.
+/// - **Format characters (Cf).** U+202E RIGHT-TO-LEFT OVERRIDE reverses the
+///   displayed order of everything after it (Trojan Source, CVE-2021-42574);
+///   the zero-width characters hide text outright.
 #[tokio::test]
 async fn control_characters_in_stderr_cannot_rewrite_the_message_line() {
+    // Written as octal byte escapes because POSIX `printf` has no \u form.
+    // \342\200\250 = U+2028, \342\200\251 = U+2029, \342\200\256 = U+202E,
+    // \342\200\213 = U+200B, \357\273\277 = U+FEFF.
     let msg = handshake_failure(
         "control-characters",
         r#"#!/bin/sh
 read -r line
 printf 'visible-head\rHIDDEN-BY-CARRIAGE-RETURN\033[2K\033[31mred\n' >&2
+printf 'line-sep\342\200\250FORGED-SECOND-LINE\n' >&2
+printf 'para-sep\342\200\251FORGED-PARAGRAPH\n' >&2
+printf 'bidi\342\200\256REVERSED-FROM-HERE\n' >&2
+printf 'zero\342\200\213width\357\273\277marks\n' >&2
 exit 8
 "#,
     )
     .await;
 
     assert!(
-        msg.contains("visible-head"),
+        msg.contains("visible-head")
+            && msg.contains("line-sep")
+            && msg.contains("para-sep")
+            && msg.contains("bidi")
+            && msg.contains("zero"),
         "the readable text must survive, got: {msg}"
     );
+    for hazard in [
+        '\r', '\n', '\u{1b}', '\u{2028}', '\u{2029}', '\u{202e}', '\u{200b}', '\u{feff}',
+    ] {
+        assert!(
+            !msg.contains(hazard),
+            "U+{:04X} must not reach the message, got: {msg:?}",
+            hazard as u32
+        );
+    }
+}
+
+// --- Failures that are not an exit code -----------------------------------
+
+/// A server that explains itself and then hangs must have that explanation in
+/// the timeout, not only in a stack of silence.
+///
+/// A hang is the startup failure an operator finds hardest to read: nothing
+/// exited, nothing was refused, the daemon simply waits and then gives up.
+/// The server said why before it stopped, and the tail already holds it.
+#[tokio::test]
+async fn a_hanging_server_surfaces_its_stderr_in_the_timeout() {
+    let script = r#"#!/bin/sh
+# Say why on stderr, then hang forever without answering. TERM is ignored, so
+# only the unconditional SIGKILL on client teardown (DS-2) ends this.
+read -r line
+printf '%s\n' 'fatal: cannot open database' >&2
+trap '' TERM
+while true; do sleep 1; done
+"#;
+
+    let path = temp_path("hangs-after-complaining");
+    std::fs::write(&path, script).expect("write hanging server script");
+    let args = [path.display().to_string()];
+
+    // A one-second silence budget, so the handshake gives up in a second
+    // rather than in the default thirty. Which of the two bounds fires first
+    // is a race and does not matter: the property under test is that a
+    // timeout carries the tail, whichever bound produced it.
+    let result = tokio::time::timeout(
+        Duration::from_secs(20),
+        McpClient::connect_with_request_timeout(
+            "/bin/sh",
+            &args,
+            &HashMap::new(),
+            Duration::from_secs(1),
+        ),
+    )
+    .await
+    .expect("connect must return within the test bound");
+
+    let _ = std::fs::remove_file(&path);
+
+    match result {
+        Ok(_) => panic!("expected the handshake to time out, but connect succeeded"),
+        Err(err @ McpError::Timeout { .. }) => {
+            let text = err.to_string();
+            assert!(
+                text.contains("fatal: cannot open database"),
+                "the timeout must carry what the server said before it hung, got: {text}"
+            );
+            assert!(
+                text.contains("timed out"),
+                "the timeout must still read as a timeout, got: {text}"
+            );
+        }
+        Err(other) => panic!("expected McpError::Timeout, got: {other}"),
+    }
+}
+
+/// A server that closes stdout and keeps running has no exit status to
+/// report, and must fall back to its stderr rather than to nothing.
+///
+/// This is the third failure shape, beside a clean exit and a hang. The
+/// child is alive, so `child.wait()` runs out its bound and there is no code
+/// to name — but the server had already said what was wrong.
+#[tokio::test]
+async fn a_server_that_closes_stdout_and_stays_alive_still_surfaces_its_stderr() {
+    let msg = handshake_failure(
+        "closes-stdout-after-complaining",
+        r#"#!/bin/sh
+read -r line
+printf '%s\n' 'fatal: no write access to the state directory' >&2
+exec 1>&-
+trap '' TERM
+while true; do sleep 1; done
+"#,
+    )
+    .await;
+
     assert!(
-        !msg.contains('\r') && !msg.contains('\u{1b}') && !msg.contains('\n'),
-        "no control character may reach the message, got: {msg:?}"
+        msg.contains("fatal: no write access to the state directory"),
+        "a live server's stderr must still be reported, got: {msg}"
+    );
+    assert!(
+        !msg.contains("exited with status"),
+        "there is no exit status to name for a child that is still running, got: {msg}"
+    );
+    assert!(
+        !msg.contains("environment variable"),
+        "the environment-variable guess must not compete with real stderr, got: {msg}"
     );
 }
 

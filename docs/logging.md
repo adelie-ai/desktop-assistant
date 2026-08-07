@@ -82,7 +82,8 @@ of the error, which the executor then logs at ERROR beside the server's name.
 That is a deliberate, bounded exposure, taken because the alternative is an
 operator who can see only an exit code and has to attach to the process to
 learn anything more. It is bounded twice over - a failed connect, and 10 lines
-of at most 512 bytes each.
+of at most 512 bytes each - and scrubbed of the characters that would let a
+server rewrite the log line it lands in.
 `server_stderr_is_buffered_and_never_logged` in
 `crates/mcp-client/tests/stderr_diagnostics.rs` holds the streaming half of
 that line.

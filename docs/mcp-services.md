@@ -474,7 +474,21 @@ If the server process exits before completing the handshake, the logged error na
 MCP server exited with status 2 before completing the handshake; it last wrote this to stderr: error: the following required arguments were not provided: --config <CONFIG>
 ```
 
-The quoted tail is bounded: the last 10 lines, each capped at 512 bytes and marked with `...` where it was cut, joined with ` | ` onto one line. Lines beyond that are discarded as they arrive, so a server that floods stderr cannot enlarge the message. A server's stderr appears **only** in this failure message. It is never streamed to the log as it arrives, at any level, because it is the server's own unfiltered output and can carry a credential or a fragment of user content — see [Logging](logging.md#what-may-appear-at-each-level).
+A server does not have to exit to fail, and the other two shapes carry the same clause. A server that stops answering is reported as a timeout, so a hang — the startup failure that is hardest to read, because nothing exited and nothing was refused — still names its cause:
+
+```
+MCP request 'initialize' timed out after 30s of silence; it last wrote this to stderr: fatal: cannot open database
+```
+
+A server that abandons its stdout but keeps running has no exit status to name, and reports what it said instead:
+
+```
+MCP server closed stdout; it last wrote this to stderr: fatal: no write access to the state directory
+```
+
+The quoted tail is bounded: the last 10 lines, each capped at 512 bytes and marked with `...` where it was cut, joined with ` | ` onto one line. Lines beyond that are discarded as they arrive, so a server that floods stderr cannot enlarge the message. Characters that would re-shape the line the message lands in are replaced with spaces before it is quoted — the C0/C1 controls, the Unicode format characters (bidi overrides, zero-width marks) and U+2028/U+2029, which a JSON field and an HTML renderer both treat as a line break. The text is a server-chosen remote string, and a renderer must still escape it for its own medium.
+
+A server's stderr appears **only** in this failure message. It is never streamed to the log as it arrives, at any level, because it is the server's own unfiltered output and can carry a credential or a fragment of user content — see [Logging](logging.md#what-may-appear-at-each-level).
 
 Where the server exits without writing anything, there is no evidence to quote, and the message instead suggests the most common silent cause — an environment variable the server needed that is not on the [pass-through allowlist](#environment-variables) and not in its own `env`:
 

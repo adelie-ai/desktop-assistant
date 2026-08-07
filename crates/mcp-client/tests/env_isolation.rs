@@ -594,7 +594,8 @@ async fn assert_non_utf8_value_passes_through(var: &'static str) {
 // may exit immediately instead of completing the handshake. The daemon must
 // report *why* (the exit status) rather than a generic protocol error, so
 // the honest-state settings/KCM panel can show something a person can act
-// on. See `StdioTransport::enrich_with_exit_status`.
+// on. See `StdioTransport::enrich_failure`, and `stderr_diagnostics.rs` for
+// the server's own account of the failure.
 
 /// A server that reads the initialize request and then exits immediately
 /// (simulating a crash on a missing dependency/env var) must be reported by
@@ -636,13 +637,13 @@ exit 7
     }
 }
 
-/// `enrich_with_exit_status`'s wait for the child's exit status must itself
-/// be bounded. `round_trip` (which this runs inside) backs every
-/// post-handshake `tools/call` too, and that path has no outer timeout the
-/// way the initial handshake does — a *server* that closes stdout but keeps
-/// running and ignores `SIGTERM` would hang a live tool call indefinitely
-/// against an unbounded wait. Only `EXIT_STATUS_WAIT` stands between "closed
-/// stdout" and a hung daemon here.
+/// `enrich_failure`'s wait for the child's exit status must itself be
+/// bounded. `round_trip` (which this runs inside) backs every post-handshake
+/// `tools/call` too, and that path has no outer timeout the way the initial
+/// handshake does — a *server* that closes stdout but keeps running and
+/// ignores `SIGTERM` would hang a live tool call indefinitely against an
+/// unbounded wait. Only `EXIT_STATUS_WAIT` stands between "closed stdout" and
+/// a hung daemon here.
 ///
 /// Asserts both that the call returns within a bounded window (comfortably
 /// above `EXIT_STATUS_WAIT` so this does not flake under load, but well
@@ -650,6 +651,16 @@ exit 7
 /// and that the result is the original generic message, not a fabricated
 /// exit status — proving the fallback path, not just "it eventually
 /// returns".
+///
+/// The equality assertion is the *whole* message, and that pins two things
+/// now rather than one. A server that closes stdout and stays alive has no
+/// exit status to name, and this fixture also writes nothing to stderr, so
+/// there is nothing at all to add: the message must come back exactly as it
+/// started. Where such a server *does* leave stderr behind, the message
+/// carries it, and
+/// `stderr_diagnostics.rs::a_server_that_closes_stdout_and_stays_alive_still_surfaces_its_stderr`
+/// pins that half. Keeping this one silent is what makes the equality here
+/// meaningful.
 #[tokio::test]
 async fn server_closing_stdout_without_exiting_falls_back_within_a_bounded_window() {
     let script = temp_path("closes-stdout-stays-alive");
@@ -683,8 +694,9 @@ while true; do sleep 1; done
         Err(McpError::UnexpectedResponse(msg)) => {
             assert_eq!(
                 msg, "MCP server closed stdout",
-                "a child that never exits must fall back to the original generic \
-                 message, not a fabricated exit status"
+                "a child that never exits and never wrote to stderr must fall back \
+                 to the original generic message, with neither a fabricated exit \
+                 status nor an empty stderr clause appended"
             );
         }
         Err(other) => panic!("expected McpError::UnexpectedResponse, got: {other}"),

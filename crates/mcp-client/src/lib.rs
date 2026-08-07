@@ -20,6 +20,7 @@ use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::task::JoinHandle;
+use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
 
 use jsonrpc::{JsonRpcRequest, JsonRpcResponse};
 
@@ -43,7 +44,7 @@ const INIT_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_LINE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// How many of a stdio MCP server's most recent stderr lines are kept for the
-/// failure path (see [`StdioTransport::enrich_with_exit_status`]).
+/// failure path (see [`StdioTransport::enrich_failure`]).
 ///
 /// The tail is what a person reads inside one log line and one settings-panel
 /// field, so it is sized for a diagnosis, not for a log file. Ten lines holds
@@ -70,6 +71,11 @@ const STDERR_TAIL_TRUNCATED: &str = "...";
 /// into a log line and into `McpServerStatusInfo::detail`, neither of which
 /// renders an embedded newline usefully.
 const STDERR_TAIL_SEPARATOR: &str = " | ";
+
+/// Introduces the stderr tail in a failure message. One phrasing across every
+/// failure shape - a clean exit, a hang, a closed stdout - so an operator
+/// learns to look for the same words wherever the failure came from.
+const STDERR_TAIL_PREFIX: &str = "; it last wrote this to stderr: ";
 
 /// Cap on a remote (HTTP) response body — the streamable-HTTP analogue of
 /// [`MAX_LINE_BYTES`]. A remote server (or a hostile endpoint impersonating
@@ -135,8 +141,20 @@ pub enum McpError {
     )]
     UnsupportedProtocolVersion { got: String, requested: String },
 
-    #[error("MCP request '{method}' timed out after {after:?} of silence")]
-    Timeout { method: String, after: Duration },
+    #[error(
+        "MCP request '{method}' timed out after {after:?} of silence{}",
+        stderr_clause(.stderr_tail)
+    )]
+    Timeout {
+        method: String,
+        after: Duration,
+        /// What a stdio server last wrote to stderr before it stopped
+        /// answering, when it wrote anything. A hang is the startup failure
+        /// that is hardest to read - nothing exited and nothing was
+        /// refused - and the server has often already said why. Always
+        /// `None` for the HTTP transport, which has no stderr.
+        stderr_tail: Option<String>,
+    },
 
     #[cfg(feature = "http")]
     #[error("HTTP transport error: {0}")]
@@ -145,6 +163,15 @@ pub enum McpError {
     #[cfg(feature = "http")]
     #[error("OAuth error: {0}")]
     OAuth(#[from] oauth::OAuthError),
+}
+
+/// The `; it last wrote this to stderr: ...` clause for an error that carries
+/// a tail, or the empty string for one that does not.
+fn stderr_clause(tail: &Option<String>) -> String {
+    match tail {
+        Some(tail) => format!("{STDERR_TAIL_PREFIX}{tail}"),
+        None => String::new(),
+    }
 }
 
 /// Characters that could cause unintended behaviour if they appear in the
@@ -530,12 +557,26 @@ impl McpClient {
         };
 
         let init_timeout = INIT_TIMEOUT.min(request_timeout);
-        tokio::time::timeout(init_timeout, client.initialize())
-            .await
-            .map_err(|_| McpError::Timeout {
-                method: "initialize".into(),
-                after: init_timeout,
-            })??;
+        // This bound, not the transport's own per-line one, is what a server
+        // that hangs during the handshake usually trips: the per-line bound is
+        // the request timeout (minutes, for tool calls that legitimately take
+        // them), while this one is 30 seconds. So the stderr tail has to be
+        // attached here too, or the commonest hang reports pure silence while
+        // the answer sits unread in the ring.
+        // Bound to a `let` before the match, so the borrow of `client` that
+        // the handshake future holds ends before the arm below reads the
+        // transport's tail.
+        let handshake = tokio::time::timeout(init_timeout, client.initialize()).await;
+        match handshake {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(McpError::Timeout {
+                    method: "initialize".into(),
+                    after: init_timeout,
+                    stderr_tail: client.transport.stderr_tail(),
+                });
+            }
+        }
 
         Ok(client)
     }
@@ -790,6 +831,25 @@ impl Transport {
             Transport::Http(_) => {}
         }
     }
+
+    /// What the server has most recently written to stderr, for a failure
+    /// raised outside the transport - the handshake's own outer bound in
+    /// [`McpClient::from_transport`], which fires while the child is still
+    /// running and so never reaches
+    /// [`StdioTransport::enrich_failure`].
+    ///
+    /// Reads the ring as it stands and does not wait for the drain: the child
+    /// is alive by definition here, so its end of the pipe stays open and the
+    /// drain cannot finish. Nothing is lost by not waiting, because a bound
+    /// only expires after seconds of silence and the drain reads continuously.
+    fn stderr_tail(&self) -> Option<String> {
+        match self {
+            Transport::Stdio(t) => stderr_tail_message(&t.stderr_tail),
+            // A remote server's diagnostics stay on its own host.
+            #[cfg(feature = "http")]
+            Transport::Http(_) => None,
+        }
+    }
 }
 
 /// The last few lines a spawned MCP server wrote to stderr, newest last.
@@ -854,6 +914,39 @@ async fn drain_stderr(mut stderr: ChildStderr, tail: StderrTail) {
     push_stderr_line(&tail, &line, cut);
 }
 
+/// True for a character that re-shapes the text around it instead of adding
+/// to it.
+///
+/// The tail is quoted into a failure message that a log reader, the
+/// settings/KCM panel and the web SPA all render, and the server chose every
+/// byte of it. Three Unicode general categories take that choice away, and
+/// `char::is_control` covers only the first:
+///
+/// - `Cc`, the C0/C1 controls. A carriage return rewinds the line and paints
+///   over what came before it; an ANSI escape clears or recolours it.
+/// - `Zl` and `Zp`, U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR.
+///   Neither is a control character, and `serde_json` does not escape either,
+///   so one reaches the panel intact and is rendered as a line break - giving
+///   the server a second line of its own text, positioned as though the
+///   interface had written it.
+/// - `Cf`, the format characters. U+202E RIGHT-TO-LEFT OVERRIDE reverses the
+///   displayed order of everything after it (Trojan Source, CVE-2021-42574),
+///   and the zero-width marks hide text outright.
+///
+/// `Cn` (unassigned) and `Co` (private use) are deliberately left alone: they
+/// render as a missing glyph rather than moving anything, and treating
+/// unassigned as hostile would scrub every character from a Unicode revision
+/// newer than the tables here.
+fn is_display_hazard(c: char) -> bool {
+    matches!(
+        c.general_category(),
+        GeneralCategory::Control
+            | GeneralCategory::Format
+            | GeneralCategory::LineSeparator
+            | GeneralCategory::ParagraphSeparator
+    )
+}
+
 /// Add one stderr line to `tail`, evicting the oldest once the ring is full.
 ///
 /// `cut` says the reader already discarded bytes from this line. Surrounding
@@ -864,14 +957,13 @@ fn push_stderr_line(tail: &Mutex<VecDeque<String>>, raw: &[u8], cut: bool) {
     // mis-set locale (or one relaying a binary dependency's output) must
     // cost the operator a replacement character, not the whole diagnostic.
     let decoded = String::from_utf8_lossy(raw);
-    // Control characters become spaces. The tail lands in a log line and in a
-    // settings-panel field, and a server that emits a carriage return or an
-    // ANSI escape sequence would otherwise rewrite the line it was put in.
-    // Never lengthens the text: every control character is one or two bytes
-    // and one space replaces it, so the cap below still holds.
+    // Display hazards become spaces, so the tail can only add text to the line
+    // it lands in and never re-shape it. Never lengthens the result: every
+    // hazard is at least one byte and one space replaces it, so the cap below
+    // still holds.
     let cleaned: String = decoded
         .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
+        .map(|c| if is_display_hazard(c) { ' ' } else { c })
         .collect();
     let text = cleaned.trim();
     if text.is_empty() {
@@ -1023,6 +1115,9 @@ impl StdioTransport {
                     .map_err(|_| McpError::Timeout {
                         method: method.to_string(),
                         after: timeout,
+                        // Filled in by `enrich_failure` on the way out: the
+                        // ring lives on the transport, not in this future.
+                        stderr_tail: None,
                     })??;
                 let Some(buf) = next else {
                     return Err(McpError::UnexpectedResponse(
@@ -1073,7 +1168,7 @@ impl StdioTransport {
 
         match tokio::try_join!(write_fut, read_fut) {
             Ok(((), result)) => Ok(result),
-            Err(err) => Err(Self::enrich_with_exit_status(
+            Err(err) => Err(Self::enrich_failure(
                 &mut self.child,
                 &mut self.stderr_drain,
                 &self.stderr_tail,
@@ -1084,7 +1179,7 @@ impl StdioTransport {
     }
 
     /// Bound on waiting for the child's exit status in
-    /// [`Self::enrich_with_exit_status`]. Generous because it only runs on an
+    /// [`Self::enrich_failure`]. Generous because it only runs on an
     /// already-failed path (a few extra seconds before reporting a failure
     /// that already happened is a fair trade for naming its cause), and it
     /// can never hang past the *caller's* own handshake timeout ([`INIT_TIMEOUT`]
@@ -1093,7 +1188,7 @@ impl StdioTransport {
     const EXIT_STATUS_WAIT: Duration = Duration::from_secs(10);
 
     /// Bound on waiting for [`drain_stderr`] to finish, once the child has
-    /// been reaped in [`Self::enrich_with_exit_status`].
+    /// been reaped in [`Self::enrich_failure`].
     ///
     /// A much smaller sibling of [`Self::EXIT_STATUS_WAIT`], not a reuse of
     /// it, because the two wait for different things. By this point the child
@@ -1107,11 +1202,15 @@ impl StdioTransport {
     /// read either way.
     const STDERR_DRAIN_WAIT: Duration = Duration::from_secs(1);
 
-    /// If `err` is the generic "server closed stdout" error and the child has
-    /// exited (or exits promptly), replace it with one naming the exit status
-    /// and quoting what the server last wrote to stderr.
+    /// The generic error `round_trip` produces when the server's stdout ends
+    /// without a reply. Matched exactly, so that only this one case is
+    /// rewritten.
+    const CLOSED_STDOUT: &'static str = "MCP server closed stdout";
+
+    /// Replace a bare transport failure with one that says what the server
+    /// did and quotes what it last wrote to stderr.
     ///
-    /// Why: a spawned server that exits immediately used to surface only
+    /// Why: a spawned server that fails at startup used to surface only
     /// "MCP server closed stdout", which does not say the process is even
     /// gone. This message flows verbatim into `McpServerStatusInfo::detail`
     /// (the settings/KCM panel's honest-state field) and the daemon's
@@ -1128,7 +1227,25 @@ impl StdioTransport {
     /// needed and did not get (see [`ENV_PASSTHROUGH_ALLOWLIST`]) is a fair
     /// guess and there is nothing better to offer.
     ///
-    /// Two waits, in order, and both bounded:
+    /// Three failure shapes reach here, and each gets the tail:
+    ///
+    /// 1. **Stdout ended and the child exited.** The message names the exit
+    ///    status and quotes the tail.
+    /// 2. **Stdout ended and the child is still running.** There is no status
+    ///    to name, so the message stays the generic one — plus the tail, when
+    ///    the server left one. A forked server that abandoned its own stdout
+    ///    lands here.
+    /// 3. **The server stopped answering.** The child is alive and holding
+    ///    both pipes open, so nothing is reaped and nothing is waited for; the
+    ///    tail rides on [`McpError::Timeout`] instead. A hang is the failure
+    ///    an operator finds hardest to read, and the server has usually
+    ///    already said why.
+    ///
+    /// Note that shape 3 is the *inner*, per-line bound. A handshake that
+    /// hangs normally trips the outer bound in [`McpClient::from_transport`]
+    /// first, which attaches the tail itself.
+    ///
+    /// Two waits, both bounded, and both only on shape 1:
     ///
     /// 1. `child.wait()`, not the non-blocking `try_wait()`. The pipe's read
     ///    end closes (which is what produced `err`) as soon as the kernel
@@ -1147,43 +1264,72 @@ impl StdioTransport {
     ///    out of the pipe are exactly the last ones the server wrote — the
     ///    ones that say why it died. Reading the ring without this wait
     ///    races that task and reports a message that is intermittently short
-    ///    of its own point.
-    async fn enrich_with_exit_status(
+    ///    of its own point. Skipped where the child is still alive, because
+    ///    then the pipe never reaches end-of-file and the wait would only
+    ///    burn its own bound.
+    async fn enrich_failure(
         child: &mut Child,
         stderr_drain: &mut JoinHandle<()>,
         stderr_tail: &Mutex<VecDeque<String>>,
         err: McpError,
     ) -> McpError {
+        // Shape 3. The child is alive and still holds the stderr pipe open,
+        // so there is nothing to reap and nothing to wait for: read the ring
+        // as it stands. Nothing is lost by not waiting, because the bound only
+        // expires after seconds of silence and the drain reads continuously.
+        if let McpError::Timeout { method, after, .. } = err {
+            return McpError::Timeout {
+                method,
+                after,
+                stderr_tail: stderr_tail_message(stderr_tail),
+            };
+        }
+
         let McpError::UnexpectedResponse(ref msg) = err else {
             return err;
         };
-        if msg != "MCP server closed stdout" {
+        if msg != Self::CLOSED_STDOUT {
             return err;
         }
-        let Ok(Ok(status)) = tokio::time::timeout(Self::EXIT_STATUS_WAIT, child.wait()).await
-        else {
-            return err;
-        };
-        // Guarded, not simply awaited: `child.wait()` above is fused and
-        // answers a second call from its cached status, so this function can
-        // run twice against one transport (a server whose grandchild holds
-        // the stdin read end open keeps the writes succeeding while stdout
-        // stays closed). A `JoinHandle` panics when it is polled after it has
-        // already yielded its output, which would turn a diagnostic into a
-        // crash. Once the drain is finished there is nothing left to wait for
-        // anyway — the ring already has every line.
-        if !stderr_drain.is_finished() {
+
+        let status = tokio::time::timeout(Self::EXIT_STATUS_WAIT, child.wait())
+            .await
+            .ok()
+            .and_then(Result::ok);
+
+        if status.is_some() && !stderr_drain.is_finished() {
+            // Guarded, not simply awaited: `child.wait()` above is fused and
+            // answers a second call from its cached status, so this function
+            // can run twice against one transport (a server whose grandchild
+            // holds the stdin read end open keeps the writes succeeding while
+            // stdout stays closed). A `JoinHandle` panics when it is polled
+            // after it has already yielded its output, which would turn a
+            // diagnostic into a crash. Once the drain is finished there is
+            // nothing left to wait for anyway — the ring already has every
+            // line.
             let _ = tokio::time::timeout(Self::STDERR_DRAIN_WAIT, &mut *stderr_drain).await;
         }
 
+        let tail = stderr_tail_message(stderr_tail);
+        let Some(status) = status else {
+            // Shape 2.
+            return match tail {
+                Some(tail) => McpError::UnexpectedResponse(format!(
+                    "{}{STDERR_TAIL_PREFIX}{tail}",
+                    Self::CLOSED_STDOUT
+                )),
+                None => err,
+            };
+        };
+
+        // Shape 1.
         let detail = match status.code() {
             Some(code) => format!("exited with status {code}"),
             None => format!("was terminated by a signal ({status})"),
         };
-        match stderr_tail_message(stderr_tail) {
+        match tail {
             Some(tail) => McpError::UnexpectedResponse(format!(
-                "MCP server {detail} before completing the handshake; it last wrote \
-                 this to stderr: {tail}"
+                "MCP server {detail} before completing the handshake{STDERR_TAIL_PREFIX}{tail}"
             )),
             None => McpError::UnexpectedResponse(format!(
                 "MCP server {detail} before completing the handshake and wrote nothing \
@@ -1351,6 +1497,8 @@ impl HttpTransport {
             .map_err(|_| McpError::Timeout {
                 method: method.to_string(),
                 after: timeout,
+                // A remote server's diagnostics stay on its own host.
+                stderr_tail: None,
             })?
             .map_err(|e| McpError::Http(format!("request to {} failed: {e}", self.url)))?;
 
@@ -1518,6 +1666,8 @@ async fn read_body_capped(
         .map_err(|_| McpError::Timeout {
             method: method.to_string(),
             after: timeout,
+            // A remote server's diagnostics stay on its own host.
+            stderr_tail: None,
         })?
 }
 
