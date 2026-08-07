@@ -1740,8 +1740,8 @@ where
         // The turn's tool-discovery mode is NOT logged here, deliberately.
         // `active_client` is the raw registry client, and the turn asks the
         // decorator chain that wraps it
-        // (`Arc` -> `MaybeProfiled` -> `Retrying` -> `FixedReasoning` ->
-        // `RoutingLlmClient`). The two answers agree only while every
+        // (`Arc` -> `Retrying` -> `FixedReasoning` -> `RoutingLlmClient`).
+        // The two answers agree only while every
         // decorator forwards the capability correctly, which is precisely the
         // invariant that breaks. Logging the raw client here would print the
         // right answer while the turn used the wrong one, and point an
@@ -1793,11 +1793,18 @@ where
         let inner = Arc::clone(&self.inner);
         let conv_id = conversation_id.clone();
         let response = {
-            let dispatch = async move {
-                inner
-                    .send_prompt(&conv_id, prompt, on_chunk, on_status)
-                    .await
-            };
+            // Boxed before the task-local wraps below. Each `with_*` embeds
+            // the future it wraps *by value*, so an unboxed turn future is
+            // re-embedded once per slot and the nest grows with every slot
+            // added here - the same accounting that put the streaming send
+            // path over a worker thread's stack in #205/#206. Boxing once
+            // keeps every wrapper pointer-sized whatever the slot count.
+            let dispatch: std::pin::Pin<Box<dyn Future<Output = _> + Send>> =
+                Box::pin(async move {
+                    inner
+                        .send_prompt(&conv_id, prompt, on_chunk, on_status)
+                        .await
+                });
             // Install the per-request system-prompt refinement so the core
             // context assembler appends it to this turn's system prompt. Empty
             // string = no refinement (unchanged prompt). It is request-scoped

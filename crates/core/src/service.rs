@@ -1976,10 +1976,19 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         );
         let started = std::time::Instant::now();
         let mut report = crate::telemetry::TurnReport::default();
-        let result = self
-            .run_turn(conversation_id, prompt, on_chunk, on_status, &mut report)
-            .instrument(span.clone())
-            .await;
+        // Boxed so the turn body lives on the heap rather than inside this
+        // future. A caller composes several task-local scopes around this
+        // call, and each one embeds what it wraps by value, which is the
+        // accounting that overflowed a worker thread's stack in #205/#206.
+        let result = Box::pin(self.run_turn(
+            conversation_id,
+            prompt,
+            on_chunk,
+            on_status,
+            &mut report,
+        ))
+        .instrument(span.clone())
+        .await;
 
         // An error the body never classified is read from the result rather
         // than guessed at: cancellation is the user's own signal, anything

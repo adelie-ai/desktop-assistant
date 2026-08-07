@@ -61,10 +61,6 @@ model = "primary"
 connection = "primary"
 model = "primary"
 
-[profiling]
-enabled = false
-full_content = false
-
 [ws_auth]
 methods = ["password"]
 allowed_origins = []

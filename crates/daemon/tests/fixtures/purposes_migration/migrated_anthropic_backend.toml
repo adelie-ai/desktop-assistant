@@ -51,10 +51,6 @@ model = "primary"
 connection = "backend"
 model = "claude-haiku-4-5-20251001"
 
-[profiling]
-enabled = false
-full_content = false
-
 [ws_auth]
 methods = ["password"]
 allowed_origins = []

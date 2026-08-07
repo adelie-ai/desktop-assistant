@@ -1372,7 +1372,7 @@ pub struct Config {
     /// acting on (#686). Empty means every configured value is live.
     ///
     /// Entries are stable area keys - `"database"`, `"embeddings"`,
-    /// `"persistence"`, `"ws_auth"`, `"tls"`, `"profiling"` - deliberately an
+    /// `"persistence"`, `"ws_auth"`, `"tls"` - deliberately an
     /// open set so a daemon that learns a new area does not break an older
     /// client. Clients should render unrecognized keys verbatim rather than
     /// dropping them.

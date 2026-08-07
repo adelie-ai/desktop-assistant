@@ -239,7 +239,7 @@ Current command variants:
   - The config view carries `restart_required`: what is in the daemon's config
     file that the running process is not acting on, as stable area keys
     (`"database"`, `"embeddings"`, `"persistence"`, `"ws_auth"`, `"tls"`,
-    `"profiling"`, `"authz"`, `"recall"`). Absent or empty means every
+    `"authz"`, `"recall"`). Absent or empty means every
     configured value is live. It
     reports *area names only* and never the configured value, so a pending
     `[ws_auth]` or `[tls]` change is visible without disclosing what it was

@@ -7,7 +7,6 @@ use desktop_assistant_core::CoreError;
 use desktop_assistant_core::ports::embedding::{EmbedFn, EmbeddingClient};
 use desktop_assistant_core::ports::inbound::{EmbeddingHealth, KnowledgeMaintenanceService};
 use desktop_assistant_core::ports::llm::{LlmClient, ReasoningConfig, RetryingLlmClient};
-use desktop_assistant_core::ports::llm_profiling::MaybeProfiled;
 use tokio_util::sync::CancellationToken;
 
 mod api_surface;
@@ -1000,11 +999,6 @@ async fn main() -> Result<()> {
     let transports_config = daemon_config
         .as_ref()
         .map(|c| c.transports.clone())
-        .unwrap_or_default();
-
-    let profiling = daemon_config
-        .as_ref()
-        .map(|c| c.profiling.clone())
         .unwrap_or_default();
 
     // Build the per-connection client registry from the [connections] map
@@ -2404,28 +2398,14 @@ async fn main() -> Result<()> {
                 resolved_consolidation.connector,
                 resolved_consolidation.model,
             );
-            // Wrap each resolved client in the same retry + profiling chain the
+            // Wrap each resolved client in the same retry chain the
             // foreground/turn paths use, erased to `Arc<dyn LlmClient>`.
-            let dreaming_llm: Arc<dyn LlmClient> = {
-                let c = build_llm_client(resolved_dreaming);
-                let c = RetryingLlmClient::new(c, 3);
-                Arc::new(MaybeProfiled::from_config(
-                    c,
-                    profiling.enabled,
-                    profiling.log_path.as_deref(),
-                    profiling.full_content,
-                ))
-            };
-            let consolidation_llm: Arc<dyn LlmClient> = {
-                let c = build_llm_client(resolved_consolidation);
-                let c = RetryingLlmClient::new(c, 3);
-                Arc::new(MaybeProfiled::from_config(
-                    c,
-                    profiling.enabled,
-                    profiling.log_path.as_deref(),
-                    profiling.full_content,
-                ))
-            };
+            let dreaming_llm: Arc<dyn LlmClient> =
+                Arc::new(RetryingLlmClient::new(build_llm_client(resolved_dreaming), 3));
+            let consolidation_llm: Arc<dyn LlmClient> = Arc::new(RetryingLlmClient::new(
+                build_llm_client(resolved_consolidation),
+                3,
+            ));
             let on_change = maintenance_service::knowledge_change_notifier(Arc::clone(
                 &background_task_registry,
             ));
@@ -2690,7 +2670,7 @@ async fn main() -> Result<()> {
     let llm = backend_reasoning::FixedReasoningLlmClient::new(llm, ReasoningConfig::default());
     let llm = RetryingLlmClient::new(llm, 3);
     // Erase the decorator stack to `Arc<dyn LlmClient>` (#207). The inner
-    // type — `MaybeProfiled<Retrying<FixedReasoning<RoutingLlmClient>>>` —
+    // type — `Retrying<FixedReasoning<RoutingLlmClient>>` —
     // was previously carried by value as the `L` of `ConversationHandler`,
     // so it monomorphized into the per-turn future and was a large part of
     // the multi-MB frame that overflowed the worker stack (#205/#206).
@@ -2698,12 +2678,7 @@ async fn main() -> Result<()> {
     // the primary and backend slots share `L = Arc<dyn LlmClient>` for free
     // (the `FixedReasoning` passthrough above is no longer needed to make
     // the two slots' types match, but is left as a harmless no-op).
-    let llm: Arc<dyn LlmClient> = Arc::new(MaybeProfiled::from_config(
-        llm,
-        profiling.enabled,
-        profiling.log_path.as_deref(),
-        profiling.full_content,
-    ));
+    let llm: Arc<dyn LlmClient> = Arc::new(llm);
     // #287 slice 7: late-set slot letting the subagent tool executor reach the
     // conversation service. Set (below) to a Weak downgrade of the routing
     // handler the instant it exists; a Weak (not Arc) keeps the executor ->
@@ -2826,12 +2801,7 @@ async fn main() -> Result<()> {
         let bt_llm =
             backend_reasoning::FixedReasoningLlmClient::new(bt_llm, ReasoningConfig::default());
         let bt_llm = RetryingLlmClient::new(bt_llm, 3);
-        let bt_llm: Arc<dyn LlmClient> = Arc::new(MaybeProfiled::from_config(
-            bt_llm,
-            profiling.enabled,
-            profiling.log_path.as_deref(),
-            profiling.full_content,
-        ));
+        let bt_llm: Arc<dyn LlmClient> = Arc::new(bt_llm);
         handler = handler.with_backend_llm(bt_llm);
     } else {
         let resolved_bt = config::resolve_backend_tasks_llm_config(daemon_config.as_ref());
@@ -2854,12 +2824,7 @@ async fn main() -> Result<()> {
             let bt_llm =
                 backend_reasoning::FixedReasoningLlmClient::new(bt_llm, ReasoningConfig::default());
             let bt_llm = RetryingLlmClient::new(bt_llm, 3);
-            let bt_llm: Arc<dyn LlmClient> = Arc::new(MaybeProfiled::from_config(
-                bt_llm,
-                profiling.enabled,
-                profiling.log_path.as_deref(),
-                profiling.full_content,
-            ));
+            let bt_llm: Arc<dyn LlmClient> = Arc::new(bt_llm);
             handler = handler.with_backend_llm(bt_llm);
         }
     }
