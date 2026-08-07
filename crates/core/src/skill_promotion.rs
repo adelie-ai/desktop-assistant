@@ -563,13 +563,37 @@ pub enum PromotionAct {
     Refuse(String),
 }
 
+/// Whether a catalog row is one the assistant may revise on its own.
+///
+/// Only its own drafts. A skill a person put in a skill root, or approved, or
+/// installed from anywhere else is theirs: revising it would swap the body
+/// under an approval that was given to different words, relabel its provenance
+/// as self-authored, and mark it absent from a disk where its file is still
+/// sitting. Amending is the useful act only when the thing being amended is a
+/// draft nobody has adopted yet.
+pub fn is_own_draft(skill: &IndexedSkill) -> bool {
+    !skill.is_approved()
+        && !skill.present_on_disk
+        && matches!(
+            skill.source.as_deref(),
+            Some(SELF_AUTHORED_SOURCE) | Some(EXTRACTED_SOURCE)
+        )
+}
+
+/// `source` recorded on a skill the dream cycle extracted from a transcript.
+///
+/// Declared here beside [`SELF_AUTHORED_SOURCE`] because [`is_own_draft`] has
+/// to recognise both, and a rule that names one marker and forgets the other is
+/// the kind of gap that lets an unattended write reach a person's skill.
+pub const EXTRACTED_SOURCE: &str = "extraction";
+
 /// Decide what a promotion request may do.
 ///
-/// The rule that matters: a request to add a skill whose name is already taken
-/// is refused, never satisfied by a second row. Amending the skill that already
-/// covers the procedure is the useful act; a near-duplicate is not, because
-/// every skill competes for the same attention budget when the library is
-/// searched.
+/// Two rules, and both are about never doing damage a person did not ask for. A
+/// request to add a skill whose name is already taken is refused, never
+/// satisfied by a second row, because every skill competes for the same
+/// attention budget when the library is searched. And a request to amend is
+/// refused unless the row is the assistant's own unadopted draft ([`is_own_draft`]).
 pub fn decide(req: &PromotionRequest, existing: Option<&IndexedSkill>) -> PromotionAct {
     match (req.mode, existing) {
         (PromotionMode::New, None) => PromotionAct::Create,
@@ -578,7 +602,12 @@ pub fn decide(req: &PromotionRequest, existing: Option<&IndexedSkill>) -> Promot
              name for a genuinely different procedure.",
             req.name, found.description
         )),
-        (PromotionMode::Amend, Some(_)) => PromotionAct::Revise,
+        (PromotionMode::Amend, Some(found)) if is_own_draft(found) => PromotionAct::Revise,
+        (PromotionMode::Amend, Some(_)) => PromotionAct::Refuse(format!(
+            "{:?} is not yours to revise: it was approved, or it came from a skill root or \
+             another source. Pick a different name, or ask the user to change that skill.",
+            req.name
+        )),
         (PromotionMode::Amend, None) => PromotionAct::Refuse(format!(
             "there is no skill named {:?} to amend. Use mode=\"new\" to add one.",
             req.name
@@ -1208,11 +1237,48 @@ mod dedup_tests {
     }
 
     #[test]
-    fn amending_an_existing_skill_revises_it() {
+    fn amending_its_own_unadopted_draft_revises_it() {
         let req = request("deploy", PromotionMode::Amend);
+        let draft = existing_skill("deploy");
+        assert!(is_own_draft(&draft));
+        assert_eq!(decide(&req, Some(&draft)), PromotionAct::Revise);
+    }
+
+    /// The damage this guard prevents: amending swaps the body, relabels the
+    /// provenance as self-authored, marks the row absent from disk, and drops
+    /// the approval. None of that may happen to a skill a person owns.
+    #[test]
+    fn amending_a_skill_a_person_owns_is_refused() {
+        let req = request("deploy", PromotionMode::Amend);
+
+        let mut approved = existing_skill("deploy");
+        approved.approved_at = Some(chrono::Utc::now());
+        assert!(!is_own_draft(&approved));
+        assert!(
+            matches!(decide(&req, Some(&approved)), PromotionAct::Refuse(_)),
+            "an approved skill is not the assistant's to rewrite"
+        );
+
+        let mut on_disk = existing_skill("deploy");
+        on_disk.present_on_disk = true;
+        assert!(
+            matches!(decide(&req, Some(&on_disk)), PromotionAct::Refuse(_)),
+            "a skill whose file is still in a skill root is not the assistant's to rewrite"
+        );
+
+        let mut installed = existing_skill("deploy");
+        installed.source = Some("https://github.com/example/skills".to_string());
+        assert!(
+            matches!(decide(&req, Some(&installed)), PromotionAct::Refuse(_)),
+            "a skill from another source is not the assistant's to rewrite"
+        );
+
+        let mut extracted = existing_skill("deploy");
+        extracted.source = Some(EXTRACTED_SOURCE.to_string());
         assert_eq!(
-            decide(&req, Some(&existing_skill("deploy"))),
-            PromotionAct::Revise
+            decide(&req, Some(&extracted)),
+            PromotionAct::Revise,
+            "the dream cycle's own unadopted draft is fair game"
         );
     }
 

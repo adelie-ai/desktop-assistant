@@ -661,6 +661,17 @@ struct RecallLookup {
 /// `[Plan]` block a later turn renders from it, honest about the fact that a
 /// step happened, without carrying the model's wording forward into a turn
 /// that starts clean.
+/// The messages THIS turn added, from the watermark `send_prompt` captured.
+///
+/// Promotion asks "did this plan follow a skill", and the answer has to be
+/// about this turn. Reading the whole log would let one turn that opened a
+/// skill months ago suppress the offer for every unrelated plan in the
+/// conversation ever after. Tolerant of a watermark past the end, which a
+/// truncating compaction could produce.
+fn turn_messages(messages: &[Message], turn_start: usize) -> &[Message] {
+    messages.get(turn_start..).unwrap_or(&[])
+}
+
 fn step_text_to_record(text: &str, provenance: TurnProvenance) -> String {
     if provenance.ingested_external() {
         WITHHELD_STEP_TEXT.to_string()
@@ -998,6 +1009,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
         args: &serde_json::Value,
         conversation_id: &ConversationId,
         provenance: TurnProvenance,
+        turn_start: usize,
         offer_made: &mut bool,
     ) -> String {
         let Some(write) = self.scratchpad_write.clone() else {
@@ -1231,7 +1243,11 @@ impl<S, L, T> ConversationHandler<S, L, T> {
         // work done after it as well.
         let skill_offer = if stack.depth() == 0 && !*offer_made {
             let offer = self
-                .plan_promotion_offer(conversation_id, &conv.messages, provenance)
+                .plan_promotion_offer(
+                    conversation_id,
+                    turn_messages(&conv.messages, turn_start),
+                    provenance,
+                )
                 .await;
             *offer_made = offer.is_some();
             offer
@@ -2946,7 +2962,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 {
                     let ack = self
                         .handle_promote_plan(
-                            &conv.messages,
+                            turn_messages(&conv.messages, turn_start),
                             &arguments,
                             conversation_id,
                             turn_provenance,
@@ -2988,6 +3004,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                             &arguments,
                             conversation_id,
                             turn_provenance,
+                            turn_start,
                             &mut skill_offer_made,
                         )
                         .await;
@@ -6870,6 +6887,18 @@ mod tests {
         (search, get, write, written)
     }
 
+    /// Whether any tool result the model read carried a promotion offer.
+    ///
+    /// Used where the exact acknowledgement cannot be named by call id, because
+    /// a turn's own bookkeeping calls (categorisation, folding) consume mock
+    /// responses and shift the pairing.
+    fn any_skill_offer(prompts: &Arc<Mutex<Vec<Vec<Message>>>>) -> bool {
+        prompts.lock().unwrap().iter().flatten().any(|m| {
+            serde_json::from_str::<serde_json::Value>(&m.content)
+                .is_ok_and(|v| !v["skill_offer"].is_null())
+        })
+    }
+
     /// The `begin_step`/`complete_step` pair for one step of a plan.
     fn plan_step_calls(n: usize, goal: &str, outcome: &str) -> Vec<LlmResponse> {
         vec![
@@ -7193,6 +7222,88 @@ mod tests {
         assert_eq!(
             ack["skill_offer"]["tool"], "promote_plan_to_skill",
             "searching the library is not following a skill: {ack}"
+        );
+    }
+
+    /// A skill read in an EARLIER turn must not suppress this turn's offer.
+    /// The question is whether THIS plan followed a skill, not whether the
+    /// conversation ever opened one - otherwise one lookup silences the feature
+    /// for the rest of the conversation.
+    #[tokio::test]
+    async fn a_skill_read_in_an_earlier_turn_does_not_suppress_this_turns_offer() {
+        let tools = vec![ToolDefinition::new(
+            "builtin_skill_get",
+            "Read a skill",
+            serde_json::json!({"type": "object"}),
+        )];
+        let mut results = HashMap::new();
+        results.insert(
+            "builtin_skill_get".to_string(),
+            serde_json::json!({"name": "unrelated", "trust_tier": "local"}).to_string(),
+        );
+
+        // Turn one reads a skill and plans nothing.
+        let mut responses = vec![
+            LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new(
+                    "s1",
+                    "builtin_skill_get",
+                    r#"{"name":"unrelated"}"#,
+                )],
+            ),
+            LlmResponse::text("That skill says to do X."),
+        ];
+        // Turn two works an unrelated plan through to the end.
+        responses.extend(plan_step_calls(1, "read the failing job", "it times out"));
+        responses.extend(plan_step_calls(2, "raise the timeout", "it now passes"));
+        responses.extend(plan_step_calls(3, "record the new value", "written down"));
+        // A fourth step, so the plan still clears the bar even though a turn's
+        // own bookkeeping call consumes one mock response.
+        responses.extend(plan_step_calls(4, "re-run the job", "it passes"));
+        responses.push(LlmResponse::text("Done."));
+
+        let (write, list, _sp) = in_memory_scratchpad();
+        let (search, get, skill_write, _written) = in_memory_skill_catalog(Vec::new());
+        let llm = ToolCallingLlm::new(responses);
+        let prompts = llm.prompts();
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            llm,
+            MockToolExecutor::new(tools, results),
+            id_gen(),
+        )
+        .with_scratchpad_write(write)
+        .with_scratchpad_list(list)
+        .with_skill_promotion(search, get, skill_write);
+
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(
+                &conv.id,
+                "what does that skill say?".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await
+            .unwrap();
+        handler
+            .send_prompt(
+                &conv.id,
+                "now fix the job".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            any_skill_offer(&prompts),
+            "an earlier turn's lookup is not this plan following a skill, so the second \
+             turn's completed plan must still be offered"
         );
     }
 

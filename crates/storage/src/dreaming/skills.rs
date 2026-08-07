@@ -37,7 +37,11 @@ use crate::skill_index::PgSkillIndexStore;
 /// `source` recorded on a skill the dream cycle extracted from a transcript,
 /// so it is told apart from one the assistant promoted from its own plan and
 /// from one a person put on disk.
-pub(crate) const EXTRACTED_SOURCE: &str = "extraction";
+///
+/// Re-exported from `core` rather than declared here: the promotion path's
+/// "may I revise this row?" rule recognises this marker, and two spellings of
+/// it would let an unattended write reach a person's skill.
+pub(crate) use desktop_assistant_core::skill_promotion::EXTRACTED_SOURCE;
 
 /// The part of the extraction system prompt that sends a method to the skill
 /// catalog rather than the fact list.

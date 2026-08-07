@@ -1221,7 +1221,8 @@ impl BuiltinToolService {
                 "Search the on-disk skill library — reusable how-to playbooks and workflows — by \
                  meaning. Call this before a recurring or procedural task to check whether an \
                  established skill already covers it, then read the full body with \
-                 builtin_skill_get before following one.",
+                 builtin_skill_get before following one. Skills awaiting approval are not \
+                 listed; a `note` says how many were held back.",
                 serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1240,7 +1241,9 @@ impl BuiltinToolService {
                 TOOL_SKILL_GET,
                 "Fetch one skill by name: its full markdown body, on-disk path, attachment \
                  filenames, kind, trust tier, and whether its files are still present on disk. \
-                 Use after builtin_skill_search to read a skill before following it. When \
+                 Use after builtin_skill_search to read a skill before following it. A skill \
+                 awaiting approval returns ok:false with awaiting_approval:true and no body -- \
+                 it cannot be followed until a person approves it. When \
                  present_on_disk is false the procedure is still good, but the skill's files are \
                  gone: its path and attachments no longer resolve, so don't try to run its \
                  bundled scripts. Returns your own user-scoped copy of this skill if you have \
@@ -1935,6 +1938,14 @@ impl BuiltinToolService {
             limit
         };
         let mut results = search_fn(query, query_embedding, embedding_model, fetch).await?;
+        // An unapproved skill is not offered (#1155). Approval is the axis that
+        // says a person agreed this may be followed, and a skill nobody agreed
+        // to must not compete for the model's attention alongside ones they
+        // did. Filtered before the limit, so an unapproved row cannot displace
+        // an approved one from the results.
+        let before = results.len();
+        results.retain(|s| s.is_approved());
+        let unapproved = before - results.len();
         if let Some(kind) = &kind_filter {
             results.retain(|s| s.kind.as_str() == kind);
         }
@@ -1955,7 +1966,15 @@ impl BuiltinToolService {
             })
             .collect();
 
-        Ok(serde_json::json!({ "ok": true, "results": items }).to_string())
+        // Said plainly rather than silently, so the model can tell "the library
+        // has nothing" from "the library has something nobody has approved".
+        let note = (unapproved > 0).then(|| {
+            format!(
+                "{unapproved} matching skill(s) are awaiting approval and are not shown; \
+                 they cannot be followed until a person approves them"
+            )
+        });
+        Ok(serde_json::json!({ "ok": true, "results": items, "note": note }).to_string())
     }
 
     async fn skill_get(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
@@ -1991,6 +2010,23 @@ impl BuiltinToolService {
                 None => mine,
             }
         };
+
+        // The body is what gets followed, so an unapproved skill's body is not
+        // returned (#1155). Reported as a business outcome naming the reason,
+        // not as "no such skill": the model asked for something real, and
+        // hiding why would invite it to ask again.
+        if let Some(s) = &found
+            && !s.is_approved()
+        {
+            return Ok(serde_json::json!({
+                "ok": false,
+                "reason": format!(
+                    "the skill {name} is awaiting approval and cannot be followed yet"
+                ),
+                "awaiting_approval": true,
+            })
+            .to_string());
+        }
 
         match found {
             Some(s) => Ok(serde_json::json!({
@@ -8321,7 +8357,9 @@ mod tests {
                 metadata: serde_json::Value::Null,
                 present_on_disk: true,
                 last_seen_at: None,
-                approved_at: None,
+                // A skill a scan found on disk arrives approved (#1155):
+                // somebody put the file there.
+                approved_at: Some(chrono::Utc::now()),
                 approved_by: None,
             }
         }
@@ -8374,6 +8412,87 @@ mod tests {
         assert_eq!(miss_json["ok"], false);
     }
 
+    /// #1155: approval is what says a skill may be followed, so an unapproved
+    /// one is neither listed by search nor served by get. Without this the
+    /// column would exist and protect nothing, and the promotion tool's own
+    /// description ("cannot be followed until a person approves it") would be
+    /// a promise the code does not keep.
+    #[tokio::test]
+    async fn an_unapproved_skill_is_neither_listed_nor_served() {
+        use desktop_assistant_core::domain::{IndexedSkill, Locality, SkillKind, TrustTier};
+        use desktop_assistant_core::ports::skill_index::{SkillGetFn, SkillSearchFn};
+        use std::sync::Arc;
+
+        fn row(name: &str, approved: bool) -> IndexedSkill {
+            IndexedSkill {
+                name: name.to_string(),
+                description: format!("does {name}"),
+                kind: SkillKind::Workflow,
+                disk_path: String::new(),
+                owner_user_id: None,
+                locality: Locality::Daemon,
+                content_hash: "h".to_string(),
+                trust_tier: TrustTier::Local,
+                source: Some("self-authored".to_string()),
+                tags: vec![],
+                attachments: vec![],
+                body: "## Steps\n1. the secret method".to_string(),
+                metadata: serde_json::Value::Null,
+                present_on_disk: false,
+                last_seen_at: None,
+                approved_at: approved.then(chrono::Utc::now),
+                approved_by: None,
+            }
+        }
+
+        let search_fn: SkillSearchFn = Arc::new(|_q, _emb, _model, _limit| {
+            Box::pin(async { Ok(vec![row("approved-one", true), row("draft", false)]) })
+        });
+        let get_fn: SkillGetFn =
+            Arc::new(|name, _owner| Box::pin(async move { Ok(Some(row(&name, name != "draft"))) }));
+        let service = BuiltinToolService::new().with_skills(search_fn, get_fn);
+
+        let out = service
+            .execute_tool(TOOL_SKILL_SEARCH, serde_json::json!({"query": "method"}))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let results = json["results"].as_array().unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "only the approved skill is listed: {json}"
+        );
+        assert_eq!(results[0]["name"], "approved-one");
+        assert!(
+            json["note"]
+                .as_str()
+                .unwrap_or("")
+                .contains("awaiting approval"),
+            "the model is told something was held back, not left guessing: {json}"
+        );
+
+        let got = service
+            .execute_tool(TOOL_SKILL_GET, serde_json::json!({"name": "draft"}))
+            .await
+            .unwrap();
+        let got_json: serde_json::Value = serde_json::from_str(&got).unwrap();
+        assert_eq!(got_json["ok"], false);
+        assert_eq!(got_json["awaiting_approval"], true);
+        assert!(
+            got_json.get("body").is_none(),
+            "the body is what gets followed, so it must not be served: {got_json}"
+        );
+
+        let allowed = service
+            .execute_tool(TOOL_SKILL_GET, serde_json::json!({"name": "approved-one"}))
+            .await
+            .unwrap();
+        let allowed_json: serde_json::Value = serde_json::from_str(&allowed).unwrap();
+        assert_eq!(allowed_json["ok"], true);
+        assert!(allowed_json["body"].as_str().unwrap().contains("## Steps"));
+    }
+
     /// Build a same-named "deploy" `IndexedSkill` for the `skill_get`
     /// fallback-chain tests below, so each test states only what varies: a
     /// `description` (to prove which row won) and whether the row is live or
@@ -8399,7 +8518,9 @@ mod tests {
             metadata: serde_json::Value::Null,
             present_on_disk,
             last_seen_at: None,
-            approved_at: None,
+            // Scanned from disk, so approved (#1155); these cases are about
+            // scope resolution, not about consent.
+            approved_at: Some(chrono::Utc::now()),
             approved_by: None,
         }
     }
