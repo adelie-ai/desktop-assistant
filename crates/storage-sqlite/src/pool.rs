@@ -97,6 +97,55 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     )
     .await?;
     ensure_column(pool, "skill_index", "last_seen_at", "TEXT").await?;
+    // #1155: the approval axis (consent), orthogonal to `trust_tier`
+    // (provenance). The ADD COLUMN + one-time backfill run as a guarded Rust
+    // step (see `ensure_skill_approval_columns`) because SQLite has no
+    // `ADD COLUMN IF NOT EXISTS`; the supporting index is pure SQL and lives
+    // in the migration file.
+    ensure_skill_approval_columns(pool).await?;
+    sqlx::raw_sql(include_str!("../migrations/003_skill_approval.sql"))
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Add `approved_at`/`approved_by` to `skill_index` if they are not already
+/// present, backfilling every pre-existing row to its `indexed_at` in the same
+/// step (#1155).
+///
+/// Every skill already in the catalog before this migration arrived by a
+/// person placing a file in a skill root -- the deliberate act that
+/// `core::skill_catalog::reconcile_scan` treats as approval -- so backfilling
+/// to `indexed_at` records exactly the consent that act already gave.
+///
+/// The backfill runs only inside the same "the column did not exist yet"
+/// guard as the `ALTER TABLE`, which is what makes it safe to re-run: this
+/// whole migration is meaningful only the first time the columns appear, so
+/// gating on column-existence -- rather than re-running the `UPDATE`
+/// unconditionally on every boot -- is what stops a person's later
+/// `set_approval(..., None)` withdrawal from being silently overwritten back
+/// to approved.
+///
+/// SQLite's `ALTER TABLE` has no `ADD COLUMN IF NOT EXISTS`, and plain SQL has
+/// no conditional DDL (a trigger body cannot run `ALTER TABLE` either), so
+/// this guard -- like `ensure_column` above -- has to live in Rust rather
+/// than in `003_skill_approval.sql`.
+async fn ensure_skill_approval_columns(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    let cols: Vec<(String,)> = sqlx::query_as("SELECT name FROM pragma_table_info('skill_index')")
+        .fetch_all(pool)
+        .await?;
+    if cols.iter().any(|(name,)| name == "approved_at") {
+        return Ok(());
+    }
+    sqlx::query("ALTER TABLE skill_index ADD COLUMN approved_at TEXT")
+        .execute(pool)
+        .await?;
+    sqlx::query("ALTER TABLE skill_index ADD COLUMN approved_by TEXT")
+        .execute(pool)
+        .await?;
+    sqlx::query("UPDATE skill_index SET approved_at = indexed_at")
+        .execute(pool)
+        .await?;
     Ok(())
 }
 

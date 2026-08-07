@@ -41,6 +41,11 @@ conformance_tests!(
     upsert_ignores_caller_supplied_presence,
     get_is_scope_addressed,
     set_presence_tolerates_unknown_and_empty,
+    authored_skill_is_unapproved_until_approved,
+    upsert_preserves_approval_across_a_rescan,
+    a_scanned_skill_arrives_approved,
+    amending_an_approved_skill_withdraws_its_approval,
+    set_approval_tolerates_unknown_and_empty,
 );
 
 fn skill(name: &str, description: &str, body: &str) -> IndexedSkill {
@@ -64,6 +69,8 @@ fn skill(name: &str, description: &str, body: &str) -> IndexedSkill {
         metadata: serde_json::json!({"author": "test"}),
         present_on_disk: true,
         last_seen_at: None,
+        approved_at: None,
+        approved_by: None,
     }
 }
 

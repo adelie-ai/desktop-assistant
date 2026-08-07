@@ -13,12 +13,20 @@
 //!   This is the one behavior genuinely local to this adapter -- SQLite has no
 //!   vector column -- so it is tested here rather than in the shared contract.
 //!
+//! Approval (#1155) is a third column pair (`approved_at`/`approved_by`),
+//! orthogonal to `trust_tier`'s provenance: `upsert_row` honours it on insert
+//! and preserves it on update, while `write_authored_row` forces it cleared on
+//! both branches. See [`SkillIndexStore::upsert`] and
+//! [`SkillIndexStore::write_authored`] for why.
+//!
 //! All SQL is static with bound parameters (no dynamic string building); the
 //! only "search input" is the bound `$query` text and `$embedding` vector.
 
 use chrono::{DateTime, Utc};
 use desktop_assistant_core::CoreError;
-use desktop_assistant_core::domain::{IndexedSkill, Locality, SkillKind, SkillScope, TrustTier};
+use desktop_assistant_core::domain::{
+    IndexedSkill, Locality, SkillApproval, SkillKind, SkillScope, TrustTier,
+};
 use desktop_assistant_core::ports::auth::current_user_id;
 use desktop_assistant_core::ports::skill_index::SkillIndexStore;
 use pgvector::Vector;
@@ -41,6 +49,13 @@ impl PgSkillIndexStore {
     /// `seen_at` stamps `last_seen_at` and marks the row present: presence is
     /// index state derived from the scan that produced `skill`, never read off
     /// the argument.
+    ///
+    /// Approval (`approved_at`/`approved_by`) is honoured on insert -- a
+    /// first-seen scan is how a skill records "a person put this file in a
+    /// skill root" (#1155) -- but the `ON CONFLICT` `SET` list below
+    /// deliberately omits both columns, so an update leaves the stored
+    /// approval exactly where it was. A rescan re-reads a file; it does not
+    /// re-decide whether a person consented to it.
     async fn upsert_row(
         conn: &mut sqlx::PgConnection,
         skill: &IndexedSkill,
@@ -50,8 +65,8 @@ impl PgSkillIndexStore {
             "INSERT INTO skill_index \
                 (name, owner_user_id, description, kind, disk_path, locality, content_hash, \
                  trust_tier, source, tags, attachments, body, metadata, embedding, embedding_model, \
-                 present_on_disk, last_seen_at) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13, NULL, NULL, TRUE, $14) \
+                 present_on_disk, last_seen_at, approved_at, approved_by) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13, NULL, NULL, TRUE, $14, $15, $16) \
              ON CONFLICT (name, owner_key) DO UPDATE SET \
                 description = EXCLUDED.description, \
                 kind = EXCLUDED.kind, \
@@ -88,6 +103,83 @@ impl PgSkillIndexStore {
         .bind(&skill.body)
         .bind(&skill.metadata)
         .bind(seen_at)
+        .bind(skill.approved_at)
+        .bind(&skill.approved_by)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| CoreError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Insert or update a skill the assistant authored from a completed plan
+    /// (#1155), keyed on `(name, owner_key)` like [`Self::upsert_row`].
+    ///
+    /// Both branches force `present_on_disk = FALSE`, `approved_at = NULL`
+    /// and `approved_by = NULL`: nothing was read off disk, and unattended
+    /// authoring records no consent, so the row cannot wear either claim
+    /// whatever the caller's argument says (see
+    /// [`SkillIndexStore::write_authored`]'s doc for why that has to be
+    /// forced here rather than trusted from the caller). `last_seen_at` is
+    /// deliberately absent from the `ON CONFLICT` `SET` list, so an amend
+    /// leaves it exactly as the last scan (if any) left it -- nothing here was
+    /// scanned, so there is nothing to mark freshly seen.
+    ///
+    /// `authored_at` stamps `indexed_at` on both branches, in place of the
+    /// wall clock, mirroring how [`Self::upsert_row`]'s `seen_at` stamps
+    /// `last_seen_at`: the instant is injected so a caller's write is
+    /// deterministic under test, per `crate::clock`'s convention.
+    ///
+    /// Embedding retention mirrors [`Self::upsert_row`]: preserved when
+    /// `content_hash` is unchanged, nulled for re-embedding when it changes.
+    async fn write_authored_row(
+        conn: &mut sqlx::PgConnection,
+        skill: &IndexedSkill,
+        authored_at: DateTime<Utc>,
+    ) -> Result<(), CoreError> {
+        sqlx::query(
+            "INSERT INTO skill_index \
+                (name, owner_user_id, description, kind, disk_path, locality, content_hash, \
+                 trust_tier, source, tags, attachments, body, metadata, embedding, embedding_model, \
+                 present_on_disk, last_seen_at, approved_at, approved_by, indexed_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13, NULL, NULL, FALSE, $14, NULL, NULL, $15) \
+             ON CONFLICT (name, owner_key) DO UPDATE SET \
+                description = EXCLUDED.description, \
+                kind = EXCLUDED.kind, \
+                disk_path = EXCLUDED.disk_path, \
+                locality = EXCLUDED.locality, \
+                content_hash = EXCLUDED.content_hash, \
+                trust_tier = EXCLUDED.trust_tier, \
+                source = EXCLUDED.source, \
+                tags = EXCLUDED.tags, \
+                attachments = EXCLUDED.attachments, \
+                body = EXCLUDED.body, \
+                metadata = EXCLUDED.metadata, \
+                embedding = CASE \
+                    WHEN skill_index.content_hash IS DISTINCT FROM EXCLUDED.content_hash \
+                    THEN NULL ELSE skill_index.embedding END, \
+                embedding_model = CASE \
+                    WHEN skill_index.content_hash IS DISTINCT FROM EXCLUDED.content_hash \
+                    THEN NULL ELSE skill_index.embedding_model END, \
+                present_on_disk = FALSE, \
+                approved_at = NULL, \
+                approved_by = NULL, \
+                indexed_at = EXCLUDED.indexed_at",
+        )
+        .bind(&skill.name)
+        .bind(&skill.owner_user_id)
+        .bind(&skill.description)
+        .bind(skill.kind.as_str())
+        .bind(&skill.disk_path)
+        .bind(skill.locality.as_str())
+        .bind(&skill.content_hash)
+        .bind(skill.trust_tier.as_str())
+        .bind(&skill.source)
+        .bind(serde_json::json!(skill.tags))
+        .bind(serde_json::json!(skill.attachments))
+        .bind(&skill.body)
+        .bind(&skill.metadata)
+        .bind(skill.last_seen_at)
+        .bind(authored_at)
         .execute(&mut *conn)
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;
@@ -102,7 +194,8 @@ impl PgSkillIndexStore {
         let user = current_user_id();
         let rows: Vec<SkillRow> = sqlx::query_as(
             "SELECT name, owner_user_id, description, kind, disk_path, locality, content_hash, \
-                    trust_tier, source, tags, attachments, body, metadata, present_on_disk, last_seen_at \
+                    trust_tier, source, tags, attachments, body, metadata, present_on_disk, \
+                    last_seen_at, approved_at, approved_by \
              FROM skill_index \
              WHERE (owner_user_id IS NULL OR owner_user_id = $1) \
                AND tsv @@ plainto_tsquery('english', $2) \
@@ -193,7 +286,7 @@ impl PgSkillIndexStore {
              ) \
              SELECT s.name, s.owner_user_id, s.description, s.kind, s.disk_path, s.locality, \
                     s.content_hash, s.trust_tier, s.source, s.tags, s.attachments, s.body, \
-                    s.metadata, s.present_on_disk, s.last_seen_at \
+                    s.metadata, s.present_on_disk, s.last_seen_at, s.approved_at, s.approved_by \
              FROM fused f JOIN scope s ON s.name = f.name AND s.owner_key = f.owner_key \
              ORDER BY f.score DESC, s.name ASC, s.owner_key ASC LIMIT $5",
         )
@@ -221,6 +314,51 @@ impl SkillIndexStore for PgSkillIndexStore {
         Self::upsert_row(&mut conn, skill, seen_at).await
     }
 
+    async fn write_authored(
+        &self,
+        skill: &IndexedSkill,
+        authored_at: DateTime<Utc>,
+    ) -> Result<(), CoreError> {
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
+        Self::write_authored_row(&mut conn, skill, authored_at).await
+    }
+
+    async fn set_approval(
+        &self,
+        scope: &SkillScope,
+        names: &[String],
+        approval: Option<SkillApproval>,
+    ) -> Result<(), CoreError> {
+        if names.is_empty() {
+            return Ok(());
+        }
+        // `Some` approves, `None` withdraws -- unpacked here rather than
+        // bound as a whole, since `SkillApproval` carries no SQL encoding of
+        // its own and the two columns it wraps are independently nullable.
+        let (approved_at, approved_by) = match approval {
+            Some(a) => (Some(a.at), a.by),
+            None => (None, None),
+        };
+        // Names absent from the scope simply match nothing -- the same
+        // tolerance `set_presence` has, and for the same reason.
+        sqlx::query(
+            "UPDATE skill_index SET approved_at = $3, approved_by = $4 \
+             WHERE owner_key = $1 AND name = ANY($2)",
+        )
+        .bind(scope.owner().unwrap_or(""))
+        .bind(names)
+        .bind(approved_at)
+        .bind(approved_by)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CoreError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
     async fn list_scope(&self, scope: &SkillScope) -> Result<Vec<IndexedSkill>, CoreError> {
         // Unfiltered by the calling user by design: the reconcile pass runs at
         // startup with no request scope and must see the whole partition it is
@@ -229,7 +367,7 @@ impl SkillIndexStore for PgSkillIndexStore {
         let rows: Vec<SkillRow> = sqlx::query_as(
             "SELECT name, owner_user_id, description, kind, disk_path, locality, content_hash, \
                     trust_tier, source, tags, attachments, body, metadata, present_on_disk, \
-                    last_seen_at \
+                    last_seen_at, approved_at, approved_by \
              FROM skill_index WHERE owner_key = $1 ORDER BY name",
         )
         .bind(scope.owner().unwrap_or(""))
@@ -299,7 +437,8 @@ impl SkillIndexStore for PgSkillIndexStore {
         let owner_key = owner.map(|_| user.as_str());
         let row: Option<SkillRow> = sqlx::query_as(
             "SELECT name, owner_user_id, description, kind, disk_path, locality, content_hash, \
-                    trust_tier, source, tags, attachments, body, metadata, present_on_disk, last_seen_at \
+                    trust_tier, source, tags, attachments, body, metadata, present_on_disk, \
+                    last_seen_at, approved_at, approved_by \
              FROM skill_index \
              WHERE name = $1 AND owner_key = COALESCE($2, '')",
         )
@@ -315,7 +454,8 @@ impl SkillIndexStore for PgSkillIndexStore {
         let user = current_user_id();
         let rows: Vec<SkillRow> = sqlx::query_as(
             "SELECT name, owner_user_id, description, kind, disk_path, locality, content_hash, \
-                    trust_tier, source, tags, attachments, body, metadata, present_on_disk, last_seen_at \
+                    trust_tier, source, tags, attachments, body, metadata, present_on_disk, \
+                    last_seen_at, approved_at, approved_by \
              FROM skill_index \
              WHERE (owner_user_id IS NULL OR owner_user_id = $1) \
              ORDER BY indexed_at DESC LIMIT $2",
@@ -347,6 +487,8 @@ struct SkillRow {
     metadata: serde_json::Value,
     present_on_disk: bool,
     last_seen_at: Option<DateTime<Utc>>,
+    approved_at: Option<DateTime<Utc>>,
+    approved_by: Option<String>,
 }
 
 impl SkillRow {
@@ -367,6 +509,8 @@ impl SkillRow {
             metadata: self.metadata,
             present_on_disk: self.present_on_disk,
             last_seen_at: self.last_seen_at,
+            approved_at: self.approved_at,
+            approved_by: self.approved_by,
         }
     }
 }

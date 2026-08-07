@@ -244,7 +244,13 @@ mod tests {
                 .iter_mut()
                 .find(|r| r.name == stored.name && r.owner_user_id == stored.owner_user_id)
             {
-                Some(existing) => *existing = stored,
+                Some(existing) => {
+                    // Approval is honoured on insert and preserved on update: a
+                    // rescan re-reads a file, it does not re-decide consent.
+                    stored.approved_at = existing.approved_at;
+                    stored.approved_by = existing.approved_by.clone();
+                    *existing = stored;
+                }
                 None => rows.push(stored),
             }
             Ok(())
@@ -255,8 +261,25 @@ mod tests {
             skill: &IndexedSkill,
             _authored_at: DateTime<Utc>,
         ) -> Result<(), CoreError> {
-            let _ = skill;
-            todo!("write_authored")
+            let mut stored = skill.clone();
+            // Forced, not read off the argument: unattended authoring records
+            // no consent, and nothing was read off disk.
+            stored.approved_at = None;
+            stored.approved_by = None;
+            stored.present_on_disk = false;
+
+            let mut rows = self.rows.lock().expect("lock");
+            match rows
+                .iter_mut()
+                .find(|r| r.name == stored.name && r.owner_user_id == stored.owner_user_id)
+            {
+                Some(existing) => {
+                    stored.last_seen_at = existing.last_seen_at;
+                    *existing = stored;
+                }
+                None => rows.push(stored),
+            }
+            Ok(())
         }
 
         async fn set_approval(
@@ -265,8 +288,14 @@ mod tests {
             names: &[String],
             approval: Option<SkillApproval>,
         ) -> Result<(), CoreError> {
-            let _ = (scope, names, approval);
-            todo!("set_approval")
+            let mut rows = self.rows.lock().expect("lock");
+            for row in rows.iter_mut() {
+                if row.owner_user_id.as_deref() == scope.owner() && names.contains(&row.name) {
+                    row.approved_at = approval.as_ref().map(|a| a.at);
+                    row.approved_by = approval.as_ref().and_then(|a| a.by.clone());
+                }
+            }
+            Ok(())
         }
 
         async fn list_scope(&self, scope: &SkillScope) -> Result<Vec<IndexedSkill>, CoreError> {

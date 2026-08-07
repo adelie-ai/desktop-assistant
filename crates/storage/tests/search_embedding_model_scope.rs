@@ -373,6 +373,8 @@ fn skill(name: &str, description: &str, body: &str) -> IndexedSkill {
         metadata: serde_json::json!({}),
         present_on_disk: true,
         last_seen_at: None,
+        approved_at: None,
+        approved_by: None,
     }
 }
 

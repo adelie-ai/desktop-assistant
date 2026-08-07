@@ -98,6 +98,82 @@ used to, because a half-finished pass could delete skills. Now the worst a
 partial pass leaves behind is a stale presence flag that the next scan corrects,
 and re-running a scan changes nothing after the first.
 
+## Approval: whether a skill may be followed
+
+`trust_tier` records **provenance** - where a skill came from (`local`,
+`github`, `well_known`, `unknown`). It says nothing about whether anybody agreed
+to run it. Approval is a second, orthogonal column pair (#1155):
+
+| Column | Meaning |
+| ------ | ------- |
+| `approved_at` | When a person approved the skill. `NULL` means not approved. |
+| `approved_by` | Who approved it. `NULL` on a single-person deployment. |
+
+The two axes are genuinely independent. A skill fetched from GitHub can be
+approved. A skill Adele wrote for herself is `local` - the most trusted
+provenance the catalog has, because it really was authored locally - and must
+still not be followed until somebody says so. One column cannot hold both facts.
+
+Who may write the columns is deliberately narrow:
+
+- **A scan approves what it inserts.** Putting a file in a skill root is a
+  deliberate human act, so `reconcile_scan` stamps `approved_at` on every skill
+  it inserts. That is the only place the scan path may decide it.
+- **A rescan never re-approves.** `upsert` honours approval on insert and
+  preserves it on update, so a skill a person unapproved stays unapproved
+  through every later scan.
+- **`write_authored` always lands unapproved.** It forces `approved_at` to NULL
+  on both branches, so an amend of an approved skill drops the approval the old
+  body earned. Forcing it in the store rather than in the caller is what makes
+  that atomic: there is no window in which new content wears an old approval.
+- **`set_approval` is the explicit flip**, in either direction.
+
+## Skills Adele writes for herself
+
+When a plan finishes, the procedure it followed is already written down: the
+scratchpad holds one `todo` note per step and one `outcome:<step>` note per
+finding (#240), which is a `## Steps` workflow in everything but name. So a
+finished plan is **promoted**, not authored from scratch.
+
+**The trigger.** A plan comes back to the root, and the offer arrives inside the
+`complete_step` acknowledgement as a `skill_offer` field. At most one offer per
+turn: a turn may return to the root several times, and repeating the offer would
+train the model to ignore it.
+
+**The bar**, in `crates/core/src/skill_promotion.rs`, and what it excludes:
+
+| Rule | What it keeps out |
+| ---- | ----------------- |
+| At least 3 steps that finished **and** recorded an outcome | A question answered (no plan at all), a single file written (one step), a pair of acts with no shape between them (two steps), and any step whose finding was never written down |
+| The turn did not read a skill (`builtin_skill_get`) before it planned | Re-saving a skill the turn just followed, which is how a library fills with near-duplicates. Searching the library is not following one |
+| No more than a third of the plan abandoned | A plan that records a search rather than a method |
+| The turn did not ingest external content (#741) | A turn whose own wording is withheld, and which therefore recorded no procedure |
+
+**It is an offer, never a write.** The model has the context to say whether what
+it just did generalises, and that judgement is the whole value. Declining is
+doing nothing.
+
+**Dedup happens before the offer.** The catalog is searched with the plan's own
+goals, and any match is named in the offer with `mode_hint: "amend"`. At the
+write, a request to add a skill whose name is already taken is refused outright
+and told to amend instead - never satisfied with a second row.
+
+**Accepting** calls `promote_plan_to_skill {name, description, mode?, tags?,
+summary?}`. The body is rendered from the plan's steps and outcomes; the model
+supplies only how the skill is found and what it is for. The transcript is never
+read, because the transcript carries the dead ends and the plan carries what
+worked. The bar is re-checked at the write, so a plan that never cleared it
+cannot be kept by calling the tool directly.
+
+**What lands** is a catalog row scoped to the caller (never host-global), with
+`trust_tier = local`, `source = self-authored`, `approved_at = NULL`, and
+`present_on_disk = false` - no file is written to a skill root. The catalog is
+the authoritative copy (#639), so the procedure reads and searches normally;
+only bundled scripts would fail to resolve, and an authored skill has none.
+
+The dream cycle writes candidates the same way. See
+`docs/features/knowledge-maintenance.md`, "A method is not a fact".
+
 ## Tools the model sees
 
 Capability-gated (advertised only when the index is wired), in the `skills`
@@ -110,14 +186,24 @@ provider group:
 - `builtin_skill_get {name}` — the full body plus metadata for one skill. Returns the
   caller's own user-scoped copy if one exists, otherwise the global one; there is no
   argument to address another user's copy (#911).
+- `promote_plan_to_skill {name, description, mode?, tags?, summary?}` — keeps the
+  finished plan as an unapproved skill. A **core-loop** tool, like
+  `begin_step`/`complete_step`: the plan and the turn's messages belong to the
+  dispatch loop, so it is intercepted there rather than routed to the tool
+  executor. Advertised only when a scratchpad writer **and** the catalog are both
+  wired.
 
 ## Where things live
 
 | Concern | Location |
 | ------- | -------- |
-| Domain (parse / hash / kind / trust) | `crates/core/src/domain/skill.rs` |
-| Port + closures | `crates/core/src/ports/skill_index.rs` |
-| Postgres store + migration + backfill | `crates/storage/src/skill_index.rs`, `migrations/031_skill_index.sql`, `embedding_backfill.rs` |
+| Domain (parse / hash / kind / trust / approval) | `crates/core/src/domain/skill.rs` |
+| Port + closures + executable contract | `crates/core/src/ports/skill_index/` |
+| The promotion bar, body rendering, dedup decision | `crates/core/src/skill_promotion.rs` |
+| Trigger + `promote_plan_to_skill` handler | `crates/core/src/service.rs` (`plan_promotion_offer`, `handle_promote_plan`) |
+| Extraction's skill arm | `crates/storage/src/dreaming/skills.rs` |
+| Postgres store + migrations + backfill | `crates/storage/src/skill_index.rs`, `migrations/033_skill_index.sql`, `035_skill_presence.sql`, `046_skill_approval.sql`, `embedding_backfill.rs` |
+| SQLite store + migrations | `crates/storage-sqlite/src/skill_index.rs`, `migrations/002_skill_index.sql`, `003_skill_approval.sql` |
 | Startup scanner | `crates/daemon/src/skill_scanner.rs` |
 | Config | `crates/daemon/src/config/mod.rs` (`SkillsConfig`) |
 | Tools | `crates/mcp-client/src/builtin.rs` (`builtin_skill_*`) |

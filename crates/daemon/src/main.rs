@@ -2884,6 +2884,36 @@ async fn main() -> Result<()> {
         handler = handler.with_descendant_task_probe(probe);
     }
 
+    // #1155: offer to keep a finished plan as a skill, and record the one the
+    // model chooses. The write always lands UNAPPROVED, so this wiring cannot
+    // grant a self-authored skill the right to be followed - only a person can.
+    // No-op without a skill catalog, which leaves the offer off entirely.
+    if let Some(si) = &skill_index_store {
+        use desktop_assistant_core::domain::IndexedSkill;
+        use desktop_assistant_core::ports::skill_index::SkillIndexStore;
+        let si_search = Arc::clone(si);
+        let si_get = Arc::clone(si);
+        let si_write = Arc::clone(si);
+        handler = handler.with_skill_promotion(
+            Arc::new(move |query, embedding, embedding_model: String, limit| {
+                let store = Arc::clone(&si_search);
+                Box::pin(async move {
+                    store
+                        .search(&query, embedding, &embedding_model, limit)
+                        .await
+                })
+            }),
+            Arc::new(move |name, owner| {
+                let store = Arc::clone(&si_get);
+                Box::pin(async move { store.get(&name, owner.as_deref()).await })
+            }),
+            Arc::new(move |skill: IndexedSkill| {
+                let store = Arc::clone(&si_write);
+                Box::pin(async move { store.write_authored(&skill, chrono::Utc::now()).await })
+            }),
+        );
+    }
+
     // Pre-prompt recall (#1100): embed the user prompt once before the model's
     // first move and put the memory nearest it in front of the model as a
     // `[Recall]` block. Default-on; `[recall] enabled = false` switches it off.

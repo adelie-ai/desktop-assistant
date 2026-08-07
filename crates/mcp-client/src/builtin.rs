@@ -319,7 +319,10 @@ const TOOL_SCRATCHPAD_SEARCH: &str = "builtin_scratchpad_search";
 const TOOL_SCRATCHPAD_DELETE: &str = "builtin_scratchpad_delete";
 const TOOL_SCRATCHPAD_PIN: &str = "builtin_scratchpad_pin";
 const TOOL_SKILL_SEARCH: &str = "builtin_skill_search";
-const TOOL_SKILL_GET: &str = "builtin_skill_get";
+/// Reading a skill's body is what "following a skill" starts with, so the name
+/// is owned by the promotion policy that refuses to re-save a skill the turn
+/// just followed (#1155) rather than declared twice.
+const TOOL_SKILL_GET: &str = desktop_assistant_core::skill_promotion::SKILL_GET_TOOL;
 
 /// Marker passed as `SkillGetFn`'s `owner` argument to mean "the caller's
 /// own scope". Per the port contract (#911), every implementation --
@@ -8318,6 +8321,8 @@ mod tests {
                 metadata: serde_json::Value::Null,
                 present_on_disk: true,
                 last_seen_at: None,
+                approved_at: None,
+                approved_by: None,
             }
         }
 
@@ -8394,6 +8399,8 @@ mod tests {
             metadata: serde_json::Value::Null,
             present_on_disk,
             last_seen_at: None,
+            approved_at: None,
+            approved_by: None,
         }
     }
 

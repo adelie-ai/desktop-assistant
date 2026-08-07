@@ -57,6 +57,14 @@ pub struct ReconcileOutcome {
 /// write into a scope it is not reconciling (which would leave the skill outside
 /// the presence sweep that just ran).
 ///
+/// Every scanned skill is stamped approved at `now` (#1155). A scan reads a
+/// file somebody put in a skill root, and placing it there is the deliberate
+/// human act that approval records; nothing else in the scan path may decide
+/// that. The stamp only reaches rows the store *inserts* -- an update preserves
+/// whatever approval the row already carries -- so a skill a person has
+/// unapproved stays unapproved through every later scan, and a skill Adele
+/// wrote for herself is not approved by the scan that later finds its file.
+///
 /// `now` is injected rather than read from the clock so tests are deterministic,
 /// following [`crate::clock`]'s convention.
 pub async fn reconcile_scan(
@@ -80,6 +88,8 @@ pub async fn reconcile_scan(
 
     for mut skill in scanned {
         skill.owner_user_id = scope.owner().map(str::to_string);
+        skill.approved_at = Some(now);
+        skill.approved_by = None;
         // Count a return once, even if two roots both offer this name (the
         // scanner resolves such collisions, but the count must not depend on
         // that).

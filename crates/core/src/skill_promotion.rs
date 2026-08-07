@@ -20,6 +20,8 @@
 //! half (reading the notes, searching the catalog for a skill that already
 //! covers this, writing the row) lives in the service dispatch loop.
 
+use std::collections::HashMap;
+
 use crate::domain::skill::{IndexedSkill, SkillError, validate_skill_name};
 use crate::domain::tool::ToolDefinition;
 use crate::domain::{Message, Role};
@@ -60,6 +62,10 @@ const ABANDONED_PREFIX: &str = "Abandoned: ";
 
 /// How many existing skills the offer names as possible duplicates.
 pub const MAX_OFFERED_MATCHES: usize = 3;
+
+/// `source` recorded on a skill the assistant wrote from its own completed
+/// plan, so the catalog can tell self-authored rows from scanned ones.
+pub const SELF_AUTHORED_SOURCE: &str = "self-authored";
 
 /// One scratchpad note, as the promotion pass reads it.
 ///
@@ -181,16 +187,76 @@ impl PromotablePlan {
 /// Returned in dotted-key order (`1`, `1.1`, `1.2`, `2`), which is the order
 /// the work happened in.
 pub fn plan_from_notes(notes: &[PlanNote<'_>]) -> Vec<PlanStep> {
-    let _ = (notes, OUTCOME_KEY_PREFIX, ABANDONED_PREFIX, STEP_NOTE_TYPE);
-    todo!("plan_from_notes")
+    let outcomes: HashMap<&str, &str> = notes
+        .iter()
+        .filter_map(|n| {
+            n.key
+                .strip_prefix(OUTCOME_KEY_PREFIX)
+                .map(|k| (k, n.content))
+        })
+        .collect();
+
+    let mut steps: Vec<PlanStep> = notes
+        .iter()
+        .filter(|n| n.note_type == STEP_NOTE_TYPE && n.done && is_step_key(n.key))
+        .map(|n| {
+            let (abandoned, outcome) = read_outcome(outcomes.get(n.key).copied());
+            PlanStep {
+                key: n.key.to_string(),
+                goal: n.content.trim().to_string(),
+                outcome,
+                abandoned,
+            }
+        })
+        .collect();
+    steps.sort_by_key(|s| dotted(&s.key));
+    steps
+}
+
+/// Whether a note key is a dotted step path (`1`, `1.2`, `1.2.3`).
+///
+/// The plan's own keys are minted from stack depth, so anything else in the
+/// `todo` list is a note the model or the user wrote by hand and is not part of
+/// the procedure.
+fn is_step_key(key: &str) -> bool {
+    !key.is_empty()
+        && key
+            .split('.')
+            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Split a stored outcome note into `(abandoned, finding)`.
+///
+/// A withheld placeholder is not a finding: it says a step happened and nothing
+/// about what it produced (#741).
+fn read_outcome(raw: Option<&str>) -> (bool, Option<String>) {
+    let Some(text) = raw.map(str::trim).filter(|t| !t.is_empty()) else {
+        return (false, None);
+    };
+    if text == WITHHELD_STEP_TEXT {
+        return (false, None);
+    }
+    match text.strip_prefix(ABANDONED_PREFIX) {
+        Some(rest) => {
+            let rest = rest.trim();
+            (true, (!rest.is_empty()).then(|| rest.to_string()))
+        }
+        None => (false, Some(text.to_string())),
+    }
+}
+
+/// A dotted key as numbers, so `1.10` sorts after `1.2` rather than before it.
+fn dotted(key: &str) -> Vec<u64> {
+    key.split('.').map(|p| p.parse().unwrap_or(0)).collect()
 }
 
 /// Whether the turn read an existing skill before it planned.
 ///
 /// True when any assistant message in the turn called [`SKILL_GET_TOOL`].
 pub fn followed_a_skill(messages: &[Message]) -> bool {
-    let _ = messages;
-    todo!("followed_a_skill")
+    messages
+        .iter()
+        .any(|m| m.role == Role::Assistant && m.tool_calls.iter().any(|c| c.name == SKILL_GET_TOOL))
 }
 
 /// Decide whether a completed plan is worth offering as a skill.
@@ -198,9 +264,36 @@ pub fn followed_a_skill(messages: &[Message]) -> bool {
 /// The bar, in one place: the plan was not itself a skill being followed, at
 /// least [`MIN_PROMOTABLE_STEPS`] steps finished and recorded what they
 /// produced, and no more than a third of the plan was abandoned.
-pub fn assess(steps: Vec<PlanStep>, followed_a_skill: bool) -> Result<PromotablePlan, NotPromotable> {
-    let _ = (steps, followed_a_skill);
-    todo!("assess")
+pub fn assess(
+    steps: Vec<PlanStep>,
+    followed_a_skill: bool,
+) -> Result<PromotablePlan, NotPromotable> {
+    if followed_a_skill {
+        return Err(NotPromotable::FollowedAnExistingSkill);
+    }
+    // A tainted turn records a placeholder in place of the model's own wording
+    // (#741), so there is a plan-shaped set of notes with no procedure in it.
+    // Reported on its own rather than as "too few steps", because the fix is
+    // different: nothing about the plan was wrong.
+    if !steps.is_empty() && steps.iter().all(|s| s.goal == WITHHELD_STEP_TEXT) {
+        return Err(NotPromotable::NothingRecorded);
+    }
+
+    let succeeded = steps.iter().filter(|s| s.succeeded()).count();
+    if succeeded < MIN_PROMOTABLE_STEPS {
+        return Err(NotPromotable::TooFewSteps {
+            succeeded,
+            needed: MIN_PROMOTABLE_STEPS,
+        });
+    }
+
+    let abandoned = steps.iter().filter(|s| s.abandoned).count();
+    let total = steps.len();
+    if abandoned * MAX_ABANDONED_DENOMINATOR > total {
+        return Err(NotPromotable::TooManyAbandoned { abandoned, total });
+    }
+
+    Ok(PromotablePlan { steps })
 }
 
 /// Render the markdown body of a skill from a plan.
@@ -209,8 +302,27 @@ pub fn assess(steps: Vec<PlanStep>, followed_a_skill: bool) -> Result<Promotable
 /// is what makes the result a workflow rather than a prose playbook (see
 /// [`crate::domain::skill::detect_kind`]), so it is written exactly.
 pub fn render_skill_body(title: &str, summary: Option<&str>, plan: &PromotablePlan) -> String {
-    let _ = (title, summary, plan);
-    todo!("render_skill_body")
+    let mut out = format!("# {}\n\n", title.trim());
+    if let Some(summary) = summary.map(str::trim).filter(|s| !s.is_empty()) {
+        out.push_str(summary);
+        out.push_str("\n\n");
+    }
+    out.push_str("## Steps\n\n");
+
+    // A step's own leaf number, so a nested step reads as `1.` under its
+    // parent rather than repeating the whole dotted path.
+    for step in plan.working_steps() {
+        let indent = "    ".repeat(step.depth());
+        let leaf = step.key.rsplit('.').next().unwrap_or(&step.key);
+        out.push_str(&format!("{indent}{leaf}. {}\n", step.goal));
+        if let Some(outcome) = &step.outcome {
+            for line in outcome.lines() {
+                out.push_str(&format!("{indent}   {line}\n"));
+            }
+        }
+        out.push('\n');
+    }
+    out
 }
 
 /// Render a whole `SKILL.md`: YAML frontmatter plus the body.
@@ -219,8 +331,26 @@ pub fn render_skill_body(title: &str, summary: Option<&str>, plan: &PromotablePl
 /// (`name`, `description`, `tags`), so the result parses back through
 /// [`crate::domain::skill::parse_skill_md`].
 pub fn render_skill_md(name: &str, description: &str, tags: &[String], body: &str) -> String {
-    let _ = (name, description, tags, body);
-    todo!("render_skill_md")
+    let tags = tags
+        .iter()
+        .map(|t| yaml_string(t))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "---\nname: {}\ndescription: {}\ntags: [{tags}]\n---\n\n{body}",
+        yaml_string(name),
+        yaml_string(description),
+    )
+}
+
+/// Quote a value as a YAML double-quoted scalar.
+///
+/// Always quoted, never conditionally: a description is free text the model
+/// wrote, and a leading `#`, a `:` or a `-` in it would otherwise change what
+/// the document means.
+fn yaml_string(value: &str) -> String {
+    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
 }
 
 /// The offer appended to a `complete_step` acknowledgement when a finished plan
@@ -230,8 +360,33 @@ pub fn render_skill_md(name: &str, description: &str, tags: &[String], body: &st
 /// amending one of those is the useful act, and adding a second is not.
 /// Declining is doing nothing.
 pub fn render_offer(plan: &PromotablePlan, existing: &[IndexedSkill]) -> serde_json::Value {
-    let _ = (plan, existing);
-    todo!("render_offer")
+    let matches: Vec<serde_json::Value> = existing
+        .iter()
+        .take(MAX_OFFERED_MATCHES)
+        .map(|s| {
+            serde_json::json!({
+                "name": s.name,
+                "description": s.description,
+                "approved": s.is_approved(),
+            })
+        })
+        .collect();
+    let amend = !matches.is_empty();
+    serde_json::json!({
+        "tool": PROMOTE_PLAN_TOOL,
+        "steps": plan.working_steps().len(),
+        "mode_hint": if amend { "amend" } else { "new" },
+        "existing": matches,
+        "bar": "Offer it only if the method would work again on different inputs. \
+                A question answered, a file written, or a one-off fix is not a skill.",
+        "note": if amend {
+            "The library may already cover this. Amend the closest match rather than \
+             adding a second skill about the same thing, or say nothing and it is dropped."
+        } else {
+            "Call the tool if this generalises. Saying nothing drops the plan, which \
+             costs nothing."
+        },
+    })
 }
 
 /// What the model asked [`PROMOTE_PLAN_TOOL`] to do.
@@ -264,13 +419,144 @@ pub struct PromotionRequest {
 /// uses, because a promoted skill's name is a directory name wherever the
 /// catalog is later exported.
 pub fn parse_promotion_request(args: &serde_json::Value) -> Result<PromotionRequest, SkillError> {
-    let _ = (args, validate_skill_name);
-    todo!("parse_promotion_request")
+    let name = args
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .trim();
+    validate_skill_name(name)?;
+
+    let description = args
+        .get("description")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .trim();
+    if description.is_empty() {
+        return Err(SkillError::InvalidFrontmatter(
+            "description is required: a skill with no trigger cannot be found again".to_string(),
+        ));
+    }
+
+    let mode = match args.get("mode").and_then(|v| v.as_str()).unwrap_or("new") {
+        "new" => PromotionMode::New,
+        "amend" => PromotionMode::Amend,
+        other => {
+            return Err(SkillError::InvalidFrontmatter(format!(
+                "unknown mode {other:?}: expected \"new\" or \"amend\""
+            )));
+        }
+    };
+
+    let tags = args
+        .get("tags")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|t| t.as_str())
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let summary = args
+        .get("summary")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    Ok(PromotionRequest {
+        name: name.to_string(),
+        description: description.to_string(),
+        summary,
+        tags,
+        mode,
+    })
 }
 
 /// The tool definition the dispatch loop advertises for accepting an offer.
 pub fn promote_plan_tool() -> ToolDefinition {
-    todo!("promote_plan_tool")
+    ToolDefinition::new(
+        PROMOTE_PLAN_TOOL,
+        "Keep the plan you just finished as a reusable skill. Call it only when the \
+         method would work again on different inputs - a question answered, a single \
+         file written, or a one-off fix is not a skill. The steps come from the plan \
+         itself, so you supply only how the skill is found and what it is for. The \
+         saved skill is UNAPPROVED and cannot be followed until a person approves it. \
+         Use mode=\"amend\" with an existing skill's name to revise that skill instead \
+         of adding a near-duplicate.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Short hyphenated skill name, e.g. \"fix-replayed-migration\". \
+                                    With mode=\"amend\", the existing skill's name."
+                },
+                "description": {
+                    "type": "string",
+                    "description": "One or two sentences saying WHEN to use the skill. This is \
+                                    what a later search matches on."
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["new", "amend"],
+                    "description": "\"new\" adds a skill; \"amend\" revises the existing skill \
+                                    of this name. Defaults to \"new\"."
+                },
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional tags for grouping."
+                },
+                "summary": {
+                    "type": "string",
+                    "description": "Optional short paragraph on what the procedure is for, \
+                                    placed above the steps."
+                }
+            },
+            "required": ["name", "description"],
+            "additionalProperties": false
+        }),
+    )
+}
+
+/// What a promotion request may do, given the catalog row that already holds
+/// the requested name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromotionAct {
+    /// Add a skill of this name.
+    Create,
+    /// Replace the body of the skill of this name.
+    Revise,
+    /// Do nothing, and say why.
+    Refuse(String),
+}
+
+/// Decide what a promotion request may do.
+///
+/// The rule that matters: a request to add a skill whose name is already taken
+/// is refused, never satisfied by a second row. Amending the skill that already
+/// covers the procedure is the useful act; a near-duplicate is not, because
+/// every skill competes for the same attention budget when the library is
+/// searched.
+pub fn decide(req: &PromotionRequest, existing: Option<&IndexedSkill>) -> PromotionAct {
+    match (req.mode, existing) {
+        (PromotionMode::New, None) => PromotionAct::Create,
+        (PromotionMode::New, Some(found)) => PromotionAct::Refuse(format!(
+            "a skill named {:?} already exists ({}). Revise it with mode=\"amend\", or pick a \
+             name for a genuinely different procedure.",
+            req.name, found.description
+        )),
+        (PromotionMode::Amend, Some(_)) => PromotionAct::Revise,
+        (PromotionMode::Amend, None) => PromotionAct::Refuse(format!(
+            "there is no skill named {:?} to amend. Use mode=\"new\" to add one.",
+            req.name
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -300,8 +586,16 @@ mod tests {
     fn good_plan() -> Vec<PlanStep> {
         vec![
             step("1", "Find the failing migration", Some("It is 041.")),
-            step("2", "Reproduce it on a scratch database", Some("Fails on replay.")),
-            step("3", "Guard the backfill", Some("Wrapped it in an existence check.")),
+            step(
+                "2",
+                "Reproduce it on a scratch database",
+                Some("Fails on replay."),
+            ),
+            step(
+                "3",
+                "Guard the backfill",
+                Some("Wrapped it in an existence check."),
+            ),
         ]
     }
 
@@ -332,10 +626,30 @@ mod tests {
     #[test]
     fn plan_reads_completed_steps_and_their_outcomes() {
         let notes = [
-            PlanNote { key: "1", content: "Find the failing migration", note_type: STEP_NOTE_TYPE, done: true },
-            PlanNote { key: "outcome:1", content: "It is 041.", note_type: "note", done: false },
-            PlanNote { key: "2", content: "Guard the backfill", note_type: STEP_NOTE_TYPE, done: true },
-            PlanNote { key: "outcome:2", content: "Wrapped it.", note_type: "note", done: false },
+            PlanNote {
+                key: "1",
+                content: "Find the failing migration",
+                note_type: STEP_NOTE_TYPE,
+                done: true,
+            },
+            PlanNote {
+                key: "outcome:1",
+                content: "It is 041.",
+                note_type: "note",
+                done: false,
+            },
+            PlanNote {
+                key: "2",
+                content: "Guard the backfill",
+                note_type: STEP_NOTE_TYPE,
+                done: true,
+            },
+            PlanNote {
+                key: "outcome:2",
+                content: "Wrapped it.",
+                note_type: "note",
+                done: false,
+            },
         ];
         let steps = plan_from_notes(&notes);
         assert_eq!(steps.len(), 2);
@@ -348,10 +662,30 @@ mod tests {
     #[test]
     fn plan_ignores_open_steps_and_hand_written_todos() {
         let notes = [
-            PlanNote { key: "1", content: "done step", note_type: STEP_NOTE_TYPE, done: true },
-            PlanNote { key: "2", content: "still open", note_type: STEP_NOTE_TYPE, done: false },
-            PlanNote { key: "buy-milk", content: "not a step", note_type: STEP_NOTE_TYPE, done: true },
-            PlanNote { key: "goal", content: "the overall goal", note_type: "note", done: false },
+            PlanNote {
+                key: "1",
+                content: "done step",
+                note_type: STEP_NOTE_TYPE,
+                done: true,
+            },
+            PlanNote {
+                key: "2",
+                content: "still open",
+                note_type: STEP_NOTE_TYPE,
+                done: false,
+            },
+            PlanNote {
+                key: "buy-milk",
+                content: "not a step",
+                note_type: STEP_NOTE_TYPE,
+                done: true,
+            },
+            PlanNote {
+                key: "goal",
+                content: "the overall goal",
+                note_type: "note",
+                done: false,
+            },
         ];
         let steps = plan_from_notes(&notes);
         assert_eq!(steps.len(), 1, "only the completed dotted step counts");
@@ -361,8 +695,18 @@ mod tests {
     #[test]
     fn plan_recognises_an_abandoned_step() {
         let notes = [
-            PlanNote { key: "1", content: "try the fast path", note_type: STEP_NOTE_TYPE, done: true },
-            PlanNote { key: "outcome:1", content: "Abandoned: no index to use", note_type: "note", done: false },
+            PlanNote {
+                key: "1",
+                content: "try the fast path",
+                note_type: STEP_NOTE_TYPE,
+                done: true,
+            },
+            PlanNote {
+                key: "outcome:1",
+                content: "Abandoned: no index to use",
+                note_type: "note",
+                done: false,
+            },
         ];
         let steps = plan_from_notes(&notes);
         assert!(steps[0].abandoned);
@@ -377,10 +721,30 @@ mod tests {
     #[test]
     fn plan_orders_steps_by_dotted_key() {
         let notes = [
-            PlanNote { key: "2", content: "second", note_type: STEP_NOTE_TYPE, done: true },
-            PlanNote { key: "1.10", content: "tenth child", note_type: STEP_NOTE_TYPE, done: true },
-            PlanNote { key: "1.2", content: "second child", note_type: STEP_NOTE_TYPE, done: true },
-            PlanNote { key: "1", content: "first", note_type: STEP_NOTE_TYPE, done: true },
+            PlanNote {
+                key: "2",
+                content: "second",
+                note_type: STEP_NOTE_TYPE,
+                done: true,
+            },
+            PlanNote {
+                key: "1.10",
+                content: "tenth child",
+                note_type: STEP_NOTE_TYPE,
+                done: true,
+            },
+            PlanNote {
+                key: "1.2",
+                content: "second child",
+                note_type: STEP_NOTE_TYPE,
+                done: true,
+            },
+            PlanNote {
+                key: "1",
+                content: "first",
+                note_type: STEP_NOTE_TYPE,
+                done: true,
+            },
         ];
         let keys: Vec<String> = plan_from_notes(&notes).into_iter().map(|s| s.key).collect();
         assert_eq!(keys, vec!["1", "1.2", "1.10", "2"], "numeric, not lexical");
@@ -389,8 +753,18 @@ mod tests {
     #[test]
     fn plan_treats_withheld_step_text_as_nothing_recorded() {
         let notes = [
-            PlanNote { key: "1", content: WITHHELD_STEP_TEXT, note_type: STEP_NOTE_TYPE, done: true },
-            PlanNote { key: "outcome:1", content: WITHHELD_STEP_TEXT, note_type: "note", done: false },
+            PlanNote {
+                key: "1",
+                content: WITHHELD_STEP_TEXT,
+                note_type: STEP_NOTE_TYPE,
+                done: true,
+            },
+            PlanNote {
+                key: "outcome:1",
+                content: WITHHELD_STEP_TEXT,
+                note_type: "note",
+                done: false,
+            },
         ];
         let steps = plan_from_notes(&notes);
         assert!(steps[0].outcome.is_none(), "a placeholder is not a finding");
@@ -430,7 +804,8 @@ mod tests {
     /// an offer to write a skill.
     #[test]
     fn completed_multi_step_plan_produces_an_offer() {
-        let plan = assess(good_plan(), false).expect("a three-step plan with outcomes clears the bar");
+        let plan =
+            assess(good_plan(), false).expect("a three-step plan with outcomes clears the bar");
         assert_eq!(plan.working_steps().len(), 3);
         let offer = render_offer(&plan, &[]);
         assert_eq!(offer["tool"], PROMOTE_PLAN_TOOL);
@@ -451,7 +826,10 @@ mod tests {
         let one = vec![step("1", "write the file", Some("done"))];
         assert_eq!(
             assess(one, false).expect_err("one step is an act, not a method"),
-            NotPromotable::TooFewSteps { succeeded: 1, needed: MIN_PROMOTABLE_STEPS }
+            NotPromotable::TooFewSteps {
+                succeeded: 1,
+                needed: MIN_PROMOTABLE_STEPS
+            }
         );
 
         let two = vec![
@@ -460,7 +838,10 @@ mod tests {
         ];
         assert_eq!(
             assess(two, false).expect_err("two steps is still not a method"),
-            NotPromotable::TooFewSteps { succeeded: 2, needed: MIN_PROMOTABLE_STEPS }
+            NotPromotable::TooFewSteps {
+                succeeded: 2,
+                needed: MIN_PROMOTABLE_STEPS
+            }
         );
     }
 
@@ -473,7 +854,10 @@ mod tests {
         ];
         assert_eq!(
             assess(steps, false).expect_err("an unrecorded step teaches nothing"),
-            NotPromotable::TooFewSteps { succeeded: 1, needed: MIN_PROMOTABLE_STEPS }
+            NotPromotable::TooFewSteps {
+                succeeded: 1,
+                needed: MIN_PROMOTABLE_STEPS
+            }
         );
     }
 
@@ -488,7 +872,10 @@ mod tests {
         ];
         assert_eq!(
             assess(steps, false).expect_err("half a plan abandoned is a search, not a method"),
-            NotPromotable::TooManyAbandoned { abandoned: 2, total: 5 }
+            NotPromotable::TooManyAbandoned {
+                abandoned: 2,
+                total: 5
+            }
         );
     }
 
@@ -507,9 +894,24 @@ mod tests {
     #[test]
     fn a_plan_with_no_recorded_text_produces_no_offer() {
         let steps = vec![
-            PlanStep { key: "1".into(), goal: WITHHELD_STEP_TEXT.into(), outcome: None, abandoned: false },
-            PlanStep { key: "2".into(), goal: WITHHELD_STEP_TEXT.into(), outcome: None, abandoned: false },
-            PlanStep { key: "3".into(), goal: WITHHELD_STEP_TEXT.into(), outcome: None, abandoned: false },
+            PlanStep {
+                key: "1".into(),
+                goal: WITHHELD_STEP_TEXT.into(),
+                outcome: None,
+                abandoned: false,
+            },
+            PlanStep {
+                key: "2".into(),
+                goal: WITHHELD_STEP_TEXT.into(),
+                outcome: None,
+                abandoned: false,
+            },
+            PlanStep {
+                key: "3".into(),
+                goal: WITHHELD_STEP_TEXT.into(),
+                outcome: None,
+                abandoned: false,
+            },
         ];
         assert_eq!(
             assess(steps, false).expect_err("a tainted turn records no procedure"),
@@ -524,7 +926,11 @@ mod tests {
     #[test]
     fn skill_body_is_built_from_plan_steps_and_outcomes() {
         let plan = assess(good_plan(), false).expect("clears the bar");
-        let body = render_skill_body("Fix a replayed migration", Some("Use when a migration replays."), &plan);
+        let body = render_skill_body(
+            "Fix a replayed migration",
+            Some("Use when a migration replays."),
+            &plan,
+        );
 
         for expected in [
             "Find the failing migration",
@@ -605,7 +1011,8 @@ mod tests {
     #[test]
     fn rendered_skill_md_quotes_a_description_that_would_break_yaml() {
         let md = render_skill_md("x", "Use when: a thing #happens", &[], "body");
-        let parsed = parse_skill_md(&md).expect("a colon in the description must not break parsing");
+        let parsed =
+            parse_skill_md(&md).expect("a colon in the description must not break parsing");
         assert_eq!(parsed.frontmatter.description, "Use when: a thing #happens");
     }
 
@@ -616,7 +1023,10 @@ mod tests {
     #[test]
     fn offer_names_existing_skills_that_may_cover_it() {
         let plan = assess(good_plan(), false).expect("clears the bar");
-        let existing = [indexed("fix-replayed-migration", "Repair a migration that replays.")];
+        let existing = [indexed(
+            "fix-replayed-migration",
+            "Repair a migration that replays.",
+        )];
         let offer = render_offer(&plan, &existing);
         let matches = offer["existing"].as_array().expect("existing is an array");
         assert_eq!(matches.len(), 1);
@@ -707,6 +1117,95 @@ mod tests {
         assert!(
             props.get("body").is_none() && props.get("steps").is_none(),
             "the body comes from the plan, never from the model"
+        );
+    }
+}
+
+/// Fixtures shared by the two test modules below.
+#[cfg(test)]
+mod tests_support {
+    use super::*;
+    use crate::domain::skill::{Locality, SkillKind, TrustTier};
+
+    pub fn request(name: &str, mode: PromotionMode) -> PromotionRequest {
+        PromotionRequest {
+            name: name.to_string(),
+            description: "when to use it".to_string(),
+            summary: None,
+            tags: Vec::new(),
+            mode,
+        }
+    }
+
+    pub fn existing_skill(name: &str) -> IndexedSkill {
+        IndexedSkill {
+            name: name.to_string(),
+            description: "the one already in the catalog".to_string(),
+            kind: SkillKind::Workflow,
+            disk_path: String::new(),
+            owner_user_id: Some("someone".to_string()),
+            locality: Locality::Daemon,
+            content_hash: "hash".to_string(),
+            trust_tier: TrustTier::Local,
+            source: Some(SELF_AUTHORED_SOURCE.to_string()),
+            tags: Vec::new(),
+            attachments: Vec::new(),
+            body: String::new(),
+            metadata: serde_json::json!({}),
+            present_on_disk: false,
+            last_seen_at: None,
+            approved_at: None,
+            approved_by: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod dedup_tests {
+    use super::tests_support::*;
+    use super::*;
+
+    /// Acceptance: an existing skill covering the same procedure is amended or
+    /// declined, never duplicated.
+    #[test]
+    fn adding_over_an_existing_name_is_refused_not_duplicated() {
+        let req = request("deploy", PromotionMode::New);
+        let act = decide(&req, Some(&existing_skill("deploy")));
+        let PromotionAct::Refuse(why) = act else {
+            panic!("a second skill of the same name must never be created");
+        };
+        assert!(
+            why.contains("amend"),
+            "the refusal names the useful act: {why}"
+        );
+    }
+
+    #[test]
+    fn amending_an_existing_skill_revises_it() {
+        let req = request("deploy", PromotionMode::Amend);
+        assert_eq!(
+            decide(&req, Some(&existing_skill("deploy"))),
+            PromotionAct::Revise
+        );
+    }
+
+    #[test]
+    fn adding_a_new_name_creates_it() {
+        assert_eq!(
+            decide(&request("fresh", PromotionMode::New), None),
+            PromotionAct::Create
+        );
+    }
+
+    #[test]
+    fn amending_a_skill_that_does_not_exist_is_refused() {
+        let act = decide(&request("ghost", PromotionMode::Amend), None);
+        let PromotionAct::Refuse(why) = act else {
+            panic!("there is nothing to amend");
+        };
+        assert!(
+            why.contains("new"),
+            "the refusal names the useful act: {why}"
         );
     }
 }
