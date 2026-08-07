@@ -618,8 +618,8 @@ mod tests {
         // The index aggregates skill libraries authored for other agent
         // harnesses (`default_user_roots` scans the Claude/Codex/Cursor dirs),
         // so a skill may name tools, commands, or UI that don't exist here. The
-        // prompt must qualify "follow them as authoritative" with where a skill
-        // came from, and direct translation rather than literal replay (#638).
+        // prompt must scope a skill's authority by where it came from, and
+        // direct translation rather than literal replay (#638).
         let assembled = assemble(&static_sections());
         assert!(
             assembled.contains("several different agents and tools"),
@@ -636,6 +636,366 @@ mod tests {
         assert!(
             assembled.contains("first principles"),
             "and offer a fallback when a skill is really about another tool's internals"
+        );
+    }
+
+    // --- Knowledge vs skills, code over context (#1156) ---------------------
+
+    const LEARNING_HEADER: &str = "== Learning ==";
+    const SKILLS_HEADER: &str = "== Skills (procedural how-tos) ==";
+    const USING_TOOLS_HEADER: &str = "== Using tools ==";
+
+    /// One `== Header ==` section of the assembled prompt, or an empty string
+    /// when the header is absent.
+    ///
+    /// Every assertion below is about one section. Asserting against the whole
+    /// prompt would let wording that lives elsewhere satisfy a test about this
+    /// section. An empty return fails every `contains`, so a dropped section
+    /// fails its test rather than passing it vacuously.
+    fn section_body(assembled: &str, header: &str) -> String {
+        let Some((_, after)) = assembled.split_once(header) else {
+            return String::new();
+        };
+        match after.split_once("\n== ") {
+            Some((section, _)) => section.to_string(),
+            None => after.to_string(),
+        }
+    }
+
+    #[test]
+    fn learning_section_no_longer_files_a_procedure_in_the_knowledge_base() {
+        // The section used to say "save the procedure to the KB tagged
+        // 'instruction'". That is the upstream source of procedural content in
+        // declarative storage: it is not drift, it is instructed on every turn
+        // (#1156).
+        let learning = section_body(&assemble(&static_sections()), LEARNING_HEADER);
+        assert!(
+            !learning.contains("save the procedure"),
+            "the section must not direct a procedure into the knowledge base: {learning}"
+        );
+        assert!(
+            !learning.contains("tagged \"instruction\""),
+            "nor name the tag it used to file one under: {learning}"
+        );
+    }
+
+    #[test]
+    fn learning_section_states_the_knowledge_versus_skill_boundary() {
+        // The rule that replaces it: knowledge records what is true, a skill
+        // records how to do something, and a skill's preferences stay
+        // knowledge, because they are facts and they change apart from the
+        // method (#1156).
+        let learning = section_body(&assemble(&static_sections()), LEARNING_HEADER);
+        assert!(
+            learning.contains("Knowledge records what is true"),
+            "the section must say what knowledge is for: {learning}"
+        );
+        assert!(
+            learning.contains("a skill records how to do something"),
+            "and what a skill is for: {learning}"
+        );
+        assert!(
+            learning.contains("belongs in a skill"),
+            "and send a method with ordered steps to a skill: {learning}"
+        );
+        // One sentence, not two adjacent claims: the subject has to be the
+        // skill's own preferences, or "stays in the knowledge base" could be
+        // satisfied by a sentence about something else entirely.
+        assert!(
+            learning.contains(
+                "A skill's own preferences - which sources, what to skip, what \"done\" \
+                 looks like - stay in the knowledge base"
+            ),
+            "while a skill's own preferences stay knowledge: {learning}"
+        );
+    }
+
+    #[test]
+    fn learning_section_still_saves_a_correction_to_the_knowledge_base() {
+        // A correction is a fact about what is true or preferred, so the
+        // boundary above leaves it exactly where it was (#1156).
+        let learning = section_body(&assemble(&static_sections()), LEARNING_HEADER);
+        assert!(
+            learning.contains("When the user corrects you, save the correction immediately."),
+            "the correction rule must survive unchanged: {learning}"
+        );
+        assert!(
+            learning.contains("knowledge base"),
+            "and the section must still name the store it goes to: {learning}"
+        );
+    }
+
+    #[test]
+    fn knowledge_base_tagging_example_no_longer_endorses_the_instruction_kind() {
+        // Moving the boundary in one section is not enough. The knowledge
+        // section's worked tagging example held up "instruction" as the good
+        // KIND to write, which pulls a finished procedure straight back into
+        // the store the Learning section just sent to a skill (#1156).
+        //
+        // The KIND stays in the reading vocabulary above it, because entries
+        // written before this carry it and a search still has to find them.
+        // What goes is the invitation to write another one.
+        let kb = section_body(&assemble(&static_sections()), "== Knowledge base ==");
+        assert!(
+            !kb.contains("Good: \"instruction\""),
+            "the worked example must not hold up the procedural KIND: {kb}"
+        );
+        assert!(
+            kb.contains("Good: \"memory\", \"project:adelie-ai\", \"topic:deploy\""),
+            "and must still show a KIND plus a specific facet: {kb}"
+        );
+    }
+
+    #[test]
+    fn knowledge_base_definition_does_not_claim_procedures_live_in_the_store() {
+        // The Learning section's boundary is not enough on its own. Line 3 of
+        // the assembled prompt says "Follow these rules in priority order", and
+        // the knowledge section opens 112 lines ahead of Learning. Its opening
+        // definition called the store "your unified store for ... and stored
+        // procedures ... everything lives here", present tense and unscoped, so
+        // a priority-ordered reader settles the question there and never
+        // reaches the boundary.
+        //
+        // Concretely: told "my morning read-in is calendar, then email, then
+        // the news feed, then summarize", the model files a knowledge entry -
+        // the exact behaviour #1156 exists to stop, in its motivating case.
+        let assembled = assemble(&static_sections());
+        let kb = section_body(&assembled, "== Knowledge base ==");
+        assert!(
+            !kb.contains("and stored procedures"),
+            "the definition must not claim procedures live in the store: {kb}"
+        );
+        assert!(
+            kb.contains("every fact lives here"),
+            "and must scope the unified-store claim to facts: {kb}"
+        );
+        assert!(
+            kb.contains("A method with ordered steps is a skill, not an entry here"),
+            "and must state the boundary where a priority-ordered reader meets \
+             it first: {kb}"
+        );
+        // The mechanism, pinned so a section reshuffle cannot quietly restore
+        // the defect: the boundary has to sit in the EARLIER section to win.
+        let kb_at = assembled
+            .find("== Knowledge base ==")
+            .expect("the knowledge section must be present");
+        let learning_at = assembled
+            .find(LEARNING_HEADER)
+            .expect("the learning section must be present");
+        assert!(
+            kb_at < learning_at,
+            "the knowledge section is read first under priority order, so it is \
+             the one that has to carry the boundary"
+        );
+    }
+
+    #[test]
+    fn knowledge_base_applies_the_same_fit_check_to_a_stored_procedure() {
+        // "If a stored instruction or procedure applies, follow it" is bare
+        // obedience, and "if it applies" is the one-word gate the skills
+        // section just replaced with a fit check. The reason there is about
+        // procedures, not about which table they sit in: a procedure that does
+        // not fit gets carried out with steps meant for a different situation.
+        //
+        // It bites hardest right now. Most procedural content sits in the
+        // knowledge base until the sweep moves it, so leaving this line alone
+        // switches the fit check off for the majority of it (#1156).
+        let kb = section_body(&assemble(&static_sections()), "== Knowledge base ==");
+        assert!(
+            !kb.contains("If a stored instruction or procedure applies, follow it"),
+            "a stored procedure must not get bare obedience: {kb}"
+        );
+        assert!(
+            kb.contains("A stored procedure is a candidate, not an instruction"),
+            "it gets the same framing a skill gets: {kb}"
+        );
+        assert!(
+            kb.contains("Check it fits this situation before you follow it"),
+            "and the same check, stated inline rather than left to a section \
+             the priority order reaches later: {kb}"
+        );
+    }
+
+    #[test]
+    fn prompt_prefers_code_for_deterministic_work_and_states_the_bar() {
+        // Reading data into the context window to count or filter it costs
+        // tokens in proportion to the data and gets less reliable as the data
+        // grows. An over-enthusiastic version of the rule is worse than none,
+        // so the bar travels with it (#1156).
+        let using = section_body(&assemble(&static_sections()), USING_TOOLS_HEADER);
+        assert!(
+            using.contains("Prefer code over context"),
+            "the prompt must prefer a script over reading the data in: {using}"
+        );
+        assert!(
+            using.contains("counting, filtering, parsing, reshaping"),
+            "and name the class of work it means: {using}"
+        );
+        assert!(
+            using.contains("in proportion to the data"),
+            "and give the token argument: {using}"
+        );
+        assert!(
+            using.contains(
+                "The bar is deterministic work over data you would otherwise have to read"
+            ),
+            "and state the bar: {using}"
+        );
+        assert!(
+            using.contains("Judgement, prose, explanation and design are not that"),
+            "and say what falls outside it: {using}"
+        );
+    }
+
+    #[test]
+    fn prompt_keeps_the_prefer_code_rule_out_of_the_resourcefulness_bullet() {
+        // Resourcefulness already gestured at "terminal and small scripts" as a
+        // fallback for when no purpose-built tool exists. The rule above makes a
+        // script a preference for a class of work, so the two are reconciled
+        // rather than stated twice in different words (#1156).
+        let assembled = assemble(&static_sections());
+        let using = section_body(&assembled, USING_TOOLS_HEADER);
+        assert!(
+            using.contains("resourceful"),
+            "the resourcefulness bullet must survive: {using}"
+        );
+        assert!(
+            !using.contains("small scripts"),
+            "but must not offer scripts a second time, as a last resort: {using}"
+        );
+        assert_eq!(
+            assembled.matches("Prefer code over context").count(),
+            1,
+            "and the preference is stated once"
+        );
+    }
+
+    #[test]
+    fn prompt_turns_a_useful_script_into_a_skill_that_carries_it() {
+        // What makes the preference compound instead of leaving a directory of
+        // forgotten one-off scripts. A skill directory carries its own
+        // attachments, so the skill can run the script rather than describe it
+        // (#1156).
+        let skills = section_body(&assemble(&static_sections()), SKILLS_HEADER);
+        assert!(
+            skills.contains("A script that proves useful becomes a skill"),
+            "the prompt must promote a script that earns its keep: {skills}"
+        );
+        assert!(
+            skills.contains("a directory holding a SKILL.md"),
+            "and say where a skill lives: {skills}"
+        );
+        // Naming the tool matters: the write root the server picks is writable,
+        // and a global root the daemon indexes need not be. Told only to "write
+        // the script into that directory", the model can aim at a read-only
+        // shared root and fail with nowhere to fall back to.
+        assert!(
+            skills.contains("skills_create_skill")
+                && skills.contains("writes the SKILL.md into a writable skills root"),
+            "and name the tool that puts it somewhere writable: {skills}"
+        );
+        assert!(
+            skills.contains("the files beside it travel with it"),
+            "and that the script travels with it: {skills}"
+        );
+        assert!(
+            skills.contains("instead of rewriting it"),
+            "so following the skill runs the script: {skills}"
+        );
+    }
+
+    #[test]
+    fn prompt_treats_a_surfaced_skill_as_a_candidate_not_an_instruction() {
+        // A wrongly recalled fact is noise; a wrongly followed procedure acts.
+        // That asymmetry sets a higher bar for following a skill than for
+        // surfacing one, and it replaces "follow them as authoritative" (#1156).
+        let skills = section_body(&assemble(&static_sections()), SKILLS_HEADER);
+        assert!(
+            skills.contains("a candidate, not an instruction"),
+            "a skill that surfaced is a candidate: {skills}"
+        );
+        assert!(
+            skills.contains("does not mean the skill applies"),
+            "because similarity is not applicability: {skills}"
+        );
+        assert!(
+            skills.contains("before you follow it"),
+            "so the fit check comes first: {skills}"
+        );
+        assert!(
+            !skills.contains("follow them as authoritative"),
+            "and the unconditional instruction to follow a skill must be gone: {skills}"
+        );
+    }
+
+    #[test]
+    fn prompt_says_what_to_do_when_a_skill_nearly_fits() {
+        // The near-miss is the signal a later generalization needs, so it is
+        // spoken rather than absorbed (#1156).
+        let skills = section_body(&assemble(&static_sections()), SKILLS_HEADER);
+        assert!(
+            skills.contains("say which part does not fit and adapt on purpose"),
+            "a near-miss must be named, not silently adapted to: {skills}"
+        );
+        assert!(
+            skills.contains("force the task into its shape"),
+            "and a skill that does not fit must not shape the work: {skills}"
+        );
+    }
+
+    #[test]
+    fn prompt_states_both_skill_granularity_failure_modes_and_the_test_between_them() {
+        // Each direction fails badly and differently, so a rule that warns
+        // about one produces the other (#1156).
+        let skills = section_body(&assemble(&static_sections()), SKILLS_HEADER);
+        assert!(
+            skills.contains("neither one skill per variation nor one skill for everything"),
+            "both failure modes must be named: {skills}"
+        );
+        assert!(
+            skills.contains("split the evidence of use"),
+            "and fragmentation must be costed: {skills}"
+        );
+        assert!(
+            skills.contains("a branch at every step"),
+            "and over-generality must be costed: {skills}"
+        );
+        assert!(
+            skills
+                .contains("if one set of steps serves both cases once what varies is a parameter"),
+            "and the test that separates them must be stated: {skills}"
+        );
+        assert!(
+            skills.contains("the steps themselves diverge"),
+            "in both directions: {skills}"
+        );
+    }
+
+    #[test]
+    fn prompt_widens_a_skill_on_the_third_recurrence_not_the_second() {
+        // Two instances are a coincidence, three are a pattern - the same rule
+        // this repository applies to code abstractions (#1156).
+        let skills = section_body(&assemble(&static_sections()), SKILLS_HEADER);
+        assert!(
+            skills.contains("on the third case that varies the same way, not the second"),
+            "generalization is earned at the third case: {skills}"
+        );
+    }
+
+    #[test]
+    fn prompt_says_to_write_a_skill_general_from_the_start() {
+        // A procedure with a path or a project name baked into its steps can
+        // only ever serve the case it was written from (#1156).
+        let skills = section_body(&assemble(&static_sections()), SKILLS_HEADER);
+        assert!(
+            skills.contains("general from the start"),
+            "a skill is written general: {skills}"
+        );
+        assert!(
+            skills.contains(
+                "parameterize paths, names and other specifics rather than bake them into the steps"
+            ),
+            "and what varies becomes a parameter: {skills}"
         );
     }
 
@@ -1155,13 +1515,7 @@ mod tests {
     /// is absent. An empty return fails every `contains` below, so a dropped
     /// section fails the test rather than passing it vacuously.
     fn narration_section(assembled: &str) -> String {
-        let Some((_, after)) = assembled.split_once(NARRATION_HEADER) else {
-            return String::new();
-        };
-        match after.split_once("\n== ") {
-            Some((section, _)) => section.to_string(),
-            None => after.to_string(),
-        }
+        section_body(assembled, NARRATION_HEADER)
     }
 
     #[test]
