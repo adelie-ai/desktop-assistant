@@ -48,7 +48,7 @@ The `[Recall]` offer is recorded by a decorator around the recall lookup, rather
 than inside the renderer. The block is assembled during prompt building, where
 no tool runs, so the decorator applies the renderer's own rules -
 `RecallRelevance::clears_floor`, `KnowledgeEntry::display_line` and
-`MAX_RECALL_ENTRIES` - to the candidates the lookup returned.
+`max_recall_entries` - to the candidates the lookup returned.
 
 One rule it cannot apply. The renderer also drops an entry `[Pinned]` is already
 carrying in full, and whether a pin resolved is decided later in assembly. On a
