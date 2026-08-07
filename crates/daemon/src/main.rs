@@ -2451,32 +2451,11 @@ async fn main() -> Result<()> {
                     // and signature satisfied. Shutdown is handled by the select
                     // between cycles, as before.
                     let result = service.run_extraction(CancellationToken::new()).await;
-                    let elapsed = cycle_start.elapsed();
-                    // The duration is a field, not part of the sentence, so a
-                    // backend can group by it. It is also a measurement, so it
-                    // goes to the metrics facade as well: one slow cycle is a
-                    // log line, a trend is a histogram.
-                    let outcome = if result.is_ok() { "ok" } else { "error" };
-                    adelie_telemetry::metrics::record_duration(
-                        "dreaming.scan.duration",
-                        elapsed,
-                        &[adelie_telemetry::metrics::Label::new("outcome", outcome)],
+                    telemetry::record_scan_cycle(
+                        telemetry::BackendCycle::Dreaming,
+                        cycle_start.elapsed(),
+                        result.map(Some).map_err(|e| e.to_string()),
                     );
-                    match result {
-                        Ok(n) => {
-                            adelie_telemetry::metrics::add("dreaming.facts.written", n as u64, &[]);
-                            tracing::info!(
-                                duration_ms = elapsed.as_millis() as u64,
-                                facts_written = n,
-                                "dreaming: scan cycle finished"
-                            );
-                        }
-                        Err(e) => tracing::warn!(
-                            duration_ms = elapsed.as_millis() as u64,
-                            error = %e,
-                            "dreaming: scan cycle failed"
-                        ),
-                    }
 
                     tokio::select! {
                         _ = tokio::time::sleep(std::time::Duration::from_secs(dreaming_interval_secs)) => {}
@@ -2536,27 +2515,11 @@ async fn main() -> Result<()> {
                     let started = std::time::Instant::now();
                     // Timer runs aren't user-cancellable (see dreaming above).
                     let result = service.run_consolidation(CancellationToken::new()).await;
-                    let elapsed = started.elapsed();
-                    // As with the extraction cycle above: the duration is a
-                    // field, and the same measurement also reaches the metrics
-                    // facade so a trend is visible without reading every line.
-                    let outcome = if result.is_ok() { "ok" } else { "error" };
-                    adelie_telemetry::metrics::record_duration(
-                        "consolidation.scan.duration",
-                        elapsed,
-                        &[adelie_telemetry::metrics::Label::new("outcome", outcome)],
+                    telemetry::record_scan_cycle(
+                        telemetry::BackendCycle::Consolidation,
+                        started.elapsed(),
+                        result.map(|_| None).map_err(|e| e.to_string()),
                     );
-                    match result {
-                        Ok(_) => tracing::info!(
-                            duration_ms = elapsed.as_millis() as u64,
-                            "consolidation: scan finished"
-                        ),
-                        Err(e) => tracing::warn!(
-                            duration_ms = elapsed.as_millis() as u64,
-                            error = %e,
-                            "consolidation: scan failed"
-                        ),
-                    }
 
                     tokio::select! {
                         _ = tokio::time::sleep(std::time::Duration::from_secs(consolidation_interval_secs)) => {}
