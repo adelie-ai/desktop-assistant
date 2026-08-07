@@ -575,20 +575,34 @@ impl PgKnowledgeBaseStore {
         Ok(rows.into_iter().map(|r| r.into_entry()).collect())
     }
 
-    /// The entries nearest a query embedding, with the cosine distance that put
-    /// them there, nearest first.
+    /// The entries nearest a query embedding, the cosine distance that put each
+    /// there, and how spread out this query's distances are over the whole
+    /// scope.
     ///
     /// Backs the knowledge arm of the `[Recall]` block (#1100). It is a plain
     /// vector search rather than the hybrid `search`, because the block reads
     /// each candidate against the spread of the store's own distances, and a
     /// fused RRF score is not a quantity that has a spread of that kind: over a
     /// hybrid search every row scores non-zero against any query. A cosine
-    /// distance is comparable, so a distribution over it means something - see
-    /// [`Self::embedding_distance_dispersion`].
+    /// distance is comparable, so a distribution over it means something.
     ///
-    /// Scoped to the task-local user by an explicit `WHERE user_id` predicate.
-    /// Row-level security is a backstop the table owner bypasses, so the
-    /// predicate is the guard, not the decoration.
+    /// **The candidates and the spread come from one scan.** Both are functions
+    /// of the same query vector: the spread says what a distance from this store
+    /// is worth, and the candidates are the distances it grades, so they have to
+    /// describe one query or the grading is against a geometry nothing here saw.
+    /// Computing them together also costs one pass rather than two - the scan is
+    /// what the query spends its time on, and it is shared.
+    ///
+    /// **The spread is measured over every row the scan could reach**, not over
+    /// the nearest ones: the near rows are the part a cued prompt moves, so their
+    /// spread is not the store's and normalizing inside it would inflate every
+    /// score. Only the rows the block may show are read whole; the pass that
+    /// measures the spread reads one distance per row and none of the content.
+    ///
+    /// Scoped to the task-local user by an explicit `WHERE user_id` predicate,
+    /// on the scan and on the read of the rows it selected. Row-level security is
+    /// a backstop the table owner bypasses, so the predicate is the guard, not
+    /// the decoration.
     ///
     /// `embedding_model` identifies the model that produced `query_embedding`,
     /// and only rows embedded by that model take part - the same rule the
@@ -596,90 +610,66 @@ impl PgKnowledgeBaseStore {
     /// across models is a comparison across vector dimensions, which the
     /// database answers with an error rather than a miss.
     ///
-    /// An empty `query_embedding` yields no rows. The vector operator raises on
-    /// a zero-dimension vector, and the caller that has no embedding has a
-    /// full-text path to fall back to (`search_text`).
+    /// An empty `query_embedding` yields no rows and no spread. The vector
+    /// operator raises on a zero-dimension vector, and the caller that has no
+    /// embedding has a full-text path to fall back to (`search_text`).
     ///
     /// `metadata` is not read. The block renders an id, an entry's tags and one
     /// line of what it says, and nothing downstream of this call looks at the
     /// column, so the entries answer with [`serde_json::Value::Null`] there -
     /// the same way this file's other search row drops `source`.
+    ///
+    /// The scan carries [`RECALL_SCAN_STATEMENT_TIMEOUT`], so the database stops
+    /// working when the caller stops waiting.
     pub async fn nearest_by_embedding(
         &self,
         query_embedding: Vec<f32>,
         embedding_model: &str,
         limit: usize,
-    ) -> Result<Vec<(KnowledgeEntry, f64)>, CoreError> {
+    ) -> Result<NearestEntries, CoreError> {
         if query_embedding.is_empty() {
-            return Ok(Vec::new());
+            return Ok(NearestEntries::default());
         }
         let user_id = current_user_id();
+
+        // A transaction, for one statement, because `SET LOCAL` is scoped to
+        // one: it is what makes the ceiling the caller keeps a ceiling the
+        // database keeps too. Abandoning the future stops the daemon waiting
+        // and leaves the backend scanning, and recall runs before every turn.
+        let mut scan = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
+        sqlx::query("SELECT set_config('statement_timeout', $1, true)")
+            .bind(RECALL_SCAN_STATEMENT_TIMEOUT.as_millis().to_string())
+            .execute(&mut *scan)
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
         let rows: Vec<KbNearestRow> = sqlx::query_as(NEAREST_BY_EMBEDDING_SQL)
             .bind(Vector::from(query_embedding))
             .bind(user_id.as_str())
             .bind(embedding_model)
             .bind(limit as i64)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *scan)
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
+        scan.commit()
             .await
             .map_err(|e| CoreError::Storage(e.to_string()))?;
 
-        Ok(rows
-            .into_iter()
-            .map(|r| {
-                let distance = r.distance;
-                (r.into_entry(), distance)
-            })
-            .collect())
-    }
-
-    /// How spread out this user's knowledge distances are for one query
-    /// embedding: the median of them, the median absolute deviation around that
-    /// median, and how many rows both were measured over.
-    ///
-    /// **This is what makes the `[Recall]` bar dimensionless.** A cosine
-    /// distance means nothing on its own, so the block reads a candidate as how
-    /// far it sits below the store's own middling row, counted in the store's
-    /// own spread.
-    ///
-    /// Measured over **every** row the search could reach, not over the nearest
-    /// ones: the near rows are the part a cued prompt moves, so their spread is
-    /// not the store's and normalizing inside it would inflate every score.
-    ///
-    /// Both statistics are distances from **one** query, so a caller grades a
-    /// prompt's candidates by the answer this call gives for that same prompt.
-    /// An answer held from an earlier query describes the geometry that query
-    /// saw, which is a different one.
-    ///
-    /// `None` where the store holds no row this query can be compared with. The
-    /// caller then falls back to a stated estimate. Same scope and same model
-    /// rule as [`Self::nearest_by_embedding`], because the two describe one
-    /// distribution.
-    pub async fn embedding_distance_dispersion(
-        &self,
-        query_embedding: Vec<f32>,
-        embedding_model: &str,
-    ) -> Result<Option<RecallDispersion>, CoreError> {
-        if query_embedding.is_empty() {
-            return Ok(None);
-        }
-        let user_id = current_user_id();
-        let measured: Option<(Option<f64>, i64, Option<f64>)> =
-            sqlx::query_as(EMBEDDING_DISTANCE_DISPERSION_SQL)
-                .bind(Vector::from(query_embedding))
-                .bind(user_id.as_str())
-                .bind(embedding_model)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| CoreError::Storage(e.to_string()))?;
-
-        let Some((Some(median), rows, Some(deviation))) = measured else {
-            return Ok(None);
-        };
-        Ok(RecallDispersion::measured(
-            median,
-            deviation,
-            rows.max(0) as usize,
-        ))
+        // Every row carries the same spread, so the first one states it.
+        let dispersion = rows.first().and_then(KbNearestRow::dispersion);
+        Ok(NearestEntries {
+            entries: rows
+                .into_iter()
+                .map(|r| {
+                    let distance = r.distance;
+                    (r.into_entry(), distance)
+                })
+                .collect(),
+            dispersion,
+        })
     }
 
     /// Full-text search that asks for **any** of the query's terms, best match
@@ -868,35 +858,38 @@ fn decode_cursor(cursor: &str) -> Result<(chrono::DateTime<chrono::Utc>, String)
     Ok((ts, id.to_string()))
 }
 
+/// How long the recall scan may run before the database stops it.
+///
+/// A ceiling the caller keeps is not a ceiling the database keeps: abandoning a
+/// query future stops the daemon waiting and leaves the backend scanning, and
+/// recall runs before every turn's first round - so a store slow enough to
+/// exceed this would otherwise accumulate scans at the rate turns arrive.
+///
+/// The value leaves the embedding its own five seconds inside the ten the whole
+/// recall lookup has, with a second to spare. `desktop-assistant-daemon`'s
+/// recall adapter holds those three to each other.
+pub const RECALL_SCAN_STATEMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+
 /// What [`PgKnowledgeBaseStore::nearest_by_embedding`] reads.
+///
+/// One scan, three uses. `d` computes one distance per row and carries nothing
+/// else, so the pass that measures the store's spread reads no content: `m`
+/// takes the median of those distances and `s` the median of each distance's own
+/// distance from it. The rows the block may show are then read whole, by primary
+/// key, and only those.
+///
+/// Every returned row carries the same spread, which is the price of stating it
+/// in the same answer as the candidates - three numbers on at most
+/// `max_recall_entries` rows.
+///
+/// An empty scope yields no rows at all: `d` is empty, so `s` is empty, and the
+/// cross join answers with nothing rather than with a spread of nothing.
 ///
 /// Held as its own string so the projection can be asserted on without a
 /// database - see `the_recall_scan_does_not_read_metadata`.
 const NEAREST_BY_EMBEDDING_SQL: &str = "\
-    SELECT id, content, tags, created_at, updated_at, source, summary,
-           MIN(chunk <=> $1) AS distance
-     FROM knowledge_base, unnest(embedding) AS chunk
-     WHERE user_id = $2
-       AND deleted_at IS NULL
-       AND embedding IS NOT NULL
-       AND embedding_model IS NOT NULL
-       AND (embedding_model = $3
-            OR (split_part($3, '@', 2) <> ''
-                AND split_part(embedding_model, '@', 2)
-                    = split_part($3, '@', 2)))
-     GROUP BY id, content, tags, created_at, updated_at, source, summary
-     ORDER BY distance
-     LIMIT $4";
-
-/// What [`PgKnowledgeBaseStore::embedding_distance_dispersion`] reads.
-///
-/// One row per entry, then two passes over those distances: the median, and the
-/// median of each distance's own distance from it. The `GROUP BY id` reduces to
-/// the primary key, and the projection carries the distance alone, so the pass
-/// reads the geometry and none of the content.
-const EMBEDDING_DISTANCE_DISPERSION_SQL: &str = "\
     WITH d AS (
-         SELECT MIN(chunk <=> $1) AS distance
+         SELECT id, MIN(chunk <=> $1) AS distance
          FROM knowledge_base, unnest(embedding) AS chunk
          WHERE user_id = $2
            AND deleted_at IS NULL
@@ -912,15 +905,38 @@ const EMBEDDING_DISTANCE_DISPERSION_SQL: &str = "\
          SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY distance) AS median,
                 count(*) AS rows_read
          FROM d
+     ),
+     s AS (
+         SELECT m.median,
+                m.rows_read,
+                percentile_cont(0.5) WITHIN GROUP (ORDER BY abs(d.distance - m.median))
+                    AS deviation
+         FROM d CROSS JOIN m
+         GROUP BY m.median, m.rows_read
      )
-     SELECT m.median,
-            m.rows_read,
-            percentile_cont(0.5) WITHIN GROUP (ORDER BY abs(d.distance - m.median))
-                AS deviation
-     FROM d CROSS JOIN m
-     GROUP BY m.median, m.rows_read";
+     SELECT kb.id, kb.content, kb.tags, kb.created_at, kb.updated_at, kb.source, kb.summary,
+            d.distance, s.median, s.rows_read, s.deviation
+     FROM d
+     JOIN knowledge_base kb ON kb.id = d.id AND kb.user_id = $2
+     CROSS JOIN s
+     ORDER BY d.distance
+     LIMIT $4";
 
-/// One entry the recall scan ranked, plus the cosine distance that ranked it.
+/// What [`PgKnowledgeBaseStore::nearest_by_embedding`] answers with: the rows
+/// the block may show, and what a distance from this store is worth.
+#[derive(Debug, Default)]
+pub struct NearestEntries {
+    /// The nearest entries, each with the cosine distance that ranked it,
+    /// nearest first.
+    pub entries: Vec<(KnowledgeEntry, f64)>,
+    /// The spread of this query's distances over the whole scope, or `None`
+    /// where the scope holds nothing to measure. The caller then reads the
+    /// source by a stated estimate.
+    pub dispersion: Option<RecallDispersion>,
+}
+
+/// One entry the recall scan ranked, the cosine distance that ranked it, and the
+/// spread every row of the answer repeats.
 ///
 /// Its own row rather than a flattened [`KbRow`], because the scan does not read
 /// `metadata`: recall never looks at it, and the column is the widest thing on
@@ -935,6 +951,9 @@ struct KbNearestRow {
     source: Option<String>,
     summary: Option<String>,
     distance: f64,
+    median: Option<f64>,
+    rows_read: i64,
+    deviation: Option<f64>,
 }
 
 impl KbNearestRow {
@@ -949,6 +968,16 @@ impl KbNearestRow {
             source: self.source,
             summary: self.summary,
         }
+    }
+
+    /// What this row says the store's spread is, where it says one it can be
+    /// trusted for - see [`RecallDispersion::measured`].
+    fn dispersion(&self) -> Option<RecallDispersion> {
+        RecallDispersion::measured(
+            self.median?,
+            self.deviation?,
+            self.rows_read.max(0) as usize,
+        )
     }
 }
 
@@ -1127,15 +1156,32 @@ mod tests {
         );
     }
 
-    /// The dispersion pass reads the geometry and none of the content: one
-    /// distance per row, and no column of the entry itself.
+    /// The pass that measures the store's spread reads the geometry and none of
+    /// the content: one distance per row, and no column of the entry itself.
+    /// Only the rows the block may show are read whole.
     #[test]
-    fn the_dispersion_pass_reads_no_entry_content() {
+    fn the_pass_that_measures_the_spread_reads_no_entry_content() {
+        let measured = NEAREST_BY_EMBEDDING_SQL
+            .split("     SELECT kb.id")
+            .next()
+            .expect("the scan selects the rows it will show after it measures the spread");
+
         for column in ["metadata", "content", "summary", "tags"] {
             assert!(
-                !EMBEDDING_DISTANCE_DISPERSION_SQL.contains(column),
-                "the dispersion pass reads {column}, which it has no use for"
+                !measured.contains(column),
+                "the pass that measures the spread reads {column}, which it has no use for"
             );
         }
+    }
+
+    /// The scan bounds the database's own work, not only the caller's patience.
+    /// Abandoning a query future leaves the backend scanning, and recall runs
+    /// before every turn.
+    #[test]
+    fn the_recall_scan_states_a_statement_timeout() {
+        assert!(
+            RECALL_SCAN_STATEMENT_TIMEOUT > std::time::Duration::ZERO,
+            "a zero timeout means no timeout at all in PostgreSQL"
+        );
     }
 }

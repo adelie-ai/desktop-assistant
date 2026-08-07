@@ -1,9 +1,8 @@
 //! The reads behind the `[Recall]` block (issues #1100 and #1101).
 //!
-//! `PgKnowledgeBaseStore::nearest_by_embedding`,
-//! `PgKnowledgeBaseStore::embedding_distance_dispersion` and
+//! `PgKnowledgeBaseStore::nearest_by_embedding` and
 //! `PgScratchpadStore::nearest_by_embedding` are what a turn asks before the
-//! model's first move. All are query surfaces over personal data, so the suite
+//! model's first move. Both are query surfaces over personal data, so the suite
 //! pins the properties the block's correctness rests on.
 //!
 //! 1. **One user's rows and no other's.** Row-level security is a non-FORCE
@@ -156,6 +155,7 @@ async fn nearest_entries_come_back_nearest_first_with_their_distance() {
             .nearest_by_embedding(axis(0), MODEL, 10)
             .await
             .expect("the read succeeds");
+        let hits = hits.entries;
 
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].0.id, "kb-near", "nearest first");
@@ -191,6 +191,7 @@ async fn nearest_entries_never_cross_the_user_boundary() {
             .nearest_by_embedding(axis(0), MODEL, 10)
             .await
             .expect("the read succeeds");
+        let hits = hits.entries;
 
         let ids: Vec<&str> = hits.iter().map(|(e, _)| e.id.as_str()).collect();
         assert_eq!(
@@ -227,6 +228,7 @@ async fn nearest_entries_ignore_a_row_embedded_by_another_model() {
             .nearest_by_embedding(axis(0), MODEL, 10)
             .await
             .expect("a row from another model must not fail the read");
+        let hits = hits.entries;
 
         let ids: Vec<&str> = hits.iter().map(|(e, _)| e.id.as_str()).collect();
         assert_eq!(ids, vec!["kb-mine"]);
@@ -252,6 +254,7 @@ async fn nearest_entries_stop_at_the_scan_limit() {
             .nearest_by_embedding(axis(0), MODEL, 3)
             .await
             .expect("the read succeeds");
+        let hits = hits.entries;
         assert_eq!(hits.len(), 3);
     })
     .await;
@@ -278,6 +281,7 @@ async fn nearest_entries_skip_a_retired_entry() {
             .nearest_by_embedding(axis(0), MODEL, 10)
             .await
             .expect("the read succeeds");
+        let hits = hits.entries;
         assert!(hits.is_empty(), "a retired entry is not a candidate");
     })
     .await;
@@ -299,6 +303,7 @@ async fn nearest_entries_answer_nothing_without_an_embedding() {
             .nearest_by_embedding(Vec::new(), MODEL, 10)
             .await
             .expect("an absent embedding is not an error");
+        let hits = hits.entries;
         assert!(hits.is_empty());
     })
     .await;
@@ -309,7 +314,8 @@ async fn nearest_entries_answer_nothing_without_an_embedding() {
 // -- the source's own dispersion (#1121) -------------------------------------
 
 /// Acceptance (#1121): the block reads a candidate against the spread of the
-/// whole store, so the store has to be able to state it.
+/// whole store, so the scan that answers with the candidates states it too -
+/// measured over the same query, in the same pass.
 #[tokio::test]
 async fn the_store_measures_the_dispersion_of_its_own_distances() {
     let Some(fx) = fixture().await else { return };
@@ -319,9 +325,10 @@ async fn the_store_measures_the_dispersion_of_its_own_distances() {
 
     with_user_id(UserId::new(USER), async {
         let measured = store
-            .embedding_distance_dispersion(axis(0), MODEL)
+            .nearest_by_embedding(axis(0), MODEL, 10)
             .await
             .expect("the read succeeds")
+            .dispersion
             .expect("a store of this size states its own geometry");
 
         let median = measured.distance_at(0.0);
@@ -357,12 +364,18 @@ async fn the_dispersion_never_crosses_the_user_boundary() {
     seed_entry(&fx.pool, USER, "kb-mine", "my one fact", axis(0)).await;
 
     with_user_id(UserId::new(USER), async {
+        let answered = store
+            .nearest_by_embedding(axis(0), MODEL, 10)
+            .await
+            .expect("the read succeeds");
+
         assert_eq!(
-            store
-                .embedding_distance_dispersion(axis(0), MODEL)
-                .await
-                .expect("the read succeeds"),
-            None,
+            answered.entries.len(),
+            1,
+            "this user holds one row, and it is theirs"
+        );
+        assert_eq!(
+            answered.dispersion, None,
             "one row is not a distribution, whatever another tenant holds"
         );
     })
@@ -391,16 +404,18 @@ async fn a_store_with_no_comparable_row_states_no_dispersion() {
     with_user_id(UserId::new(USER), async {
         assert_eq!(
             store
-                .embedding_distance_dispersion(axis(0), MODEL)
+                .nearest_by_embedding(axis(0), MODEL, 10)
                 .await
-                .expect("a row from another model must not fail the read"),
+                .expect("a row from another model must not fail the read")
+                .dispersion,
             None
         );
         assert_eq!(
             store
-                .embedding_distance_dispersion(Vec::new(), MODEL)
+                .nearest_by_embedding(Vec::new(), MODEL, 10)
                 .await
-                .expect("an absent embedding is not an error"),
+                .expect("an absent embedding is not an error")
+                .dispersion,
             None
         );
     })

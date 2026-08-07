@@ -627,29 +627,49 @@ fn render_recall_with_width(
 /// Ranked by how many of those entries carry each name, and names of equal
 /// weight keep the order the entries arrived in - which is nearest first.
 ///
-/// An ordered map rather than a hash one, and the tie broken on where a name
-/// was first seen, so the line is the same line every time. Nothing bounds how
-/// many tags an entry holds, so the count of names is the count of tags on the
+/// **Entries, not occurrences.** A name an entry happens to list twice describes
+/// one entry, and counting it twice would rank it above a name two entries
+/// really share.
+///
+/// An ordered map rather than a hash one, and the tie broken on where a name was
+/// first seen, so the line is the same line every time. Nothing bounds how many
+/// tags an entry holds, so the count of names is the count of tags on the
 /// entries shown: a map keeps that linear in the names rather than quadratic.
 fn carried_tags<'a>(shown: &[&(&'a RecallEntry, String)]) -> Vec<&'a str> {
-    // name -> (how many entries carry it, where it was first seen).
-    let mut counted: std::collections::BTreeMap<&str, (usize, usize)> =
-        std::collections::BTreeMap::new();
-    for (seen, name) in shown
-        .iter()
-        .flat_map(|(hit, _)| hit.entry.tags.iter())
-        .enumerate()
-    {
-        let carried = counted.entry(name.as_str()).or_insert((0, seen));
-        carried.0 += 1;
+    let mut counted: std::collections::BTreeMap<&str, Carried> = std::collections::BTreeMap::new();
+    let mut seen = 0;
+    for (position, (hit, _)) in shown.iter().enumerate() {
+        for name in &hit.entry.tags {
+            let carried = counted.entry(name.as_str()).or_insert(Carried {
+                entries: 0,
+                first_seen: seen,
+                last_entry: position,
+            });
+            seen += 1;
+            if carried.entries == 0 || carried.last_entry != position {
+                carried.entries += 1;
+                carried.last_entry = position;
+            }
+        }
     }
-    let mut ranked: Vec<(&str, (usize, usize))> = counted.into_iter().collect();
-    ranked.sort_by_key(|(_, (carried, first_seen))| (std::cmp::Reverse(*carried), *first_seen));
+    let mut ranked: Vec<(&str, Carried)> = counted.into_iter().collect();
+    ranked.sort_by_key(|(_, carried)| (std::cmp::Reverse(carried.entries), carried.first_seen));
     ranked
         .into_iter()
         .take(MAX_RECALL_TAGS)
         .map(|(name, _)| name)
         .collect()
+}
+
+/// How one tag name did among the entries the block showed.
+#[derive(Clone, Copy)]
+struct Carried {
+    /// How many of those entries carry it.
+    entries: usize,
+    /// Where the name was first seen, which breaks a tie by nearness.
+    first_seen: usize,
+    /// The last entry counted for it, so one entry cannot count twice.
+    last_entry: usize,
 }
 
 /// Whether `values` names `wanted`.
@@ -687,11 +707,14 @@ fn contains(values: &[String], wanted: &str) -> bool {
 fn tag_list(names: &[&str], max_bytes: usize) -> String {
     let mut out = String::new();
     for name in names {
-        if name.is_empty() || name.chars().any(char::is_whitespace) {
-            continue;
-        }
+        // Size first, and the shape of the name second. Nothing bounds how many
+        // tags an entry holds or how long one is, and the size check is a
+        // comparison where the shape check reads every character.
         let separator = if out.is_empty() { 0 } else { 2 };
         if out.len() + separator + name.len() > max_bytes {
+            continue;
+        }
+        if name.is_empty() || name.chars().any(char::is_whitespace) {
             continue;
         }
         if !out.is_empty() {
@@ -1975,6 +1998,24 @@ mod tests {
             !line.contains("below-the-bar"),
             "an entry the bar refused lights nothing: {line}"
         );
+    }
+
+    #[test]
+    fn a_tag_one_entry_lists_twice_counts_once() {
+        // A name an entry happens to list twice describes one entry. Counting
+        // the occurrence would rank it above a name two entries really share.
+        let candidates = RecallCandidates {
+            entries: vec![
+                hit("kb-1", "a fact", &["doubled", "doubled"], 0.10),
+                hit("kb-2", "another fact", &["shared"], 0.11),
+                hit("kb-3", "a third fact", &["shared"], 0.12),
+            ],
+            ..RecallCandidates::default()
+        };
+
+        let block = render(&candidates).expect("a block");
+
+        assert_eq!(tag_names(&block), vec!["shared", "doubled"], "{block}");
     }
 
     /// Acceptance (#1121): the names are ranked by how many of the surfaced

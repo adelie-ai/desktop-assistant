@@ -234,23 +234,25 @@ nothing, a weak cue clears a line or two, and a strong cue clears a dozen. The
 block is wide exactly when there is something to be wide about, and the
 configured width is a safety cap on the worst case rather than the mechanism.
 
-**Measured over the source, never over the candidates.** The lookup reads only
+**Measured over the source, never over the candidates.** The lookup shows only
 the nearest rows, so their spread is the near tail's and not the store's, and
 normalizing inside a truncated set inflates every score.
-`PgKnowledgeBaseStore::embedding_distance_dispersion` measures the median and the
-median absolute deviation over every row the search could reach.
+`PgKnowledgeBaseStore::nearest_by_embedding` measures the median and the median
+absolute deviation over every row the scan could reach.
 
-**Measured against this turn's own prompt, every turn.** Both statistics are
-distances *from one query* to every row, so a held pair would grade this prompt's
-candidates by the geometry the last prompt saw. The margin between a prompt with
-a cue and one without is about 0.4 deviations, a few hundredths of cosine
-distance, and a prompt unlike the store - a pasted document against a store of
-short facts - moves the median further than that; a held estimate would then
-admit an acknowledgement for as long as it stood. The measurement is one narrow
-pass over the rows the arm is already scanning and it runs beside that arm, so
-exactness costs a concurrent read rather than a turn. It carries its own
-four-second ceiling, well inside the whole lookup's ten, because the block does
-not need it.
+**One scan states both.** The candidates and the spread are functions of the same
+query vector: the spread says what a distance from this store is worth, and the
+candidates are the distances it grades. An answer held from an earlier prompt
+would grade this one against a geometry nothing here saw, and the margin has no
+room for that - about 0.4 deviations between the two classes, which is a few
+hundredths of cosine distance. Computing them together costs one pass rather than
+two: the scan is what the query spends its time on, the pass that measures the
+spread reads one distance per row and no content, and only the rows the block may
+show are read whole.
+
+The scan states a `statement_timeout` of four seconds, so the ceiling the caller
+keeps is a ceiling the database keeps too. Abandoning a query stops the daemon
+waiting and leaves the backend scanning, and recall runs before every turn.
 
 Before a source can measure its own, the block reads it by a stated estimate,
 which is deliberately narrow. A measurement is refused, and the estimate stands,
@@ -433,21 +435,19 @@ direction is quiet rather than loud, which is the safe one, but it is a change
 and not a measurement. #1146 covers measuring the pad where it is large enough
 to state its own.
 
-**The dispersion pass is a second scan of the same rows.** It is narrow - one
-distance per row and no content - and it runs beside the arm rather than before
-it, so it costs a concurrent read rather than turn latency. It is still a second
-sequential scan per turn, and #859 is what makes the first one structural past
-roughly ten thousand entries. Holding the measurement between turns is the
-obvious saving and it is deliberately not taken: the statistic is a function of
-the prompt, so a held one grades the wrong geometry.
+**The spread costs two sorts over the scanned distances.** They are sorts of one
+double per row, on rows the scan has already computed, so they are small beside
+the vector arithmetic that dominates - but they are not free, and #859 is what
+makes the scan itself structural past roughly ten thousand entries. Holding the
+measurement between turns is the obvious saving and it is deliberately not taken:
+the statistic is a function of the prompt, so a held one grades the wrong
+geometry.
 
-**The scan reads whole rows.** Fifty entries are read to render a handful of
-lines, because the count of what did not fit has to be a count. The row count is
-bounded; the bytes those rows carry are not, so a store of unusually long entries
-pays more per prompt than a store of one-liners. Measured against a populated
-store, the wide projection costs a small fraction of a query that is already only
-a few milliseconds, so the read is left as one query rather than split into a
-rank pass and a body pass.
+**The scan reads whole rows for the ones it may show.** Fifty entries are ranked
+to render a handful of lines, because the count of what did not fit has to be a
+count. The row count is bounded; the bytes those rows carry are not, so a store
+of unusually long entries pays more per prompt than a store of one-liners.
+Measured against a populated store, the whole query costs a few milliseconds.
 
 **It fires on every turn, including agent and subagent runs.** Any turn that goes
 through `send_prompt` gets a lookup, so a spawned agent working from a
@@ -479,9 +479,8 @@ measured.
 | What the other blocks showed | `planning::listed_scratchpad_keys` and `planning::plan_note_keys` |
 | Rendered on the first round | `surfaced_blocks`, `crates/core/src/context/mod.rs` |
 | Embedding, every query, degradation | `crates/daemon/src/recall.rs` |
-| The knowledge query | `PgKnowledgeBaseStore::nearest_by_embedding`, `crates/storage/src/knowledge.rs` |
+| The knowledge query, and the spread it states | `PgKnowledgeBaseStore::nearest_by_embedding`, `crates/storage/src/knowledge.rs` |
 | Its degraded form | `PgKnowledgeBaseStore::search_text_any_term`, same file |
-| The dispersion measurement | `PgKnowledgeBaseStore::embedding_distance_dispersion`, same file |
 | The scratchpad query | `PgScratchpadStore::nearest_by_embedding`, `crates/storage/src/scratchpad.rs` |
 | Its degraded form | `PgScratchpadStore::search_text_any_term`, same file |
 | The tag names | `recall::carried_tags`, `crates/core/src/recall.rs` |
