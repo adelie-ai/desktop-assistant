@@ -1010,6 +1010,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
         conversation_id: &ConversationId,
         provenance: TurnProvenance,
         turn_start: usize,
+        plan_base: u32,
         offer_made: &mut bool,
     ) -> String {
         let Some(write) = self.scratchpad_write.clone() else {
@@ -1247,6 +1248,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
                     conversation_id,
                     turn_messages(&conv.messages, turn_start),
                     provenance,
+                    plan_base,
                 )
                 .await;
             *offer_made = offer.is_some();
@@ -1279,6 +1281,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
     async fn read_plan_steps(
         &self,
         conversation_id: &ConversationId,
+        plan_base: u32,
     ) -> Vec<skill_promotion::PlanStep> {
         let Some(list) = self.scratchpad_list.clone() else {
             return Vec::new();
@@ -1312,7 +1315,9 @@ impl<S, L, T> ConversationHandler<S, L, T> {
                 done: n.done,
             })
             .collect();
-        skill_promotion::plan_from_notes(&view)
+        // The pad is the conversation's, not the turn's, so drop the steps
+        // earlier plans left behind (#1155).
+        skill_promotion::steps_this_turn(skill_promotion::plan_from_notes(&view), plan_base)
     }
 
     /// Catalog entries that may already cover a finished plan (#1155).
@@ -1364,6 +1369,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
         conversation_id: &ConversationId,
         messages: &[Message],
         provenance: TurnProvenance,
+        plan_base: u32,
     ) -> Option<serde_json::Value> {
         self.skill_search.as_ref()?;
         self.skill_write_authored.as_ref()?;
@@ -1373,7 +1379,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             return None;
         }
 
-        let steps = self.read_plan_steps(conversation_id).await;
+        let steps = self.read_plan_steps(conversation_id, plan_base).await;
         let plan = match skill_promotion::assess(steps, skill_promotion::followed_a_skill(messages))
         {
             Ok(plan) => plan,
@@ -1404,6 +1410,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
         args: &serde_json::Value,
         conversation_id: &ConversationId,
         provenance: TurnProvenance,
+        plan_base: u32,
     ) -> String {
         let Some(write) = self.skill_write_authored.clone() else {
             return r#"{"ok":false,"error":"the skill library is not available in this turn"}"#
@@ -1425,7 +1432,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             }
         };
 
-        let steps = self.read_plan_steps(conversation_id).await;
+        let steps = self.read_plan_steps(conversation_id, plan_base).await;
         let plan = match skill_promotion::assess(steps, skill_promotion::followed_a_skill(messages))
         {
             Ok(plan) => plan,
@@ -1741,9 +1748,9 @@ impl<S, L, T> ConversationHandler<S, L, T> {
     /// `done`). Seeding the root counter from the highest existing top-level key
     /// makes a new turn mint the next number instead. Without a lister wired (or
     /// on a read error), falls back to a fresh stack — the prior behaviour.
-    async fn build_step_stack(&self, conversation_id: &ConversationId) -> StepStack {
+    async fn build_step_stack(&self, conversation_id: &ConversationId) -> (StepStack, u32) {
         let Some(list) = self.scratchpad_list.clone() else {
-            return StepStack::new();
+            return (StepStack::new(), 0);
         };
         // Only `todo`-typed notes are plan steps. Cap generously; only their
         // keys matter, and a conversation never accrues that many top-level
@@ -1757,9 +1764,9 @@ impl<S, L, T> ConversationHandler<S, L, T> {
         {
             Ok(notes) => {
                 let max = planning::max_top_level_key(notes.iter().map(|n| n.key.as_str()));
-                StepStack::with_root_counter(max)
+                (StepStack::with_root_counter(max), max)
             }
-            Err(_) => StepStack::new(),
+            Err(_) => (StepStack::new(), 0),
         }
     }
 }
@@ -2329,7 +2336,10 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         // Seeded from the conversation's existing `todo` keys so a later turn
         // continues the numbering instead of clobbering an earlier turn's note
         // via the scratchpad's upsert-by-key write (DA-7 / #292).
-        let mut step_stack = self.build_step_stack(conversation_id).await;
+        // `plan_base` is the highest top-level step number the conversation
+        // already held. Step notes outlive their turn, so it is what separates
+        // the plan THIS turn opens from every plan before it (#1155).
+        let (mut step_stack, plan_base) = self.build_step_stack(conversation_id).await;
         // At most one offer to keep the turn's plan as a skill (#1155). A turn
         // may return to the root plan several times, and repeating the offer
         // each time would train the model to ignore it.
@@ -2966,6 +2976,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                             &arguments,
                             conversation_id,
                             turn_provenance,
+                            plan_base,
                         )
                         .await;
                     conv.messages
@@ -3005,6 +3016,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                             conversation_id,
                             turn_provenance,
                             turn_start,
+                            plan_base,
                             &mut skill_offer_made,
                         )
                         .await;
@@ -7305,6 +7317,59 @@ mod tests {
             "an earlier turn's lookup is not this plan following a skill, so the second \
              turn's completed plan must still be offered"
         );
+    }
+
+    /// Step notes outlive their turn and the step stack keeps counting, so a
+    /// plain read of the pad returns every step the conversation ever
+    /// completed. Two unrelated two-step plans must not clear a three-step bar
+    /// between them, nor be written as one spliced procedure.
+    #[tokio::test]
+    async fn a_later_turns_plan_does_not_inherit_the_earlier_turns_steps() {
+        let mut responses = Vec::new();
+        responses.extend(plan_step_calls(1, "turn one, step one", "did a"));
+        responses.extend(plan_step_calls(2, "turn one, step two", "did b"));
+        responses.push(LlmResponse::text("First job done."));
+        responses.extend(plan_step_calls(3, "turn two, step one", "did c"));
+        responses.extend(plan_step_calls(4, "turn two, step two", "did d"));
+        responses.push(LlmResponse::text("Second job done."));
+
+        let (write, list, _sp) = in_memory_scratchpad();
+        let (search, get, skill_write, written) = in_memory_skill_catalog(Vec::new());
+        let llm = ToolCallingLlm::new(responses);
+        let prompts = llm.prompts();
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            llm,
+            MockToolExecutor::new(Vec::new(), HashMap::new()),
+            id_gen(),
+        )
+        .with_scratchpad_write(write)
+        .with_scratchpad_list(list)
+        .with_skill_promotion(search, get, skill_write);
+
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "first job".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+        handler
+            .send_prompt(
+                &conv.id,
+                "second job".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !any_skill_offer(&prompts),
+            "neither turn opened three steps of its own, so neither is a method"
+        );
+        assert!(written.lock().unwrap().is_empty());
     }
 
     /// Acceptance: a skill written this way is unapproved, and its body comes

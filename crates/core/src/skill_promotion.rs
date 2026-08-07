@@ -257,13 +257,64 @@ fn dotted(key: &str) -> Vec<u64> {
         .collect()
 }
 
+/// Keep only the steps a turn opened for itself.
+///
+/// Step notes live in the conversation's scratchpad, not the turn's, and the
+/// step stack continues numbering where the last turn stopped. So a plain read
+/// returns every step the conversation ever completed, and a later plan would
+/// be judged - and written - as though the earlier ones were part of it: two
+/// unrelated two-step plans would clear a three-step bar between them, and the
+/// skill body would splice two procedures together.
+///
+/// `previous_top_level` is the highest top-level step number that existed when
+/// this turn began, so a step is this turn's when its top-level number is
+/// greater. Nested steps ride on their parent's number, so they are kept or
+/// dropped with it.
+pub fn steps_this_turn(steps: Vec<PlanStep>, previous_top_level: u32) -> Vec<PlanStep> {
+    steps
+        .into_iter()
+        .filter(|s| {
+            s.key
+                .split('.')
+                .next()
+                .and_then(|head| head.parse::<u32>().ok())
+                .is_some_and(|top| top > previous_top_level)
+        })
+        .collect()
+}
+
 /// Whether the turn read an existing skill before it planned.
 ///
-/// True when any assistant message in the turn called [`SKILL_GET_TOOL`].
+/// True when the turn called [`SKILL_GET_TOOL`] and got a skill back. A call
+/// that was refused - the name does not exist, or the skill is still awaiting
+/// approval - read nothing, so it is not a skill being followed, and treating
+/// it as one would decline a perfectly good plan.
+///
+/// Conservative where it cannot tell: a result the turn has already compacted
+/// to a scratchpad pointer no longer says whether it succeeded, and that counts
+/// as followed. A missed offer costs nothing; a near-duplicate skill costs
+/// attention on every later search.
 pub fn followed_a_skill(messages: &[Message]) -> bool {
-    messages
+    let refused: std::collections::HashSet<&str> = messages
         .iter()
-        .any(|m| m.role == Role::Assistant && m.tool_calls.iter().any(|c| c.name == SKILL_GET_TOOL))
+        .filter(|m| m.role == Role::Tool && is_refusal(&m.content))
+        .filter_map(|m| m.tool_call_id.as_deref())
+        .collect();
+
+    messages.iter().any(|m| {
+        m.role == Role::Assistant
+            && m.tool_calls
+                .iter()
+                .any(|c| c.name == SKILL_GET_TOOL && !refused.contains(c.id.as_str()))
+    })
+}
+
+/// Whether a tool result is the skill library saying it returned nothing.
+///
+/// Reads the structured `ok` field rather than matching English, so the
+/// judgement survives a reworded message.
+fn is_refusal(content: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(content).is_ok_and(|v| v["ok"] == false)
 }
 
 /// Decide whether a completed plan is worth offering as a skill.
@@ -372,7 +423,12 @@ fn yaml_string(value: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            // U+2028/U+2029 are separators, not `char::is_control()`
+            // controls, and YAML treats them as line breaks: left raw they
+            // would fold the same way a newline does.
+            c if c.is_control() || c == '\u{2028}' || c == '\u{2029}' => {
+                out.push_str(&format!("\\u{:04x}", c as u32))
+            }
             c => out.push(c),
         }
     }
@@ -834,6 +890,62 @@ mod tests {
         assert!(!steps[0].succeeded());
     }
 
+    // --- steps_this_turn -----------------------------------------------------
+
+    /// Step notes outlive the turn that wrote them, so a plan must be judged on
+    /// the steps THIS turn opened. Without this, two unrelated two-step plans
+    /// in one conversation would clear a three-step bar between them and be
+    /// written as one spliced procedure.
+    #[test]
+    fn a_later_plan_does_not_inherit_an_earlier_turns_steps() {
+        let all = vec![
+            step("1", "turn one, step one", Some("a")),
+            step("1.1", "turn one, nested", Some("b")),
+            step("2", "turn one, step two", Some("c")),
+            step("3", "turn two, step one", Some("d")),
+            step("3.1", "turn two, nested", Some("e")),
+            step("4", "turn two, step two", Some("f")),
+        ];
+        let mine = steps_this_turn(all.clone(), 2);
+        let keys: Vec<&str> = mine.iter().map(|s| s.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["3", "3.1", "4"],
+            "a nested step rides on its parent"
+        );
+
+        assert_eq!(
+            steps_this_turn(all.clone(), 0).len(),
+            6,
+            "a first turn keeps everything it opened"
+        );
+
+        // The harm the filter prevents: two unrelated two-step plans in one
+        // conversation, neither of them a method, clearing the bar between them
+        // and being written as one spliced procedure.
+        let two_and_two = vec![
+            step("1", "turn one, step one", Some("a")),
+            step("2", "turn one, step two", Some("b")),
+            step("3", "turn two, step one", Some("c")),
+            step("4", "turn two, step two", Some("d")),
+        ];
+        assert_eq!(
+            assess(two_and_two.clone(), false)
+                .expect("unfiltered, four steps wrongly clear the bar")
+                .working_steps()
+                .len(),
+            4
+        );
+        assert_eq!(
+            assess(steps_this_turn(two_and_two, 2), false)
+                .expect_err("this turn opened two steps, which is not a method"),
+            NotPromotable::TooFewSteps {
+                succeeded: 2,
+                needed: MIN_PROMOTABLE_STEPS
+            }
+        );
+    }
+
     // --- followed_a_skill ----------------------------------------------------
 
     #[test]
@@ -845,6 +957,36 @@ mod tests {
             arguments: "{}".to_string(),
         }];
         assert!(followed_a_skill(&[msg]));
+    }
+
+    #[test]
+    fn a_refused_skill_read_did_not_follow_one() {
+        // The library said no - the skill does not exist, or it is awaiting
+        // approval - so the turn read nothing and its plan is its own.
+        let mut call = Message::new(Role::Assistant, "");
+        call.tool_calls = vec![crate::domain::tool::ToolCall {
+            id: "c1".to_string(),
+            name: SKILL_GET_TOOL.to_string(),
+            arguments: "{}".to_string(),
+        }];
+        let mut result = Message::new(Role::Tool, r#"{"ok":false,"awaiting_approval":true}"#);
+        result.tool_call_id = Some("c1".to_string());
+        assert!(!followed_a_skill(&[call, result]));
+    }
+
+    #[test]
+    fn a_compacted_skill_read_counts_as_followed() {
+        // The result no longer says whether it succeeded, so the conservative
+        // reading stands: a missed offer costs less than a near-duplicate.
+        let mut call = Message::new(Role::Assistant, "");
+        call.tool_calls = vec![crate::domain::tool::ToolCall {
+            id: "c1".to_string(),
+            name: SKILL_GET_TOOL.to_string(),
+            arguments: "{}".to_string(),
+        }];
+        let mut result = Message::new(Role::Tool, "<compacted to scratchpad note outcome:1>");
+        result.tool_call_id = Some("c1".to_string());
+        assert!(followed_a_skill(&[call, result]));
     }
 
     #[test]
@@ -1355,6 +1497,8 @@ mod yaml_tests {
             "trailing spaces   ",
             "*emphasis* and &anchor and *alias",
             "100%",
+            "line\u{2028}separator",
+            "paragraph\u{2029}separator",
         ] {
             let md = render_skill_md("x", description, &[], "body");
             let parsed = parse_skill_md(&md)
@@ -1394,7 +1538,7 @@ mod yaml_tests {
 
     /// A step key the store could hold that is not the shape the stack mints.
     #[test]
-    fn an_absurd_step_key_does_not_panic_the_sort() {
+    fn an_absurd_step_key_sorts_last_rather_than_first() {
         let notes = [
             PlanNote {
                 key: "99999999999999999999",
@@ -1410,11 +1554,7 @@ mod yaml_tests {
             },
         ];
         let steps = plan_from_notes(&notes);
-        assert_eq!(
-            steps.len(),
-            2,
-            "an unparseable number sorts, it does not panic"
-        );
+        assert_eq!(steps.len(), 2, "an unparseable number is kept, not dropped");
         assert_eq!(
             steps[0].key, "1",
             "and the overflowing key sorts as zero-or-last, not randomly"

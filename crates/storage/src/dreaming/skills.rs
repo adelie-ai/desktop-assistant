@@ -28,7 +28,8 @@ use desktop_assistant_core::domain::{IndexedSkill, Locality, TrustTier};
 use desktop_assistant_core::ports::auth::current_user_id;
 use desktop_assistant_core::ports::skill_index::SkillIndexStore;
 use desktop_assistant_core::skill_promotion::{
-    MIN_PROMOTABLE_STEPS, PlanStep, PromotablePlan, render_skill_body, render_skill_md,
+    MIN_PROMOTABLE_STEPS, PlanStep, PromotablePlan, is_own_draft, render_skill_body,
+    render_skill_md,
 };
 use sqlx::PgPool;
 
@@ -224,9 +225,13 @@ pub(crate) fn to_indexed_skill(proposed: &ExtractedSkill) -> Option<IndexedSkill
 /// Write the methods one conversation's extraction found, and report how many
 /// landed.
 ///
-/// A method whose name is already held by an **approved** skill is skipped: a
-/// person reviewed that body, and an unattended pass must not overwrite it.
-/// An unapproved row of the same name is revised instead, which is what stops
+/// A method whose name is already held by anything other than the assistant's
+/// own unadopted draft is skipped. `is_own_draft` is the same rule the
+/// interactive promotion tool applies, and it has to be the same rule here:
+/// `write_authored` replaces the body, relabels the provenance and marks the
+/// row absent from disk, so pointing it at a skill a person approved, placed in
+/// a skill root, or installed from elsewhere would destroy their work. An
+/// unapproved draft of the same name is revised instead, which is what stops
 /// every cycle adding another near-duplicate.
 pub(crate) async fn write_extracted_skills(
     pool: &PgPool,
@@ -249,10 +254,12 @@ pub(crate) async fn write_extracted_skills(
             continue;
         };
         match store.get(&skill.name, skill.owner_user_id.as_deref()).await {
-            Ok(Some(existing)) if existing.is_approved() => {
+            Ok(Some(existing)) if !is_own_draft(&existing) => {
                 tracing::info!(
                     skill = %skill.name,
-                    "dreaming: an approved skill of this name exists; leaving it alone"
+                    approved = existing.is_approved(),
+                    present_on_disk = existing.present_on_disk,
+                    "dreaming: a skill of this name is not ours to revise; leaving it alone"
                 );
                 continue;
             }
@@ -358,6 +365,36 @@ mod tests {
         assert!(!skill.present_on_disk);
         assert_eq!(skill.source.as_deref(), Some(EXTRACTED_SOURCE));
         assert!(skill.body.contains("step 1") && skill.body.contains("did 1"));
+    }
+
+    /// The dream cycle writes unattended, so it uses exactly the rule the
+    /// interactive path uses for what it may revise. Guarding on approval alone
+    /// would leave a person's on-disk skill open to being overwritten the
+    /// moment its approval was withdrawn.
+    #[test]
+    fn extraction_may_only_revise_its_own_unadopted_drafts() {
+        let mut draft = to_indexed_skill(&parse_extracted_skills(&proposal(3))[0])
+            .expect("three steps clears the bar");
+        assert!(
+            is_own_draft(&draft),
+            "what extraction itself writes is revisable"
+        );
+
+        draft.approved_at = Some(chrono::Utc::now());
+        assert!(!is_own_draft(&draft), "a person approved this body");
+
+        let mut on_disk =
+            to_indexed_skill(&parse_extracted_skills(&proposal(3))[0]).expect("clears the bar");
+        on_disk.present_on_disk = true;
+        assert!(
+            !is_own_draft(&on_disk),
+            "the file is still in a skill root, so marking the row absent would lie"
+        );
+
+        let mut installed =
+            to_indexed_skill(&parse_extracted_skills(&proposal(3))[0]).expect("clears the bar");
+        installed.source = Some("https://github.com/example/skills".to_string());
+        assert!(!is_own_draft(&installed), "somebody else wrote this one");
     }
 
     #[test]
