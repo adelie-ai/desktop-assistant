@@ -66,6 +66,16 @@ pub const RECENT_USE_WINDOW: usize = 10;
 /// any entry with a single use.
 pub const MIN_ACTIVATION_SUM: f64 = 1e-6;
 
+/// How much of a mark's reason is stored.
+///
+/// The reason comes from a language model and nothing before storage bounds it.
+/// It is one statement of why an entry helped or was wrong, which is what a
+/// later reader needs and all a later reader will read - the same length a
+/// knowledge entry's one-line summary gets, chosen for the same reason and
+/// stated here rather than borrowed, because a change to the summary's cap is a
+/// summary decision.
+pub const MARK_REASON_MAX_CHARS: usize = 200;
+
 /// Whether a mark says the entry helped or says it was wrong.
 ///
 /// A negative mark is not the absence of a positive one. "Offered, opened, and

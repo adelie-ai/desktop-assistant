@@ -95,6 +95,19 @@ Marking is the one write on the log that a caller asks for rather than one that
 measures a read, so it is awaited and its failure reaches the caller. A caller
 that asked to record a judgement has to learn whether the judgement landed.
 
+The reason is cut to `MARK_REASON_MAX_CHARS` rather than refused. It comes from
+a language model and nothing before storage bounds it, and an over-long reason
+should cost its tail, not the mark.
+
+The write retries once, and only when an entry went missing under it. Deleting
+an entry removes it outright, and the delete runs in whatever conversation the
+user asked from, so an id named in a mark can be gone between the statement's
+own read of `knowledge_base` and the foreign key check that follows. The key
+check then raises and the whole batch rolls back, which would contradict what
+the tool promises: an id that did not land is named, and the rest of the batch
+still lands. On the retry the row is definitively gone and the remaining ids are
+marked. The check reads the SQLSTATE, not the message.
+
 ## Bounded per entry
 
 A spacing term needs per-use timestamps, because when the uses fell is the half
@@ -167,6 +180,11 @@ exception is the mark, which the caller asked for.
 Running off the path costs one guarantee worth stating: a spawned write may
 still be in flight when the tool returns. In practice an offer is recorded when
 the lookup answers and taken up a model round trip later, which is seconds.
+
+A `[Recall]` lookup that found nothing is recorded too, as an offer of no
+entries, because a recall offer replaces the conversation's standing offers and
+an empty one is what ends the previous turn's. A lookup that failed outright
+records nothing, so on that turn the previous turn's offers stand.
 
 The log is capability-gated like every other knowledge closure. Without a
 database the tools behave exactly as they did before it existed, and

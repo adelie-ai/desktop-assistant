@@ -25,7 +25,8 @@ mod support;
 use chrono::Utc;
 use desktop_assistant_core::domain::KnowledgeEntry;
 use desktop_assistant_core::domain::knowledge_use::{
-    KnowledgeUseRecord, MarkPolarity, MarkSource, RECENT_USE_WINDOW, UseScoreWeights,
+    KnowledgeUseRecord, MARK_REASON_MAX_CHARS, MarkPolarity, MarkSource, RECENT_USE_WINDOW,
+    UseScoreWeights,
 };
 use desktop_assistant_core::ports::knowledge::KnowledgeBaseStore;
 use desktop_assistant_core::ports::knowledge_use::{KnowledgeUseLog, MarkRequest, OfferScope};
@@ -378,6 +379,35 @@ async fn a_negative_mark_is_recordable_and_lowers_the_score() {
         wrong.usefulness(now, &weights) < right.usefulness(now, &weights),
         "an entry marked wrong must score below the same entry unmarked"
     );
+
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_long_reason_is_cut_rather_than_refused() {
+    let Some(fx) = fixture().await else { return };
+    let log = PgKnowledgeUseLog::new(fx.pool.clone());
+    write_as(&fx.pool, ALICE, "kb-1").await;
+
+    // The reason comes from a language model and nothing before storage bounds
+    // it. Cutting costs the tail; refusing would cost the mark, which is the
+    // highest-quality signal the log holds.
+    let long: String = "e".repeat(MARK_REASON_MAX_CHARS * 3);
+    with_user_id(UserId::new(ALICE), async {
+        log.record_mark(MarkRequest {
+            entry_ids: vec!["kb-1".to_string()],
+            polarity: MarkPolarity::Negative,
+            source: MarkSource::Model,
+            reason: Some(long),
+        })
+        .await
+        .expect("a long reason does not refuse the mark")
+    })
+    .await;
+
+    let record = record_of(&log, ALICE, "kb-1").await.expect("a record");
+    let stored = record.marks[0].reason.as_deref().expect("a reason");
+    assert_eq!(stored.chars().count(), MARK_REASON_MAX_CHARS);
 
     fx.cleanup().await;
 }

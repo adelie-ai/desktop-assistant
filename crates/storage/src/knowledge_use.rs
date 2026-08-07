@@ -21,7 +21,8 @@
 use chrono::{DateTime, Utc};
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::knowledge_use::{
-    KnowledgeMark, KnowledgeUseRecord, MarkPolarity, MarkSource, RECENT_USE_WINDOW,
+    KnowledgeMark, KnowledgeUseRecord, MARK_REASON_MAX_CHARS, MarkPolarity, MarkSource,
+    RECENT_USE_WINDOW,
 };
 use desktop_assistant_core::ports::auth::current_user_id;
 use desktop_assistant_core::ports::knowledge_use::{
@@ -50,6 +51,27 @@ fn storable(ids: Vec<String>) -> Vec<String> {
     ids.into_iter().filter(|id| !id.contains('\0')).collect()
 }
 
+/// A mark's reason, cut to [`MARK_REASON_MAX_CHARS`].
+///
+/// The reason comes from a language model and nothing before this point bounds
+/// it. Cutting rather than refusing is the same trade a knowledge entry's
+/// summary makes: an over-long reason costs its tail, never the mark.
+fn bounded_reason(reason: Option<&str>) -> Option<String> {
+    reason.map(|text| text.chars().take(MARK_REASON_MAX_CHARS).collect())
+}
+
+/// Whether a failure is the foreign key to `knowledge_base` refusing a row,
+/// which is what a hard delete racing the mark write looks like.
+///
+/// Read from the SQLSTATE rather than the message, so the check does not depend
+/// on how the driver words it. `23503` is `foreign_key_violation`.
+fn is_missing_entry(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .and_then(|db| db.code())
+        .is_some_and(|code| code == "23503")
+}
+
 /// One `knowledge_use_stats` row as it comes back.
 #[derive(sqlx::FromRow)]
 struct StatsRow {
@@ -70,6 +92,67 @@ struct MarkRow {
     polarity: String,
     reason: Option<String>,
     marked_at: DateTime<Utc>,
+}
+
+impl PgKnowledgeUseLog {
+    /// One attempt at the mark write, in its own transaction.
+    ///
+    /// Returns the raw `sqlx::Error` so the caller can tell a vanished entry
+    /// from any other failure by its SQLSTATE, rather than by reading a message.
+    async fn mark_once(
+        &self,
+        ids: &[String],
+        request: &MarkRequest,
+    ) -> Result<Vec<String>, sqlx::Error> {
+        let user_id = current_user_id();
+        let mut tx = self.pool.begin().await?;
+
+        // The standing mark. One per source per entry: a second mark from the
+        // same source is the same opinion changing its mind, not a second
+        // opinion.
+        let marked: Vec<String> = sqlx::query_scalar(
+            "INSERT INTO knowledge_use_marks \
+                 (user_id, entry_id, marked_by, polarity, reason, marked_at) \
+             SELECT kb.user_id, kb.id, $3, $4, $5, NOW() \
+             FROM knowledge_base kb \
+             WHERE kb.user_id = $1 AND kb.id = ANY($2) AND kb.deleted_at IS NULL \
+             ON CONFLICT (user_id, entry_id, marked_by) DO UPDATE SET \
+                 polarity = EXCLUDED.polarity, \
+                 reason = EXCLUDED.reason, \
+                 marked_at = NOW() \
+             RETURNING entry_id",
+        )
+        .bind(user_id.as_str())
+        .bind(ids)
+        .bind(request.source.as_str())
+        .bind(request.polarity.as_str())
+        .bind(bounded_reason(request.reason.as_deref()))
+        .fetch_all(&mut *tx)
+        .await?;
+
+        // A mark is a use: the entry was retrieved and acted on. The counter and
+        // the recent-use window both move, whichever way the mark points - the
+        // polarity is carried by the mark row, and the score reads it there.
+        if !marked.is_empty() {
+            sqlx::query(
+                "INSERT INTO knowledge_use_stats \
+                     (user_id, entry_id, marked_count, first_seen_at, recent_uses) \
+                 SELECT $1, m, 1, NOW(), ARRAY[NOW()] \
+                 FROM UNNEST($2::text[]) AS m \
+                 ON CONFLICT (user_id, entry_id) DO UPDATE SET \
+                     marked_count = knowledge_use_stats.marked_count + 1, \
+                     recent_uses = (ARRAY[NOW()] || knowledge_use_stats.recent_uses)[1:$3::int]",
+            )
+            .bind(user_id.as_str())
+            .bind(&marked)
+            .bind(RECENT_USE_WINDOW as i32)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(marked)
+    }
 }
 
 impl KnowledgeUseLog for PgKnowledgeUseLog {
@@ -173,68 +256,25 @@ impl KnowledgeUseLog for PgKnowledgeUseLog {
     }
 
     async fn record_mark(&self, request: MarkRequest) -> Result<Vec<String>, CoreError> {
-        let ids = storable(request.entry_ids);
+        let ids = storable(request.entry_ids.clone());
         if ids.is_empty() {
             return Ok(vec![]);
         }
-        let user_id = current_user_id();
-
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| CoreError::Storage(e.to_string()))?;
-
-        // The standing mark. One per source per entry: a second mark from the
-        // same source is the same opinion changing its mind, not a second
-        // opinion.
-        let marked: Vec<String> = sqlx::query_scalar(
-            "INSERT INTO knowledge_use_marks \
-                 (user_id, entry_id, marked_by, polarity, reason, marked_at) \
-             SELECT kb.user_id, kb.id, $3, $4, $5, NOW() \
-             FROM knowledge_base kb \
-             WHERE kb.user_id = $1 AND kb.id = ANY($2) AND kb.deleted_at IS NULL \
-             ON CONFLICT (user_id, entry_id, marked_by) DO UPDATE SET \
-                 polarity = EXCLUDED.polarity, \
-                 reason = EXCLUDED.reason, \
-                 marked_at = NOW() \
-             RETURNING entry_id",
-        )
-        .bind(user_id.as_str())
-        .bind(&ids)
-        .bind(request.source.as_str())
-        .bind(request.polarity.as_str())
-        .bind(request.reason.as_deref())
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|e| CoreError::Storage(e.to_string()))?;
-
-        // A mark is a use: the entry was retrieved and acted on. The counter
-        // and the recent-use window both move, whichever way the mark points -
-        // the polarity is carried by the mark row, and the score reads it from
-        // there.
-        if !marked.is_empty() {
-            sqlx::query(
-                "INSERT INTO knowledge_use_stats \
-                     (user_id, entry_id, marked_count, first_seen_at, recent_uses) \
-                 SELECT $1, m, 1, NOW(), ARRAY[NOW()] \
-                 FROM UNNEST($2::text[]) AS m \
-                 ON CONFLICT (user_id, entry_id) DO UPDATE SET \
-                     marked_count = knowledge_use_stats.marked_count + 1, \
-                     recent_uses = (ARRAY[NOW()] || knowledge_use_stats.recent_uses)[1:$3::int]",
-            )
-            .bind(user_id.as_str())
-            .bind(&marked)
-            .bind(RECENT_USE_WINDOW as i32)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| CoreError::Storage(e.to_string()))?;
-        }
-
-        tx.commit()
-            .await
-            .map_err(|e| CoreError::Storage(e.to_string()))?;
-        Ok(marked)
+        // One retry, and only when an entry went missing under the statement.
+        // `builtin_knowledge_base_delete` removes an entry outright, and it runs
+        // in whatever conversation the user asked from, so an id named here can
+        // be gone between this statement's own SELECT and the foreign key check
+        // that follows it. The key check then raises and the whole batch rolls
+        // back - which contradicts what the mark tool promises its caller: an id
+        // that did not land is named, and the rest of the batch still lands. On
+        // the retry the row is definitively gone, the SELECT no longer produces
+        // it, and the remaining ids are marked. A second failure means another
+        // entry went during the retry, and the caller is told the write failed.
+        let outcome = match self.mark_once(&ids, &request).await {
+            Err(e) if is_missing_entry(&e) => self.mark_once(&ids, &request).await,
+            other => other,
+        };
+        outcome.map_err(|e| CoreError::Storage(e.to_string()))
     }
 
     async fn records(&self, entry_ids: Vec<String>) -> Result<Vec<KnowledgeUseRecord>, CoreError> {
