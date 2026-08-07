@@ -78,6 +78,32 @@ fn axis(i: usize) -> Vec<f32> {
     v
 }
 
+/// A three-dimensional unit vector `radians` around from [`axis`] zero. Its
+/// cosine distance from that axis is `1 - cos(radians)`, which is what lets a
+/// fixture seed a spread of distances rather than only 0.0 and 1.0.
+fn at_angle(radians: f32) -> Vec<f32> {
+    vec![radians.cos(), radians.sin(), 0.0]
+}
+
+/// Seed enough rows, evenly spread in angle, for the store to state its own
+/// dispersion.
+///
+/// Two distances would not do it: half the rows at 0.0 and half at 1.0 gives a
+/// median absolute deviation of zero, which a measurement refuses as
+/// degenerate. A real store's distances are spread, and so are these.
+async fn seed_a_spread(pool: &PgPool, user: &str, id_prefix: &str) {
+    for i in 0..RECALL_DISPERSION_MIN_ROWS {
+        seed_entry(
+            pool,
+            user,
+            &format!("{id_prefix}-{i}"),
+            "a stored fact",
+            at_angle((i + 1) as f32 * 0.1),
+        )
+        .await;
+    }
+}
+
 /// Write an entry as `user`, then stamp an embedding on it. Writes never embed
 /// inline - the background backfill does - so the test stands in for it.
 async fn seed_entry(pool: &PgPool, user: &str, id: &str, content: &str, chunk: Vec<f32>) {
@@ -289,19 +315,7 @@ async fn the_store_measures_the_dispersion_of_its_own_distances() {
     let Some(fx) = fixture().await else { return };
     let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
-    // Enough rows for a measurement, spread over two axes: two thirds of them
-    // sit one axis away from the query and one third sits on it, so the median
-    // distance is 1.0 and half the rows are 1.0 away from that median.
-    for i in 0..RECALL_DISPERSION_MIN_ROWS {
-        seed_entry(
-            &fx.pool,
-            USER,
-            &format!("kb-spread-{i}"),
-            "a stored fact",
-            axis(usize::from(i % 3 != 0)),
-        )
-        .await;
-    }
+    seed_a_spread(&fx.pool, USER, "kb-spread").await;
 
     with_user_id(UserId::new(USER), async {
         let measured = store
@@ -310,13 +324,18 @@ async fn the_store_measures_the_dispersion_of_its_own_distances() {
             .expect("the read succeeds")
             .expect("a store of this size states its own geometry");
 
+        let median = measured.distance_at(0.0);
         assert!(
-            (measured.distance_at(0.0) - 1.0).abs() < 1e-6,
-            "the median of a two-thirds-far store is the far distance: {measured:?}"
+            (0.3..0.7).contains(&median),
+            "the median of an evenly spread store is a middling distance: {median}"
         );
         assert!(
-            measured.deviations_below_median(0.0) > 0.0,
+            measured.deviations_below_median(0.0) > 1.0,
             "a row on the query's own axis stands out of that median: {measured:?}"
+        );
+        assert!(
+            measured.deviations_below_median(median).abs() < 1e-9,
+            "and a row at the median stands out of it by nothing: {measured:?}"
         );
     })
     .await;
@@ -332,16 +351,9 @@ async fn the_dispersion_never_crosses_the_user_boundary() {
     let Some(fx) = fixture().await else { return };
     let store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
-    for i in 0..RECALL_DISPERSION_MIN_ROWS {
-        seed_entry(
-            &fx.pool,
-            OTHER_USER,
-            &format!("kb-theirs-{i}"),
-            "another tenant's fact",
-            axis(i % 2),
-        )
-        .await;
-    }
+    // Their store states a dispersion on its own, so a read that crossed the
+    // boundary would answer with one rather than with nothing.
+    seed_a_spread(&fx.pool, OTHER_USER, "kb-theirs").await;
     seed_entry(&fx.pool, USER, "kb-mine", "my one fact", axis(0)).await;
 
     with_user_id(UserId::new(USER), async {

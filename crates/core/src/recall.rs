@@ -21,7 +21,7 @@
 //!   earlier in a short, fully-visible conversation is durable and invisible.
 //! - **The tags those entries carry**, a working vocabulary for the model's
 //!   first search. Derived from what surfaced rather than searched for, so it
-//!   cannot speak when nothing surfaced - see [`carried_tags`].
+//!   cannot speak when nothing surfaced - see `carried_tags`.
 //!
 //! ## What bounds it
 //!
