@@ -1132,6 +1132,31 @@ mod tests {
         assert!(render(&unmeasured(at(RECALL_BAR - 0.1))).is_none());
     }
 
+    /// The stated estimate is the one place a distance is still stated by hand,
+    /// so what it admits is pinned here rather than left to drift.
+    ///
+    /// The two distances are the closest a prompt of no content came, and the
+    /// furthest a prompt with a real cue came, on the store the estimate was
+    /// set from. An estimate that admitted the first would put unrelated memory
+    /// in front of the model on every acknowledgement; one that refused the
+    /// second would keep a real hit out of a store too new to measure itself.
+    #[test]
+    fn the_stated_estimate_admits_a_measured_hit_and_refuses_measured_noise() {
+        let nearest_a_prompt_of_no_content_came = 0.32;
+        let furthest_a_real_cue_came = 0.21;
+
+        assert!(
+            RECALL_ASSUMED_DISPERSION.deviations_below_median(nearest_a_prompt_of_no_content_came)
+                < RECALL_BAR,
+            "the estimate admits a candidate no prompt with a cue produced"
+        );
+        assert!(
+            RECALL_ASSUMED_DISPERSION.deviations_below_median(furthest_a_real_cue_came)
+                >= RECALL_BAR,
+            "the estimate refuses a candidate a prompt with a real cue produced"
+        );
+    }
+
     /// A source that did measure itself is read by its own numbers, so the
     /// estimate governs only where nothing better exists.
     #[test]

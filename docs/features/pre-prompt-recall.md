@@ -416,7 +416,7 @@ distance is still stated by hand.
 **The pad is read by the stated estimate too.** One conversation's scratchpad
 rarely holds enough rows for a median absolute deviation over it to be a
 measurement rather than noise, and the pad read is already the block's most
-expensive query, so no second pass measures it. #1148 covers measuring it where
+expensive query, so no second pass measures it. #1146 covers measuring it where
 a pad is large enough to state its own.
 
 **The scan reads whole rows.** Fifty entries are read to render a handful of

@@ -319,7 +319,7 @@ async fn gather(
         // The pad is read against the stated estimate. One conversation's pad
         // rarely holds enough rows for a median absolute deviation over it to
         // be a measurement rather than noise, and the pad read is already the
-        // block's most expensive query - see #1148.
+        // block's most expensive query - see #1146.
         note_dispersion: None,
     })
 }
