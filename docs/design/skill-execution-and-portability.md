@@ -1,9 +1,10 @@
 # Skill execution and portability (design)
 
 > Status: **mixed.** The catalog semantics described in "The catalog is
-> cumulative" are **implemented** (#638, #639). Everything from "Portability"
-> onward is a **design of record** — filed as #649, #650 and #651, none of it
-> built. File and type references were verified against the code at writing time.
+> cumulative", and the prompt rules for following a skill, are **implemented**
+> (#638, #639, #1156). Everything from "Portability" onward is a **design of
+> record** — filed as #649, #650 and #651, none of it built. File and type
+> references were verified against the code at writing time.
 
 Companion to `skill-library-and-workflows.md`, which covers what a skill *is* and
 how it is indexed. This one covers what happens when a skill has to actually run
@@ -101,11 +102,33 @@ scans `~/.agents/skills`, `~/.claude/skills`, `~/.codex/skills` and
 that teach how to do something *with the harness itself* name tools, commands and
 UI that do not exist here.
 
-The prompt used to say to read a skill body and "follow them as authoritative",
-full stop. It now scopes that authority to intent rather than mechanics, and
-directs translation over replay: keep the goal, the ordering and the domain
-steps; substitute local tools; drop steps with no counterpart; say so and work
-from first principles when a skill is really about another tool's internals.
+The prompt used to say to read a skill body and follow it as authoritative, full
+stop. It now scopes that authority to intent rather than mechanics, and directs
+translation over replay: keep the goal, the ordering and the domain steps;
+substitute local tools; drop steps with no counterpart; say so and work from
+first principles when a skill is really about another tool's internals.
+
+## A surfaced skill is a candidate, not an instruction
+
+*Implemented: #1156.*
+
+Retrieval matches on similarity, and similarity is not applicability. The
+asymmetry that sets the bar: a wrongly recalled fact is noise the model ignores
+for a few tokens, but a wrongly followed procedure *acts*, with steps that were
+right for the situation it was written for. The risk grows as the library fills
+and as skills are put in front of the model unasked.
+
+So the prompt directs a fit check before a skill is followed — what it is for,
+what it is not for, what it assumes is already true. A near-miss is named and
+adapted to on purpose rather than silently, because the part that did not fit is
+the axis along which the skill wants generalizing.
+
+The same section states the granularity balance, in both directions:
+near-duplicate skills split the evidence of use and compete for one attention
+budget, while a skill with a branch at every step can never say when it applies.
+The test between them is whether one set of steps serves both cases once what
+varies is a parameter. Generalization is earned at the third recurrence, matching
+the rule this repository already applies to code abstractions.
 
 ## Portability: the bundle store
 
