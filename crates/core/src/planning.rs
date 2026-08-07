@@ -5,16 +5,26 @@
 //! step turns out to need its own sub-plan — open nested sub-steps. As each
 //! step finishes, the *gist* of what was learned is jotted to the scratchpad
 //! and the verbose raw work (tool results) is **dropped from working
-//! context**, replaced by a short searchable pointer to the note. The plan
+//! context**, read instead as a short searchable pointer to the note. The plan
 //! itself stays cheaply in view; the firehose does not.
+//!
+//! Dropped from working context means exactly that. The pointer goes in the
+//! turn's context projection and the conversation's stored transcript keeps the
+//! raw output, so a user still finds what a tool returned. The projection lives
+//! for one turn, so the saving is a within-turn one: a later turn loads the raw
+//! results again and pays for them until windowing and the rolling summary
+//! carry them out of view. Making the saving last across turns needs the
+//! eviction DECISION recorded on the row - the note key the result was
+//! distilled into - so the next turn can rebuild the projection without
+//! reading back what it replaced.
 //!
 //! This module is the pure mechanism behind that behaviour:
 //!
 //! - `StepStack` — a per-turn stack of `StepFrame`s. `begin` pushes a
 //!   frame and auto-assigns a dotted path from stack depth + a per-frame child
 //!   counter (step 1 → 1.1, 1.2, …; 1.2 → 1.2.1 … 1.2.6). `complete` pops it.
-//! - `evict_tool_results` — replaces the content of sizeable `Role::Tool`
-//!   messages in a scope with a pointer to the scratchpad note that distilled
+//! - `evict_tool_results` — makes the turn read every sizeable `Role::Tool`
+//!   message in a scope as a pointer to the scratchpad note that distilled
 //!   them, **preserving role + `tool_call_id`** so provider ToolUse↔ToolResult
 //!   pairing stays valid (Bedrock/Ollama). Idempotent and structure-preserving.
 //! - `render_plan` — renders the open todos as a compact indented tree for
@@ -24,9 +34,10 @@
 //!   MCP/builtin-executor tools, because only the loop owns `conv.messages`).
 //!
 //! The async orchestration (writing the todo/outcome notes through the wired
-//! scratchpad closures, then mutating `conv.messages`) lives in the service
+//! scratchpad closures, then projecting the scope) lives in the service
 //! dispatch loop; everything here is synchronous and unit-tested in isolation.
 
+use crate::context::ContextProjection;
 use crate::domain::{Message, Role, ToolDefinition};
 use crate::ports::scratchpad::{NOTE_KEY_MAX_CHARS, SCRATCHPAD_GOAL_KEY};
 
@@ -183,16 +194,6 @@ impl StepStack {
             })
             .collect()
     }
-
-    /// Drop every frame. Called by the dispatch loop after overflow recovery,
-    /// which can drain messages and invalidate the absolute watermarks. The
-    /// root counter is intentionally preserved: the todos written before the
-    /// clear still live on the scratchpad, so a fresh step must keep advancing
-    /// the numbering rather than reuse a key (e.g. `"1"`) that would clobber an
-    /// existing todo via upsert.
-    pub fn clear(&mut self) {
-        self.frames.clear();
-    }
 }
 
 /// Compose a child owner-path from a parent's own `owner_todo` and a step key:
@@ -234,9 +235,10 @@ pub(crate) fn truncate_on_char_boundary(s: &str, max_bytes: usize) -> String {
     s[..cut].to_string()
 }
 
-/// Build the pointer that replaces an evicted tool result. Addressed to the
-/// model so it knows the detail still exists (in the named note, or via a
-/// re-run) and was removed only to keep the turn lean.
+/// Build the pointer the turn reads in place of an evicted tool result.
+/// Addressed to the model, so it knows the detail still exists - in the named
+/// note, or a re-run away - and left the turn only to keep it lean. The
+/// conversation's stored transcript is unaffected either way.
 pub(crate) fn compaction_pointer(tool_name: Option<&str>, note_keys: &[String]) -> String {
     let ran = match tool_name {
         Some(n) if !n.is_empty() => format!(" (ran {n})"),
@@ -261,56 +263,60 @@ pub(crate) fn compaction_pointer(tool_name: Option<&str>, note_keys: &[String]) 
     )
 }
 
-/// Replace the content of every sizeable `Role::Tool` message in
-/// `messages[from..]` with a [`compaction_pointer`], freeing context while
+/// Read every sizeable `Role::Tool` message in `messages[from..]` as a
+/// [`compaction_pointer`] for the rest of the turn, freeing context while
 /// leaving the message structure (role + `tool_call_id`) intact so provider
 /// tool-call/result pairing is never broken.
 ///
 /// Returns `(results_evicted, bytes_freed)`.
 ///
-/// Idempotent: results already bearing a pointer are skipped. `from` is
-/// clamped to the slice length. Only the rare overflow-recovery path drains
-/// messages mid-turn, and it drains from the left — shifting absolute
-/// watermarks so this *under*-evicts (safe) rather than over-evicts; the
-/// dispatch loop additionally clears the step stack on overflow recovery, so
-/// a stale watermark never reaches here.
+/// The pointer goes in the round's projection, not in `messages`. The raw
+/// output stays in the conversation's stored transcript, so a user who opens
+/// the conversation later still finds what the tool returned, whether or not
+/// the distilling note was written.
+///
+/// Idempotent: results the round already reads as a pointer are skipped.
+/// `from` is clamped to the slice length. No path removes messages mid-turn,
+/// so an absolute watermark taken when a step opened still points at the same
+/// message when the step closes.
 pub(crate) fn evict_tool_results(
-    messages: &mut [Message],
+    messages: &[Message],
+    projection: &mut ContextProjection,
     from: usize,
     note_keys: &[String],
 ) -> (usize, usize) {
     let from = from.min(messages.len());
 
     // Map each tool_call_id to the tool that produced it, from the assistant
-    // tool-call requests, so the pointer can name what ran. Owned to avoid
-    // holding an immutable borrow across the mutation below.
-    let mut names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    // tool-call requests, so the pointer can name what ran.
+    let mut names: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
     for m in messages.iter() {
         if m.role == Role::Assistant {
             for tc in &m.tool_calls {
-                names.insert(tc.id.clone(), tc.name.clone());
+                names.insert(tc.id.as_str(), tc.name.as_str());
             }
         }
     }
 
     let mut evicted = 0usize;
     let mut freed = 0usize;
-    for m in messages[from..].iter_mut() {
-        if m.role != Role::Tool || m.content.len() < COMPACTION_MIN_EVICT_BYTES {
+    for m in &messages[from..] {
+        let current = projection.content(m);
+        if m.role != Role::Tool || current.len() < COMPACTION_MIN_EVICT_BYTES {
             continue;
         }
-        if m.content.starts_with(COMPACTION_POINTER_PREFIX) {
+        if current.starts_with(COMPACTION_POINTER_PREFIX) {
             continue; // already compacted by an inner step
         }
         let tool_name = m
             .tool_call_id
             .as_deref()
             .and_then(|id| names.get(id))
-            .map(String::as_str);
+            .copied();
         let pointer = compaction_pointer(tool_name, note_keys);
-        freed += m.content.len().saturating_sub(pointer.len());
+        freed += current.len().saturating_sub(pointer.len());
         evicted += 1;
-        m.content = pointer;
+        projection.replace(m, pointer);
     }
     (evicted, freed)
 }
@@ -1037,19 +1043,6 @@ mod tests {
         assert!(stack.complete().is_none());
     }
 
-    #[test]
-    fn clear_drops_frames_but_preserves_numbering() {
-        let mut stack = StepStack::new();
-        stack.begin("a", 0);
-        stack.begin("b", 1);
-        stack.clear();
-        assert_eq!(stack.depth(), 0);
-        // Numbering does NOT reset: a fresh step after a clear must not reuse a
-        // key (e.g. "1") that an earlier, still-persisted todo already owns.
-        let (k, _) = stack.begin("c", 2);
-        assert_eq!(k, "2");
-    }
-
     // --- DA-7: seed root_counter from existing top-level keys ---
 
     #[test]
@@ -1097,31 +1090,83 @@ mod tests {
     #[test]
     fn evict_shrinks_large_results_preserving_pairing() {
         let big = "x".repeat(5000);
-        let mut messages = vec![
+        let messages = vec![
             Message::new(Role::User, "do it"),
             Message::assistant_with_tool_calls(vec![ToolCall::new("c1", "weather_forecast", "{}")]),
             tool_msg("c1", &big),
         ];
         let keys = vec!["outcome:1".to_string()];
-        let (evicted, freed) = evict_tool_results(&mut messages, 1, &keys);
+        let mut projection = ContextProjection::default();
+        let (evicted, freed) = evict_tool_results(&messages, &mut projection, 1, &keys);
         assert_eq!(evicted, 1);
         assert!(freed > 4000);
         // Structure preserved: still a Tool message with its tool_call_id.
         assert_eq!(messages[2].role, Role::Tool);
         assert_eq!(messages[2].tool_call_id.as_deref(), Some("c1"));
-        // Content is now the pointer, naming the tool and the note.
-        assert!(messages[2].content.starts_with(COMPACTION_POINTER_PREFIX));
-        assert!(messages[2].content.contains("weather_forecast"));
-        assert!(messages[2].content.contains("outcome:1"));
+        // The turn now reads the pointer, naming the tool and the note.
+        let projected = projection.content(&messages[2]);
+        assert!(projected.starts_with(COMPACTION_POINTER_PREFIX));
+        assert!(projected.contains("weather_forecast"));
+        assert!(projected.contains("outcome:1"));
         // The assistant tool-call request is untouched.
         assert_eq!(messages[1].role, Role::Assistant);
         assert_eq!(messages[1].tool_calls.len(), 1);
     }
 
+    /// #798: the raw tool output is the conversation's observation layer. It
+    /// stays in the stored transcript however the turn chooses to read it.
+    #[test]
+    fn evicting_a_result_leaves_the_stored_transcript_unchanged() {
+        let big = "x".repeat(5000);
+        let messages = vec![
+            Message::assistant_with_tool_calls(vec![ToolCall::new("c1", "read_file", "{}")]),
+            tool_msg("c1", &big),
+        ];
+        let before = messages.clone();
+        let mut projection = ContextProjection::default();
+        let (evicted, _) =
+            evict_tool_results(&messages, &mut projection, 0, &["outcome:1".to_string()]);
+
+        assert_eq!(evicted, 1, "the result still leaves the turn's view");
+        assert_eq!(
+            messages, before,
+            "eviction must not write to the stored transcript"
+        );
+        assert_eq!(
+            messages[1].content, big,
+            "the raw output must survive in the record"
+        );
+    }
+
+    /// #798: a step completed with no outcome, or whose note write failed,
+    /// carries no distilled trace. Neither may cost the raw output.
+    #[test]
+    fn evicting_with_no_carry_forward_note_still_keeps_the_raw_output() {
+        let big = "x".repeat(5000);
+        let messages = vec![
+            Message::assistant_with_tool_calls(vec![ToolCall::new("c1", "read_file", "{}")]),
+            tool_msg("c1", &big),
+        ];
+        let mut projection = ContextProjection::default();
+        let (evicted, _) = evict_tool_results(&messages, &mut projection, 0, &[]);
+
+        assert_eq!(evicted, 1);
+        assert!(
+            projection
+                .content(&messages[1])
+                .contains("no carry-forward"),
+            "the model is told there is no note"
+        );
+        assert_eq!(
+            messages[1].content, big,
+            "with no note to carry it forward, the record is the only copy left"
+        );
+    }
+
     #[test]
     fn evict_skips_small_and_already_compacted_results() {
         let big = "y".repeat(5000);
-        let mut messages = vec![
+        let messages = vec![
             Message::assistant_with_tool_calls(vec![
                 ToolCall::new("c1", "t", "{}"),
                 ToolCall::new("c2", "t", "{}"),
@@ -1130,20 +1175,22 @@ mod tests {
             tool_msg("c2", &big),
         ];
         let keys = vec!["k".to_string()];
-        let (evicted, _) = evict_tool_results(&mut messages, 0, &keys);
+        let mut projection = ContextProjection::default();
+        let (evicted, _) = evict_tool_results(&messages, &mut projection, 0, &keys);
         assert_eq!(evicted, 1); // only the big one
-        assert_eq!(messages[1].content, "tiny");
+        assert_eq!(projection.content(&messages[1]), "tiny");
 
         // Second pass over the same range is a no-op (idempotent).
-        let (evicted2, freed2) = evict_tool_results(&mut messages, 0, &keys);
+        let (evicted2, freed2) = evict_tool_results(&messages, &mut projection, 0, &keys);
         assert_eq!(evicted2, 0);
         assert_eq!(freed2, 0);
     }
 
     #[test]
     fn evict_clamps_out_of_range_watermark() {
-        let mut messages = vec![Message::new(Role::User, "hi")];
-        let (evicted, freed) = evict_tool_results(&mut messages, 99, &[]);
+        let messages = vec![Message::new(Role::User, "hi")];
+        let mut projection = ContextProjection::default();
+        let (evicted, freed) = evict_tool_results(&messages, &mut projection, 99, &[]);
         assert_eq!((evicted, freed), (0, 0));
     }
 

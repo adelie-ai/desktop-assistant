@@ -62,6 +62,11 @@ impl ToolUsageStore for PgToolUsageStore {
         // deliberate constant shared with the compaction code rather than a
         // literal duplicated here — so a reworded pointer can't silently stop
         // being recognised and quietly zero the eviction column.
+        //
+        // Compaction shapes the turn's view and leaves the stored transcript
+        // alone, so nothing writes a pointer to a row now. What this matches is
+        // history: conversations compacted by an earlier version, whose result
+        // rows still hold a pointer instead of the tool's output.
         let evicted_like = format!("{COMPACTION_POINTER_PREFIX}%");
         let rows: Vec<ToolUsageRow> = sqlx::query_as(
             // Calls and results are aggregated SEPARATELY and then joined, so a

@@ -1069,9 +1069,11 @@ pub struct ToolUsageView {
     /// Largest single resident result — distinguishes a steady trickle from one
     /// enormous dump.
     pub max_result_bytes: u64,
-    /// Results compacted away to the scratchpad. Their original size is NOT
-    /// recoverable, so a non-zero count means `result_bytes` under-reports what
-    /// this tool actually cost (see #675).
+    /// Stored results whose content is a compaction pointer rather than the
+    /// tool's own output. Compaction now shapes the model's view and leaves the
+    /// stored transcript alone, so this counts conversations compacted by an
+    /// earlier version. Their original size is NOT recoverable, so a non-zero
+    /// count means `result_bytes` under-reports what this tool actually cost.
     pub evicted_results: u32,
     /// Message ordinals of the first and last call, so a client can navigate to
     /// where the tool entered the conversation.

@@ -2806,13 +2806,27 @@ async fn main() -> Result<()> {
         .unwrap_or(true);
     match (recall_enabled, &kb_store, &pg_pool, embedding_fn.as_ref()) {
         (true, Some(kb), Some(pool), Some(embed)) => {
+            // How many knowledge lines the block shows. Absent from the config
+            // means the built-in default; a stated width is held to what the
+            // lookup actually reads. Once, here, before the first turn: the
+            // block renders deep inside context assembly, which carries no
+            // configuration of its own.
+            let entry_lines = match daemon_config.as_ref().and_then(|c| c.recall.max_entries) {
+                Some(configured) => {
+                    desktop_assistant_core::recall::set_max_recall_entries(configured)
+                }
+                None => desktop_assistant_core::recall::max_recall_entries(),
+            };
             handler = handler.with_recall_search(recall::build_recall_search(
                 Arc::clone(kb),
                 pool.clone(),
                 Arc::clone(embed),
                 embedding_model_id.clone(),
             ));
-            tracing::info!("pre-prompt recall wired: prompts are looked up against memory");
+            tracing::info!(
+                entry_lines,
+                "pre-prompt recall wired: prompts are looked up against memory"
+            );
         }
         (false, _, _, _) => tracing::info!("pre-prompt recall disabled by configuration"),
         (true, None, _, _) | (true, _, None, _) => {

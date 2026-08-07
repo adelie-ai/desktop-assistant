@@ -24,10 +24,16 @@
 //! ## What bounds it
 //!
 //! - **A relevance floor, not a top-k.** A candidate under the floor is
-//!   dropped rather than padded out to fill the budget, so "thanks" and "run
-//!   the tests" produce no block at all.
-//! - **A line budget.** [`MAX_RECALL_ENTRIES`] entry lines,
-//!   [`MAX_RECALL_NOTES`] note lines and [`MAX_RECALL_TAGS`] tag names.
+//!   dropped rather than padded out to fill the budget, so a prompt with
+//!   nothing near it produces no block at all. How near is near enough is the
+//!   floor's own question, and how well the current floor answers it is #1121's
+//!   (the entry floor admits more than a prompt of no content should reach).
+//! - **A line budget, derived from a token budget.**
+//!   [`RECALL_BLOCK_TOKEN_BUDGET`] pays for [`BUDGETED_MAX_RECALL_ENTRIES`]
+//!   entry lines, [`MAX_RECALL_NOTES`] note lines and [`MAX_RECALL_TAGS`] tag
+//!   names. The entry arm ships narrower than the budget pays for, at
+//!   [`DEFAULT_MAX_RECALL_ENTRIES`], until #1121 gates what the floor admits.
+//!   A deployment may state its own width.
 //! - **Nothing already in view.** A note `[Pinned]` renders in full, a key the
 //!   `[Scratchpad]` index has just listed, a step or finding `[Plan]` has just
 //!   named, and a knowledge entry a pin attaches (#1104) are all dropped here.
@@ -40,9 +46,10 @@
 //!
 //! ## Saying what did not fit
 //!
-//! A model that sees eight entries cannot tell whether the store holds exactly
-//! eight relevant things or four hundred, and those call for different next
-//! moves. So the block reports how many cleared the floor and did not fit.
+//! A model that sees the lines the block had room for cannot tell whether the
+//! store holds exactly that many relevant things or four hundred, and those
+//! call for different next moves. So the block reports how many cleared the
+//! floor and did not fit.
 //!
 //! That count means something only because the floor defines it. Over a hybrid
 //! search every row scores non-zero against any query, so "how many matched" is
@@ -50,19 +57,175 @@
 //! [`RECALL_ENTRY_SCAN_LIMIT`] (and [`RECALL_NOTE_SCAN_LIMIT`]) and no further,
 //! so when a scan fills up the count is a lower bound and says so.
 
+use std::sync::OnceLock;
+
 use crate::ports::recall::{RecallCandidates, RecallEntry, RecallNote};
 use crate::ports::scratchpad::NOTE_KEY_MAX_CHARS;
 
-/// How many knowledge lines the block may show.
+/// The token budget for the whole `[Recall]` block, worst case.
 ///
-/// Every part of a line is bounded - the id by [`RECALL_ID_MAX_CHARS`], the
-/// tags by [`RECALL_TAGS_MAX_CHARS`], and the summary by
-/// [`crate::domain::knowledge::SUMMARY_MAX_CHARS`] - so the entry half of the
-/// block cannot exceed about 3200 characters however long the entries
-/// themselves are. Real entries carry a short id and a few tags, so the usual
-/// cost is far below that, which is what keeps the whole block near its
-/// 300-token budget.
-pub const MAX_RECALL_ENTRIES: usize = 8;
+/// The block renders once per turn, on the first round only, and the model is
+/// told it may ignore it. 2,560 tokens is two percent of a 128,000-token
+/// window - the smaller of the two window sizes the models this daemon drives
+/// usually carry - which is what a hint of that kind is worth: enough for an
+/// index the model can scan, and not enough to compete with the work.
+///
+/// A deployment whose model carries a smaller window buys fewer lines with the
+/// same share of it, so the width is configurable - see
+/// [`set_max_recall_entries`].
+pub const RECALL_BLOCK_TOKEN_BUDGET: usize = 2_560;
+
+/// Bytes to a token: the rule the context budget itself counts by
+/// ([`crate::ports::tool_usage::estimate_tokens`]).
+///
+/// **Bytes, not characters, and the difference is the whole point.** The
+/// per-part bounds below (`RECALL_ID_MAX_CHARS` and the rest) are stated in
+/// characters, because their job is to make one physical line of a value that
+/// might carry a newline. A character bound says nothing about cost: nothing
+/// restricts an id, a tag or a model-written summary to ASCII, and four bytes
+/// to the character is a real case, so a line inside its character bounds can
+/// carry four times the bytes the block is charged for. Every bound the budget
+/// rests on is therefore a byte bound, and `bounded_bytes` holds each rendered
+/// line to it.
+const RECALL_BYTES_PER_TOKEN: usize = 4;
+
+/// [`RECALL_BLOCK_TOKEN_BUDGET`] in the bytes the bounds are stated in.
+const RECALL_BLOCK_MAX_BYTES: usize = RECALL_BLOCK_TOKEN_BUDGET * RECALL_BYTES_PER_TOKEN;
+
+/// What `crate::context` puts in front of the body, and the model pays for.
+const RECALL_BLOCK_PREFIX_BYTES: usize = "[Recall] ".len();
+
+/// What one knowledge line may cost, in bytes, its newline apart.
+///
+/// The shape is `"- " + id + " [" + tags + "] " + summary`, and the figure is
+/// the sum of the parts' own bounds read as bytes. An all-ASCII line is inside
+/// it already, so the usual line is untouched; a line of multi-byte text is cut
+/// to it and shows fewer characters for the same cost. Real entries carry a
+/// short id and a few tags, so a real line costs a quarter of this - the width
+/// rests on the bound rather than on the average, because only the bound is a
+/// promise.
+const RECALL_ENTRY_LINE_MAX_BYTES: usize = 2
+    + RECALL_ID_MAX_CHARS
+    + 2
+    + RECALL_TAGS_MAX_BYTES
+    + 2
+    + crate::domain::knowledge::SUMMARY_MAX_CHARS;
+
+/// What one scratchpad line may cost, in bytes, its newline apart:
+/// `"- " + key + ": " + content`, at [`NOTE_KEY_MAX_CHARS`] and
+/// [`RECALL_NOTE_MAX_CHARS`] read as bytes.
+const RECALL_NOTE_LINE_MAX_BYTES: usize = 2 + NOTE_KEY_MAX_CHARS + 2 + RECALL_NOTE_MAX_CHARS;
+
+/// What one "did not fit" line costs, worst case.
+///
+/// The newline, `"...and "` (7), the digits of any `usize` (20), the hedge
+/// `" or more"` (8), a space, the longer of the two nouns - `"entries"` (7) -
+/// and `" matched less closely."` (22). Every part is ASCII, so the figure is
+/// bytes as well as characters. `dropped_line` is held to it by
+/// `the_did_not_fit_line_stays_inside_the_bound_the_budget_assumes`.
+const RECALL_DROPPED_LINE_MAX_BYTES: usize = 1 + 7 + 20 + 8 + 1 + 7 + 22;
+
+/// What the block costs before its first knowledge line, worst case: the
+/// prefix, the header and its entry hint, the entry arm's "did not fit" line,
+/// the pad label with [`MAX_RECALL_NOTES`] lines and its own "did not fit"
+/// line, and the tag label with a full tag line.
+const RECALL_FIXED_MAX_BYTES: usize = RECALL_BLOCK_PREFIX_BYTES
+    + RECALL_HEADER.len()
+    + 1
+    + RECALL_ENTRY_HINT.len()
+    + RECALL_DROPPED_LINE_MAX_BYTES
+    + 1
+    + RECALL_NOTE_LABEL.len()
+    + MAX_RECALL_NOTES * (1 + RECALL_NOTE_LINE_MAX_BYTES)
+    + RECALL_DROPPED_LINE_MAX_BYTES
+    + 1
+    + RECALL_TAG_LABEL.len()
+    + 1
+    + RECALL_TAG_LINE_MAX_BYTES;
+
+/// How many knowledge lines [`RECALL_BLOCK_TOKEN_BUDGET`] pays for, once the
+/// fixed part of the block is taken.
+///
+/// The width is the quotient, not a chosen number. Eight was the right width
+/// for a block that injected entry bodies; this block injects none, so the
+/// budget buys an index instead of a handful of extracts. Breadth is the point:
+/// a title the model can see but has not opened still says that something
+/// exists, and an entry that never appears cannot be asked for.
+///
+/// This is not what ships today - see [`DEFAULT_MAX_RECALL_ENTRIES`].
+pub const BUDGETED_MAX_RECALL_ENTRIES: usize =
+    (RECALL_BLOCK_MAX_BYTES - RECALL_FIXED_MAX_BYTES) / (1 + RECALL_ENTRY_LINE_MAX_BYTES);
+
+/// How many knowledge lines the block shows where a deployment states nothing.
+///
+/// **The budget derives [`BUDGETED_MAX_RECALL_ENTRIES`], and the default is
+/// held below it on purpose.** Eight is not what the arithmetic computed; it is
+/// the width that was already shipping.
+///
+/// Why it is held there: [`RECALL_ENTRY_MAX_DISTANCE`] admits candidates for a
+/// prompt that asks nothing - an acknowledgement, or "continue" - so the number
+/// of lines is also the number of unrelated memories such a prompt puts in
+/// front of the model. Widening the block before that floor has an admission
+/// gate would multiply the noise case rather than the recall case, and a
+/// deployment would meet the regression before anyone measured it.
+///
+/// #1121 grades the width from the prompt's own signal, which turns this
+/// constant into a safety cap rather than the mechanism, and sets it to
+/// [`BUDGETED_MAX_RECALL_ENTRIES`]: a cap exists to protect the token budget, so
+/// the budget's own figure is the value it wants.
+///
+/// A deployment that wants the wider index now sets it - see
+/// [`set_max_recall_entries`].
+pub const DEFAULT_MAX_RECALL_ENTRIES: usize = 8;
+
+/// The width this deployment renders: [`DEFAULT_MAX_RECALL_ENTRIES`] until
+/// [`set_max_recall_entries`] installs another.
+pub fn max_recall_entries() -> usize {
+    CONFIGURED_MAX_RECALL_ENTRIES
+        .get()
+        .copied()
+        .unwrap_or(DEFAULT_MAX_RECALL_ENTRIES)
+}
+
+/// Install the width this deployment configured, and answer with the width that
+/// took effect.
+///
+/// Once, at startup, before the first turn. The block is rendered deep inside
+/// context assembly, which carries no configuration of its own, and the width
+/// is one number for the whole daemon rather than one per turn. A later call
+/// keeps the live value and says so: a width that moved under a running turn
+/// would leave that turn's "and N more" count disagreeing with the lines above
+/// it.
+pub fn set_max_recall_entries(width: usize) -> usize {
+    let wanted = resolve_max_recall_entries(width);
+    match CONFIGURED_MAX_RECALL_ENTRIES.set(wanted) {
+        Ok(()) => wanted,
+        Err(_) => {
+            let live = max_recall_entries();
+            tracing::warn!(
+                wanted,
+                live,
+                "the recall width is already set for this process; keeping the live value"
+            );
+            live
+        }
+    }
+}
+
+/// Hold a configured width to what the block can honestly render.
+///
+/// At least one line, because a block that showed none of what it found would
+/// report every hit as a hit that did not fit. At most
+/// [`RECALL_ENTRY_SCAN_LIMIT`] lines, because the lookup reads that far and no
+/// further: a wider block would show lines the scan never read, and count a
+/// tail that does not exist.
+pub fn resolve_max_recall_entries(width: usize) -> usize {
+    width.clamp(1, RECALL_ENTRY_SCAN_LIMIT)
+}
+
+/// The width a deployment installed, if it installed one. See
+/// [`set_max_recall_entries`].
+static CONFIGURED_MAX_RECALL_ENTRIES: OnceLock<usize> = OnceLock::new();
 
 /// How much of an entry id a line may spend.
 ///
@@ -77,16 +240,19 @@ pub const RECALL_ID_MAX_CHARS: usize = 64;
 /// Tags are normalised and cannot carry whitespace, but nothing bounds how many
 /// an entry may hold, and the list is a decoration on a line whose subject is
 /// the summary.
-pub const RECALL_TAGS_MAX_CHARS: usize = 120;
+///
+/// In bytes, because that is the unit [`RECALL_BLOCK_TOKEN_BUDGET`] is stated
+/// in and a tag name may be in any script.
+pub const RECALL_TAGS_MAX_BYTES: usize = 120;
 
-/// How much of the block's tag line the tag names may spend.
+/// How much of the block's tag line the tag names may spend, in bytes.
 ///
 /// A registry name is `TEXT` with no length cap and no truncation on the write
 /// path, so five of them is a bound on the count and not on the size.
-pub const RECALL_TAG_LINE_MAX_CHARS: usize = 240;
+pub const RECALL_TAG_LINE_MAX_BYTES: usize = 240;
 
 /// How many tag names the block may show, before
-/// [`RECALL_TAG_LINE_MAX_CHARS`] takes whichever of them fit.
+/// [`RECALL_TAG_LINE_MAX_BYTES`] takes whichever of them fit.
 ///
 /// Names only, and few of them: the arm exists to hand the model this user's
 /// working vocabulary before its first search, not to list the vocabulary.
@@ -94,7 +260,7 @@ pub const MAX_RECALL_TAGS: usize = 5;
 
 /// How many knowledge rows one lookup reads before it stops counting.
 ///
-/// The block shows [`MAX_RECALL_ENTRIES`]; it reads this far so that "and N
+/// The block shows [`max_recall_entries`]; it reads this far so that "and N
 /// more matched less closely" is a count rather than a guess. Bounding it costs
 /// one `LIMIT` rather than a second query, and a scan that fills up makes the
 /// count report itself as a lower bound.
@@ -283,6 +449,12 @@ impl<'a> RecallSurface<'a> {
 /// first - and is never reordered: a cosine distance and a lexical match are
 /// not comparable, and one lookup only ever produces one of the two.
 pub(crate) fn render_recall(surface: &RecallSurface<'_>) -> Option<String> {
+    render_recall_with_width(surface, max_recall_entries())
+}
+
+/// [`render_recall`] at a stated width, so the width can be varied without
+/// varying the deployment's own setting.
+fn render_recall_with_width(surface: &RecallSurface<'_>, max_entries: usize) -> Option<String> {
     let candidates = surface.candidates;
 
     let above_floor: Vec<&RecallEntry> = candidates
@@ -361,7 +533,7 @@ pub(crate) fn render_recall(surface: &RecallSurface<'_>) -> Option<String> {
         .take(MAX_RECALL_TAGS)
         .map(|tag| tag.name.as_str())
         .collect();
-    let tags = tag_list(&near_tags, RECALL_TAG_LINE_MAX_CHARS);
+    let tags = tag_list(&near_tags, RECALL_TAG_LINE_MAX_BYTES);
 
     if showable.is_empty() && showable_notes.is_empty() && tags.is_empty() {
         return None;
@@ -373,12 +545,12 @@ pub(crate) fn render_recall(surface: &RecallSurface<'_>) -> Option<String> {
         block.push_str(RECALL_ENTRY_HINT);
     }
 
-    for (hit, line) in showable.iter().take(MAX_RECALL_ENTRIES) {
+    for (hit, line) in showable.iter().take(max_entries) {
         block.push('\n');
         block.push_str(&entry_line(hit, line));
     }
 
-    let dropped = showable.len().saturating_sub(MAX_RECALL_ENTRIES);
+    let dropped = showable.len().saturating_sub(max_entries);
     if let Some(line) = dropped_line(dropped, capped, "entries") {
         block.push('\n');
         block.push_str(&line);
@@ -419,20 +591,24 @@ fn contains(values: &[String], wanted: &str) -> bool {
     values.iter().any(|value| value == wanted)
 }
 
-/// Join tag names into at most `max_chars` characters, taking whole names.
+/// Join tag names into at most `max_bytes` bytes, taking whole names.
 ///
 /// A name is never cut. Half a tag name is a tag no row carries, and the model
 /// is being handed this list precisely so it can search on one - so a name that
 /// does not fit is left out instead. Empty when the first name alone is too
 /// long, which is the honest answer for a vocabulary this block cannot show.
 ///
+/// Bytes rather than characters, because a name may be in any script and the
+/// block's budget is stated in bytes. This is the one part of a line that
+/// [`bounded_bytes`] must not cut, so it bounds itself.
+///
 /// Normalisation already guarantees a name carries no whitespace, so only the
 /// size needs bounding here, never the shape.
-fn tag_list(names: &[&str], max_chars: usize) -> String {
+fn tag_list(names: &[&str], max_bytes: usize) -> String {
     let mut out = String::new();
     for name in names {
         let separator = if out.is_empty() { 0 } else { 2 };
-        if out.chars().count() + separator + name.chars().count() > max_chars {
+        if out.len() + separator + name.len() > max_bytes {
             break;
         }
         if !out.is_empty() {
@@ -440,6 +616,44 @@ fn tag_list(names: &[&str], max_chars: usize) -> String {
         }
         out.push_str(name);
     }
+    out
+}
+
+/// Hold a rendered line to `max_bytes`, cutting on a character boundary.
+///
+/// The per-part bounds a line is built from are stated in characters, and a
+/// character is one to four bytes. The block's budget is stated in bytes,
+/// because that is what the model is charged. So a line that is inside its
+/// character bounds can still be four times the size the budget allowed it, and
+/// this is where that is settled.
+///
+/// A line that had to lose anything ends in the same `...` a truncated value
+/// carries, so a cut line never reads as a whole one. An all-ASCII line is
+/// already inside the bound and passes through untouched, which is every real
+/// line; the cut is what keeps a line of another script honest rather than what
+/// shapes the usual one.
+fn bounded_bytes(line: String, max_bytes: usize) -> String {
+    if line.len() <= max_bytes {
+        return line;
+    }
+    const MARKER: &str = "...";
+    // A bound too small to hold the marker cannot carry it. The bound wins: a
+    // line that overran it to announce the cut would defeat the point of it.
+    let keep = if max_bytes < MARKER.len() {
+        max_bytes
+    } else {
+        max_bytes - MARKER.len()
+    };
+    let mut end = keep;
+    while end > 0 && !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    if max_bytes < MARKER.len() {
+        return line[..end].to_string();
+    }
+    let mut out = String::with_capacity(end + MARKER.len());
+    out.push_str(&line[..end]);
+    out.push_str(MARKER);
     out
 }
 
@@ -468,17 +682,18 @@ fn bounded(value: &str, max_chars: usize) -> String {
 /// an entry for the lack of a summary.
 fn entry_line(hit: &RecallEntry, line: &str) -> String {
     let id = bounded(&hit.entry.id, RECALL_ID_MAX_CHARS);
-    if hit.entry.tags.is_empty() {
+    let rendered = if hit.entry.tags.is_empty() {
         format!("- {id} {line}")
     } else {
         let names: Vec<&str> = hit.entry.tags.iter().map(String::as_str).collect();
-        let tags = tag_list(&names, RECALL_TAGS_MAX_CHARS);
+        let tags = tag_list(&names, RECALL_TAGS_MAX_BYTES);
         if tags.is_empty() {
             format!("- {id} {line}")
         } else {
             format!("- {id} [{tags}] {line}")
         }
-    }
+    };
+    bounded_bytes(rendered, RECALL_ENTRY_LINE_MAX_BYTES)
 }
 
 /// One scratchpad line: the note's key, then the start of what it says.
@@ -501,11 +716,12 @@ fn note_line(note: &RecallNote) -> Option<String> {
         return None;
     }
     let content = bounded(&note.content, RECALL_NOTE_MAX_CHARS);
-    if content.is_empty() {
-        Some(format!("- {key}"))
+    let rendered = if content.is_empty() {
+        format!("- {key}")
     } else {
-        Some(format!("- {key}: {content}"))
-    }
+        format!("- {key}: {content}")
+    };
+    Some(bounded_bytes(rendered, RECALL_NOTE_LINE_MAX_BYTES))
 }
 
 /// The "did not fit" line for one arm, or `None` when nothing was dropped.
@@ -595,11 +811,16 @@ mod tests {
     /// Render with nothing else in view - the ordinary turn, and what every
     /// test that is not about dedupe wants.
     fn render(candidates: &RecallCandidates) -> Option<String> {
-        render_recall(&RecallSurface::new(
-            candidates,
-            RECALL_ENTRY_SCAN_LIMIT,
-            RECALL_NOTE_SCAN_LIMIT,
-        ))
+        render_at(candidates, DEFAULT_MAX_RECALL_ENTRIES)
+    }
+
+    /// The same, at a stated width. Every test states the width it means, so no
+    /// test depends on what a deployment happened to configure.
+    fn render_at(candidates: &RecallCandidates, max_entries: usize) -> Option<String> {
+        render_recall_with_width(
+            &RecallSurface::new(candidates, RECALL_ENTRY_SCAN_LIMIT, RECALL_NOTE_SCAN_LIMIT),
+            max_entries,
+        )
     }
 
     /// Render against a turn that already shows something: the note keys the
@@ -619,9 +840,10 @@ mod tests {
         planned_keys: &[String],
         pinned_entry_ids: &[String],
     ) -> Option<String> {
-        render_recall(
+        render_recall_with_width(
             &RecallSurface::new(candidates, RECALL_ENTRY_SCAN_LIMIT, RECALL_NOTE_SCAN_LIMIT)
                 .already_in_view(indexed_keys, planned_keys, pinned_entry_ids),
+            DEFAULT_MAX_RECALL_ENTRIES,
         )
     }
 
@@ -641,6 +863,407 @@ mod tests {
             .skip_while(|l| !l.starts_with(RECALL_NOTE_LABEL))
             .filter(|l| l.starts_with("- "))
             .collect()
+    }
+
+    // --- The width, and the token budget it comes from (#1124) --------------
+
+    /// What the caller puts in front of the body. It is part of what the model
+    /// pays for, so the budget counts it.
+    const BLOCK_PREFIX: &str = "[Recall] ";
+
+    /// `n` characters with no whitespace in them, so a bounded part of a line
+    /// comes out at exactly its bound rather than shorter. One byte each.
+    fn filler(n: usize) -> String {
+        "x".repeat(n)
+    }
+
+    /// The same length in characters, four bytes each: what a summary in
+    /// another script, or an id nobody restricted, actually costs.
+    fn wide_filler(n: usize) -> String {
+        "\u{1F600}".repeat(n)
+    }
+
+    /// What the block costs the turn, counted the way the context budget counts
+    /// it (`bytes / 4`).
+    fn block_tokens(block: &str) -> usize {
+        let bytes = BLOCK_PREFIX.len() + block.len();
+        crate::ports::tool_usage::estimate_tokens(bytes as u64) as usize
+    }
+
+    /// The most expensive knowledge candidate the renderer can be handed: the
+    /// id, the tag list and the summary all at their bounds.
+    fn worst_case_hit(i: usize) -> RecallEntry {
+        let mut entry = KnowledgeEntry::new(
+            format!("{i:0>width$}", width = RECALL_ID_MAX_CHARS),
+            "a body the summary stands in for",
+            vec![filler(RECALL_TAGS_MAX_BYTES)],
+        );
+        entry.summary = Some(filler(crate::domain::knowledge::SUMMARY_MAX_CHARS));
+        RecallEntry {
+            entry,
+            relevance: RecallRelevance::Distance(0.10),
+        }
+    }
+
+    /// The most expensive block the renderer can produce at `entries` lines:
+    /// every arm full, every bounded part at its bound, and both "did not fit"
+    /// lines rendered.
+    fn worst_case_candidates(entries: usize) -> RecallCandidates {
+        RecallCandidates {
+            entries: (0..=entries).map(worst_case_hit).collect(),
+            notes: (0..=MAX_RECALL_NOTES)
+                .map(|i| {
+                    note(
+                        &format!("{i:0>width$}", width = NOTE_KEY_MAX_CHARS),
+                        &filler(RECALL_NOTE_MAX_CHARS),
+                        0.10,
+                    )
+                })
+                .collect(),
+            tags: vec![tag(&filler(RECALL_TAG_LINE_MAX_BYTES), 0.10)],
+        }
+    }
+
+    /// The same block with every value in a four-byte script, each part still
+    /// inside its own character bound. Nothing restricts an id, a tag or a
+    /// model-written summary to ASCII, so this is what the budget has to
+    /// survive.
+    fn wide_worst_case_candidates(entries: usize) -> RecallCandidates {
+        let wide_hit = |_i: usize| {
+            let mut entry = KnowledgeEntry::new(
+                wide_filler(RECALL_ID_MAX_CHARS),
+                "a body the summary stands in for",
+                // A whole name or none, so the tag bound is stated in the
+                // bytes `tag_list` counts.
+                vec![wide_filler(RECALL_TAGS_MAX_BYTES / 4)],
+            );
+            entry.summary = Some(wide_filler(crate::domain::knowledge::SUMMARY_MAX_CHARS));
+            RecallEntry {
+                entry,
+                relevance: RecallRelevance::Distance(0.10),
+            }
+        };
+        RecallCandidates {
+            entries: (0..=entries).map(wide_hit).collect(),
+            notes: (0..=MAX_RECALL_NOTES)
+                .map(|_| {
+                    note(
+                        &wide_filler(NOTE_KEY_MAX_CHARS),
+                        &wide_filler(RECALL_NOTE_MAX_CHARS),
+                        0.10,
+                    )
+                })
+                .collect(),
+            tags: vec![tag(&wide_filler(RECALL_TAG_LINE_MAX_BYTES / 4), 0.10)],
+        }
+    }
+
+    /// A block of the shape a real store produces: short ids, two or three
+    /// tags, and a distilled summary.
+    fn typical_candidates(entries: usize) -> RecallCandidates {
+        RecallCandidates {
+            entries: (0..entries)
+                .map(|i| {
+                    hit(
+                        &format!("kb-{i:04}"),
+                        "The lab cluster runs three nodes and the registry is on the storage host.",
+                        &["infra", "deploy"],
+                        0.10 + (i as f64) * 0.001,
+                    )
+                })
+                .collect(),
+            notes: (0..MAX_RECALL_NOTES)
+                .map(|i| {
+                    note(
+                        &format!("finding-{i}"),
+                        "The pool leaks a connection per cancelled turn.",
+                        0.12,
+                    )
+                })
+                .collect(),
+            tags: (0..MAX_RECALL_TAGS)
+                .map(|i| tag(&format!("topic:subject-{i}"), 0.15))
+                .collect(),
+        }
+    }
+
+    /// Acceptance (#1124): the block's total token cost stays within the stated
+    /// budget. A line-format change that inflates the block fails here.
+    ///
+    /// Both widths, because the shipped default is narrower than the budget
+    /// pays for: the budgeted width is the binding case, and the default is the
+    /// one a turn actually pays today.
+    #[test]
+    fn the_recall_block_stays_within_its_stated_token_budget() {
+        for width in [DEFAULT_MAX_RECALL_ENTRIES, BUDGETED_MAX_RECALL_ENTRIES] {
+            let block = render_at(&worst_case_candidates(width), width).expect("every arm is full");
+            let tokens = block_tokens(&block);
+
+            assert!(
+                tokens <= RECALL_BLOCK_TOKEN_BUDGET,
+                "the worst block of {width} lines costs {tokens} tokens, over the \
+                 {RECALL_BLOCK_TOKEN_BUDGET}-token budget - re-derive the width or shorten the \
+                 line"
+            );
+        }
+    }
+
+    /// The budgeted width is derived from the budget rather than chosen: one
+    /// line more does not fit inside it.
+    #[test]
+    fn the_budgeted_recall_width_is_the_widest_its_token_budget_allows() {
+        let one_wider = BUDGETED_MAX_RECALL_ENTRIES + 1;
+
+        let block =
+            render_at(&worst_case_candidates(one_wider), one_wider).expect("every arm is full");
+        let tokens = block_tokens(&block);
+
+        assert!(
+            tokens > RECALL_BLOCK_TOKEN_BUDGET,
+            "{one_wider} lines costs {tokens} tokens, still inside the \
+             {RECALL_BLOCK_TOKEN_BUDGET}-token budget - the width is narrower than the budget pays \
+             for, so re-derive it"
+        );
+    }
+
+    /// Acceptance (#1124), deferred in part: the budget pays for an index
+    /// materially wider than the eight lines a block that injected bodies could
+    /// afford, and the shipped default is held at eight until #1121 gates what
+    /// the relevance floor admits.
+    ///
+    /// The second assertion is the deferral, written down. #1121 grades the
+    /// width, leaves this constant as a safety cap, sets it to
+    /// [`BUDGETED_MAX_RECALL_ENTRIES`], and edits this test to say so. That is
+    /// the point: the flip is a deliberate act, not a drift.
+    #[test]
+    fn the_budget_pays_for_a_width_materially_wider_than_the_default_that_ships() {
+        let budgeted = BUDGETED_MAX_RECALL_ENTRIES;
+        assert!(
+            budgeted >= 16,
+            "an index of one-line summaries exists for breadth; the budget pays for {budgeted} \
+             lines, which is not materially wider than eight"
+        );
+
+        let shipped = DEFAULT_MAX_RECALL_ENTRIES;
+        assert_eq!(
+            shipped, 8,
+            "the default is held at the width that was already shipping until #1121 gates the \
+             relevance floor; raise it to {budgeted} with that gate, not before"
+        );
+    }
+
+    /// Acceptance (#1124): the width is configurable, so a deployment can tune
+    /// the budget without a rebuild.
+    #[test]
+    fn a_deployment_can_configure_the_recall_width() {
+        let configured = 12;
+        assert_eq!(
+            resolve_max_recall_entries(configured),
+            configured,
+            "a width the block can honestly render is taken as stated"
+        );
+
+        let candidates = RecallCandidates {
+            entries: near_hits(configured + 5),
+            ..RecallCandidates::default()
+        };
+        let block = render_at(&candidates, configured).expect("a block");
+
+        assert_eq!(entry_lines(&block).len(), configured);
+    }
+
+    /// Acceptance (#1124): the scan limit stays at or above the width, so "and
+    /// N more" still counts rows the lookup actually read.
+    #[test]
+    fn the_recall_scan_limit_stays_at_or_above_the_width() {
+        let scan = RECALL_ENTRY_SCAN_LIMIT;
+
+        for width in [DEFAULT_MAX_RECALL_ENTRIES, BUDGETED_MAX_RECALL_ENTRIES] {
+            assert!(
+                width <= scan,
+                "a width of {width} shows lines the {scan}-row scan never read"
+            );
+        }
+        assert_eq!(
+            resolve_max_recall_entries(RECALL_ENTRY_SCAN_LIMIT + 10),
+            RECALL_ENTRY_SCAN_LIMIT,
+            "a configured width past the scan limit would count rows the lookup never read"
+        );
+        assert_eq!(
+            resolve_max_recall_entries(0),
+            1,
+            "a block that shows none of what it found is not a block"
+        );
+    }
+
+    /// Acceptance (#1124): widening the block does not change what a single
+    /// line contains.
+    #[test]
+    fn widening_the_block_does_not_change_what_a_line_contains() {
+        let narrow_width = DEFAULT_MAX_RECALL_ENTRIES;
+        let wide_width = BUDGETED_MAX_RECALL_ENTRIES;
+        let candidates = RecallCandidates {
+            entries: near_hits(wide_width),
+            notes: near_notes(2),
+            tags: vec![tag("topic:mine", 0.10)],
+        };
+
+        let narrow = render_at(&candidates, narrow_width).expect("a block");
+        let wide = render_at(&candidates, wide_width).expect("a block");
+
+        assert_eq!(entry_lines(&narrow).len(), narrow_width);
+        assert_eq!(entry_lines(&wide).len(), wide_width);
+        assert_eq!(
+            entry_lines(&narrow),
+            entry_lines(&wide)[..narrow_width],
+            "a wider block says the same thing about each entry it already showed"
+        );
+        assert_eq!(
+            note_lines(&narrow),
+            note_lines(&wide),
+            "the entry width is not the pad's width"
+        );
+    }
+
+    /// The "did not fit" line stays inside the bound the budget arithmetic
+    /// allows it, at the hedged form and the longer noun.
+    #[test]
+    fn the_did_not_fit_line_stays_inside_the_bound_the_budget_assumes() {
+        // The constant carries the line's own newline, so the text itself has
+        // one character less to spend.
+        let bound = RECALL_DROPPED_LINE_MAX_BYTES - 1;
+        for noun in ["entries", "notes"] {
+            let line = dropped_line(usize::MAX, true, noun).expect("a count that dropped rows");
+            assert!(
+                line.chars().count() <= bound,
+                "the widest \"did not fit\" line is {} characters, over the {bound} the budget \
+                 allows it: {line}",
+                line.chars().count()
+            );
+        }
+    }
+
+    /// The budget counts one newline for each line it expects, so the block's
+    /// fixed text must not carry a line the arithmetic never counted.
+    #[test]
+    fn the_blocks_fixed_text_carries_no_line_of_its_own() {
+        for text in [
+            BLOCK_PREFIX,
+            RECALL_HEADER,
+            RECALL_ENTRY_HINT,
+            RECALL_NOTE_LABEL,
+            RECALL_TAG_LABEL,
+        ] {
+            assert!(
+                !text.contains('\n'),
+                "a line the budget did not count: {text}"
+            );
+        }
+    }
+
+    /// Acceptance (#1124), and the case an ASCII fixture cannot reach: the
+    /// budget is stated in bytes, a character is one to four of them, and
+    /// nothing restricts an id, a tag or a summary to ASCII. A block of
+    /// four-byte text must therefore cost no more than an ASCII one.
+    #[test]
+    fn a_block_of_multi_byte_text_stays_within_the_same_token_budget() {
+        let width = BUDGETED_MAX_RECALL_ENTRIES;
+        let candidates = wide_worst_case_candidates(width);
+
+        let block = render_at(&candidates, width).expect("every arm is full");
+        let tokens = block_tokens(&block);
+
+        assert!(!block.is_ascii(), "the fixture must not be ASCII");
+        assert!(
+            tokens <= RECALL_BLOCK_TOKEN_BUDGET,
+            "a block of four-byte text costs {tokens} tokens, over the \
+             {RECALL_BLOCK_TOKEN_BUDGET}-token budget - a bound in characters does not bound a \
+             cost in bytes"
+        );
+    }
+
+    /// Every line the block renders stays inside the byte bound the budget
+    /// gave it, whatever script its parts arrive in.
+    #[test]
+    fn every_rendered_line_stays_inside_its_byte_bound() {
+        let width = BUDGETED_MAX_RECALL_ENTRIES;
+        let block =
+            render_at(&wide_worst_case_candidates(width), width).expect("every arm is full");
+
+        for line in entry_lines(&block) {
+            assert!(
+                line.len() <= RECALL_ENTRY_LINE_MAX_BYTES,
+                "entry line is {} bytes, over {RECALL_ENTRY_LINE_MAX_BYTES}",
+                line.len()
+            );
+        }
+        for line in note_lines(&block) {
+            assert!(
+                line.len() <= RECALL_NOTE_LINE_MAX_BYTES,
+                "note line is {} bytes, over {RECALL_NOTE_LINE_MAX_BYTES}",
+                line.len()
+            );
+        }
+    }
+
+    /// Acceptance (#1124): the configured width reaches the renderer the
+    /// context assembly actually calls, not only the pure function beneath it.
+    ///
+    /// The only test in this binary that installs a process width, and it
+    /// installs the widest the block will take. A wider width never cuts a
+    /// list, and every other test that reaches `render_recall` renders a
+    /// handful of lines, so this install cannot change what any of them sees.
+    #[test]
+    fn the_configured_width_reaches_the_renderer_the_assembly_calls() {
+        let installed = set_max_recall_entries(RECALL_ENTRY_SCAN_LIMIT);
+        assert_eq!(
+            installed, RECALL_ENTRY_SCAN_LIMIT,
+            "no other test in this binary may install a width"
+        );
+
+        let wanted = DEFAULT_MAX_RECALL_ENTRIES + 5;
+        let candidates = RecallCandidates {
+            entries: near_hits(wanted),
+            ..RecallCandidates::default()
+        };
+        let block = render_recall(&RecallSurface::new(
+            &candidates,
+            RECALL_ENTRY_SCAN_LIMIT,
+            RECALL_NOTE_SCAN_LIMIT,
+        ))
+        .expect("a block");
+
+        assert_eq!(
+            entry_lines(&block).len(),
+            wanted,
+            "render_recall must read the configured width, not the derived default"
+        );
+    }
+
+    /// Pins what a block of realistic shape costs, so a change to the line
+    /// format cannot inflate the usual case without a reader seeing it. The
+    /// worst case is a ceiling nothing real reaches; this is the number a turn
+    /// actually pays.
+    ///
+    /// Both widths: what the shipped default costs today, and what the budgeted
+    /// width will cost when #1121 raises the default to it.
+    #[test]
+    fn a_typical_recall_block_costs_far_less_than_its_worst_case() {
+        for (width, low, high) in [
+            (DEFAULT_MAX_RECALL_ENTRIES, 250, 450),
+            (BUDGETED_MAX_RECALL_ENTRIES, 500, 800),
+        ] {
+            let candidates = typical_candidates(width + 4);
+
+            let block = render_at(&candidates, width).expect("a block");
+            let tokens = block_tokens(&block);
+
+            assert!(
+                (low..=high).contains(&tokens),
+                "a typical block of {width} lines costs {tokens} tokens; the pinned range is \
+                 {low} to {high}. Re-derive the range where the change is intended"
+            );
+        }
     }
 
     #[test]
@@ -786,13 +1409,14 @@ mod tests {
         );
     }
 
+    /// Acceptance (#1124): a prompt with nothing above the floor still produces
+    /// no block, whatever the width. The floor decides what the block says;
+    /// the width decides only how much of what cleared it is shown.
     #[test]
-    fn recall_block_is_absent_when_nothing_clears_the_relevance_floor() {
-        // "thanks" and "run the tests" must produce silence, not eight
-        // irrelevant memories.
+    fn a_prompt_with_nothing_above_the_relevance_floor_still_produces_no_block() {
         let far = RECALL_ENTRY_MAX_DISTANCE + 0.01;
         let candidates = RecallCandidates {
-            entries: (0..8)
+            entries: (0..DEFAULT_MAX_RECALL_ENTRIES * 2)
                 .map(|i| hit(&format!("kb-{i}"), "an unrelated fact", &[], far))
                 .collect(),
             notes: vec![note(
@@ -812,7 +1436,7 @@ mod tests {
     #[test]
     fn recall_block_respects_its_line_budget() {
         let candidates = RecallCandidates {
-            entries: near_hits(MAX_RECALL_ENTRIES + 12),
+            entries: near_hits(DEFAULT_MAX_RECALL_ENTRIES + 12),
             notes: vec![],
             tags: (0..MAX_RECALL_TAGS + 7)
                 .map(|i| tag(&format!("topic:t{i}"), 0.10))
@@ -823,7 +1447,7 @@ mod tests {
 
         assert_eq!(
             entry_lines(&block).len(),
-            MAX_RECALL_ENTRIES,
+            DEFAULT_MAX_RECALL_ENTRIES,
             "the entry budget is a cap, not a suggestion: {block}"
         );
         let tags = block
@@ -840,7 +1464,7 @@ mod tests {
     #[test]
     fn recall_block_reports_how_many_hits_it_dropped() {
         let candidates = RecallCandidates {
-            entries: near_hits(MAX_RECALL_ENTRIES + 4),
+            entries: near_hits(DEFAULT_MAX_RECALL_ENTRIES + 4),
             ..RecallCandidates::default()
         };
 
@@ -863,7 +1487,7 @@ mod tests {
 
         let block = render(&candidates).expect("a block");
 
-        let dropped = RECALL_ENTRY_SCAN_LIMIT - MAX_RECALL_ENTRIES;
+        let dropped = RECALL_ENTRY_SCAN_LIMIT - DEFAULT_MAX_RECALL_ENTRIES;
         assert!(
             block.contains(&format!(
                 "...and {dropped} or more entries matched less closely."
@@ -877,7 +1501,7 @@ mod tests {
         // The scan filled, but its tail fell below the floor. Rows arrive
         // nearest-first, so nothing beyond the tail could have cleared it
         // either - the count is exact and must not carry the hedge.
-        let mut entries = near_hits(MAX_RECALL_ENTRIES + 3);
+        let mut entries = near_hits(DEFAULT_MAX_RECALL_ENTRIES + 3);
         entries.extend((0..RECALL_ENTRY_SCAN_LIMIT - entries.len()).map(|i| {
             hit(
                 &format!("kb-far-{i}"),
@@ -923,7 +1547,7 @@ mod tests {
     fn recall_block_counts_only_hits_above_the_relevance_floor() {
         // 12 near, 20 far. The count is the 4 that cleared the floor and did
         // not fit, never the 24 that a top-k would have called matches.
-        let mut entries = near_hits(MAX_RECALL_ENTRIES + 4);
+        let mut entries = near_hits(DEFAULT_MAX_RECALL_ENTRIES + 4);
         entries.extend((0..20).map(|i| {
             hit(
                 &format!("kb-far-{i}"),
@@ -1042,15 +1666,11 @@ mod tests {
         let block = render(&candidates).expect("a block");
         let line = entry_lines(&block)[0];
 
-        let ceiling = RECALL_ID_MAX_CHARS
-            + RECALL_TAGS_MAX_CHARS
-            + crate::domain::knowledge::SUMMARY_MAX_CHARS
-            // "- ", " [", "] "
-            + 6;
+        let ceiling = RECALL_ENTRY_LINE_MAX_BYTES;
         assert!(
-            line.chars().count() <= ceiling,
-            "line is {} characters, over the {ceiling} the constants promise",
-            line.chars().count()
+            line.len() <= ceiling,
+            "line is {} bytes, over the {ceiling} the constants promise",
+            line.len()
         );
     }
 
@@ -1127,10 +1747,9 @@ mod tests {
             .find(|l| l.starts_with(RECALL_TAG_LABEL))
             .expect("a tag line");
         assert!(
-            line.chars().count()
-                <= RECALL_TAG_LABEL.chars().count() + 1 + RECALL_TAG_LINE_MAX_CHARS,
-            "tag line is {} characters: {line}",
-            line.chars().count()
+            line.len() <= RECALL_TAG_LABEL.len() + 1 + RECALL_TAG_LINE_MAX_BYTES,
+            "tag line is {} bytes: {line}",
+            line.len()
         );
         assert!(line.contains("topic:short"), "{line}");
     }
@@ -1190,12 +1809,12 @@ mod tests {
         // The boundary of "nothing was dropped": one more hit and the line
         // appears, so this is where an off-by-one would print "and 0 more".
         let candidates = RecallCandidates {
-            entries: near_hits(MAX_RECALL_ENTRIES),
+            entries: near_hits(DEFAULT_MAX_RECALL_ENTRIES),
             ..RecallCandidates::default()
         };
         let block = render(&candidates).expect("a block");
 
-        assert_eq!(entry_lines(&block).len(), MAX_RECALL_ENTRIES);
+        assert_eq!(entry_lines(&block).len(), DEFAULT_MAX_RECALL_ENTRIES);
         assert!(!block.contains("more entries matched"), "{block}");
     }
 
@@ -1209,7 +1828,7 @@ mod tests {
         };
         let block = render(&candidates).expect("a block");
 
-        let dropped = RECALL_ENTRY_SCAN_LIMIT - 1 - MAX_RECALL_ENTRIES;
+        let dropped = RECALL_ENTRY_SCAN_LIMIT - 1 - DEFAULT_MAX_RECALL_ENTRIES;
         assert!(
             block.contains(&format!(
                 "...and {dropped} more entries matched less closely."
