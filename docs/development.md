@@ -246,6 +246,11 @@ export OPENAI_BASE_URL=https://api.openai.com/v1
 export RUST_LOG=info
 ```
 
+`RUST_LOG` drives the whole telemetry stack, not only the console. See
+[Logging and telemetry](logging.md) for the level contract - what may appear at
+INFO and what belongs at DEBUG - the metrics facade, and OTLP export behind the
+`otel` feature.
+
 If `OPENAI_MODEL` is not set, the daemon defaults OpenAI to `gpt-5.4`.
 
 To enable local git versioning for built-in memory/preferences:

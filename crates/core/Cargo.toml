@@ -30,6 +30,9 @@ test-support = []
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
+# Log capture for the level-contract tests: they assert what does and does not
+# reach a line at a given level, which needs a subscriber writing into a buffer.
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

@@ -12,7 +12,17 @@ path = "src/main.rs"
 name = "desktop_assistant_dbus_bridge"
 path = "src/lib.rs"
 
+[features]
+# Export telemetry to an OpenTelemetry collector. Off by default: with it off
+# no opentelemetry crate is resolved at all, so `cargo install` costs a desktop
+# user nothing. With it on the OTLP layers are added beside the console layer,
+# never in place of it, so an exporting build still prints locally. Everything
+# about where telemetry goes comes from the standard OTEL_* environment
+# variables; there is no flag and no ADELIE_BRIDGE_* variable for it.
+otel = ["adelie-telemetry/otel"]
+
 [dependencies]
+adelie-telemetry.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 clap = { version = "4", features = ["derive", "env"] }
@@ -25,7 +35,6 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["full"] }
 tracing.workspace = true
-tracing-subscriber.workspace = true
 uuid = { version = "1", features = ["v4"] }
 zbus.workspace = true
 

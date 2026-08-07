@@ -308,11 +308,24 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = T>,
 {
+    capture_tracing_at(Level::TRACE, f).await
+}
+
+/// As [`capture_tracing`], but capturing only records at `level` or above.
+///
+/// The level contract says what may appear at INFO and what belongs at DEBUG,
+/// so a test of that contract has to be able to ask for one level and not the
+/// other. Capturing everything cannot tell the two apart.
+pub async fn capture_tracing_at<F, Fut, T>(level: Level, f: F) -> (T, String)
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
     ensure_permissive_global_default();
     let buf = SharedBuf(Arc::new(Mutex::new(Vec::new())));
     let for_writer = buf.clone();
     let subscriber = tracing_subscriber::fmt()
-        .with_max_level(Level::TRACE)
+        .with_max_level(level)
         .with_writer(move || for_writer.clone())
         .with_ansi(false)
         .with_level(false)

@@ -28,6 +28,9 @@
 //!   authenticated UDS connection, reconnect, and JWT minting — #316).
 //! - [`adapter`]: D-Bus adapter structs (one per object path) that
 //!   speak only `api-model` types — no `core`/`application` deps.
+//! - [`telemetry`]: what this binary tells the shared telemetry crate about
+//!   itself. The binary installs the subscriber; this crate's library half
+//!   never does.
 //! - [`session`]: per-D-Bus-sender daemon sessions — each sender gets its own
 //!   authenticated `Connector` + a unicast event forwarder, so turn responses
 //!   (and, post-#367/#320, live sync and client tools) reach only that caller
@@ -35,6 +38,7 @@
 
 pub mod adapter;
 pub mod session;
+pub mod telemetry;
 pub mod transport;
 
 pub use session::{ConnectorSessionFactory, SessionRegistry, spawn_name_owner_watcher};

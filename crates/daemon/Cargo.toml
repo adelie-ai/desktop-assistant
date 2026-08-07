@@ -4,6 +4,15 @@ version = "0.1.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 
+[features]
+# Export telemetry to an OpenTelemetry collector. Off by default: with it off
+# no opentelemetry crate is resolved at all, so `cargo install` costs a desktop
+# user nothing. With it on the OTLP layers are added beside the console layer,
+# never in place of it, so an exporting build still prints locally. Everything
+# about where telemetry goes comes from the standard OTEL_* environment
+# variables; there is no flag and no DESKTOP_ASSISTANT_* variable for it.
+otel = ["adelie-telemetry/otel"]
+
 [dependencies]
 desktop-assistant-application = { path = "../application" }
 desktop-assistant-peer-cred = { path = "../peer-cred" }
@@ -26,7 +35,7 @@ notify.workspace = true
 zbus.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
+adelie-telemetry.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml = { workspace = true, features = ["preserve_order"] }
@@ -70,6 +79,9 @@ walkdir = "2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
+# Log capture for the telemetry tests: they assert what the installed
+# subscriber actually writes, which needs a layer over a buffer.
+tracing-subscriber.workspace = true
 tempfile = "3"
 httpmock = "0.8"
 
