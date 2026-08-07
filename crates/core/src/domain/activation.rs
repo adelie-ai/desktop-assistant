@@ -399,15 +399,23 @@ mod tests {
         );
     }
 
-    /// Acceptance (#1123), the reason the ceiling matters: an entry that has
-    /// been opened and marked for years, sitting exactly on the bar, must still
-    /// rank below an entry nobody has ever opened that the prompt names
-    /// outright. That is #698's caution, and it is about the top line.
-    #[test]
-    fn a_heavily_used_entry_does_not_outrank_a_strong_semantic_match() {
-        let now = now();
-        let weights = ActivationWeights::default();
+    /// The bar every candidate has already cleared, and so the score the
+    /// weakest one in any block carries. `crate::recall::RECALL_BAR` states it;
+    /// it is repeated here because this module must not depend on the block.
+    const BAR: f64 = 6.8;
 
+    /// What the measured prompts reached, nearest candidate first
+    /// (`crate::recall`'s seeded corpus). The weakest real hit reached 7.3 and
+    /// the strongest 11.4, so a best match leads the bar by anywhere from half a
+    /// deviation to 4.6 - which is the range any claim about the top line has to
+    /// hold over.
+    const MEASURED_HITS: &[f64] = &[
+        11.4, 10.9, 10.2, 9.8, 9.4, 9.1, 8.7, 8.4, 8.0, 7.8, 7.5, 7.4, 7.3,
+    ];
+
+    /// An entry opened and marked for years: the largest history a store
+    /// realistically holds.
+    fn a_veteran(now: DateTime<Utc>) -> KnowledgeUseRecord {
         let mut veteran = evenly_over(now, 500, YEAR);
         veteran.marked_count = 20;
         veteran.marks = vec![KnowledgeMark {
@@ -416,15 +424,32 @@ mod tests {
             reason: None,
             marked_at: at(now, 60),
         }];
+        veteran
+    }
 
-        let at_the_bar = activation(6.8, Some(&veteran), now, &weights);
-        let strong_and_cold = activation(11.4, None, now, &weights);
+    /// Acceptance (#1123), the reason the ceiling matters: an entry that has
+    /// been opened and marked for years, sitting exactly on the bar, must still
+    /// rank below an entry nobody has ever opened that the prompt matched
+    /// better. That is #698's caution, and it is about the top line.
+    ///
+    /// Over every distance the measured prompts actually reached, not only the
+    /// strongest of them: a claim tested at one favourable point is not a
+    /// claim.
+    #[test]
+    fn a_heavily_used_entry_never_outranks_the_best_semantic_match() {
+        let now = now();
+        let weights = ActivationWeights::default();
+        let veteran = a_veteran(now);
 
-        assert!(
-            at_the_bar < strong_and_cold,
-            "a veteran at the bar scored {at_the_bar} against a cold strong match at \
-             {strong_and_cold}"
-        );
+        let at_the_bar = activation(BAR, Some(&veteran), now, &weights);
+        for best in MEASURED_HITS {
+            let cold = activation(*best, None, now, &weights);
+            assert!(
+                at_the_bar < cold,
+                "a veteran at the bar scored {at_the_bar} against a cold best match at \
+                 {best} deviations, which scored {cold}"
+            );
+        }
     }
 
     /// Acceptance (#1123): the semantic term is the source-normalized deviation
