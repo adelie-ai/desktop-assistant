@@ -9322,6 +9322,85 @@ mod tests {
         );
     }
 
+    /// #1144's second cost, end to end. The carry removes one common reason a
+    /// prompt is oversized; it does not remove the pre-flight shrink itself.
+    /// A conversation whose tool results carry no eviction decision - the model
+    /// never completed a step, or planning was never wired - still assembles a
+    /// prompt the check has to narrow. Turn-entry compaction ran against the
+    /// wider window, so without the fold the range between the two window
+    /// starts is in neither the prompt nor the rolling summary.
+    #[tokio::test]
+    async fn a_shrunk_turn_folds_what_the_preflight_check_dropped() {
+        use crate::ports::llm::{BudgetSource, ContextBudget, with_context_budget};
+
+        let handler = ConversationHandler::new(
+            MockStore::new(),
+            TokenReportingLlm {
+                text: "ok".into(),
+                // Far under the threshold, so the post-call token-pressure
+                // path never runs and only the pre-flight fold can move the
+                // marker past what turn entry covered.
+                input_tokens: 10,
+                max_context: Some(200_000),
+            },
+            id_gen(),
+        );
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        let mut stored = handler.get_conversation(&conv.id).await.unwrap();
+        for i in 0..30 {
+            stored
+                .messages
+                .push(Message::new(Role::User, format!("u-{i}")));
+            stored
+                .messages
+                .push(Message::assistant_with_tool_calls(vec![ToolCall::new(
+                    format!("c{i}"),
+                    "read_file",
+                    "{}",
+                )]));
+            stored
+                .messages
+                .push(Message::tool_result(format!("c{i}"), "PAYLOAD".repeat(500)));
+        }
+        // No row carries a decision: nothing for the carry to rebuild.
+        assert!(
+            stored.messages.iter().all(|m| m.distilled_into.is_empty()),
+            "the fixture must give the carry nothing to do"
+        );
+        handler.store.update(stored.clone()).await.unwrap();
+
+        // What turn-entry compaction alone can reach: the start of the window
+        // the loop asks for. Anything past this came from the fold.
+        let entry_marker = window_start(&stored.messages, MAX_CONTEXT_MESSAGES);
+
+        let budget = ContextBudget {
+            max_input_tokens: 4_000,
+            source: BudgetSource::ConnectorTable,
+        };
+        with_context_budget(budget, async {
+            handler
+                .send_prompt(&conv.id, "next".into(), noop_callback(), noop_status())
+                .await
+                .unwrap();
+        })
+        .await;
+
+        let after = handler.get_conversation(&conv.id).await.unwrap();
+        assert!(
+            after.compacted_through > entry_marker,
+            "the pre-flight shrink dropped messages past the compaction marker \
+             ({entry_marker}); the marker must cover them, got {}",
+            after.compacted_through
+        );
+        assert!(
+            !after.context_summary.is_empty(),
+            "the marker may only step over a range the summary describes"
+        );
+    }
+
     #[tokio::test]
     async fn send_prompt_no_shrink_when_tokens_under_threshold() {
         use crate::ports::llm::{BudgetSource, ContextBudget, with_context_budget};
