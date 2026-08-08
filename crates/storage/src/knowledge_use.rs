@@ -740,6 +740,66 @@ impl KnowledgeUseLog for PgKnowledgeUseLog {
     }
 }
 
+/// Everything the log knows about every one of the current user's entries.
+///
+/// The whole-store read the daily consolidation pass needs (#1127), where
+/// [`KnowledgeUseLog::records`] answers about a named handful. Two statements
+/// rather than a join, and the same two the by-id read runs - a join over the
+/// marks would multiply the stats rows, and the stitch below is the one this
+/// module already trusts.
+///
+/// **Not on a per-turn path**, so it takes neither the caller's ceiling nor the
+/// read timeout the recall path sets: it runs once per user per day, in a
+/// background pass that owns its own cancellation. A statement timeout tuned
+/// for a turn would fail a legitimate read of a large store.
+///
+/// Ids the log has never seen are absent, on the same terms as
+/// [`KnowledgeUseLog::records`], so a caller can tell an entry nothing has
+/// touched from one that was offered and ignored.
+pub(crate) async fn all_use_records(
+    pool: &sqlx::PgPool,
+    user_id: &str,
+) -> Result<Vec<KnowledgeUseRecord>, CoreError> {
+    let stats: Vec<StatsRow> = sqlx::query_as(
+        "SELECT entry_id, offered_count, opened_count, marked_count, first_seen_at, \
+                last_offered_at, recent_uses \
+         FROM knowledge_use_stats \
+         WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| CoreError::Storage(format!("dreaming: load use records failed: {e}")))?;
+
+    let marks: Vec<MarkRow> = sqlx::query_as(
+        "SELECT entry_id, marked_by, polarity, reason, marked_at \
+         FROM knowledge_use_marks \
+         WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| CoreError::Storage(format!("dreaming: load use marks failed: {e}")))?;
+
+    Ok(stats
+        .into_iter()
+        .map(|row| KnowledgeUseRecord {
+            marks: marks
+                .iter()
+                .filter(|m| m.entry_id == row.entry_id)
+                .filter_map(into_mark)
+                .collect(),
+            entry_id: row.entry_id,
+            offered_count: row.offered_count.max(0) as u64,
+            opened_count: row.opened_count.max(0) as u64,
+            marked_count: row.marked_count.max(0) as u64,
+            first_seen_at: row.first_seen_at,
+            last_offered_at: row.last_offered_at,
+            recent_uses: row.recent_uses,
+        })
+        .collect())
+}
+
 /// A stored mark row as a domain mark, or `None` when the row carries a value
 /// the domain does not know.
 ///

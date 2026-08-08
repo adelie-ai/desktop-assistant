@@ -62,13 +62,20 @@
 //! failure: a plan that produced no work must not look like a model that kept
 //! everything.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
+use chrono::{DateTime, Utc};
 use desktop_assistant_core::CoreError;
+use desktop_assistant_core::domain::activation::ActivationWeights;
+use desktop_assistant_core::domain::knowledge_use::KnowledgeUseRecord;
+use desktop_assistant_core::domain::replay::replay_priority;
+use desktop_assistant_core::domain::salience::{SalienceReading, SalienceSource};
 use desktop_assistant_core::ports::auth::{UserId, current_user_id, with_user_id};
 use serde::Deserialize;
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
+
+use crate::knowledge_use::all_use_records;
 
 use super::common::{extract_json_payload, is_total_failure};
 use super::reconcile::{OpBuffer, ProposedOp, SynthesizedMerge, apply_ops};
@@ -87,10 +94,37 @@ struct KbEntry {
     tags: Vec<String>,
     metadata: KbMetadata,
     /// Provenance (`extraction` | `consolidation` | `explicit`, or NULL on rows
-    /// written before the column existed). Gates the never-prune rule.
+    /// written before the column existed). Gates the never-prune rule, and
+    /// carries the [`SalienceSignal::Instructed`] signal.
     source: Option<String>,
     /// How many times consolidation has already rewritten this entry.
     review_generation: i16,
+    /// The entry's one-line summary, where it has one. Read for its salience
+    /// signals and for nothing else - the prompt still shows the body.
+    summary: Option<String>,
+}
+
+impl KbEntry {
+    /// What re-examining this entry is worth today (#1127).
+    ///
+    /// [`replay_priority`] holds the whole rule: what was retrieved, what was
+    /// contradicted, and what is salient, on the scale the `[Recall]` block
+    /// already scores in.
+    fn replay_priority(
+        &self,
+        records: &HashMap<&str, &KnowledgeUseRecord>,
+        now: DateTime<Utc>,
+        weights: &ActivationWeights,
+    ) -> f64 {
+        let share = SalienceReading::read(&SalienceSource {
+            provenance: self.source.as_deref(),
+            content: &self.content,
+            summary: self.summary.as_deref(),
+            tags: &self.tags,
+        })
+        .share(&weights.use_score);
+        replay_priority(records.get(self.id.as_str()).copied(), share, now, weights)
+    }
 }
 
 impl KbEntry {
@@ -199,6 +233,22 @@ async fn consolidate_user(
     if total_entries == 0 {
         return Ok(ConsolidationStats::default());
     }
+
+    // What the use log knows, read once for the whole store (#1127). A read
+    // that fails must not fail the pass: the pass is still correct on the tag
+    // order alone, and a night skipped because the log was unreadable is worse
+    // than a night ordered the way every night was ordered before the log
+    // existed.
+    let records = match all_use_records(pool, current_user_id().as_str()).await {
+        Ok(records) => records,
+        Err(e) => {
+            tracing::warn!(
+                "dreaming: the use log could not be read, so this pass is ordered by tag alone: {e}"
+            );
+            Vec::new()
+        }
+    };
+    let entries = order_by_replay_priority(entries, &records, Utc::now());
 
     let slices = slice_entries(entries);
     if slices.len() > 1 {
@@ -528,9 +578,10 @@ async fn load_active_entries(pool: &PgPool) -> Result<Vec<KbEntry>, CoreError> {
         serde_json::Value,
         Option<String>,
         i16,
+        Option<String>,
     );
     let rows: Vec<Row> = sqlx::query_as(
-        "SELECT id, content, tags, metadata, source, review_generation \
+        "SELECT id, content, tags, metadata, source, review_generation, summary \
          FROM knowledge_base \
          WHERE user_id = $1 AND deleted_at IS NULL \
          ORDER BY tags, created_at ASC",
@@ -543,16 +594,52 @@ async fn load_active_entries(pool: &PgPool) -> Result<Vec<KbEntry>, CoreError> {
     Ok(rows
         .into_iter()
         .map(
-            |(id, content, tags, md, source, review_generation)| KbEntry {
+            |(id, content, tags, md, source, review_generation, summary)| KbEntry {
                 id,
                 content,
                 tags,
                 metadata: KbMetadata::from_json(&md),
                 source,
                 review_generation,
+                summary,
             },
         )
         .collect())
+}
+
+/// Put the tag groups most worth re-examining first (#1127).
+///
+/// The pass examines everything either way. What this decides is the order, and
+/// therefore which entries share a slice and which entries a pass that was
+/// cancelled or that lost slices to failures actually reached.
+///
+/// **Whole tag groups move, never single entries.** Entries arrive ordered by
+/// tags precisely so that near-duplicates land in one slice, and redundancy is
+/// what the pass exists to find; an order that put the six most-retrieved
+/// entries first would scatter every cluster it depends on. So a group is a run
+/// of entries carrying the identical tags, a group's priority is that of its
+/// best entry, and the groups are sorted by it.
+///
+/// **The sort is stable**, so groups of equal priority - which is every group in
+/// a store with no use history - keep the tag order they arrived in. A store
+/// this term says nothing about is sliced exactly as it was before the term
+/// existed.
+fn order_by_replay_priority(
+    entries: Vec<KbEntry>,
+    records: &[KnowledgeUseRecord],
+    now: DateTime<Utc>,
+) -> Vec<KbEntry> {
+    let weights = ActivationWeights::default();
+    let by_id: HashMap<&str, &KnowledgeUseRecord> = records
+        .iter()
+        .map(|record| (record.entry_id.as_str(), record))
+        .collect();
+
+    let _priorities: Vec<f64> = entries
+        .iter()
+        .map(|entry| entry.replay_priority(&by_id, now, &weights))
+        .collect();
+    entries
 }
 
 /// Greedily pack tag-ordered entries into slices under the prompt char budget.
@@ -1307,6 +1394,7 @@ mod tests {
             metadata: KbMetadata::default(),
             source: None,
             review_generation: 0,
+            summary: None,
         }
     }
 
@@ -1338,6 +1426,200 @@ mod tests {
     fn missing_operations_key_is_empty() {
         let ops = parse_operations("{}").unwrap().ops;
         assert!(ops.is_empty());
+    }
+
+    // --- Replay: what the pass looks at first (#1127) ------------------------
+
+    /// The instant every ordering test runs at. Fixed, so a use record's age is
+    /// the number the test wrote and not the number the clock gave.
+    fn replay_now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-08-07T12:00:00Z")
+            .expect("a fixed clock parses")
+            .with_timezone(&Utc)
+    }
+
+    /// A use record for `id`, opened at each of `ages` seconds ago.
+    fn retrieved(id: &str, ages: &[i64]) -> KnowledgeUseRecord {
+        let now = replay_now();
+        KnowledgeUseRecord {
+            entry_id: id.to_string(),
+            offered_count: ages.len() as u64,
+            opened_count: ages.len() as u64,
+            marked_count: 0,
+            first_seen_at: now
+                - chrono::TimeDelta::seconds(ages.iter().copied().max().unwrap_or(1)),
+            last_offered_at: Some(
+                now - chrono::TimeDelta::seconds(ages.iter().copied().min().unwrap_or(1)),
+            ),
+            recent_uses: ages
+                .iter()
+                .map(|a| now - chrono::TimeDelta::seconds(*a))
+                .collect(),
+            marks: Vec::new(),
+        }
+    }
+
+    /// The same record, plus a standing negative mark set `age` seconds ago.
+    fn contradicted(mut record: KnowledgeUseRecord, age: i64) -> KnowledgeUseRecord {
+        record.marked_count += 1;
+        record.marks.push(
+            desktop_assistant_core::domain::knowledge_use::KnowledgeMark {
+                source: desktop_assistant_core::domain::MarkSource::Model,
+                polarity: desktop_assistant_core::domain::MarkPolarity::Negative,
+                reason: Some("the fact it states was withdrawn".to_string()),
+                marked_at: replay_now() - chrono::TimeDelta::seconds(age),
+            },
+        );
+        record
+    }
+
+    /// The ids in the order the pass would examine them.
+    fn examined(entries: Vec<KbEntry>, records: &[KnowledgeUseRecord]) -> Vec<String> {
+        order_by_replay_priority(entries, records, replay_now())
+            .into_iter()
+            .map(|e| e.id)
+            .collect()
+    }
+
+    /// Acceptance (#1127): the daily pass examines a recently retrieved entry
+    /// before one that was only recently written.
+    ///
+    /// The entry nothing has reached for is the newer of the two, and it still
+    /// comes second - which is the whole claim, because write activity alone
+    /// cannot tell the two apart. Each carries its own tags, so the two are
+    /// separate groups and the order is the ordering rule's and not the tag
+    /// sort's.
+    #[test]
+    fn the_daily_pass_examines_a_recently_retrieved_entry_before_a_recently_written_one() {
+        // Arrives in the tag order the loader gives: the written-yesterday entry
+        // first, so a pass that ignored the log would keep it first.
+        let entries = vec![
+            entry("kb-written", "a fact nobody has reached for", &["a-topic"]),
+            entry(
+                "kb-retrieved",
+                "a fact the work keeps needing",
+                &["b-topic"],
+            ),
+        ];
+        let records = vec![retrieved("kb-retrieved", &[3_600, 7_200])];
+
+        assert_eq!(
+            examined(entries, &records),
+            vec!["kb-retrieved".to_string(), "kb-written".to_string()]
+        );
+    }
+
+    /// Acceptance (#1127): a fact that was retrieved and then contradicted is
+    /// examined before one that was merely retrieved.
+    ///
+    /// Identical retrieval histories, so the contradiction is the only thing
+    /// separating them.
+    #[test]
+    fn the_daily_pass_examines_a_contradicted_entry_before_a_merely_retrieved_one() {
+        let entries = vec![
+            entry("kb-fine", "a fact nobody has disputed", &["a-topic"]),
+            entry("kb-wrong", "a fact somebody said was wrong", &["b-topic"]),
+        ];
+        let records = vec![
+            retrieved("kb-fine", &[600, 6_000]),
+            contradicted(retrieved("kb-wrong", &[600, 6_000]), 600),
+        ];
+
+        assert_eq!(
+            examined(entries, &records),
+            vec!["kb-wrong".to_string(), "kb-fine".to_string()]
+        );
+    }
+
+    /// Acceptance (#1127): a salient entry is examined before a non-salient
+    /// entry of the same age.
+    ///
+    /// Neither has ever been retrieved, which is the state most of a store is
+    /// in, so salience is the only thing separating them.
+    #[test]
+    fn the_daily_pass_examines_a_salient_entry_before_a_non_salient_one_of_the_same_age() {
+        let entries = vec![
+            entry(
+                "kb-plain",
+                "the kitchen tap turns the wrong way",
+                &["a-topic"],
+            ),
+            entry(
+                "kb-salient",
+                "the insurance renewal is due by the end of March",
+                &["b-topic"],
+            ),
+        ];
+
+        assert_eq!(
+            examined(entries, &[]),
+            vec!["kb-salient".to_string(), "kb-plain".to_string()]
+        );
+    }
+
+    /// Whole tag groups move, never single entries. Redundancy clusters by tag
+    /// and finding it is what the pass is for, so an order that scattered a
+    /// cluster would cost more than it bought.
+    #[test]
+    fn ordering_by_replay_priority_keeps_entries_that_share_tags_together() {
+        let entries = vec![
+            entry("kb-a1", "one of a pair", &["shared"]),
+            entry("kb-a2", "the other of the pair", &["shared"]),
+            entry("kb-b1", "an unrelated fact", &["other"]),
+        ];
+        // The *second* member of the shared group is the retrieved one, so its
+        // whole group must move and not just the entry that earned it.
+        let records = vec![retrieved("kb-a2", &[600])];
+
+        assert_eq!(
+            examined(entries, &records),
+            vec![
+                "kb-a1".to_string(),
+                "kb-a2".to_string(),
+                "kb-b1".to_string()
+            ]
+        );
+    }
+
+    /// The pass still examines everything. Ordering decides what it reaches
+    /// first, and a cancelled or partly-failed pass is what makes that matter -
+    /// it must never decide what it reaches at all.
+    #[test]
+    fn ordering_by_replay_priority_examines_every_entry_it_was_given() {
+        let entries: Vec<KbEntry> = (0..40)
+            .map(|i| {
+                entry(
+                    &format!("kb-{i}"),
+                    "a stored fact",
+                    &[if i % 3 == 0 { "one" } else { "two" }],
+                )
+            })
+            .collect();
+        let records = vec![retrieved("kb-7", &[600]), retrieved("kb-31", &[60])];
+
+        let mut ordered = examined(entries, &records);
+        assert_eq!(ordered.len(), 40);
+        ordered.sort();
+        ordered.dedup();
+        assert_eq!(ordered.len(), 40, "no entry may be dropped or duplicated");
+    }
+
+    /// A store the log says nothing about is ordered exactly as it was before
+    /// this term existed: the tag order the loader gave, unmoved.
+    #[test]
+    fn a_store_with_no_use_history_keeps_the_tag_order_the_loader_gave_it() {
+        let entries: Vec<KbEntry> = (0..12)
+            .map(|i| {
+                entry(
+                    &format!("kb-{i}"),
+                    "a stored fact",
+                    &[if i < 6 { "a" } else { "b" }],
+                )
+            })
+            .collect();
+        let expected: Vec<String> = (0..12).map(|i| format!("kb-{i}")).collect();
+
+        assert_eq!(examined(entries, &[]), expected);
     }
 
     #[test]

@@ -882,9 +882,17 @@ fn rank_by_activation<'a, T: Activatable>(
         .iter()
         .map(|(hit, _)| {
             let coverage = hit.situation_coverage(situation);
-            hit.relevance()
-                .semantic_signal(dispersion)
-                .map(|semantic| activation(semantic, hit.use_record(), coverage, now, &weights))
+            let salience = hit.salience_share(&weights.use_score);
+            hit.relevance().semantic_signal(dispersion).map(|semantic| {
+                activation(
+                    semantic,
+                    hit.use_record(),
+                    coverage,
+                    salience,
+                    now,
+                    &weights,
+                )
+            })
         })
         .collect();
     let with_signal = scored.iter().filter(|score| score.is_some()).count();
@@ -2999,6 +3007,156 @@ mod tests {
             render(&with_a_cue_nothing_matches),
             "entries that carry no situation record must render the block their distances \
              alone would have rendered"
+        );
+    }
+
+    // --- Salience (#1127) ----------------------------------------------------
+
+    /// The same candidate, with a body a salience detector reads.
+    ///
+    /// A person's own promotion and a deadline: two of the five signals, which
+    /// is a realistic reading rather than the maximum one.
+    fn salient(mut hit: RecallEntry) -> RecallEntry {
+        hit.entry.source = Some(crate::domain::salience::SOURCE_EXPLICIT.to_string());
+        hit.entry.content =
+            "The passport renewal is due by the end of March, and it needs the old one."
+                .to_string();
+        hit
+    }
+
+    /// Acceptance (#1127): a salient entry is ranked above an equally near entry
+    /// that is not.
+    #[test]
+    fn a_salient_entry_is_ranked_above_an_equally_near_entry_that_is_not() {
+        let source = seeded_source();
+        let candidates = RecallCandidates {
+            entries: vec![
+                hit(
+                    "kb-plain",
+                    "a fact with nothing riding on it",
+                    &["topic"],
+                    source.distance_at(9.0),
+                ),
+                salient(hit(
+                    "kb-salient",
+                    "a fact with a date on it",
+                    &["topic"],
+                    source.distance_at(8.9),
+                )),
+            ],
+            entry_dispersion: Some(source),
+            ..RecallCandidates::default()
+        };
+
+        assert_eq!(
+            shown_ids(&candidates),
+            vec!["kb-salient".to_string(), "kb-plain".to_string()],
+            "the entry a person asked for, with a deadline on it, must lead one a tenth of a \
+             deviation nearer that carries neither"
+        );
+    }
+
+    /// Acceptance (#1127): salience ranks the admitted set and never changes its
+    /// membership, so it cannot surface an entry the bar refused and the block's
+    /// "and N more entries also matched" hedge stays true.
+    #[test]
+    fn a_salient_entry_cannot_be_admitted_when_the_bar_refused_it() {
+        let source = seeded_source();
+        let admitted = DEFAULT_MAX_RECALL_ENTRIES + 4;
+
+        let mut entries: Vec<RecallEntry> = (0..admitted)
+            .map(|i| {
+                hit(
+                    &format!("kb-{i}"),
+                    "a stored fact",
+                    &["topic"],
+                    source.distance_at(RECALL_BAR + 2.0 - (i as f64) * 0.05),
+                )
+            })
+            .collect();
+        // Well below the bar, and carrying every salience signal there is. A
+        // term that could admit would put it in the block, and would make the
+        // count below wrong by one.
+        let mut everything = hit(
+            "kb-below-the-bar",
+            "an unrelated fact with everything riding on it",
+            &["topic"],
+            source.distance_at(RECALL_BAR - 2.0),
+        );
+        everything.entry.source = Some(crate::domain::salience::SOURCE_EXPLICIT.to_string());
+        everything.entry.content = "The invoice is due by Friday, the doctor wants payment up \
+                                    front, and I promised to sort the deposit."
+            .to_string();
+        assert_eq!(
+            crate::domain::SalienceReading::read(&crate::domain::SalienceSource::of(
+                &everything.entry
+            ))
+            .signals()
+            .count(),
+            crate::domain::SalienceSignal::ALL.len(),
+            "precondition: this candidate carries every signal, so nothing weaker is being tested"
+        );
+        entries.push(everything);
+
+        let candidates = RecallCandidates {
+            entries,
+            entry_dispersion: Some(source),
+            ..RecallCandidates::default()
+        };
+        let block = render(&candidates).expect("a block");
+
+        assert!(
+            !block.contains("kb-below-the-bar"),
+            "the bar admits on distance; salience only orders what it admitted: {block}"
+        );
+        assert!(
+            block.contains("...and 4 more entries also matched."),
+            "the hedge counts what cleared the bar, which salience cannot move: {block}"
+        );
+    }
+
+    /// Acceptance (#1127): a store no detector reads renders exactly the block
+    /// its distances alone would have rendered.
+    ///
+    /// Byte for byte, over the whole seeded corpus, so a low-salience store is
+    /// unaffected by the term existing.
+    #[test]
+    fn a_store_no_salience_detector_reads_renders_the_block_it_always_did() {
+        let source = seeded_source();
+        let plain: Vec<RecallEntry> = STRONG_CUE
+            .iter()
+            .enumerate()
+            .map(|(i, score)| {
+                hit(
+                    &format!("kb-c{i}"),
+                    "a stored fact",
+                    &["topic"],
+                    source.distance_at(*score),
+                )
+            })
+            .collect();
+
+        for entry in &plain {
+            assert!(
+                crate::domain::SalienceReading::read(&crate::domain::SalienceSource::of(
+                    &entry.entry
+                ))
+                .is_empty(),
+                "precondition: the seeded corpus carries no salience signal"
+            );
+        }
+
+        let expected: Vec<String> = (0..STRONG_CUE.len())
+            .take_while(|i| STRONG_CUE[*i] >= RECALL_BAR)
+            .map(|i| format!("kb-c{i}"))
+            .collect();
+        assert_eq!(
+            shown_ids(&RecallCandidates {
+                entries: plain,
+                entry_dispersion: Some(source),
+                ..RecallCandidates::default()
+            }),
+            expected
         );
     }
 

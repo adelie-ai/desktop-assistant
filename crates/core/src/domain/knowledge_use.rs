@@ -253,7 +253,12 @@ impl UseScoreWeights {
     }
 
     /// What one mark from `source` is worth, in uses.
-    fn mark_weight(&self, source: MarkSource) -> f64 {
+    ///
+    /// Public because it is the one place this project prices a person's own
+    /// statement against the model's reading, and a second term that needs that
+    /// ratio must read it here rather than restate it - see
+    /// [`crate::domain::salience`].
+    pub fn mark_weight(&self, source: MarkSource) -> f64 {
         match source {
             MarkSource::Model => self.model_mark,
             MarkSource::Person => self.person_mark,
@@ -384,6 +389,45 @@ impl KnowledgeUseRecord {
             .sum();
 
         recent + tail + marks
+    }
+
+    /// How much this entry has been **retrieved**, on the same base-level scale
+    /// as [`Self::use_sum`] but reading the opens alone.
+    ///
+    /// [`Self::use_sum`] answers "what is this entry worth", so a negative mark
+    /// subtracts from it and a contradicted entry sinks. That is right for
+    /// ranking a `[Recall]` block and wrong for choosing what to re-examine: a
+    /// fact that was retrieved and then contradicted is the most valuable thing
+    /// a consolidation pass can look at, and a sum that drives it below an entry
+    /// nobody has ever opened would hide it. So the two questions get two sums
+    /// rather than one sum and a sign convention that has to mean opposite
+    /// things in two places.
+    ///
+    /// Marks are excluded entirely rather than taken as positive. A mark of
+    /// either polarity is already recorded as a use, so the open it came with is
+    /// still counted here; what is dropped is the extra weight the judgement
+    /// carries, which [`crate::domain::replay`] reads through
+    /// [`Self::contradiction_sum`] instead.
+    pub fn retrieval_sum(&self, now: DateTime<Utc>, weights: &UseScoreWeights) -> f64 {
+        let _ = (now, weights);
+        0.0
+    }
+
+    /// How much standing evidence there is that this entry is **wrong**, on the
+    /// same base-level scale, as a magnitude rather than a signed quantity.
+    ///
+    /// The negative marks alone, each weighted by its source and decayed by its
+    /// own age, with the sign dropped. Zero for an entry nobody has contradicted,
+    /// which is the ordinary answer.
+    ///
+    /// The sign is dropped here rather than at the caller because the quantity
+    /// itself is "how much contradiction", and a caller that had to negate it
+    /// would be free to forget. It decays because a contradiction nobody has
+    /// acted on for a year is less urgent than one from this morning - not
+    /// because it has stopped being true.
+    pub fn contradiction_sum(&self, now: DateTime<Utc>, weights: &UseScoreWeights) -> f64 {
+        let _ = (now, weights);
+        0.0
     }
 
     /// The approximated contribution of the uses that fell out of the recent
@@ -619,6 +663,89 @@ mod tests {
             record
                 .usefulness(now, &UseScoreWeights::default())
                 .is_finite()
+        );
+    }
+
+    /// The retrieval sum answers "how much was this reached for", so a
+    /// contradiction cannot sink it. That is the half [`crate::domain::replay`]
+    /// reads, and it must not be the half a negative mark drives below zero.
+    #[test]
+    fn the_retrieval_sum_reads_the_opens_and_never_the_marks() {
+        let now = now();
+        let weights = UseScoreWeights::default();
+        let plain = opened(now, &[60, 600], 2);
+
+        let mut refuted = plain.clone();
+        refuted.marked_count = 1;
+        refuted.marks = vec![KnowledgeMark {
+            source: MarkSource::Person,
+            polarity: MarkPolarity::Negative,
+            reason: Some("out of date".to_string()),
+            marked_at: at(now, 60),
+        }];
+
+        assert_eq!(
+            refuted.retrieval_sum(now, &weights),
+            plain.retrieval_sum(now, &weights),
+            "a mark must not move the sum that measures retrieval"
+        );
+        assert!(
+            refuted.use_sum(now, &weights) < plain.use_sum(now, &weights),
+            "precondition: it does move the sum that measures worth"
+        );
+        assert!(refuted.retrieval_sum(now, &weights) > 0.0);
+        assert_eq!(
+            KnowledgeUseRecord::unseen("kb-1", now).retrieval_sum(now, &weights),
+            0.0
+        );
+    }
+
+    /// The contradiction sum reads the negative marks alone, as a magnitude, so
+    /// a caller can add it rather than having to remember to negate it.
+    #[test]
+    fn the_contradiction_sum_reads_the_negative_marks_and_nothing_else() {
+        let now = now();
+        let weights = UseScoreWeights::default();
+        let plain = opened(now, &[60, 600], 2);
+        assert_eq!(plain.contradiction_sum(now, &weights), 0.0);
+
+        let mut praised = plain.clone();
+        praised.marked_count = 1;
+        praised.marks = vec![KnowledgeMark {
+            source: MarkSource::Model,
+            polarity: MarkPolarity::Positive,
+            reason: None,
+            marked_at: at(now, 60),
+        }];
+        assert_eq!(
+            praised.contradiction_sum(now, &weights),
+            0.0,
+            "a positive mark is not a contradiction"
+        );
+
+        let mut refuted = plain.clone();
+        refuted.marked_count = 1;
+        refuted.marks = vec![KnowledgeMark {
+            source: MarkSource::Model,
+            polarity: MarkPolarity::Negative,
+            reason: None,
+            marked_at: at(now, 60),
+        }];
+        let model_said_so = refuted.contradiction_sum(now, &weights);
+        assert!(model_said_so > 0.0, "a magnitude, not a signed quantity");
+
+        let mut by_a_person = refuted.clone();
+        by_a_person.marks[0].source = MarkSource::Person;
+        assert!(
+            by_a_person.contradiction_sum(now, &weights) > model_said_so,
+            "a person's contradiction outweighs the model's, by the log's own ratio"
+        );
+
+        let mut stale = refuted.clone();
+        stale.marks[0].marked_at = at(now, 365 * 24 * 3600);
+        assert!(
+            stale.contradiction_sum(now, &weights) < model_said_so,
+            "a year-old contradiction weighs less than a minute-old one"
         );
     }
 

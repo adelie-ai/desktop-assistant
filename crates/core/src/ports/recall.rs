@@ -60,8 +60,9 @@ use std::sync::Arc;
 
 use crate::CoreError;
 use crate::domain::KnowledgeEntry;
-use crate::domain::activation::NO_SITUATION;
-use crate::domain::knowledge_use::KnowledgeUseRecord;
+use crate::domain::activation::{NO_SALIENCE, NO_SITUATION};
+use crate::domain::knowledge_use::{KnowledgeUseRecord, UseScoreWeights};
+use crate::domain::salience::{SalienceReading, SalienceSource};
 use crate::domain::situation::{SituationCue, SituationRecord};
 
 /// How near a candidate is to the prompt, and in which sense.
@@ -293,6 +294,13 @@ impl Activatable for RecallEntry {
     fn situation_coverage(&self, cue: Option<&SituationCue>) -> f64 {
         cue.map_or(NO_SITUATION, |cue| cue.coverage(&self.situation))
     }
+
+    /// Read from the entry's own stored text and provenance, which the scan
+    /// already selects. Nothing is stored and nothing extra is read, so a
+    /// detector added later applies to every entry ever written.
+    fn salience_share(&self, weights: &UseScoreWeights) -> f64 {
+        SalienceReading::read(&SalienceSource::of(&self.entry)).share(weights)
+    }
 }
 
 /// One skill offered as a recall candidate (#1154): procedural memory, cued by
@@ -378,6 +386,19 @@ impl Activatable for RecallSkill {
     fn situation_coverage(&self, _cue: Option<&SituationCue>) -> f64 {
         NO_SITUATION
     }
+
+    /// A skill carries no salience reading (#1127). Every signal is read from a
+    /// knowledge entry's own body, summary, tags and provenance, and a skill
+    /// holds none of those: its body never travels, and a person approves a
+    /// skill rather than promoting it. So the term has nothing to read and
+    /// contributes exactly zero.
+    ///
+    /// Approval (#1155) is the nearest thing the catalog holds to a person's own
+    /// instruction, and it is deliberately not read here: every followable skill
+    /// is approved, so a signal every candidate carries separates nobody.
+    fn salience_share(&self, _weights: &UseScoreWeights) -> f64 {
+        NO_SALIENCE
+    }
 }
 
 /// What a candidate contributes to its activation score
@@ -404,6 +425,16 @@ pub trait Activatable {
     /// here: a procedure is if anything more situational than a fact, which is
     /// why #1154 reads #1125 rather than duplicating it.
     fn situation_coverage(&self, cue: Option<&SituationCue>) -> f64;
+    /// How much of the salience information this build can detect the candidate
+    /// carries (#1127), or
+    /// [`NO_SALIENCE`] where the source
+    /// holds no text a detector can read.
+    ///
+    /// `weights` prices a person's own statement against the detector's reading
+    /// of text, and it is the use log's own mark weighting rather than a
+    /// coefficient of this term's - see
+    /// [`crate::domain::salience`].
+    fn salience_share(&self, weights: &UseScoreWeights) -> f64;
 }
 
 /// One scratchpad note offered as a recall candidate (#1101).
