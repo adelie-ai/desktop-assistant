@@ -5,10 +5,10 @@ its phases #711 / #893 / #894 (memory architecture), #742 (SQLite excluded from 
 #882 (user_id audit does not cover storage-sqlite), #639 (the skill-index precedent),
 #680 (multi-tenancy boundary)
 
-Companion to `skill-execution-and-portability.md`, whose "Why the policy left the storage
-adapters" section describes the same mistake, made once already and reversed for the skill
-index. This document works out what the same reversal costs for the dream cycle, where the
-answer is not the same, because consolidation deletes and the skill index does not.
+The same mistake - domain policy left inside a storage adapter - was made once already and
+reversed for the skill index. This document works out what the same reversal costs for the
+dream cycle, where the answer is not the same, because consolidation deletes and the skill
+index does not.
 
 ## The problem, priced
 

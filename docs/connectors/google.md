@@ -1,6 +1,6 @@
 # Google (Vertex AI Gemini) Connector
 
-Crate: `desktop-assistant-llm-google` (planned)
+Crate: `desktop-assistant-llm-google`
 
 Google's Bedrock equivalent is **Vertex AI**: a cloud-credential-authenticated,
 project- and region-scoped gateway hosting Gemini. This connector targets the
@@ -73,8 +73,11 @@ gated on a `cve-mcp` / `cargo audit` scan; prefer minting the token by reusing t
 workspace `jsonwebtoken` (SA JWT -> token exchange at `oauth2.googleapis.com/token`)
 over a vendor SDK.
 
-These fields exceed the current wire views and client dialogs, so **v1 Google is
-config-file-only** with a documented `daemon.toml` block in `cloud-providers.md`.
+`ConnectionConfigView` carries these fields (`base_url`, `api_key_env`,
+`project`, `location`, `auth_mode`, `credentials_path`, the timeouts and
+`max_context_tokens`), so a Google connection can be created and edited over the
+API as well as from a `daemon.toml` block - see `cloud-providers.md` for the
+file form.
 
 ## Preflight
 

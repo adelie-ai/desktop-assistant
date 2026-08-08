@@ -1,6 +1,5 @@
 //! Event-driven parent-wake: re-engage a parent conversation when its
-//! subagents finish, without polling (issue #668; see
-//! `docs/design/subagent-parent-wake.md`).
+//! subagents finish, without polling (issue #668).
 //!
 //! [`ParentWakeCoordinator`] consumes the registry's [`SubagentCompletion`]
 //! signal (slice 1) and drives an autonomous *wake turn* on the top-level

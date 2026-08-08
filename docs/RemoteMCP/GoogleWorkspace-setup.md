@@ -6,7 +6,8 @@ client **you** own in **your own** Google Cloud project. Nothing here is
 Adele-specific plumbing you have to build — it is configuration plus a Google
 Cloud setup.
 
-Read [README.md](README.md) first for how remote MCP and secrets work in Adele.
+Read [mcp-services.md](../mcp-services.md) first for how remote MCP and secrets
+work in Adele.
 
 ## The endpoints
 
@@ -138,7 +139,7 @@ The server now exists but has no refresh token, so its state is
 - **CLI:**
 
   ```
-  desktop-assistant --mcp-oauth-login google-calendar
+  desktop-assistant-daemon --mcp-oauth-login google-calendar
   ```
 
 Your browser opens for consent. On success the refresh token is written to

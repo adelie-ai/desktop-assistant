@@ -36,11 +36,7 @@ Interface: `org.desktopAssistant.Settings`
 
 ### Settings Methods
 
-- `GetLlmSettings() -> (connector: s, model: s, base_url: s, has_api_key: b)`
-- `SetLlmSettings(connector: s, model: s, base_url: s) -> ()`
 - `SetApiKey(api_key: s) -> ()`
-- `GenerateWsJwt(subject: s) -> token: s`
-  - Token subject is always the current OS username on the user bus.
 - `GetEmbeddingsSettings() -> (connector: s, model: s, base_url: s, has_api_key: b, available: b, is_default: b)`
 - `SetEmbeddingsSettings(connector: s, model: s, base_url: s) -> ()`
   - Empty `connector` clears the override and reverts to defaulting from the LLM connector
@@ -78,8 +74,8 @@ here works exactly as it did, with no configuration to add.
 Where the bridge runs as a different account than the daemon, it is a **tenant**
 unless `[authz] admin_subjects` in `daemon.toml` names that account's login
 name. A tenant is refused the service-configuration writes - `SetApiKey`,
-`SetLlmSettings`, `SetEmbeddingsSettings`, `SetDatabaseSettings`,
-`SetBackendTasksSettings`, `SetWsAuthSettings`, the connection and purpose
+`SetEmbeddingsSettings`, `SetDatabaseSettings`, `SetBackendTasksSettings`,
+`SetWsAuthSettings`, the connection and purpose
 writes, the MCP lifecycle writes, and `SetConfig` (whose personality traits are
 one global block, not a per-user preference). Reads and conversations are
 unaffected, and a tenant still sets their own disposition per conversation,
@@ -176,7 +172,7 @@ busctl --user call org.desktopAssistant \
 - Secret handling over D-Bus is write-only by design:
   - API keys can be written with `SetApiKey`.
   - There is no method that returns secret values.
-  - `GetLlmSettings` and `GetEmbeddingsSettings` only return non-sensitive fields plus `has_api_key`.
-- WebSocket auth uses bearer JWTs:
-  - Generate locally signed tokens with `GenerateWsJwt`.
-  - Multiple tokens can be valid at once until expiry.
+  - `GetEmbeddingsSettings` only returns non-sensitive fields plus `has_api_key`.
+- WebSocket auth uses bearer JWTs, minted off the D-Bus surface entirely; see
+  [WEBSOCKET_API.md](WEBSOCKET_API.md). Multiple tokens can be valid at once
+  until expiry.

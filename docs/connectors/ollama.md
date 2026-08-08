@@ -15,7 +15,8 @@ The connector auto-pulls missing models on first use via `POST /api/pull`.
 
 | Source | Variable | Required |
 |--------|----------|----------|
-| Config file | `daemon.toml` [ollama] section | Yes (model + base_url) |
+| Config file | `daemon.toml` `[llm]` `connector = "ollama"` | No |
+| Config file | `daemon.toml` `[connections.<id>]` `type = "ollama"` | No |
 
 ## Prompt Caching
 

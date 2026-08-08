@@ -13,7 +13,7 @@
 //! a network the operator already controls: loopback, an RFC1918 IPv4 or
 //! IPv6 ULA (`fc00::/7`) private range unconditionally, and CGNAT
 //! (`100.64.0.0/10`) or a bare (dot-free) hostname only when the request
-//! carries no credential. `docs/remote-brain-setup.md` documents the
+//! carries no credential. `docs/k8s-deployment.md` documents the
 //! load-bearing case: the shipped k8s manifests reach Ollama, which carries
 //! no credential, at `http://ollama:11434` over the in-cluster network, and
 //! a blanket TLS-only rule would refuse a working install.
@@ -412,7 +412,7 @@ mod tests {
     }
 
     /// The load-bearing case: `deploy/k8s/base/daemon.toml` and
-    /// `docs/remote-brain-setup.md` reach Ollama, which has no credential
+    /// `docs/k8s-deployment.md` reach Ollama, which has no credential
     /// concept, at `http://ollama:11434` — an in-cluster Kubernetes Service
     /// name, which is a bare hostname.
     #[test]

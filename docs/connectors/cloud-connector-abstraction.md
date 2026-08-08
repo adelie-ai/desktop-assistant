@@ -121,16 +121,6 @@ Plan:
 Each connector then supplies only its auth headers, base-URL / endpoint shaping,
 caching decision, model addressing, and error classifier.
 
-## Shared model cache
-
-`list_models()` is hit on every model-picker open, and the live listings are
-non-trivial (OpenRouter `/models` is a large catalog; Azure/Vertex listings are
-also heavy or occasionally unavailable). `llm-bedrock` already solved this with a
-`ModelClock` + 1h TTL cache (`llm-bedrock/src/lib.rs`). Lift that pattern into a
-small shared helper (in `llm-http` or the compat crate) that all three new
-connectors use, and always degrade to the curated table when the live listing
-fails, rather than surfacing an error to the picker.
-
 ## What varies, and where it is encapsulated
 
 Each row is a concern the request called out ("anything that varies across
@@ -250,26 +240,6 @@ decline, not a technical failure: it is non-retryable, logged at info/debug (nev
 error), surfaced to the user with a specific, informative reason, and its raw
 provider body (which contains the flagged user content) is never dumped into logs
 (AGENTS.md 8.2/8.3).
-
-## Threading provider config (do not skip)
-
-The factory builds every client from a single flat `ResolvedLlmConfig`
-(`registry.rs`), populated by the resolver (`config/resolution.rs`) and already
-carrying provider-specific fields (`aws_profile`, `keep_warm`). Azure needs
-`deployment`, `api_surface` (`v1` | `classic`), `auth_mode` (`api_key` | `entra`);
-Vertex needs `project`, `location`, `auth_mode` (`vertex` | `api_key`),
-`credentials_path`. None exist on `ResolvedLlmConfig` today, and `new(api_key)`
-has nowhere to put them. Adding a provider therefore MUST also:
-
-- add the provider-specific fields to `ResolvedLlmConfig` (consider a per-connector
-  `extras` sub-struct rather than flattening many optionals onto the shared
-  struct), and
-- extract them in the resolver's two per-connector matches
-  (`config/resolution.rs`), and
-- thread them via new builder setters in the factory arm.
-
-A checklist that stops at the config enums leaves Azure/Vertex with no way to
-receive their core config.
 
 ## The variant list is generated
 
@@ -391,62 +361,3 @@ a negative test that a genuinely unknown `type` still errors. (The existing
 `rejects_unknown_type` fixture asserts `type = "gemini"` is rejected; adding a
 `google` variant leaves `gemini` unknown, so that fixture keeps passing unchanged -
 no edit required.)
-
-## Client configuration surface
-
-Azure (`deployment`, `auth_mode`, `api_surface`) and Vertex (`project`,
-`location`, `auth_mode`, `credentials_path`) carry fields the current
-`ConnectionConfigView` / `ConnectionConfigPayload` cannot represent, and the KCM /
-GTK / TUI connection edit dialogs have no controls for them. v1 ships these two as
-**config-file-only** (documented `daemon.toml` blocks in `cloud-providers.md`);
-adding the fields to the wire views and the client edit dialogs is a tracked
-follow-up. OpenRouter's fields fit the existing OpenAI-shaped view, so it is
-GUI-configurable from the start.
-
-## Phased build plan
-
-Each provider is an independently shippable change; the shared wiring files (the
-four enums and mappers, `registry.rs`, `model_defaults.toml`) are edited by all
-three, so the provider changes are serialized rather than developed in parallel
-worktrees.
-
-1. `llm-openrouter` - lowest risk, OpenAI-compatible, unlocks the most models.
-   The Chat Completions dialect (types, SSE parsing, tool-schema + empty-key
-   sanitizer, `cache_control` helper) starts as an internal module here.
-2. `llm-azure` - v1 GA Chat Completions; becomes the second consumer of the
-   dialect, at which point it is extracted into `llm-openai-compat`.
-3. `llm-google` (Vertex Gemini) - full custom mapping; the largest change.
-
-Robustness the reference connectors proved necessary, carried into all three (per
-"if it generalizes, share it; if it applies conceptually but differs, reimplement
-using Bedrock as a guide"):
-
-- Tool-schema sanitization (Bedrock strips top-level `oneOf/anyOf/allOf` and
-  injects `type`; one bad MCP schema 400s the whole turn). Shared in the compat
-  module for OpenRouter/Azure; reimplemented, larger, for Gemini's stricter
-  OpenAPI-subset (also drops `$schema`, `additionalProperties`, `$ref`).
-- Empty-key tool-input `{"":{}}` sanitization (gpt-oss emits it; OpenRouter routes
-  gpt-oss). Shared in the compat module.
-- "Streaming with tools unsupported" detection: classify to
-  `CoreError::ToolsUnsupported` at minimum; a non-streaming fallback + per-model
-  memo is the Bedrock-proven ideal, relevant to OpenRouter's weak-backend long
-  tail.
-- TTL'd model-list cache (above).
-
-Testing mirrors the reference crates: `httpmock` integration tests with SSE body
-fixtures, pure error-classifier unit tests, a cancellation test, tool-accumulator
-tests, malformed-SSE tolerance, callback-abort state preservation, and (Anthropic
-pattern) a redaction test. Written first (failing), per the repo TDD policy.
-
-## The Google target (decided)
-
-Google = **Vertex AI** (Gemini), the cloud-credential-authenticated,
-project/region-scoped gateway that parallels Bedrock. The simpler Gemini API on
-`generativelanguage.googleapis.com` (single `GOOGLE_API_KEY`, no project/region)
-is folded in as an `auth_mode` variant of the same crate, since both speak the
-identical `generateContent` schema and differ only in host and auth. See
-`google.md`. Verified current: Vertex `v1` REST
-`.../publishers/google/models/{model}:streamGenerateContent` is the live GA
-surface (branding is migrating to "Gemini Enterprise Agent Platform" but the REST
-path is unchanged); `v1beta1` carries the newest features and may be required for
-`thinkingConfig` - confirm at implementation.

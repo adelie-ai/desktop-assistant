@@ -3,8 +3,8 @@
 //!
 //! Consolidation soft-deletes an entry when it is superseded or pruned, but no
 //! read path filtered `deleted_at`, so retired facts stayed fully searchable
-//! and were handed back to the assistant as current. On `adele-prod` that was
-//! 681 tombstones against 75 live entries -- roughly 90% of everything the
+//! and were handed back to the assistant as current. On a live instance that
+//! was 681 tombstones against 75 live entries -- roughly 90% of everything the
 //! knowledge base could return had already been retired.
 //!
 //! The embedding pipeline had the same split: `invalidate_all_knowledge_

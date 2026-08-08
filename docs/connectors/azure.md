@@ -1,6 +1,6 @@
 # Azure OpenAI Connector
 
-Crate: `desktop-assistant-llm-azure` (planned)
+Crate: `desktop-assistant-llm-azure`
 
 Azure OpenAI (Microsoft Foundry) serves models through operator-provisioned
 **deployments**. One connector points at one Azure resource and picks a model on
@@ -46,18 +46,21 @@ Responses surface is a later option that would also unlock hosted tool search.
 The connector key `azure` would derive `AZURE_API_KEY` from the generic rule, so
 `AzureConnection` sets an explicit default `api_key_env = "AZURE_OPENAI_API_KEY"`
 (and `AZURE_OPENAI_BASE_URL` / `AZURE_OPENAI_MODEL`) to match Azure's own
-conventions. Fields: `deployment` (the body `model`), `api_surface` (`v1` |
+conventions. Fields: `api_surface` (`v1` |
 `classic`), `auth_mode` (`api_key` | `entra`), `api_version` (classic only),
-`base_url`, api_key_env, secret, timeouts, max_context_tokens. `base_url` is the
+`base_url`, api_key_env, secret, timeouts, max_context_tokens. The deployment
+name is not a connection field: it is the per-purpose `model`, sent in the
+request body. `base_url` is the
 resource endpoint, so `Connector::default_http_base_url` returns empty; a
 missing base_url resolves to a clean `Unavailable` at preflight (see below), not a
 default host. The struct holds the api key / token and implements a redacting
 `Debug`.
 
-These fields exceed what `ConnectionConfigView` / `ConnectionConfigPayload` can
-represent and have no client edit-dialog controls, so **v1 Azure is
-config-file-only** with a documented `daemon.toml` block in `cloud-providers.md`;
-wiring the fields into the wire views and client dialogs is a tracked follow-up.
+`ConnectionConfigView` carries these fields (`base_url`, `api_key_env`,
+`api_surface`, `auth_mode`, `api_version`, the timeouts and
+`max_context_tokens`), so an Azure connection can be created and edited over the
+API as well as from a `daemon.toml` block - see `cloud-providers.md` for the
+file form.
 
 ## Preflight
 
@@ -148,29 +151,3 @@ Azure serves `text-embedding-3-*` via deployments. `EmbeddingClient` targets
 OpenAI-compatible, so the existing embeddings `_` fallthrough in `main.rs` can
 serve it with the correct base_url - but the availability gate must be the real
 `supports_embeddings` check, not the current `connector != "anthropic"` literal.
-
-## Test plan
-
-- v1 URL shaping (`/openai/v1/chat/completions`, body `model`, no api-version) and
-  the classic fallback shape.
-- `api-key` header vs Entra bearer (refreshing `TokenProvider`, token never
-  logged).
-- Preflight: missing base_url / model / (api_key when `auth_mode=api_key`) each
-  yield a specific `Unavailable`.
-- Message/tool round-trip (shared compat tests + an Azure smoke);
-  `max_completion_tokens` for reasoning models.
-- `cached_tokens` -> `cache_read_input_tokens`.
-- Reasoning gating via deployment -> base-model resolution.
-- Error paths (httpmock): 400 overflow, 401, 429 (+retry-after), content-filter
-  decline, 5xx.
-- Embeddings round-trip via `/openai/v1/embeddings`.
-- Redacting `Debug`; cancellation; malformed-SSE tolerance; callback-abort
-  preservation.
-
-## Open questions
-
-- Whether to add Entra ID in v1 or ship `api_key` first and add `auth_mode=entra`
-  behind the `TokenProvider` seam next (reusing the workspace `jsonwebtoken` +
-  existing OAuth machinery; any new Azure identity crate gated on a CVE scan).
-- Whether to expose the `classic` surface at all in v1, or v1-only until a real
-  legacy resource needs it.

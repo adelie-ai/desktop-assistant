@@ -17,7 +17,8 @@ Crate: `desktop-assistant-llm-openai`
 | Environment | `OPENAI_API_KEY` | Yes |
 | Environment | `OPENAI_MODEL` | No |
 | Environment | `OPENAI_BASE_URL` | No |
-| Config file | `daemon.toml` [openai] section | No |
+| Config file | `daemon.toml` `[llm]` `connector = "openai"` | No |
+| Config file | `daemon.toml` `[connections.<id>]` `type = "openai"` | No |
 
 ## Context-Overflow Detection
 

@@ -2,10 +2,9 @@
 
 The daemon indexes on-disk `SKILL.md` playbooks into a searchable catalog so the
 assistant can find and read a reusable how-to by meaning. This page documents the
-runtime behavior so it need not be re-derived from the code. The full feature
-design (workflows, per-user blessing, client-registered user skills) lives in
-`docs/design/skill-library-and-workflows.md`; this page covers what ships in the
-Postgres index slice (#573).
+runtime behavior so it need not be re-derived from the code. It covers what ships
+in the Postgres index slice (#573); workflows, per-user blessing and
+client-registered user skills are later slices.
 
 > Scope: the **Postgres** path. The SQLite adapter (#594) and the skills-mcp
 > search demotion (#595) are follow-ups; user-scoped (client-registered) skills

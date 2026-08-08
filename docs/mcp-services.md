@@ -416,7 +416,7 @@ Fields under `[servers.http.oauth]`:
 **One-time login.** Run the interactive flow once per account to mint the refresh token. It opens your browser (installed-app loopback + PKCE), captures the redirect on `127.0.0.1`, and writes the refresh token into `secrets.toml` under `refresh_token_ref`:
 
 ```bash
-desktop-assistant --mcp-oauth-login gmail-work
+desktop-assistant-daemon --mcp-oauth-login gmail-work
 # → opens browser, then: "Saved refresh token for 'gmail-work' … Restart the daemon."
 ```
 
@@ -469,6 +469,41 @@ auth_bearer_secret = "google_work_token"
 The examples above use a static `auth_bearer_secret` for brevity; in practice each account entry should carry its own [`[servers.http.oauth]`](#oauth-20-google) block instead (with a distinct `refresh_token_ref` and `account`), so the daemon keeps every account's token fresh on its own. Two services for the *same* account (e.g. Gmail + Calendar) can share one `account` key so a single login covers both.
 
 Within a single account, choosing between that account's calendars (primary vs. a shared "XYZ" calendar) is handled by the server's own `calendarId` tool argument, not by configuration.
+
+A full end-to-end walkthrough for Google's endpoints — creating the OAuth client, the scope list, and the one-time sign-in — is in [Google Workspace setup](RemoteMCP/GoogleWorkspace-setup.md).
+
+## What Tool Discovery Tells the Model
+
+`builtin_tool_search` reports where each hit runs, because a tool's name and
+description do not say which machine it acts on. Each result carries a
+`runs_on` value:
+
+| `runs_on` | What it means |
+|---|---|
+| `daemon` | A built-in, or an MCP server the daemon spawned. Acts on the daemon's own files and processes. |
+| `remote-service` | An MCP server the daemon reaches over HTTP. Acts on that service, and on no local files. |
+| `device` | A tool the connected client registered. Acts on the user's own machine. |
+
+The daemon and remote-service split is read live from the routing table and the
+server configuration, so a server added since startup classifies correctly. A
+name the executor does not route is a built-in, which runs inside the daemon
+process, so it reports `daemon`.
+
+Client-registered tools are searched too. They are registered per connection and
+never written to the tool registry, so a search that consulted only the registry
+could never offer the option that acts on the user's own machine. They are
+matched lexically against the query - the set is tens of tools, and no embedding
+exists for it.
+
+Each response also carries `same_machine` and a one-line `runs_on` legend naming
+the daemon's machine. Only the runner values present in the results are
+described. When the daemon and the client are the same machine, a client tool
+and a daemon tool of the same name are the same capability, so the daemon entry
+is kept and the duplicate is dropped - matching how the turn loop resolves that
+collision.
+
+A search that matched more client tools than it returned reports the count it
+dropped in `more_device_tools_matched`.
 
 ## Startup Behaviour
 
@@ -552,5 +587,5 @@ just backend-dev-restart
 
 ## Further Reading
 
-- [MCP Integration internals](mcp-integration.md) — protocol details, dynamic list refresh, tool routing
+- [Google Workspace setup](RemoteMCP/GoogleWorkspace-setup.md) — end-to-end OAuth walkthrough for Google's remote MCP endpoints
 - [D-Bus API](dbus-api.md) — how clients invoke tools via the conversation API

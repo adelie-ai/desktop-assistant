@@ -3,7 +3,7 @@
 //!
 //! Renaming `nomic-embed-text:latest` to `nomic-embed-text` in `daemon.toml`
 //! resolves to the *same* Ollama digest, but the whole-string comparison saw a
-//! different fingerprint and invalidated everything. On `adele-prod` that
+//! different fingerprint and invalidated everything. On a live instance that
 //! re-embedded 873 rows to produce vectors identical to the ones it replaced.
 //! Cheap against a local Ollama; against a metered provider it is the whole
 //! corpus re-embedded for a config typo, with search degraded until the

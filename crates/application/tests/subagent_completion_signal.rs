@@ -1,5 +1,5 @@
 //! Acceptance tests for the subagent parent-wake *signal* (slice 1 of the
-//! parent-wake feature; see `docs/design/subagent-parent-wake.md`).
+//! parent-wake feature).
 //!
 //! Written before the implementation (TDD). They describe the business
 //! outcome: when a `TaskKind::Subagent` task reaches a terminal state, the

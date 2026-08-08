@@ -240,26 +240,19 @@ just package-snap           # run on host with snapd/core24
 - [API transport](docs/API_TRANSPORT.md)
 - [WebSocket API](docs/WEBSOCKET_API.md)
 - [D-Bus API](docs/dbus-api.md)
-- [MCP services](docs/mcp-services.md) — adding and configuring MCP servers
-- [MCP integration internals](docs/mcp-integration.md)
+- [MCP services](docs/mcp-services.md) — adding and configuring MCP servers, tool routing, and where each tool runs
 - [Development guide](docs/development.md)
 - [Logging and telemetry](docs/logging.md) — `RUST_LOG`, the level contract, OTLP export
 - [Cloud providers](docs/cloud-providers.md)
 
 ## What's not done yet
 
-The multi-agent / multi-transport foundation is in; several wiring follow-ups
-are tracked and unfinished:
+The multi-agent / multi-transport foundation is in; two follow-ups are tracked
+and unfinished:
 
-- `#128` — wire `ClientToolCoordinator` into `daemon::main` (turn-state
-  resume on reconnect).
 - `#129` — real cold-restart resume for suspended turns. Today, foreground
   and subagent tasks are marked `Failed` on restart; standalone agents are
   marked `Failed` pending real resume.
-- `#133` — dispatch-side enforcement of the `TOOL_ALLOWLIST` task-local.
-- `#134` — wire `SubagentTools` (`spawn_subagent`, `get_subagent_status`)
-  into the `McpToolExecutor` dispatch path. The tools exist but are not yet
-  reachable from a conversation.
 - `#135` — first-class `system_prompt` field on `Conversation`.
 
 ## License

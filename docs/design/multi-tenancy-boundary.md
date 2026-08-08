@@ -176,7 +176,8 @@ only what stays global: TLS certificates, `ws_auth`, and the host-global tool an
 skill index embedder.
 
 That matters because restart-as-reconfiguration is not viable for a shared instance.
-Prod runs one replica with `strategy=Recreate`, shutdown does not drain in-flight
+A shared instance may legitimately run a single replica behind a rollout strategy that
+stops the old process before the new one is ready, shutdown does not drain in-flight
 turns, and an abandoned turn is a known data-loss path (#583). Reconfiguring should
 never cost every tenant their connection.
 

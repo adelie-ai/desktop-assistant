@@ -234,7 +234,7 @@ pub struct SpawnMeta {
 
 /// Fires when a `TaskKind::Subagent` task reaches a terminal state, so a
 /// parent-wake coordinator can re-engage the parent conversation without
-/// polling (parent-wake feature; see `docs/design/subagent-parent-wake.md`).
+/// polling (parent-wake feature).
 ///
 /// The child's final answer is NOT carried here — it is already written to the
 /// session scratchpad as a `result` note under [`owner_todo`](Self::owner_todo)
@@ -1354,7 +1354,7 @@ impl Inner {
             notify.notify_waiters();
         }
 
-        // Parent-wake signal (see `docs/design/subagent-parent-wake.md`): a
+        // Parent-wake signal: a
         // terminated subagent notifies the late-set observer so the parent
         // conversation can be re-engaged without polling. Fired LAST — after
         // every lock is released, after the `TaskCompleted` broadcast, and after

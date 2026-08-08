@@ -1,20 +1,12 @@
 # Security Audit — desktop-assistant
 
-**Date:** 2026-03-31
+**Audited:** 2026-03-31
+**Last updated:** 2026-08-08
 **Scope:** All crates in the `desktop-assistant/` Cargo workspace
 
 ---
 
 ## Accepted Risks
-
-### 1. No WebSocket Origin Validation (ACCEPTED — LOW)
-
-**File:** `crates/ws-interface/src/lib.rs:135-149`
-
-**Status:** Accepted risk (2026-03-31)
-**Rationale:** The intended clients are native applications (gtk-client, TUI), not browsers. Native clients do not send `Origin` headers, so CSWSH is not a practical attack vector. Revisit if browser-based clients are ever added.
-
----
 
 ### 2. Internal Error Details Leaked to Clients (ACCEPTED — LOW)
 
@@ -27,7 +19,7 @@
 
 ### 3. Hardcoded PAM Service Name (ACCEPTED — LOW)
 
-**File:** `crates/daemon/src/config.rs:1715`
+**File:** `crates/daemon/src/config/pam_auth.rs:184`
 
 **Status:** Accepted risk (2026-03-31)
 **Rationale:** The `"login"` service works correctly. Using a dedicated PAM service is a hygiene improvement but not a vulnerability. Revisit when packaging/distribution is addressed.
@@ -36,7 +28,7 @@
 
 ### 4. Server Auth Config via Environment Variables (ACCEPTED — LOW)
 
-**File:** `crates/daemon/src/main.rs:174-179`
+**File:** `crates/daemon/src/transports.rs:539-544`
 
 **Status:** Accepted risk (2026-03-31)
 **Rationale:** These env vars are *server-side* configuration controlling what credentials the `/login` endpoint accepts — not client credentials being passed around. When managed by systemd, env vars can be loaded from restricted files via `EnvironmentFile=`.
@@ -63,7 +55,7 @@ source address and per username, and the endpoint answers `429` with
 
 ### 6. FNV-1a Hash for Secret Fingerprinting (LOW)
 
-**File:** `crates/daemon/src/config.rs:1142-1154`
+**File:** `crates/daemon/src/config/secrets.rs:266-276`
 
 FNV-1a is used to generate log fingerprints for secrets. FNV is not collision-resistant.
 
@@ -77,6 +69,26 @@ FNV-1a is used to generate log fingerprints for secrets. FNV is not collision-re
 
 **Status:** Resolved by #142 (`feat/issue-142-ws-msg-size`).
 The `WebSocketUpgrade` now sets both `.max_message_size(4 << 20)` and `.max_frame_size(4 << 20)` (4 MiB), matching the UDS frame cap in `crates/uds-interface/src/lib.rs` and the D-Bus bridge cap in `crates/dbus-bridge/src/transport.rs`. The handler emits a clean RFC 6455 close (code 1009, "Message Too Big") when the cap is exceeded rather than dropping the TCP connection silently. See `docs/API_TRANSPORT.md` for the cross-transport summary.
+
+---
+
+## Resolved
+
+### 1. No WebSocket Origin Validation (RESOLVED — 2026-08-08)
+
+**File:** `crates/ws-interface/src/lib.rs:297`
+
+**Status:** Resolved. `validate_origin()` checks the `Origin` header against the
+`[ws_auth] allowed_origins` list and is enforced on both entry points a browser
+can reach: the WebSocket upgrade (`:366`) and `POST /login` (`:487`). An
+`Origin` that is not on the list is refused with `403` before any handler runs,
+and an empty list refuses every `Origin`, so browser clients are denied by
+default rather than allowed by omission.
+
+**Remaining limit, by design:** a request carrying no `Origin` header at all is
+allowed. That is the native-client path — tui/gtk send none. This closes the
+browser CSWSH vector; it is not an authentication check, and it does not
+constrain a non-browser client that simply omits the header.
 
 ---
 

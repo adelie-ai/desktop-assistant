@@ -1,21 +1,22 @@
 //! Unix-domain-socket frontend for the assistant API.
 //!
-//! Local clients (D-Bus bridge, CLI, future minter shim) talk to the
-//! daemon over a single UDS path that speaks the same JSON wire format
-//! as the WebSocket adapter. Per `docs/architecture-evolution.md` rule
-//! #5, the transport is pluggable and the daemon does **not** auth
-//! local clients by peer-cred — every connection still presents a JWT,
-//! issued by the local minter (#100 / `auth-jwt`).
+//! Local clients (D-Bus bridge, CLI) talk to the daemon over a single
+//! UDS path that speaks the same JSON wire format as the WebSocket
+//! adapter. Per `docs/architecture-evolution.md` rule #5 the transport
+//! is pluggable, and the daemon authenticates a local connection by the
+//! kernel's `SO_PEERCRED` (#407): the standalone minter is retired, and
+//! a JWT is only needed on the network door.
 //!
 //! ## Framing
 //!
 //! UDS is a byte stream, not message-oriented, so each frame is sent
 //! as a 4-byte little-endian `u32` length prefix followed by the JSON
-//! body. The first frame on every connection is a handshake of the
-//! shape `{"jwt": "<token>"}`. If the token validates we enter the
-//! shared [`desktop_assistant_transport_dispatch::dispatch_loop`];
-//! otherwise we write a `WsFrame::Error` describing the failure and
-//! close the socket.
+//! body. The first frame on every connection is a handshake whose
+//! `jwt` field is optional — a peer-cred-authenticated local client
+//! sends none. If the connection authenticates we enter the shared
+//! [`desktop_assistant_transport_dispatch::dispatch_loop`]; otherwise
+//! we write a `WsFrame::Error` describing the failure and close the
+//! socket.
 //!
 //! ## Auth
 //!

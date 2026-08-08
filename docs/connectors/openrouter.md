@@ -1,6 +1,6 @@
 # OpenRouter Connector
 
-Crate: `desktop-assistant-llm-openrouter` (planned)
+Crate: `desktop-assistant-llm-openrouter`
 
 OpenRouter is an OpenAI-compatible aggregator that routes one API to many model
 vendors (`anthropic/*`, `openai/*`, `google/*`, `meta-llama/*`, ...). Built on the
@@ -140,29 +140,3 @@ implement `EmbeddingClient`; `Connector::supports_embeddings` returns `false`
 explicitly (the enum default is `true`), and the embeddings availability gate must
 exclude OpenRouter so an embedding purpose does not silently build an OpenAI-shaped
 client against `/embeddings`.
-
-## Test plan
-
-- `convert_messages` round-trip; flat `function` tool serialization; tool-call
-  accumulation from indexed `delta.tool_calls`.
-- Schema + empty-key sanitization (shared compat tests).
-- Caching: system-block `cache_control` present; `cache_write_tokens` /
-  `cached_tokens` parsed into usage.
-- Reasoning: `effort` and `max_tokens` mapping; omitted when empty.
-- Error paths (httpmock): 400 overflow, 402 credits, 429 + retry, 5xx,
-  tools-unsupported.
-- Streaming-with-tools-unsupported fallback (#619): the provider error is
-  classified to `ToolsUnsupported`; the non-streaming retry returns the tool
-  calls + usage + text-via-`on_chunk`; the memo skips streaming on the second
-  call (the streaming endpoint is not hit again); a model that does not error
-  stays on streaming; a non-streaming failure surfaces without looping;
-  cancellation is honoured on the non-streaming path.
-- `MODEL_OVERRIDE` routes the body `model`.
-- Redacting `Debug`; cancellation mid-stream; malformed-SSE tolerance;
-  callback-abort preserves accumulated tool calls and usage.
-
-## Open questions
-
-- Default attribution `HTTP-Referer` / `X-Title` value (Adele project URL).
-- Whether to expose provider-routing preferences (`provider: {order,
-  allow_fallbacks}`) as config, or keep v1 minimal.

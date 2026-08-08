@@ -17,7 +17,8 @@ Crate: `desktop-assistant-llm-anthropic`
 | Environment | `ANTHROPIC_API_KEY` | Yes |
 | Environment | `ANTHROPIC_MODEL` | No |
 | Environment | `ANTHROPIC_BASE_URL` | No |
-| Config file | `daemon.toml` [anthropic] section | No |
+| Config file | `daemon.toml` `[llm]` `connector = "anthropic"` | No |
+| Config file | `daemon.toml` `[connections.<id>]` `type = "anthropic"` | No |
 
 ## Prompt Caching
 

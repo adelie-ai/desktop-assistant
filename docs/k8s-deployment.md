@@ -279,8 +279,7 @@ If a pod goes into `CrashLoopBackOff` after enabling TLS or rotating a
 certificate, check `kubectl logs` for a `TLS setup failed` line naming the
 underlying error, then restore a readable, valid cert/key pair and roll the
 pod. If you want this instance to serve plaintext deliberately - for example
-behind an ingress or a tailnet that already terminates TLS, as in
-[`docs/remote-brain-setup.md`](remote-brain-setup.md) - set
+behind an ingress or a tailnet that already terminates TLS - set
 `[tls] enabled = false` (or `DESKTOP_ASSISTANT_WS_TLS=false`) instead of
 leaving a broken TLS configuration in place.
 

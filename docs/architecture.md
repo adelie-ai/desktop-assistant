@@ -13,6 +13,37 @@ The project follows a ports-and-adapters (hexagonal) layout:
 
 ## Crate Responsibilities
 
+Every workspace member, in `Cargo.toml` order. The crates with more to say have
+their own section below.
+
+| Crate | Responsibility |
+|---|---|
+| `protocol` | Dependency-light protocol and domain enums, plus the pure rules a domain type and its wire view must answer identically |
+| `api-model` | Protocol-neutral command / result / event types shared by every adapter |
+| `application` | Maps `api-model` commands onto the core inbound ports |
+| `frame-codec` | Length-prefixed frame codec (4-byte LE length + body) shared by the local transports |
+| `peer-cred` | Kernel-attested `SO_PEERCRED` identity lookup for a connected Unix socket |
+| `auth-jwt` | HS256 JWT claim shape, codec, and key-file IO for the network door |
+| `ws-interface` | WebSocket frontend (axum), optional TLS, and the `POST /login` endpoint |
+| `core` | Domain entities, inbound and outbound ports, `ConversationHandler` |
+| `daemon` | Composition root: wires adapters, serves the transports |
+| `llm-openai` | OpenAI Responses / Chat Completions streaming connector |
+| `llm-openai-compat` | Building blocks for the OpenAI Chat Completions dialect — a library, not an `LlmClient` |
+| `llm-openrouter` | OpenRouter aggregator connector, on the shared compat dialect |
+| `llm-azure` | Azure OpenAI (Microsoft Foundry) connector, on the shared compat dialect |
+| `llm-bedrock` | Amazon Bedrock connector (Converse, Responses, Invoke) |
+| `llm-anthropic` | Anthropic Messages API connector |
+| `llm-google` | Google Vertex AI / Gemini `generateContent` connector |
+| `llm-ollama` | Ollama connector, implementing both `LlmClient` and `EmbeddingClient` |
+| `llm-http` | Shared HTTP error-handling helpers for the reqwest-based connectors |
+| `mcp-client` | MCP transport, tool discovery, and per-server tool routing |
+| `storage` | Postgres persistence for conversations, knowledge, and assistant state |
+| `storage-sqlite` | Embeddable SQLite adapter over the same storage ports, behind an off-by-default `sqlite` feature |
+| `client-common` | Shared client-side transport, config, and command types for the frontends |
+| `transport-dispatch` | The per-connection request / event loop that WS and UDS both run |
+| `uds-interface` | Unix-domain-socket frontend; local clients authenticate by peer-cred |
+| `dbus-bridge` | Standalone per-user binary that owns `org.desktopAssistant` |
+
 ## `core`
 
 - Domain entities (`Conversation`, `Message`, roles, tool metadata)
@@ -61,16 +92,12 @@ The project follows a ports-and-adapters (hexagonal) layout:
   rows are pruned — without a daemon restart. Unwired when there is no Postgres,
   leaving the headless path unchanged.
 
-## `tui`
-
-- Terminal interface for conversation workflows
-- Connects to daemon over D-Bus
-- Streams response updates from D-Bus signals
-
 ## Runtime Flow (Prompt)
 
-1. TUI (or any D-Bus client) calls `SendPrompt`
-2. D-Bus adapter forwards to core service
+1. A client calls `SendPrompt` over one of the transports — WebSocket, UDS, or
+   D-Bus, which the bridge carries to the daemon over UDS
+2. The transport adapter maps the call to an `api::Command`; the shared
+   dispatcher hands it to the application layer and on to the core service
 3. Core looks the prompt up against memory and surfaces the candidates as a
    `[Recall]` block on the turn's first round - see
    [pre-prompt recall](features/pre-prompt-recall.md). What that block offered,
@@ -83,7 +110,8 @@ The project follows a ports-and-adapters (hexagonal) layout:
    allowlist, the turn's provenance gate, and what this user has been burned by
    before - see [negative memory](features/negative-memory.md) - then executes
    the permitted ones through the MCP executor
-6. D-Bus adapter emits chunk/complete/error signals
+6. The dispatcher streams chunk / complete / error events back over the same
+   connection; for a D-Bus caller the bridge re-emits them as D-Bus signals
 7. Client renders updates incrementally
 
 ### Tool-provenance gating
