@@ -12,6 +12,12 @@ license = "AGPL-3.0-or-later"
 # off-by-default `otel` feature, which the daemon's `otel` passthrough turns on
 # for the one shared build of that crate.
 adelie-telemetry.workspace = true
+# The bridge between a `tracing` span and a W3C trace context, used only by
+# `otel_bridge`. Both are optional and reached only through the `otel` feature,
+# so a default build resolves neither. The opentelemetry 0.x crates version-lock
+# as a set, so these two track the versions `adelie-telemetry` pins.
+tracing-opentelemetry = { version = "0.33", optional = true }
+opentelemetry = { version = "0.32", optional = true }
 async-trait.workspace = true
 backon = "1"
 desktop-assistant-auth-jwt.workspace = true
@@ -39,8 +45,30 @@ chrono-tz = "0.10.4"
 # `SkillIndexStore` implementation must satisfy. Enabled by the storage crates'
 # dev-dependencies so each adapter's test suite runs the same cases.
 test-support = []
+# Off by default, and turned on by the daemon's own `otel` passthrough. It buys
+# one thing this crate cannot do otherwise: give a turn span the trace id its
+# request id spells, and read that id back out for an outbound call. Everything
+# else about a turn's telemetry works without it, including the correlation id
+# on every log line. A default build resolves no opentelemetry crate, which
+# `scripts/no-opentelemetry.sh` holds the line on.
+otel = [
+    "adelie-telemetry/otel",
+    "dep:tracing-opentelemetry",
+    "dep:opentelemetry",
+]
+
+# The `otel` acceptance test is its own target with `required-features`, so
+# these are compiled only when that feature is on and a default `cargo test`
+# resolves none of them. Dev edges are outside what a shipped build compiles,
+# which is what `scripts/no-opentelemetry.sh` reads (`--edges normal,build`).
+[[test]]
+name = "trace_otel"
+required-features = ["otel"]
 
 [dev-dependencies]
+opentelemetry = "0.32"
+opentelemetry_sdk = "0.32"
+tracing-opentelemetry = "0.33"
 tokio = { workspace = true, features = ["test-util", "macros"] }
 # Log capture for the level-contract tests: they assert what does and does not
 # reach a line at a given level, which needs a subscriber writing into a buffer.

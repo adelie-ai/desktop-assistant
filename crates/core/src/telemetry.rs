@@ -15,8 +15,19 @@
 //!
 //! A conversation is deliberately **not** a trace. It lives for days and holds
 //! an unbounded number of turns, which no backend renders usefully. The
-//! conversation id is a span attribute instead, so one query still returns
-//! every turn in a conversation.
+//! conversation id is a span attribute on every span here instead, so one query
+//! still returns every turn in a conversation.
+//!
+//! ## The trace id is the request id
+//!
+//! A uuid is 16 bytes and a W3C trace id is 16 bytes, so the turn's own
+//! correlation id becomes its trace id with no mapping table between them. The
+//! client mints that id, the daemon adopts it, and
+//! [`crate::ports::turn_telemetry`] owns both rules. One identifier then
+//! appears in the client's event stream, in the pod log and in a backend.
+//!
+//! Binding it to an exported span needs the `otel` feature; carrying it does
+//! not. A default build still puts the value on every line the turn writes.
 //!
 //! ## Every span here is at INFO, and closes with a line
 //!
@@ -231,9 +242,14 @@ impl ToolRunner {
 /// `rounds`, `outcome` and `duration_ms` are declared empty and filled in when
 /// the turn ends, so one span answers both "which turn was this" and "what did
 /// it cost" without a second lookup.
-pub(crate) fn turn_span(conversation_id: &str, request_id: &str, user_id: &str) -> tracing::Span {
+pub(crate) fn turn_span(
+    conversation_id: &str,
+    request_id: &str,
+    user_id: &str,
+    trace: &crate::ports::turn_telemetry::TurnTrace,
+) -> tracing::Span {
     let route = crate::ports::turn_telemetry::current_turn_route();
-    tracing::info_span!(
+    let span = tracing::info_span!(
         "turn",
         request_id = request_id,
         conversation_id = conversation_id,
@@ -241,10 +257,16 @@ pub(crate) fn turn_span(conversation_id: &str, request_id: &str, user_id: &str) 
         connection_id = route.connection_id(),
         model = route.model(),
         provider = route.provider(),
+        trace_id = %trace.trace.trace_id(),
         rounds = tracing::field::Empty,
         outcome = tracing::field::Empty,
         duration_ms = tracing::field::Empty,
-    )
+    );
+    // The turn is the root of its trace, so this is where the trace id the
+    // client already knows becomes the one a backend indexes by. Everything
+    // below inherits it.
+    crate::otel_bridge::bind_parent(&span, trace);
+    span
 }
 
 /// One iteration of the tool loop.
@@ -255,6 +277,7 @@ pub(crate) fn round_span(round: usize) -> tracing::Span {
     tracing::info_span!(
         "turn.round",
         round = round,
+        conversation_id = %crate::ports::turn_telemetry::current_conversation_id(),
         tools = tracing::field::Empty,
         outcome = tracing::field::Empty,
         input_tokens = tracing::field::Empty,
@@ -313,6 +336,8 @@ pub(crate) fn aux_llm_span(purpose: LlmPurpose) -> tracing::Span {
         purpose = purpose.as_label(),
         provider = route.provider(),
         model = route.model(),
+        conversation_id = %crate::ports::turn_telemetry::current_conversation_id(),
+        provider_request_id = tracing::field::Empty,
     )
 }
 
@@ -357,7 +382,9 @@ pub(crate) fn llm_span(parent: &tracing::Span, round: usize, route: &TurnRoute) 
         round = round,
         provider = route.provider(),
         model = route.model(),
+        conversation_id = %crate::ports::turn_telemetry::current_conversation_id(),
         outcome = tracing::field::Empty,
+        provider_request_id = tracing::field::Empty,
     )
 }
 
@@ -374,6 +401,7 @@ pub(crate) fn tool_span(parent: &tracing::Span, tool: &str, runner: ToolRunner) 
         "tool.call",
         tool = %Safe::name(tool),
         runner = runner.as_label(),
+        conversation_id = %crate::ports::turn_telemetry::current_conversation_id(),
         outcome = tracing::field::Empty,
     )
 }

@@ -172,6 +172,15 @@ impl<T: BridgeTransport + 'static> DbusConversationsAdapter<T> {
                     client_context: None,
                     // The D-Bus bridge does not originate idempotency keys (#204).
                     idempotency_key: None,
+                    // The bridge is the top of the trace for a D-Bus caller.
+                    // `SendPrompt(ss) -> s` has no room for a caller-supplied
+                    // id and no options dictionary to add one to, and widening
+                    // that signature would break every existing caller, so the
+                    // bridge mints. A D-Bus caller still gets a correlatable
+                    // turn: the id it is handed back is the one the daemon
+                    // stamps every streamed event with.
+                    turn_id: Some(uuid::Uuid::new_v4().to_string()),
+                    traceparent: None,
                 },
             )
             .await?;

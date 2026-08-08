@@ -56,6 +56,7 @@ use crate::ports::transport::{
 use crate::ports::turn_interactivity::{
     TurnInteractivity, current_turn_interactivity, with_turn_interactivity,
 };
+use crate::ports::turn_telemetry::{TurnTrace, current_turn_trace, with_turn_trace};
 
 /// The set of request-scoped task-locals that must be re-installed inside a
 /// spawned turn body. Capture it before the spawn, re-install it inside.
@@ -95,6 +96,12 @@ pub struct RequestScope {
     /// runs on a spawned task inherits the decision its caller made rather than
     /// re-deriving it from the session it also carries.
     pub interactivity: TurnInteractivity,
+    /// Which trace this turn belongs to, and which conversation it is part of.
+    /// Resolved at the transport boundary, which is the only place that knows
+    /// both what the client sent and what the daemon adopted. `None` where the
+    /// turn reached the loop by another door, and the loop then mints its own
+    /// from the correlation id.
+    pub turn_trace: Option<TurnTrace>,
 }
 
 impl RequestScope {
@@ -114,6 +121,7 @@ impl RequestScope {
             client_label: current_client_label(),
             client_context: current_client_context(),
             interactivity: current_turn_interactivity(),
+            turn_trace: current_turn_trace(),
         }
     }
 
@@ -147,19 +155,23 @@ impl RequestScope {
             client_label,
             client_context,
             interactivity,
+            turn_trace,
         } = self;
         let fut = Box::pin(fut);
-        with_turn_interactivity(
-            interactivity,
-            with_client_context(
-                client_context,
-                with_co_location(
-                    co_located,
-                    with_client_label(
-                        client_label,
-                        with_transport_kind(
-                            transport,
-                            with_user_id(user_id, with_session_id(session_id, fut)),
+        with_turn_trace(
+            turn_trace,
+            with_turn_interactivity(
+                interactivity,
+                with_client_context(
+                    client_context,
+                    with_co_location(
+                        co_located,
+                        with_client_label(
+                            client_label,
+                            with_transport_kind(
+                                transport,
+                                with_user_id(user_id, with_session_id(session_id, fut)),
+                            ),
                         ),
                     ),
                 ),
@@ -296,6 +308,10 @@ mod tests {
                 ..ClientContext::default()
             }),
             interactivity: TurnInteractivity::Interactive,
+            turn_trace: Some(TurnTrace::minted(
+                Some("11111111-2222-4333-8444-555555555555"),
+                "conv-1",
+            )),
         };
         scope.scope(async {}).await;
 

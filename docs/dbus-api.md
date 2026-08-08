@@ -21,6 +21,15 @@ Interface: `org.desktopAssistant.Settings`
 - `DeleteConversation(id: s) -> ()`
 - `ClearAllHistory() -> deleted_count: u`
 - `SendPrompt(conversation_id: s, prompt: s) -> request_id: s`
+  - The returned `request_id` is what every streamed event for this turn
+    carries, and it is also the turn's trace id in the daemon's telemetry.
+  - A D-Bus caller cannot supply its own id: the signature has no room for one
+    and no options dictionary to add one to, so the bridge mints. The bridge is
+    therefore the top of the trace for a D-Bus caller, and the caller still
+    correlates by the value it is handed back.
+- `SendPromptWithSystemRefinement(conversation_id: s, prompt: s, system_refinement: s) -> request_id: s`
+  - As `SendPrompt`, plus a system-prompt addition that applies to this turn
+    only. It is never stored and never appears in chat history.
 - `SetConversationToolGate(conversation_id: s, disabled: b) -> b`
   - Per-conversation override for the tool-provenance gate (see "Tool-provenance
     gating" below). Returns the stored value after the write.

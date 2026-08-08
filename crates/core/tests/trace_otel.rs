@@ -47,10 +47,9 @@ fn traceparent_inside(span: tracing::Span, trace: TurnTrace) -> String {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()
         .expect("a current-thread runtime");
-    runtime.block_on(
-        with_turn_trace(Some(trace), async { outbound_traceparent() }).instrument(span),
-    )
-    .expect("a span with a valid trace context names a traceparent")
+    runtime
+        .block_on(with_turn_trace(Some(trace), async { outbound_traceparent() }).instrument(span))
+        .expect("a span with a valid trace context names a traceparent")
 }
 
 #[test]

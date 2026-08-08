@@ -43,12 +43,7 @@ const ARGUMENT_SENTINEL: &str = "SENTINEL-ARGUMENT-a-path-the-model-chose";
 fn temp_path(label: &str) -> PathBuf {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "mcp-trace-{}-{}-{}",
-        std::process::id(),
-        n,
-        label
-    ))
+    std::env::temp_dir().join(format!("mcp-trace-{}-{}-{}", std::process::id(), n, label))
 }
 
 /// A fake MCP server that answers `initialize` and `tools/call`, and writes the
@@ -87,10 +82,7 @@ async fn stdio_call(label: &str) -> Value {
     .await
     .expect("the fake server must complete the handshake");
     client
-        .call_tool(
-            "echo",
-            serde_json::json!({ "text": ARGUMENT_SENTINEL }),
-        )
+        .call_tool("echo", serde_json::json!({ "text": ARGUMENT_SENTINEL }))
         .await
         .expect("the fake server must answer the call");
     client.shutdown().await;

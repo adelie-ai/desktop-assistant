@@ -110,12 +110,17 @@ lint-sqlite:
 lint-mcp-host:
     cargo clippy -p desktop-assistant-client-common --features mcp-host --all-targets -- -D warnings
 
-# Clippy the two telemetry-exporting binaries with their own `otel` feature
-# enabled, for the same reason `lint-sqlite` and `lint-mcp-host` exist: the
-# feature is off by default and nothing in a workspace build turns it on, so
-# the workspace lint above type-checks none of the exporting path. A change
-# that compiles with default features can still fail with `otel` on.
+# Clippy the telemetry-exporting crates with their own `otel` feature enabled,
+# for the same reason `lint-sqlite` and `lint-mcp-host` exist: the feature is
+# off by default and nothing in a workspace build turns it on, so the workspace
+# lint above type-checks none of the exporting path. A change that compiles
+# with default features can still fail with `otel` on.
+#
+# `core` is named as well as the two binaries because it carries the only code
+# that reads a span's trace context, and a binary's passthrough compiles that
+# code but does not lint `core`'s own targets.
 lint-otel:
+    cargo clippy -p desktop-assistant-core --features otel --all-targets -- -D warnings
     cargo clippy -p desktop-assistant-daemon --features otel --all-targets -- -D warnings
     cargo clippy -p desktop-assistant-dbus-bridge --features otel --all-targets -- -D warnings
 
@@ -139,9 +144,10 @@ doc-sqlite:
 doc-mcp-host:
     ./scripts/doc.sh -p desktop-assistant-client-common --features mcp-host
 
-# Rustdoc the two telemetry-exporting binaries with their `otel` feature on,
-# for the same reason `lint-otel` exists.
+# Rustdoc the telemetry-exporting crates with their `otel` feature on, for the
+# same reason `lint-otel` exists.
 doc-otel:
+    ./scripts/doc.sh -p desktop-assistant-core --features otel
     ./scripts/doc.sh -p desktop-assistant-daemon --features otel
     ./scripts/doc.sh -p desktop-assistant-dbus-bridge --features otel
 
@@ -170,10 +176,16 @@ test-sqlite:
 test-mcp-host:
     cargo test -p desktop-assistant-client-common --features mcp-host
 
-# Run the two telemetry-exporting binaries' suites with `otel` on. The OTLP
-# pipelines are built at `init`, so this is the only step that compiles and
-# runs them; it needs a C compiler and an assembler for the TLS backend.
+# Run the telemetry-exporting crates' suites with `otel` on. The OTLP pipelines
+# are built at `init`, so this is the only step that compiles and runs them; it
+# needs a C compiler and an assembler for the TLS backend.
+#
+# `core`'s `trace_otel` target declares `required-features = ["otel"]`, so this
+# is the only step that runs it at all. It holds the two claims that cannot be
+# made with the feature off: that an exported span carries the trace id the
+# request id spells, and that an outbound call names that same trace.
 test-otel:
+    cargo test -p desktop-assistant-core --features otel
     cargo test -p desktop-assistant-daemon --features otel
     cargo test -p desktop-assistant-dbus-bridge --features otel
 

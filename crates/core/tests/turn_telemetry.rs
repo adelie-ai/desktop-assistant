@@ -2069,13 +2069,17 @@ fn a_provider_request_id_cannot_forge_a_log_line() {
     }
 
     assert!(
-        !captured.console.contains("forged: the database is on fire\u{1b}"),
+        !captured
+            .console
+            .contains("forged: the database is on fire\u{1b}"),
         "the escape survived onto the console\n--- console ---\n{}",
         captured.console
     );
     for line in captured.console.lines() {
         assert!(
-            !line.trim_start().starts_with("2026-01-01T00:00:00.0Z ERROR forged"),
+            !line
+                .trim_start()
+                .starts_with("2026-01-01T00:00:00.0Z ERROR forged"),
             "a provider header forged a line that reads as the daemon's own\n\
              --- console ---\n{}",
             captured.console

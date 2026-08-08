@@ -267,7 +267,17 @@ Current command variants:
 - `get_conversation { id }`
 - `delete_conversation { id }`
 - `clear_all_history`
-- `send_message { conversation_id, content }`
+- `send_message { conversation_id, content, turn_id?, traceparent? }`
+  - `turn_id`: the client's own correlation id for this turn, as a uuid. A
+    turn starts when a person presses send, so the client mints this and the
+    daemon adopts it; the ack returns the value the daemon actually uses. An
+    absent, malformed or nil value means the daemon mints its own, which is
+    what keeps an older client working unchanged. It reaches no authorization
+    decision and it is not `idempotency_key`.
+  - `traceparent`: a W3C trace context, for a caller that is already inside a
+    trace and wants the daemon to continue it rather than start one. The web
+    BFF is the case this exists for. An unusable value is discarded and never
+    fails the turn. `tracestate` is not carried.
 - `get_llm_settings`
 - `set_llm_settings { connector, model?, base_url? }`
 - `set_api_key { api_key }`

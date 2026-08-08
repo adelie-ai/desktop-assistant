@@ -20,7 +20,14 @@ This mirrors the Ports & Adapters approach in `AGENTS.md`.
 ### Commands
 - `Ping`
 - `GetStatus`
-- `SendMessage { conversation_id?, content }` (streaming response)
+- `SendMessage { conversation_id?, content, ..., turn_id?, traceparent? }` (streaming response)
+  - `turn_id` is the client's own correlation id for this turn, as a uuid. The
+    daemon adopts a well-formed, non-nil value and returns it on the ack;
+    anything else, including an absent field, means the daemon mints its own.
+    It grants nothing and is not the idempotency key.
+  - `traceparent` is a W3C trace context for a caller that is already inside a
+    trace, so the daemon continues that trace rather than starting one. Absent
+    or unusable values are discarded and never fail the turn.
 - `GetConfig`
 - `SetConfig { changes }`
 
