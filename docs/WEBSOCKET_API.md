@@ -388,16 +388,39 @@ every frame unchanged, and a tier or reason string it does not recognise must
 be treated as `unclassified` / `unknown` - which is to say, assume it can be
 refused.
 
-#### Per-conversation override ("live dangerously")
+#### The tool policy, and what closes by default
 
-A conversation that legitimately wants to read a page and then act on it in
-the same turn can turn the gate off for itself. Send
+**Behaviour change.** The daemon now runs every turn at a *tool policy*, and
+the shipped default is `standard`, which refuses nothing. A turn that reads
+outside content keeps every tier and reports the fact once on the status
+channel. An integrator that relied on tiers closing after ingest must set
+`tool_policy = "aggressive"` under `[security]` in `daemon.toml` to get the
+previous behaviour back. The three levels:
+
+| Level | A turn that has read outside content |
+|---|---|
+| `aggressive` | The four tiers above close for the rest of the turn |
+| `standard` (default) | Nothing closes |
+| `lax` | Nothing closes, and nothing is reported |
+
+The daemon says which level it resolved in its startup log. A value it does
+not recognise is named in an error there, and the daemon runs at `standard`.
+
+#### Per-conversation override
+
+A conversation can ask for the level that refuses nothing, whatever the
+daemon default is. Send
 `set_conversation_tool_gate { conversation_id, disabled: true }` and expect
 `result -> conversation_tool_gate { disabled: true }` echoing the stored
-value. `disabled` is resolved fresh on every send, so flipping it takes
-effect starting with the conversation's next turn; `GetConversation` also
-reports the live value as `tool_gate_disabled` on the conversation view
-(omitted from the wire when `false`).
+value. `disabled: true` selects `lax`; `disabled: false` stores no level, so
+the conversation follows the daemon default. The value is resolved fresh on
+every send, so flipping it takes effect starting with the conversation's next
+turn; `GetConversation` also reports the live value as `tool_gate_disabled`
+on the conversation view (omitted from the wire when `false`).
+
+A conversation cannot yet select `aggressive` for itself - the stored value is
+still the boolean this command has always carried. Naming all three levels per
+conversation is issue #1199.
 
 With the override on, a gated tool call runs even after the turn has read
 outside content - `check()` never refuses. The turn still tracks whether it

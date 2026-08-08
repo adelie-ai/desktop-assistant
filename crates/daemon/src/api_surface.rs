@@ -26,6 +26,7 @@
 //! conversation's last stored selection; if neither is usable, dispatch
 //! through the interactive purpose's default.
 
+use desktop_assistant_core::tool_provenance::ToolPolicy;
 use std::sync::{Arc, Mutex};
 
 use parking_lot::RwLock;
@@ -1237,23 +1238,52 @@ where
         }
     }
 
-    /// Resolve the effective tool-provenance-gate override for a send
-    /// (#1007). Fails closed: any store error logs a warning and resolves to
-    /// `false` — the gate stays enforced. A broken read must never fail open
-    /// into bypassing the gate.
-    async fn resolve_tool_gate_disabled(&self, conversation_id: &ConversationId) -> bool {
+    /// This daemon's configured default tool policy, read from the live
+    /// configuration so a reload takes effect without a restart.
+    ///
+    /// Startup validation rejects an unparseable value, so reaching the
+    /// fallback here means a reload introduced one. That warns and uses the
+    /// shipped default: a running daemon must not be left without a level, and
+    /// it must not silently take a more permissive one than the operator's
+    /// last valid choice.
+    fn configured_tool_policy(&self) -> ToolPolicy {
+        match self.registry.snapshot_config().security.tool_policy() {
+            Ok(policy) => policy,
+            Err(e) => {
+                tracing::warn!("{e}; using {}", ToolPolicy::default().as_str());
+                ToolPolicy::default()
+            }
+        }
+    }
+
+    /// Resolve the tool policy for a send: the conversation's own override,
+    /// else this daemon's configured default.
+    ///
+    /// The stored override is still the boolean #1007 shipped, and `true`
+    /// means [`ToolPolicy::Lax`] - the level that turn asked for by name. A
+    /// stored `false` is not a level; it is the absence of one, so it takes
+    /// the daemon default like any conversation that never set it.
+    ///
+    /// Never resolves to a more permissive level than the operator chose: a
+    /// store error logs and falls back to that default, and only an explicit
+    /// stored `true` reaches [`ToolPolicy::Lax`].
+    async fn resolve_tool_policy(&self, conversation_id: &ConversationId) -> ToolPolicy {
+        let default = self.configured_tool_policy();
         match self
             .selection_store
             .get_tool_gate_disabled(conversation_id)
             .await
         {
-            Ok(disabled) => disabled,
+            Ok(true) => ToolPolicy::Lax,
+            Ok(false) => default,
             Err(e) => {
                 tracing::warn!(
                     conversation_id = %conversation_id.0,
-                    "failed to read conversation tool-gate override; gate stays enforced: {e}"
+                    "failed to read conversation tool policy; using the daemon default \
+                     {}: {e}",
+                    default.as_str()
                 );
-                false
+                default
             }
         }
     }
@@ -1811,10 +1841,10 @@ where
         // doesn't outlive the `'static` dispatch future.
         let effective_personality = self.resolve_personality(conversation_id).await;
 
-        // Resolve the per-conversation tool-provenance-gate override (#1007),
-        // fresh on every send, the same way as the personality above. Fails
-        // closed inside `resolve_tool_gate_disabled` itself.
-        let effective_tool_gate_disabled = self.resolve_tool_gate_disabled(conversation_id).await;
+        // Resolve the turn's tool policy, fresh on every send, the same way as
+        // the personality above. A read that fails resolves to this daemon's
+        // configured default inside `resolve_tool_policy` itself.
+        let effective_tool_policy = self.resolve_tool_policy(conversation_id).await;
 
         // Capture the ambient "now" once per turn and render the line the core
         // assembler surfaces as a `[Now]` system message, giving the assistant a
@@ -1850,13 +1880,12 @@ where
             // personality, identical to Phase-1 behaviour; the core read side
             // (`current_personality`) is unchanged.
             let dispatch = with_personality(effective_personality, dispatch);
-            // Install the resolved tool-gate override (#1007) so the core
-            // dispatch loop constructs this turn's `TurnProvenance` disabled
-            // when the conversation has one stored. The core read side
-            // (`current_tool_gate_disabled`) fails closed to `false` outside
-            // this scope.
-            let dispatch = desktop_assistant_core::ports::llm::with_tool_gate_disabled(
-                effective_tool_gate_disabled,
+            // Install the resolved tool policy so the core dispatch loop
+            // constructs this turn's `TurnProvenance` at that level. The core
+            // read side (`current_tool_policy`) reads back the shipped default
+            // outside this scope, never the most permissive level.
+            let dispatch = desktop_assistant_core::ports::llm::with_tool_policy(
+                effective_tool_policy,
                 dispatch,
             );
             // Install the ambient "now" line so the core assembler surfaces a
@@ -5381,7 +5410,7 @@ url = postgres://adele:hunter2@db.example/adele
             /// `send_prompt` — proves the routing wrapper resolved the
             /// conversation's stored tool-gate override and installed it on
             /// the dispatch scope.
-            captured_tool_gate_disabled: StdMutex<Vec<bool>>,
+            captured_tool_policy: StdMutex<Vec<ToolPolicy>>,
         }
 
         impl CapturingInner {
@@ -5392,7 +5421,7 @@ url = postgres://adele:hunter2@db.example/adele
                     captured_model_override: StdMutex::new(Vec::new()),
                     captured_personality: StdMutex::new(Vec::new()),
                     captured_budget: StdMutex::new(Vec::new()),
-                    captured_tool_gate_disabled: StdMutex::new(Vec::new()),
+                    captured_tool_policy: StdMutex::new(Vec::new()),
                 }
             }
         }
@@ -5460,12 +5489,8 @@ url = postgres://adele:hunter2@db.example/adele
                 self.captured_personality.lock().unwrap().push(personality);
                 let budget = desktop_assistant_core::ports::llm::current_context_budget();
                 self.captured_budget.lock().unwrap().push(budget);
-                let gate_disabled =
-                    desktop_assistant_core::ports::llm::current_tool_gate_disabled();
-                self.captured_tool_gate_disabled
-                    .lock()
-                    .unwrap()
-                    .push(gate_disabled);
+                let policy = desktop_assistant_core::ports::llm::current_tool_policy();
+                self.captured_tool_policy.lock().unwrap().push(policy);
                 Ok("ok".to_string())
             }
         }
@@ -5564,19 +5589,20 @@ url = postgres://adele:hunter2@db.example/adele
                 .await
                 .expect("plain send_prompt should succeed via interactive purpose");
 
-            let captured = inner.captured_tool_gate_disabled.lock().unwrap();
+            let captured = inner.captured_tool_policy.lock().unwrap();
             assert_eq!(captured.len(), 1);
-            assert!(
-                !captured[0],
-                "no stored override must resolve to the gate enforced"
+            assert_eq!(
+                captured[0],
+                ToolPolicy::Standard,
+                "no stored override must resolve to the configured default"
             );
         }
 
         #[tokio::test]
-        async fn send_installs_the_stored_tool_gate_override() {
-            // Once `SetConversationToolGate` has pinned `true` on a
-            // conversation, the next send must install that resolved value on
-            // the dispatch scope.
+        async fn a_stored_override_resolves_to_the_permissive_level() {
+            // `SetConversationToolGate { disabled: true }` is a conversation
+            // asking for the level that refuses nothing, and the next send
+            // must install exactly that on the dispatch scope.
             let (routing, inner, _registry, store) = make_handler();
             let id = ConversationId::from("c1");
             store
@@ -5590,11 +5616,12 @@ url = postgres://adele:hunter2@db.example/adele
                 .await
                 .expect("plain send_prompt should succeed via interactive purpose");
 
-            let captured = inner.captured_tool_gate_disabled.lock().unwrap();
+            let captured = inner.captured_tool_policy.lock().unwrap();
             assert_eq!(captured.len(), 1);
-            assert!(
+            assert_eq!(
                 captured[0],
-                "a stored `true` override must resolve to the gate disabled"
+                ToolPolicy::Lax,
+                "a stored `true` override must resolve to the permissive level"
             );
         }
 
@@ -5651,7 +5678,7 @@ url = postgres://adele:hunter2@db.example/adele
         }
 
         #[tokio::test]
-        async fn resolve_tool_gate_disabled_fails_closed_on_a_store_error() {
+        async fn resolve_tool_policy_falls_back_to_the_default_on_a_store_error() {
             let cfg = local_ollama_cfg();
             let registry = make_handle_with(cfg);
             let inner = Arc::new(CapturingInner::new());
@@ -5673,11 +5700,13 @@ url = postgres://adele:hunter2@db.example/adele
                 .await
                 .expect("a broken store must not fail the turn");
 
-            let captured = inner.captured_tool_gate_disabled.lock().unwrap();
+            let captured = inner.captured_tool_policy.lock().unwrap();
             assert_eq!(captured.len(), 1);
-            assert!(
-                !captured[0],
-                "a store error must resolve to the gate enforced, never disabled"
+            assert_eq!(
+                captured[0],
+                ToolPolicy::Standard,
+                "a store error must resolve to the configured default, never to the \
+                 permissive level"
             );
         }
 

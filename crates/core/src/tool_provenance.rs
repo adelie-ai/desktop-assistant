@@ -22,7 +22,17 @@
 //! 2. [`ToolTier`] - what can this tool do?
 //!
 //! [`TurnProvenance`] then tracks, for the length of one turn, whether any
-//! tool has returned externally-controlled bytes. Once one has, the tiers that
+//! tool has returned externally-controlled bytes.
+//!
+//! What that fact then does depends on the turn's [`ToolPolicy`], which is
+//! resolved once before the turn starts. The rest of this section describes
+//! [`ToolPolicy::Aggressive`]. Under the shipped default,
+//! [`ToolPolicy::Standard`], no tier closes at all - the turn says once that
+//! it read outside content, and stamps what it writes from that point.
+//! [`ToolPolicy`] states why the default is that way and what it costs.
+//!
+//! Under [`ToolPolicy::Aggressive`], once a tool has returned such bytes the
+//! tiers that
 //! can act - send data out, change any state, run code - stay closed for the
 //! rest of that turn. Two things stay open: reading, because reading is not
 //! exfiltration and closing it would break recall while stopping nothing; and
@@ -125,25 +135,22 @@
 //!   tier and a trusted provenance. The server identity is not available at
 //!   the dispatch chokepoint today. Until it is, the fail-closed default can
 //!   be bypassed by name choice.
-//! - **A per-conversation override can disable the gate outright.** Issue
-//!   #1007 adds a stored, per-conversation boolean that, when set, constructs
-//!   [`TurnProvenance`] with [`TurnProvenance::new_with_gate_disabled`]:
-//!   [`TurnProvenance::check`] then always returns [`ToolGate::Allow`],
-//!   whatever the turn has ingested. This is a deliberate hole in the gate,
-//!   not an oversight - a conversation that legitimately wants to read a page
-//!   and act on it in the same turn has no other way to say so, and the
-//!   alternative (no override at all) pushed some ordinary workflows into
-//!   needless friction. The accepted risk is exactly what the rest of this
-//!   module defends against: with the override on, a turn that reads
-//!   attacker-controlled content and then acts on it is indistinguishable
-//!   from a turn the user actually asked to act, for as long as the override
-//!   stays on. The turn still tracks whether it ingested external content
-//!   (`observe_result` is unchanged), so the loop still tells the person
-//!   watching, once per turn, that a call which would normally have been
-//!   refused ran anyway - see [`GATE_BYPASSED_STATUS`]. Resolution fails
-//!   closed at every layer above this module: an unset value, a missing row,
-//!   a cross-user row, or a store error all resolve to the gate staying
-//!   enforced. Only an explicit stored `true` disables it.
+//! - **The shipped default refuses nothing.** [`ToolPolicy::Standard`] is what
+//!   a turn runs at unless a conversation, a client or the operator says
+//!   otherwise, and at that level no tier ever closes. So the attack this
+//!   module opens with is not stopped by default. That is a recorded trade,
+//!   and [`ToolPolicy`] holds the reasoning: a level that refused on the fact
+//!   of reading fired on ordinary work, so the person switched it off, and a
+//!   control that is switched off protects nothing. What the default keeps is
+//!   the tracking - `observe_result` is unchanged at every level - which pays
+//!   for two things: [`GATE_OPEN_STATUS`] once per turn, and a provenance
+//!   stamp on what the turn writes after it read. The stamp is the part that
+//!   matters, because it closes the cross-turn route two bullets above.
+//!   [`ToolPolicy::Aggressive`] restores the behaviour this module describes,
+//!   per conversation. Resolution never fails open: an unset value, an
+//!   unreadable one, a missing row, a cross-user row, and a store error all
+//!   resolve to the operator's configured default, never to
+//!   [`ToolPolicy::Lax`].
 //! - **Any namespace can claim a shipped tool's classification.** Stripping is
 //!   namespace-agnostic on purpose, because an operator chooses the namespace
 //!   freely (`fs__fileio_read_lines` is the documented example), so this
@@ -223,9 +230,85 @@ pub enum DeclaredReader {
     SubagentAnswer,
 }
 
+/// How much this turn is willing to refuse.
+///
+/// One control, three positions, resolved fresh for every turn. The middle
+/// position is the default and it is the one that decides the shape of the
+/// other two.
+///
+/// **Why the middle position refuses nothing.** A level that refuses because
+/// the turn read a web page fires on ordinary work: research over several
+/// pages, the assistant writing its own scratchpad, every operator-added
+/// server, which this build cannot classify. The person then moves the control
+/// to [`ToolPolicy::Lax`] and is protected by nothing at all. That already
+/// happened once here - the gate shipped, and its blanket opt-out shipped three
+/// days later. So [`ToolPolicy::Standard`] buys its protection from work the
+/// person never feels: it marks what a turn wrote after it read outside
+/// content, and it says once that the turn kept acting. What it does not do is
+/// stop the attack this module describes. That is a recorded trade, not an
+/// oversight: [`ToolPolicy::Aggressive`] is one per-conversation setting away
+/// for work where the residual risk matters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ToolPolicy {
+    /// Every gated tier refuses for the rest of a turn that has taken in
+    /// externally-controlled bytes.
+    Aggressive,
+    /// Nothing refuses. The turn still tracks that it took in outside
+    /// content, so the status line and the provenance stamp on durable
+    /// writes both still happen.
+    #[default]
+    Standard,
+    /// Nothing refuses, nothing is stamped, and nothing is said.
+    Lax,
+}
+
+impl ToolPolicy {
+    /// The wire and configuration spelling of this level.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ToolPolicy::Aggressive => "aggressive",
+            ToolPolicy::Standard => "standard",
+            ToolPolicy::Lax => "lax",
+        }
+    }
+
+    /// Parse a wire or configuration value, or `None` when it names no level
+    /// this build knows.
+    ///
+    /// Deliberately returns `None` rather than a level: a value this build
+    /// cannot read must resolve where the caller's own fallback is written
+    /// down, and never quietly to the most permissive level. Matching ignores
+    /// case and surrounding space, because this arrives from a hand-edited
+    /// configuration file as well as from a client.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "aggressive" => Some(ToolPolicy::Aggressive),
+            "standard" => Some(ToolPolicy::Standard),
+            "lax" => Some(ToolPolicy::Lax),
+            _ => None,
+        }
+    }
+
+    /// Whether a turn under this level stamps the durable writes it makes
+    /// after taking in externally-controlled bytes.
+    ///
+    /// True for every level except [`ToolPolicy::Lax`]. Under
+    /// [`ToolPolicy::Aggressive`] most of those writes are refused anyway, so
+    /// this earns its place at [`ToolPolicy::Standard`], where it closes the
+    /// cross-turn route this module's header records as open: text read from
+    /// outside, written to a note, and read back clean by the next turn.
+    #[must_use]
+    pub fn stamps_durable_writes(self) -> bool {
+        !matches!(self, ToolPolicy::Lax)
+    }
+}
+
 /// What a tool can do, at the granularity the gate needs.
 ///
-/// The variants are ordered from least to most reach. [`ToolTier::is_gated`]
+/// The variants are ordered from least to most reach.
+/// [`ToolTier::is_gated_under`]
 /// and [`ToolTier::label`] both match exhaustively, so a new tier cannot be
 /// added without deciding whether it closes and what the model is told.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -254,23 +337,30 @@ pub enum ToolTier {
 }
 
 impl ToolTier {
-    /// Whether this tier closes once the turn has taken in
+    /// Whether this tier closes under `policy` once the turn has taken in
     /// externally-controlled bytes.
     ///
-    /// Why these four: each one can carry the user's data out, change durable
-    /// state, or run code. The two that stay open cannot. Reading gathers,
-    /// but gathering is only half an exfiltration and the other half is
-    /// closed. Session output reaches the user and nobody else, and the
-    /// model's own prose reaches them regardless.
+    /// Under [`ToolPolicy::Aggressive`], why these four: each one can carry
+    /// the user's data out, change durable state, or run code. The two that
+    /// stay open cannot. Reading gathers, but gathering is only half an
+    /// exfiltration and the other half is closed. Session output reaches the
+    /// user and nobody else, and the model's own prose reaches them
+    /// regardless.
+    ///
+    /// Under the other two policies no tier closes at all, for the reason
+    /// [`ToolPolicy`] gives.
     ///
     /// The loop's own planning surface is unaffected: `begin_step` and
     /// `complete_step` are intercepted before dispatch and never reach this
     /// gate, so a tainted turn can still open and close steps.
     #[must_use]
-    pub fn is_gated(self) -> bool {
-        match self {
-            Read | Present => false,
-            Mutate | Egress | Execution | Unclassified => true,
+    pub fn is_gated_under(self, policy: ToolPolicy) -> bool {
+        match policy {
+            ToolPolicy::Standard | ToolPolicy::Lax => false,
+            ToolPolicy::Aggressive => match self {
+                Read | Present => false,
+                Mutate | Egress | Execution | Unclassified => true,
+            },
         }
     }
 
@@ -912,12 +1002,19 @@ pub enum GateChange {
     JustClosed,
 }
 
-/// Every tier the gate closes, for a caller that has to report the change
-/// rather than evaluate it - a client, an automation, another agent.
+/// Every tier the gate closes under `policy`, for a caller that has to report
+/// the change rather than evaluate it - a client, an automation, another
+/// agent.
 ///
-/// `tier_list_matches_is_gated` holds this against [`ToolTier::is_gated`], so
-/// the two cannot drift.
-pub const GATED_TIERS: &[ToolTier] = &[Mutate, Egress, Execution, Unclassified];
+/// `tier_list_matches_is_gated_under` holds this against
+/// [`ToolTier::is_gated_under`] at every level, so the two cannot drift.
+#[must_use]
+pub fn gated_tiers(policy: ToolPolicy) -> &'static [ToolTier] {
+    match policy {
+        ToolPolicy::Aggressive => &[Mutate, Egress, Execution, Unclassified],
+        ToolPolicy::Standard | ToolPolicy::Lax => &[],
+    }
+}
 
 /// The status line the turn loop emits when the gate closes.
 ///
@@ -927,17 +1024,20 @@ pub const GATED_TIERS: &[ToolTier] = &[Mutate, Egress, Execution, Unclassified];
 pub const GATE_CLOSED_STATUS: &str =
     "Read outside content - sending, changing and running are off for the rest of this turn";
 
-/// The status line the turn loop emits when the per-conversation override
-/// (issue #1007) lets a gated tool run in a turn that would otherwise have
-/// refused it.
+/// The status line the turn loop emits under [`ToolPolicy::Standard`], at the
+/// moment the turn takes in externally-controlled bytes.
 ///
-/// Emitted once per turn, at the same moment [`GATE_CLOSED_STATUS`] would
-/// have fired had the override been off - see
-/// [`TurnProvenance::observe_result`]. A safety-off switch must not be a
-/// silent one: the person watching needs to know a call that would normally
-/// have been refused ran anyway.
-pub const GATE_BYPASSED_STATUS: &str = "Live dangerously is on for this conversation: a tool \
-     that would normally be refused after reading outside content ran anyway.";
+/// Emitted once per turn, at the same moment [`GATE_CLOSED_STATUS`] fires
+/// under [`ToolPolicy::Aggressive`] - see [`TurnProvenance::observe_result`].
+/// A level that refuses nothing must not also be a silent one: this line and
+/// the provenance stamp on durable writes are the whole of what that level
+/// buys, so the person watching has to be able to see the first of them.
+///
+/// It does not say a call was allowed that would otherwise have been refused,
+/// because under this level no call is ever refused, so there is no exception
+/// to report.
+pub const GATE_OPEN_STATUS: &str = "Read outside content - this turn keeps its full tool \
+     access, and what it writes from here is marked.";
 
 /// Whether the current turn has taken in externally-controlled bytes.
 ///
@@ -947,29 +1047,25 @@ pub const GATE_BYPASSED_STATUS: &str = "Live dangerously is on for this conversa
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct TurnProvenance {
     ingested_external: bool,
-    /// The per-conversation override (issue #1007). When `true`,
-    /// [`Self::check`] always returns [`ToolGate::Allow`] regardless of
-    /// [`Self::ingested_external`]. Defaults to `false` — every existing
-    /// caller of [`Self::new`] keeps the gate enforced.
-    gate_disabled: bool,
+    /// The level this turn runs at, resolved once before the turn starts.
+    /// Defaults to [`ToolPolicy::Standard`], so a caller that does not resolve
+    /// one gets the shipped default rather than the most permissive level.
+    policy: ToolPolicy,
 }
 
 impl TurnProvenance {
-    /// A turn that has taken in nothing, with the gate enforced.
+    /// A turn that has taken in nothing, at the default level.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// A turn that has taken in nothing, with the per-conversation override
-    /// (issue #1007) applied. `disabled = true` means [`Self::check`] always
-    /// allows, whatever the turn ingests; `disabled = false` is identical to
-    /// [`Self::new`].
+    /// A turn that has taken in nothing, at `policy`.
     #[must_use]
-    pub fn new_with_gate_disabled(disabled: bool) -> Self {
+    pub fn new_with_policy(policy: ToolPolicy) -> Self {
         Self {
             ingested_external: false,
-            gate_disabled: disabled,
+            policy,
         }
     }
 
@@ -979,11 +1075,10 @@ impl TurnProvenance {
         self.ingested_external
     }
 
-    /// Whether the per-conversation override (issue #1007) is disabling the
-    /// gate for this turn.
+    /// The level this turn runs at.
     #[must_use]
-    pub fn gate_disabled(self) -> bool {
-        self.gate_disabled
+    pub fn policy(self) -> ToolPolicy {
+        self.policy
     }
 
     /// Fold a completed tool's result into the turn's provenance.
@@ -1022,14 +1117,8 @@ impl TurnProvenance {
     /// report the limit rather than wait for a person who is not there.
     #[must_use]
     pub fn check(self, name: &str, interactivity: TurnInteractivity) -> ToolGate {
-        // The per-conversation override (issue #1007): skip the tier/ingested
-        // check entirely rather than special-casing it below, so a future
-        // gated tier is covered by the same bypass without a second edit.
-        if self.gate_disabled {
-            return ToolGate::Allow;
-        }
         let tier = classify_tool(name).tier;
-        if !self.ingested_external || !tier.is_gated() {
+        if !self.ingested_external || !tier.is_gated_under(self.policy) {
             return ToolGate::Allow;
         }
         ToolGate::Refuse(refusal_text(name, tier, interactivity))
@@ -1091,13 +1180,26 @@ mod tests {
     }
 
     #[test]
-    fn acting_tiers_are_gated_and_reading_is_not() {
-        assert!(Egress.is_gated());
-        assert!(Mutate.is_gated());
-        assert!(Execution.is_gated());
-        assert!(Unclassified.is_gated());
-        assert!(!Read.is_gated());
-        assert!(!Present.is_gated());
+    fn acting_tiers_are_gated_and_reading_is_not_under_aggressive() {
+        use ToolPolicy::Aggressive;
+        assert!(Egress.is_gated_under(Aggressive));
+        assert!(Mutate.is_gated_under(Aggressive));
+        assert!(Execution.is_gated_under(Aggressive));
+        assert!(Unclassified.is_gated_under(Aggressive));
+        assert!(!Read.is_gated_under(Aggressive));
+        assert!(!Present.is_gated_under(Aggressive));
+    }
+
+    #[test]
+    fn no_tier_is_gated_under_standard_or_lax() {
+        for policy in [ToolPolicy::Standard, ToolPolicy::Lax] {
+            for tier in [Read, Present, Mutate, Egress, Execution, Unclassified] {
+                assert!(
+                    !tier.is_gated_under(policy),
+                    "{tier:?} closes under {policy:?}, and no tier may"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1332,7 +1434,7 @@ mod tests {
         for src in CLASSIFIED_SOURCES {
             for entry in src.tools {
                 let acts = ACTING_WORDS.iter().any(|w| entry.name.contains(w));
-                if acts && !entry.tier.is_gated() {
+                if acts && !entry.tier.is_gated_under(ToolPolicy::Aggressive) {
                     wrong.push((entry.name, entry.tier));
                 }
             }
@@ -1362,7 +1464,10 @@ mod tests {
     fn an_unknown_tool_is_gated_but_does_not_taint() {
         let unknown = classify_tool("acme_do_something");
         assert_eq!(unknown, ToolClassification::UNCLASSIFIED);
-        assert!(unknown.tier.is_gated(), "no permissive default");
+        assert!(
+            unknown.tier.is_gated_under(ToolPolicy::Aggressive),
+            "no permissive default"
+        );
         assert_eq!(
             unknown.provenance, Trusted,
             "an unknown tool must not close the gate against its own next call"
@@ -1449,7 +1554,7 @@ mod tests {
         // grade back with the body. A GitHub or `.well-known` skill is
         // third-party text steering the model, so it closes the gate; a skill
         // the user wrote here does not.
-        let mut local = TurnProvenance::new();
+        let mut local = TurnProvenance::new_with_policy(ToolPolicy::Aggressive);
         assert_eq!(
             local.observe_result(
                 "builtin_skill_get",
@@ -1460,7 +1565,7 @@ mod tests {
         );
 
         for tier in ["github", "well_known", "unknown"] {
-            let mut turn = TurnProvenance::new();
+            let mut turn = TurnProvenance::new_with_policy(ToolPolicy::Aggressive);
             let payload =
                 format!(r#"{{"ok":true,"name":"x","trust_tier":"{tier}","body":"steps"}}"#);
             assert_eq!(
@@ -1473,7 +1578,7 @@ mod tests {
 
     #[test]
     fn a_skill_search_taints_when_any_hit_came_from_outside() {
-        let mut all_local = TurnProvenance::new();
+        let mut all_local = TurnProvenance::new_with_policy(ToolPolicy::Aggressive);
         assert_eq!(
             all_local.observe_result(
                 "builtin_skill_search",
@@ -1482,7 +1587,7 @@ mod tests {
             GateChange::Unchanged
         );
 
-        let mut mixed = TurnProvenance::new();
+        let mut mixed = TurnProvenance::new_with_policy(ToolPolicy::Aggressive);
         assert_eq!(
             mixed.observe_result(
                 "builtin_skill_search",
@@ -1502,7 +1607,7 @@ mod tests {
             r#"{"ok":true,"body":"steps"}"#,
             r#"{"ok":true,"results":[{"name":"x"}]}"#,
         ] {
-            let mut turn = TurnProvenance::new();
+            let mut turn = TurnProvenance::new_with_policy(ToolPolicy::Aggressive);
             assert_eq!(
                 turn.observe_result("builtin_skill_get", payload),
                 GateChange::JustClosed,
@@ -1525,7 +1630,7 @@ mod tests {
             r#"{"error":"missing required argument 'name'"}"#,
             r#"{"ok":true,"body":""}"#,
         ] {
-            let mut turn = TurnProvenance::new();
+            let mut turn = TurnProvenance::new_with_policy(ToolPolicy::Aggressive);
             assert_eq!(
                 turn.observe_result("builtin_skill_search", payload),
                 GateChange::Unchanged,
@@ -1540,7 +1645,7 @@ mod tests {
         // turn loop, so the note is stamped at the write and this read is what
         // keys on the stamp. Without it the parent could pull a tainted
         // child's answer into a clean turn with every tier still open.
-        let mut turn = TurnProvenance::new();
+        let mut turn = TurnProvenance::new_with_policy(ToolPolicy::Aggressive);
         let payload = format!(
             r#"{{"notes":[{{"key":"result","content":"{} the answer"}}]}}"#,
             EXTERNAL_CONTENT_MARKER
@@ -1550,7 +1655,7 @@ mod tests {
             GateChange::JustClosed
         );
 
-        let mut clean = TurnProvenance::new();
+        let mut clean = TurnProvenance::new_with_policy(ToolPolicy::Aggressive);
         assert_eq!(
             clean.observe_result(
                 "builtin_scratchpad_search",
@@ -1579,7 +1684,7 @@ mod tests {
         // the spawn itself would let a turn dispatch exactly one, which is the
         // opposite of that. A detached spawn hands back two daemon-minted ids
         // and no child output.
-        let mut detached = TurnProvenance::new();
+        let mut detached = TurnProvenance::new_with_policy(ToolPolicy::Aggressive);
         assert_eq!(
             detached.observe_result(
                 "spawn_subagent",
@@ -1598,7 +1703,7 @@ mod tests {
         );
 
         // A waited spawn returns the child's answer as raw text.
-        let mut waited = TurnProvenance::new();
+        let mut waited = TurnProvenance::new_with_policy(ToolPolicy::Aggressive);
         assert_eq!(
             waited.observe_result("spawn_subagent", "the three sources agree"),
             GateChange::JustClosed
@@ -1607,7 +1712,7 @@ mod tests {
 
     #[test]
     fn a_status_poll_taints_only_once_it_carries_the_answer() {
-        let mut polling = TurnProvenance::new();
+        let mut polling = TurnProvenance::new_with_policy(ToolPolicy::Aggressive);
         for payload in [
             r#"{"task_id":"t-1","status":"running"}"#,
             r#"{"task_id":"t-1","status":"pending"}"#,
@@ -1640,7 +1745,7 @@ mod tests {
             r#"{"answer":"words"}"#,
             r#"["t-1","c-1"]"#,
         ] {
-            let mut turn = TurnProvenance::new();
+            let mut turn = TurnProvenance::new_with_policy(ToolPolicy::Aggressive);
             assert_eq!(
                 turn.observe_result("spawn_subagent", payload),
                 GateChange::JustClosed,
@@ -1661,7 +1766,7 @@ mod tests {
             r#"{"ok":true,"results":{"name":"x"}}"#,
             r#"{"ok":true}"#,
         ] {
-            let mut turn = TurnProvenance::new();
+            let mut turn = TurnProvenance::new_with_policy(ToolPolicy::Aggressive);
             assert_eq!(
                 turn.observe_result("builtin_skill_get", payload),
                 GateChange::JustClosed,
@@ -1675,7 +1780,7 @@ mod tests {
         // `homeassistant_call_service` takes `return_response` and hands back
         // whatever the integration replied with, exactly the bytes its sibling
         // read tools are marked for.
-        let mut turn = TurnProvenance::new();
+        let mut turn = TurnProvenance::new_with_policy(ToolPolicy::Aggressive);
         assert_eq!(
             turn.observe_result("homeassistant_call_service", "{}"),
             GateChange::JustClosed
@@ -1684,7 +1789,7 @@ mod tests {
 
     #[test]
     fn a_clean_turn_allows_every_tier() {
-        let clean = TurnProvenance::new();
+        let clean = TurnProvenance::new_with_policy(ToolPolicy::Aggressive);
         assert!(!clean.ingested_external());
         for name in ["web_read", "fileio_remove", "terminal_execute", "acme_x"] {
             assert_eq!(
@@ -1697,7 +1802,7 @@ mod tests {
 
     #[test]
     fn only_an_external_result_taints_the_turn() {
-        let mut turn = TurnProvenance::new();
+        let mut turn = TurnProvenance::new_with_policy(ToolPolicy::Aggressive);
         for name in [
             "builtin_conversation_search",
             "fileio_write_file",
@@ -1722,7 +1827,7 @@ mod tests {
     fn the_gate_reports_closing_only_once() {
         // The turn loop announces the close to the person watching, so a
         // second report would put a duplicate line on the status channel.
-        let mut turn = TurnProvenance::new();
+        let mut turn = TurnProvenance::new_with_policy(ToolPolicy::Aggressive);
         assert_eq!(
             turn.observe_result("web_read", "body"),
             GateChange::JustClosed
@@ -1737,16 +1842,22 @@ mod tests {
     }
 
     #[test]
-    fn tier_list_matches_is_gated() {
+    fn tier_list_matches_is_gated_under() {
         // The list is what a client is told; `is_gated` is what the daemon
         // enforces. A drift between them would publish a false contract.
         let tiers = [Read, Present, Mutate, Egress, Execution, Unclassified];
-        for tier in tiers {
-            assert_eq!(
-                GATED_TIERS.contains(&tier),
-                tier.is_gated(),
-                "{tier:?} is listed and enforced differently"
-            );
+        for policy in [
+            ToolPolicy::Aggressive,
+            ToolPolicy::Standard,
+            ToolPolicy::Lax,
+        ] {
+            for tier in tiers {
+                assert_eq!(
+                    gated_tiers(policy).contains(&tier),
+                    tier.is_gated_under(policy),
+                    "{tier:?} is listed and enforced differently under {policy:?}"
+                );
+            }
         }
     }
 
@@ -1759,7 +1870,7 @@ mod tests {
 
     #[test]
     fn a_tainted_turn_refuses_the_acting_tiers_only() {
-        let mut turn = TurnProvenance::new();
+        let mut turn = TurnProvenance::new_with_policy(ToolPolicy::Aggressive);
         turn.observe_result("web_read", "body");
         for name in ["web_read", "fileio_remove", "terminal_execute", "acme_x"] {
             assert!(
@@ -1789,7 +1900,7 @@ mod tests {
         // note or save a fact, the note is read back into the next turn, and
         // that turn starts clean. Writing to the assistant's memory is
         // therefore gated like any other durable change.
-        let mut turn = TurnProvenance::new();
+        let mut turn = TurnProvenance::new_with_policy(ToolPolicy::Aggressive);
         turn.observe_result("web_read", "body");
         for name in [
             "builtin_scratchpad_write",
@@ -1814,7 +1925,7 @@ mod tests {
         // on the next turn, and the next turn starts clean. A refusal that
         // says "a new turn can do it" hands the model the script for
         // finishing the attack, so the way forward goes to the person.
-        let mut turn = TurnProvenance::new();
+        let mut turn = TurnProvenance::new_with_policy(ToolPolicy::Aggressive);
         turn.observe_result("web_read", "body");
         for interactivity in [TurnInteractivity::Interactive, TurnInteractivity::Headless] {
             let ToolGate::Refuse(text) = turn.check("web_read", interactivity) else {
@@ -1845,7 +1956,7 @@ mod tests {
 
     #[test]
     fn the_refusal_states_the_cause_the_tier_and_a_way_forward() {
-        let mut turn = TurnProvenance::new();
+        let mut turn = TurnProvenance::new_with_policy(ToolPolicy::Aggressive);
         turn.observe_result("web_read", "body");
         let ToolGate::Refuse(text) = turn.check("web_read", TurnInteractivity::Interactive) else {
             panic!("a tainted turn must refuse an egress tool");
@@ -1860,7 +1971,7 @@ mod tests {
 
     #[test]
     fn a_headless_refusal_says_no_one_can_lift_it() {
-        let mut turn = TurnProvenance::new();
+        let mut turn = TurnProvenance::new_with_policy(ToolPolicy::Aggressive);
         turn.observe_result("web_read", "body");
         let ToolGate::Refuse(text) = turn.check("web_read", TurnInteractivity::Headless) else {
             panic!("a tainted turn must refuse an egress tool");
@@ -1873,7 +1984,7 @@ mod tests {
     fn an_overlong_tool_name_is_bounded_in_the_refusal() {
         // The name comes from the model and the refusal is persisted and
         // shown, so it goes through the same cap as a status line.
-        let mut turn = TurnProvenance::new();
+        let mut turn = TurnProvenance::new_with_policy(ToolPolicy::Aggressive);
         turn.observe_result("web_read", "body");
         let ToolGate::Refuse(text) = turn.check(&"x".repeat(4096), TurnInteractivity::Headless)
         else {
@@ -1894,60 +2005,112 @@ mod tests {
         );
     }
 
-    // --- per-conversation gate override (issue #1007) ----------------------
+    // --- the tool policy levels --------------------------------------------
 
     #[test]
-    fn a_gate_disabled_turn_allows_a_gated_tool_after_ingesting_external_content() {
-        // The whole point of the override: a turn that would normally refuse
-        // an acting tool after reading outside content runs it anyway.
-        let mut turn = TurnProvenance::new_with_gate_disabled(true);
-        assert!(turn.gate_disabled());
+    fn a_lax_turn_allows_a_gated_tool_after_ingesting_external_content() {
+        let mut turn = TurnProvenance::new_with_policy(ToolPolicy::Lax);
+        assert_eq!(turn.policy(), ToolPolicy::Lax);
         turn.observe_result("web_read", "body");
         assert_eq!(
             turn.check("fileio_remove", TurnInteractivity::Interactive),
-            ToolGate::Allow,
-            "a gate-disabled turn must allow a gated tool even after ingesting \
-             external content"
+            ToolGate::Allow
         );
     }
 
     #[test]
-    fn observe_result_still_reports_just_closed_once_when_gate_disabled() {
-        // The override turns off the *refusal*, not the bookkeeping: the turn
-        // still tracks whether it ingested external content, so the loop can
-        // still announce the one-time bypass status.
-        let mut turn = TurnProvenance::new_with_gate_disabled(true);
-        assert_eq!(
-            turn.observe_result("web_read", "body"),
-            GateChange::JustClosed
-        );
-        assert_eq!(
-            turn.observe_result("web_read", "body again"),
-            GateChange::Unchanged,
-            "the change must still fire at most once per turn"
-        );
-    }
-
-    #[test]
-    fn default_turn_provenance_behaviour_is_unchanged_by_the_override_field() {
-        // `TurnProvenance::new()` — every existing call site — must still
-        // build a turn with the gate enforced.
-        let mut turn = TurnProvenance::new();
-        assert!(!turn.gate_disabled());
+    fn a_standard_turn_allows_every_tier_after_ingesting_external_content() {
+        // The shipped default refuses nothing. One case per gated tier, so a
+        // level that closed only some of them still fails here.
+        let mut turn = TurnProvenance::new_with_policy(ToolPolicy::Standard);
         turn.observe_result("web_read", "body");
-        assert!(
-            matches!(
-                turn.check("fileio_remove", TurnInteractivity::Interactive),
-                ToolGate::Refuse(_)
-            ),
-            "the default constructor must keep the gate enforced"
-        );
+        for name in [
+            "fileio_remove",
+            "web_read",
+            "terminal_execute",
+            "acme_do_something",
+        ] {
+            assert_eq!(
+                turn.check(name, TurnInteractivity::Interactive),
+                ToolGate::Allow,
+                "{name} was refused at the level that must refuse nothing"
+            );
+        }
     }
 
     #[test]
-    fn gate_bypassed_status_is_a_plain_ascii_sentence_distinct_from_gate_closed() {
-        assert!(GATE_BYPASSED_STATUS.is_ascii());
-        assert_ne!(GATE_BYPASSED_STATUS, GATE_CLOSED_STATUS);
-        assert!(!GATE_BYPASSED_STATUS.is_empty());
+    fn observe_result_still_reports_just_closed_once_at_every_level() {
+        // The level changes the refusal, never the bookkeeping: the status
+        // line and the provenance stamp both depend on this staying true.
+        for policy in [
+            ToolPolicy::Aggressive,
+            ToolPolicy::Standard,
+            ToolPolicy::Lax,
+        ] {
+            let mut turn = TurnProvenance::new_with_policy(policy);
+            assert_eq!(
+                turn.observe_result("web_read", "body"),
+                GateChange::JustClosed,
+                "{policy:?}"
+            );
+            assert_eq!(
+                turn.observe_result("web_read", "body again"),
+                GateChange::Unchanged,
+                "the change must still fire at most once per turn, at {policy:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_aggressive_turn_still_refuses_a_gated_tool_after_ingesting() {
+        let mut turn = TurnProvenance::new_with_policy(ToolPolicy::Aggressive);
+        turn.observe_result("web_read", "body");
+        assert!(matches!(
+            turn.check("fileio_remove", TurnInteractivity::Interactive),
+            ToolGate::Refuse(_)
+        ));
+    }
+
+    #[test]
+    fn gate_open_status_is_a_plain_ascii_sentence_distinct_from_gate_closed() {
+        assert!(GATE_OPEN_STATUS.is_ascii());
+        assert_ne!(GATE_OPEN_STATUS, GATE_CLOSED_STATUS);
+        assert!(!GATE_OPEN_STATUS.is_empty());
+    }
+
+    #[test]
+    fn a_policy_round_trips_through_its_wire_spelling() {
+        for policy in [
+            ToolPolicy::Aggressive,
+            ToolPolicy::Standard,
+            ToolPolicy::Lax,
+        ] {
+            assert_eq!(ToolPolicy::parse(policy.as_str()), Some(policy));
+        }
+    }
+
+    #[test]
+    fn a_policy_parses_case_insensitively_and_ignores_surrounding_space() {
+        assert_eq!(ToolPolicy::parse("  LAX \n"), Some(ToolPolicy::Lax));
+    }
+
+    #[test]
+    fn an_unknown_policy_value_parses_to_none_rather_than_to_a_level() {
+        for value in ["", "yolo", "off", "true", "standard-ish"] {
+            assert_eq!(ToolPolicy::parse(value), None, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn the_default_policy_is_standard() {
+        assert_eq!(ToolPolicy::default(), ToolPolicy::Standard);
+        assert_eq!(TurnProvenance::default().policy(), ToolPolicy::Standard);
+    }
+
+    #[test]
+    fn every_level_except_lax_stamps_durable_writes() {
+        assert!(ToolPolicy::Aggressive.stamps_durable_writes());
+        assert!(ToolPolicy::Standard.stamps_durable_writes());
+        assert!(!ToolPolicy::Lax.stamps_durable_writes());
     }
 }

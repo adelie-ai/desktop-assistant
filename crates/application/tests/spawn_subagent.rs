@@ -94,10 +94,12 @@ impl FakeConversations {
                 use desktop_assistant_core::ports::turn_capability::{
                     TurnCapabilityChange, TurnCapabilityReason, notify_turn_capability_change,
                 };
-                use desktop_assistant_core::tool_provenance::{GATE_CLOSED_STATUS, GATED_TIERS};
+                use desktop_assistant_core::tool_provenance::{
+                    GATE_CLOSED_STATUS, ToolPolicy, gated_tiers,
+                };
                 let _ = notify_turn_capability_change(TurnCapabilityChange {
                     reason: TurnCapabilityReason::ExternalContentIngested,
-                    closed_tiers: GATED_TIERS.to_vec(),
+                    closed_tiers: gated_tiers(ToolPolicy::Aggressive).to_vec(),
                     message: GATE_CLOSED_STATUS.to_string(),
                 });
                 Ok(t)

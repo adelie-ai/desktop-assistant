@@ -264,6 +264,9 @@ pub(crate) fn turn_span(
         model = route.model(),
         provider = route.provider(),
         trace_id = %trace.trace.trace_id(),
+        // The security level this turn ran at, so a backend can find every
+        // turn that ran permissively without reading any of them.
+        tool_policy = crate::ports::llm::current_tool_policy().as_str(),
         rounds = tracing::field::Empty,
         outcome = tracing::field::Empty,
         duration_ms = tracing::field::Empty,

@@ -24,7 +24,7 @@ use crate::ports::knowledge_use::current_situation;
 use crate::ports::knowledge_use::{KnowledgeOfferedFn, OfferScope, record_in_background};
 use crate::ports::llm::{
     ChunkCallback, LlmClient, ReasoningConfig, StatusCallback, current_cancellation_token,
-    current_context_budget, current_tool_allowlist, current_tool_gate_disabled,
+    current_context_budget, current_tool_allowlist, current_tool_policy,
 };
 use crate::ports::negative_memory::{
     BurnObservation, ExtinguishBurnsFn, LiveBurnsFn, RecordBurnFn,
@@ -56,8 +56,8 @@ use crate::ports::turn_telemetry::{
 use crate::sanitize::sanitize_assistant_text;
 use crate::skill_promotion::{self, PromotionMode};
 use crate::tool_provenance::{
-    GATE_BYPASSED_STATUS, GATE_CLOSED_STATUS, GATED_TIERS, GateChange, ToolGate, TurnProvenance,
-    WITHHELD_STEP_TEXT,
+    GATE_CLOSED_STATUS, GATE_OPEN_STATUS, GateChange, ToolGate, ToolPolicy, TurnProvenance,
+    WITHHELD_STEP_TEXT, gated_tiers,
 };
 use crate::tools::{
     NoopToolExecutor, categorize_tool_namespaces, summarize_tool_name, summarize_tool_text,
@@ -2542,13 +2542,13 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
         // a new value. Nothing outside this function can reach it, which is
         // the whole of the no-leak-across-turns property.
         //
-        // The per-conversation override (#1007) is read fresh here, at
-        // construction, from the task-local the daemon's dispatch wrapper
-        // installs from the conversation's stored setting. Outside that
-        // wrapper (tests, dreaming jobs) it defaults to `false` - the gate
-        // stays enforced.
-        let mut turn_provenance =
-            TurnProvenance::new_with_gate_disabled(current_tool_gate_disabled());
+        // The turn's tool policy is read fresh here, at construction, from
+        // the task-local the daemon's dispatch wrapper installs. The daemon
+        // resolves it per send: conversation override, then the level the
+        // client sent, then the operator's configured default. Outside that
+        // wrapper (tests, dreaming jobs) it reads back as the shipped
+        // default, never as the most permissive level.
+        let mut turn_provenance = TurnProvenance::new_with_policy(current_tool_policy());
 
         // No turn-start filler. A quick/direct answer narrates nothing and just
         // streams its reply. Progress is narrated when the model declares a
@@ -3941,14 +3941,28 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 if turn_provenance.observe_result(&tool_call.name, &stored)
                     == GateChange::JustClosed
                 {
-                    if turn_provenance.gate_disabled() {
-                        // The override (#1007) is a deliberate safety-off
-                        // switch, not a silent one: nothing actually closed
-                        // (every acting tier stays open), so the structured
-                        // `closed_tiers` channel would be empty and
-                        // misleading here. Say so once, in plain text, on
-                        // the status channel every client already renders.
-                        on_status(GATE_BYPASSED_STATUS.to_string());
+                    let policy = turn_provenance.policy();
+                    if policy == ToolPolicy::Lax {
+                        // The level that tells the person nothing. Chosen
+                        // deliberately, per conversation, so a status line
+                        // here would be noise. It is not hidden from the
+                        // operator: a turn that read outside content and is
+                        // refusing nothing is the combination worth finding
+                        // later, so it is recorded at warning level on the
+                        // turn's own span.
+                        tracing::warn!(
+                            tool_policy = policy.as_str(),
+                            "turn read outside content and will refuse nothing"
+                        );
+                    } else if gated_tiers(policy).is_empty() {
+                        // Nothing closed, so the structured `closed_tiers`
+                        // channel would carry an empty list and read as a
+                        // narrowing that did not happen. Say the true thing
+                        // instead, in plain text, on the status channel every
+                        // client already renders: the turn read outside
+                        // content, kept its tools, and marks what it writes
+                        // from here.
+                        on_status(GATE_OPEN_STATUS.to_string());
                     } else {
                         // Structured first: this is an API-first platform, and a
                         // caller driving the daemon has to be able to read the
@@ -3959,7 +3973,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                         // signal degrades rather than disappears.
                         let delivery = notify_turn_capability_change(TurnCapabilityChange {
                             reason: TurnCapabilityReason::ExternalContentIngested,
-                            closed_tiers: GATED_TIERS.to_vec(),
+                            closed_tiers: gated_tiers(policy).to_vec(),
                             message: GATE_CLOSED_STATUS.to_string(),
                         });
                         if delivery == Delivery::Dropped {
@@ -4162,6 +4176,7 @@ mod tests {
     use super::*;
     use crate::context::MIN_TRUNCATION_TOKENS;
     use crate::domain::{ToolCall, ToolDefinition, TransportKind};
+    use crate::ports::llm::with_tool_policy;
     use crate::ports::llm::{
         BudgetSource, ContextBudget, HostedToolSearch, LlmResponse, TokenUsage,
     };
@@ -5893,12 +5908,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gate_disabled_override_allows_the_gated_tool_and_announces_the_bypass_once() {
-        // With the per-conversation override on, a tool that would normally
-        // be refused after reading outside content runs anyway, and the
-        // person watching sees exactly one status line saying so (issue
-        // #1007) — a deliberate safety-off switch, not a silent one.
-        use crate::ports::llm::with_tool_gate_disabled;
+    async fn a_standard_turn_runs_the_gated_tool_and_says_so_once() {
+        // The shipped default refuses nothing, and is not silent about it:
+        // the tool that the strict level would refuse runs, and the person
+        // watching sees exactly one status line saying the turn read outside
+        // content and kept its tools.
 
         let handler = two_call_handler("weather_get_current", "web_read");
         let conv = handler
@@ -5907,18 +5921,18 @@ mod tests {
             .unwrap();
 
         let (status_cb, statuses) = recording_status();
-        with_tool_gate_disabled(
-            true,
+        with_tool_policy(
+            ToolPolicy::Standard,
             handler.send_prompt(&conv.id, "go".into(), noop_callback(), status_cb),
         )
         .await
-        .expect("the turn completes with the override on");
+        .expect("the turn completes at the default level");
 
         let results = tool_results(&handler, &conv.id).await;
         assert_eq!(results[0], "RAN weather_get_current");
         assert_eq!(
             results[1], "RAN web_read",
-            "the gated tool must run when the override is on, got: {}",
+            "the gated tool must run at the level that refuses nothing, got: {}",
             results[1]
         );
         assert_eq!(
@@ -5926,10 +5940,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|s| s.as_str() == crate::tool_provenance::GATE_BYPASSED_STATUS)
+                .filter(|s| s.as_str() == GATE_OPEN_STATUS)
                 .count(),
             1,
-            "the bypass must be announced exactly once"
+            "the turn must say once that it read outside content and kept its tools"
         );
         assert!(
             !statuses
@@ -5937,7 +5951,7 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|s| s.as_str() == GATE_CLOSED_STATUS),
-            "a bypassed gate must not also report itself as closed"
+            "a level that closes nothing must not report a gate as closed"
         );
     }
 
@@ -5952,10 +5966,12 @@ mod tests {
             .await
             .unwrap();
 
-        handler
-            .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
-            .await
-            .expect("the turn continues after the refusal");
+        with_tool_policy(
+            ToolPolicy::Aggressive,
+            handler.send_prompt(&conv.id, "go".into(), noop_callback(), noop_status()),
+        )
+        .await
+        .expect("the turn continues after the refusal");
 
         let results = tool_results(&handler, &conv.id).await;
         assert_eq!(results.len(), 2, "both calls must record a tool_result");
@@ -5975,10 +5991,12 @@ mod tests {
             .await
             .unwrap();
 
-        handler
-            .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
-            .await
-            .expect("the turn continues after the refusal");
+        with_tool_policy(
+            ToolPolicy::Aggressive,
+            handler.send_prompt(&conv.id, "go".into(), noop_callback(), noop_status()),
+        )
+        .await
+        .expect("the turn continues after the refusal");
 
         let results = tool_results(&handler, &conv.id).await;
         assert!(
@@ -5996,10 +6014,12 @@ mod tests {
             .await
             .unwrap();
 
-        handler
-            .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
-            .await
-            .expect("the turn continues after the refusal");
+        with_tool_policy(
+            ToolPolicy::Aggressive,
+            handler.send_prompt(&conv.id, "go".into(), noop_callback(), noop_status()),
+        )
+        .await
+        .expect("the turn continues after the refusal");
 
         let results = tool_results(&handler, &conv.id).await;
         assert!(
@@ -6040,10 +6060,12 @@ mod tests {
             .await
             .unwrap();
 
-        let answer = handler
-            .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
-            .await
-            .expect("a refusal must not fail the turn");
+        let answer = with_tool_policy(
+            ToolPolicy::Aggressive,
+            handler.send_prompt(&conv.id, "go".into(), noop_callback(), noop_status()),
+        )
+        .await
+        .expect("a refusal must not fail the turn");
 
         assert_eq!(answer, "answered anyway");
         let results = tool_results(&handler, &conv.id).await;
@@ -6071,10 +6093,12 @@ mod tests {
             .await
             .unwrap();
 
-        handler
-            .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
-            .await
-            .expect("the turn continues after the refusal");
+        with_tool_policy(
+            ToolPolicy::Aggressive,
+            handler.send_prompt(&conv.id, "go".into(), noop_callback(), noop_status()),
+        )
+        .await
+        .expect("the turn continues after the refusal");
 
         let refusal = tool_results(&handler, &conv.id).await.remove(1);
         let lower = refusal.to_lowercase();
@@ -6122,14 +6146,18 @@ mod tests {
             .await
             .unwrap();
 
-        handler
-            .send_prompt(&conv.id, "one".into(), noop_callback(), noop_status())
-            .await
-            .expect("first turn completes");
-        handler
-            .send_prompt(&conv.id, "two".into(), noop_callback(), noop_status())
-            .await
-            .expect("second turn completes");
+        with_tool_policy(
+            ToolPolicy::Aggressive,
+            handler.send_prompt(&conv.id, "one".into(), noop_callback(), noop_status()),
+        )
+        .await
+        .expect("first turn completes");
+        with_tool_policy(
+            ToolPolicy::Aggressive,
+            handler.send_prompt(&conv.id, "two".into(), noop_callback(), noop_status()),
+        )
+        .await
+        .expect("second turn completes");
 
         let results = tool_results(&handler, &conv.id).await;
         assert!(
@@ -6158,7 +6186,10 @@ mod tests {
             std::time::Duration::from_secs(5),
             with_turn_interactivity(
                 TurnInteractivity::Headless,
-                handler.send_prompt(&conv.id, "go".into(), noop_callback(), noop_status()),
+                with_tool_policy(
+                    ToolPolicy::Aggressive,
+                    handler.send_prompt(&conv.id, "go".into(), noop_callback(), noop_status()),
+                ),
             ),
         )
         .await
@@ -6219,10 +6250,12 @@ mod tests {
             .unwrap();
 
         let (status_cb, first_turn) = recording_status();
-        handler
-            .send_prompt(&conv.id, "one".into(), noop_callback(), status_cb)
-            .await
-            .expect("first turn completes");
+        with_tool_policy(
+            ToolPolicy::Aggressive,
+            handler.send_prompt(&conv.id, "one".into(), noop_callback(), status_cb),
+        )
+        .await
+        .expect("first turn completes");
         let announcements = first_turn
             .lock()
             .unwrap()
@@ -6239,10 +6272,12 @@ mod tests {
 
         // A new turn re-arms the announcement, because it re-arms the gate.
         let (status_cb, second_turn) = recording_status();
-        handler
-            .send_prompt(&conv.id, "two".into(), noop_callback(), status_cb)
-            .await
-            .expect("second turn completes");
+        with_tool_policy(
+            ToolPolicy::Aggressive,
+            handler.send_prompt(&conv.id, "two".into(), noop_callback(), status_cb),
+        )
+        .await
+        .expect("second turn completes");
         assert_eq!(
             second_turn
                 .lock()
@@ -6296,7 +6331,10 @@ mod tests {
                 sink.lock().unwrap().push(c);
                 Delivery::Taken
             }),
-            handler.send_prompt(&conv.id, "go".into(), noop_callback(), status_cb),
+            with_tool_policy(
+                ToolPolicy::Aggressive,
+                handler.send_prompt(&conv.id, "go".into(), noop_callback(), status_cb),
+            ),
         )
         .await
         .expect("the turn completes");
@@ -6347,7 +6385,10 @@ mod tests {
         let (status_cb, statuses) = recording_status();
         with_turn_capability_observer(
             Arc::new(|_| Delivery::Dropped),
-            handler.send_prompt(&conv.id, "go".into(), noop_callback(), status_cb),
+            with_tool_policy(
+                ToolPolicy::Aggressive,
+                handler.send_prompt(&conv.id, "go".into(), noop_callback(), status_cb),
+            ),
         )
         .await
         .expect("the turn completes");
@@ -6416,10 +6457,12 @@ mod tests {
             .await
             .unwrap();
 
-        handler
-            .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
-            .await
-            .expect("the turn continues after the refusal");
+        with_tool_policy(
+            ToolPolicy::Aggressive,
+            handler.send_prompt(&conv.id, "go".into(), noop_callback(), noop_status()),
+        )
+        .await
+        .expect("the turn continues after the refusal");
 
         let refusal = tool_results(&handler, &conv.id).await.remove(1);
         let lower = refusal.to_lowercase();
@@ -6654,10 +6697,12 @@ mod tests {
             .await
             .unwrap();
 
-        handler
-            .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
-            .await
-            .expect("the turn completes");
+        with_tool_policy(
+            ToolPolicy::Aggressive,
+            handler.send_prompt(&conv.id, "go".into(), noop_callback(), noop_status()),
+        )
+        .await
+        .expect("the turn completes");
 
         let results = tool_results(&handler, &conv.id).await;
         assert!(
@@ -6700,10 +6745,12 @@ mod tests {
             .await
             .unwrap();
 
-        handler
-            .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
-            .await
-            .expect("the turn completes");
+        with_tool_policy(
+            ToolPolicy::Aggressive,
+            handler.send_prompt(&conv.id, "go".into(), noop_callback(), noop_status()),
+        )
+        .await
+        .expect("the turn completes");
 
         let results = tool_results(&handler, &conv.id).await;
         assert!(
@@ -6749,10 +6796,12 @@ mod tests {
             .await
             .unwrap();
 
-        handler
-            .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
-            .await
-            .expect("the turn completes");
+        with_tool_policy(
+            ToolPolicy::Aggressive,
+            handler.send_prompt(&conv.id, "go".into(), noop_callback(), noop_status()),
+        )
+        .await
+        .expect("the turn completes");
 
         let results = tool_results(&handler, &conv.id).await;
         assert!(

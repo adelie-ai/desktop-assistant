@@ -243,30 +243,32 @@ tokio::task_local! {
     /// `ConversationService`/`LlmClient` signatures.
     static IDEMPOTENCY_KEY: Option<String>;
 
-    /// The per-conversation tool-provenance gate override for this turn
-    /// (issue #1007). Installed by the daemon's dispatch wrapper via
-    /// [`with_tool_gate_disabled`] from the conversation's stored override,
-    /// resolved fresh on every send; read by [`current_tool_gate_disabled`]
-    /// at the point `TurnProvenance` is constructed
+    /// The tool policy this turn runs at. Installed by the daemon's dispatch
+    /// wrapper via [`with_tool_policy`], resolved fresh on every send; read by
+    /// [`current_tool_policy`] at the point `TurnProvenance` is constructed
     /// (`ConversationHandler::send_prompt`), which passes the value to
-    /// [`crate::tool_provenance::TurnProvenance::new_with_gate_disabled`].
+    /// [`crate::tool_provenance::TurnProvenance::new_with_policy`].
     ///
-    /// `true` means the tool-provenance gate never refuses for this turn,
-    /// whatever it ingests - a deliberate, per-conversation safety-off
-    /// switch. Fail-closed by construction: unset outside the scope (tests,
-    /// dreaming jobs, any caller that doesn't route through the daemon
-    /// dispatch wrapper), which [`current_tool_gate_disabled`] returns as
-    /// `false` — the gate stays enforced. The daemon-side resolver
-    /// (`RoutingConversationHandler::resolve_tool_gate_disabled`) applies the
-    /// same fail-closed rule one layer up: a missing row, a cross-user row,
-    /// or a store error all resolve to `false` before this scope is even
-    /// installed.
+    /// The level decides what a turn does once it has taken in
+    /// externally-controlled bytes; see
+    /// [`crate::tool_provenance::ToolPolicy`], which also records why the
+    /// default refuses nothing.
+    ///
+    /// Never resolves to the most permissive level by accident. Unset outside
+    /// the scope (tests, dreaming jobs, any caller that does not route through
+    /// the daemon dispatch wrapper) reads back as
+    /// [`crate::tool_provenance::ToolPolicy::Standard`], the shipped default.
+    /// The daemon-side resolver
+    /// (`RoutingConversationHandler::resolve_tool_policy`) applies the same
+    /// rule one layer up: a missing row, a cross-user row, an unreadable
+    /// value, or a store error all resolve to the operator's configured
+    /// default before this scope is installed.
     ///
     /// Why a task-local: mirrors [`PERSONALITY`] and the other per-turn
     /// task-locals in this module so the value threads to
     /// `ConversationHandler::send_prompt` without changing the
     /// `ConversationService`/`LlmClient` signatures.
-    static TOOL_GATE_DISABLED: bool;
+    static TOOL_POLICY: crate::tool_provenance::ToolPolicy;
 }
 
 /// Run `fut` with the given reasoning config installed as the current
@@ -364,24 +366,25 @@ pub fn current_idempotency_key() -> Option<String> {
     IDEMPOTENCY_KEY.try_with(|k| k.clone()).ok().flatten()
 }
 
-/// Run `fut` with `disabled` installed as the current turn's tool-provenance
-/// gate override. `ConversationHandler::send_prompt` reads it via
-/// [`current_tool_gate_disabled`] when constructing `TurnProvenance`. See
-/// `TOOL_GATE_DISABLED`.
-pub async fn with_tool_gate_disabled<F, T>(disabled: bool, fut: F) -> T
+/// Run `fut` with `policy` installed as the current turn's tool policy.
+/// `ConversationHandler::send_prompt` reads it via [`current_tool_policy`]
+/// when constructing `TurnProvenance`. See `TOOL_POLICY`.
+pub async fn with_tool_policy<F, T>(policy: crate::tool_provenance::ToolPolicy, fut: F) -> T
 where
     F: std::future::Future<Output = T>,
 {
-    TOOL_GATE_DISABLED.scope(disabled, fut).await
+    TOOL_POLICY.scope(policy, fut).await
 }
 
-/// The current turn's tool-provenance gate override, or `false` when no
-/// [`with_tool_gate_disabled`] scope is installed. `false` means the gate
-/// stays enforced — the fail-closed default for callers that don't route
-/// through the daemon dispatch wrapper (tests, dreaming jobs, agent runs).
-/// Safe to call from any async context.
-pub fn current_tool_gate_disabled() -> bool {
-    TOOL_GATE_DISABLED.try_with(|d| *d).unwrap_or(false)
+/// The current turn's tool policy, or
+/// [`crate::tool_provenance::ToolPolicy::Standard`] when no
+/// [`with_tool_policy`] scope is installed - the shipped default, for callers
+/// that do not route through the daemon dispatch wrapper (tests, dreaming
+/// jobs, agent runs). It never reads back as
+/// [`crate::tool_provenance::ToolPolicy::Lax`] from an absent scope. Safe to
+/// call from any async context.
+pub fn current_tool_policy() -> crate::tool_provenance::ToolPolicy {
+    TOOL_POLICY.try_with(|p| *p).unwrap_or_default()
 }
 
 /// Run `fut` with `model` installed as the current turn's model override.
@@ -2169,31 +2172,34 @@ mod tests {
         assert_eq!(observed, inner);
     }
 
-    // --- TOOL_GATE_DISABLED tests (issue #1007) ---
+    use crate::tool_provenance::ToolPolicy;
+
+    // --- TOOL_POLICY tests ---
 
     #[tokio::test]
-    async fn current_tool_gate_disabled_is_false_outside_scope() {
+    async fn current_tool_policy_is_the_shipped_default_outside_scope() {
         // Callers that never install the scope (tests, dreaming jobs, any
-        // path not routed through the daemon dispatch wrapper) must see the
-        // gate enforced — the fail-closed default.
-        assert!(!current_tool_gate_disabled());
+        // path not routed through the daemon dispatch wrapper) get the
+        // shipped default, and never the most permissive level.
+        assert_eq!(current_tool_policy(), ToolPolicy::Standard);
     }
 
     #[tokio::test]
-    async fn current_tool_gate_disabled_observes_installed_scope() {
-        let observed = with_tool_gate_disabled(true, async { current_tool_gate_disabled() }).await;
-        assert!(observed);
-        // After the scope exits the task-local is unset again (back to false).
-        assert!(!current_tool_gate_disabled());
+    async fn current_tool_policy_observes_installed_scope() {
+        let observed =
+            with_tool_policy(ToolPolicy::Aggressive, async { current_tool_policy() }).await;
+        assert_eq!(observed, ToolPolicy::Aggressive);
+        // After the scope exits the task-local is unset again.
+        assert_eq!(current_tool_policy(), ToolPolicy::Standard);
     }
 
     #[tokio::test]
-    async fn nested_tool_gate_disabled_shadows_outer() {
-        let observed = with_tool_gate_disabled(true, async {
-            with_tool_gate_disabled(false, async { current_tool_gate_disabled() }).await
+    async fn nested_tool_policy_shadows_outer() {
+        let observed = with_tool_policy(ToolPolicy::Aggressive, async {
+            with_tool_policy(ToolPolicy::Lax, async { current_tool_policy() }).await
         })
         .await;
-        assert!(!observed);
+        assert_eq!(observed, ToolPolicy::Lax);
     }
 
     // --- MODEL_OVERRIDE tests (issue #34) ---

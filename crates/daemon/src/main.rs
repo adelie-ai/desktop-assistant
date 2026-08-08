@@ -979,6 +979,27 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Say which tool policy this daemon runs at, before it serves anything. A
+    // security level that is only visible by reading the file is a level
+    // nobody checks, and an unreadable value has to be named rather than
+    // quietly replaced.
+    {
+        let security = daemon_config
+            .as_ref()
+            .map(|c| c.security.clone())
+            .unwrap_or_default();
+        match security.tool_policy() {
+            Ok(policy) => tracing::info!(
+                "tool policy: {} (conversations may still ask for a different level)",
+                policy.as_str()
+            ),
+            Err(error) => tracing::error!(
+                "{error}. Running at {} until the file is corrected",
+                desktop_assistant_core::tool_provenance::ToolPolicy::default().as_str()
+            ),
+        }
+    }
+
     // Seed the built-in HS256 issuer identity (iss/aud) once, before serving, so
     // the issue and validate paths share a single immutable identity (#407 step
     // 5). Unset `[ws_auth.hs256]` fields fall back to per-host defaults
