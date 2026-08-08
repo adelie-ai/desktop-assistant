@@ -464,6 +464,27 @@ secret_scan_fails_loudly_when_the_host_local_rules_are_malformed() {
     assert_not_contains "$RUN_OUT" 'clean' 'must not claim a clean scan'
 }
 
+secret_scan_fails_loudly_when_the_host_local_rules_are_unreadable() {
+    # A file that is present but unreadable is a different state from an absent
+    # one, and only one of the two is supported. Absent means this machine
+    # checks layer 1 only. Unreadable means the site-specific rules were meant
+    # to apply and did not, so the scan is missing a layer it was asked for -
+    # and the difference is invisible in the result unless the step says so.
+    local file="$TEST_TMP/private-rules.toml"
+    printf '[[rules]]\nid = "x"\ndescription = "x"\nregex = %s\n' "'''\\bzephyr-prod\\b'''" >"$file"
+    chmod 000 "$file"
+    export ADELE_SECRET_SCAN_PRIVATE_RULES="$file"
+    local fixture="$TEST_TMP/src"
+    mkdir -p "$fixture"
+    printf 'Nothing private in here.\n' >"$fixture/README.md"
+
+    run_cmd "$SECRET_SCAN_SH" "$fixture"
+    [ "$RUN_STATUS" -ne 0 ] || fail 'an unreadable host-local rules file must fail the step'
+    assert_contains "$RUN_ERR" 'DID NOT RUN' 'names the real outcome'
+    assert_contains "$RUN_ERR" 'could not be read' 'diagnoses the permission problem specifically'
+    assert_not_contains "$RUN_OUT" 'clean' 'must not claim a clean scan'
+}
+
 run_test secret_scan_passes_on_a_clean_report
 run_test secret_scan_fails_when_gitleaks_reports_a_leak
 run_test secret_scan_fails_loudly_when_gitleaks_is_not_installed
@@ -487,4 +508,10 @@ run_test secret_scan_runs_and_says_so_when_the_host_local_rules_are_absent
 run_test secret_scan_detects_a_site_literal_when_the_host_local_rules_are_present
 run_test secret_scan_does_not_detect_a_site_literal_when_the_host_local_rules_are_absent
 run_test secret_scan_fails_loudly_when_the_host_local_rules_are_malformed
+if [ "$(id -u)" -eq 0 ]; then
+    skip_test secret_scan_fails_loudly_when_the_host_local_rules_are_unreadable \
+        'runs as root, which can read a mode-000 file, so the unreadable case cannot be staged - rerun as an ordinary user'
+else
+    run_test secret_scan_fails_loudly_when_the_host_local_rules_are_unreadable
+fi
 finish_tests 'secret-scan-gate'

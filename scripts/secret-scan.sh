@@ -165,9 +165,29 @@ trap 'rm -f "$report" "$scan_out" "$merged_config"' EXIT
 # anything that redefines a key already in layer 1 makes gitleaks reject the
 # config, which the report-existence check below turns into a loud hard
 # failure rather than a pass.
-private_config="${ADELE_SECRET_SCAN_PRIVATE_RULES:-${XDG_CONFIG_HOME:-$HOME/.config}/adelie-ai/gitleaks-private.toml}"
+#
+# HOME is defaulted rather than required: with neither it nor XDG_CONFIG_HOME
+# set, the path simply does not exist and the scan runs on layer 1, which is
+# the documented state for a machine that has no host-local rules. Letting
+# `set -u` abort here would fail the whole gate over an unset variable that
+# this step does not actually need.
+private_config="${ADELE_SECRET_SCAN_PRIVATE_RULES:-${XDG_CONFIG_HOME:-${HOME:-}/.config}/adelie-ai/gitleaks-private.toml}"
 if [ -f "$private_config" ]; then
-    cat "$config" "$private_config" >"$merged_config"
+    # A file that is present but unreadable is NOT the same as an absent one.
+    # Absent means "this machine checks layer 1 only", which is a supported
+    # state. Unreadable means the site-specific rules were meant to apply and
+    # did not, so the scan is missing a layer it was asked for - and a scan
+    # missing a layer must never report clean.
+    cat "$config" "$private_config" >"$merged_config" 2>/dev/null || die_loud \
+        'SECRET SCAN DID NOT RUN: the host-local rules file could not be read' \
+        "Found the file but could not read it, so the site-specific rules were" \
+        'not applied. This is not the same as having no such file: the rules' \
+        'were meant to run, so the scan is not reported as clean.' \
+        '' \
+        "    $private_config" \
+        '' \
+        'Fix the file permissions, or remove the file to scan on the committed' \
+        'rules alone.'
     active_config="$merged_config"
     layers='layer 1 + host-local rules'
 else

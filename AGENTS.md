@@ -344,6 +344,10 @@ Like the advisory scan, the step is deliberately unable to pass by accident:
   report, so a syntax error in a hand-written layer 2 cannot read as a clean
   scan. A *missing* file is not a failure; it is the normal state on a
   machine that has not set one up.
+- **A host-local rules file that exists but cannot be read** - hard failure,
+  with its own message. Present-but-unreadable is not the same state as
+  absent: the site-specific rules were meant to apply and did not, so the
+  scan is missing a layer it was asked for and does not report clean.
 - **A secret found** - hard failure, always. There is no suppress-and-warn
   path for a real finding the way there is for an informational RustSec
   advisory; add a reviewed `.gitleaksignore` entry for a genuine false
