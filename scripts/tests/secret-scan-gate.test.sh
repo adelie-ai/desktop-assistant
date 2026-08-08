@@ -252,6 +252,388 @@ secret_scan_does_not_flag_a_duplicated_known_fixture_under_claude_worktrees() {
         "a duplicated known-fixture under .claude/worktrees/ must not fail the scan: $RUN_ERR"
 }
 
+# --- private information (the real, pinned gitleaks binary; no mock) --------
+#
+# A second class the gate must catch, next to credentials: private information.
+# None of it is a credential, so every one of these strings passed the gate for
+# as long as it was in the tree. The scan is split in two layers, and each
+# layer has its own tests below:
+#
+#   Layer 1 - the rules committed in .gitleaks.toml. Generic SHAPES only: an
+#             absolute home path, a hostname on a private-network pseudo-TLD.
+#             This file is public, so no site-specific value may appear in it.
+#   Layer 2 - a host-local rules file outside the repository, holding the
+#             site-specific literals (instance names, private domains). It is
+#             OPTIONAL: a fresh clone with no such file still scans, and still
+#             passes, with layer 1 alone.
+
+# Layer 2 is optional, so a test that does not say which of the two states it
+# runs in silently inherits whatever the machine executing it happens to have
+# installed at the real location. Every test below states it. This path is
+# inside the private per-test temp dir and is never created, so the scan runs
+# layer 1 only.
+without_private_rules() {
+    export ADELE_SECRET_SCAN_PRIVATE_RULES="$TEST_TMP/absent-private-rules.toml"
+}
+
+# A layer-2 rules file built inside the throwaway test directory, around an
+# invented instance name that names nothing this project or anyone else
+# operates. The real host-local file is never read and never depended on: a
+# suite that pointed at it would pass or fail according to a file that is not
+# in the repository and differs per machine.
+INVENTED_SITE_LITERAL='zephyr-prod'
+with_invented_private_rules() {
+    local file="$TEST_TMP/private-rules.toml"
+    cat >"$file" <<'TOML'
+[[rules]]
+id = "site-invented-instance-name"
+description = "Invented instance name; fixture for the gate's own layer-2 tests."
+regex = '''\bzephyr-prod\b'''
+TOML
+    export ADELE_SECRET_SCAN_PRIVATE_RULES="$file"
+}
+
+secret_scan_detects_an_absolute_home_path() {
+    # One of the audited leaks arrived as pasted terminal output, which carries
+    # the operator's home directory with it. Both spellings count: Linux and
+    # macOS.
+    without_private_rules
+    local fixture="$TEST_TMP/src"
+    mkdir -p "$fixture/docs"
+    printf 'Ran it from /home/mallory/Projects/adelie-ai and it worked.\n' >"$fixture/docs/linux.md"
+    printf 'On the laptop the tree is at /Users/mallory/Code/adelie-ai.\n' >"$fixture/docs/macos.md"
+
+    run_cmd "$SECRET_SCAN_SH" "$fixture"
+    [ "$RUN_STATUS" -ne 0 ] || fail 'an absolute home path naming an account must fail the scan'
+    assert_contains "$RUN_ERR" 'adele-absolute-home-path' 'names the rule that matched'
+    assert_contains "$RUN_ERR" 'docs/linux.md' 'names the file holding the Linux home path'
+    assert_contains "$RUN_ERR" 'docs/macos.md' 'names the file holding the macOS home path'
+}
+
+secret_scan_detects_home_paths_whose_account_names_the_bundled_allowlist_discards() {
+    # The reason the private-information rules run in their own pass, pinned as
+    # a test because it is invisible from the outside: gitleaks' bundled global
+    # allowlist discards a finding whose secret starts with "true", contains
+    # "false", ends with "null", or is one repeated letter - case-insensitively,
+    # and with no output at all. While these rules extended the bundled set,
+    # every account name below was silently missed and the scan exited 0.
+    without_private_rules
+    local fixture="$TEST_TMP/src" account
+    mkdir -p "$fixture"
+    for account in trueman TrueUser isfalseuser reginald-null xx; do
+        printf 'Ran it from /home/%s/Projects/adelie-ai and it worked.\n' "$account" \
+            >"$fixture/$account.md"
+    done
+
+    run_cmd "$SECRET_SCAN_SH" "$fixture"
+    [ "$RUN_STATUS" -ne 0 ] || fail 'account names the bundled allowlist discards must still be detected'
+    for account in trueman TrueUser isfalseuser reginald-null xx; do
+        assert_contains "$RUN_ERR" "$account.md" "detects the home path of account '$account'"
+    done
+}
+
+secret_scan_does_not_flag_a_placeholder_that_ends_a_sentence() {
+    # The account name is matched by a character class that includes a dot, so
+    # a placeholder written at the end of a sentence used to be read as a
+    # different name with the full stop attached - "user." rather than "user" -
+    # and stopped matching the exemption. This repository's prose ends
+    # sentences with a full stop, so the gate would fail on its own documented
+    # example.
+    without_private_rules
+    local fixture="$TEST_TMP/src" account
+    mkdir -p "$fixture"
+    for account in user example assistant ada; do
+        printf 'The fixture account is /home/%s.\n' "$account" >"$fixture/$account.md"
+    done
+
+    run_cmd "$SECRET_SCAN_SH" "$fixture"
+    assert_eq 0 "$RUN_STATUS" \
+        "a placeholder that ends a sentence is still that placeholder: $RUN_ERR"
+}
+
+secret_scan_does_not_flag_a_public_domain_that_uses_a_private_tld_as_a_subdomain() {
+    # The rule is about the LAST label. A public name that merely uses one of
+    # these words as a subdomain is an ordinary public FQDN, and a plausible
+    # naming convention - so matching it would fail the gate on clean content.
+    without_private_rules
+    local fixture="$TEST_TMP/src"
+    mkdir -p "$fixture"
+    cat >"$fixture/public.md" <<'EOF'
+See notebooks.lab.example.com for the shared workspace.
+Also try foo.lab.example.org and bar.corp.example.net.
+Published in the collab.labs directory.
+EOF
+
+    run_cmd "$SECRET_SCAN_SH" "$fixture"
+    assert_eq 0 "$RUN_STATUS" "a private-network word used as a subdomain of a public domain is not a private host: $RUN_ERR"
+}
+
+secret_scan_does_not_flag_field_access_that_reads_like_a_hostname() {
+    # `ctx.home_dir` has the shape of a host on the .home pseudo-TLD right up
+    # to the underscore. This workspace is full of them, so the rule has to
+    # stop at an identifier character as well as at a label character.
+    without_private_rules
+    local fixture="$TEST_TMP/src"
+    mkdir -p "$fixture"
+    cat >"$fixture/code.rs" <<'EOF'
+assert_eq!(ctx.home_dir, None);
+let home = peer.home_dir.clone();
+EOF
+    printf '[connections.home_bedrock]\nmodel = "x"\n' >"$fixture/config.toml"
+
+    run_cmd "$SECRET_SCAN_SH" "$fixture"
+    assert_eq 0 "$RUN_STATUS" "ordinary member access must not read as a private hostname: $RUN_ERR"
+}
+
+secret_scan_does_not_flag_documented_home_path_placeholders() {
+    # This matters more than the detection above. A rule that fires on the
+    # placeholder people are told to write instead gets disabled within a week,
+    # and then the real rule is gone too. The first five are the substitutes
+    # AGENTS.base.md rule 5.2 names; the rest are the synthetic account names
+    # this repository's own fixtures, documentation and container images
+    # already use.
+    without_private_rules
+    local fixture="$TEST_TMP/src"
+    mkdir -p "$fixture"
+    cat >"$fixture/placeholders.md" <<'EOF'
+/home/<user>/.config
+/home/user/work
+/home/$USER/bin
+${HOME}/.local/share
+~/.config/adelie-ai
+/home/example/.ssh/id_ed25519
+/home/assistant/.config
+/home/ada/.local/share
+/home/ada-client/.cache
+/home/peer/notes
+/home/x/.agents/skills
+/home/{owner}/.local/share/adele
+EOF
+
+    run_cmd "$SECRET_SCAN_SH" "$fixture"
+    assert_eq 0 "$RUN_STATUS" "documented home-path placeholders must not fail the scan: $RUN_ERR"
+}
+
+secret_scan_detects_a_private_network_hostname() {
+    # A hostname on a pseudo-TLD that public DNS never delegates is a private
+    # machine by construction, whatever it is called - so the rule matches the
+    # SHAPE and needs no site-specific name written into the public config.
+    without_private_rules
+    local fixture="$TEST_TMP/src" tld
+    mkdir -p "$fixture"
+    for tld in lab lan corp home; do
+        printf 'Deployed to daemon.internal-site.%s and it answered.\n' "$tld" \
+            >"$fixture/host-$tld.md"
+    done
+
+    run_cmd "$SECRET_SCAN_SH" "$fixture"
+    [ "$RUN_STATUS" -ne 0 ] || fail 'a private-network hostname must fail the scan'
+    assert_contains "$RUN_ERR" 'adele-private-network-hostname' 'names the rule that matched'
+    for tld in lab lan corp home; do
+        assert_contains "$RUN_ERR" "host-$tld.md" "detects a hostname under .$tld"
+    done
+}
+
+secret_scan_does_not_flag_public_or_documentation_hostnames() {
+    # example.com is the reserved documentation domain and is explicitly fine
+    # (AGENTS.base.md rule 5.2). The rest are names this repository already
+    # carries on purpose: Kubernetes' own service domain, the cloud metadata
+    # host its SSRF policy exists to block, and ordinary member access in Rust
+    # that happens to read like a hostname.
+    without_private_rules
+    local fixture="$TEST_TMP/src"
+    mkdir -p "$fixture"
+    cat >"$fixture/public.md" <<'EOF'
+https://example.com/docs
+registry.example.com/adelie/daemon
+adele-daemon.default.svc.cluster.local
+http://metadata.google.internal/computeMetadata/v1/
+let addr = self.local;
+let url = cfg.db.internal;
+published in the collab.labs directory
+EOF
+
+    run_cmd "$SECRET_SCAN_SH" "$fixture"
+    assert_eq 0 "$RUN_STATUS" "public and documentation hostnames must not fail the scan: $RUN_ERR"
+}
+
+secret_scan_does_not_flag_the_gate_files_that_carry_the_patterns() {
+    # The rule file and this suite both have to contain the very strings the
+    # rules match, and gitleaks scans the working tree, so without an exemption
+    # a clean checkout fails its own gate. That is the noise that trains people
+    # to bypass it (the same reasoning as the allowlists already in
+    # .gitleaks.toml). Copied to their repo-relative paths inside the fixture,
+    # because the exemption is matched by path SUFFIX and has to hold wherever
+    # the file is checked out.
+    without_private_rules
+    local fixture="$TEST_TMP/src"
+    mkdir -p "$fixture/scripts/tests"
+    cp "$SCRIPT_TESTS_ROOT/.gitleaks.toml" "$fixture/.gitleaks.toml"
+    cp "$SCRIPT_TESTS_ROOT/.gitleaks-private-info.toml" "$fixture/.gitleaks-private-info.toml"
+    cp "$SCRIPT_TESTS_ROOT/scripts/tests/secret-scan-gate.test.sh" \
+        "$fixture/scripts/tests/secret-scan-gate.test.sh"
+
+    run_cmd "$SECRET_SCAN_SH" "$fixture"
+    assert_eq 0 "$RUN_STATUS" \
+        "the rule file and this suite must not match their own patterns: $RUN_ERR"
+}
+
+# --- layer 2: the optional host-local site rules -----------------------------
+
+secret_scan_runs_and_says_so_when_the_host_local_rules_are_absent() {
+    # A fresh clone, a new machine and CI all have no host-local file. The scan
+    # must still run and still pass on layer 1 alone - and say which layers it
+    # ran, because "clean" means two different things in the two states.
+    without_private_rules
+    local fixture="$TEST_TMP/src"
+    mkdir -p "$fixture"
+    printf 'Nothing private in here.\n' >"$fixture/README.md"
+
+    run_cmd "$SECRET_SCAN_SH" "$fixture"
+    assert_eq 0 "$RUN_STATUS" "a missing host-local rules file must not fail the scan: $RUN_ERR"
+    assert_contains "$RUN_OUT" 'clean' 'reports the clean scan'
+    assert_contains "$RUN_OUT" 'no host-local rules' 'says the site-specific layer did not run'
+}
+
+secret_scan_detects_a_site_literal_when_the_host_local_rules_are_present() {
+    with_invented_private_rules
+    local fixture="$TEST_TMP/src"
+    mkdir -p "$fixture"
+    printf 'kubectl -n %s rollout status deploy/adele-daemon\n' "$INVENTED_SITE_LITERAL" \
+        >"$fixture/runbook.md"
+
+    run_cmd "$SECRET_SCAN_SH" "$fixture"
+    [ "$RUN_STATUS" -ne 0 ] || fail 'a site literal must fail the scan when the host-local rules are present'
+    assert_contains "$RUN_ERR" 'site-invented-instance-name' 'names the host-local rule that matched'
+    assert_contains "$RUN_ERR" 'runbook.md' 'names the file holding the site literal'
+}
+
+secret_scan_still_applies_the_committed_shapes_when_the_host_local_rules_are_present() {
+    # The host-local rules are APPENDED to the committed shapes, not
+    # substituted for them. Nothing in the output distinguishes the two, so
+    # without this test a merge that dropped the committed half would look
+    # exactly like a clean scan on a machine that has a host-local file - and
+    # the machines that have one are the machines with something to lose.
+    with_invented_private_rules
+    local fixture="$TEST_TMP/src"
+    mkdir -p "$fixture"
+    printf 'Ran it from /home/mallory/Projects/adelie-ai and it worked.\n' >"$fixture/home.md"
+    printf 'It answered at daemon.internal-site.lab this morning.\n' >"$fixture/host.md"
+    printf 'kubectl -n %s get pods\n' "$INVENTED_SITE_LITERAL" >"$fixture/site.md"
+
+    run_cmd "$SECRET_SCAN_SH" "$fixture"
+    [ "$RUN_STATUS" -ne 0 ] || fail 'the committed shapes must still apply alongside host-local rules'
+    assert_contains "$RUN_ERR" 'adele-absolute-home-path' 'the committed home-path rule still runs'
+    assert_contains "$RUN_ERR" 'adele-private-network-hostname' 'the committed hostname rule still runs'
+    assert_contains "$RUN_ERR" 'site-invented-instance-name' 'the host-local rule runs too'
+}
+
+secret_scan_does_not_detect_a_site_literal_when_the_host_local_rules_are_absent() {
+    # The paired negative. Without it the test above proves only that the scan
+    # fails, not that the host-local layer is what made it fail.
+    without_private_rules
+    local fixture="$TEST_TMP/src"
+    mkdir -p "$fixture"
+    printf 'kubectl -n %s rollout status deploy/adele-daemon\n' "$INVENTED_SITE_LITERAL" \
+        >"$fixture/runbook.md"
+
+    run_cmd "$SECRET_SCAN_SH" "$fixture"
+    assert_eq 0 "$RUN_STATUS" \
+        "a site literal is layer 2's to catch, so layer 1 alone must pass it: $RUN_ERR"
+}
+
+secret_scan_fails_loudly_when_the_host_local_rules_are_malformed() {
+    # The host-local file is hand-written, on one machine, outside review. A
+    # syntax error in it must not read as a clean scan: gitleaks rejects the
+    # config, writes no report, and the existing report-existence check turns
+    # that into a hard failure rather than a pass.
+    local file="$TEST_TMP/private-rules.toml"
+    printf 'this is not valid toml [[[\n' >"$file"
+    export ADELE_SECRET_SCAN_PRIVATE_RULES="$file"
+    local fixture="$TEST_TMP/src"
+    mkdir -p "$fixture"
+    printf 'Nothing private in here.\n' >"$fixture/README.md"
+
+    run_cmd "$SECRET_SCAN_SH" "$fixture"
+    [ "$RUN_STATUS" -ne 0 ] || fail 'a malformed host-local rules file must fail the step'
+    assert_contains "$RUN_ERR" 'DID NOT RUN' 'names the real outcome'
+    assert_not_contains "$RUN_OUT" 'clean' 'must not claim a clean scan'
+}
+
+secret_scan_refuses_a_host_local_rule_that_would_shadow_a_committed_rule() {
+    # The sharp edge of merging two configs by concatenation. gitleaks keeps
+    # one rule per id and lets the LATER definition win, silently - so a
+    # host-local file that reuses a committed rule's id switches that rule off
+    # and the scan still prints "clean". A weaker gate that reports success is
+    # worse than no gate, because nobody goes looking. The fixture below is the
+    # committed home-path rule's own id, pointed at a regex that matches
+    # nothing, over content that rule is supposed to catch.
+    local file="$TEST_TMP/private-rules.toml"
+    cat >"$file" <<'TOML'
+[[rules]]
+id = "adele-absolute-home-path"
+description = "Reuses a committed rule's id, which would replace it."
+regex = '''\bmatches-nothing-at-all\b'''
+TOML
+    export ADELE_SECRET_SCAN_PRIVATE_RULES="$file"
+    local fixture="$TEST_TMP/src"
+    mkdir -p "$fixture"
+    printf 'Ran it from /home/mallory/Projects/adelie-ai and it worked.\n' >"$fixture/doc.md"
+
+    run_cmd "$SECRET_SCAN_SH" "$fixture"
+    [ "$RUN_STATUS" -ne 0 ] || fail 'a host-local rule that shadows a committed rule must fail the step'
+    assert_not_contains "$RUN_OUT" 'clean' 'must not report a clean scan on a rule set it silently weakened'
+    assert_contains "$RUN_ERR" 'adele-absolute-home-path' 'names the id that would have been replaced'
+}
+
+secret_scan_fails_loudly_when_two_host_local_rules_share_an_id() {
+    # The same replacement, entirely inside the host-local file: the second
+    # block wins and the first stops matching. Reserving the id prefix cannot
+    # catch this one, so it is checked separately.
+    local file="$TEST_TMP/private-rules.toml"
+    cat >"$file" <<'TOML'
+[[rules]]
+id = "site-duplicated"
+description = "First definition."
+regex = '''\bzephyr-prod\b'''
+
+[[rules]]
+id = "site-duplicated"
+description = "Second definition, which replaces the first."
+regex = '''\bmatches-nothing-at-all\b'''
+TOML
+    export ADELE_SECRET_SCAN_PRIVATE_RULES="$file"
+    local fixture="$TEST_TMP/src"
+    mkdir -p "$fixture"
+    printf 'Nothing private in here.\n' >"$fixture/README.md"
+
+    run_cmd "$SECRET_SCAN_SH" "$fixture"
+    [ "$RUN_STATUS" -ne 0 ] || fail 'two rules sharing an id must fail the step'
+    assert_contains "$RUN_ERR" 'site-duplicated' 'names the id that is defined twice'
+    assert_not_contains "$RUN_OUT" 'clean' 'must not claim a clean scan'
+}
+
+secret_scan_fails_loudly_when_the_host_local_rules_are_unreadable() {
+    # A file that is present but unreadable is a different state from an absent
+    # one, and only one of the two is supported. Absent means this machine
+    # checks layer 1 only. Unreadable means the site-specific rules were meant
+    # to apply and did not, so the scan is missing a layer it was asked for -
+    # and the difference is invisible in the result unless the step says so.
+    local file="$TEST_TMP/private-rules.toml"
+    printf '[[rules]]\nid = "x"\ndescription = "x"\nregex = %s\n' "'''\\bzephyr-prod\\b'''" >"$file"
+    chmod 000 "$file"
+    export ADELE_SECRET_SCAN_PRIVATE_RULES="$file"
+    local fixture="$TEST_TMP/src"
+    mkdir -p "$fixture"
+    printf 'Nothing private in here.\n' >"$fixture/README.md"
+
+    run_cmd "$SECRET_SCAN_SH" "$fixture"
+    [ "$RUN_STATUS" -ne 0 ] || fail 'an unreadable host-local rules file must fail the step'
+    assert_contains "$RUN_ERR" 'DID NOT RUN' 'names the real outcome'
+    assert_contains "$RUN_ERR" 'could not be read' 'diagnoses the permission problem specifically'
+    assert_not_contains "$RUN_OUT" 'clean' 'must not claim a clean scan'
+}
+
 run_test secret_scan_passes_on_a_clean_report
 run_test secret_scan_fails_when_gitleaks_reports_a_leak
 run_test secret_scan_fails_loudly_when_gitleaks_is_not_installed
@@ -266,4 +648,24 @@ run_test secret_scan_detects_a_working_tree_key
 run_test secret_scan_does_not_flag_the_clean_tree
 run_test secret_scan_detects_a_key_under_claude_worktrees
 run_test secret_scan_does_not_flag_a_duplicated_known_fixture_under_claude_worktrees
+run_test secret_scan_detects_an_absolute_home_path
+run_test secret_scan_detects_home_paths_whose_account_names_the_bundled_allowlist_discards
+run_test secret_scan_does_not_flag_a_placeholder_that_ends_a_sentence
+run_test secret_scan_does_not_flag_a_public_domain_that_uses_a_private_tld_as_a_subdomain
+run_test secret_scan_does_not_flag_field_access_that_reads_like_a_hostname
+run_test secret_scan_does_not_flag_documented_home_path_placeholders
+run_test secret_scan_detects_a_private_network_hostname
+run_test secret_scan_does_not_flag_public_or_documentation_hostnames
+run_test secret_scan_does_not_flag_the_gate_files_that_carry_the_patterns
+run_test secret_scan_runs_and_says_so_when_the_host_local_rules_are_absent
+run_test secret_scan_detects_a_site_literal_when_the_host_local_rules_are_present
+run_test secret_scan_still_applies_the_committed_shapes_when_the_host_local_rules_are_present
+run_test secret_scan_does_not_detect_a_site_literal_when_the_host_local_rules_are_absent
+run_test secret_scan_fails_loudly_when_the_host_local_rules_are_malformed
+if [ "$(id -u)" -eq 0 ]; then
+    skip_test secret_scan_fails_loudly_when_the_host_local_rules_are_unreadable \
+        'runs as root, which can read a mode-000 file, so the unreadable case cannot be staged - rerun as an ordinary user'
+else
+    run_test secret_scan_fails_loudly_when_the_host_local_rules_are_unreadable
+fi
 finish_tests 'secret-scan-gate'
