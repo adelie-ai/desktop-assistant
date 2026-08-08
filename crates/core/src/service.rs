@@ -1406,16 +1406,36 @@ impl<S, L, T> ConversationHandler<S, L, T> {
         pending: &PendingAction,
         identity: &str,
         outcome: &str,
+        external: bool,
         written: &Arc<Mutex<HashMap<String, String>>>,
     ) {
         let Some(write) = self.record_burn.clone() else {
             return;
         };
+        // Both halves of one rule, in one place. Once the turn has read content
+        // from outside the trust boundary it can vouch for neither the tool's
+        // error text nor the arguments the model chose - a model that has just
+        // read a web page may be quoting it back, and an argument is the
+        // channel it writes directly. Both are shown to a later turn at a
+        // decision point, so where the turn cannot vouch for them, neither is
+        // recorded.
+        //
+        // The lesson survives either way. The act is the fingerprint, which
+        // this does not touch, and the circumstance is read off the clock and
+        // the client rather than written by the model.
+        let (outcome, scope) = if external {
+            (
+                OUTCOME_WITHHELD_EXTERNAL.to_string(),
+                pending.scope.without_arguments(),
+            )
+        } else {
+            (clamp_outcome(outcome), pending.scope.clone())
+        };
         let observation = BurnObservation {
             action: pending.action.clone(),
             fingerprint: pending.fingerprint.clone(),
-            scope: pending.scope.clone(),
-            outcome: clamp_outcome(outcome),
+            scope,
+            outcome,
         };
         let written = Arc::clone(written);
         let identity = identity.to_string();
@@ -3965,16 +3985,19 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                         // the model is deciding whether to act, so it is the
                         // worst place of the four to park an instruction.
                         //
-                        // The lesson survives; the words do not. What went
-                        // wrong is worth less than the guarantee that nothing
-                        // an outside party wrote is replayed at a decision
-                        // point.
-                        let outcome = if turn_provenance.ingested_external() {
-                            OUTCOME_WITHHELD_EXTERNAL
-                        } else {
-                            stored.as_str()
-                        };
-                        self.record_burn_for(pending, identity, outcome, &burns_written_this_turn);
+                        // The lesson survives; the words do not, whether they
+                        // are the server's own or the model's arguments echoing
+                        // them back. What went wrong is worth less than the
+                        // guarantee that nothing an outside party wrote is
+                        // replayed at a decision point - `record_burn_for`
+                        // holds both halves of that rule.
+                        self.record_burn_for(
+                            pending,
+                            identity,
+                            &stored,
+                            turn_provenance.ingested_external(),
+                            &burns_written_this_turn,
+                        );
                     }
                 }
 
@@ -15052,6 +15075,12 @@ mod tests {
     /// its own retry disproved. The turn read its live burns before its first
     /// round, so the lesson it wrote is not among them - it has to be tracked
     /// as the turn goes.
+    ///
+    /// The write runs off the turn's path, so this depends on
+    /// `ScriptedToolExecutor::execute_tool` yielding: without that the spawned
+    /// task is never polled before the second call reads the map, and the test
+    /// asserts an absence it produced itself. Removing that yield turns this
+    /// test red, which is the point of naming the dependency here.
     #[tokio::test]
     async fn a_burn_written_this_turn_is_extinguished_by_a_later_success_in_it() {
         let executor = ScriptedToolExecutor::new(
@@ -15146,13 +15175,28 @@ mod tests {
         assert_eq!(written.len(), 1, "the failure still teaches that it failed");
         assert!(
             !written[0].outcome.contains("exfiltrate"),
-            "but not one word an outside party chose; got {}",
+            "but not one word the server chose; got {}",
             written[0].outcome
         );
         assert!(
             written[0].outcome.contains("outside the trust boundary"),
             "and it says why the words are missing; got {}",
             written[0].outcome
+        );
+        // The stronger channel, and the one an outcome-only guard misses: the
+        // model writes the arguments itself, and a model that has just read a
+        // page may be quoting it back. A recorded argument is printed verbatim
+        // in a later turn's warning, at a decision point.
+        assert_eq!(
+            written[0]
+                .scope
+                .get(&crate::domain::Facet::Argument("query".to_string())),
+            None,
+            "nothing the model wrote after reading outside content is recorded"
+        );
+        assert!(
+            !written[0].fingerprint.is_empty(),
+            "and the act is still identified, so the lesson still fires on it"
         );
     }
 

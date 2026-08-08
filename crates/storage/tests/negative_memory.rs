@@ -19,6 +19,8 @@
 //! - `a_second_live_burn_with_one_identity_is_refused_by_the_index`
 //! - `a_burn_scoped_by_a_facet_this_build_cannot_name_is_not_returned`
 //! - `a_burn_and_the_correction_over_it_are_reaped_together`
+//! - `two_first_writes_of_one_act_at_once_make_one_lesson`
+//! - `two_corrections_of_one_burn_at_once_write_one_overlay`
 //! - `a_burn_nothing_has_confirmed_is_reaped_on_the_next_write`
 //! - `a_reaped_burn_takes_its_facets_with_it`
 //! - `a_cross_tenant_read_of_a_negative_memory_returns_nothing`
@@ -658,6 +660,103 @@ async fn a_burn_and_the_correction_over_it_are_reaped_together() {
         !held.iter().any(|m| m.id == burn.id) && !held.iter().any(|m| m.id == correction_id),
         "once both are past the horizon the pair goes together, and neither is \
          left naming the other"
+    );
+    fx.cleanup().await;
+}
+
+/// Two turns failing the same act at the same moment must produce one lesson,
+/// not one lesson and a lost one.
+///
+/// The `FOR UPDATE` read cannot serialize this: it locks a row that exists, and
+/// on a first write there is none. The loser of the race therefore has to meet
+/// the live-identity index and read it as "someone got here first", rather than
+/// as an error that costs a lesson.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_first_writes_of_one_act_at_once_make_one_lesson() {
+    let Some(fx) = fixture().await else { return };
+    let store = PgNegativeMemoryStore::new(fx.pool.clone());
+
+    let (left, right) = tokio::join!(
+        with_user_id(UserId::new(ALICE), async {
+            store
+                .record_burn(observation(at_the_workshop(), "build is a mount point"))
+                .await
+        }),
+        with_user_id(UserId::new(ALICE), async {
+            store
+                .record_burn(observation(
+                    on_a_laptop(),
+                    "build is a mount point here too",
+                ))
+                .await
+        }),
+    );
+    let left = left.expect("the first write succeeds");
+    let right = right.expect("the second write succeeds, however the race went");
+
+    assert_eq!(
+        left.id, right.id,
+        "one act is one lesson, whichever transaction reached it first"
+    );
+    let live = live_as(&store, ALICE).await;
+    assert_eq!(live.len(), 1, "and there is exactly one row holding it");
+    assert_eq!(
+        live[0].occurrences, 2,
+        "the loser confirmed the winner's row rather than losing its own lesson"
+    );
+    fx.cleanup().await;
+}
+
+/// Two successes of one act in one turn each spawn their own correction write.
+/// Only one may land, or the second names a burn that no longer points at it.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_corrections_of_one_burn_at_once_write_one_overlay() {
+    let Some(fx) = fixture().await else { return };
+    let store = PgNegativeMemoryStore::new(fx.pool.clone());
+
+    let burn = burn_as(
+        &store,
+        ALICE,
+        observation(at_the_workshop(), "build is a mount point"),
+    )
+    .await;
+
+    let (left, right) = tokio::join!(
+        with_user_id(UserId::new(ALICE), async {
+            store
+                .extinguish(vec![burn.id.clone()], "it works now".to_string())
+                .await
+        }),
+        with_user_id(UserId::new(ALICE), async {
+            store
+                .extinguish(vec![burn.id.clone()], "it works now".to_string())
+                .await
+        }),
+    );
+    let extinguished = left.expect("one correction lands").len()
+        + right.expect("the other reports nothing to do").len();
+    assert_eq!(
+        extinguished, 1,
+        "one burn, one correction, one report of it"
+    );
+
+    let history = history_as(&store, ALICE).await;
+    assert_eq!(
+        history.len(),
+        2,
+        "the burn and one overlay, with no orphan beside them"
+    );
+    let overlay = history
+        .iter()
+        .find(|m| m.kind == NegativeMemoryKind::Correction)
+        .expect("the overlay exists");
+    assert_eq!(
+        history
+            .iter()
+            .find(|m| m.id == burn.id)
+            .and_then(|m| m.superseded_by.clone()),
+        Some(overlay.id.clone()),
+        "and the burn names the one that was written"
     );
     fx.cleanup().await;
 }

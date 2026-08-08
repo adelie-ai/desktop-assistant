@@ -145,11 +145,16 @@ questions about different objects.
   and the foreign key takes their facets with them. A burn and the correction
   over it are one unit and go together, so a reap never leaves a correction
   naming a lesson that is gone.
-- **Nothing an outside party wrote is replayed.** A tool's error text can be a
-  remote server's own words. Once a turn has read content from outside the trust
-  boundary, a burn it records keeps the lesson and drops the words - a burn is
-  read back in another conversation at the moment the model is deciding whether
-  to act, which is the last place such a sentence should reach.
+- **Nothing an outside party wrote is replayed.** A burn is read back in
+  another conversation, at the moment the model is deciding whether to act -
+  the last place an outside party's sentence should reach. Two channels get
+  there. A tool's error text can be a remote server's own words, and the
+  arguments are written by the model, which may be quoting a page it has just
+  read. Once a turn has read content from outside the trust boundary, a burn it
+  records keeps the lesson and drops both: the outcome becomes a fixed line
+  saying why, and the recorded arguments are left out. The act is the digest, so
+  the lesson still fires on exactly the call it was about; only what a warning
+  can say about it is lost.
 - **No surface yet for reading or clearing a burn.** A person meets this only as
   the assistant saying it tried something before and it went badly. A wrong burn
   goes quiet four weeks after its last occurrence on its own, and the moment the

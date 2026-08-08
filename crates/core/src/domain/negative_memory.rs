@@ -295,6 +295,25 @@ impl Scope {
             .all(|(facet, value)| present.get(facet) == Some(value.as_str()))
     }
 
+    /// The same scope with nothing the model wrote in it: circumstance only.
+    ///
+    /// An argument value is chosen by the model, and a model that has just read
+    /// a web page may be echoing it. The values are shown to a later turn at a
+    /// decision point, so where the turn cannot vouch for them they are not
+    /// recorded at all. Dropping them costs a warning some of what it can say
+    /// and costs the match nothing: the act is the digest, which this does not
+    /// touch.
+    #[must_use]
+    pub fn without_arguments(&self) -> Scope {
+        Scope(
+            self.0
+                .iter()
+                .filter(|(facet, _)| !facet.is_identity())
+                .map(|(f, v)| (f.clone(), v.clone()))
+                .collect(),
+        )
+    }
+
     /// This scope widened by a second occurrence.
     ///
     /// A situation facet the second occurrence *observed with a different
@@ -352,13 +371,26 @@ impl Scope {
 /// be what identifies.
 pub fn fingerprint(arguments: &serde_json::Value) -> String {
     let mut hasher = Sha256::new();
-    absorb(&mut hasher, arguments);
+    absorb(&mut hasher, arguments, MAX_ARGUMENT_DEPTH);
     format!("{:x}", hasher.finalize())[..32].to_string()
 }
 
+/// How far into a nested argument the digest reads.
+///
+/// Past this it writes one marker byte and stops, which folds two calls
+/// differing only below the limit into one act. The dispatch path cannot reach
+/// it - `serde_json` refuses to parse deeper than 128 - so this bounds a caller
+/// that builds a value programmatically, and bounds it without a stack
+/// overflow.
+const MAX_ARGUMENT_DEPTH: usize = 64;
+
 /// Feed one JSON value into `hasher` in a form that depends on its content and
 /// not on how it was written.
-fn absorb(hasher: &mut Sha256, value: &serde_json::Value) {
+fn absorb(hasher: &mut Sha256, value: &serde_json::Value, depth: usize) {
+    let Some(depth) = depth.checked_sub(1) else {
+        hasher.update(*b"!");
+        return;
+    };
     // Every arm leads with a distinct tag byte, so the string "1" and the
     // number 1 cannot hash alike, and each composite frames its own end.
     match value {
@@ -378,7 +410,7 @@ fn absorb(hasher: &mut Sha256, value: &serde_json::Value) {
         serde_json::Value::Array(items) => {
             hasher.update(*b"[");
             for item in items {
-                absorb(hasher, item);
+                absorb(hasher, item, depth);
             }
             hasher.update(*b"]");
         }
@@ -390,7 +422,7 @@ fn absorb(hasher: &mut Sha256, value: &serde_json::Value) {
             keys.sort_unstable();
             for key in keys {
                 absorb_text(hasher, key);
-                absorb(hasher, &map[key]);
+                absorb(hasher, &map[key], depth);
             }
             hasher.update(*b"}");
         }
@@ -440,6 +472,13 @@ impl PendingAction {
         arguments: &serde_json::Value,
         situation: &Situation,
     ) -> Self {
+        // A provider that emits no arguments may send an empty object or a
+        // literal null, and the two are the same call. Normalising here keeps
+        // one act from splitting into two lessons on a detail of the wire.
+        let arguments = match arguments {
+            serde_json::Value::Null => &serde_json::Value::Object(serde_json::Map::new()),
+            other => other,
+        };
         let mut scope = Scope::new();
         if let serde_json::Value::Object(map) = arguments {
             let mut named: Vec<(&String, String)> = map

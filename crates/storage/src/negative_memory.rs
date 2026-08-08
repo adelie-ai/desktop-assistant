@@ -473,7 +473,13 @@ impl NegativeMemoryStore for PgNegativeMemoryStore {
             .await
             .map_err(storage_error)?;
             if written.rows_affected() == 0 {
-                continue;
+                // The lock above says this cannot happen. Rolling back rather
+                // than skipping on, because carrying on would commit a
+                // correction naming a burn that was never marked - a row saying
+                // an unnamed lesson stopped applying.
+                return Err(CoreError::Storage(format!(
+                    "negative memory {id} was locked as live and then wrote no correction"
+                )));
             }
 
             sqlx::query(
@@ -503,7 +509,12 @@ impl NegativeMemoryStore for PgNegativeMemoryStore {
             .await
             .map_err(storage_error)?;
             if overlaid.rows_affected() == 0 {
-                continue;
+                // Same argument as above, and the same answer: the correction
+                // row is already written in this transaction, so skipping on
+                // would commit an orphan.
+                return Err(CoreError::Storage(format!(
+                    "negative memory {id} was locked as live and then refused its correction"
+                )));
             }
 
             extinguished.push(id.clone());
