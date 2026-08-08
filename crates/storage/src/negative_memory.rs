@@ -33,9 +33,12 @@
 //!
 //! ## The writer is the reaper
 //!
-//! There is no sweep. Every write path first deletes this user's burns that
-//! nothing has confirmed for [`FORGET_DAYS`], which bounds the table on the
-//! path that grows it. The foreign key takes each row's facets with it.
+//! There is no sweep. [`NegativeMemoryStore::record_burn`] first deletes this
+//! user's burns that nothing has confirmed for [`FORGET_DAYS`], and the foreign
+//! key takes each row's facets with it. That one path is enough to bound the
+//! table, because it is the only one that can add a lesson: a correction is
+//! written over a burn, so it cannot arrive before the write that would have
+//! reaped.
 //!
 //! [`FORGET_DAYS`]: desktop_assistant_core::domain::negative_memory::FORGET_DAYS
 //!
@@ -71,6 +74,7 @@ impl PgNegativeMemoryStore {
 struct MemoryRow {
     id: String,
     action: String,
+    fingerprint: String,
     kind: String,
     outcome: String,
     occurrences: i64,
@@ -104,22 +108,40 @@ fn storable(value: &str) -> bool {
 /// Assemble rows and their facets into domain memories, in the order the rows
 /// arrived.
 ///
-/// A row whose stored kind this build cannot name is dropped: an unknown kind
-/// is one this reader cannot act on, and a memory that might be a correction
-/// must never be treated as a lesson.
+/// A row this build cannot read whole is dropped, and both ways it can fail are
+/// the same failure. An unknown `kind` is one this reader cannot act on, and a
+/// memory that might be a correction must never be treated as a lesson. A facet
+/// naming a dimension this build does not know is worse: keeping the row
+/// without it would drop a requirement, so the burn would fire on acts it had
+/// never been seen with - the over-generalization the whole feature is built to
+/// avoid, arriving through a version skew.
 fn assemble(rows: Vec<MemoryRow>, facets: Vec<FacetRow>) -> Vec<NegativeMemory> {
     rows.into_iter()
         .filter_map(|row| {
-            let kind = NegativeMemoryKind::from_stored(&row.kind)?;
+            let kind = NegativeMemoryKind::from_stored(&row.kind).or_else(|| {
+                tracing::warn!(
+                    kind = %row.kind,
+                    "negative memory row has a kind this build cannot name; skipping it"
+                );
+                None
+            })?;
             let scope = Scope::from_stored(
                 facets
                     .iter()
                     .filter(|f| f.memory_id == row.id)
                     .map(|f| (f.kind.as_str(), f.name.as_str(), f.value.clone())),
-            );
+            )
+            .or_else(|| {
+                tracing::warn!(
+                    "negative memory row is scoped by a facet this build cannot name; \
+                     skipping it"
+                );
+                None
+            })?;
             Some(NegativeMemory {
                 id: row.id,
                 action: row.action,
+                fingerprint: row.fingerprint,
                 kind,
                 scope,
                 outcome: row.outcome,
@@ -161,8 +183,8 @@ where
 
 /// The columns every memory read selects, in the order [`MemoryRow`] names
 /// them.
-const MEMORY_COLUMNS: &str = "id, action, kind, outcome, occurrences, written_at, \
-                              last_confirmed_at, superseded_by";
+const MEMORY_COLUMNS: &str = "id, action, fingerprint, kind, outcome, occurrences, \
+                              written_at, last_confirmed_at, superseded_by";
 
 impl NegativeMemoryStore for PgNegativeMemoryStore {
     async fn live_burns(&self) -> Result<Vec<NegativeMemory>, CoreError> {
@@ -193,16 +215,28 @@ impl NegativeMemoryStore for PgNegativeMemoryStore {
                 "a negative memory cannot hold a NUL byte".to_string(),
             ));
         }
-        let fingerprint = observation.scope.fingerprint();
+        let fingerprint = observation.fingerprint.clone();
 
         let mut tx = self.pool.begin().await.map_err(storage_error)?;
 
         // The writer is the reaper (see the module header). Runs first so a
         // long-forgotten burn cannot be confirmed back to life by an identity
         // collision this write would otherwise find.
+        //
+        // A burn and the correction over it are one unit and go together. A
+        // burn is always older than what corrected it, so reaping on each row's
+        // own stamp would take the burn first and leave a correction naming
+        // nothing - a row that says an unnamed lesson stopped applying.
         sqlx::query(
-            "DELETE FROM negative_memory \
-             WHERE user_id = $1 AND last_confirmed_at < NOW() - make_interval(days => $2)",
+            "DELETE FROM negative_memory nm \
+             WHERE nm.user_id = $1 \
+               AND nm.last_confirmed_at < NOW() - make_interval(days => $2) \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM negative_memory partner \
+                   WHERE partner.user_id = nm.user_id \
+                     AND (partner.id = nm.superseded_by OR partner.superseded_by = nm.id) \
+                     AND partner.last_confirmed_at >= NOW() - make_interval(days => $2) \
+               )",
         )
         .bind(user_id)
         .bind(FORGET_DAYS.round() as i32)
@@ -227,58 +261,118 @@ impl NegativeMemoryStore for PgNegativeMemoryStore {
         .await
         .map_err(storage_error)?;
 
-        let write = match existing {
+        // `FOR UPDATE` locks a row that exists; it cannot lock one that does
+        // not. So a first write races another turn's first write of the same
+        // act, and the loser would violate the live-identity index and lose its
+        // lesson to a logged warning. `ON CONFLICT DO NOTHING` turns that into
+        // an ordinary answer: the loser writes nothing, reads the winner's row,
+        // and confirms it - which is what the second occurrence of one act
+        // should have done all along.
+        let existing = match existing {
+            Some(row) => Some(row),
             None => {
                 let id = uuid::Uuid::now_v7().to_string();
-                sqlx::query(
+                let claimed = sqlx::query_scalar::<_, String>(
                     "INSERT INTO negative_memory \
                          (id, user_id, action, fingerprint, kind, outcome) \
-                     VALUES ($1, $2, $3, $4, 'burn', $5)",
+                     VALUES ($1, $2, $3, $4, 'burn', $5) \
+                     ON CONFLICT (user_id, action, fingerprint) \
+                         WHERE kind = 'burn' AND superseded_by IS NULL \
+                     DO NOTHING \
+                     RETURNING id",
                 )
                 .bind(&id)
                 .bind(user_id)
                 .bind(&observation.action)
                 .bind(&fingerprint)
                 .bind(&observation.outcome)
-                .execute(&mut *tx)
+                .fetch_optional(&mut *tx)
                 .await
                 .map_err(storage_error)?;
 
-                for (facet, value) in observation.scope.iter() {
-                    if !storable(facet.name()) || !storable(value) {
-                        continue;
+                match claimed {
+                    Some(id) => {
+                        for (facet, value) in observation.scope.iter() {
+                            // The domain refuses a facet a text column cannot
+                            // hold, so reaching this is a broken invariant
+                            // rather than bad input, and it must not pass
+                            // quietly: the row's stored facets would then say
+                            // less than the call it describes.
+                            if !storable(facet.name()) || !storable(value) {
+                                return Err(CoreError::Storage(format!(
+                                    "a negative memory facet cannot hold a NUL byte: \
+                                     {}",
+                                    facet.name()
+                                )));
+                            }
+                            sqlx::query(
+                                "INSERT INTO negative_memory_facet \
+                                     (user_id, memory_id, kind, name, value) \
+                                 VALUES ($1, $2, $3, $4, $5) \
+                                 ON CONFLICT (user_id, memory_id, kind, name) DO NOTHING",
+                            )
+                            .bind(user_id)
+                            .bind(&id)
+                            .bind(facet.kind())
+                            .bind(facet.name())
+                            .bind(value)
+                            .execute(&mut *tx)
+                            .await
+                            .map_err(storage_error)?;
+                        }
+                        tx.commit().await.map_err(storage_error)?;
+                        return Ok(BurnWrite {
+                            id,
+                            occurrences: 1,
+                            widened_by: 0,
+                        });
                     }
-                    sqlx::query(
-                        "INSERT INTO negative_memory_facet \
-                             (user_id, memory_id, kind, name, value) \
-                         VALUES ($1, $2, $3, $4, $5) \
-                         ON CONFLICT (user_id, memory_id, kind, name) DO NOTHING",
-                    )
+                    // Another transaction wrote this identity first. Read its
+                    // row and confirm it.
+                    None => sqlx::query_as::<_, MemoryRow>(sqlx::AssertSqlSafe(format!(
+                        "SELECT {MEMORY_COLUMNS} \
+                         FROM negative_memory \
+                         WHERE user_id = $1 AND action = $2 AND fingerprint = $3 \
+                           AND kind = 'burn' AND superseded_by IS NULL \
+                         FOR UPDATE"
+                    )))
                     .bind(user_id)
-                    .bind(&id)
-                    .bind(facet.kind())
-                    .bind(facet.name())
-                    .bind(value)
-                    .execute(&mut *tx)
+                    .bind(&observation.action)
+                    .bind(&fingerprint)
+                    .fetch_optional(&mut *tx)
                     .await
-                    .map_err(storage_error)?;
-                }
-
-                BurnWrite {
-                    id,
-                    occurrences: 1,
-                    widened_by: 0,
+                    .map_err(storage_error)?,
                 }
             }
+        };
+
+        let write = match existing {
+            // The winner's row was extinguished between the conflict and the
+            // re-read. Nothing to confirm and nothing written; the next
+            // occurrence starts the lesson again.
+            None => BurnWrite {
+                id: String::new(),
+                occurrences: 0,
+                widened_by: 0,
+            },
             Some(row) => {
                 // What the row requires today, read as the domain reads it, so
                 // the widening rule here is the same one every other caller
                 // gets.
                 let held = facets_for(&mut *tx, user_id, std::slice::from_ref(&row.id)).await?;
-                let current = Scope::from_stored(
+                // A scope this build cannot read whole cannot be widened
+                // safely: dropping the unreadable facet would remove a
+                // requirement the lesson was written with. Refuse, and let the
+                // occurrence pass unrecorded rather than make the burn wider.
+                let Some(current) = Scope::from_stored(
                     held.iter()
                         .map(|f| (f.kind.as_str(), f.name.as_str(), f.value.clone())),
-                );
+                ) else {
+                    return Err(CoreError::Storage(format!(
+                        "negative memory {} is scoped by a facet this build cannot name",
+                        row.id
+                    )));
+                };
                 let widened = current.broadened_against(&observation.scope);
                 let dropped: Vec<(&'static str, String)> = current
                     .iter()
@@ -337,6 +431,27 @@ impl NegativeMemoryStore for PgNegativeMemoryStore {
         let mut extinguished = Vec::new();
         let mut tx = self.pool.begin().await.map_err(storage_error)?;
         for id in ids.iter().filter(|id| storable(id)) {
+            // Lock the burn before anything is written against it. Two
+            // successful calls of one act in a turn each spawn their own
+            // correction write, so this is the ordinary path rather than a rare
+            // race; without the lock both would read the burn as live and write
+            // a correction, and the second would name a burn that no longer
+            // points at it.
+            let live = sqlx::query_scalar::<_, String>(
+                "SELECT id FROM negative_memory \
+                 WHERE user_id = $1 AND id = $2 \
+                   AND kind = 'burn' AND superseded_by IS NULL \
+                 FOR UPDATE",
+            )
+            .bind(user_id)
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(storage_error)?;
+            if live.is_none() {
+                continue;
+            }
+
             let correction_id = uuid::Uuid::now_v7().to_string();
             // Insert-from-select, never insert-the-handed-id: the correction
             // carries the burn's own action, fingerprint and owner, and a burn
@@ -375,7 +490,7 @@ impl NegativeMemoryStore for PgNegativeMemoryStore {
             .await
             .map_err(storage_error)?;
 
-            sqlx::query(
+            let overlaid = sqlx::query(
                 "UPDATE negative_memory \
                  SET superseded_by = $3, superseded_at = NOW() \
                  WHERE user_id = $1 AND id = $2 \
@@ -387,6 +502,9 @@ impl NegativeMemoryStore for PgNegativeMemoryStore {
             .execute(&mut *tx)
             .await
             .map_err(storage_error)?;
+            if overlaid.rows_affected() == 0 {
+                continue;
+            }
 
             extinguished.push(id.clone());
         }

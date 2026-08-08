@@ -16,6 +16,9 @@
 //! - `extinction_writes_an_overlay_and_the_original_remains_readable`
 //! - `extinguishing_a_burn_twice_changes_nothing`
 //! - `a_new_burn_can_be_written_after_the_old_one_was_extinguished`
+//! - `a_second_live_burn_with_one_identity_is_refused_by_the_index`
+//! - `a_burn_scoped_by_a_facet_this_build_cannot_name_is_not_returned`
+//! - `a_burn_and_the_correction_over_it_are_reaped_together`
 //! - `a_burn_nothing_has_confirmed_is_reaped_on_the_next_write`
 //! - `a_reaped_burn_takes_its_facets_with_it`
 //! - `a_cross_tenant_read_of_a_negative_memory_returns_nothing`
@@ -36,6 +39,7 @@ mod support;
 
 use desktop_assistant_core::domain::negative_memory::{
     FORGET_DAYS, FULL_STRENGTH, Facet, MAX_LIVE_BURNS, NegativeMemory, NegativeMemoryKind, Scope,
+    fingerprint,
 };
 use desktop_assistant_core::domain::{KnowledgeEntry, MarkPolarity, MarkSource, SituationField};
 use desktop_assistant_core::ports::knowledge::KnowledgeBaseStore;
@@ -78,12 +82,21 @@ fn on_a_laptop() -> Scope {
         .with(Facet::Situation(SituationField::Weekday), "sunday")
 }
 
-fn observation(scope: Scope, outcome: &str) -> BurnObservation {
+/// One observation of `scope` going badly. `act` names the call, so two
+/// observations with different acts are two lessons however alike their
+/// recorded facets look.
+fn observation_of(act: &str, scope: Scope, outcome: &str) -> BurnObservation {
     BurnObservation {
         action: ACTION.to_string(),
+        fingerprint: fingerprint(&serde_json::json!({ "call": act })),
         scope,
         outcome: outcome.to_string(),
     }
+}
+
+/// The act every test is about, unless it says otherwise.
+fn observation(scope: Scope, outcome: &str) -> BurnObservation {
+    observation_of("rm -rf build in /srv/app", scope, outcome)
 }
 
 async fn burn_as(store: &PgNegativeMemoryStore, user: &str, obs: BurnObservation) -> BurnWrite {
@@ -259,7 +272,12 @@ async fn a_second_failure_with_a_different_argument_is_a_second_burn() {
     )
     .await;
     let elsewhere = at_the_workshop().with(Facet::Argument("cwd".to_string()), "/srv/other");
-    let second = burn_as(&store, ALICE, observation(elsewhere, "no such directory")).await;
+    let second = burn_as(
+        &store,
+        ALICE,
+        observation_of("rm -rf build in /srv/other", elsewhere, "no such directory"),
+    )
+    .await;
 
     assert_ne!(second.id, first.id, "another directory is another lesson");
     let live = live_as(&store, ALICE).await;
@@ -398,6 +416,63 @@ async fn a_new_burn_can_be_written_after_the_old_one_was_extinguished() {
     fx.cleanup().await;
 }
 
+/// The partial unique index is the backstop the confirm branch never reaches:
+/// nothing in the adapter tries to write a second live lesson for one identity,
+/// so only the index itself holds the "one live lesson" rule against a race or
+/// a later caller. Proved by attempting the write the index exists to refuse.
+#[tokio::test]
+async fn a_second_live_burn_with_one_identity_is_refused_by_the_index() {
+    let Some(fx) = fixture().await else { return };
+    let store = PgNegativeMemoryStore::new(fx.pool.clone());
+
+    let first = burn_as(
+        &store,
+        ALICE,
+        observation(at_the_workshop(), "build is a mount point"),
+    )
+    .await;
+    let fingerprint =
+        sqlx::query_scalar::<_, String>("SELECT fingerprint FROM negative_memory WHERE id = $1")
+            .bind(&first.id)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("read the identity back");
+
+    let duplicate = sqlx::query(
+        "INSERT INTO negative_memory (id, user_id, action, fingerprint, kind, outcome) \
+         VALUES ($1, $2, $3, $4, 'burn', $5)",
+    )
+    .bind("nm-duplicate")
+    .bind(ALICE)
+    .bind(ACTION)
+    .bind(&fingerprint)
+    .bind("the same lesson, written twice")
+    .execute(&fx.pool)
+    .await;
+    assert!(
+        duplicate.is_err(),
+        "the index must refuse a second live lesson for one identity"
+    );
+
+    // The same row is accepted once the first is extinguished, which is the
+    // other half of what the predicate buys.
+    extinguish_as(&store, ALICE, vec![first.id.clone()], "it works now").await;
+    sqlx::query(
+        "INSERT INTO negative_memory (id, user_id, action, fingerprint, kind, outcome) \
+         VALUES ($1, $2, $3, $4, 'burn', $5)",
+    )
+    .bind("nm-duplicate")
+    .bind(ALICE)
+    .bind(ACTION)
+    .bind(&fingerprint)
+    .bind("it went badly again")
+    .execute(&fx.pool)
+    .await
+    .expect("a fresh lesson may take the identity a correction released");
+
+    fx.cleanup().await;
+}
+
 // --- The writer is the reaper ------------------------------------------------
 
 /// A burn nothing has confirmed past the forget horizon is dropped on the next
@@ -416,7 +491,12 @@ async fn a_burn_nothing_has_confirmed_is_reaped_on_the_next_write() {
     backdate(&fx.pool, &old.id, FORGET_DAYS.round() as i32 + 1).await;
 
     let elsewhere = at_the_workshop().with(Facet::Argument("cwd".to_string()), "/srv/other");
-    burn_as(&store, ALICE, observation(elsewhere, "no such directory")).await;
+    burn_as(
+        &store,
+        ALICE,
+        observation_of("rm -rf build in /srv/other", elsewhere, "no such directory"),
+    )
+    .await;
 
     let live = live_as(&store, ALICE).await;
     assert_eq!(live.len(), 1, "only the fresh lesson is left");
@@ -445,7 +525,12 @@ async fn a_reaped_burn_takes_its_facets_with_it() {
     backdate(&fx.pool, &old.id, FORGET_DAYS.round() as i32 + 1).await;
 
     let elsewhere = at_the_workshop().with(Facet::Argument("cwd".to_string()), "/srv/other");
-    burn_as(&store, ALICE, observation(elsewhere, "no such directory")).await;
+    burn_as(
+        &store,
+        ALICE,
+        observation_of("rm -rf build in /srv/other", elsewhere, "no such directory"),
+    )
+    .await;
 
     assert_eq!(
         count(&fx.pool, "SELECT count(*) FROM negative_memory_facet").await,
@@ -464,9 +549,116 @@ async fn the_live_read_is_bounded() {
 
     for i in 0..MAX_LIVE_BURNS + 5 {
         let scope = Scope::new().with(Facet::Argument("cwd".to_string()), format!("/srv/{i}"));
-        burn_as(&store, ALICE, observation(scope, "no such directory")).await;
+        burn_as(
+            &store,
+            ALICE,
+            observation_of(&format!("clean /srv/{i}"), scope, "no such directory"),
+        )
+        .await;
     }
     assert_eq!(live_as(&store, ALICE).await.len(), MAX_LIVE_BURNS);
+    fx.cleanup().await;
+}
+
+/// A row scoped by a dimension this build does not know is not returned at all.
+///
+/// Dropping the unreadable facet and keeping the row is the tempting answer and
+/// the dangerous one: the burn would lose a requirement and fire on acts it had
+/// never been seen with. The case is ordinary - a database written by a build
+/// that knows one more situation dimension, read by one that does not, is a
+/// rollback.
+#[tokio::test]
+async fn a_burn_scoped_by_a_facet_this_build_cannot_name_is_not_returned() {
+    let Some(fx) = fixture().await else { return };
+    let store = PgNegativeMemoryStore::new(fx.pool.clone());
+
+    let burn = burn_as(
+        &store,
+        ALICE,
+        observation(at_the_workshop(), "build is a mount point"),
+    )
+    .await;
+    assert_eq!(live_as(&store, ALICE).await.len(), 1);
+
+    sqlx::query(
+        "INSERT INTO negative_memory_facet (user_id, memory_id, kind, name, value) \
+         VALUES ($1, $2, 'situation', 'moon_phase', 'waxing')",
+    )
+    .bind(ALICE)
+    .bind(&burn.id)
+    .execute(&fx.pool)
+    .await
+    .expect("a later build's dimension lands in the table");
+
+    assert!(
+        live_as(&store, ALICE).await.is_empty(),
+        "a lesson this build cannot read whole is a lesson it must not act on"
+    );
+    fx.cleanup().await;
+}
+
+/// A burn and the correction over it are one unit and are reaped together.
+///
+/// A burn is always older than what corrected it, so reaping on each row's own
+/// stamp would take the burn first and leave a correction naming nothing - a
+/// row saying an unnamed lesson stopped applying.
+#[tokio::test]
+async fn a_burn_and_the_correction_over_it_are_reaped_together() {
+    let Some(fx) = fixture().await else { return };
+    let store = PgNegativeMemoryStore::new(fx.pool.clone());
+
+    let burn = burn_as(
+        &store,
+        ALICE,
+        observation(at_the_workshop(), "build is a mount point"),
+    )
+    .await;
+    extinguish_as(&store, ALICE, vec![burn.id.clone()], "it works now").await;
+    // The burn is well past the horizon; its correction is not.
+    backdate(&fx.pool, &burn.id, FORGET_DAYS.round() as i32 + 1).await;
+
+    burn_as(
+        &store,
+        ALICE,
+        observation_of(
+            "clean /srv/other",
+            Scope::new().with(Facet::Argument("cwd".to_string()), "/srv/other"),
+            "no such directory",
+        ),
+    )
+    .await;
+
+    let correction_id =
+        sqlx::query_scalar::<_, String>("SELECT superseded_by FROM negative_memory WHERE id = $1")
+            .bind(&burn.id)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("the burn names its correction");
+
+    let held = history_as(&store, ALICE).await;
+    assert!(
+        held.iter().any(|m| m.id == burn.id) && held.iter().any(|m| m.id == correction_id),
+        "the pair survives while its correction is still fresh"
+    );
+    backdate(&fx.pool, &correction_id, FORGET_DAYS.round() as i32 + 1).await;
+
+    burn_as(
+        &store,
+        ALICE,
+        observation_of(
+            "clean /srv/third",
+            Scope::new().with(Facet::Argument("cwd".to_string()), "/srv/third"),
+            "no such directory",
+        ),
+    )
+    .await;
+
+    let held = history_as(&store, ALICE).await;
+    assert!(
+        !held.iter().any(|m| m.id == burn.id) && !held.iter().any(|m| m.id == correction_id),
+        "once both are past the horizon the pair goes together, and neither is \
+         left naming the other"
+    );
     fx.cleanup().await;
 }
 

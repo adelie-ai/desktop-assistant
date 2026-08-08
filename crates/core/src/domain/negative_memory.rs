@@ -29,37 +29,39 @@
 //!
 //! ## What a burn is keyed on
 //!
-//! An action, and the facets it was taken with. The action is a tool call,
-//! because a tool call is the one thing in a turn with an identity that can be
-//! matched exactly - and exact matching is what holds the scope narrow. The
-//! facets are of two kinds ([`Facet`]), and they are not interchangeable:
+//! Two things, and only the second one ever moves.
 //!
-//! - **Argument facets** say *what* was done. They are the burn's identity:
-//!   [`Scope::fingerprint`] is taken over these alone, and
-//!   [`Scope::broadened_against`] refuses to drop one. Two failures of one tool
-//!   with different arguments are two lessons, never one.
-//! - **Situation facets** say *when and where* it was done - the cue of
-//!   [`crate::domain::situation`]. These are what a second occurrence drops. A
-//!   burn seen on one host and then on another has shown that the host was not
-//!   the cause, so the host stops being required.
+//! - **The act**: the tool's name and [`PendingAction::fingerprint`], a digest
+//!   over the call's arguments exactly as they were made. This is the burn's
+//!   identity, and it never widens. A tool call is the one thing in a turn with
+//!   an identity that can be matched exactly, and exact matching is what holds
+//!   a burn to the act it was actually about.
+//! - **The circumstance**: the situation facets of
+//!   [`crate::domain::situation`] - where the act was taken, and when. These
+//!   are what a second occurrence drops, once it shows a value was not the
+//!   cause.
 //!
 //! That is the whole of "scope tightly, broaden only on re-confirmation": the
-//! evidence for widening is a repeat somewhere else, and nothing else widens
-//! anything.
+//! act is fixed evidence, the circumstance is provisional, and only an observed
+//! disagreement makes the burn wider.
 //!
-//! ## Firing is a subset test, confirming is an identity test
+//! **Firing and confirming ask the same question.** A burn fires on the act it
+//! was recorded against and on no other, so a call whose arguments differ in
+//! any way - one value changed, one argument added, one left out - is a
+//! different act and a different lesson. That is stricter than it has to be,
+//! deliberately: a burn that fails to fire costs one repeat of a mistake, and a
+//! burn that fires on the wrong act costs the assistant's usefulness in a way
+//! nobody can see.
 //!
-//! Two different questions, deliberately answered differently.
+//! ## Why the digest reads the whole argument and the record does not
 //!
-//! [`NegativeMemory::fires`] asks whether everything the burn requires is true
-//! of the call about to be made. A call that carries *more* than the burn
-//! requires still fires it: adding an argument does not make it a different
-//! act.
-//!
-//! Confirmation asks whether this failure is the same lesson as one already
-//! held, and that is an exact match on [`Scope::fingerprint`]. A looser rule
-//! would fold two lessons into one and widen the survivor, which is the
-//! failure mode above arriving by the back door.
+//! [`Scope`] stores only argument values short enough to hold whole, because a
+//! stored value is there to be read back and shown. The digest has no such
+//! limit: it hashes every argument at full length. Without that, two failures
+//! of one tool differing only past the storable length would share a
+//! fingerprint and fold into one lesson, which is the same over-generalization
+//! by another route - and it would land hardest on `command`, `query` and
+//! `url`, the arguments that *are* the act.
 //!
 //! ## Extinction is an overlay
 //!
@@ -133,22 +135,21 @@ pub const SILENCE_FLOOR: f64 = 0.25;
 /// situation record's writer bounds itself.
 pub const FORGET_DAYS: f64 = 56.0;
 
-/// Most facets one action may be scoped by.
+/// Most argument facets one burn records.
 ///
-/// Not a trim - a call carrying more capturable arguments than this is declined
-/// outright, by [`PendingAction::observe`]. Keeping only some of them would
-/// scope the burn on a subset of what actually happened, which is a wider burn
-/// wearing a narrow one's evidence. Twelve is past every tool this workspace
-/// advertises.
+/// A bound on what is *stored and shown*, not on what is matched: the identity
+/// is [`PendingAction::fingerprint`], which reads every argument whatever this
+/// says. So trimming here cannot widen a burn - it can only shorten the line
+/// that explains one. Arguments past the cap are dropped in name order, which
+/// is stable across calls.
 pub const MAX_ACTION_FACETS: usize = 12;
 
-/// Longest argument value that can be a facet.
+/// Longest argument value a burn records.
 ///
-/// The same bound the situation record uses for its own values, for the same
-/// reason: a facet is matched by equality, so it has to be small enough to
-/// store whole. A longer value is not truncated to fit - two different values
-/// sharing a prefix would then match - it is simply not a facet, which makes
-/// the burn wider along an axis nothing could have matched on anyway.
+/// The same bound the situation record uses for its own values. A longer value
+/// is not truncated to fit - a truncated value read back would misdescribe the
+/// call - it is simply not recorded. Nothing is lost from the match by that:
+/// [`PendingAction::fingerprint`] has already read the value at full length.
 pub const MAX_FACET_VALUE_CHARS: usize = MAX_SITUATION_VALUE_CHARS;
 
 /// Longest outcome text a burn carries.
@@ -239,22 +240,26 @@ impl Scope {
         self
     }
 
-    /// Rebuild a scope from stored `(kind, name, value)` triples, skipping any
-    /// facet this build cannot name.
-    pub fn from_stored<I, K, N, V>(rows: I) -> Self
+    /// Rebuild a scope from stored `(kind, name, value)` triples.
+    ///
+    /// `None` when any row names a facet this build cannot resolve. Dropping
+    /// the row instead would be the dangerous answer, not the safe one: the
+    /// burn would lose a requirement and fire on acts it had never been seen
+    /// with. A memory this build cannot read whole is a memory it must not act
+    /// on at all.
+    pub fn from_stored<I, K, N, V>(rows: I) -> Option<Self>
     where
         I: IntoIterator<Item = (K, N, V)>,
         K: AsRef<str>,
         N: AsRef<str>,
         V: Into<String>,
     {
-        Self(
-            rows.into_iter()
-                .filter_map(|(kind, name, value)| {
-                    Facet::from_stored(kind.as_ref(), name.as_ref()).map(|f| (f, value.into()))
-                })
-                .collect(),
-        )
+        rows.into_iter()
+            .map(|(kind, name, value)| {
+                Facet::from_stored(kind.as_ref(), name.as_ref()).map(|f| (f, value.into()))
+            })
+            .collect::<Option<BTreeMap<_, _>>>()
+            .map(Self)
     }
 
     /// Every facet and its required value, in a stable order.
@@ -279,9 +284,11 @@ impl Scope {
 
     /// Whether `present` satisfies every facet this scope requires.
     ///
-    /// A subset test, not an equality test: a call that carries more than the
-    /// burn requires is still the act the burn is about. See the module header
-    /// for why confirmation asks a different question.
+    /// Only ever asked of two scopes whose acts already match, so in practice
+    /// this decides the circumstance: the argument facets on both sides are
+    /// identical whenever the fingerprints are. Checking them anyway costs
+    /// nothing and keeps the answer right if a caller ever asks without having
+    /// compared the act first.
     pub fn matches(&self, present: &Scope) -> bool {
         self.0
             .iter()
@@ -290,10 +297,21 @@ impl Scope {
 
     /// This scope widened by a second occurrence.
     ///
-    /// A situation facet whose observed value differs is dropped: the failure
-    /// happened without it, so it was not the cause. Identity facets are kept
-    /// whatever `observed` says, because a differing argument means a different
-    /// lesson and this is the wrong operation for it - see the module header.
+    /// A situation facet the second occurrence *observed with a different
+    /// value* is dropped: the failure happened without it, so it was not the
+    /// cause.
+    ///
+    /// A facet the second occurrence says nothing about is kept. Absence is not
+    /// disagreement, and treating it as disagreement would let one repeat from
+    /// a headless path - or from a client that reports no hostname and no
+    /// timezone, where the whole situation is empty - strip a burn's
+    /// circumstance and set it firing everywhere. That is widening on the
+    /// absence of evidence, which is the failure mode this module exists to
+    /// prevent, arriving as its own remedy.
+    ///
+    /// Identity facets are kept whatever `observed` says. Confirmation only
+    /// reaches here for two occurrences of the same act, so they are equal
+    /// already; the guard is what makes that structural rather than incidental.
     ///
     /// This is the only thing in the module that makes a burn wider.
     #[must_use]
@@ -302,83 +320,124 @@ impl Scope {
             self.0
                 .iter()
                 .filter(|(facet, value)| {
-                    facet.is_identity() || observed.get(facet) == Some(value.as_str())
+                    facet.is_identity()
+                        || observed
+                            .get(facet)
+                            .is_none_or(|seen| seen == value.as_str())
                 })
                 .map(|(f, v)| (f.clone(), v.clone()))
                 .collect(),
         )
     }
+}
 
-    /// A stable digest of the identity facets alone: the burn's handle.
-    ///
-    /// Two failures share a lesson when their actions and their fingerprints
-    /// both match. The situation is excluded on purpose - it is what widens,
-    /// so it cannot also be what identifies.
-    pub fn fingerprint(&self) -> String {
-        let mut hasher = Sha256::new();
-        for (facet, value) in self.0.iter().filter(|(f, _)| f.is_identity()) {
-            hasher.update(facet.name().as_bytes());
-            hasher.update([0x1f]);
-            hasher.update(value.as_bytes());
-            hasher.update([0x1e]);
+/// A stable digest of a call's arguments, exactly as they were made: the burn's
+/// handle.
+///
+/// Two failures share a lesson when their action and their fingerprint both
+/// match, and nothing else makes them one. Three properties it has to have, and
+/// each is a line below rather than a convention:
+///
+/// - **It reads every argument at full length**, so two calls differing only
+///   past [`MAX_FACET_VALUE_CHARS`] are two lessons rather than one.
+/// - **It does not depend on the order arguments arrive in**, because an object
+///   has no order and two encoders of one call must agree.
+/// - **It cannot confuse a name for a value, or one argument for two.** Every
+///   piece is framed by a separator no JSON text can contain, and nesting is
+///   framed as well, so `{"ab": "c"}` and `{"a": "bc"}` differ.
+///
+/// The situation is excluded on purpose: it is what widens, so it cannot also
+/// be what identifies.
+pub fn fingerprint(arguments: &serde_json::Value) -> String {
+    let mut hasher = Sha256::new();
+    absorb(&mut hasher, arguments);
+    format!("{:x}", hasher.finalize())[..32].to_string()
+}
+
+/// Feed one JSON value into `hasher` in a form that depends on its content and
+/// not on how it was written.
+fn absorb(hasher: &mut Sha256, value: &serde_json::Value) {
+    // Every arm leads with a distinct tag byte, so a string "1" and the number
+    // 1 cannot hash alike, and each composite frames its own end.
+    match value {
+        serde_json::Value::Null => hasher.update(*b"0"),
+        serde_json::Value::Bool(b) => {
+            hasher.update(*b"b");
+            hasher.update([u8::from(*b)]);
         }
-        format!("{:x}", hasher.finalize())[..32].to_string()
+        serde_json::Value::Number(n) => {
+            hasher.update(*b"n");
+            hasher.update(n.to_string().as_bytes());
+            hasher.update([0x1e_u8]);
+        }
+        serde_json::Value::String(text) => {
+            hasher.update(*b"s");
+            hasher.update(text.as_bytes());
+            hasher.update([0x1e_u8]);
+        }
+        serde_json::Value::Array(items) => {
+            hasher.update(*b"[");
+            for item in items {
+                absorb(hasher, item);
+            }
+            hasher.update(*b"]");
+        }
+        serde_json::Value::Object(map) => {
+            hasher.update(*b"{");
+            // Sorted, so the digest does not depend on whether the map behind
+            // `serde_json::Value` preserves insertion order.
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort_unstable();
+            for key in keys {
+                hasher.update(key.as_bytes());
+                hasher.update([0x1f_u8]);
+                absorb(hasher, &map[key]);
+            }
+            hasher.update(*b"}");
+        }
     }
 }
 
-/// A tool call about to be made, reduced to what a burn can be matched on.
+/// A tool call about to be made, reduced to what a burn is matched on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingAction {
     /// The tool's name.
     pub action: String,
-    /// Everything observed about the call and the moment it is made in.
+    /// The digest of the call's arguments: what makes this act this act. See
+    /// [`fingerprint`].
+    pub fingerprint: String,
+    /// What the burn records and shows: the arguments short enough to hold
+    /// whole, and the situation the call is made in.
     pub scope: Scope,
 }
 
 impl PendingAction {
-    /// Read a pending call and the present situation into a matchable action.
+    /// Read a pending call and the present situation into a matchable act.
     ///
-    /// `None` when the call cannot be scoped, and a declined call neither fires
-    /// a burn nor writes one. Three cases, all of them the same refusal to
-    /// over-generalize:
+    /// Total: every call can be scoped, because the identity is a digest of the
+    /// arguments and a digest has no shape it cannot read. What varies is how
+    /// much of the call the burn can *show*, and that is [`Scope`]'s business
+    /// rather than the match's.
     ///
-    /// - `arguments` is neither an object nor null. There is nothing to name a
-    ///   facet by.
-    /// - The call carries arguments but none of them can be a facet - every one
-    ///   is structured, or longer than [`MAX_FACET_VALUE_CHARS`]. A burn
-    ///   written here would be keyed on the bare tool name and would interrupt
-    ///   every later call to it.
-    /// - The call carries more than [`MAX_ACTION_FACETS`] usable arguments.
-    ///   Keeping some of them would scope the burn on less than what happened.
-    ///
-    /// An argument that is structured or too long is dropped while others
-    /// remain; that widens the burn along an axis equality could not have
-    /// matched anyway, and it is why a file write is remembered by its path
-    /// rather than by its contents.
+    /// An argument becomes a facet when it is a scalar with no control
+    /// characters and is no longer than [`MAX_FACET_VALUE_CHARS`], and at most
+    /// [`MAX_ACTION_FACETS`] of them are kept, in name order. Every one of
+    /// those limits shortens what a warning can say and none of them widens
+    /// what it fires on.
     pub fn observe(
         action: impl Into<String>,
         arguments: &serde_json::Value,
         situation: &Situation,
-    ) -> Option<Self> {
-        let arguments = match arguments {
-            serde_json::Value::Null => None,
-            serde_json::Value::Object(map) => Some(map),
-            _ => return None,
-        };
-
+    ) -> Self {
         let mut scope = Scope::new();
-        if let Some(map) = arguments {
-            let usable: Vec<(&String, String)> = map
+        if let serde_json::Value::Object(map) = arguments {
+            let mut named: Vec<(&String, String)> = map
                 .iter()
                 .filter_map(|(name, value)| facet_value(value).map(|v| (name, v)))
+                .filter(|(name, _)| storable_text(name))
                 .collect();
-            if !map.is_empty() && usable.is_empty() {
-                return None;
-            }
-            if usable.len() > MAX_ACTION_FACETS {
-                return None;
-            }
-            for (name, value) in usable {
+            named.sort_unstable_by(|a, b| a.0.cmp(b.0));
+            for (name, value) in named.into_iter().take(MAX_ACTION_FACETS) {
                 scope = scope.with(Facet::Argument(name.clone()), value);
             }
         }
@@ -386,15 +445,11 @@ impl PendingAction {
             scope = scope.with(Facet::Situation(field), value);
         }
 
-        Some(Self {
+        Self {
             action: action.into(),
+            fingerprint: fingerprint(arguments),
             scope,
-        })
-    }
-
-    /// The identity of this action: what a confirmation must match exactly.
-    pub fn fingerprint(&self) -> String {
-        self.scope.fingerprint()
+        }
     }
 }
 
@@ -434,6 +489,10 @@ pub struct NegativeMemory {
     pub id: String,
     /// The tool the memory is about.
     pub action: String,
+    /// The digest of the arguments the act was made with. With `action`, the
+    /// identity a call has to match exactly before this fires. See
+    /// [`fingerprint`].
+    pub fingerprint: String,
     /// Whether this row is the lesson or the correction over it.
     pub kind: NegativeMemoryKind,
     /// Everything that must be true before this fires.
@@ -482,23 +541,27 @@ impl NegativeMemory {
 
     /// Whether this burn interrupts `pending`.
     ///
-    /// Five conditions, and every one of them is a way the burn could be wrong
+    /// Six conditions, and every one of them is a way the burn could be wrong
     /// about right now: it must be a lesson rather than a correction, it must
-    /// not have been extinguished, it must be about this tool, it must still be
-    /// loud enough, and everything it requires must hold.
+    /// not have been extinguished, it must be about this tool, it must be about
+    /// this call rather than another call of the same tool, it must still be
+    /// loud enough, and its circumstance must hold.
     pub fn fires(&self, pending: &PendingAction, now: DateTime<Utc>) -> bool {
         self.kind == NegativeMemoryKind::Burn
             && self.superseded_by.is_none()
             && self.action == pending.action
+            && self.fingerprint == pending.fingerprint
             && !self.is_silent(now)
             && self.scope.matches(&pending.scope)
     }
 }
 
-/// The burns that interrupt `pending`, strongest first.
+/// Every burn that interrupts `pending`, strongest first.
 ///
-/// Bounded by [`MAX_WARNED_BURNS`]: the caller is about to put this in front of
-/// a model that has to read all of it before it can act.
+/// All of them, not the few worth showing. The display cap belongs to
+/// [`render_warning`], because the other caller of this function extinguishes
+/// what a success disproved - and a lesson left standing because it fell off
+/// the end of a warning would be a lesson nothing could ever correct.
 pub fn burns_that_fire<'a>(
     memories: &'a [NegativeMemory],
     pending: &PendingAction,
@@ -514,7 +577,6 @@ pub fn burns_that_fire<'a>(
             .then(b.occurrences.cmp(&a.occurrences))
             .then(a.id.cmp(&b.id))
     });
-    fired.truncate(MAX_WARNED_BURNS);
     fired
 }
 
@@ -532,7 +594,7 @@ pub fn render_warning(fired: &[&NegativeMemory], now: DateTime<Utc>) -> Option<S
         "This call has not run. The same call went badly before, and what follows is a \
          candidate warning, not a refusal.\n",
     );
-    for burn in fired {
+    for burn in fired.iter().take(MAX_WARNED_BURNS) {
         let days = now
             .signed_duration_since(burn.last_confirmed_at)
             .num_days()
@@ -547,11 +609,13 @@ pub fn render_warning(fired: &[&NegativeMemory], now: DateTime<Utc>) -> Option<S
             n => format!(", {n} times"),
         };
         out.push_str(&format!("\n- Last {when}{times}: {}\n", burn.outcome));
-        if !burn.scope.is_empty() {
-            out.push_str(&format!(
-                "  It went badly with: {}\n",
-                describe(&burn.scope)
-            ));
+        let arguments = describe(&burn.scope, false);
+        if !arguments.is_empty() {
+            out.push_str(&format!("  Called with: {arguments}\n"));
+        }
+        let circumstance = describe(&burn.scope, true);
+        if !circumstance.is_empty() {
+            out.push_str(&format!("  It went badly at: {circumstance}\n"));
         }
     }
     out.push_str(
@@ -562,19 +626,27 @@ pub fn render_warning(fired: &[&NegativeMemory], now: DateTime<Utc>) -> Option<S
     Some(out)
 }
 
-/// One line naming what a scope requires, for the warning above.
-fn describe(scope: &Scope) -> String {
+/// One line naming half of what a scope holds, for the warning above.
+///
+/// The two halves are rendered apart because they mean different things, and
+/// because an argument may be named `host`, which would otherwise read exactly
+/// like the situation field of that name.
+fn describe(scope: &Scope, situation: bool) -> String {
     scope
         .iter()
+        .filter(|(facet, _)| facet.is_identity() != situation)
         .map(|(facet, value)| format!("{}={value}", facet.name()))
         .collect::<Vec<_>>()
         .join(", ")
 }
 
-/// The stored form of an argument value, when it can be one.
+/// The recorded form of an argument value, when it has one.
 ///
-/// Scalars only, and only short ones. See [`MAX_FACET_VALUE_CHARS`] for why a
-/// long value is dropped rather than cut down.
+/// Scalars only, short enough to hold whole, and free of control characters -
+/// which a database `text` column cannot always store and a warning cannot
+/// legibly show. A value this refuses is still read at full length by
+/// [`fingerprint`], so refusing one narrows what a warning can say and never
+/// what it fires on.
 fn facet_value(value: &serde_json::Value) -> Option<String> {
     let rendered = match value {
         serde_json::Value::String(s) => s.clone(),
@@ -583,7 +655,16 @@ fn facet_value(value: &serde_json::Value) -> Option<String> {
         serde_json::Value::Null => "null".to_string(),
         serde_json::Value::Array(_) | serde_json::Value::Object(_) => return None,
     };
-    (rendered.chars().count() <= MAX_FACET_VALUE_CHARS).then_some(rendered)
+    (rendered.chars().count() <= MAX_FACET_VALUE_CHARS && storable_text(&rendered))
+        .then_some(rendered)
+}
+
+/// Whether `text` can be held whole in a stored facet.
+///
+/// Postgres `text` cannot hold a NUL byte, and no control character belongs in
+/// a value a person reads back off a warning.
+fn storable_text(text: &str) -> bool {
+    !text.is_empty() && !text.chars().any(char::is_control)
 }
 
 /// Cut `outcome` to [`MAX_OUTCOME_CHARS`] on a character boundary.
@@ -636,7 +717,6 @@ mod tests {
             &args(&[("command", text("rm -rf build")), ("cwd", text("/srv/app"))]),
             &here_and_now(),
         )
-        .expect("a two-argument call is scopeable")
     }
 
     /// The burn that call left behind, recorded `age` before the fixed clock.
@@ -645,6 +725,7 @@ mod tests {
         NegativeMemory {
             id: "nm-1".to_string(),
             action: pending.action.clone(),
+            fingerprint: pending.fingerprint.clone(),
             kind: NegativeMemoryKind::Burn,
             scope: pending.scope,
             outcome: "rm -rf failed: build is a mount point and the host lost its cache"
@@ -743,8 +824,7 @@ mod tests {
                 text("terminal_run: rm -rf build is a mount point and the host lost its cache"),
             )]),
             &here_and_now(),
-        )
-        .expect("a one-argument call is scopeable");
+        );
         assert!(
             burns_that_fire(&[fresh_burn()], &talking_about_it, now()).is_empty(),
             "writing about a burn is not taking the action it is about"
@@ -764,8 +844,7 @@ mod tests {
                 ("cwd", text("/srv/other")),
             ]),
             &here_and_now(),
-        )
-        .expect("a two-argument call is scopeable");
+        );
         assert!(
             burns_that_fire(&[fresh_burn()], &elsewhere, now()).is_empty(),
             "the same command in another directory is another act"
@@ -784,8 +863,7 @@ mod tests {
                 .with(SituationField::Host, "laptop")
                 .with(SituationField::TimeOfDay, "morning")
                 .with(SituationField::Weekday, "thursday"),
-        )
-        .expect("a two-argument call is scopeable");
+        );
         assert!(
             burns_that_fire(&[fresh_burn()], &another_host, now()).is_empty(),
             "one occurrence is evidence about one host, not about every host"
@@ -800,30 +878,8 @@ mod tests {
             "builtin_terminal_preview",
             &args(&[("command", text("rm -rf build")), ("cwd", text("/srv/app"))]),
             &here_and_now(),
-        )
-        .expect("a two-argument call is scopeable");
-        assert!(burns_that_fire(&[fresh_burn()], &other_tool, now()).is_empty());
-    }
-
-    /// Firing is a subset test: a call that carries more than the burn requires
-    /// is still the act the burn is about.
-    #[test]
-    fn a_call_that_carries_more_than_the_burn_requires_still_fires_it() {
-        let with_an_extra_argument = PendingAction::observe(
-            "terminal_run",
-            &args(&[
-                ("command", text("rm -rf build")),
-                ("cwd", text("/srv/app")),
-                ("timeout_seconds", serde_json::json!(30)),
-            ]),
-            &here_and_now(),
-        )
-        .expect("a three-argument call is scopeable");
-        assert_eq!(
-            burns_that_fire(&[fresh_burn()], &with_an_extra_argument, now()).len(),
-            1,
-            "adding an argument does not make it a different act"
         );
+        assert!(burns_that_fire(&[fresh_burn()], &other_tool, now()).is_empty());
     }
 
     // --- Acceptance: decay --------------------------------------------------
@@ -905,8 +961,7 @@ mod tests {
                 .with(SituationField::Host, "laptop")
                 .with(SituationField::TimeOfDay, "evening")
                 .with(SituationField::Weekday, "sunday"),
-        )
-        .expect("a two-argument call is scopeable");
+        );
 
         assert!(
             !first.fires(&on_a_laptop, now()),
@@ -945,8 +1000,7 @@ mod tests {
                 ("cwd", text("/srv/other")),
             ]),
             &Situation::new().with(SituationField::Host, "laptop"),
-        )
-        .expect("a two-argument call is scopeable");
+        );
 
         let widened = first.scope.broadened_against(&a_different_command.scope);
         assert_eq!(
@@ -958,6 +1012,29 @@ mod tests {
             widened.get(&Facet::Argument("cwd".to_string())),
             Some("/srv/app"),
             "the directory stays required too"
+        );
+    }
+
+    /// Absence is not disagreement. A second occurrence that says nothing about
+    /// a facet leaves it required.
+    ///
+    /// The bug this guards is the module's own failure mode arriving as its own
+    /// remedy: one repeat from a headless path, or from a client reporting
+    /// neither a hostname nor a timezone, carries an empty situation - and
+    /// reading "absent" as "different" would strip a burn's whole circumstance
+    /// and set it firing everywhere, on no evidence at all.
+    #[test]
+    fn a_facet_the_second_occurrence_says_nothing_about_is_kept() {
+        let first = fresh_burn();
+        let nothing_reported = PendingAction::observe(
+            "terminal_run",
+            &args(&[("command", text("rm -rf build")), ("cwd", text("/srv/app"))]),
+            &Situation::new(),
+        );
+        let widened = first.scope.broadened_against(&nothing_reported.scope);
+        assert_eq!(
+            widened, first.scope,
+            "a repeat that observed no circumstance widens nothing"
         );
     }
 
@@ -1003,56 +1080,142 @@ mod tests {
         assert!(burns_that_fire(&[correction], &the_call(), now()).is_empty());
     }
 
-    // --- Scoping: what can and cannot become a burn -------------------------
+    // --- What a burn records, and what it matches on ---------------------
 
-    /// A call whose every argument is structured or oversized cannot be scoped,
-    /// so nothing is learned from it. A burn keyed on the bare tool name would
-    /// interrupt every later call to that tool, which is the failure mode this
-    /// whole design exists to prevent.
+    /// Acceptance (#1126), and the near miss that matters most: a burn left by
+    /// a call with no arguments must not fire on a call that has them.
+    ///
+    /// This is the widest a burn could ever be - one bad call of a tool
+    /// standing for every call of it - and it arrives by an ordinary route: the
+    /// model forgets a required argument, the tool refuses, and the lesson is
+    /// written. The identity is the arguments, so it holds.
     #[test]
-    fn a_call_whose_arguments_cannot_be_scoped_is_declined() {
-        assert!(
-            PendingAction::observe(
-                "builtin_file_write",
-                &args(&[("blocks", serde_json::json!([{"a": 1}]))]),
-                &here_and_now(),
-            )
-            .is_none(),
-            "a structured-only call cannot be scoped, so it is not learned from"
-        );
+    fn a_burn_from_a_call_with_no_arguments_does_not_fire_on_a_call_that_has_them() {
+        let forgot_the_arguments =
+            PendingAction::observe("terminal_run", &serde_json::json!({}), &here_and_now());
+        let mut burn = fresh_burn();
+        burn.fingerprint = forgot_the_arguments.fingerprint.clone();
+        burn.scope = forgot_the_arguments.scope.clone();
 
-        let too_long = "x".repeat(MAX_FACET_VALUE_CHARS + 1);
         assert!(
-            PendingAction::observe(
-                "builtin_file_write",
-                &args(&[("content", text(&too_long))]),
-                &here_and_now(),
-            )
-            .is_none(),
-            "an oversized-only call cannot be scoped either"
+            burn.fires(&forgot_the_arguments, now()),
+            "the burn is about the call that was actually made"
+        );
+        assert!(
+            !burn.fires(&the_call(), now()),
+            "and about no other call of that tool"
         );
     }
 
-    /// A call with more usable arguments than can be scoped is declined rather
-    /// than scoped on a subset - a subset is a wider burn wearing a narrower
-    /// one's evidence.
+    /// The same guard where the situation contributes nothing: on a headless
+    /// deployment, or from a client that reports no host and no timezone, a
+    /// zero-argument burn's scope is empty - and an empty scope matches
+    /// everything. The act is what stops it, so the act has to be enough.
     #[test]
-    fn a_call_with_more_arguments_than_can_be_scoped_is_declined() {
-        let many: Vec<(&str, serde_json::Value)> = [
-            "a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8", "a9", "a10", "a11", "a12", "a13",
-        ]
-        .iter()
-        .map(|n| (*n, text("v")))
-        .collect();
-        assert_eq!(many.len(), MAX_ACTION_FACETS + 1);
-        assert!(PendingAction::observe("t", &args(&many), &here_and_now()).is_none());
+    fn a_burn_with_an_empty_scope_still_fires_only_on_its_own_act() {
+        let nothing_connected =
+            PendingAction::observe("terminal_run", &serde_json::json!({}), &Situation::new());
+        assert!(
+            nothing_connected.scope.is_empty(),
+            "the case this test is about: nothing to match on but the act"
+        );
+        let mut burn = fresh_burn();
+        burn.fingerprint = nothing_connected.fingerprint.clone();
+        burn.scope = nothing_connected.scope.clone();
+
+        assert!(burn.fires(&nothing_connected, now()));
+        assert!(
+            !burn.fires(
+                &PendingAction::observe(
+                    "terminal_run",
+                    &args(&[("command", text("rm -rf build"))]),
+                    &Situation::new(),
+                ),
+                now()
+            ),
+            "an empty scope must not become an empty condition"
+        );
     }
 
-    /// An oversized argument beside a usable one is dropped, and the burn is
-    /// keyed on what is left. That is why a file write is remembered by its
-    /// path and not by its contents.
+    /// Adding an argument makes it another call, so it is another lesson.
+    /// Stricter than it needs to be, deliberately: a burn that fails to fire
+    /// costs one repeat of a mistake, and a burn that fires on the wrong act
+    /// costs something nobody can see.
     #[test]
-    fn an_oversized_argument_is_dropped_while_the_others_still_scope_the_burn() {
+    fn a_call_that_adds_an_argument_is_a_different_act() {
+        let with_a_timeout = PendingAction::observe(
+            "terminal_run",
+            &args(&[
+                ("command", text("rm -rf build")),
+                ("cwd", text("/srv/app")),
+                ("timeout_seconds", serde_json::json!(30)),
+            ]),
+            &here_and_now(),
+        );
+        assert!(burns_that_fire(&[fresh_burn()], &with_a_timeout, now()).is_empty());
+    }
+
+    /// A structured argument cannot be shown in a warning, and it is still read
+    /// whole by the identity. So a call the record cannot describe is still a
+    /// call the match can tell from another.
+    #[test]
+    fn a_structured_argument_is_not_recorded_and_still_identifies_the_call() {
+        let one = PendingAction::observe(
+            "builtin_file_write",
+            &args(&[("blocks", serde_json::json!([{"a": 1}]))]),
+            &here_and_now(),
+        );
+        let other = PendingAction::observe(
+            "builtin_file_write",
+            &args(&[("blocks", serde_json::json!([{"a": 2}]))]),
+            &here_and_now(),
+        );
+        assert_eq!(
+            one.scope.get(&Facet::Argument("blocks".to_string())),
+            None,
+            "there is nothing short and scalar to record"
+        );
+        assert_ne!(
+            one.fingerprint, other.fingerprint,
+            "and the two calls are still two acts"
+        );
+    }
+
+    /// The bug this guards: two long commands in one directory. The recorded
+    /// facets are identical - both commands are too long to hold - so an
+    /// identity taken over the record alone would fold two lessons into one and
+    /// widen the survivor. The identity reads the argument at full length.
+    #[test]
+    fn two_arguments_differing_past_the_recorded_length_are_two_acts() {
+        let prefix = "x".repeat(MAX_FACET_VALUE_CHARS);
+        let one = PendingAction::observe(
+            "terminal_run",
+            &args(&[
+                ("command", text(&format!("{prefix}a"))),
+                ("cwd", text("/srv/app")),
+            ]),
+            &here_and_now(),
+        );
+        let other = PendingAction::observe(
+            "terminal_run",
+            &args(&[
+                ("command", text(&format!("{prefix}b"))),
+                ("cwd", text("/srv/app")),
+            ]),
+            &here_and_now(),
+        );
+        assert_eq!(
+            one.scope, other.scope,
+            "the record cannot tell them apart, which is the case this is about"
+        );
+        assert_ne!(one.fingerprint, other.fingerprint, "the identity can");
+    }
+
+    /// An oversized argument beside a usable one is dropped from the record and
+    /// the rest still describes the call. That is why a file write is shown by
+    /// its path and not by its contents.
+    #[test]
+    fn an_oversized_argument_is_dropped_from_the_record_and_the_others_remain() {
         let pending = PendingAction::observe(
             "builtin_file_write",
             &args(&[
@@ -1060,8 +1223,7 @@ mod tests {
                 ("content", text(&"x".repeat(MAX_FACET_VALUE_CHARS + 1))),
             ]),
             &here_and_now(),
-        )
-        .expect("one usable argument is enough to scope the call");
+        );
         assert_eq!(
             pending.scope.get(&Facet::Argument("path".to_string())),
             Some("/srv/app/config.toml")
@@ -1069,52 +1231,70 @@ mod tests {
         assert_eq!(
             pending.scope.get(&Facet::Argument("content".to_string())),
             None,
-            "a value too long to match on is not a facet"
+            "a value too long to hold whole is not recorded"
         );
     }
 
-    /// A tool that takes no arguments is scopeable: its name is the whole
-    /// identity, and that is as narrow as the act gets.
+    /// A value with a control character in it cannot be stored whole, so it is
+    /// not recorded - and the identity still reads it, so the burn is no wider
+    /// for that.
     #[test]
-    fn a_call_with_no_arguments_is_scoped_by_its_name_and_situation() {
-        let pending = PendingAction::observe(
-            "builtin_tasks_list",
-            &serde_json::json!({}),
-            &here_and_now(),
-        )
-        .expect("a no-argument call is scopeable");
-        assert_eq!(pending.scope.len(), 3, "the three situation facets");
-        assert!(
-            PendingAction::observe(
-                "builtin_tasks_list",
-                &serde_json::Value::Null,
-                &here_and_now()
-            )
-            .is_some(),
-            "null arguments read the same as an empty object"
-        );
-    }
-
-    /// Arguments that are not an object at all name nothing, so they cannot be
-    /// scoped.
-    #[test]
-    fn a_call_whose_arguments_are_not_an_object_is_declined() {
-        assert!(PendingAction::observe("t", &serde_json::json!("bare"), &here_and_now()).is_none());
-        assert!(PendingAction::observe("t", &serde_json::json!([1, 2]), &here_and_now()).is_none());
-    }
-
-    /// A deployment with nothing connected reports an empty situation. The burn
-    /// is then scoped by its arguments alone, which is narrower than nothing
-    /// and is the most the system can honestly say.
-    #[test]
-    fn a_call_in_an_empty_situation_is_scoped_by_its_arguments_alone() {
-        let pending = PendingAction::observe(
+    fn a_control_character_keeps_a_value_out_of_the_record_but_not_the_identity() {
+        let one = PendingAction::observe(
             "terminal_run",
-            &args(&[("command", text("rm -rf build"))]),
-            &Situation::new(),
-        )
-        .expect("an empty situation does not stop a call being scoped");
-        assert_eq!(pending.scope.len(), 1);
+            &args(&[
+                ("command", text("printf a\u{0}b")),
+                ("cwd", text("/srv/app")),
+            ]),
+            &here_and_now(),
+        );
+        let other = PendingAction::observe(
+            "terminal_run",
+            &args(&[
+                ("command", text("printf a\u{0}c")),
+                ("cwd", text("/srv/app")),
+            ]),
+            &here_and_now(),
+        );
+        assert_eq!(
+            one.scope.get(&Facet::Argument("command".to_string())),
+            None,
+            "nothing a text column cannot hold reaches the record"
+        );
+        assert_ne!(one.fingerprint, other.fingerprint);
+    }
+
+    /// More arguments than the record keeps: the extra ones are dropped in name
+    /// order, which is stable, and the identity is unaffected.
+    #[test]
+    fn a_call_with_more_arguments_than_are_recorded_keeps_the_first_by_name() {
+        let many: Vec<(&str, serde_json::Value)> = [
+            "a01", "a02", "a03", "a04", "a05", "a06", "a07", "a08", "a09", "a10", "a11", "a12",
+            "a13",
+        ]
+        .iter()
+        .map(|n| (*n, text("v")))
+        .collect();
+        assert_eq!(many.len(), MAX_ACTION_FACETS + 1);
+        let pending = PendingAction::observe("t", &args(&many), &Situation::new());
+        assert_eq!(pending.scope.len(), MAX_ACTION_FACETS);
+        assert_eq!(
+            pending.scope.get(&Facet::Argument("a13".to_string())),
+            None,
+            "the last by name is the one dropped"
+        );
+    }
+
+    /// Arguments that are not an object name nothing, so nothing is recorded -
+    /// and they still identify the call.
+    #[test]
+    fn arguments_that_are_not_an_object_still_identify_the_call() {
+        let bare = PendingAction::observe("t", &serde_json::json!("bare"), &Situation::new());
+        let listed = PendingAction::observe("t", &serde_json::json!([1, 2]), &Situation::new());
+        let nothing = PendingAction::observe("t", &serde_json::Value::Null, &Situation::new());
+        assert!(bare.scope.is_empty());
+        assert_ne!(bare.fingerprint, listed.fingerprint);
+        assert_ne!(bare.fingerprint, nothing.fingerprint);
     }
 
     // --- Identity -----------------------------------------------------------
@@ -1128,11 +1308,9 @@ mod tests {
             "terminal_run",
             &args(&[("command", text("rm -rf build")), ("cwd", text("/srv/app"))]),
             &Situation::new().with(SituationField::Host, "laptop"),
-        )
-        .expect("a two-argument call is scopeable");
+        );
         assert_eq!(
-            here.fingerprint(),
-            elsewhere.fingerprint(),
+            here.fingerprint, elsewhere.fingerprint,
             "the same act in another place is the same act"
         );
     }
@@ -1149,9 +1327,8 @@ mod tests {
                 ("cwd", text("/srv/other")),
             ]),
             &here_and_now(),
-        )
-        .expect("a two-argument call is scopeable");
-        assert_ne!(here.fingerprint(), other.fingerprint());
+        );
+        assert_ne!(here.fingerprint, other.fingerprint);
     }
 
     /// The digest does not depend on the order arguments arrive in.
@@ -1161,15 +1338,13 @@ mod tests {
             "t",
             &args(&[("a", text("1")), ("b", text("2"))]),
             &Situation::new(),
-        )
-        .expect("scopeable");
+        );
         let other = PendingAction::observe(
             "t",
             &args(&[("b", text("2")), ("a", text("1"))]),
             &Situation::new(),
-        )
-        .expect("scopeable");
-        assert_eq!(one.fingerprint(), other.fingerprint());
+        );
+        assert_eq!(one.fingerprint, other.fingerprint);
     }
 
     /// Two argument sets that differ only in where a separator falls must not
@@ -1180,35 +1355,42 @@ mod tests {
             "t",
             &args(&[("ab", text("c")), ("d", text("e"))]),
             &Situation::new(),
-        )
-        .expect("scopeable");
+        );
         let other = PendingAction::observe(
             "t",
             &args(&[("a", text("bc")), ("d", text("e"))]),
             &Situation::new(),
-        )
-        .expect("scopeable");
-        assert_ne!(one.fingerprint(), other.fingerprint());
+        );
+        assert_ne!(one.fingerprint, other.fingerprint);
     }
 
     // --- Stored form --------------------------------------------------------
 
-    /// A facet this build cannot name is dropped on read rather than kept as an
-    /// unmatchable requirement, because a requirement nothing can satisfy would
-    /// silence the burn instead of narrowing it.
+    /// A facet this build cannot name refuses the whole scope, and the reader
+    /// then refuses the memory.
+    ///
+    /// Dropping the unreadable facet is the tempting answer and it is the
+    /// dangerous one: the burn would lose a requirement and fire on acts it had
+    /// never been seen with. This is not hypothetical - a database written by a
+    /// build that knows one more situation dimension, read by one that does
+    /// not, is an ordinary rollback.
     #[test]
-    fn a_stored_facet_this_build_cannot_name_is_dropped() {
-        let scope = Scope::from_stored([
+    fn a_stored_facet_this_build_cannot_name_refuses_the_whole_scope() {
+        assert_eq!(
+            Scope::from_stored([
+                ("argument", "cwd", "/srv/app"),
+                ("situation", "host", "workshop"),
+                ("situation", "moon_phase", "waxing"),
+            ]),
+            None,
+            "a scope with an unreadable requirement is no scope at all"
+        );
+        let readable = Scope::from_stored([
             ("argument", "cwd", "/srv/app"),
             ("situation", "host", "workshop"),
-            ("situation", "moon_phase", "waxing"),
-            ("astrology", "sign", "leo"),
-        ]);
-        assert_eq!(scope.len(), 2);
-        assert_eq!(
-            scope.get(&Facet::Situation(SituationField::Host)),
-            Some("workshop")
-        );
+        ])
+        .expect("every facet is one this build names");
+        assert_eq!(readable.len(), 2);
     }
 
     /// Every facet kind and every known situation field survives a round trip
@@ -1220,7 +1402,7 @@ mod tests {
             .iter()
             .map(|(f, v)| (f.kind().to_string(), f.name().to_string(), v.to_string()))
             .collect();
-        assert_eq!(Scope::from_stored(rows), original);
+        assert_eq!(Scope::from_stored(rows), Some(original));
     }
 
     /// The stored kind of a memory round trips, and an unknown one is refused.
@@ -1251,8 +1433,13 @@ mod tests {
             "it says how to proceed anyway"
         );
         assert!(
-            warning.contains("command=rm -rf build"),
-            "it says what it is scoped to, so the model can judge the fit"
+            warning.contains("Called with: command=rm -rf build, cwd=/srv/app"),
+            "it says which call it is about, so the model can judge the fit"
+        );
+        assert!(
+            warning.contains("It went badly at: host=workshop"),
+            "and it says the circumstance apart from the arguments, so an \
+             argument named `host` cannot read like the situation field"
         );
     }
 
@@ -1263,10 +1450,13 @@ mod tests {
         assert!(render_warning(&[], now()).is_none());
     }
 
-    /// A wall of past failures is not a warning. The set is capped, strongest
-    /// first, so the model reads the most recent lessons and not all of them.
+    /// A wall of past failures is not a warning, so the rendered block is
+    /// capped. The match is not: every fired lesson comes back, because the
+    /// other caller extinguishes what a success disproved, and a lesson left
+    /// standing for falling off the end of a warning is a lesson nothing could
+    /// ever correct.
     #[test]
-    fn the_warning_names_at_most_the_capped_number_of_burns() {
+    fn every_fired_burn_is_returned_and_the_warning_names_only_a_few() {
         let held: Vec<NegativeMemory> = (0..MAX_WARNED_BURNS + 2)
             .map(|i| {
                 let mut burn = burn_aged(TimeDelta::days(i as i64));
@@ -1275,10 +1465,20 @@ mod tests {
             })
             .collect();
         let fired = burns_that_fire(&held, &the_call(), now());
-        assert_eq!(fired.len(), MAX_WARNED_BURNS);
+        assert_eq!(
+            fired.len(),
+            MAX_WARNED_BURNS + 2,
+            "every lesson this act disproves has to be reachable"
+        );
         assert_eq!(
             fired[0].id, "nm-0",
             "the strongest - most recently confirmed - leads"
+        );
+        let warning = render_warning(&fired, now()).expect("a fired burn renders a warning");
+        assert_eq!(
+            warning.matches("\n- Last ").count(),
+            MAX_WARNED_BURNS,
+            "and only a few of them are put in front of the model"
         );
     }
 

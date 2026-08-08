@@ -20,27 +20,26 @@ Three things, never a bare proposition.
 | context | the facets it went badly with |
 | outcome | what went wrong, in the words of whatever recorded it |
 
-The context is a set of required **facets**, of two kinds, and the two are not
-interchangeable.
+Two things are matched, and only the second ever moves.
 
-- **Argument facets** say *what* was done: the call's own arguments, by name.
-  They are the burn's identity. The fingerprint is taken over these alone, and
-  nothing ever drops one.
-- **Situation facets** say *when and where*: the host, the part of the day, the
-  weekday - the cue described in
-  [pre-prompt recall](pre-prompt-recall.md). These are what a second occurrence
-  drops.
+- **The act**: the tool's name, and a digest of the call's arguments exactly as
+  they were made. This is the burn's identity, and it never widens. A call whose
+  arguments differ in any way - one value changed, one argument added, one left
+  out - is a different act and a different lesson.
+- **The circumstance**: the situation facets - the host, the part of the day,
+  the weekday - described in [pre-prompt recall](pre-prompt-recall.md). These
+  are what a second occurrence drops.
 
-An argument is a facet only if it is a short scalar. A long value is not cut
-down to fit, because two different values sharing a prefix would then match; it
-is simply not a facet. A structured value is not a facet either. So a file write
-is remembered by its path and not by its contents.
+That is stricter than it has to be, deliberately. A burn that fails to fire
+costs one repeat of a mistake. A burn that fires on the wrong act costs the
+assistant's usefulness in a way nobody can see, and that is the whole argument
+of this feature.
 
-A call the rule cannot scope produces no burn at all. Three cases: the arguments
-are not an object, the call carries arguments but none of them can be a facet,
-or it carries more usable arguments than the cap. All three decline rather than
-scope loosely, because a burn keyed on a bare tool name would interrupt every
-later call to that tool.
+The burn also *records* the arguments it can hold whole - short scalars, free of
+control characters, up to a cap, kept in name order - so a warning can say which
+call it is about. That record is for reading, never for matching. The digest has
+no such limit and hashes every argument at full length, which is what stops two
+long commands in one directory folding into one lesson.
 
 ## Strength and scope move in opposite directions
 
@@ -53,12 +52,15 @@ only ever falls: it halves every two weeks without a repeat, and a burn under a
 quarter of full - four weeks - stops interrupting anything. It stays readable
 for another four weeks after that, then the next write drops it.
 
-**Scope is as narrow as the evidence allows.** A fresh burn requires every facet
-it was observed in, so it fires only on a repeat of exactly what went wrong. It
-widens only when the same act fails again somewhere else: the situation facets
-the second occurrence disagrees with are dropped, because the failure happened
-without them, so they were not the cause. Two failures in the same situation
-widen nothing.
+**Scope is as narrow as the evidence allows.** A fresh burn requires every
+situation facet it was observed in, on top of the act itself, so it fires only
+on a repeat of exactly what went wrong. It widens only when the same act fails
+again somewhere else: the situation facets the second occurrence *observed with
+a different value* are dropped, because the failure happened without them, so
+they were not the cause. Two failures in the same situation widen nothing, and
+neither does a repeat that observed no situation at all - absence is not
+disagreement, and reading it as disagreement would let one headless retry strip
+a burn's whole circumstance.
 
 Over-generalization is the failure mode this shape exists to prevent. An
 assistant that turns "this failed once" into "never do this" becomes uselessly
@@ -79,7 +81,8 @@ This call has not run. The same call went badly before, and what follows is a
 candidate warning, not a refusal.
 
 - Last 3 days ago, 2 times: rm -rf failed: build is a mount point
-  It went badly with: command=rm -rf build, cwd=/srv/app
+  Called with: command=rm -rf build, cwd=/srv/app
+  It went badly at: host=workshop, time_of_day=morning, weekday=thursday
 
 Decide whether the cause still applies. If it does not - the fault is fixed, the
 interface changed, or you mean something different this time - make the same
@@ -93,6 +96,11 @@ so making the same call again runs it. That is also what stops the warning
 becoming a loop, and it is why a call that just failed is not held again inside
 the same turn.
 
+An identity takes effect from the *next round*, not from the next call. A model
+may emit the same call twice in one response, and both copies are held: the
+model has read nothing between them, so letting the second through would run the
+act before the warning had been read at all.
+
 The turn reads its live burns once, before its first round, and matches them in
 memory. A read per tool call would put a database round trip in front of every
 one.
@@ -105,7 +113,9 @@ A burn that stops applying is not deleted. The same call succeeding writes a
 `history(action)` reads both.
 
 Only the burns a success would actually have fired are extinguished: a success
-elsewhere says nothing about a lesson whose context still holds.
+elsewhere says nothing about a lesson whose context still holds. That covers
+lessons this turn wrote as well as ones it read, so a tool that fails once and
+works on the retry does not leave a lesson its own retry disproved.
 
 One trial extinguishes, where nature would want several safe exposures. The
 asymmetry is deliberate. The dangerous failure here is an assistant that stays
@@ -130,9 +140,20 @@ questions about different objects.
   dispatch loop behaves exactly as it did before this existed.
 - **Never fails a turn.** An unreadable store costs the turn its lessons and
   nothing else. Both writes run off the turn's path.
-- **The writer is the reaper.** There is no sweep. Every write first drops this
-  user's burns that nothing has confirmed past the forget horizon, and the
-  foreign key takes their facets with them.
+- **The writer is the reaper.** There is no sweep. Recording a bad outcome first
+  drops this user's burns that nothing has confirmed past the forget horizon,
+  and the foreign key takes their facets with them. A burn and the correction
+  over it are one unit and go together, so a reap never leaves a correction
+  naming a lesson that is gone.
+- **Nothing an outside party wrote is replayed.** A tool's error text can be a
+  remote server's own words. Once a turn has read content from outside the trust
+  boundary, a burn it records keeps the lesson and drops the words - a burn is
+  read back in another conversation at the moment the model is deciding whether
+  to act, which is the last place such a sentence should reach.
+- **No surface yet for reading or clearing a burn.** A person meets this only as
+  the assistant saying it tried something before and it went badly. A wrong burn
+  goes quiet four weeks after its last occurrence on its own, and the moment the
+  same call succeeds. A tool to list and clear them is not built.
 - **Personal data.** Both tables carry `user_id`, enable their own row-level
   security, and are registered in `PERSONAL_DATA_TABLES`. What a person's
   assistant tried and how it failed is as personal as the work it was doing.

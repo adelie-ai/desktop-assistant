@@ -54,7 +54,12 @@ use crate::domain::negative_memory::{NegativeMemory, Scope};
 pub struct BurnObservation {
     /// The tool that went badly.
     pub action: String,
-    /// Every facet the call was made with - its arguments and the situation.
+    /// The digest of the arguments it went badly with. With `action`, the
+    /// identity a later occurrence must match exactly to confirm this lesson
+    /// rather than start a second one.
+    pub fingerprint: String,
+    /// What the burn records and shows: the arguments short enough to hold
+    /// whole, and the situation the call was made in.
     pub scope: Scope,
     /// What went wrong, already clamped by
     /// [`clamp_outcome`](crate::domain::negative_memory::clamp_outcome).
