@@ -1421,7 +1421,12 @@ impl<S, L, T> ConversationHandler<S, L, T> {
         let identity = identity.to_string();
         record_in_background("negative_memory.burn", async move {
             let recorded = write(observation).await?;
-            if let Ok(mut held) = written.lock() {
+            // An empty id is the store saying it wrote nothing - the identity
+            // it would have taken was extinguished under it. There is nothing
+            // for a later success to correct, so nothing is remembered.
+            if !recorded.id.is_empty()
+                && let Ok(mut held) = written.lock()
+            {
                 held.insert(identity, recorded.id);
             }
             Ok(1)

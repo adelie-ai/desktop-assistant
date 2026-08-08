@@ -343,8 +343,10 @@ impl Scope {
 /// - **It does not depend on the order arguments arrive in**, because an object
 ///   has no order and two encoders of one call must agree.
 /// - **It cannot confuse a name for a value, or one argument for two.** Every
-///   piece is framed by a separator no JSON text can contain, and nesting is
-///   framed as well, so `{"ab": "c"}` and `{"a": "bc"}` differ.
+///   string is written with its length in front of it and every composite
+///   frames its own end, so `{"ab": "c"}` and `{"a": "bc"}` differ - and so do
+///   two calls whose argument names carry whatever byte a separator-only
+///   framing would have relied on being absent.
 ///
 /// The situation is excluded on purpose: it is what widens, so it cannot also
 /// be what identifies.
@@ -357,8 +359,8 @@ pub fn fingerprint(arguments: &serde_json::Value) -> String {
 /// Feed one JSON value into `hasher` in a form that depends on its content and
 /// not on how it was written.
 fn absorb(hasher: &mut Sha256, value: &serde_json::Value) {
-    // Every arm leads with a distinct tag byte, so a string "1" and the number
-    // 1 cannot hash alike, and each composite frames its own end.
+    // Every arm leads with a distinct tag byte, so the string "1" and the
+    // number 1 cannot hash alike, and each composite frames its own end.
     match value {
         serde_json::Value::Null => hasher.update(*b"0"),
         serde_json::Value::Bool(b) => {
@@ -367,13 +369,11 @@ fn absorb(hasher: &mut Sha256, value: &serde_json::Value) {
         }
         serde_json::Value::Number(n) => {
             hasher.update(*b"n");
-            hasher.update(n.to_string().as_bytes());
-            hasher.update([0x1e_u8]);
+            absorb_text(hasher, &n.to_string());
         }
         serde_json::Value::String(text) => {
             hasher.update(*b"s");
-            hasher.update(text.as_bytes());
-            hasher.update([0x1e_u8]);
+            absorb_text(hasher, text);
         }
         serde_json::Value::Array(items) => {
             hasher.update(*b"[");
@@ -389,13 +389,24 @@ fn absorb(hasher: &mut Sha256, value: &serde_json::Value) {
             let mut keys: Vec<&String> = map.keys().collect();
             keys.sort_unstable();
             for key in keys {
-                hasher.update(key.as_bytes());
-                hasher.update([0x1f_u8]);
+                absorb_text(hasher, key);
                 absorb(hasher, &map[key]);
             }
             hasher.update(*b"}");
         }
     }
+}
+
+/// Feed one string in with its length in front of it.
+///
+/// Length-prefixed rather than separator-framed, because a separator only
+/// frames what cannot contain it - and a JSON string, including an object's
+/// key, can contain any byte at all. A length says where the string ends
+/// whatever is in it, which is what makes the digest injective rather than
+/// injective-in-practice.
+fn absorb_text(hasher: &mut Sha256, text: &str) {
+    hasher.update((text.len() as u64).to_be_bytes());
+    hasher.update(text.as_bytes());
 }
 
 /// A tool call about to be made, reduced to what a burn is matched on.
@@ -1347,8 +1358,10 @@ mod tests {
         assert_eq!(one.fingerprint, other.fingerprint);
     }
 
-    /// Two argument sets that differ only in where a separator falls must not
-    /// collide, so the digest frames each name and value.
+    /// Two argument sets that differ only in where one name ends and its value
+    /// begins must not collide, so each string is written with its length in
+    /// front of it - including one carrying whatever byte a separator-only
+    /// framing would have leaned on being absent.
     #[test]
     fn argument_names_and_values_cannot_be_confused_for_each_other() {
         let one = PendingAction::observe(
@@ -1362,6 +1375,16 @@ mod tests {
             &Situation::new(),
         );
         assert_ne!(one.fingerprint, other.fingerprint);
+
+        // The same question where the name itself carries a separator byte.
+        let framed =
+            PendingAction::observe("t", &args(&[("a\u{1f}b", text("c"))]), &Situation::new());
+        let split = PendingAction::observe(
+            "t",
+            &args(&[("a", text("\u{1f}b\u{1f}c"))]),
+            &Situation::new(),
+        );
+        assert_ne!(framed.fingerprint, split.fingerprint);
     }
 
     // --- Stored form --------------------------------------------------------

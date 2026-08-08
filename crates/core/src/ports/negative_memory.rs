@@ -69,9 +69,15 @@ pub struct BurnObservation {
 /// What recording a bad outcome did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BurnWrite {
-    /// The row now holding this lesson.
+    /// The row now holding this lesson, or empty when nothing was written.
+    ///
+    /// Empty is a real answer, not an error: the identity this observation
+    /// would have taken was extinguished by another writer between the conflict
+    /// and the re-read, so there is no live lesson to confirm and the next
+    /// occurrence starts one.
     pub id: String,
-    /// How many times it has been recorded. One means this write created it.
+    /// How many times it has been recorded. One means this write created it,
+    /// and zero means nothing was written - see `id`.
     pub occurrences: u32,
     /// Situation facets this occurrence dropped, because the failure happened
     /// without them. Zero on a first write, because there is nothing to widen.
