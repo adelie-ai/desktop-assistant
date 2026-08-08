@@ -317,6 +317,68 @@ const ENV_PASSTHROUGH_ALLOWLIST: &[&str] = &[
     // read-only container filesystem) - the sibling of SKILLS_MCP_ROOTS
     // above, for writes rather than reads.
     "SKILLS_MCP_WRITE_ROOT",
+    // OTLP transport, for every server that exports telemetry. `env_clear`
+    // above means a server that receives none of these has no export
+    // configuration at all, so it exports nothing - no traces, no metrics
+    // and no log records. The daemon's own spans still arrive, which is
+    // what makes the gap read like a working pipeline (#1189).
+    //
+    // Each per-signal form is here beside its generic one because
+    // `adelie-telemetry` resolves the per-signal variable first: carrying
+    // only the generic form would silently drop a deployment that sends one
+    // signal to a different collector. The endpoint and the protocol both
+    // matter on their own - a server left on the compiled-default transport
+    // while the collector listens on the other port fails every export, and
+    // the failure reads as a network fault rather than as configuration
+    // (docs/logging.md, "Choosing a transport").
+    //
+    // Named one variable at a time, never by an `OTEL_` prefix match.
+    // Kubernetes injects a legacy service-link pair for every Service in the
+    // namespace, so a Service named `otel-collector` puts
+    // `OTEL_COLLECTOR_PORT` and `OTEL_COLLECTOR_SERVICE_HOST` in the
+    // daemon's environment; a prefix rule would forward those, and any
+    // future credential variable that happens to start the same way.
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_PROTOCOL",
+    "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
+    "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL",
+    "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL",
+    "OTEL_EXPORTER_OTLP_TIMEOUT",
+    "OTEL_EXPORTER_OTLP_TRACES_TIMEOUT",
+    "OTEL_EXPORTER_OTLP_METRICS_TIMEOUT",
+    "OTEL_EXPORTER_OTLP_LOGS_TIMEOUT",
+    // The deployment's own resource attributes - pod, namespace and node in
+    // the shipped k8s manifest (deploy/k8s/components/telemetry/daemon-telemetry.yaml).
+    // Without them a server's spans carry none of the deployment context the
+    // daemon's spans carry, so a reader cannot tell which pod produced them.
+    // The SDK merges this value into the resource; it does not let it
+    // replace the service name each server sets for itself in code.
+    "OTEL_RESOURCE_ATTRIBUTES",
+    // One filter governs a server's console output and its exported log
+    // records together, so without this an operator cannot raise a deployed
+    // server's log level at all: its exported records stay at the compiled
+    // default. That single filter is the daemon's own documented contract
+    // (docs/logging.md), and an operator expects a server to behave the same
+    // way. It holds no secret. The cost is the one the daemon already
+    // carries and states: RUST_LOG=debug ships conversation content to the
+    // collector, now from the servers as well.
+    "RUST_LOG",
+    // NOTE: OTEL_EXPORTER_OTLP_HEADERS and its three per-signal forms are
+    // deliberately NOT here. That variable carries the backend ingestion
+    // credential, so passing it would hand the credential to every spawned
+    // server, including a third-party one an operator adds - the leak this
+    // allowlist exists to prevent. Servers export to the in-cluster
+    // collector, and the collector is where backend credentials belong. A
+    // server that genuinely must reach a backend directly takes the scoped
+    // route, `McpServerConfig::inherit_env`.
+    //
+    // NOTE: OTEL_SERVICE_NAME is deliberately NOT here either. Every spawned
+    // server would then report under the daemon's service name and the
+    // traces would be unreadable. Each server names itself from its own
+    // config.
 ];
 
 /// "List changed" notification flags, shared between an `McpClient` and the
