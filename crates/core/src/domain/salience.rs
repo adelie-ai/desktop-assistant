@@ -105,11 +105,11 @@ use crate::domain::knowledge::KnowledgeEntry;
 
 /// The provenance value an entry written during a live turn carries.
 ///
-/// The string the `source` column holds. Repeated here rather than imported,
-/// because the storage layer owns the column and the domain must not depend on
-/// it - and pinned against storage's own copy by
-/// `the_domain_and_the_store_agree_on_what_explicit_provenance_is` in
-/// `crates/storage`, which is the only place both values are in scope.
+/// The string the `source` column holds, defined here rather than in storage
+/// because the domain must not depend on the storage layer. Storage names the
+/// same constant rather than declaring a second one, so the two cannot drift:
+/// a drift would show up only as a signal that never fires, which is the
+/// quietest failure a ranking term has.
 pub const SOURCE_EXPLICIT: &str = "explicit";
 
 /// One kind of evidence that a stored fact deserves attention.
@@ -152,7 +152,8 @@ impl SalienceSignal {
         Self::Commitment,
     ];
 
-    /// The name this signal is written under.
+    /// A short distinct name for this signal, for a message that has to say
+    /// which one. Nothing stores it - see "Read, never written" above.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Deliberate => "deliberate",
@@ -177,9 +178,15 @@ impl SalienceSignal {
     /// test would read an ordinary engineering note as being about money and a
     /// promise.
     ///
-    /// The bare topic word is a cue as well as the specific ones, because a tag
-    /// is part of the haystack and a store that tags an entry `health` has said
-    /// what it is about more plainly than its prose does.
+    /// **No bare topic word is a cue.** "health" would be one on the face of
+    /// it - a tag is part of the haystack, and a store that tags an entry
+    /// `health` has said what it is about. But this design prices every cue the
+    /// same, and a topic word is weak evidence where a specific one is strong,
+    /// so while they are worth alike a topic word can only add noise. "health
+    /// check", "service health" and "healthy" are ordinary in the engineering
+    /// notes this store holds, and none of them is about anybody's health. A
+    /// bare topic word wants a lower weight than a specific cue, and that is a
+    /// design change rather than a longer list.
     fn cues(self) -> &'static [&'static str] {
         match self {
             // Provenance, not text. `Deliberate` is decided by the `source`
@@ -200,8 +207,6 @@ impl SalienceSignal {
                 "no later than",
             ],
             Self::Money => &[
-                "money",
-                "finance",
                 "invoice",
                 "payment",
                 "salary",
@@ -217,8 +222,6 @@ impl SalienceSignal {
                 "bank account",
             ],
             Self::Health => &[
-                "health",
-                "medical",
                 "doctor",
                 "dentist",
                 "hospital",
@@ -270,11 +273,16 @@ const MAX_CUE_INFLECTION_CHARS: usize = 3;
 /// haystack a reading is read from.
 ///
 /// A newline rather than a space, and it is load-bearing rather than cosmetic.
-/// Cues are phrases, and a space would let one straddle two fields that each say
-/// nothing: an entry tagged `bank` and `account` would carry the phrase "bank
-/// account" that neither tag states, and a body ending "...is due" beside a
-/// summary opening "by Friday" would carry "due by". A newline is not
-/// alphanumeric, so [`says`] refuses a match that spans it.
+/// Cues are phrases whose words are separated by a space, and a space here would
+/// let one straddle two fields that each say nothing: an entry tagged `bank` and
+/// `account` would carry the phrase "bank account" that neither tag states, and
+/// a body ending "...is due" beside a summary opening "by Friday" would carry
+/// "due by". With a newline the phrase is simply not in the haystack, so the
+/// match never happens and no boundary test is involved.
+///
+/// It has to be non-alphanumeric for the other half of the job: a single-word
+/// cue at the start of a tag is preceded by this character, and [`says`] admits
+/// a match only where what precedes it is not a letter or a digit.
 const FIELD_SEPARATOR: char = '\n';
 
 /// Whether `haystack` says `cue`, as a word rather than as a run of letters.
@@ -411,11 +419,10 @@ impl SalienceReading {
     /// - **It is never negative and never over one**, so the bound is a property
     ///   of this function rather than of its caller.
     pub fn share(&self) -> f64 {
-        let detectable = SalienceSignal::ALL.len();
-        if detectable == 0 {
-            return 0.0;
-        }
-        (self.0.len() as f64 / detectable as f64).clamp(0.0, 1.0)
+        // The set can only hold signals the enum declares, so the ratio cannot
+        // pass one; the clamp says so rather than leaving a reader to work it
+        // out from the type.
+        (self.0.len() as f64 / SalienceSignal::ALL.len() as f64).clamp(0.0, 1.0)
     }
 }
 
@@ -509,9 +516,13 @@ mod tests {
         );
     }
 
-    /// A tag says what an entry is about more plainly than its prose does, and a
-    /// summary is what a reader of a long entry actually meets. Both are read,
-    /// and both can fire a signal the body does not.
+    /// The tags and the summary are read as well as the body, and either can
+    /// fire a signal the body does not.
+    ///
+    /// The tag here is a cue rather than a bare topic word, because a bare topic
+    /// word is deliberately not one - `cues` says why. An entry tagged only
+    /// `health` carries no signal, and that is the cost of pricing every cue
+    /// alike, stated here so it is met as a decision rather than as a surprise.
     #[test]
     fn a_signal_in_the_tags_or_the_summary_fires_where_the_body_alone_would_not() {
         let plain = "Tuesdays are no good from now on.";
@@ -520,15 +531,15 @@ mod tests {
             "precondition: the body alone carries nothing"
         );
 
-        let tags = vec!["health".to_string()];
+        let tags = vec!["invoice".to_string()];
         assert!(
             SalienceReading::read(&SalienceSource {
                 content: plain,
                 tags: &tags,
                 ..SalienceSource::default()
             })
-            .carries(SalienceSignal::Health),
-            "a health tag must reach the reading"
+            .carries(SalienceSignal::Money),
+            "a tag that is a cue must reach the reading"
         );
 
         assert!(
@@ -539,6 +550,17 @@ mod tests {
             })
             .carries(SalienceSignal::Health),
             "a summary must reach the reading"
+        );
+
+        let topic_only = vec!["health".to_string()];
+        assert!(
+            SalienceReading::read(&SalienceSource {
+                content: plain,
+                tags: &topic_only,
+                ..SalienceSource::default()
+            })
+            .is_empty(),
+            "a bare topic word is not a cue, deliberately"
         );
     }
 
@@ -606,6 +628,8 @@ mod tests {
             "The neuroscience paper is filed under reading.",
             "Naomi owed the team a review of the retry loop.",
             "The deployment is committed to main once the gate is green.",
+            "The health check endpoint returns 200.",
+            "A medical-imaging customer asked about the money-transfer flow.",
         ] {
             let reading = body(innocent);
             assert!(
@@ -718,10 +742,10 @@ mod tests {
         }
     }
 
-    /// Stored names are stable, because they are what a reading is written
-    /// under.
+    /// Every signal is named, and no two share a name, so a message that says
+    /// which signal fired says one thing.
     #[test]
-    fn every_signal_has_its_own_stable_name() {
+    fn every_signal_has_a_name_of_its_own() {
         let mut names: Vec<&str> = SalienceSignal::ALL
             .iter()
             .map(|signal| signal.as_str())

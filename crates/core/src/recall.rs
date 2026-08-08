@@ -3016,8 +3016,8 @@ mod tests {
 
     /// The same candidate, with a body a salience detector reads.
     ///
-    /// A person's own promotion and a deadline: two of the five signals, which
-    /// is a realistic reading rather than the maximum one.
+    /// A live-turn write and a deadline: two of the five signals, which is a
+    /// realistic reading rather than the maximum one.
     fn salient(mut hit: RecallEntry) -> RecallEntry {
         hit.entry.source = Some(crate::domain::salience::SOURCE_EXPLICIT.to_string());
         hit.entry.content =
@@ -3053,8 +3053,8 @@ mod tests {
         assert_eq!(
             shown_ids(&candidates),
             vec!["kb-salient".to_string(), "kb-plain".to_string()],
-            "the entry a person asked for, with a deadline on it, must lead one a tenth of a \
-             deviation nearer that carries neither"
+            "the entry written in a live turn, with a deadline on it, must lead one a tenth of \
+             a deviation nearer that carries neither"
         );
     }
 

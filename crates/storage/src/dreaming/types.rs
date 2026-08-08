@@ -214,23 +214,16 @@ pub struct ConsolidationStats {
 mod tests {
     use super::*;
 
-    /// The domain and the store name one value, and this is the only place both
-    /// are in scope to say so.
+    /// The constant is the string migration 026 writes into the column.
     ///
-    /// The salience term reads `explicit` provenance as a signal, and this
-    /// module's constant is what the write and prune paths compare against. A
-    /// test inside either crate could only compare a constant with itself; a
-    /// drift between them would show up in production as a signal that never
-    /// fires, which is the quietest failure a ranking term has.
+    /// One assertion, because there is only one thing left to check. This name
+    /// is an alias for the domain's constant rather than a second declaration,
+    /// so the two cannot disagree and a test comparing them would compare a
+    /// value with itself. What no type checks is that either of them matches the
+    /// schema, and a mismatch there is silent: the prune guard would stop
+    /// protecting live-turn entries and the salience signal would never fire.
     #[test]
-    fn the_domain_and_the_store_agree_on_what_explicit_provenance_is() {
-        assert_eq!(
-            SOURCE_EXPLICIT,
-            desktop_assistant_core::domain::salience::SOURCE_EXPLICIT
-        );
-        assert_eq!(
-            SOURCE_EXPLICIT, "explicit",
-            "and both are the string migration 026 defines"
-        );
+    fn explicit_provenance_is_the_value_the_schema_writes() {
+        assert_eq!(SOURCE_EXPLICIT, "explicit");
     }
 }

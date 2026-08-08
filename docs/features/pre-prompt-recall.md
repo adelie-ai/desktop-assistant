@@ -638,6 +638,13 @@ take a three-character inflection - "invoices" still fires "invoice" and
 "taxonomy" no longer fires "tax". The fields are joined by a newline, so a phrase
 cue cannot be assembled out of two tags that each say nothing.
 
+**No bare topic word is a cue**, so an entry tagged only `health` carries no
+signal. That is a cost, and it is paid on purpose: every cue here is worth the
+same, a topic word is weak evidence where a specific one is strong, and "health
+check" and "service health" are ordinary in the engineering notes this store
+holds. A topic word wants a lower weight than a specific cue, which is a design
+change rather than a longer list.
+
 **The signals divide one fixed lift rather than each adding one.** The term is a
 ratio - of the signals this build can detect, how many does this entry carry - so
 it cannot grow with how many signals a deployment happens to be able to detect. A

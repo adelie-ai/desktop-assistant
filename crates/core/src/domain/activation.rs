@@ -260,7 +260,9 @@ impl ActivationWeights {
     ///   non-semantic signals should lead - the same case
     ///   [`DEFAULT_USE_LIFT`] describes for the use log, and the guarantee
     ///   #1123 deliberately did not make. Beyond about seven tenths of a
-    ///   deviation the semantic lead stands against every cheap signal there is.
+    ///   deviation the semantic lead stands against both cheap signals together.
+    ///   The use log is not one of them and is not bounded by this: see
+    ///   [`MAX_REINFORCEMENT_DEVIATIONS`].
     pub fn reference_use_lift(&self) -> f64 {
         self.reinforcement(self.reference_sum())
     }
@@ -284,10 +286,10 @@ impl ActivationWeights {
     /// this name states is that "this entry carries everything that makes a fact
     /// worth keeping" is worth what "you opened this yesterday" is worth.
     ///
-    /// **Why the reading is not worth more than one recorded use**, when a
-    /// person's own instruction is among the signals it reads: a mark in the use
-    /// log records something that happened, and a salience signal reads what
-    /// text means. A reading must not outweigh a record. See
+    /// **Why the reading is not worth more than one recorded use**, when one of
+    /// the signals may be a person's own doing: a mark in the use log records a
+    /// judgement somebody made, and a salience signal is inferred from what an
+    /// entry happens to look like. A reading must not outweigh a record. See
     /// [`crate::domain::salience`].
     pub fn salience_lift(&self) -> f64 {
         self.reference_use_lift()
@@ -928,15 +930,17 @@ mod tests {
         );
     }
 
-    /// Acceptance (#1125): the situation term is counted in the source's own
-    /// median absolute deviations, like the other two.
+    /// An equally placed and equally situated candidate scores the same against
+    /// any source, however differently that source's distances are spread.
     ///
-    /// The same test the semantic term gets, extended to the third: two sources
-    /// of quite different geometry, one candidate equally placed in each and
-    /// equally matched by the situation. The score is the same number, so
-    /// nothing here is a raw distance and nothing is a raw match count.
+    /// Named for what it checks rather than for the wider property it was once
+    /// called after: `situation` takes no dispersion, so it could not vary with
+    /// one even if it were a raw match count. What holds the term to the
+    /// semantic term's unit is its ceiling, and
+    /// `the_situation_term_is_bounded_by_one_use_at_the_reference_age` is where
+    /// that is checked.
     #[test]
-    fn the_situation_term_is_counted_in_the_sources_own_deviations() {
+    fn an_equally_placed_and_equally_situated_candidate_scores_the_same_against_any_source() {
         use crate::ports::recall::RecallDispersion;
 
         let now = now();
@@ -969,8 +973,10 @@ mod tests {
         );
     }
 
-    /// Acceptance (#1125): the situation term is bounded, and the bound is
-    /// exactly what one use at the reference age is worth.
+    /// Acceptance (#1125): the situation term is bounded, the bound is exactly
+    /// what one use at the reference age is worth, and it is therefore counted
+    /// in the source's own median absolute deviations rather than in a unit of
+    /// its own.
     ///
     /// Both halves. The ceiling holds over every coverage a caller could hand
     /// in, including the ones the type does not rule out - a value past one, a
@@ -1362,8 +1368,8 @@ mod tests {
 
     /// An entry no detector reads forfeits the lift; it never subtracts.
     ///
-    /// Most of what is worth keeping carries no deadline, no money and nobody's
-    /// instruction, so absence must not be evidence against an entry.
+    /// Most of what is worth keeping names no deadline, no money and nobody it
+    /// was promised to, so absence must not be evidence against an entry.
     #[test]
     fn an_unsalient_entry_forfeits_the_lift_rather_than_being_pushed_below_the_rest() {
         let now = now();

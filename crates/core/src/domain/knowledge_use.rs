@@ -252,15 +252,18 @@ impl UseScoreWeights {
         self.decay.clamp(0.01, 0.99)
     }
 
-    /// What one mark from `source` is worth, in uses. Never negative: a
-    /// deployment may fit its own weights, and a mark that subtracted where it
-    /// should add would invert every rule stated over it.
+    /// What one mark from `source` is worth, in uses.
+    ///
+    /// **Not clamped**, deliberately. [`KnowledgeUseRecord::use_sum`] is what
+    /// the `[Recall]` ranking reads, and this is how a mark reaches it, so a
+    /// floor here would change that ranking under any weights a deployment
+    /// fitted for itself. A guard wanted by one caller belongs at that caller,
+    /// and [`KnowledgeUseRecord::contradiction_sum`] takes its own.
     fn mark_weight(&self, source: MarkSource) -> f64 {
         match source {
             MarkSource::Model => self.model_mark,
             MarkSource::Person => self.person_mark,
         }
-        .max(0.0)
     }
 }
 

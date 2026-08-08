@@ -190,7 +190,8 @@ P_i = retrieved + contradicted + salient
   moment it is recalled, which is where a contradiction surfaces; a fact written
   yesterday and never reached for has told nobody anything yet. The use log
   (`docs/features/knowledge-use-log.md`) is what can tell the two apart, read
-  here as its opens alone.
+  here without the weight a mark's judgement carries - the use a mark came with
+  still counts, because marking an entry means it was retrieved.
 - **`contradicted` adds here, where the retrieval score subtracts it.** A fact
   that was retrieved and then found wrong is the highest-value thing a
   consolidation pass can examine, so the signal that pushes it out of a
@@ -219,9 +220,12 @@ wrong.
 
 **It orders and does not select.** Nothing is dropped. Capping a day's material
 is a separate decision, and a cap laid over an arbitrary order would silently
-stop examining whatever sorted last. A use log that cannot be read costs the
-order and not the pass: the run says so once in the journal and keeps the order
-it sliced in.
+stop examining whatever sorted last.
+
+A use log that cannot be read costs two of the three terms and not the pass.
+Salience is read from the entries themselves, so the slices are still ordered on
+that term alone - not left in the order they were packed in - and the journal
+line says which terms the run was blind to.
 
 ## What consolidation may and may not do
 

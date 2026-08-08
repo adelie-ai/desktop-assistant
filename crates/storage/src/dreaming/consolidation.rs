@@ -94,8 +94,8 @@ struct KbEntry {
     tags: Vec<String>,
     metadata: KbMetadata,
     /// Provenance (`extraction` | `consolidation` | `explicit`, or NULL on rows
-    /// written before the column existed). Gates the never-prune rule, and
-    /// carries the [`SalienceSignal::Instructed`] signal.
+    /// written before the column existed). Gates the never-prune rule, and is
+    /// the one salience signal read from provenance rather than from text.
     source: Option<String>,
     /// How many times consolidation has already rewritten this entry.
     review_generation: i16,
@@ -242,9 +242,10 @@ async fn consolidate_user(
     }
 
     // What the use log knows, read once for the whole store (#1127). A read
-    // that fails costs the order and not the pass: every slice is still
-    // examined, in the order every pass used before the log was read at all, so
-    // a night skipped because the log was unreadable would be the worse answer.
+    // that fails costs two of the three terms and not the pass: salience is read
+    // from the entries themselves, so the slices are still ordered, on that term
+    // alone. Every slice is still examined either way, and a night skipped
+    // because the log was unreadable would be the worse answer.
     //
     // Read only where it can change something. One slice is one call that shows
     // the model everything, so there is no order to decide and no reason to
@@ -254,8 +255,9 @@ async fn consolidate_user(
             Ok(records) => records,
             Err(e) => {
                 tracing::warn!(
-                    "dreaming: the use log could not be read, so this pass keeps the order it \
-                     was sliced in: {e}"
+                    "dreaming: the use log could not be read, so this pass is ordered on \
+                     salience alone - what was retrieved and what was contradicted are both \
+                     unknown to it: {e}"
                 );
                 Vec::new()
             }
@@ -1484,8 +1486,17 @@ mod tests {
     }
 
     /// The same record, plus a standing negative mark set `age` seconds ago.
+    ///
+    /// As the writer stores it: the same statement that moves `marked_count`
+    /// prepends the stamp to the recent window, because a mark is a use
+    /// whichever way it points. A fixture that moved only the counter would
+    /// describe a record no store holds.
     fn contradicted(mut record: KnowledgeUseRecord, age: i64) -> KnowledgeUseRecord {
         record.marked_count += 1;
+        record
+            .recent_uses
+            .push(replay_now() - chrono::TimeDelta::seconds(age));
+        record.recent_uses.sort_unstable_by(|a, b| b.cmp(a));
         record.marks.push(
             desktop_assistant_core::domain::knowledge_use::KnowledgeMark {
                 source: desktop_assistant_core::domain::MarkSource::Model,
