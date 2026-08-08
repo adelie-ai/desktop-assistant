@@ -1280,6 +1280,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             frame.watermark,
             &note_keys,
             trace,
+            planning::EvictReason::StepCompleted,
         );
         tracing::info!(
             step = %frame.key,
@@ -2550,6 +2551,10 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
         // default, never as the most permissive level.
         let mut turn_provenance = TurnProvenance::new_with_policy(current_tool_policy());
 
+        // Where each round's messages begin, so the supersession sweep (#1205)
+        // can protect the most recent round. Pushed at the top of every round.
+        let mut round_starts: Vec<usize> = Vec::new();
+
         // No turn-start filler. A quick/direct answer narrates nothing and just
         // streams its reply. Progress is narrated when the model declares a
         // logical step (`begin_step`, in the dispatch loop below) — a step spans
@@ -2744,6 +2749,43 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
             if let Some(line) = narration_floor.take_due_line() {
                 on_status(line);
             }
+
+            // Sweep tool results no step ever claimed (#1205). `complete_step`
+            // already distils a step's own results into a note, but it only
+            // fires for a model that opened a step and closed it - and step
+            // discipline is the first thing a weak model loses, so the context
+            // grew largest exactly where the budget is smallest. This takes the
+            // model out of the trigger.
+            //
+            // Two boundaries protect what the turn may still be working in: the
+            // outermost open step, whose scope belongs to its own
+            // `complete_step`, and the start of the previous round, so a result
+            // the model has seen only once is still whole. `round_starts` is
+            // pushed below, after the sweep, so index `len - 1` is the previous
+            // round.
+            if let Some(&previous_round_start) = round_starts
+                .len()
+                .checked_sub(2)
+                .and_then(|i| round_starts.get(i))
+            {
+                let protected = step_stack
+                    .open_watermark()
+                    .map_or(previous_round_start, |w| w.min(previous_round_start));
+                let (swept, freed) = planning::evict_superseded_tool_results(
+                    &mut conv.messages,
+                    &mut projection,
+                    protected,
+                );
+                if swept > 0 {
+                    tracing::info!(
+                        round = round + 1,
+                        swept_results = swept,
+                        freed_bytes = freed,
+                        "swept tool results no step claimed"
+                    );
+                }
+            }
+            round_starts.push(conv.messages.len());
 
             // Build the tool set: core + dynamically activated.
             // When hosted search has been demoted, use the full core set
