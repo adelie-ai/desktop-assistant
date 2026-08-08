@@ -140,10 +140,10 @@ const ALLOWED_CROSS_USER_QUERIES: &[AllowedCrossUserQuery] = &[
     AllowedCrossUserQuery {
         file: "src/dreaming/consolidation.rs",
         line_hint: 0,
-        rationale: "load_entries_needing_review_by_user: dreaming \
-                    consolidation entry point. Returns rows grouped \
-                    by user_id; the worker installs a per-user \
-                    scope before processing each group.",
+        rationale: "load_user_ids_with_active_entries: dreaming \
+                    consolidation entry point. Returns user ids only - \
+                    no content - so the worker can install a per-user \
+                    scope; load_active_entries then binds user_id.",
     },
     AllowedCrossUserQuery {
         file: "src/dreaming/summarize.rs",
