@@ -45,7 +45,9 @@ use desktop_assistant_core::ports::llm::{
 };
 use desktop_assistant_core::ports::store::ConversationStore;
 use desktop_assistant_core::ports::tools::ToolExecutor;
-use desktop_assistant_core::ports::turn_telemetry::{TurnRoute, with_request_id, with_turn_route};
+use desktop_assistant_core::ports::turn_telemetry::{
+    TurnRoute, TurnTrace, resolve_turn_trace, with_request_id, with_turn_route, with_turn_trace,
+};
 use desktop_assistant_core::service::ConversationHandler;
 use tokio_util::sync::CancellationToken;
 use tracing::Level;
@@ -85,6 +87,10 @@ const USER_ID: &str = "user-SENTINEL-UNBOUNDED-USER-ID";
 
 /// The correlation id the transport would have minted.
 const REQUEST_ID: &str = "11111111-2222-4333-8444-555555555555";
+
+/// What a provider calls the call it just served. An id, not content, and the
+/// only thing an LLM boundary gives back that is worth quoting to a provider.
+const PROVIDER_REQUEST_ID: &str = "req_ExAmPlE0123456789";
 
 const CONNECTION_ID: &str = "conn-primary";
 const PROVIDER: &str = "example-connector";
@@ -616,12 +622,25 @@ impl From<LlmResponse> for Reply {
 /// An LLM that replays a script, so the turn's shape is fixed by the test.
 struct ScriptedLlm {
     responses: Mutex<Vec<Reply>>,
+    /// What this connector says the provider called the call. A `&'static str`
+    /// so a test can hand it a hostile value without the harness bounding it
+    /// on the way in - the bounding under test happens at the recording site.
+    provider_request_id: &'static str,
 }
 
 impl ScriptedLlm {
     fn new(responses: Vec<Reply>) -> Self {
         Self {
             responses: Mutex::new(responses),
+            provider_request_id: PROVIDER_REQUEST_ID,
+        }
+    }
+
+    /// A connector whose provider answers with `id` as its request identifier.
+    fn reporting(responses: Vec<Reply>, id: &'static str) -> Self {
+        Self {
+            responses: Mutex::new(responses),
+            provider_request_id: id,
         }
     }
 }
@@ -635,6 +654,12 @@ impl LlmClient for ScriptedLlm {
         _reasoning: ReasoningConfig,
         mut on_chunk: ChunkCallback,
     ) -> Result<LlmResponse, CoreError> {
+        // What a real connector does the moment the provider answers, before
+        // anything about the body is known: report the provider's own
+        // identifier onto the open `llm.call` span. No provider continues our
+        // trace, so capturing that id is the only thing this boundary allows,
+        // and it matters most on the calls that fail.
+        desktop_assistant_core::ports::llm::record_provider_request_id(self.provider_request_id);
         let reply = {
             let mut responses = self.responses.lock().unwrap();
             if responses.is_empty() {
@@ -870,6 +895,41 @@ async fn one_turn(handler: &ConversationHandler<MemStore, ScriptedLlm, ScriptedT
                     )
                     .await;
             }),
+        ),
+    )
+    .await;
+}
+
+/// Run one turn with the trace the transport would have resolved installed,
+/// the way the dispatcher installs it before the turn body is spawned.
+async fn one_turn_traced(
+    handler: &ConversationHandler<MemStore, ScriptedLlm, ScriptedTools>,
+    trace: TurnTrace,
+) {
+    let conv = handler
+        .create_conversation("c".into(), vec![])
+        .await
+        .expect("create the conversation");
+    with_turn_trace(
+        Some(trace),
+        with_user_id(
+            UserId::new(USER_ID),
+            with_request_id(
+                REQUEST_ID.to_string(),
+                with_turn_route(route(), async {
+                    let _ = handler
+                        .send_prompt_with_override(
+                            &conv.id,
+                            PROMPT_SENTINEL.to_string(),
+                            None,
+                            String::new(),
+                            Box::new(|_| true),
+                            Box::new(|_| {}),
+                            CancellationToken::new(),
+                        )
+                        .await;
+                }),
+            ),
         ),
     )
     .await;
@@ -1775,4 +1835,250 @@ fn profiling_llm_client_is_gone() {
         .join("ports")
         .join("llm_profiling.rs");
     assert!(!module.exists(), "{} still exists", module.display());
+}
+
+// ---------------------------------------------------------------------------
+// Carrying the trace across a boundary (epic D12 and D13).
+// ---------------------------------------------------------------------------
+
+/// The trace id the correlation id spells, with the hyphens a uuid carries and
+/// a trace id does not.
+fn trace_id_of(request_id: &str) -> String {
+    request_id.replace('-', "")
+}
+
+#[test]
+fn request_id_and_trace_id_are_the_same_value() {
+    // The whole point of D12: one identifier in the client's event stream, in
+    // the pod log and in the backend, pasteable from any one into any other.
+    // A uuid is 16 bytes and a W3C trace id is 16 bytes, so no mapping table
+    // and no second identifier exist to disagree.
+    //
+    // This holds with the `otel` feature off, which is the build every desktop
+    // install runs. What the feature adds is export, not correlation.
+    let _serialised = serialised();
+    let captured = run(Level::INFO, two_round_script(), ScriptedTools::ok());
+    let turn = captured.span("turn");
+
+    assert_eq!(
+        turn.field("request_id"),
+        Some(REQUEST_ID),
+        "the turn span must carry the id the client already correlates by"
+    );
+    assert_eq!(
+        turn.field("trace_id"),
+        Some(trace_id_of(REQUEST_ID).as_str()),
+        "the trace id must be the request id and nothing else; got {:?}",
+        turn.fields
+    );
+}
+
+#[test]
+fn incoming_traceparent_is_continued_not_replaced() {
+    // A caller that already has a trace is joined, not restarted. Without
+    // this the web BFF's hop becomes a second trace that only a timestamp
+    // relates to the first.
+    let _serialised = serialised();
+    let incoming = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+    let captured = capture(Level::INFO, async move {
+        let handler = handler(two_round_script(), ScriptedTools::ok());
+        one_turn_traced(
+            &handler,
+            resolve_turn_trace(Some(incoming), REQUEST_ID, CONVERSATION_ID),
+        )
+        .await;
+    });
+
+    let turn = captured.span("turn");
+    assert_eq!(
+        turn.field("trace_id"),
+        Some("4bf92f3577b34da6a3ce929d0e0e4736"),
+        "the turn must join the caller's trace"
+    );
+    assert_eq!(
+        turn.field("request_id"),
+        Some(REQUEST_ID),
+        "continuing a trace must not disturb the correlation id, which is a \
+         separate identifier the client reads its own stream by"
+    );
+}
+
+#[test]
+fn conversation_id_is_an_attribute_not_a_trace() {
+    // D13. A conversation lives for days and holds an unbounded number of
+    // turns, which no backend renders usefully. So two turns in one
+    // conversation are two traces that share an attribute, and one query still
+    // returns every turn in the conversation.
+    let _serialised = serialised();
+    let first = "11111111-2222-4333-8444-555555555555";
+    let second = "99999999-8888-4777-8666-555555555555";
+
+    let mut trace_ids = Vec::new();
+    for request_id in [first, second] {
+        let captured = capture(Level::INFO, async move {
+            let handler = handler(two_round_script(), ScriptedTools::ok());
+            one_turn_traced(
+                &handler,
+                resolve_turn_trace(None, request_id, CONVERSATION_ID),
+            )
+            .await;
+        });
+        let turn = captured.span("turn");
+        assert_eq!(
+            turn.field("conversation_id"),
+            Some(CONVERSATION_ID),
+            "both turns must carry the conversation as an attribute"
+        );
+        trace_ids.push(
+            turn.field("trace_id")
+                .expect("every turn span carries a trace id")
+                .to_string(),
+        );
+    }
+
+    assert_eq!(trace_ids[0], trace_id_of(first));
+    assert_eq!(trace_ids[1], trace_id_of(second));
+    assert_ne!(
+        trace_ids[0], trace_ids[1],
+        "two turns in one conversation must be two traces, or the trace grows \
+         without bound and no backend can draw it"
+    );
+}
+
+#[test]
+fn every_span_in_a_turn_carries_the_conversation_id() {
+    // The attribute is only useful if the query that reads it returns the
+    // whole turn. A round or a provider call without it drops out of that
+    // answer.
+    let _serialised = serialised();
+    let captured = capture(Level::INFO, async move {
+        let handler = handler(two_round_script(), ScriptedTools::ok());
+        one_turn_traced(
+            &handler,
+            resolve_turn_trace(None, REQUEST_ID, CONVERSATION_ID),
+        )
+        .await;
+    });
+
+    for name in ["turn", "turn.round", "llm.call", "tool.call"] {
+        let spans = captured.spans_named(name);
+        assert!(!spans.is_empty(), "no `{name}` span opened");
+        for span in spans {
+            assert_eq!(
+                span.field("conversation_id"),
+                Some(CONVERSATION_ID),
+                "a `{name}` span must carry the conversation id; got {:?}",
+                span.fields
+            );
+        }
+    }
+}
+
+#[test]
+fn llm_span_records_the_provider_request_id() {
+    // No provider continues our trace, so the useful move at that boundary is
+    // capture: record the identifier a support ticket quotes. It lands on the
+    // provider-call span because that is the span open while the call runs.
+    let _serialised = serialised();
+    let captured = run(Level::INFO, two_round_script(), ScriptedTools::ok());
+
+    for span in captured.spans_named("llm.call") {
+        assert_eq!(
+            span.field("provider_request_id"),
+            Some(PROVIDER_REQUEST_ID),
+            "a provider call must record what the provider called it; got {:?}",
+            span.fields
+        );
+    }
+}
+
+#[test]
+fn propagation_records_no_content() {
+    // D10 on the fields this change adds. A span records its fields at
+    // creation and nothing prints them, so a captured value is invisible on
+    // the console and still exports when the span closes. These are read back
+    // in process for that reason.
+    let _serialised = serialised();
+    let captured = capture(Level::INFO, async move {
+        let handler = handler(two_round_script(), ScriptedTools::failing());
+        one_turn_traced(
+            &handler,
+            resolve_turn_trace(None, REQUEST_ID, CONVERSATION_ID),
+        )
+        .await;
+    });
+
+    let added = ["trace_id", "conversation_id", "provider_request_id"];
+    let content = [
+        ("prompt", PROMPT_SENTINEL),
+        ("tool argument", TOOL_ARGUMENT_SENTINEL),
+        ("model reply", REPLY_SENTINEL),
+        ("tool result", TOOL_RESULT_SENTINEL),
+        ("tool error", TOOL_ERROR_SENTINEL),
+    ];
+
+    for span in &captured.spans {
+        for field in added {
+            let Some(value) = span.field(field) else {
+                continue;
+            };
+            for (what, sentinel) in content {
+                assert!(
+                    !value.contains(sentinel),
+                    "the {what} reached `{}.{field}`, which exports verbatim \
+                     when the span closes",
+                    span.name
+                );
+            }
+        }
+    }
+}
+
+/// A provider request id shaped like a whole log line. A response header is
+/// bounded by nothing at this end: an upstream proxy, or a provider having a
+/// bad day, can answer with anything at all.
+const FORGED_PROVIDER_REQUEST_ID: &str =
+    "req_1\n2026-01-01T00:00:00.0Z ERROR forged: the database is on fire\u{1b}[31m";
+
+#[test]
+fn a_provider_request_id_cannot_forge_a_log_line() {
+    // The value comes from a host nobody here controls and lands on a span
+    // field, which exports verbatim when the span closes. A newline produces
+    // what reads as a second genuine line, complete with its own timestamp and
+    // level, and an ANSI escape survives with colour off.
+    let _serialised = serialised();
+    let captured = capture(Level::INFO, async move {
+        let handler = ConversationHandler::with_tools(
+            MemStore::default(),
+            ScriptedLlm::reporting(two_round_script(), FORGED_PROVIDER_REQUEST_ID),
+            ScriptedTools::ok(),
+            Box::new(|| CONVERSATION_ID.to_string()),
+        );
+        one_turn(&handler).await;
+    });
+
+    for span in captured.spans_named("llm.call") {
+        let Some(recorded) = span.field("provider_request_id") else {
+            continue;
+        };
+        assert!(
+            !recorded.contains('\n') && !recorded.contains('\u{1b}'),
+            "a provider's own header must be neutralised before it reaches a \
+             span field; got {recorded:?}"
+        );
+    }
+
+    assert!(
+        !captured.console.contains("forged: the database is on fire\u{1b}"),
+        "the escape survived onto the console\n--- console ---\n{}",
+        captured.console
+    );
+    for line in captured.console.lines() {
+        assert!(
+            !line.trim_start().starts_with("2026-01-01T00:00:00.0Z ERROR forged"),
+            "a provider header forged a line that reads as the daemon's own\n\
+             --- console ---\n{}",
+            captured.console
+        );
+    }
 }
