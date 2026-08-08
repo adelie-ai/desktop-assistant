@@ -6,7 +6,7 @@ use desktop_assistant_core::domain::ToolCall;
 use desktop_assistant_core::domain::{Message, Role, ToolDefinition, ToolNamespace};
 use desktop_assistant_core::ports::llm::{
     ChunkCallback, HostedToolSearch, LlmClient, LlmResponse, ModelCapabilities, ModelInfo,
-    ModelKind, ReasoningConfig, TokenUsage, current_model_override,
+    ModelKind, ReasoningConfig, TokenUsage, current_model_override, record_provider_request_id,
 };
 use desktop_assistant_llm_http::{
     STREAM_CONNECT_TIMEOUT, STREAM_EVENT_TIMEOUT, StreamStep, build_response, next_step,
@@ -594,6 +594,18 @@ impl OpenAiClient {
             return Err(CoreError::Llm(format!(
                 "OpenAI API error (HTTP {status}): {body}"
             )));
+        }
+
+        // Capture OpenAI's own request id onto the open `llm.call` span
+        // (#1152), before `bytes_stream()` consumes `response`. This is the
+        // value to quote when opening a support ticket with OpenAI, and the
+        // closest thing to end-to-end tracing this boundary allows.
+        if let Some(request_id) = response
+            .headers()
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok())
+        {
+            record_provider_request_id(request_id);
         }
 
         let mut events = response.bytes_stream().eventsource();
@@ -2060,6 +2072,213 @@ mod tests {
         assert!(
             !OpenAiClient::new("k".into()).hosted_tool_search().is_some(),
             "the constructor default is off, and the two connectors differ"
+        );
+    }
+
+    // --- Provider request id capture (#1152) ------------------------------
+    //
+    // A minimal `tracing` layer that reads a named span's fields back in
+    // process, modelled on `SpanCapture` in
+    // `crates/core/tests/turn_telemetry.rs` but pared down to what these
+    // tests need: one span, read once the call under test has finished.
+
+    #[derive(Clone, Default)]
+    struct RequestIdSpanCapture(
+        std::sync::Arc<
+            std::sync::Mutex<
+                std::collections::HashMap<String, std::collections::HashMap<String, String>>,
+            >,
+        >,
+    );
+
+    struct RequestIdFieldVisitor<'a>(&'a mut std::collections::HashMap<String, String>);
+
+    impl tracing::field::Visit for RequestIdFieldVisitor<'_> {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+    }
+
+    impl<S> tracing_subscriber::layer::Layer<S> for RequestIdSpanCapture
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            _id: &tracing::span::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = std::collections::HashMap::new();
+            attrs.record(&mut RequestIdFieldVisitor(&mut fields));
+            self.0
+                .lock()
+                .expect("capture lock")
+                .insert(attrs.metadata().name().to_string(), fields);
+        }
+
+        fn on_record(
+            &self,
+            id: &tracing::span::Id,
+            values: &tracing::span::Record<'_>,
+            ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let Some(span) = ctx.span(id) else {
+                return;
+            };
+            let mut all = self.0.lock().expect("capture lock");
+            let fields = all.entry(span.name().to_string()).or_default();
+            values.record(&mut RequestIdFieldVisitor(fields));
+        }
+    }
+
+    impl RequestIdSpanCapture {
+        /// The fields recorded on the span named `name`, or empty if that
+        /// span was never opened.
+        fn fields_of(&self, name: &str) -> std::collections::HashMap<String, String> {
+            self.0
+                .lock()
+                .expect("capture lock")
+                .get(name)
+                .cloned()
+                .unwrap_or_default()
+        }
+    }
+
+    /// Build a capturing subscriber and an `llm.call` span shaped exactly
+    /// like core's `llm_span`/`aux_llm_span`: `provider_request_id` declared
+    /// as `tracing::field::Empty`. A connector's `record_provider_request_id`
+    /// call needs that declaration to have a field to land on - `tracing`
+    /// silently drops a `record` for a field the span never declared, which
+    /// is the trap this mirrors core's shape to avoid.
+    ///
+    /// The `DefaultGuard` must stay alive for the whole call under test; drop
+    /// it only after the fields have been read back.
+    fn request_id_capture() -> (
+        RequestIdSpanCapture,
+        tracing::subscriber::DefaultGuard,
+        tracing::Span,
+    ) {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let capture = RequestIdSpanCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let guard = tracing::subscriber::set_default(subscriber);
+        let span = tracing::info_span!("llm.call", provider_request_id = tracing::field::Empty);
+        (capture, guard, span)
+    }
+
+    #[tokio::test]
+    async fn openai_call_records_the_provider_request_id() {
+        use tracing::Instrument;
+
+        let server = httpmock::MockServer::start();
+        server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/responses");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .header("x-request-id", "req_test_openai_456")
+                .body(STUB_SSE_BODY);
+        });
+
+        let client = OpenAiClient::new("key".into()).with_base_url(server.url(""));
+        let (capture, _guard, span) = request_id_capture();
+
+        let _ = client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .instrument(span)
+            .await;
+
+        let fields = capture.fields_of("llm.call");
+        assert_eq!(
+            fields.get("provider_request_id").map(String::as_str),
+            Some("req_test_openai_456"),
+            "the connector must record OpenAI's x-request-id header onto the span"
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_call_without_a_request_id_header_records_nothing() {
+        use tracing::Instrument;
+
+        let server = httpmock::MockServer::start();
+        server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/responses");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(STUB_SSE_BODY);
+        });
+
+        let client = OpenAiClient::new("key".into()).with_base_url(server.url(""));
+        let (capture, _guard, span) = request_id_capture();
+
+        let _ = client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .instrument(span)
+            .await;
+
+        let fields = capture.fields_of("llm.call");
+        assert!(
+            !fields.contains_key("provider_request_id"),
+            "an absent header must leave the field empty, not record an empty string: {fields:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_call_neutralises_a_control_character_in_the_request_id() {
+        use tracing::Instrument;
+
+        let server = httpmock::MockServer::start();
+        server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/responses");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                // A literal newline cannot ride in an HTTP header value at
+                // all - `http::HeaderValue` rejects the byte outright, so
+                // that injection is stopped by the transport itself, not by
+                // this connector. A tab is the one C0 control character the
+                // transport does carry (`HeaderValue` allows byte 9), so it
+                // is what proves the connector routes the header through
+                // `Safe::name` rather than passing it through raw.
+                .header("x-request-id", "req\ttest")
+                .body(STUB_SSE_BODY);
+        });
+
+        let client = OpenAiClient::new("key".into()).with_base_url(server.url(""));
+        let (capture, _guard, span) = request_id_capture();
+
+        let _ = client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .instrument(span)
+            .await;
+
+        let fields = capture.fields_of("llm.call");
+        let recorded = fields
+            .get("provider_request_id")
+            .expect("a present header, even a deceptive one, must still record a value");
+        assert_eq!(
+            recorded, "req\u{fffd}test",
+            "Safe::name must replace the control character with U+FFFD, not pass it through"
         );
     }
 }

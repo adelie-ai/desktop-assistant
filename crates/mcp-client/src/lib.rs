@@ -1,4 +1,20 @@
 //! Model Context Protocol (MCP) client for discovering and invoking external tool servers.
+//!
+//! # Trace context
+//!
+//! An operator who can see that a turn spent forty seconds in a tool call, and
+//! cannot see what the server did during it, is looking at a trace that stopped
+//! at this boundary. Every request this client sends from inside a turn carries
+//! the turn's W3C trace context, so the server's own spans join that trace.
+//!
+//! Each transport carries it the way it can. Streamable HTTP sends a real
+//! `traceparent` request header, which is what a server nobody here owns
+//! understands. stdio is JSON-RPC over a pipe with no headers, so the context
+//! rides the MCP spec's reserved `_meta` property on `params`, where `mcp-core`
+//! reads it. `tracestate` is not sent on either: nothing in this fleet sets one.
+//!
+//! Outside a turn there is no trace, and then nothing is injected. A server that
+//! joins an invented trace is worse than one that starts its own.
 
 mod builtin;
 pub mod config;
@@ -15,6 +31,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use desktop_assistant_core::domain::ToolDefinition;
+use desktop_assistant_core::ports::turn_telemetry::outbound_traceparent;
 #[cfg(feature = "http")]
 use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -755,6 +772,12 @@ impl McpClient {
         params: Option<serde_json::Value>,
     ) -> Result<serde_json::Value, McpError> {
         let id = self.next_id();
+        // The trace this call belongs to, resolved once here so both transports
+        // carry the same value by the vehicle each has: a real header over
+        // HTTP, the spec's `_meta` over a pipe. `None` outside a turn, and then
+        // nothing is injected - a server that joins an invented trace is worse
+        // than one that starts its own.
+        let traceparent = outbound_traceparent();
         let request = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
             id,
@@ -764,7 +787,12 @@ impl McpClient {
 
         let result = self
             .transport
-            .round_trip(&request, self.request_timeout, &self.flags)
+            .round_trip(
+                &request,
+                self.request_timeout,
+                &self.flags,
+                traceparent.as_deref(),
+            )
             .await?;
 
         if result_has_list_changed(&result) {
@@ -792,11 +820,26 @@ impl Transport {
         request: &JsonRpcRequest,
         timeout: Duration,
         flags: &ListChangeFlags,
+        traceparent: Option<&str>,
     ) -> Result<serde_json::Value, McpError> {
         match self {
-            Transport::Stdio(t) => t.round_trip(request, timeout, flags).await,
+            // A pipe has no headers, so the trace context rides the MCP spec's
+            // reserved `_meta` property on `params`. `mcp-core` reads it there
+            // and makes it the parent of the request it serves.
+            Transport::Stdio(t) => {
+                let request = match traceparent {
+                    Some(traceparent) => &JsonRpcRequest {
+                        params: jsonrpc::with_traceparent(request.params.clone(), traceparent),
+                        ..request.clone()
+                    },
+                    None => request,
+                };
+                t.round_trip(request, timeout, flags).await
+            }
+            // Streamable HTTP has real headers, so it uses them. That is what
+            // an MCP server we do not own understands.
             #[cfg(feature = "http")]
-            Transport::Http(t) => t.round_trip(request, timeout, flags).await,
+            Transport::Http(t) => t.round_trip(request, timeout, flags, traceparent).await,
         }
     }
 
@@ -1560,6 +1603,7 @@ impl HttpTransport {
         method: &str,
         token: Option<&str>,
         timeout: Duration,
+        traceparent: Option<&str>,
     ) -> Result<(reqwest::StatusCode, String, String), McpError> {
         let mut builder = self
             .client
@@ -1568,6 +1612,12 @@ impl HttpTransport {
             .json(payload);
         if let Some(token) = token {
             builder = builder.bearer_auth(token);
+        }
+        // The W3C header a remote MCP server understands. `tracestate` is not
+        // sent: nothing in this fleet sets one, and an empty one carries no
+        // information a receiver can use.
+        if let Some(traceparent) = traceparent {
+            builder = builder.header("traceparent", traceparent);
         }
         if let Some(session) = &self.session_id {
             builder = builder.header("Mcp-Session-Id", session);
@@ -1615,13 +1665,14 @@ impl HttpTransport {
         request: &JsonRpcRequest,
         timeout: Duration,
         flags: &ListChangeFlags,
+        traceparent: Option<&str>,
     ) -> Result<serde_json::Value, McpError> {
         let payload = serde_json::to_value(request)?;
         let method = request.method.as_str();
 
         let token = self.credential.token().await?;
         let (status, content_type, body) = self
-            .send_once(&payload, method, token.as_deref(), timeout)
+            .send_once(&payload, method, token.as_deref(), timeout, traceparent)
             .await?;
 
         // If the resource server rejects the (possibly stale) access token,
@@ -1634,7 +1685,7 @@ impl HttpTransport {
                     self.url
                 );
                 let token = self.credential.refreshed_token().await?;
-                self.send_once(&payload, method, token.as_deref(), timeout)
+                self.send_once(&payload, method, token.as_deref(), timeout, traceparent)
                     .await?
             } else {
                 (status, content_type, body)

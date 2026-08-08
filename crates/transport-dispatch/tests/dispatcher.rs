@@ -105,6 +105,8 @@ async fn dispatcher_streams_send_message_ack_then_events() {
             system_refinement: String::new(),
             client_context: None,
             idempotency_key: None,
+            turn_id: None,
+            traceparent: None,
         },
     };
     let inbound = stream::iter(vec![Ok::<_, anyhow::Error>(req)]);
@@ -447,6 +449,8 @@ async fn observe_turn_context(
             system_refinement: String::new(),
             client_context: per_turn,
             idempotency_key: None,
+            turn_id: None,
+            traceparent: None,
         },
     };
     let inbound = stream::iter(vec![Ok::<_, anyhow::Error>(req)]);

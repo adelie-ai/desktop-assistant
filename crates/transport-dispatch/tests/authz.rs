@@ -347,6 +347,8 @@ command_table! {
                 system_refinement: String::new(),
                 client_context: None,
                 idempotency_key: None,
+                turn_id: None,
+                traceparent: None,
             },
             Tenant),
     SetConversationPersonality => (api::Command::SetConversationPersonality {

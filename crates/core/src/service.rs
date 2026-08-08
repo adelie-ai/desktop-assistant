@@ -43,7 +43,8 @@ use crate::ports::turn_capability::{
 };
 use crate::ports::turn_interactivity::{TurnInteractivity, current_turn_interactivity};
 use crate::ports::turn_telemetry::{
-    UNSET as TURN_TELEMETRY_UNSET, current_request_id, current_turn_route,
+    TurnTrace, UNSET as TURN_TELEMETRY_UNSET, current_request_id, current_turn_route,
+    current_turn_trace, with_turn_trace,
 };
 use crate::sanitize::sanitize_assistant_text;
 use crate::skill_promotion::{self, PromotionMode};
@@ -1975,10 +1976,17 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         // correlation ids through span scope rather than by hand.
         let request_id = current_request_id();
         let user_id = current_user_id();
+        // The trace the transport resolved, if the turn came through one. An
+        // agent run, a scheduled job and a test reach the loop by another door
+        // and carry no trace, so they mint one here from the correlation id.
+        // Either way no turn runs without a trace.
+        let trace = current_turn_trace()
+            .unwrap_or_else(|| TurnTrace::minted(request_id.as_deref(), &conversation_id.0));
         let span = crate::telemetry::turn_span(
             &conversation_id.0,
             request_id.as_deref().unwrap_or(TURN_TELEMETRY_UNSET),
             user_id.as_str(),
+            &trace,
         );
         // Reports on drop, so a turn that ends by panicking still writes its
         // completion line and its measurement. The body fills it in as it runs,
@@ -1989,10 +1997,17 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         // future. A caller composes several task-local scopes around this
         // call, and each one embeds what it wraps by value, which is the
         // accounting that overflowed a worker thread's stack in #205/#206.
-        let result =
+        //
+        // The trace is installed around the body rather than only read from it,
+        // so every span the body opens - each round, each provider call, each
+        // tool dispatch - carries the conversation id, and so an outbound call
+        // to an MCP server can name the trace to join.
+        let result = with_turn_trace(
+            Some(trace),
             Box::pin(self.run_turn(conversation_id, prompt, on_chunk, on_status, &mut report))
-                .instrument(span)
-                .await;
+                .instrument(span),
+        )
+        .await;
 
         // An error the body never classified is read from the result rather
         // than guessed at: cancellation is the user's own signal, anything

@@ -281,6 +281,40 @@ pub enum Command {
         /// without double-processing an action. Absent = no idempotency.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         idempotency_key: Option<String>,
+        /// Optional client-minted correlation id for this turn, as a uuid.
+        ///
+        /// A turn starts when a person commits an input, which happens in the
+        /// client. The client is therefore the top of the turn, and the id it
+        /// mints is what the daemon adopts as the `request_id` it stamps every
+        /// streamed event with and returns on [`CommandResult::SendMessageAck`].
+        /// One value then appears in the client's own log, in the daemon's log
+        /// and in a trace backend, and can be pasted from any one into any
+        /// other.
+        ///
+        /// Absent, malformed, or the nil uuid: the daemon mints its own and the
+        /// turn runs unchanged. A client that sends nothing is a supported
+        /// configuration, not a degraded one.
+        ///
+        /// This is a correlation id and nothing else. It grants no capability,
+        /// names no user, and reaches no authorization or tenancy decision. It
+        /// is **not** `idempotency_key`, which is a separate field above and is
+        /// what the exactly-once retry path reads.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
+        /// Optional W3C `traceparent` for a caller that is already inside a
+        /// trace, so the daemon continues that trace instead of starting one.
+        ///
+        /// The web BFF is the case this exists for: a browser starts the turn,
+        /// the BFF forwards it, and the daemon serves it, which is one trace
+        /// across three processes rather than three that share a timestamp.
+        ///
+        /// A present and valid value outranks `turn_id` for the *trace* id;
+        /// `turn_id` still supplies the correlation id. Malformed, oversized or
+        /// carrying the all-zero trace id: discarded, and the turn runs
+        /// unchanged. `tracestate` is deliberately not carried; nothing in this
+        /// fleet sets one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        traceparent: Option<String>,
     },
 
     /// Set (or clear) a conversation's personality override (issue #227,
@@ -3326,6 +3360,8 @@ mod tests {
             system_refinement: String::new(),
             client_context: None,
             idempotency_key: None,
+            turn_id: None,
+            traceparent: None,
         };
         let json = serde_json::to_string(&cmd2).unwrap();
         assert!(json.contains("\"override\":"));
@@ -3355,6 +3391,8 @@ mod tests {
             system_refinement: String::new(),
             client_context: None,
             idempotency_key: None,
+            turn_id: None,
+            traceparent: None,
         };
         let json_empty = serde_json::to_string(&empty).unwrap();
         assert!(
@@ -3370,6 +3408,8 @@ mod tests {
             system_refinement: "Respond briefly, by voice.".into(),
             client_context: None,
             idempotency_key: None,
+            turn_id: None,
+            traceparent: None,
         };
         let json = serde_json::to_string(&with_refinement).unwrap();
         assert!(json.contains("\"system_refinement\":\"Respond briefly, by voice.\""));
@@ -3399,6 +3439,8 @@ mod tests {
             system_refinement: String::new(),
             client_context: None,
             idempotency_key: None,
+            turn_id: None,
+            traceparent: None,
         };
         let json = serde_json::to_string(&without).unwrap();
         assert!(
@@ -3414,6 +3456,8 @@ mod tests {
             system_refinement: String::new(),
             client_context: None,
             idempotency_key: Some("turn-uuid-1".into()),
+            turn_id: None,
+            traceparent: None,
         };
         let json = serde_json::to_string(&with_key).unwrap();
         assert!(json.contains("\"idempotency_key\":\"turn-uuid-1\""));
@@ -3441,6 +3485,8 @@ mod tests {
             system_refinement: String::new(),
             client_context: None,
             idempotency_key: None,
+            turn_id: None,
+            traceparent: None,
         };
         let json = serde_json::to_string(&without).unwrap();
         assert!(
@@ -3460,6 +3506,8 @@ mod tests {
                 ..ClientContext::default()
             }),
             idempotency_key: None,
+            turn_id: None,
+            traceparent: None,
         };
         let json = serde_json::to_string(&with_ctx).unwrap();
         assert!(
@@ -3469,6 +3517,113 @@ mod tests {
         assert!(json.contains("\"real_name\":\"Ada Lovelace\""));
         let back: Command = serde_json::from_str(&json).unwrap();
         assert_eq!(with_ctx, back);
+    }
+
+    #[test]
+    fn send_message_turn_id_is_optional_and_round_trips() {
+        // Absent on the wire -> None. An older client that mints nothing keeps
+        // working against a newer daemon.
+        let cmd: Command =
+            serde_json::from_str(r#"{"send_message":{"conversation_id":"c1","content":"hi"}}"#)
+                .unwrap();
+        match &cmd {
+            Command::SendMessage { turn_id, .. } => assert!(turn_id.is_none()),
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let without = Command::SendMessage {
+            conversation_id: "c1".into(),
+            content: "hi".into(),
+            override_selection: None,
+            system_refinement: String::new(),
+            client_context: None,
+            idempotency_key: None,
+            turn_id: None,
+            traceparent: None,
+        };
+        let json = serde_json::to_string(&without).unwrap();
+        assert!(
+            !json.contains("turn_id"),
+            "an absent turn id must not appear on the wire: {json}"
+        );
+
+        let with_id = Command::SendMessage {
+            conversation_id: "c1".into(),
+            content: "hi".into(),
+            override_selection: None,
+            system_refinement: String::new(),
+            client_context: None,
+            idempotency_key: None,
+            turn_id: Some("11111111-2222-4333-8444-555555555555".into()),
+            traceparent: None,
+        };
+        let json = serde_json::to_string(&with_id).unwrap();
+        assert!(json.contains("\"turn_id\":\"11111111-2222-4333-8444-555555555555\""));
+        let back: Command = serde_json::from_str(&json).unwrap();
+        assert_eq!(with_id, back);
+    }
+
+    #[test]
+    fn send_message_traceparent_is_optional_and_round_trips() {
+        let cmd: Command =
+            serde_json::from_str(r#"{"send_message":{"conversation_id":"c1","content":"hi"}}"#)
+                .unwrap();
+        match &cmd {
+            Command::SendMessage { traceparent, .. } => assert!(traceparent.is_none()),
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let with_parent = Command::SendMessage {
+            conversation_id: "c1".into(),
+            content: "hi".into(),
+            override_selection: None,
+            system_refinement: String::new(),
+            client_context: None,
+            idempotency_key: None,
+            turn_id: None,
+            traceparent: Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".into()),
+        };
+        let json = serde_json::to_string(&with_parent).unwrap();
+        assert!(json.contains("\"traceparent\":\"00-4bf92f3577b34da6a3ce929d0e0e4736"));
+        let back: Command = serde_json::from_str(&json).unwrap();
+        assert_eq!(with_parent, back);
+    }
+
+    #[test]
+    fn turn_id_and_idempotency_key_stay_separate() {
+        // Two fields, two purposes. The retry path reads one and the trace
+        // reads the other, so a command carrying both must keep them apart on
+        // the wire and after a round trip.
+        let cmd = Command::SendMessage {
+            conversation_id: "c1".into(),
+            content: "hi".into(),
+            override_selection: None,
+            system_refinement: String::new(),
+            client_context: None,
+            idempotency_key: Some("key-for-the-retry-path".into()),
+            turn_id: Some("11111111-2222-4333-8444-555555555555".into()),
+            traceparent: None,
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let back: Command = serde_json::from_str(&json).unwrap();
+        match back {
+            Command::SendMessage {
+                idempotency_key,
+                turn_id,
+                ..
+            } => {
+                assert_eq!(idempotency_key.as_deref(), Some("key-for-the-retry-path"));
+                assert_eq!(
+                    turn_id.as_deref(),
+                    Some("11111111-2222-4333-8444-555555555555")
+                );
+                assert_ne!(
+                    idempotency_key, turn_id,
+                    "one field must never stand in for the other"
+                );
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[test]
