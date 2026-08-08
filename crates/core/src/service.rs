@@ -3482,17 +3482,50 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 // The name is model-supplied, so it is bounded to one line of
                 // capped length before it leaves the process (#945), the same
                 // way the arguments beside it are.
-                // Not implemented: the spec is the tests in this module.
+                // Negative memory (#1126): the decision point. A burn recalled
+                // after the act taught nothing, so a call that repeats one this
+                // user was burned by does not run yet - the lesson arrives as
+                // the tool result and the model decides what to do with it.
+                //
+                // A candidate, not a refusal, and the mechanism says so as well
+                // as the wording: the identity is marked met before the loop
+                // continues, so making the same call again runs it. That is
+                // also what stops the warning becoming a loop.
+                //
+                // A call the rule cannot scope produces no pending action and
+                // therefore no warning. Nothing is learned from such a call
+                // either, so the two halves stay symmetric.
                 let pending_action = PendingAction::observe(
                     tool_call.name.clone(),
                     &arguments,
                     &current_situation(),
                 );
-                let _ = (
-                    &live_burns,
-                    &mut burns_met_this_turn,
-                    render_warning(&[], Utc::now()),
-                );
+                if let Some(pending) = pending_action.as_ref()
+                    && !live_burns.is_empty()
+                    && !burns_met_this_turn.contains(&burn_key(pending))
+                    && let Some(warning) = render_warning(
+                        &burns_that_fire(&live_burns, pending, Utc::now()),
+                        Utc::now(),
+                    )
+                {
+                    tracing::info!(
+                        tool = %Safe::name(&tool_call.name),
+                        "tool call held: this act went badly before"
+                    );
+                    burns_met_this_turn.insert(burn_key(pending));
+                    notify_tool_event(ToolEvent::Started {
+                        name: summarize_tool_name(&tool_call.name),
+                        args: summarize_tool_value(&arguments),
+                    });
+                    notify_tool_event(ToolEvent::Finished {
+                        name: summarize_tool_name(&tool_call.name),
+                        ok: false,
+                        output: "held: this act went badly before".to_string(),
+                    });
+                    conv.messages
+                        .push(Message::tool_result(&tool_call.id, &warning));
+                    continue;
+                }
 
                 notify_tool_event(ToolEvent::Started {
                     name: summarize_tool_name(&tool_call.name),
@@ -3744,13 +3777,13 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 // where a lesson would have fired extinguishes that lesson,
                 // because a burn that no longer applies is the failure mode
                 // this feature has to be quickest about.
-                // Not implemented: the spec is the tests in this module.
-                if let Some(pending) = pending_action.as_ref()
-                    && false
-                {
-                    self.extinguish_burns_for(pending, &live_burns);
-                    self.record_burn_for(pending, &stored);
-                    burns_met_this_turn.insert(burn_key(pending));
+                if let Some(pending) = pending_action.as_ref() {
+                    if tool_ok {
+                        self.extinguish_burns_for(pending, &live_burns);
+                    } else {
+                        burns_met_this_turn.insert(burn_key(pending));
+                        self.record_burn_for(pending, &stored);
+                    }
                 }
 
                 // Dynamic activation: if tool_search returned results,

@@ -80,8 +80,9 @@ The project follows a ports-and-adapters (hexagonal) layout:
    the situation this prompt arrived in
 4. Core requests LLM streaming completion
 5. If tool calls are requested, core checks each one against the caller's tool
-   allowlist and the turn's provenance gate, then executes the permitted ones
-   through the MCP executor
+   allowlist, the turn's provenance gate, and what this user has been burned by
+   before - see [negative memory](features/negative-memory.md) - then executes
+   the permitted ones through the MCP executor
 6. D-Bus adapter emits chunk/complete/error signals
 7. Client renders updates incrementally
 
