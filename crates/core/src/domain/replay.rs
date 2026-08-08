@@ -56,10 +56,6 @@ use chrono::{DateTime, Utc};
 use crate::domain::activation::ActivationWeights;
 use crate::domain::knowledge_use::KnowledgeUseRecord;
 
-/// An entry no salience detector says anything about, which is what a caller
-/// passes where it has no text to read.
-pub const NO_SALIENCE_SHARE: f64 = 0.0;
-
 /// What re-examining one entry is worth today.
 ///
 /// `record` is what the use log knows about it, and `None` - an entry nothing
@@ -67,22 +63,38 @@ pub const NO_SALIENCE_SHARE: f64 = 0.0;
 /// with no use history is ordered by salience alone and, failing that, by
 /// whatever order it arrived in. `salience_share` is
 /// [`SalienceReading::share`](crate::domain::salience::SalienceReading::share),
-/// and [`NO_SALIENCE_SHARE`] is the answer where there is no text to read.
+/// and [`NO_SALIENCE`] is the answer where there is no text to read.
 ///
-/// Never negative: a contradiction raises this score rather than sinking it,
-/// which is the one place this function deliberately disagrees with
-/// [`crate::domain::activation`].
+/// **Never negative**, over any weights a deployment fitted for itself. A
+/// contradiction raises this score rather than sinking it, which is the one
+/// place this function deliberately disagrees with
+/// [`crate::domain::activation`], and a score that could go below zero would
+/// sort a contradicted entry behind one nobody has ever opened - the exact
+/// entry this ordering exists to surface. Each term is held at or above zero
+/// where it is formed rather than the sum being clamped, so a caller reading one
+/// term gets the same guarantee.
+///
+/// [`NO_SALIENCE`]: crate::domain::activation::NO_SALIENCE
 pub fn replay_priority(
     record: Option<&KnowledgeUseRecord>,
     salience_share: f64,
     now: DateTime<Utc>,
     weights: &ActivationWeights,
 ) -> f64 {
+    // `max(0.0)` on each term rather than on the sum. `contradiction_sum` and
+    // `retrieval_sum` are both non-negative already, so what this guards is a
+    // negative `use_lift` - which nothing constructs today, and which
+    // `ActivationWeights` exists so a deployment can fit. The sibling guard, and
+    // the same reasoning, is in `ActivationWeights::salience`.
     let retrieved = record.map_or(0.0, |record| {
-        weights.reinforcement(record.retrieval_sum(now, &weights.use_score))
+        weights
+            .reinforcement(record.retrieval_sum(now, &weights.use_score))
+            .max(0.0)
     });
     let contradicted = record.map_or(0.0, |record| {
-        weights.reinforcement(record.contradiction_sum(now, &weights.use_score))
+        weights
+            .reinforcement(record.contradiction_sum(now, &weights.use_score))
+            .max(0.0)
     });
     retrieved + contradicted + weights.salience(salience_share)
 }
@@ -90,7 +102,10 @@ pub fn replay_priority(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::knowledge_use::{KnowledgeMark, MarkPolarity, MarkSource};
+    use crate::domain::activation::NO_SALIENCE;
+    use crate::domain::knowledge_use::{
+        KnowledgeMark, MarkPolarity, MarkSource, RECENT_USE_WINDOW, UseScoreWeights,
+    };
     use chrono::TimeDelta;
 
     const DAY: i64 = 24 * 3600;
@@ -119,15 +134,23 @@ mod tests {
         }
     }
 
-    /// The same record, plus a standing negative mark set `age` seconds ago. As
-    /// the writer stores it: a mark is a use whichever way it points, so the
-    /// counter moves too.
+    /// The same record, plus a standing negative mark set `age` seconds ago.
+    ///
+    /// As the writer stores it, which is the part a hand-built fixture gets
+    /// wrong: a mark is a use whichever way it points, so the same statement
+    /// that moves `marked_count` prepends the stamp to the recent window. A
+    /// fixture that moved only the counter would describe a record no store
+    /// holds, and every claim measured against it would be measured against
+    /// nothing.
     fn contradicted(
         mut record: KnowledgeUseRecord,
         now: DateTime<Utc>,
         age: i64,
     ) -> KnowledgeUseRecord {
         record.marked_count += 1;
+        record.recent_uses.push(at(now, age));
+        record.recent_uses.sort_unstable_by(|a, b| b.cmp(a));
+        record.recent_uses.truncate(RECENT_USE_WINDOW);
         record.marks.push(KnowledgeMark {
             source: MarkSource::Model,
             polarity: MarkPolarity::Negative,
@@ -148,13 +171,9 @@ mod tests {
         let now = now();
         let weights = ActivationWeights::default();
 
-        let reached_for = replay_priority(
-            Some(&retrieved(now, &[3_600])),
-            NO_SALIENCE_SHARE,
-            now,
-            &weights,
-        );
-        let only_written = replay_priority(None, NO_SALIENCE_SHARE, now, &weights);
+        let reached_for =
+            replay_priority(Some(&retrieved(now, &[3_600])), NO_SALIENCE, now, &weights);
+        let only_written = replay_priority(None, NO_SALIENCE, now, &weights);
 
         assert!(
             reached_for > only_written,
@@ -174,9 +193,18 @@ mod tests {
         let weights = ActivationWeights::default();
         let history = retrieved(now, &[600, 6_000]);
 
-        let merely = replay_priority(Some(&history), NO_SALIENCE_SHARE, now, &weights);
-        let wrong = contradicted(history, now, 600);
-        let and_wrong = replay_priority(Some(&wrong), NO_SALIENCE_SHARE, now, &weights);
+        // The comparison entry carries the same extra use the mark came with,
+        // so what separates the two is the judgement and not one more open.
+        let mut merely_opened_again = history.clone();
+        merely_opened_again.opened_count += 1;
+        merely_opened_again.recent_uses.insert(0, at(now, 600));
+        let merely = replay_priority(Some(&merely_opened_again), NO_SALIENCE, now, &weights);
+        let and_wrong = replay_priority(
+            Some(&contradicted(history, now, 600)),
+            NO_SALIENCE,
+            now,
+            &weights,
+        );
 
         assert!(
             and_wrong > merely,
@@ -201,8 +229,8 @@ mod tests {
         let wrong = contradicted(history.clone(), now, 600);
 
         assert!(
-            replay_priority(Some(&wrong), NO_SALIENCE_SHARE, now, &weights)
-                > replay_priority(Some(&history), NO_SALIENCE_SHARE, now, &weights),
+            replay_priority(Some(&wrong), NO_SALIENCE, now, &weights)
+                > replay_priority(Some(&history), NO_SALIENCE, now, &weights),
             "a contradiction must pull an entry toward the front of a review"
         );
         assert!(
@@ -224,7 +252,7 @@ mod tests {
         let weights = ActivationWeights::default();
 
         let salient = replay_priority(None, 1.0, now, &weights);
-        let plain = replay_priority(None, NO_SALIENCE_SHARE, now, &weights);
+        let plain = replay_priority(None, NO_SALIENCE, now, &weights);
         assert!(salient > plain, "{salient} against {plain}");
 
         // And with equal histories as well, so the claim is not confined to a
@@ -232,7 +260,7 @@ mod tests {
         let history = retrieved(now, &[3_600, 36_000]);
         assert!(
             replay_priority(Some(&history), 1.0, now, &weights)
-                > replay_priority(Some(&history), NO_SALIENCE_SHARE, now, &weights)
+                > replay_priority(Some(&history), NO_SALIENCE, now, &weights)
         );
     }
 
@@ -247,17 +275,17 @@ mod tests {
 
         let fresh = replay_priority(
             Some(&contradicted(history.clone(), now, 600)),
-            NO_SALIENCE_SHARE,
+            NO_SALIENCE,
             now,
             &weights,
         );
         let stale = replay_priority(
             Some(&contradicted(history.clone(), now, 365 * DAY)),
-            NO_SALIENCE_SHARE,
+            NO_SALIENCE,
             now,
             &weights,
         );
-        let none = replay_priority(Some(&history), NO_SALIENCE_SHARE, now, &weights);
+        let none = replay_priority(Some(&history), NO_SALIENCE, now, &weights);
 
         assert!(stale < fresh, "{stale} against {fresh}");
         assert!(
@@ -272,11 +300,11 @@ mod tests {
     fn an_entry_nothing_has_touched_has_no_replay_priority_of_its_own() {
         let now = now();
         let weights = ActivationWeights::default();
-        assert_eq!(replay_priority(None, NO_SALIENCE_SHARE, now, &weights), 0.0);
+        assert_eq!(replay_priority(None, NO_SALIENCE, now, &weights), 0.0);
         assert_eq!(
             replay_priority(
                 Some(&KnowledgeUseRecord::unseen("kb-1", now)),
-                NO_SALIENCE_SHARE,
+                NO_SALIENCE,
                 now,
                 &weights
             ),
@@ -287,9 +315,8 @@ mod tests {
     /// Never negative, over every state the log can be in. A score that could go
     /// below zero would sort a contradicted entry behind one nobody has opened.
     #[test]
-    fn replay_priority_is_never_negative() {
+    fn replay_priority_is_never_negative_under_any_weights() {
         let now = now();
-        let weights = ActivationWeights::default();
         let mut only_a_negative_mark = KnowledgeUseRecord::unseen("kb-1", now);
         only_a_negative_mark.marked_count = 1;
         only_a_negative_mark.marks = vec![KnowledgeMark {
@@ -299,15 +326,36 @@ mod tests {
             marked_at: at(now, 60),
         }];
 
-        for share in [0.0, 0.5, 1.0] {
-            for record in [
-                None,
-                Some(&only_a_negative_mark),
-                Some(&retrieved(now, &[60])),
-            ] {
-                let scored = replay_priority(record, share, now, &weights);
-                assert!(scored >= 0.0, "scored {scored}");
-                assert!(scored.is_finite());
+        // Including weights nothing constructs today. `ActivationWeights` is a
+        // struct precisely so a deployment can fit its own from its own log, and
+        // a fitted value that came out negative must not invert the ordering.
+        let fitted = [
+            ActivationWeights::default(),
+            ActivationWeights {
+                use_lift: -0.5,
+                ..ActivationWeights::default()
+            },
+            ActivationWeights {
+                use_score: UseScoreWeights {
+                    person_mark: -3.0,
+                    model_mark: -3.0,
+                    ..UseScoreWeights::default()
+                },
+                ..ActivationWeights::default()
+            },
+        ];
+
+        for weights in fitted {
+            for share in [0.0, 0.5, 1.0] {
+                for record in [
+                    None,
+                    Some(&only_a_negative_mark),
+                    Some(&retrieved(now, &[60])),
+                ] {
+                    let scored = replay_priority(record, share, now, &weights);
+                    assert!(scored >= 0.0, "scored {scored} at {weights:?}");
+                    assert!(scored.is_finite());
+                }
             }
         }
     }

@@ -953,11 +953,14 @@ async fn empty_knowledge_base_consolidates_to_a_clean_no_op() {
 ///
 /// Driven through the real entry point, so it covers the whole path the unit
 /// tests cannot: the `knowledge_use_stats` read, its `user_id` predicate, the
-/// stitch into a domain record, the ordering, and the prompt the model is
+/// stitch into a domain record, the slice ordering, and the prompt the model is
 /// actually shown.
 ///
-/// The never-retrieved entry is seeded first and sorts first by tag, so a pass
-/// that did not read the log would list it first.
+/// **Each entry is given a body big enough to fill a slice**, because ordering
+/// moves slices and not entries. A store that fits in one prompt is shown to the
+/// model in one call and has no order to get wrong, so a two-entry fixture would
+/// assert nothing. The never-retrieved entry is seeded first and sorts first by
+/// tag, so a pass that did not read the log would prompt it first.
 #[tokio::test]
 async fn the_daily_pass_prompts_a_recently_retrieved_entry_before_a_recently_written_one() {
     let Some(fx) = support::DbFixture::try_new("dream1127").await else {
@@ -965,11 +968,15 @@ async fn the_daily_pass_prompts_a_recently_retrieved_entry_before_a_recently_wri
     };
     let pool = &fx.pool;
 
+    // Comfortably over half the holistic prompt budget, so no two of these
+    // share a slice.
+    let filler = "the same sentence again and again. ".repeat(700);
+
     seed_kb_tagged(
         pool,
         "u1",
         "kb-written",
-        "a fact nobody has reached for",
+        &format!("a fact nobody has reached for. {filler}"),
         &["a-topic"],
     )
     .await;
@@ -977,7 +984,7 @@ async fn the_daily_pass_prompts_a_recently_retrieved_entry_before_a_recently_wri
         pool,
         "u1",
         "kb-retrieved",
-        "a fact the work keeps needing",
+        &format!("a fact the work keeps needing. {filler}"),
         &["b-topic"],
     )
     .await;
@@ -1007,24 +1014,44 @@ async fn the_daily_pass_prompts_a_recently_retrieved_entry_before_a_recently_wri
 
     // Taken out of the guard before the `await` below, so no lock is held
     // across one.
-    let for_u1 = {
-        let seen = prompts.lock().expect("the capture buffer is not poisoned");
-        seen.iter()
-            .find(|p| p.contains("kb-retrieved"))
-            .expect("user1's slice was prompted")
-            .clone()
+    let seen: Vec<String> = {
+        let captured = prompts.lock().expect("the capture buffer is not poisoned");
+        captured.clone()
     };
-    let retrieved_at = for_u1.find("## kb-retrieved").expect("its id is listed");
-    let written_at = for_u1
-        .find("## kb-written")
-        .expect("the other id is listed");
+
+    let retrieved_at = seen
+        .iter()
+        .position(|p| p.contains("## kb-retrieved"))
+        .expect("user1's retrieved entry was prompted");
+    let written_at = seen
+        .iter()
+        .position(|p| p.contains("## kb-written"))
+        .expect("user1's written entry was prompted");
+    assert_ne!(
+        retrieved_at, written_at,
+        "precondition: the two entries are big enough to be sliced apart"
+    );
     assert!(
         retrieved_at < written_at,
-        "the entry the log says was opened must be examined first:\n{for_u1}"
+        "the slice holding the entry the log says was opened must be examined first; the \
+         prompts arrived in the order {:?}",
+        seen.iter()
+            .map(|p| p.lines().find(|l| l.starts_with("## ")).unwrap_or(""))
+            .collect::<Vec<_>>()
     );
+
+    let for_u1 = &seen[retrieved_at];
     assert!(
         !for_u1.contains("kb-other"),
         "another tenant's entry must never reach this prompt"
+    );
+    let for_u2 = seen
+        .iter()
+        .find(|p| p.contains("kb-other"))
+        .expect("user2's slice was prompted");
+    assert!(
+        !for_u2.contains("kb-retrieved") && !for_u2.contains("kb-written"),
+        "and user1's entries must never reach user2's"
     );
 
     fx.cleanup().await;

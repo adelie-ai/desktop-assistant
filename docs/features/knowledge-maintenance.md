@@ -203,18 +203,25 @@ P_i = retrieved + contradicted + salient
 Every term is read through the activation weights the recall block already uses,
 so nothing here is a second set of coefficients to fit.
 
-**Whole tag groups move, never single entries.** Entries are loaded in tag order
-precisely so near-duplicates land in one slice, and redundancy is what the pass
-exists to find; an order that put the six most-retrieved entries first would
-scatter every cluster it depends on. A group is a run of entries carrying the
-identical tags, its priority is that of its best entry, and the sort is stable -
-so a store with no use history is sliced exactly as it was before this existed.
+**Whole slices move, never entries and not even tag groups.** The loader's
+`ORDER BY tags` is what puts near-duplicates side by side, and finding those is
+the work the pass exists to do. Ordering anything smaller than a slice moves
+entries across slice boundaries and can separate a pair the packing had together
+- `{invoice}` beside `{invoices}` is exactly the pair a merge is wanted for.
+Sorting whole slices leaves every slice's membership byte for byte what it was. A
+slice's priority is that of its best entry, and the sort is stable, so slices
+nothing separates keep the order they were packed in.
+
+It follows that **a store small enough for one slice is unaffected**, and the
+pass does not even read the use log for one. That is correct rather than a gap:
+such a pass shows the model everything in one call, so it has no order to get
+wrong.
 
 **It orders and does not select.** Nothing is dropped. Capping a day's material
 is a separate decision, and a cap laid over an arbitrary order would silently
 stop examining whatever sorted last. A use log that cannot be read costs the
-order and not the pass: the run says so once in the journal and proceeds on the
-tag order alone.
+order and not the pass: the run says so once in the journal and keeps the order
+it sliced in.
 
 ## What consolidation may and may not do
 

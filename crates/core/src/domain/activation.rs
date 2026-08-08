@@ -248,12 +248,19 @@ impl ActivationWeights {
     ///   keeps the stated relations.
     /// - **A size that suits what it claims.** At the default weights it is
     ///   about a third of a deviation, which settles a near-tie between adjacent
-    ///   candidates and is a ninth of [`MAX_REINFORCEMENT_DEVIATIONS`]. A cheap
-    ///   signal can reorder a bunched block; it can never overturn a semantic
-    ///   lead. Its influence is therefore largest exactly where the admitted
-    ///   band is narrowest, which is the weakly cued prompt - the case where the
-    ///   prompt named nothing the store really holds and the other signals
-    ///   should lead.
+    ///   candidates and is a ninth of [`MAX_REINFORCEMENT_DEVIATIONS`].
+    ///
+    ///   **What one such signal can and cannot do, exactly.** A third of a
+    ///   deviation is under the half a deviation that separates the bar from the
+    ///   weakest hit the measured prompts produced, so one cheap signal on its
+    ///   own cannot take the top line from any measured best match. Two of them
+    ///   together reach about seven tenths and can. That is not a leak: a best
+    ///   match half a deviation above the bar means the prompt named nothing the
+    ///   store really holds, and a weakly cued prompt is exactly when the
+    ///   non-semantic signals should lead - the same case
+    ///   [`DEFAULT_USE_LIFT`] describes for the use log, and the guarantee
+    ///   #1123 deliberately did not make. Beyond about seven tenths of a
+    ///   deviation the semantic lead stands against every cheap signal there is.
     pub fn reference_use_lift(&self) -> f64 {
         self.reinforcement(self.reference_sum())
     }
@@ -1092,15 +1099,18 @@ mod tests {
 
     // --- Salience (#1127) ----------------------------------------------------
 
-    /// Acceptance (#1127): the salience term is counted in the source's own
-    /// median absolute deviations, like the three before it.
+    /// An equally placed and equally salient candidate scores the same against
+    /// any source, however differently that source's distances are spread.
     ///
-    /// The same test the semantic and situation terms get, extended to the
-    /// fourth: two sources of quite different geometry, one candidate equally
-    /// placed in each and equally salient. The score is the same number, so
-    /// nothing here is a raw distance and nothing is a raw count of signals.
+    /// Narrower than "the term is counted in deviations", and named for what it
+    /// checks: `salience` takes no dispersion, so it could not vary with one
+    /// even if it were a raw count. What holds the term to the semantic term's
+    /// unit is its ceiling, and
+    /// `the_salience_term_is_bounded_by_one_use_at_the_reference_age` is where
+    /// that is checked - a term returning `share * 100` passes this test and
+    /// fails that one.
     #[test]
-    fn the_salience_term_is_counted_in_the_sources_own_deviations() {
+    fn an_equally_placed_and_equally_salient_candidate_scores_the_same_against_any_source() {
         use crate::ports::recall::RecallDispersion;
 
         let now = now();
@@ -1149,9 +1159,7 @@ mod tests {
 
         let each: f64 = SalienceSignal::ALL
             .iter()
-            .map(|signal| {
-                weights.salience(SalienceReading::of([*signal]).share(&weights.use_score))
-            })
+            .map(|signal| weights.salience(SalienceReading::of([*signal]).share()))
             .sum();
         assert!(
             (each - ceiling).abs() < 1e-9,
@@ -1161,8 +1169,10 @@ mod tests {
         );
     }
 
-    /// Acceptance (#1127): the salience term is bounded, and the bound is
-    /// exactly what one use at the reference age is worth.
+    /// Acceptance (#1127): the salience term is bounded, the bound is exactly
+    /// what one use at the reference age is worth, and it is therefore counted
+    /// in the source's own median absolute deviations rather than in a unit of
+    /// its own.
     ///
     /// Both halves. The ceiling holds over every share a caller could hand in,
     /// including the ones the type does not rule out - a value past one, a
@@ -1287,6 +1297,65 @@ mod tests {
                     &weights
                 ),
                 semantic + weights.reinforcement(record.use_sum(now, &weights.use_score))
+            );
+        }
+    }
+
+    /// What the two cheap terms do **together**, which neither term's own test
+    /// covers and which is not what either alone can do.
+    ///
+    /// Each is bounded by one reference use, about a third of a deviation, and
+    /// that is under the half a deviation between the bar and the weakest hit
+    /// the measured prompts produced - so neither alone takes the top line from
+    /// any measured best match. Both at once reach about seven tenths and take
+    /// it from the weakest. Pinned in both directions, because a reader who met
+    /// only the two single-term tests would carry away a bound that is half the
+    /// real one.
+    ///
+    /// The case where they win is the weakly cued prompt, which is when the
+    /// non-semantic signals are supposed to lead (#1123). The case where they
+    /// lose is every prompt that named something the store holds.
+    #[test]
+    fn the_two_cheap_terms_together_reach_twice_what_either_reaches_alone() {
+        let now = now();
+        let weights = ActivationWeights::default();
+        let one = weights.reference_use_lift();
+
+        let both_at_the_bar = activation(BAR, None, 1.0, 1.0, now, &weights);
+        assert!(
+            (both_at_the_bar - BAR - 2.0 * one).abs() < 1e-9,
+            "a fully situated, fully salient candidate at the bar scored {both_at_the_bar}, and \
+             the two terms are supposed to be worth {one} each"
+        );
+
+        let weakest = *MEASURED_HITS.last().expect("the corpus is not empty");
+        assert!(
+            weakest - BAR < 2.0 * one,
+            "precondition: the weakest measured hit leads the bar by {}, which the two terms \
+             together must be able to close",
+            weakest - BAR
+        );
+        assert!(
+            both_at_the_bar > activation(weakest, None, NO_SITUATION, NO_SALIENCE, now, &weights),
+            "on the most weakly cued prompt the corpus holds, an entry that recurs here and \
+             carries every salience signal is supposed to lead"
+        );
+
+        // And every lead wider than the two of them stands, over the measured
+        // corpus rather than at one favourable point.
+        let wide: Vec<f64> = MEASURED_HITS
+            .iter()
+            .copied()
+            .filter(|hit| hit - BAR > 2.0 * one)
+            .collect();
+        assert!(
+            wide.len() >= 3,
+            "the corpus must hold several prompts that lead by more than both terms: {wide:?}"
+        );
+        for best in wide {
+            assert!(
+                both_at_the_bar < activation(best, None, NO_SITUATION, NO_SALIENCE, now, &weights),
+                "a best match at {best} deviations must keep its line against both cheap terms"
             );
         }
     }

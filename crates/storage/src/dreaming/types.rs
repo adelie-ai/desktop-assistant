@@ -141,12 +141,18 @@ pub const MAX_DELETE_REASON_CHARS: usize = 500;
 /// quote is to name the shape that came back, which the first line of it does.
 pub const MAX_DROPPED_OP_EXCERPT_CHARS: usize = 160;
 
-/// `knowledge_base.source` for an entry that was promoted deliberately: the
-/// user asked for it, or Adele decided in the moment that it was worth keeping.
+/// `knowledge_base.source` for an entry written during a live turn: the user
+/// asked for it, or Adele decided in the moment that it was worth keeping. The
+/// column cannot separate those two.
 ///
 /// Consolidation may rewrite or merge such an entry, but never prunes one: a
-/// fact a person entered on purpose is not the model's to remove.
-pub const SOURCE_EXPLICIT: &str = "explicit";
+/// fact somebody entered on purpose is not the model's to remove.
+///
+/// The domain reads the same value as a salience signal, so there is one
+/// definition of it and this is the name storage knows it by. A second literal
+/// here would be a value two layers could disagree about, and the disagreement
+/// would show only as a signal that never fires.
+pub const SOURCE_EXPLICIT: &str = desktop_assistant_core::domain::salience::SOURCE_EXPLICIT;
 
 /// Why consolidation soft-deleted a row, recorded on the row itself.
 ///
@@ -202,4 +208,29 @@ pub struct ConsolidationStats {
     /// answer, not a deliberate refusal: it is reported so a repaired answer is
     /// never quietly smaller than the one the model sent.
     pub dropped_operations: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The domain and the store name one value, and this is the only place both
+    /// are in scope to say so.
+    ///
+    /// The salience term reads `explicit` provenance as a signal, and this
+    /// module's constant is what the write and prune paths compare against. A
+    /// test inside either crate could only compare a constant with itself; a
+    /// drift between them would show up in production as a signal that never
+    /// fires, which is the quietest failure a ranking term has.
+    #[test]
+    fn the_domain_and_the_store_agree_on_what_explicit_provenance_is() {
+        assert_eq!(
+            SOURCE_EXPLICIT,
+            desktop_assistant_core::domain::salience::SOURCE_EXPLICIT
+        );
+        assert_eq!(
+            SOURCE_EXPLICIT, "explicit",
+            "and both are the string migration 026 defines"
+        );
+    }
 }

@@ -122,14 +122,12 @@ impl KbEntry {
             summary: self.summary.as_deref(),
             tags: &self.tags,
         })
-        .share(&weights.use_score);
+        .share();
         replay_priority(records.get(self.id.as_str()).copied(), share, now, weights)
     }
-}
 
-impl KbEntry {
-    /// Deliberately promoted by a person, so consolidation may rewrite or merge
-    /// it but never prune it.
+    /// Written during a live turn, so consolidation may rewrite or merge it but
+    /// never prune it.
     fn is_protected(&self) -> bool {
         self.source.as_deref() == Some(SOURCE_EXPLICIT)
     }
@@ -234,22 +232,6 @@ async fn consolidate_user(
         return Ok(ConsolidationStats::default());
     }
 
-    // What the use log knows, read once for the whole store (#1127). A read
-    // that fails must not fail the pass: the pass is still correct on the tag
-    // order alone, and a night skipped because the log was unreadable is worse
-    // than a night ordered the way every night was ordered before the log
-    // existed.
-    let records = match all_use_records(pool, current_user_id().as_str()).await {
-        Ok(records) => records,
-        Err(e) => {
-            tracing::warn!(
-                "dreaming: the use log could not be read, so this pass is ordered by tag alone: {e}"
-            );
-            Vec::new()
-        }
-    };
-    let entries = order_by_replay_priority(entries, &records, Utc::now());
-
     let slices = slice_entries(entries);
     if slices.len() > 1 {
         tracing::info!(
@@ -258,6 +240,30 @@ async fn consolidate_user(
             slices.len()
         );
     }
+
+    // What the use log knows, read once for the whole store (#1127). A read
+    // that fails costs the order and not the pass: every slice is still
+    // examined, in the order every pass used before the log was read at all, so
+    // a night skipped because the log was unreadable would be the worse answer.
+    //
+    // Read only where it can change something. One slice is one call that shows
+    // the model everything, so there is no order to decide and no reason to
+    // spend the query.
+    let slices = if slices.len() > 1 {
+        let records = match all_use_records(pool, current_user_id().as_str()).await {
+            Ok(records) => records,
+            Err(e) => {
+                tracing::warn!(
+                    "dreaming: the use log could not be read, so this pass keeps the order it \
+                     was sliced in: {e}"
+                );
+                Vec::new()
+            }
+        };
+        order_slices_by_replay_priority(slices, &records, Utc::now())
+    } else {
+        slices
+    };
 
     let mut buffer = OpBuffer::new();
     // Every op the model proposes is collected across all slices and only then
@@ -607,57 +613,57 @@ async fn load_active_entries(pool: &PgPool) -> Result<Vec<KbEntry>, CoreError> {
         .collect())
 }
 
-/// Put the tag groups most worth re-examining first (#1127).
+/// Examine the slices most worth re-examining first (#1127).
 ///
-/// The pass examines everything either way. What this decides is the order, and
-/// therefore which entries share a slice and which entries a pass that was
-/// cancelled or that lost slices to failures actually reached.
+/// The pass examines every entry either way. What this decides is which slice
+/// the day's first expensive call is spent on, and - because the pass stops
+/// between slices when it is cancelled and continues past a slice whose call
+/// failed - which entries a pass that did not finish actually reached.
 ///
-/// **Whole tag groups move, never single entries.** Entries arrive ordered by
-/// tags precisely so that near-duplicates land in one slice, and redundancy is
-/// what the pass exists to find; an order that put the six most-retrieved
-/// entries first would scatter every cluster it depends on. So a group is a run
-/// of entries carrying the identical tags, a group's priority is that of its
-/// best entry, and the groups are sorted by it.
+/// **Slices, not entries, and not tag groups.** The loader's `ORDER BY tags`
+/// is what puts near-duplicates side by side, and finding those is the work the
+/// pass exists to do. Ordering anything smaller than a slice moves entries
+/// across slice boundaries and can separate a pair the packing had together -
+/// `{invoice}` and `{invoices}` are adjacent under a tag sort and are exactly
+/// the pair a merge is wanted for. Sorting whole slices leaves every slice's
+/// membership byte for byte what it was, so nothing that was examined together
+/// stops being examined together.
 ///
-/// **The sort is stable**, so groups of equal priority - which is every group in
-/// a store with no use history - keep the tag order they arrived in. A store
-/// this term says nothing about is sliced exactly as it was before the term
-/// existed.
-fn order_by_replay_priority(
-    entries: Vec<KbEntry>,
+/// It follows that a store small enough for one slice is unaffected, which is
+/// correct rather than a gap: such a pass shows the model everything in one
+/// call, so it has no order to get wrong.
+///
+/// A slice's priority is that of its best entry. **The sort is stable**, so
+/// slices of equal priority keep the order the loader gave them.
+fn order_slices_by_replay_priority(
+    slices: Vec<Vec<KbEntry>>,
     records: &[KnowledgeUseRecord],
     now: DateTime<Utc>,
-) -> Vec<KbEntry> {
+) -> Vec<Vec<KbEntry>> {
     let weights = ActivationWeights::default();
     let by_id: HashMap<&str, &KnowledgeUseRecord> = records
         .iter()
         .map(|record| (record.entry_id.as_str(), record))
         .collect();
 
-    let mut groups: Vec<(f64, Vec<KbEntry>)> = Vec::new();
-    for entry in entries {
-        let priority = entry.replay_priority(&by_id, now, &weights);
-        match groups.last_mut() {
-            // A run of the identical tags is one group. Equality on the whole
-            // vector rather than on any one tag: that is exactly what
-            // `ORDER BY tags` groups by, so this cuts the runs the loader made
-            // and invents none of its own.
-            Some((best, group)) if group.last().is_some_and(|last| last.tags == entry.tags) => {
-                *best = best.max(priority);
-                group.push(entry);
-            }
-            _ => groups.push((priority, vec![entry])),
-        }
-    }
+    let mut scored: Vec<(f64, Vec<KbEntry>)> = slices
+        .into_iter()
+        .map(|slice| {
+            let best = slice
+                .iter()
+                .map(|entry| entry.replay_priority(&by_id, now, &weights))
+                .fold(0.0_f64, f64::max);
+            (best, slice)
+        })
+        .collect();
 
     // `total_cmp` rather than `partial_cmp`, so the comparator is a total order
     // and the sort cannot depend on which pair it happened to visit first. A
     // priority that is not a number cannot reach here - every term is bounded
     // arithmetic over stored timestamps - and if one did, `total_cmp` still
     // orders it rather than making the sort incoherent.
-    groups.sort_by(|left, right| right.0.total_cmp(&left.0));
-    groups.into_iter().flat_map(|(_, group)| group).collect()
+    scored.sort_by(|left, right| right.0.total_cmp(&left.0));
+    scored.into_iter().map(|(_, slice)| slice).collect()
 }
 
 /// Greedily pack tag-ordered entries into slices under the prompt char budget.
@@ -1491,39 +1497,43 @@ mod tests {
         record
     }
 
-    /// The ids in the order the pass would examine them.
-    fn examined(entries: Vec<KbEntry>, records: &[KnowledgeUseRecord]) -> Vec<String> {
-        order_by_replay_priority(entries, records, replay_now())
+    /// The ids of each slice, in the order the pass would examine them.
+    fn examined(slices: Vec<Vec<KbEntry>>, records: &[KnowledgeUseRecord]) -> Vec<Vec<String>> {
+        order_slices_by_replay_priority(slices, records, replay_now())
             .into_iter()
-            .map(|e| e.id)
+            .map(|slice| slice.into_iter().map(|e| e.id).collect())
             .collect()
+    }
+
+    /// Two slices, each holding one entry, in the order the loader gave them.
+    fn two_slices(first: KbEntry, second: KbEntry) -> Vec<Vec<KbEntry>> {
+        vec![vec![first], vec![second]]
     }
 
     /// Acceptance (#1127): the daily pass examines a recently retrieved entry
     /// before one that was only recently written.
     ///
-    /// The entry nothing has reached for is the newer of the two, and it still
-    /// comes second - which is the whole claim, because write activity alone
-    /// cannot tell the two apart. Each carries its own tags, so the two are
-    /// separate groups and the order is the ordering rule's and not the tag
-    /// sort's.
+    /// The entry nothing has reached for is the newer of the two and is sliced
+    /// first, so a pass that ignored the log would spend its first call on it.
+    /// Write activity alone cannot tell the two apart; the use log can.
     #[test]
     fn the_daily_pass_examines_a_recently_retrieved_entry_before_a_recently_written_one() {
-        // Arrives in the tag order the loader gives: the written-yesterday entry
-        // first, so a pass that ignored the log would keep it first.
-        let entries = vec![
+        let slices = two_slices(
             entry("kb-written", "a fact nobody has reached for", &["a-topic"]),
             entry(
                 "kb-retrieved",
                 "a fact the work keeps needing",
                 &["b-topic"],
             ),
-        ];
+        );
         let records = vec![retrieved("kb-retrieved", &[3_600, 7_200])];
 
         assert_eq!(
-            examined(entries, &records),
-            vec!["kb-retrieved".to_string(), "kb-written".to_string()]
+            examined(slices, &records),
+            vec![
+                vec!["kb-retrieved".to_string()],
+                vec!["kb-written".to_string()]
+            ]
         );
     }
 
@@ -1534,18 +1544,18 @@ mod tests {
     /// separating them.
     #[test]
     fn the_daily_pass_examines_a_contradicted_entry_before_a_merely_retrieved_one() {
-        let entries = vec![
+        let slices = two_slices(
             entry("kb-fine", "a fact nobody has disputed", &["a-topic"]),
             entry("kb-wrong", "a fact somebody said was wrong", &["b-topic"]),
-        ];
+        );
         let records = vec![
             retrieved("kb-fine", &[600, 6_000]),
             contradicted(retrieved("kb-wrong", &[600, 6_000]), 600),
         ];
 
         assert_eq!(
-            examined(entries, &records),
-            vec!["kb-wrong".to_string(), "kb-fine".to_string()]
+            examined(slices, &records),
+            vec![vec!["kb-wrong".to_string()], vec!["kb-fine".to_string()]]
         );
     }
 
@@ -1556,7 +1566,7 @@ mod tests {
     /// in, so salience is the only thing separating them.
     #[test]
     fn the_daily_pass_examines_a_salient_entry_before_a_non_salient_one_of_the_same_age() {
-        let entries = vec![
+        let slices = two_slices(
             entry(
                 "kb-plain",
                 "the kitchen tap turns the wrong way",
@@ -1567,34 +1577,36 @@ mod tests {
                 "the insurance renewal is due by the end of March",
                 &["b-topic"],
             ),
-        ];
+        );
 
         assert_eq!(
-            examined(entries, &[]),
-            vec!["kb-salient".to_string(), "kb-plain".to_string()]
+            examined(slices, &[]),
+            vec![vec!["kb-salient".to_string()], vec!["kb-plain".to_string()]]
         );
     }
 
-    /// Whole tag groups move, never single entries. Redundancy clusters by tag
-    /// and finding it is what the pass is for, so an order that scattered a
-    /// cluster would cost more than it bought.
+    /// A slice's membership is exactly what the packing made it. Ordering moves
+    /// whole slices, so a pair the tag sort put together - `{invoice}` beside
+    /// `{invoices}`, which is the pair a merge is wanted for - is still shown to
+    /// the model together, whatever their priorities.
     #[test]
-    fn ordering_by_replay_priority_keeps_entries_that_share_tags_together() {
-        let entries = vec![
-            entry("kb-a1", "one of a pair", &["shared"]),
-            entry("kb-a2", "the other of the pair", &["shared"]),
-            entry("kb-b1", "an unrelated fact", &["other"]),
+    fn ordering_never_moves_an_entry_between_slices() {
+        let slices = vec![
+            vec![
+                entry("kb-invoice", "the invoice went out on Monday", &["invoice"]),
+                entry("kb-invoices", "invoices go out on Mondays", &["invoices"]),
+            ],
+            vec![entry("kb-zebra", "an unrelated fact", &["zebra"])],
         ];
-        // The *second* member of the shared group is the retrieved one, so its
-        // whole group must move and not just the entry that earned it.
-        let records = vec![retrieved("kb-a2", &[600])];
+        // The second slice is the retrieved one, so it leads - and the pair in
+        // the first slice must still travel together behind it.
+        let records = vec![retrieved("kb-zebra", &[60])];
 
         assert_eq!(
-            examined(entries, &records),
+            examined(slices, &records),
             vec![
-                "kb-a1".to_string(),
-                "kb-a2".to_string(),
-                "kb-b1".to_string()
+                vec!["kb-zebra".to_string()],
+                vec!["kb-invoice".to_string(), "kb-invoices".to_string()],
             ]
         );
     }
@@ -1603,41 +1615,48 @@ mod tests {
     /// first, and a cancelled or partly-failed pass is what makes that matter -
     /// it must never decide what it reaches at all.
     #[test]
-    fn ordering_by_replay_priority_examines_every_entry_it_was_given() {
-        let entries: Vec<KbEntry> = (0..40)
-            .map(|i| {
-                entry(
-                    &format!("kb-{i}"),
-                    "a stored fact",
-                    &[if i % 3 == 0 { "one" } else { "two" }],
-                )
+    fn ordering_examines_every_slice_and_every_entry_it_was_given() {
+        let slices: Vec<Vec<KbEntry>> = (0..8)
+            .map(|s| {
+                (0..5)
+                    .map(|i| {
+                        entry(
+                            &format!("kb-{s}-{i}"),
+                            "a stored fact",
+                            &[if s % 2 == 0 { "one" } else { "two" }],
+                        )
+                    })
+                    .collect()
             })
             .collect();
-        let records = vec![retrieved("kb-7", &[600]), retrieved("kb-31", &[60])];
+        let records = vec![retrieved("kb-3-2", &[600]), retrieved("kb-6-0", &[60])];
 
-        let mut ordered = examined(entries, &records);
-        assert_eq!(ordered.len(), 40);
-        ordered.sort();
-        ordered.dedup();
-        assert_eq!(ordered.len(), 40, "no entry may be dropped or duplicated");
+        let ordered = examined(slices, &records);
+        assert_eq!(ordered.len(), 8, "no slice may be dropped");
+        let mut ids: Vec<String> = ordered.into_iter().flatten().collect();
+        assert_eq!(ids.len(), 40);
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 40, "no entry may be dropped or duplicated");
     }
 
-    /// A store the log says nothing about is ordered exactly as it was before
-    /// this term existed: the tag order the loader gave, unmoved.
+    /// Slices nothing separates keep the order the packing gave them, because
+    /// the sort is stable.
+    ///
+    /// "Nothing separates them" is the load-bearing part and it is more than an
+    /// empty use log: salience is read whether or not the log can be, so the
+    /// entries here carry no cue either. A store with a use history of nothing
+    /// and a deadline in one slice is **not** ordered as it was, and
+    /// `the_daily_pass_examines_a_salient_entry_before_a_non_salient_one_of_the_same_age`
+    /// is where that is stated.
     #[test]
-    fn a_store_with_no_use_history_keeps_the_tag_order_the_loader_gave_it() {
-        let entries: Vec<KbEntry> = (0..12)
-            .map(|i| {
-                entry(
-                    &format!("kb-{i}"),
-                    "a stored fact",
-                    &[if i < 6 { "a" } else { "b" }],
-                )
-            })
+    fn slices_with_nothing_to_separate_them_keep_the_order_they_were_packed_in() {
+        let slices: Vec<Vec<KbEntry>> = (0..6)
+            .map(|s| vec![entry(&format!("kb-{s}"), "a stored fact", &["topic"])])
             .collect();
-        let expected: Vec<String> = (0..12).map(|i| format!("kb-{i}")).collect();
+        let expected: Vec<Vec<String>> = (0..6).map(|s| vec![format!("kb-{s}")]).collect();
 
-        assert_eq!(examined(entries, &[]), expected);
+        assert_eq!(examined(slices, &[]), expected);
     }
 
     #[test]

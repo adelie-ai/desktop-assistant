@@ -881,14 +881,16 @@ fn rank_by_activation<'a, T: Activatable>(
     let scored: Vec<Option<f64>> = showable
         .iter()
         .map(|(hit, _)| {
-            let coverage = hit.situation_coverage(situation);
-            let salience = hit.salience_share(&weights.use_score);
+            // Both cheap signals are read inside the `map`, so a degraded
+            // lookup - where every candidate carries a lexical rank and no
+            // distance, and this function returns the list untouched - pays for
+            // neither. A salience reading lowercases the whole body.
             hit.relevance().semantic_signal(dispersion).map(|semantic| {
                 activation(
                     semantic,
                     hit.use_record(),
-                    coverage,
-                    salience,
+                    hit.situation_coverage(situation),
+                    hit.salience_share(),
                     now,
                     &weights,
                 )
