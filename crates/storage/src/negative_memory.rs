@@ -166,46 +166,250 @@ const MEMORY_COLUMNS: &str = "id, action, kind, outcome, occurrences, written_at
 
 impl NegativeMemoryStore for PgNegativeMemoryStore {
     async fn live_burns(&self) -> Result<Vec<NegativeMemory>, CoreError> {
-        // Not implemented: the spec is tests/negative_memory.rs.
-        let _ = (
-            &self.pool,
-            current_user_id(),
-            MAX_LIVE_BURNS,
-            MEMORY_COLUMNS,
-            FORGET_DAYS,
-        );
-        Ok(Vec::new())
+        let user_id = current_user_id();
+        let rows = sqlx::query_as::<_, MemoryRow>(sqlx::AssertSqlSafe(format!(
+            "SELECT {MEMORY_COLUMNS} \
+             FROM negative_memory \
+             WHERE user_id = $1 AND kind = 'burn' AND superseded_by IS NULL \
+             ORDER BY last_confirmed_at DESC \
+             LIMIT $2"
+        )))
+        .bind(user_id.as_str())
+        .bind(i64::try_from(MAX_LIVE_BURNS).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(storage_error)?;
+
+        let ids: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
+        let facets = facets_for(&self.pool, user_id.as_str(), &ids).await?;
+        Ok(assemble(rows, facets))
     }
 
     async fn record_burn(&self, observation: BurnObservation) -> Result<BurnWrite, CoreError> {
-        // Not implemented: the spec is tests/negative_memory.rs.
-        let _ = (
-            storable(&observation.action),
-            observation.scope.fingerprint(),
-        );
-        Ok(BurnWrite {
-            id: uuid::Uuid::now_v7().to_string(),
-            occurrences: 1,
-            widened_by: 0,
-        })
+        let user_id = current_user_id();
+        let user_id = user_id.as_str();
+        if !storable(&observation.action) || !storable(&observation.outcome) {
+            return Err(CoreError::Storage(
+                "a negative memory cannot hold a NUL byte".to_string(),
+            ));
+        }
+        let fingerprint = observation.scope.fingerprint();
+
+        let mut tx = self.pool.begin().await.map_err(storage_error)?;
+
+        // The writer is the reaper (see the module header). Runs first so a
+        // long-forgotten burn cannot be confirmed back to life by an identity
+        // collision this write would otherwise find.
+        sqlx::query(
+            "DELETE FROM negative_memory \
+             WHERE user_id = $1 AND last_confirmed_at < NOW() - make_interval(days => $2)",
+        )
+        .bind(user_id)
+        .bind(FORGET_DAYS.round() as i32)
+        .execute(&mut *tx)
+        .await
+        .map_err(storage_error)?;
+
+        // The live slot for this identity. `FOR UPDATE` so a concurrent second
+        // failure of the same act queues behind this one rather than racing the
+        // insert below into a unique violation.
+        let existing = sqlx::query_as::<_, MemoryRow>(sqlx::AssertSqlSafe(format!(
+            "SELECT {MEMORY_COLUMNS} \
+             FROM negative_memory \
+             WHERE user_id = $1 AND action = $2 AND fingerprint = $3 \
+               AND kind = 'burn' AND superseded_by IS NULL \
+             FOR UPDATE"
+        )))
+        .bind(user_id)
+        .bind(&observation.action)
+        .bind(&fingerprint)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(storage_error)?;
+
+        let write = match existing {
+            None => {
+                let id = uuid::Uuid::now_v7().to_string();
+                sqlx::query(
+                    "INSERT INTO negative_memory \
+                         (id, user_id, action, fingerprint, kind, outcome) \
+                     VALUES ($1, $2, $3, $4, 'burn', $5)",
+                )
+                .bind(&id)
+                .bind(user_id)
+                .bind(&observation.action)
+                .bind(&fingerprint)
+                .bind(&observation.outcome)
+                .execute(&mut *tx)
+                .await
+                .map_err(storage_error)?;
+
+                for (facet, value) in observation.scope.iter() {
+                    if !storable(facet.name()) || !storable(value) {
+                        continue;
+                    }
+                    sqlx::query(
+                        "INSERT INTO negative_memory_facet \
+                             (user_id, memory_id, kind, name, value) \
+                         VALUES ($1, $2, $3, $4, $5) \
+                         ON CONFLICT (user_id, memory_id, kind, name) DO NOTHING",
+                    )
+                    .bind(user_id)
+                    .bind(&id)
+                    .bind(facet.kind())
+                    .bind(facet.name())
+                    .bind(value)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(storage_error)?;
+                }
+
+                BurnWrite {
+                    id,
+                    occurrences: 1,
+                    widened_by: 0,
+                }
+            }
+            Some(row) => {
+                // What the row requires today, read as the domain reads it, so
+                // the widening rule here is the same one every other caller
+                // gets.
+                let held = facets_for(&mut *tx, user_id, std::slice::from_ref(&row.id)).await?;
+                let current = Scope::from_stored(
+                    held.iter()
+                        .map(|f| (f.kind.as_str(), f.name.as_str(), f.value.clone())),
+                );
+                let widened = current.broadened_against(&observation.scope);
+                let dropped: Vec<(&'static str, String)> = current
+                    .iter()
+                    .filter(|(facet, _)| widened.get(facet).is_none())
+                    .map(|(facet, _)| (facet.kind(), facet.name().to_string()))
+                    .collect();
+
+                for (kind, name) in &dropped {
+                    sqlx::query(
+                        "DELETE FROM negative_memory_facet \
+                         WHERE user_id = $1 AND memory_id = $2 AND kind = $3 AND name = $4",
+                    )
+                    .bind(user_id)
+                    .bind(&row.id)
+                    .bind(kind)
+                    .bind(name)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(storage_error)?;
+                }
+
+                let occurrences = sqlx::query_scalar::<_, i64>(
+                    "UPDATE negative_memory \
+                     SET last_confirmed_at = NOW(), occurrences = occurrences + 1, outcome = $3 \
+                     WHERE user_id = $1 AND id = $2 \
+                     RETURNING occurrences",
+                )
+                .bind(user_id)
+                .bind(&row.id)
+                .bind(&observation.outcome)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(storage_error)?;
+
+                BurnWrite {
+                    id: row.id,
+                    occurrences: u32::try_from(occurrences).unwrap_or(u32::MAX),
+                    widened_by: dropped.len(),
+                }
+            }
+        };
+
+        tx.commit().await.map_err(storage_error)?;
+        Ok(write)
     }
 
     async fn extinguish(&self, ids: Vec<String>, note: String) -> Result<Vec<String>, CoreError> {
-        // Not implemented: the spec is tests/negative_memory.rs.
-        let _ = (ids, note);
-        Ok(Vec::new())
+        let user_id = current_user_id();
+        let user_id = user_id.as_str();
+        if !storable(&note) {
+            return Err(CoreError::Storage(
+                "a correction cannot hold a NUL byte".to_string(),
+            ));
+        }
+
+        let mut extinguished = Vec::new();
+        let mut tx = self.pool.begin().await.map_err(storage_error)?;
+        for id in ids.iter().filter(|id| storable(id)) {
+            let correction_id = uuid::Uuid::now_v7().to_string();
+            // Insert-from-select, never insert-the-handed-id: the correction
+            // carries the burn's own action, fingerprint and owner, and a burn
+            // this user does not hold - or one already extinguished - writes
+            // nothing.
+            let written = sqlx::query(
+                "INSERT INTO negative_memory \
+                     (id, user_id, action, fingerprint, kind, outcome) \
+                 SELECT $1, user_id, action, fingerprint, 'correction', $4 \
+                 FROM negative_memory \
+                 WHERE user_id = $2 AND id = $3 \
+                   AND kind = 'burn' AND superseded_by IS NULL",
+            )
+            .bind(&correction_id)
+            .bind(user_id)
+            .bind(id)
+            .bind(&note)
+            .execute(&mut *tx)
+            .await
+            .map_err(storage_error)?;
+            if written.rows_affected() == 0 {
+                continue;
+            }
+
+            sqlx::query(
+                "INSERT INTO negative_memory_facet (user_id, memory_id, kind, name, value) \
+                 SELECT user_id, $1, kind, name, value \
+                 FROM negative_memory_facet \
+                 WHERE user_id = $2 AND memory_id = $3 \
+                 ON CONFLICT (user_id, memory_id, kind, name) DO NOTHING",
+            )
+            .bind(&correction_id)
+            .bind(user_id)
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(storage_error)?;
+
+            sqlx::query(
+                "UPDATE negative_memory \
+                 SET superseded_by = $3, superseded_at = NOW() \
+                 WHERE user_id = $1 AND id = $2 \
+                   AND kind = 'burn' AND superseded_by IS NULL",
+            )
+            .bind(user_id)
+            .bind(id)
+            .bind(&correction_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(storage_error)?;
+
+            extinguished.push(id.clone());
+        }
+        tx.commit().await.map_err(storage_error)?;
+        Ok(extinguished)
     }
 
     async fn history(&self, action: String) -> Result<Vec<NegativeMemory>, CoreError> {
-        // Not implemented: the spec is tests/negative_memory.rs.
-        let _ = (
-            action,
-            assemble(Vec::new(), Vec::new()),
-            facets_for(&self.pool, "", &[]),
-            storage_error(sqlx::Error::RowNotFound),
-            NegativeMemoryKind::Burn,
-            Scope::new(),
-        );
-        Ok(Vec::new())
+        let user_id = current_user_id();
+        let rows = sqlx::query_as::<_, MemoryRow>(sqlx::AssertSqlSafe(format!(
+            "SELECT {MEMORY_COLUMNS} \
+             FROM negative_memory \
+             WHERE user_id = $1 AND action = $2 \
+             ORDER BY last_confirmed_at DESC, id"
+        )))
+        .bind(user_id.as_str())
+        .bind(&action)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(storage_error)?;
+
+        let ids: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
+        let facets = facets_for(&self.pool, user_id.as_str(), &ids).await?;
+        Ok(assemble(rows, facets))
     }
 }
