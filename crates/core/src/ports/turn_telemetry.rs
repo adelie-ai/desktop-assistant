@@ -120,7 +120,10 @@ impl TurnTrace {
         }
     }
 
-    /// The `traceparent` header value naming the best parent this turn knows.
+    /// The `traceparent` header value for a call this turn makes outward.
+    ///
+    /// Named for what it returns rather than for the common case: a continued
+    /// trace names a parent that is not a root.
     ///
     /// A continued trace names the caller's own span, so a receiver hangs its
     /// work where it belongs rather than under an id nobody exported. A minted
@@ -133,7 +136,7 @@ impl TurnTrace {
     /// it with `true` would override a caller that deliberately did not sample,
     /// and a receiver running a parent-based sampler would then act on a
     /// decision nobody made.
-    pub fn root_header(&self) -> String {
+    pub fn outbound_header(&self) -> String {
         match self.trace {
             TraceOrigin::Continued(parent) => parent.to_header(),
             TraceOrigin::Minted(trace_id) => TraceParent::root_for(trace_id, true).to_header(),
@@ -243,7 +246,7 @@ pub fn outbound_traceparent() -> Option<String> {
     if let Some(header) = crate::otel_bridge::current_span_traceparent() {
         return Some(header);
     }
-    current_turn_trace().map(|trace| trace.root_header())
+    current_turn_trace().map(|trace| trace.outbound_header())
 }
 
 /// The 16 bytes a request id spells, or all zero when it spells nothing.
@@ -502,7 +505,7 @@ mod tests {
         // deterministic root instead would put every server's work under an id
         // nobody exported, which reads as an orphan subtree in the trace.
         let trace = resolve_turn_trace(Some(INCOMING), CLIENT_ID, "conv-1");
-        let header = trace.root_header();
+        let header = trace.outbound_header();
         assert_eq!(
             adelie_telemetry::extract_traceparent(&header)
                 .expect("the header this crate writes must parse")
@@ -521,7 +524,7 @@ mod tests {
         let unsampled = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00";
         let trace = resolve_turn_trace(Some(unsampled), CLIENT_ID, "conv-1");
         assert!(!trace.sampled());
-        assert!(trace.root_header().ends_with("-00"));
+        assert!(trace.outbound_header().ends_with("-00"));
 
         let minted = resolve_turn_trace(None, CLIENT_ID, "conv-1");
         assert!(

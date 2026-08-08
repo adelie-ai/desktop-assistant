@@ -366,6 +366,7 @@ mod tests {
         assert_eq!(current_co_location(), None);
         assert_eq!(current_client_label(), None);
         assert_eq!(current_client_context(), None);
+        assert_eq!(current_turn_trace(), None);
         assert_eq!(current_turn_interactivity(), TurnInteractivity::Headless);
     }
 }

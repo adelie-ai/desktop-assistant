@@ -2131,10 +2131,12 @@ fn a_conversation_id_cannot_forge_a_log_line() {
         one_turn(&handler).await;
     });
 
+    let mut carried = 0;
     for span in &captured.spans {
         let Some(recorded) = span.field("conversation_id") else {
             continue;
         };
+        carried += 1;
         assert!(
             !recorded.contains('\u{1b}'),
             "an escape survived onto `{}.conversation_id`, which exports \
@@ -2142,6 +2144,13 @@ fn a_conversation_id_cannot_forge_a_log_line() {
             span.name
         );
     }
+
+    assert!(
+        carried > 0,
+        "no span carried a conversation id, so the loop above asserted nothing; \
+         the run produced {:?}",
+        captured.span_names()
+    );
 
     for line in captured.console.lines() {
         assert!(

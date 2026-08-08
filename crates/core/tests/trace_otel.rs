@@ -81,7 +81,7 @@ fn client_turn_and_daemon_turn_share_one_trace() {
     // names the same trace. So the client, the daemon and the MCP server all
     // land in one place.
     let trace = resolve_turn_trace(None, REQUEST_ID, CONVERSATION_ID);
-    let client_header = trace.root_header();
+    let client_header = trace.outbound_header();
 
     let daemon_header = with_otel_layer(|| {
         let span = tracing::info_span!("turn");
