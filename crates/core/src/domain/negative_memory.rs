@@ -282,9 +282,10 @@ impl Scope {
     /// A subset test, not an equality test: a call that carries more than the
     /// burn requires is still the act the burn is about. See the module header
     /// for why confirmation asks a different question.
-    pub fn matches(&self, _present: &Scope) -> bool {
-        // Not implemented: the spec is the test suite below.
-        true
+    pub fn matches(&self, present: &Scope) -> bool {
+        self.0
+            .iter()
+            .all(|(facet, value)| present.get(facet) == Some(value.as_str()))
     }
 
     /// This scope widened by a second occurrence.
@@ -297,9 +298,15 @@ impl Scope {
     /// This is the only thing in the module that makes a burn wider.
     #[must_use]
     pub fn broadened_against(&self, observed: &Scope) -> Scope {
-        let _ = observed;
-        // Not implemented: the spec is the test suite below.
-        Scope::new()
+        Scope(
+            self.0
+                .iter()
+                .filter(|(facet, value)| {
+                    facet.is_identity() || observed.get(facet) == Some(value.as_str())
+                })
+                .map(|(f, v)| (f.clone(), v.clone()))
+                .collect(),
+        )
     }
 
     /// A stable digest of the identity facets alone: the burn's handle.
@@ -308,9 +315,14 @@ impl Scope {
     /// both match. The situation is excluded on purpose - it is what widens,
     /// so it cannot also be what identifies.
     pub fn fingerprint(&self) -> String {
-        // Not implemented: the spec is the test suite below.
-        let _ = Sha256::new();
-        String::new()
+        let mut hasher = Sha256::new();
+        for (facet, value) in self.0.iter().filter(|(f, _)| f.is_identity()) {
+            hasher.update(facet.name().as_bytes());
+            hasher.update([0x1f]);
+            hasher.update(value.as_bytes());
+            hasher.update([0x1e]);
+        }
+        format!("{:x}", hasher.finalize())[..32].to_string()
     }
 }
 
@@ -348,11 +360,35 @@ impl PendingAction {
         arguments: &serde_json::Value,
         situation: &Situation,
     ) -> Option<Self> {
-        // Not implemented: the spec is the test suite below.
-        let _ = (arguments, situation, facet_value(&serde_json::Value::Null));
+        let arguments = match arguments {
+            serde_json::Value::Null => None,
+            serde_json::Value::Object(map) => Some(map),
+            _ => return None,
+        };
+
+        let mut scope = Scope::new();
+        if let Some(map) = arguments {
+            let usable: Vec<(&String, String)> = map
+                .iter()
+                .filter_map(|(name, value)| facet_value(value).map(|v| (name, v)))
+                .collect();
+            if !map.is_empty() && usable.is_empty() {
+                return None;
+            }
+            if usable.len() > MAX_ACTION_FACETS {
+                return None;
+            }
+            for (name, value) in usable {
+                scope = scope.with(Facet::Argument(name.clone()), value);
+            }
+        }
+        for (field, value) in situation.iter() {
+            scope = scope.with(Facet::Situation(field), value);
+        }
+
         Some(Self {
             action: action.into(),
-            scope: Scope::new(),
+            scope,
         })
     }
 
@@ -423,9 +459,12 @@ impl NegativeMemory {
     /// carries no unit that anything else in the workspace reads - see the
     /// module header.
     pub fn strength(&self, now: DateTime<Utc>) -> f64 {
-        // Not implemented: the spec is the test suite below.
-        let _ = now;
-        FULL_STRENGTH
+        let elapsed = now.signed_duration_since(self.last_confirmed_at);
+        let days = elapsed.num_milliseconds() as f64 / (1000.0 * 60.0 * 60.0 * 24.0);
+        if days <= 0.0 {
+            return FULL_STRENGTH;
+        }
+        FULL_STRENGTH * 0.5_f64.powf(days / HALF_LIFE_DAYS)
     }
 
     /// Whether this has decayed past the point of interrupting anything.
@@ -435,9 +474,10 @@ impl NegativeMemory {
 
     /// Whether this should be dropped from the store.
     pub fn is_forgotten(&self, now: DateTime<Utc>) -> bool {
-        // Not implemented: the spec is the test suite below.
-        let _ = (now, FORGET_DAYS);
-        false
+        now.signed_duration_since(self.last_confirmed_at)
+            .num_milliseconds() as f64
+            / (1000.0 * 60.0 * 60.0 * 24.0)
+            > FORGET_DAYS
     }
 
     /// Whether this burn interrupts `pending`.
@@ -447,9 +487,11 @@ impl NegativeMemory {
     /// not have been extinguished, it must be about this tool, it must still be
     /// loud enough, and everything it requires must hold.
     pub fn fires(&self, pending: &PendingAction, now: DateTime<Utc>) -> bool {
-        // Not implemented: the spec is the test suite below.
-        let _ = (pending, now);
-        true
+        self.kind == NegativeMemoryKind::Burn
+            && self.superseded_by.is_none()
+            && self.action == pending.action
+            && !self.is_silent(now)
+            && self.scope.matches(&pending.scope)
     }
 }
 
@@ -462,9 +504,18 @@ pub fn burns_that_fire<'a>(
     pending: &PendingAction,
     now: DateTime<Utc>,
 ) -> Vec<&'a NegativeMemory> {
-    // Not implemented: the spec is the test suite below.
-    let _ = (pending, now, MAX_WARNED_BURNS);
-    memories.iter().collect()
+    let mut fired: Vec<&NegativeMemory> =
+        memories.iter().filter(|m| m.fires(pending, now)).collect();
+    // Strongest first, then most-repeated, then by id so a tie is stable rather
+    // than left to the order the store happened to answer in.
+    fired.sort_by(|a, b| {
+        b.strength(now)
+            .total_cmp(&a.strength(now))
+            .then(b.occurrences.cmp(&a.occurrences))
+            .then(a.id.cmp(&b.id))
+    });
+    fired.truncate(MAX_WARNED_BURNS);
+    fired
 }
 
 /// What the model reads in place of the tool result, when a burn fires.
@@ -474,7 +525,9 @@ pub fn burns_that_fire<'a>(
 /// moment and should read as one rule rather than as two unrelated warnings.
 /// Returns `None` when nothing fired.
 pub fn render_warning(fired: &[&NegativeMemory], now: DateTime<Utc>) -> Option<String> {
-    // Not implemented: the spec is the test suite below.
+    if fired.is_empty() {
+        return None;
+    }
     let mut out = String::from(
         "This call has not run. The same call went badly before, and what follows is a \
          candidate warning, not a refusal.\n",
