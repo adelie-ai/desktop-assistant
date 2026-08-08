@@ -23,6 +23,11 @@ aws-sdk-bedrockruntime = { version = "1", default-features = false, features = [
     "rt-tokio",
 ] }
 aws-smithy-types = "1"
+# `RequestId`, to read the AWS request id off a `Converse`/`ConverseStream`
+# output for the `llm.call` trace span (#1152). Not re-exported by either SDK
+# crate, so it must be a direct dependency; already resolved transitively via
+# the SDK crates above, so this pins a version already in the lockfile.
+aws-types = "1"
 desktop-assistant-core.workspace = true
 desktop-assistant-llm-http.workspace = true
 serde.workspace = true
@@ -37,5 +42,7 @@ tracing.workspace = true
 # against a local mock endpoint instead of AWS.
 httpmock = "0.8"
 tokio = { workspace = true, features = ["test-util", "macros"] }
+tracing-subscriber.workspace = true
+
 [lints]
 workspace = true

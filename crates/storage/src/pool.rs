@@ -224,6 +224,11 @@ const MIGRATIONS: &[Migration] = &[
     // which of those the model opened. Its own tables rather than migration
     // 044's, whose foreign key to `knowledge_base(id)` a skill has no row for.
     migration!("048_skill_use_log.sql"),
+    // #1126: negative memory -- the actions that went badly, and the facets
+    // they went badly with, so the same act meets its own lesson before it is
+    // taken again. Extinction is an overlay, so a corrected burn stays
+    // readable beside the correction written over it.
+    migration!("049_negative_memory.sql"),
 ];
 
 /// Second half of the advisory-lock key: the schema the migrations write to.

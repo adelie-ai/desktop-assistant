@@ -44,6 +44,9 @@ use desktop_assistant_core::ports::session::{SessionId, with_session_id};
 use desktop_assistant_core::ports::transport::{
     ClientContext, with_client_context, with_client_label, with_co_location, with_transport_kind,
 };
+use desktop_assistant_core::ports::turn_telemetry::{
+    adopt_or_mint_turn_id, resolve_turn_trace, with_turn_trace,
+};
 use futures::sink::{Sink, SinkExt};
 use futures::stream::{Stream, StreamExt};
 use tokio::sync::mpsc;
@@ -402,6 +405,8 @@ pub async fn dispatch_loop<R, W>(
                 system_refinement,
                 client_context: per_turn_client_context,
                 idempotency_key,
+                turn_id,
+                traceparent,
             } => {
                 // Per-turn client context (#557, epic #549): a per-turn context
                 // supplied on the command REPLACES the connection's handshake
@@ -418,8 +423,24 @@ pub async fn dispatch_loop<R, W>(
                 // value, closing the #261 spawn-drop class for the override too.
                 let client_context =
                     effective_client_context(per_turn_client_context, client_context.clone());
-                // Per-request id for event correlation (matches old WS path).
-                let request_id = uuid::Uuid::new_v4().to_string();
+                // The turn's correlation id. A turn starts when a person
+                // commits an input, which happens in the client, so the client
+                // mints this and the daemon adopts it; the daemon mints only
+                // when none arrived, which is what keeps an older client
+                // working unchanged. The value is a correlation id and nothing
+                // else - it grants no capability and names no user, so it
+                // reaches no authorization or tenancy decision, and the
+                // capability check above has already run on the command kind
+                // alone. It is also not `idempotency_key`, which is the
+                // separate field the exactly-once retry path reads.
+                let request_id = adopt_or_mint_turn_id(turn_id.as_deref());
+                // The trace this turn belongs to, resolved here because this is
+                // the only place that knows both what the caller sent and what
+                // the daemon adopted. An incoming `traceparent` continues that
+                // caller's trace; otherwise the correlation id becomes the
+                // trace id. Neither input can fail the turn.
+                let turn_trace =
+                    resolve_turn_trace(traceparent.as_deref(), &request_id, &conversation_id);
                 // Reliable delivery to THIS connection. The handler additionally
                 // fans each turn event to other connections viewing the
                 // conversation (#1) — done there, not here, so the fan-out is
@@ -436,26 +457,29 @@ pub async fn dispatch_loop<R, W>(
                 // streamed events are stamped with, so a socket client
                 // can correlate the response (voice#49); the legacy path
                 // simply leaves `task_id` empty.
-                let task_id = with_client_context(
-                    client_context.clone(),
-                    with_co_location(
-                        co_located,
-                        with_client_label(
-                            client_label.clone(),
-                            with_transport_kind(
-                                transport,
-                                with_user_id(
-                                    user_id.clone(),
-                                    with_session_id(
-                                        session_id.clone(),
-                                        handler.start_send_message(
-                                            conversation_id.clone(),
-                                            content.clone(),
-                                            override_selection.clone(),
-                                            system_refinement.clone(),
-                                            request_id.clone(),
-                                            idempotency_key.clone(),
-                                            Arc::clone(&sink),
+                let task_id = with_turn_trace(
+                    Some(turn_trace.clone()),
+                    with_client_context(
+                        client_context.clone(),
+                        with_co_location(
+                            co_located,
+                            with_client_label(
+                                client_label.clone(),
+                                with_transport_kind(
+                                    transport,
+                                    with_user_id(
+                                        user_id.clone(),
+                                        with_session_id(
+                                            session_id.clone(),
+                                            handler.start_send_message(
+                                                conversation_id.clone(),
+                                                content.clone(),
+                                                override_selection.clone(),
+                                                system_refinement.clone(),
+                                                request_id.clone(),
+                                                idempotency_key.clone(),
+                                                Arc::clone(&sink),
+                                            ),
                                         ),
                                     ),
                                 ),
@@ -522,27 +546,31 @@ pub async fn dispatch_loop<R, W>(
                         let co_located_for_task = co_located;
                         let client_label_for_task = client_label.clone();
                         let client_context_for_task = client_context.clone();
+                        let turn_trace_for_task = turn_trace.clone();
                         tokio::spawn(async move {
-                            let _ = with_client_context(
-                                client_context_for_task,
-                                with_co_location(
-                                    co_located_for_task,
-                                    with_client_label(
-                                        client_label_for_task,
-                                        with_transport_kind(
-                                            transport_for_task,
-                                            with_user_id(
-                                                user_id_for_task,
-                                                with_session_id(
-                                                    session_id_for_task,
-                                                    handler.handle_send_message_with_override(
-                                                        conversation_id,
-                                                        content,
-                                                        override_selection,
-                                                        system_refinement,
-                                                        request_id,
-                                                        idempotency_key,
-                                                        sink,
+                            let _ = with_turn_trace(
+                                Some(turn_trace_for_task),
+                                with_client_context(
+                                    client_context_for_task,
+                                    with_co_location(
+                                        co_located_for_task,
+                                        with_client_label(
+                                            client_label_for_task,
+                                            with_transport_kind(
+                                                transport_for_task,
+                                                with_user_id(
+                                                    user_id_for_task,
+                                                    with_session_id(
+                                                        session_id_for_task,
+                                                        handler.handle_send_message_with_override(
+                                                            conversation_id,
+                                                            content,
+                                                            override_selection,
+                                                            system_refinement,
+                                                            request_id,
+                                                            idempotency_key,
+                                                            sink,
+                                                        ),
                                                     ),
                                                 ),
                                             ),

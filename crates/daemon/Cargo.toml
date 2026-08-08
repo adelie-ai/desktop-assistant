@@ -11,7 +11,11 @@ license = "AGPL-3.0-or-later"
 # never in place of it, so an exporting build still prints locally. Everything
 # about where telemetry goes comes from the standard OTEL_* environment
 # variables; there is no flag and no DESKTOP_ASSISTANT_* variable for it.
-otel = ["adelie-telemetry/otel"]
+# `core` is named too: it holds the only code that gives a turn span the trace
+# id its request id spells, and that code is behind that crate's own `otel`
+# feature. Without this line an exporting daemon would produce spans whose
+# trace ids nothing in a user report can find.
+otel = ["adelie-telemetry/otel", "desktop-assistant-core/otel"]
 
 [dependencies]
 desktop-assistant-application = { path = "../application" }

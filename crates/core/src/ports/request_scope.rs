@@ -56,6 +56,7 @@ use crate::ports::transport::{
 use crate::ports::turn_interactivity::{
     TurnInteractivity, current_turn_interactivity, with_turn_interactivity,
 };
+use crate::ports::turn_telemetry::{TurnTrace, current_turn_trace, with_turn_trace};
 
 /// The set of request-scoped task-locals that must be re-installed inside a
 /// spawned turn body. Capture it before the spawn, re-install it inside.
@@ -95,6 +96,12 @@ pub struct RequestScope {
     /// runs on a spawned task inherits the decision its caller made rather than
     /// re-deriving it from the session it also carries.
     pub interactivity: TurnInteractivity,
+    /// Which trace this turn belongs to, and which conversation it is part of.
+    /// Resolved at the transport boundary, which is the only place that knows
+    /// both what the client sent and what the daemon adopted. `None` where the
+    /// turn reached the loop by another door, and the loop then mints its own
+    /// from the correlation id.
+    pub turn_trace: Option<TurnTrace>,
 }
 
 impl RequestScope {
@@ -114,6 +121,7 @@ impl RequestScope {
             client_label: current_client_label(),
             client_context: current_client_context(),
             interactivity: current_turn_interactivity(),
+            turn_trace: current_turn_trace(),
         }
     }
 
@@ -147,19 +155,23 @@ impl RequestScope {
             client_label,
             client_context,
             interactivity,
+            turn_trace,
         } = self;
         let fut = Box::pin(fut);
-        with_turn_interactivity(
-            interactivity,
-            with_client_context(
-                client_context,
-                with_co_location(
-                    co_located,
-                    with_client_label(
-                        client_label,
-                        with_transport_kind(
-                            transport,
-                            with_user_id(user_id, with_session_id(session_id, fut)),
+        with_turn_trace(
+            turn_trace,
+            with_turn_interactivity(
+                interactivity,
+                with_client_context(
+                    client_context,
+                    with_co_location(
+                        co_located,
+                        with_client_label(
+                            client_label,
+                            with_transport_kind(
+                                transport,
+                                with_user_id(user_id, with_session_id(session_id, fut)),
+                            ),
                         ),
                     ),
                 ),
@@ -184,6 +196,7 @@ mod tests {
         assert_eq!(scope.client_label, None);
         assert_eq!(scope.client_context, None);
         assert_eq!(scope.interactivity, TurnInteractivity::Headless);
+        assert_eq!(scope.turn_trace, None);
     }
 
     #[tokio::test]
@@ -197,19 +210,23 @@ mod tests {
             timezone: Some("Europe/London".to_string()),
             ..ClientContext::default()
         };
-        let captured = with_client_context(
-            Some(client_context.clone()),
-            with_co_location(
-                Some(true),
-                with_client_label(
-                    Some("laptop".to_string()),
-                    with_transport_kind(
-                        TransportKind::WebSocket,
-                        with_user_id(
-                            UserId::new("alice"),
-                            with_session_id(SessionId::new("sess-9"), async {
-                                RequestScope::capture()
-                            }),
+        let turn_trace = TurnTrace::minted(Some(TURN_ID), "conv-9");
+        let captured = with_turn_trace(
+            Some(turn_trace.clone()),
+            with_client_context(
+                Some(client_context.clone()),
+                with_co_location(
+                    Some(true),
+                    with_client_label(
+                        Some("laptop".to_string()),
+                        with_transport_kind(
+                            TransportKind::WebSocket,
+                            with_user_id(
+                                UserId::new("alice"),
+                                with_session_id(SessionId::new("sess-9"), async {
+                                    RequestScope::capture()
+                                }),
+                            ),
                         ),
                     ),
                 ),
@@ -224,6 +241,7 @@ mod tests {
         assert_eq!(captured.client_label, Some("laptop".to_string()));
         assert_eq!(captured.client_context, Some(client_context.clone()));
         assert_eq!(captured.interactivity, TurnInteractivity::Interactive);
+        assert_eq!(captured.turn_trace, Some(turn_trace.clone()));
 
         // Re-install from the captured bundle in a context where none of the
         // locals are set (simulating the post-spawn task) and read them back.
@@ -238,6 +256,7 @@ mod tests {
                     current_client_label(),
                     current_client_context(),
                     current_turn_interactivity(),
+                    current_turn_trace(),
                 )
             })
             .await;
@@ -249,6 +268,43 @@ mod tests {
         assert_eq!(observed.4, Some("laptop".to_string()));
         assert_eq!(observed.5, Some(client_context));
         assert_eq!(observed.6, TurnInteractivity::Interactive);
+        assert_eq!(observed.7, Some(turn_trace));
+    }
+
+    /// A turn id, as a client mints one.
+    const TURN_ID: &str = "11111111-2222-4333-8444-555555555555";
+
+    #[tokio::test]
+    async fn the_turn_trace_rides_request_scope_across_a_real_spawn() {
+        // The one hop this whole feature depends on. The transport resolves
+        // the trace, the turn body runs on a fresh `tokio::spawn`, and a
+        // task-local does not cross that boundary. Without the bundle
+        // re-installing it, every round, provider call and tool dispatch
+        // records an unset conversation, and every outbound MCP call injects
+        // nothing - silently, because a missing task-local reads as a default
+        // rather than as a failure. That is the #261 class, on the hop that
+        // would hide it best.
+        let trace = TurnTrace::minted(Some(TURN_ID), "conv-9");
+        let captured =
+            with_turn_trace(Some(trace.clone()), async { RequestScope::capture() }).await;
+
+        let observed = tokio::spawn(async move {
+            let before = current_turn_trace();
+            let inside = captured.scope(async { current_turn_trace() }).await;
+            (before, inside)
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            observed.0, None,
+            "the task-local must not cross the spawn, or this proves nothing"
+        );
+        assert_eq!(
+            observed.1,
+            Some(trace),
+            "RequestScope must re-install the turn's trace inside the spawn"
+        );
     }
 
     #[tokio::test]
@@ -296,6 +352,10 @@ mod tests {
                 ..ClientContext::default()
             }),
             interactivity: TurnInteractivity::Interactive,
+            turn_trace: Some(TurnTrace::minted(
+                Some("11111111-2222-4333-8444-555555555555"),
+                "conv-1",
+            )),
         };
         scope.scope(async {}).await;
 
@@ -306,6 +366,7 @@ mod tests {
         assert_eq!(current_co_location(), None);
         assert_eq!(current_client_label(), None);
         assert_eq!(current_client_context(), None);
+        assert_eq!(current_turn_trace(), None);
         assert_eq!(current_turn_interactivity(), TurnInteractivity::Headless);
     }
 }

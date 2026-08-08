@@ -108,6 +108,52 @@ pub struct SendAck {
     pub task_id: String,
 }
 
+/// What a client says about the trace a turn belongs to.
+///
+/// A turn starts when a person commits an input, and that happens in the
+/// client, so the client is the top of the trace and mints the id. The daemon
+/// adopts it as the `request_id` it stamps every streamed event with, so one
+/// value is greppable in the client's own log, in the daemon's log, and in a
+/// trace backend.
+///
+/// None of this needs an exporter. A desktop client installed with
+/// `cargo install` runs a default-feature build that exports no span at all,
+/// and it still mints and sends the id, so the daemon produces a trace whose id
+/// matches what the client printed. Correlation survives where export does not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnTrace {
+    /// The turn's correlation id, as a uuid. The daemon adopts a well-formed,
+    /// non-nil value and mints its own otherwise.
+    pub turn_id: String,
+    /// A W3C `traceparent` for a caller that is already inside a trace, so the
+    /// daemon continues that trace rather than starting one. `None` where the
+    /// client is the top of the trace, which is the ordinary case.
+    pub traceparent: Option<String>,
+}
+
+impl TurnTrace {
+    /// A fresh turn id, and no trace to continue.
+    ///
+    /// The client is the root of its own trace. This is what every
+    /// `send_prompt*` method uses.
+    #[must_use]
+    pub fn mint() -> Self {
+        Self {
+            turn_id: uuid::Uuid::new_v4().to_string(),
+            traceparent: None,
+        }
+    }
+
+    /// A turn id, plus the trace a caller is already inside.
+    #[must_use]
+    pub fn continuing(turn_id: String, traceparent: String) -> Self {
+        Self {
+            turn_id,
+            traceparent: Some(traceparent),
+        }
+    }
+}
+
 #[async_trait]
 pub trait AssistantCommands: Send + Sync {
     /// Serialize `command` as a `WsRequest`, send it over the transport, and
@@ -345,6 +391,10 @@ pub trait AssistantCommands: Send + Sync {
     ///
     /// This is the single chokepoint every `send_prompt*` method routes through,
     /// so the ack-handling and wire shape live in one place.
+    ///
+    /// The turn id it sends is minted here. See
+    /// [`send_prompt_traced`](Self::send_prompt_traced) for a caller that has a
+    /// trace of its own to continue.
     async fn send_prompt_idempotent_ack(
         &self,
         conversation_id: &str,
@@ -352,6 +402,34 @@ pub trait AssistantCommands: Send + Sync {
         override_selection: Option<api::SendPromptOverride>,
         system_refinement: String,
         idempotency_key: Option<String>,
+    ) -> Result<SendAck> {
+        self.send_prompt_traced(
+            conversation_id,
+            prompt,
+            override_selection,
+            system_refinement,
+            idempotency_key,
+            TurnTrace::mint(),
+        )
+        .await
+    }
+
+    /// Like [`send_prompt_idempotent_ack`](Self::send_prompt_idempotent_ack)
+    /// but with the turn's trace context stated rather than minted.
+    ///
+    /// A caller that already sits inside a trace - the web BFF forwarding a
+    /// browser's turn, one daemon calling another - passes what it has, and the
+    /// daemon continues that trace instead of starting a second one. A caller
+    /// that only wants the correlation id passes [`TurnTrace::mint`], which is
+    /// what every other `send_prompt*` method does.
+    async fn send_prompt_traced(
+        &self,
+        conversation_id: &str,
+        prompt: &str,
+        override_selection: Option<api::SendPromptOverride>,
+        system_refinement: String,
+        idempotency_key: Option<String>,
+        trace: TurnTrace,
     ) -> Result<SendAck> {
         let result = self
             .send_command(api::Command::SendMessage {
@@ -364,6 +442,8 @@ pub trait AssistantCommands: Send + Sync {
                 // browser-multiplexed web BFF); so no per-turn override here.
                 client_context: None,
                 idempotency_key,
+                turn_id: Some(trace.turn_id),
+                traceparent: trace.traceparent,
             })
             .await?;
         // The daemon replies with `SendMessageAck { request_id, task_id }`:
@@ -862,6 +942,162 @@ mod tests {
         async fn send_command(&self, command: api::Command) -> Result<api::CommandResult> {
             *self.last.lock().unwrap() = Some(command);
             Ok(self.reply.clone())
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // The client is the top of the trace (epic D12).
+    // -----------------------------------------------------------------
+
+    /// The turn id the last recorded send carried.
+    fn sent_turn_id(client: &RecordingClient) -> String {
+        match client.last() {
+            api::Command::SendMessage { turn_id, .. } => {
+                turn_id.expect("every send from this client carries a turn id")
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    fn ack_client() -> RecordingClient {
+        RecordingClient::new(api::CommandResult::SendMessageAck {
+            request_id: "req-1".to_string(),
+            task_id: "task-1".to_string(),
+        })
+    }
+
+    #[tokio::test]
+    async fn client_mints_and_propagates_with_otel_off() {
+        // This crate has no `otel` feature and resolves no opentelemetry crate.
+        // A desktop install from `cargo install` runs exactly this build and
+        // exports no span at all, and it still mints the id the daemon adopts,
+        // so the daemon produces a trace whose id matches what the client
+        // printed. Correlation survives where export does not.
+        let client = ack_client();
+        client.send_prompt("conv-1", "hello").await.unwrap();
+
+        let turn_id = sent_turn_id(&client);
+        let parsed = uuid::Uuid::parse_str(&turn_id)
+            .unwrap_or_else(|e| panic!("the client must mint a uuid, got {turn_id:?}: {e}"));
+        assert!(
+            !parsed.is_nil(),
+            "the nil uuid spells the trace id the W3C spec reserves as invalid,              so the daemon would discard it and mint its own"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_send_path_mints_a_turn_id() {
+        // Four public entry points reach one chokepoint. A path that skipped
+        // the mint would leave that client silently rooted at the daemon.
+        let client = ack_client();
+
+        client.send_prompt("conv-1", "hello").await.unwrap();
+        let plain = sent_turn_id(&client);
+
+        client
+            .send_prompt_with_override("conv-1", "hello", None)
+            .await
+            .unwrap();
+        let with_override = sent_turn_id(&client);
+
+        client
+            .send_prompt_with_system_refinement("conv-1", "hello", "briefly")
+            .await
+            .unwrap();
+        let with_refinement = sent_turn_id(&client);
+
+        client
+            .send_prompt_idempotent("conv-1", "hello", None, String::new(), Some("k".into()))
+            .await
+            .unwrap();
+        let idempotent = sent_turn_id(&client);
+
+        for id in [&plain, &with_override, &with_refinement, &idempotent] {
+            assert!(
+                uuid::Uuid::parse_str(id).is_ok_and(|u| !u.is_nil()),
+                "{id:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn two_turns_get_different_turn_ids() {
+        // One id per turn, not one per client. Two turns sharing an id would
+        // merge two traces and make each turn's duration meaningless.
+        let client = ack_client();
+        client.send_prompt("conv-1", "first").await.unwrap();
+        let first = sent_turn_id(&client);
+        client.send_prompt("conv-1", "second").await.unwrap();
+        let second = sent_turn_id(&client);
+        assert_ne!(first, second);
+    }
+
+    #[tokio::test]
+    async fn a_minted_turn_sends_no_traceparent() {
+        // The client is the root, so there is no trace to continue. Sending an
+        // invented one would make the daemon join a trace nobody started.
+        let client = ack_client();
+        client.send_prompt("conv-1", "hello").await.unwrap();
+        match client.last() {
+            api::Command::SendMessage { traceparent, .. } => assert!(traceparent.is_none()),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_caller_inside_a_trace_states_it_rather_than_minting() {
+        // The web BFF's case: a browser started the turn, so the BFF forwards
+        // the browser's id and the trace it belongs to rather than replacing
+        // either.
+        let client = ack_client();
+        let header = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        client
+            .send_prompt_traced(
+                "conv-1",
+                "hello",
+                None,
+                String::new(),
+                None,
+                TurnTrace::continuing("11111111-2222-4333-8444-555555555555".into(), header.into()),
+            )
+            .await
+            .unwrap();
+
+        match client.last() {
+            api::Command::SendMessage {
+                turn_id,
+                traceparent,
+                ..
+            } => {
+                assert_eq!(
+                    turn_id.as_deref(),
+                    Some("11111111-2222-4333-8444-555555555555")
+                );
+                assert_eq!(traceparent.as_deref(), Some(header));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_turn_id_never_becomes_the_idempotency_key() {
+        // Two fields, two purposes. A send with no idempotency key must still
+        // carry a turn id, and the key slot must stay empty.
+        let client = ack_client();
+        client.send_prompt("conv-1", "hello").await.unwrap();
+        match client.last() {
+            api::Command::SendMessage {
+                idempotency_key,
+                turn_id,
+                ..
+            } => {
+                assert!(turn_id.is_some());
+                assert!(
+                    idempotency_key.is_none(),
+                    "minting a turn id must not enrol the send in the retry path"
+                );
+            }
+            other => panic!("unexpected {other:?}"),
         }
     }
 

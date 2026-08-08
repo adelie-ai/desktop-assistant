@@ -1091,6 +1091,8 @@ async fn ws_send_message_ack_then_streaming_events() {
             system_refinement: String::new(),
             client_context: None,
             idempotency_key: Some("idem-1".into()),
+            turn_id: None,
+            traceparent: None,
         },
     };
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
@@ -1257,6 +1259,8 @@ async fn ws_send_message_cancels_when_client_disconnects() {
             system_refinement: String::new(),
             client_context: None,
             idempotency_key: None,
+            turn_id: None,
+            traceparent: None,
         },
     };
     ws.send(tokio_tungstenite::tungstenite::Message::Text(

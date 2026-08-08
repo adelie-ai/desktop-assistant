@@ -122,17 +122,105 @@ turning anything on and without reproducing the turn.
 
 ### The identifier to start from
 
-The daemon mints one `request_id` per turn and stamps it on every event that
-turn streams, so a client already shows it. That value is a field on the turn
-span, and every line the turn writes carries it through span scope:
+One `request_id` per turn, stamped on every event that turn streams, so a
+client already shows it. That value is a field on the turn span, and every line
+the turn writes carries it through span scope:
 
 ```text
-INFO turn{request_id="4bf92f35-..." conversation_id="c-91" user_id="alice"}: executing tool tool=web_fetch arg_bytes=214
+INFO turn{request_id="4bf92f35-..." trace_id="4bf92f3577b34da6a3ce929d0e0e4736" conversation_id="c-91" user_id="alice"}: executing tool tool=web_fetch arg_bytes=214
 ```
 
-So one identifier, taken from a client's own event stream, greps the pod log
-and finds the turn. Carrying it *between* processes - client to daemon, daemon
-to an MCP server - is separate work and is not done yet.
+The `trace_id` beside it is normally the same value. A uuid is 16 bytes and a
+W3C trace id is 16 bytes, so the request id becomes the trace id directly, with
+no mapping table and no second identifier. One string therefore greps the pod
+log, appears in the client's own event stream, and finds the trace in a
+backend, and it can be pasted from any one of the three into any other.
+
+That holds with the `otel` feature off. What the feature adds is export, not
+correlation.
+
+**One case makes them differ, and it is worth knowing before you go looking.**
+When a caller supplies a `traceparent` - the web BFF forwarding a browser's
+turn - the daemon continues *that* trace, so `trace_id` is the caller's and
+`request_id` stays the correlation id the client reads its own stream by.
+Pasting the request id into a backend then finds nothing. The turn's own log
+line carries both, so the trace id is one grep away.
+
+### Who mints it
+
+A turn starts when a person presses send or stops speaking, and that happens in
+the client. So the client mints the id and the daemon adopts it. The daemon
+mints its own only when none arrives, which is what keeps an older client
+working unchanged - a client that sends nothing is a supported configuration,
+not a degraded one.
+
+The daemon accepts a well-formed, non-nil uuid and falls back to minting for
+anything else. A malformed value never fails the turn.
+
+**`request_id` is no longer unique by construction.** The daemon used to mint it
+per send, so nothing could collide. A client now chooses it, and the daemon
+checks its shape and not its novelty. Nothing inside the daemon keys on it - the
+in-flight index and the idempotency store key on the user, the conversation and
+the idempotency key, and event delivery is scoped by user id - so a repeated
+value costs a confusing trace and nothing else there.
+
+Two consequences reach a client, and both are worth stating for an integrator
+writing against this API:
+
+- **Mint one id per turn, not one per session.** A client dedupes the echoed
+  `UserMessageAdded` on `request_id`, because it already rendered that bubble
+  optimistically. Reusing an id across two turns in one conversation therefore
+  suppresses the second bubble in the client that sent it. The shipped clients
+  mint per send and never hit this.
+- **A process that multiplexes several callers over one daemon connection must
+  mint its own value for the daemon hop** rather than forward what it was
+  given, because it demultiplexes the reply stream on what comes back. The web
+  BFF is the one that does this, and it carries the caller's trace in
+  `traceparent` instead, which loses nothing: the daemon joins that trace
+  either way.
+
+The id is a correlation id and nothing else. It grants no capability and names
+no user, so it reaches no authorization or tenancy decision. It is also not the
+idempotency key, which is a separate field on the same command and is what the
+exactly-once retry path reads.
+
+### Which boundaries carry the trace, and which do not
+
+A trace is only useful if it survives a process boundary, and none of these
+boundaries is plain HTTP, so none of them gets it for free.
+
+| Boundary | How the context travels |
+|---|---|
+| Client to daemon, over UDS, WebSocket or D-Bus | `turn_id` and `traceparent`, two optional fields on the `SendMessage` command. The frames are our own and have no header concept. |
+| Daemon to a stdio MCP server | `params._meta.traceparent` on the JSON-RPC request. A pipe has no headers, and `_meta` is the MCP spec's own place for protocol metadata. |
+| Daemon to a remote MCP server, over Streamable HTTP | A real `traceparent` request header, which is what a server nobody here owns understands. |
+| Browser to the web BFF to the daemon | The browser mints an id and sends it. The BFF mints its own `turn_id` for the daemon hop and passes the browser's trace on in `traceparent`, so the daemon joins the browser's trace. Three processes, one trace. |
+
+Two boundaries deliberately carry nothing, and both are worth knowing about
+before an operator goes looking for the missing half:
+
+- **An LLM provider.** No provider continues our trace and none ever will. The
+  useful move there is capture rather than propagation: the provider's own
+  request identifier is recorded on the `llm.call` span as
+  `provider_request_id`. That is the value to quote when opening a support
+  ticket with the provider, and it is the closest thing to end-to-end that this
+  boundary allows. Ollama reports no such identifier, so its calls carry none.
+- **A D-Bus caller.** `SendPrompt(conversation_id, prompt)` has no room for a
+  caller-supplied id and no options dictionary to add one to, and widening that
+  signature would break every existing caller. So the bridge mints, and the
+  bridge is the top of the trace for a D-Bus caller such as the KDE plasmoid.
+  The caller still gets a correlatable turn: the id the method returns is the
+  one the daemon stamps on every streamed event.
+
+`tracestate` is not sent on any boundary. Nothing in this fleet sets one, and
+an empty one carries no information a receiver can use.
+
+### A conversation is not a trace
+
+A conversation lives for days and holds an unbounded number of turns, which is
+not a shape any backend renders usefully. So the conversation id is an
+attribute on every span in the turn rather than a trace of its own, and one
+backend query still returns every turn in a conversation.
 
 ### The shape of a turn
 
@@ -146,19 +234,19 @@ turn                       one turn, the root
     llm.call
 ```
 
-A conversation is deliberately **not** a trace. It lives for days and holds an
-unbounded number of turns, which no backend renders usefully. `conversation_id`
-is an attribute on the turn span instead, so one query still returns every turn
-in a conversation.
+An MCP server's own spans join this tree. A stdio server hangs its work under
+the `tool.call` that dispatched it; with the `otel` feature off the daemon has
+no span id to name, so the server's spans hang under the turn instead. The
+trace is the same either way, and only the shape differs.
 
-Field summary:
+Field summary. Every span carries `conversation_id`.
 
 | span | fields |
 |---|---|
-| `turn` | `request_id`, `conversation_id`, `user_id`, `connection_id`, `provider`, `model`, then `rounds`, `outcome` and `duration_ms` when it ends |
-| `turn.round` | `round` (one-based), `tools`, `outcome`, and the four token counts the provider reported |
-| `llm.call` | `purpose`, `provider`, `model`, plus `round` and `outcome` for a round's own call |
-| `tool.call` | `tool`, `runner` (`client` or `server`), `outcome` |
+| `turn` | `request_id`, `trace_id`, `conversation_id`, `user_id`, `connection_id`, `provider`, `model`, then `rounds`, `outcome` and `duration_ms` when it ends |
+| `turn.round` | `round` (one-based), `conversation_id`, `tools`, `outcome`, and the four token counts the provider reported |
+| `llm.call` | `purpose`, `provider`, `model`, `conversation_id`, `provider_request_id`, plus `round` and `outcome` for a round's own call |
+| `tool.call` | `tool`, `runner` (`client` or `server`), `conversation_id`, `outcome` |
 | `recall.lookup` | `conversation_id` |
 
 `connection_id` reads `unset` when routing fell through to the statically
@@ -349,6 +437,11 @@ cargo build -p desktop-assistant-daemon --features otel
 cargo build -p desktop-assistant-dbus-bridge --features otel
 ```
 
+The daemon's feature turns on `desktop-assistant-core`'s own `otel` feature,
+which is what gives a turn span the trace id its request id spells. A build
+without it still mints and carries the id everywhere described above; it simply
+exports no span.
+
 With the feature on, the OTLP layers are added *beside* the console layer,
 never in place of it, so an exporting build still prints locally. The feature
 compiles the TLS backend, which needs a C compiler and an assembler
@@ -391,6 +484,14 @@ OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf \
 
 Each binary reports its own `service.name`: `adele-daemon` and
 `adele-dbus-bridge`.
+
+**`OTEL_SERVICE_NAME` does not change it.** The name is passed to the SDK's
+resource builder in code, and a value supplied there wins over the variable, so
+the variable is read and then overwritten. Verified in a running pod: with
+`OTEL_SERVICE_NAME` set to another value, every record still arrived as
+`service.name=adele-daemon`. Do not set it, and do not use it to tell two
+deployments apart - carry `OTEL_RESOURCE_ATTRIBUTES` for that, which the same
+builder merges rather than replaces. Tracked in `adelie-ai/adelie-telemetry#11`.
 
 ### Choosing a transport
 

@@ -38,6 +38,7 @@ use desktop_assistant_core::ports::embedding::EmbeddingClient;
 use desktop_assistant_core::ports::llm::{
     ChunkCallback, LlmClient, LlmResponse, ModelInfo, ReasoningConfig, TokenUsage,
     ToolCallAccumulator, current_cancellation_token, current_model_override,
+    record_provider_request_id,
 };
 use desktop_assistant_llm_http::{
     Clock, ModelCache, STREAM_CONNECT_TIMEOUT, STREAM_EVENT_TIMEOUT, StreamStep, apply_context_cap,
@@ -475,6 +476,20 @@ impl GoogleClient {
                 .await
                 .unwrap_or_else(|_| "unable to read body".into());
             return Err(errors::classify_http_error(status, &headers, &body));
+        }
+
+        // Capture Google's own request id onto the open `llm.call` span
+        // (#1152), before `bytes_stream()` consumes `response`. Google does
+        // not always send this header, so an absent header must record
+        // nothing rather than an empty string; `record_provider_request_id`
+        // already ignores an empty value, and `if let Some` here means the
+        // absent-header case never calls it at all.
+        if let Some(request_id) = response
+            .headers()
+            .get("x-goog-request-id")
+            .and_then(|v| v.to_str().ok())
+        {
+            record_provider_request_id(request_id);
         }
 
         let mut events = response.bytes_stream().eventsource();
@@ -1111,5 +1126,232 @@ mod tests {
         let warm = client.list_models().await.expect("served from cache");
         assert_eq!(recovered, warm);
         ok.assert_calls(1);
+    }
+
+    // --- Provider request id capture (#1152) ------------------------------
+    //
+    // A minimal `tracing` layer that reads a named span's fields back in
+    // process, modelled on `SpanCapture` in
+    // `crates/core/tests/turn_telemetry.rs` but pared down to what these
+    // tests need: one span, read once the call under test has finished.
+
+    #[derive(Clone, Default)]
+    struct RequestIdSpanCapture(
+        std::sync::Arc<
+            std::sync::Mutex<
+                std::collections::HashMap<String, std::collections::HashMap<String, String>>,
+            >,
+        >,
+    );
+
+    struct RequestIdFieldVisitor<'a>(&'a mut std::collections::HashMap<String, String>);
+
+    impl tracing::field::Visit for RequestIdFieldVisitor<'_> {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+    }
+
+    impl<S> tracing_subscriber::layer::Layer<S> for RequestIdSpanCapture
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            _id: &tracing::span::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = std::collections::HashMap::new();
+            attrs.record(&mut RequestIdFieldVisitor(&mut fields));
+            self.0
+                .lock()
+                .expect("capture lock")
+                .insert(attrs.metadata().name().to_string(), fields);
+        }
+
+        fn on_record(
+            &self,
+            id: &tracing::span::Id,
+            values: &tracing::span::Record<'_>,
+            ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let Some(span) = ctx.span(id) else {
+                return;
+            };
+            let mut all = self.0.lock().expect("capture lock");
+            let fields = all.entry(span.name().to_string()).or_default();
+            values.record(&mut RequestIdFieldVisitor(fields));
+        }
+    }
+
+    impl RequestIdSpanCapture {
+        /// The fields recorded on the span named `name`, or empty if that
+        /// span was never opened.
+        fn fields_of(&self, name: &str) -> std::collections::HashMap<String, String> {
+            self.0
+                .lock()
+                .expect("capture lock")
+                .get(name)
+                .cloned()
+                .unwrap_or_default()
+        }
+    }
+
+    /// Build a capturing subscriber and an `llm.call` span shaped exactly
+    /// like core's `llm_span`/`aux_llm_span`: `provider_request_id` declared
+    /// as `tracing::field::Empty`. A connector's `record_provider_request_id`
+    /// call needs that declaration to have a field to land on - `tracing`
+    /// silently drops a `record` for a field the span never declared, which
+    /// is the trap this mirrors core's shape to avoid.
+    ///
+    /// The `DefaultGuard` must stay alive for the whole call under test; drop
+    /// it only after the fields have been read back.
+    fn request_id_capture() -> (
+        RequestIdSpanCapture,
+        tracing::subscriber::DefaultGuard,
+        tracing::Span,
+    ) {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let capture = RequestIdSpanCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let guard = tracing::subscriber::set_default(subscriber);
+        let span = tracing::info_span!("llm.call", provider_request_id = tracing::field::Empty);
+        (capture, guard, span)
+    }
+
+    /// A minimal `GenerateContentResponse` SSE frame: an empty JSON object
+    /// parses through `#[serde(default)]` on every field, so the stream ends
+    /// with no candidates and no usage - enough to make `send_and_stream`
+    /// return `Ok` without needing a realistic completion body.
+    const STUB_GEMINI_SSE_BODY: &str = "data: {}\n\n";
+
+    #[tokio::test]
+    async fn google_call_records_the_provider_request_id() {
+        use desktop_assistant_core::domain::Role;
+        use tracing::Instrument;
+
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path_matches(r"streamGenerateContent");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .header("x-goog-request-id", "req_test_google_789")
+                .body(STUB_GEMINI_SSE_BODY);
+        });
+
+        let client = GoogleClient::new("k".into())
+            .with_auth_mode(AuthMode::ApiKey)
+            .with_base_url(server.url(""));
+        let (capture, _guard, span) = request_id_capture();
+
+        let _ = client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .instrument(span)
+            .await;
+
+        let fields = capture.fields_of("llm.call");
+        assert_eq!(
+            fields.get("provider_request_id").map(String::as_str),
+            Some("req_test_google_789"),
+            "the connector must record Google's x-goog-request-id header onto the span"
+        );
+    }
+
+    #[tokio::test]
+    async fn google_call_without_a_request_id_header_records_nothing() {
+        use desktop_assistant_core::domain::Role;
+        use tracing::Instrument;
+
+        // Google does not always send `x-goog-request-id`; an absent header
+        // is a normal response, not a malformed one.
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path_matches(r"streamGenerateContent");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(STUB_GEMINI_SSE_BODY);
+        });
+
+        let client = GoogleClient::new("k".into())
+            .with_auth_mode(AuthMode::ApiKey)
+            .with_base_url(server.url(""));
+        let (capture, _guard, span) = request_id_capture();
+
+        let _ = client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .instrument(span)
+            .await;
+
+        let fields = capture.fields_of("llm.call");
+        assert!(
+            !fields.contains_key("provider_request_id"),
+            "an absent header must leave the field empty, not record an empty string: {fields:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn google_call_neutralises_a_control_character_in_the_request_id() {
+        use desktop_assistant_core::domain::Role;
+        use tracing::Instrument;
+
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path_matches(r"streamGenerateContent");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                // A literal newline cannot ride in an HTTP header value at
+                // all - `http::HeaderValue` rejects the byte outright, so
+                // that injection is stopped by the transport itself, not by
+                // this connector. A tab is the one C0 control character the
+                // transport does carry (`HeaderValue` allows byte 9), so it
+                // is what proves the connector routes the header through
+                // `Safe::name` rather than passing it through raw.
+                .header("x-goog-request-id", "req\ttest")
+                .body(STUB_GEMINI_SSE_BODY);
+        });
+
+        let client = GoogleClient::new("k".into())
+            .with_auth_mode(AuthMode::ApiKey)
+            .with_base_url(server.url(""));
+        let (capture, _guard, span) = request_id_capture();
+
+        let _ = client
+            .stream_completion(
+                vec![Message::new(Role::User, "hi")],
+                &[],
+                ReasoningConfig::default(),
+                Box::new(|_| true),
+            )
+            .instrument(span)
+            .await;
+
+        let fields = capture.fields_of("llm.call");
+        let recorded = fields
+            .get("provider_request_id")
+            .expect("a present header, even a deceptive one, must still record a value");
+        assert_eq!(
+            recorded, "req\u{fffd}test",
+            "Safe::name must replace the control character with U+FFFD, not pass it through"
+        );
     }
 }

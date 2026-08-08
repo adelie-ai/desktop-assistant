@@ -426,6 +426,8 @@ async fn send_message_ack_carries_a_real_task_id() {
                 system_refinement: String::new(),
                 client_context: None,
                 idempotency_key: None,
+                turn_id: None,
+                traceparent: None,
             },
         }],
     );
@@ -500,6 +502,8 @@ async fn send_message_falls_back_to_legacy_ack_when_handler_opts_out() {
                 system_refinement: String::new(),
                 client_context: None,
                 idempotency_key: None,
+                turn_id: None,
+                traceparent: None,
             },
         }],
     );
@@ -695,6 +699,8 @@ async fn send_message_ack_request_id_matches_streamed_event_request_id() {
                 system_refinement: String::new(),
                 client_context: None,
                 idempotency_key: None,
+                turn_id: None,
+                traceparent: None,
             },
         }],
     );

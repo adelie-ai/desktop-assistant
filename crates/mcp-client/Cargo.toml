@@ -55,6 +55,10 @@ http = ["dep:reqwest", "dep:sha2", "dep:base64", "dep:url", "dep:rand"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
+# The `traceparent` parser, so the propagation tests read back what went on the
+# wire rather than comparing a formatted string to itself. Already in the tree
+# through `desktop-assistant-core`.
+adelie-telemetry.workspace = true
 httpmock = "0.8"
 tempfile = "3"
 async-trait.workspace = true

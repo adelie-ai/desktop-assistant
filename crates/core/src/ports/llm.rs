@@ -619,6 +619,41 @@ impl ReasoningConfig {
     }
 }
 
+/// The span field a connector reports the provider's own request id on.
+///
+/// Named once, here, because the connectors record onto a span this crate
+/// builds and `tracing` drops a `record` for a field the span never declared.
+/// A silent drop is exactly what a drifting string literal produces.
+pub const PROVIDER_REQUEST_ID_FIELD: &str = "provider_request_id";
+
+/// Put the provider's own request identifier on the open provider-call span.
+///
+/// A trace stops at a boundary we do not own: no LLM provider continues our
+/// trace, and none ever will. The useful move there is capture rather than
+/// propagation. This is the value quoted when a support ticket is opened with
+/// a provider - Bedrock's request id, an `x-request-id` header - and it is the
+/// closest thing to end-to-end that this boundary allows.
+///
+/// A connector calls this while its call is in flight, where the `llm.call`
+/// span is the open one. Outside such a span the call does nothing, which is
+/// what a model-catalog or embedding round trip made outside a turn should do.
+///
+/// An identifier is an id, not content, so it belongs at INFO under D10. The
+/// value still arrives from a remote host, so it goes through
+/// `adelie_telemetry::Safe::name`, which bounds it and strips the control,
+/// bidi and line-breaking characters that would otherwise let a header end the
+/// log line and start one that reads as genuine.
+pub fn record_provider_request_id(id: &str) {
+    let id = id.trim();
+    if id.is_empty() {
+        return;
+    }
+    tracing::Span::current().record(
+        PROVIDER_REQUEST_ID_FIELD,
+        tracing::field::display(adelie_telemetry::Safe::name(id)),
+    );
+}
+
 /// Token usage statistics from an LLM call.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TokenUsage {

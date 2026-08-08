@@ -1369,6 +1369,14 @@ async fn main() -> Result<()> {
     // what was opened, and what was marked. Present whenever the knowledge base
     // is, because the two share a pool and the log is only ever written about
     // entries the knowledge base holds.
+    // #1126: what this user's assistant has been burned by. Gated on a
+    // database only. Without one the dispatch loop behaves exactly as it did
+    // before negative memory existed.
+    let negative_memory = pg_pool.as_ref().map(|pool| {
+        Arc::new(desktop_assistant_storage::PgNegativeMemoryStore::new(
+            pool.clone(),
+        ))
+    });
     let kb_use_log = pg_pool.as_ref().map(|pool| {
         Arc::new(desktop_assistant_storage::PgKnowledgeUseLog::new(
             pool.clone(),
@@ -2847,6 +2855,30 @@ async fn main() -> Result<()> {
             let log = Arc::clone(&log);
             Box::pin(async move { log.record_offered(scope, names).await })
         }));
+    }
+    // #1126: negative memory. All three closures together - a read without a
+    // write only ever forgets, a write without a read never teaches, and
+    // without the correction a lesson that stopped applying would interrupt
+    // work forever.
+    if let Some(store) = &negative_memory {
+        use desktop_assistant_core::ports::negative_memory::NegativeMemoryStore;
+        let read = Arc::clone(store);
+        let write = Arc::clone(store);
+        let correct = Arc::clone(store);
+        handler = handler.with_negative_memory(
+            Arc::new(move || {
+                let store = Arc::clone(&read);
+                Box::pin(async move { store.live_burns().await })
+            }),
+            Arc::new(move |observation| {
+                let store = Arc::clone(&write);
+                Box::pin(async move { store.record_burn(observation).await })
+            }),
+            Arc::new(move |ids, note| {
+                let store = Arc::clone(&correct);
+                Box::pin(async move { store.extinguish(ids, note).await })
+            }),
+        );
     }
     if let Some(release_fn) = scratchpad_release_references_fn {
         handler = handler.with_scratchpad_release_references(release_fn);
