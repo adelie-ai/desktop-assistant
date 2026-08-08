@@ -3974,7 +3974,9 @@ mod tests {
         ] {
             assert_eq!(
                 tool_tier_to_view(core).is_gated(),
-                core.is_gated(),
+                core.is_gated_under(
+                    desktop_assistant_core::tool_provenance::ToolPolicy::Aggressive
+                ),
                 "{core:?} is gated differently on the wire"
             );
         }
@@ -5503,11 +5505,13 @@ mod tests {
             use desktop_assistant_core::ports::turn_capability::{
                 TurnCapabilityChange, TurnCapabilityReason, notify_turn_capability_change,
             };
-            use desktop_assistant_core::tool_provenance::{GATE_CLOSED_STATUS, GATED_TIERS};
+            use desktop_assistant_core::tool_provenance::{
+                GATE_CLOSED_STATUS, ToolPolicy, gated_tiers,
+            };
             // Mirrors what the core turn loop does when the gate closes.
             let delivery = notify_turn_capability_change(TurnCapabilityChange {
                 reason: TurnCapabilityReason::ExternalContentIngested,
-                closed_tiers: GATED_TIERS.to_vec(),
+                closed_tiers: gated_tiers(ToolPolicy::Aggressive).to_vec(),
                 message: GATE_CLOSED_STATUS.to_string(),
             });
             if delivery == Delivery::Dropped {

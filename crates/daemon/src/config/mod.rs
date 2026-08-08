@@ -70,6 +70,7 @@ pub(super) use resolution::{
 // the re-import keeps it visible. Test-only callers reference
 // `secrets::sanitize_secret_value` directly to avoid a cfg-gated
 // `use`.
+use desktop_assistant_core::tool_provenance::ToolPolicy;
 use secrets::{
     bucket_secret_len, is_placeholder_secret_value, redacted_secret_audit, write_secret_to_backend,
 };
@@ -151,6 +152,10 @@ pub struct DaemonConfig {
     /// D-Bus surface share one schema.
     #[serde(default)]
     pub personality: Personality,
+    /// `[security]` — how much this daemon's turns are willing to refuse.
+    /// Absent section => the shipped default, `standard`.
+    #[serde(default, skip_serializing_if = "SecurityConfig::is_default")]
+    pub security: SecurityConfig,
     /// `[skills]` — the on-disk skill library the daemon indexes at startup
     /// (#573). Absent section => defaults (enabled, platform-default roots).
     #[serde(default, skip_serializing_if = "SkillsConfig::is_default")]
@@ -328,6 +333,64 @@ impl SubagentsConfig {
 
 fn default_wake_parent() -> bool {
     true
+}
+
+/// `[security]` configuration: this daemon's default tool policy.
+///
+/// The level a turn runs at unless the conversation says otherwise. It is the
+/// value every other layer falls back to, so it is also what an unreadable or
+/// absent setting resolves to, and it is what a client mirrors when it has no
+/// stored preference of its own.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SecurityConfig {
+    /// `aggressive`, `standard` or `lax`. See
+    /// [`desktop_assistant_core::tool_provenance::ToolPolicy`] for what each
+    /// level does and why the default refuses nothing.
+    ///
+    /// Held as the wire spelling rather than the parsed enum so a value this
+    /// build does not know survives loading and is reported by name.
+    /// [`SecurityConfig::tool_policy`] returns the error, the daemon says at
+    /// startup which level it actually resolved, and the shipped default is
+    /// used. Rejecting the whole file would stop the daemon over one word,
+    /// which this daemon deliberately does not do for any other setting.
+    #[serde(default = "default_tool_policy")]
+    pub tool_policy: String,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            tool_policy: default_tool_policy(),
+        }
+    }
+}
+
+impl SecurityConfig {
+    /// Whether this equals the default section, so a default `[security]` is
+    /// not serialized (keeping migrated `daemon.toml` output stable).
+    fn is_default(&self) -> bool {
+        self.tool_policy == default_tool_policy()
+    }
+
+    /// The configured level, or an error naming the bad value and the accepted
+    /// set.
+    ///
+    /// A security level is exactly the setting that must not degrade quietly:
+    /// a typo that resolved to a default would leave the operator believing
+    /// they had chosen something else.
+    pub fn tool_policy(&self) -> Result<ToolPolicy, String> {
+        ToolPolicy::parse(&self.tool_policy).ok_or_else(|| {
+            format!(
+                "[security] tool_policy = {:?} names no known level; use \"aggressive\", \
+                 \"standard\" or \"lax\"",
+                self.tool_policy
+            )
+        })
+    }
+}
+
+fn default_tool_policy() -> String {
+    ToolPolicy::default().as_str().to_string()
 }
 
 /// `[skills]` configuration: whether to index on-disk skills, and which global
@@ -4165,6 +4228,55 @@ max_context_tokens = 1000000
         );
         let reparsed: DaemonConfig = toml::from_str(&serialized).unwrap();
         assert_eq!(parsed.purposes, reparsed.purposes);
+    }
+
+    // --- [security] section --------------------------------------------------
+
+    #[test]
+    fn tool_policy_defaults_to_standard_when_the_section_is_absent() {
+        // A fresh install with no `[security]` block runs at the shipped
+        // default, which refuses nothing.
+        let config: DaemonConfig = toml::from_str("").unwrap();
+        assert_eq!(config.security.tool_policy(), Ok(ToolPolicy::Standard));
+    }
+
+    #[test]
+    fn every_tool_policy_level_parses_from_the_section() {
+        for (written, expected) in [
+            ("aggressive", ToolPolicy::Aggressive),
+            ("standard", ToolPolicy::Standard),
+            ("lax", ToolPolicy::Lax),
+        ] {
+            let config: DaemonConfig =
+                toml::from_str(&format!("[security]\ntool_policy = \"{written}\"\n")).unwrap();
+            assert_eq!(config.security.tool_policy(), Ok(expected), "{written}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_tool_policy_value_is_named_rather_than_replaced() {
+        // The value survives loading so the daemon can say which word it did
+        // not understand. Silently resolving it would leave the operator
+        // believing they had chosen a level they had not.
+        let config: DaemonConfig = toml::from_str("[security]\ntool_policy = \"yolo\"\n").unwrap();
+        let error = config
+            .security
+            .tool_policy()
+            .expect_err("an unknown level must not resolve");
+        assert!(error.contains("yolo"), "{error}");
+        for level in ["aggressive", "standard", "lax"] {
+            assert!(
+                error.contains(level),
+                "the accepted set must be named: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_default_security_section_is_not_serialized() {
+        let config: DaemonConfig = toml::from_str("").unwrap();
+        let serialized = toml::to_string(&config).unwrap();
+        assert!(!serialized.contains("[security]"), "{serialized}");
     }
 
     // --- [personality] section (#226) --------------------------------------
