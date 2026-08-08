@@ -162,11 +162,22 @@ per send, so nothing could collide. A client now chooses it, and the daemon
 checks its shape and not its novelty. Nothing inside the daemon keys on it - the
 in-flight index and the idempotency store key on the user, the conversation and
 the idempotency key, and event delivery is scoped by user id - so a repeated
-value costs a confusing trace and nothing else there. A process that
-*multiplexes* several callers over one daemon connection is the exception: it
-must mint its own value for the daemon hop rather than forward what it was
-given, because it demultiplexes on what comes back. The web BFF is the one that
-does this today.
+value costs a confusing trace and nothing else there.
+
+Two consequences reach a client, and both are worth stating for an integrator
+writing against this API:
+
+- **Mint one id per turn, not one per session.** A client dedupes the echoed
+  `UserMessageAdded` on `request_id`, because it already rendered that bubble
+  optimistically. Reusing an id across two turns in one conversation therefore
+  suppresses the second bubble in the client that sent it. The shipped clients
+  mint per send and never hit this.
+- **A process that multiplexes several callers over one daemon connection must
+  mint its own value for the daemon hop** rather than forward what it was
+  given, because it demultiplexes the reply stream on what comes back. The web
+  BFF is the one that does this, and it carries the caller's trace in
+  `traceparent` instead, which loses nothing: the daemon joins that trace
+  either way.
 
 The id is a correlation id and nothing else. It grants no capability and names
 no user, so it reaches no authorization or tenancy decision. It is also not the
