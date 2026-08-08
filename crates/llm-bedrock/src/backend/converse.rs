@@ -13,10 +13,12 @@ use aws_sdk_bedrockruntime::types::{
     ContentBlock, Message as BedrockMessage, SystemContentBlock, ToolConfiguration,
 };
 use aws_smithy_types::Document;
+use aws_types::request_id::RequestId;
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::ToolCall;
 use desktop_assistant_core::ports::llm::{
     ChunkCallback, LlmResponse, ModelInfo, ModelListingReport, TokenUsage,
+    record_provider_request_id,
 };
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
@@ -504,6 +506,15 @@ impl ConverseBackend {
             },
         };
 
+        // Capture Bedrock's own request id onto the open `llm.call` span
+        // (#1152), before the stream body is consumed below. Not an HTTP
+        // header: the AWS SDK output type carries it through
+        // `aws_types::request_id::RequestId`, which answers `None` when the
+        // service could not be reached rather than an empty string.
+        if let Some(request_id) = response.request_id() {
+            record_provider_request_id(request_id);
+        }
+
         let mut stream = response.stream;
         let mut text = String::new();
         let mut tool_acc = ToolCallAccumulator::default();
@@ -638,6 +649,13 @@ impl ConverseBackend {
                 }
             },
         };
+
+        // Capture Bedrock's own request id onto the open `llm.call` span
+        // (#1152). See `dispatch_streaming` for why this reads
+        // `RequestId::request_id()` rather than an HTTP header.
+        if let Some(request_id) = response.request_id() {
+            record_provider_request_id(request_id);
+        }
 
         let mut text = String::new();
         let mut tool_calls = Vec::new();

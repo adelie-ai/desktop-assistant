@@ -32,7 +32,7 @@ use tokio_util::sync::CancellationToken;
 
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::ToolCall;
-use desktop_assistant_core::ports::llm::{ChunkCallback, LlmResponse};
+use desktop_assistant_core::ports::llm::{ChunkCallback, LlmResponse, record_provider_request_id};
 use desktop_assistant_llm_http::build_response;
 
 use crate::usage::parse_usage;
@@ -185,6 +185,18 @@ pub async fn send_chat_request(
             .await
             .unwrap_or_else(|_| "unable to read body".into());
         return Err(classify(status, &headers, &body));
+    }
+
+    // Capture the routed backend's own request id onto the open `llm.call`
+    // span (#1152). This one site covers every caller of `send_chat_request`
+    // - Azure and OpenRouter, each streaming and non-streaming - so a single
+    // header read here reaches all four dispatch paths.
+    if let Some(request_id) = response
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+    {
+        record_provider_request_id(request_id);
     }
 
     Ok(response)
@@ -343,6 +355,203 @@ mod tests {
         assert!(
             matches!(out, Err(CoreError::Cancelled)),
             "a tripped token must short-circuit the non-streaming body read"
+        );
+    }
+
+    // --- Provider request id capture (#1152) ------------------------------
+    //
+    // These drive `send_chat_request` directly: it is the one function this
+    // module exports that reads the response, and Azure and OpenRouter each
+    // reach it from both their streaming and non-streaming dispatch (proven
+    // by reading both crates' call sites - see the report for #1152), so a
+    // single header read there covers all four paths without editing either
+    // connector crate.
+    //
+    // A minimal `tracing` layer that reads a named span's fields back in
+    // process, modelled on `SpanCapture` in
+    // `crates/core/tests/turn_telemetry.rs` but pared down to what these
+    // tests need: one span, read once the call under test has finished.
+
+    #[derive(Clone, Default)]
+    struct RequestIdSpanCapture(
+        Arc<
+            std::sync::Mutex<
+                std::collections::HashMap<String, std::collections::HashMap<String, String>>,
+            >,
+        >,
+    );
+
+    struct RequestIdFieldVisitor<'a>(&'a mut std::collections::HashMap<String, String>);
+
+    impl tracing::field::Visit for RequestIdFieldVisitor<'_> {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+    }
+
+    impl<S> tracing_subscriber::layer::Layer<S> for RequestIdSpanCapture
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            _id: &tracing::span::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = std::collections::HashMap::new();
+            attrs.record(&mut RequestIdFieldVisitor(&mut fields));
+            self.0
+                .lock()
+                .expect("capture lock")
+                .insert(attrs.metadata().name().to_string(), fields);
+        }
+
+        fn on_record(
+            &self,
+            id: &tracing::span::Id,
+            values: &tracing::span::Record<'_>,
+            ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let Some(span) = ctx.span(id) else {
+                return;
+            };
+            let mut all = self.0.lock().expect("capture lock");
+            let fields = all.entry(span.name().to_string()).or_default();
+            values.record(&mut RequestIdFieldVisitor(fields));
+        }
+    }
+
+    impl RequestIdSpanCapture {
+        /// The fields recorded on the span named `name`, or empty if that
+        /// span was never opened.
+        fn fields_of(&self, name: &str) -> std::collections::HashMap<String, String> {
+            self.0
+                .lock()
+                .expect("capture lock")
+                .get(name)
+                .cloned()
+                .unwrap_or_default()
+        }
+    }
+
+    /// Build a capturing subscriber and an `llm.call` span shaped exactly
+    /// like core's `llm_span`/`aux_llm_span`: `provider_request_id` declared
+    /// as `tracing::field::Empty`. A connector's `record_provider_request_id`
+    /// call needs that declaration to have a field to land on - `tracing`
+    /// silently drops a `record` for a field the span never declared, which
+    /// is the trap this mirrors core's shape to avoid.
+    ///
+    /// The `DefaultGuard` must stay alive for the whole call under test; drop
+    /// it only after the fields have been read back.
+    fn request_id_capture() -> (
+        RequestIdSpanCapture,
+        tracing::subscriber::DefaultGuard,
+        tracing::Span,
+    ) {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let capture = RequestIdSpanCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let guard = tracing::subscriber::set_default(subscriber);
+        let span = tracing::info_span!("llm.call", provider_request_id = tracing::field::Empty);
+        (capture, guard, span)
+    }
+
+    /// A `send_chat_request` call against `server`, driven inside a captured
+    /// `llm.call` span, returning the fields recorded on it. `server` must
+    /// outlive this call - the caller keeps its own `MockServer` binding in
+    /// scope, the same way `response_for` above requires.
+    async fn send_and_capture(server: &MockServer) -> std::collections::HashMap<String, String> {
+        use tracing::Instrument;
+
+        let request = reqwest::Client::new()
+            .post(format!("{}/chat/completions", server.base_url()))
+            .body("{}");
+        let (capture, _guard, span) = request_id_capture();
+
+        let _ = async {
+            send_chat_request(
+                request,
+                &CancellationToken::new(),
+                Duration::from_secs(5),
+                "stalled",
+                |status, _headers, body| CoreError::Llm(format!("HTTP {status}: {body}")),
+            )
+            .await
+        }
+        .instrument(span)
+        .await;
+
+        capture.fields_of("llm.call")
+    }
+
+    #[tokio::test]
+    async fn openai_compat_call_records_the_provider_request_id() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/chat/completions");
+            then.status(200)
+                .header("content-type", "application/json")
+                .header("x-request-id", "req_test_compat_321")
+                .body(NS_BODY);
+        });
+
+        let fields = send_and_capture(&server).await;
+        assert_eq!(
+            fields.get("provider_request_id").map(String::as_str),
+            Some("req_test_compat_321"),
+            "the shared dispatch must record the routed backend's x-request-id onto the span"
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_compat_call_without_a_request_id_header_records_nothing() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/chat/completions");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(NS_BODY);
+        });
+
+        let fields = send_and_capture(&server).await;
+        assert!(
+            !fields.contains_key("provider_request_id"),
+            "an absent header must leave the field empty, not record an empty string: {fields:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_compat_call_neutralises_a_control_character_in_the_request_id() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/chat/completions");
+            then.status(200)
+                .header("content-type", "application/json")
+                // A literal newline cannot ride in an HTTP header value at
+                // all - `http::HeaderValue` rejects the byte outright, so
+                // that injection is stopped by the transport itself, not by
+                // this module. A tab is the one C0 control character the
+                // transport does carry (`HeaderValue` allows byte 9), so it
+                // is what proves the dispatch routes the header through
+                // `Safe::name` rather than passing it through raw.
+                .header("x-request-id", "req\ttest")
+                .body(NS_BODY);
+        });
+
+        let fields = send_and_capture(&server).await;
+        let recorded = fields
+            .get("provider_request_id")
+            .expect("a present header, even a deceptive one, must still record a value");
+        assert_eq!(
+            recorded, "req\u{fffd}test",
+            "Safe::name must replace the control character with U+FFFD, not pass it through"
         );
     }
 }
