@@ -129,6 +129,13 @@ impl StepStack {
         }
     }
 
+    /// The scope start of the outermost open step, or `None` when no step is
+    /// open. Everything from here on belongs to a step that will distil it into
+    /// a note, so a sweep must stop short of it.
+    pub fn open_watermark(&self) -> Option<usize> {
+        self.frames.first().map(|f| f.watermark)
+    }
+
     pub fn depth(&self) -> usize {
         self.frames.len()
     }
@@ -245,16 +252,39 @@ pub(crate) fn truncate_on_char_boundary(s: &str, max_bytes: usize) -> String {
 /// Addressed to the model, so it knows the detail still exists - in the named
 /// note, or a re-run away - and left the turn only to keep it lean. The
 /// conversation's stored transcript is unaffected either way.
-pub(crate) fn compaction_pointer(tool_name: Option<&str>, note_keys: &[String]) -> String {
+/// Why a result left the turn's working context.
+///
+/// The pointer text differs because the model's next move differs. A step that
+/// completed distilled the result into a note it can re-read. A sweep names no
+/// note, so re-running the tool is the only route back, and the text has to say
+/// so rather than send the model looking for a note that was never written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EvictReason {
+    /// The step covering this result completed.
+    StepCompleted,
+    /// No step ever claimed it and a later round has superseded it.
+    Superseded,
+}
+
+pub(crate) fn compaction_pointer(
+    tool_name: Option<&str>,
+    note_keys: &[String],
+    reason: EvictReason,
+) -> String {
     let ran = match tool_name {
         Some(n) if !n.is_empty() => format!(" (ran {n})"),
         _ => String::new(),
     };
     if note_keys.is_empty() {
+        let cause = match reason {
+            EvictReason::StepCompleted => {
+                "when its step completed (no carry-forward note was recorded)"
+            }
+            EvictReason::Superseded => "once a later round superseded it",
+        };
         return format!(
             "{COMPACTION_POINTER_PREFIX}{ran}: this result was dropped from working \
-             context when its step completed (no carry-forward note was recorded). \
-             Re-run the tool if you need it again.>"
+             context {cause}. Re-run the tool if you need it again.>"
         );
     }
     let keys = note_keys
@@ -331,6 +361,7 @@ pub(crate) fn evict_tool_results(
     from: usize,
     note_keys: &[String],
     trace: DistilledTrace,
+    reason: EvictReason,
 ) -> (usize, usize) {
     let from = from.min(messages.len());
     let names = tool_names_by_call_id(messages);
@@ -350,7 +381,7 @@ pub(crate) fn evict_tool_results(
             .as_deref()
             .and_then(|id| names.get(id))
             .map(String::as_str);
-        let pointer = compaction_pointer(tool_name, note_keys);
+        let pointer = compaction_pointer(tool_name, note_keys, reason);
         freed += current.len().saturating_sub(pointer.len());
         evicted += 1;
         if trace == DistilledTrace::Written && !note_keys.is_empty() {
@@ -359,6 +390,42 @@ pub(crate) fn evict_tool_results(
         projection.replace(m, pointer);
     }
     (evicted, freed)
+}
+
+/// Evict every sizeable `Role::Tool` result in `messages[..upto]` that no step
+/// claimed, leaving the same pointer shape [`evict_tool_results`] leaves.
+///
+/// Why this exists beside `evict_tool_results`: that one runs when a step
+/// completes, so it only ever fires for a model that opened a step and closed
+/// it. Step discipline is the first thing a weak model loses, which made the
+/// context grow largest exactly where the budget is smallest. This is the same
+/// eviction with the model taken out of the trigger.
+///
+/// `upto` is the caller's protected boundary - the start of the range the turn
+/// may still be working in. Nothing at or after it is touched, so a result the
+/// model has not yet had a chance to act on stays whole, and an open step's
+/// scope is left for its own `complete_step` to distil into a note.
+///
+/// No note is written and nothing is recorded on the row
+/// ([`DistilledTrace::Absent`]), so a later turn reads the stored output rather
+/// than a pointer to a note that never existed. The raw bytes stay in the
+/// conversation's stored transcript either way.
+///
+/// Returns `(results_evicted, bytes_freed)`.
+pub(crate) fn evict_superseded_tool_results(
+    messages: &mut [Message],
+    projection: &mut ContextProjection,
+    upto: usize,
+) -> (usize, usize) {
+    let upto = upto.min(messages.len());
+    evict_tool_results(
+        &mut messages[..upto],
+        projection,
+        0,
+        &[],
+        DistilledTrace::Absent,
+        EvictReason::Superseded,
+    )
 }
 
 /// Rebuild the pointers an earlier turn's [`evict_tool_results`] decided on,
@@ -398,7 +465,7 @@ pub(crate) fn carry_evictions(
             .as_deref()
             .and_then(|id| names.get(id))
             .map(String::as_str);
-        let pointer = compaction_pointer(tool_name, &m.distilled_into);
+        let pointer = compaction_pointer(tool_name, &m.distilled_into, EvictReason::StepCompleted);
         // A pointer longer than what it replaces makes the prompt bigger, which
         // is the one thing this may not do. Reachable at the small end: the
         // eviction threshold is [`COMPACTION_MIN_EVICT_BYTES`] and a pointer
@@ -1213,6 +1280,7 @@ mod tests {
             1,
             &keys,
             DistilledTrace::Written,
+            EvictReason::StepCompleted,
         );
         assert_eq!(evicted, 1);
         assert!(freed > 4000);
@@ -1227,6 +1295,137 @@ mod tests {
         // The assistant tool-call request is untouched.
         assert_eq!(messages[1].role, Role::Assistant);
         assert_eq!(messages[1].tool_calls.len(), 1);
+    }
+
+    // --- #1205: eviction must not depend on step discipline ---------------
+
+    #[test]
+    fn a_result_no_step_claimed_is_evicted_by_the_sweep() {
+        // The whole point: a model that never opened a step still gets its
+        // superseded tool output out of the turn's working context.
+        let big = "x".repeat(5000);
+        let mut messages = vec![
+            Message::assistant_with_tool_calls(vec![ToolCall::new("c1", "read_file", "{}")]),
+            tool_msg("c1", &big),
+            Message::assistant_with_tool_calls(vec![ToolCall::new("c2", "read_file", "{}")]),
+            tool_msg("c2", &big),
+        ];
+        let mut projection = ContextProjection::default();
+        // Protect the most recent round: messages[2..].
+        let (swept, freed) = evict_superseded_tool_results(&mut messages, &mut projection, 2);
+
+        assert_eq!(swept, 1, "the superseded result must leave the turn's view");
+        assert!(freed > 4000, "freed {freed} bytes");
+        assert!(
+            projection
+                .content(&messages[1])
+                .starts_with(COMPACTION_POINTER_PREFIX)
+        );
+        assert_eq!(
+            projection.content(&messages[3]),
+            big,
+            "the protected round must be untouched"
+        );
+    }
+
+    #[test]
+    fn the_sweep_pointer_does_not_send_the_model_after_a_note_that_was_never_written() {
+        // No step ran, so no note exists. The text must say re-run the tool,
+        // and must not mention a step completing or a note to re-read.
+        let big = "x".repeat(5000);
+        let mut messages = vec![
+            Message::assistant_with_tool_calls(vec![ToolCall::new("c1", "read_file", "{}")]),
+            tool_msg("c1", &big),
+        ];
+        let mut projection = ContextProjection::default();
+        evict_superseded_tool_results(&mut messages, &mut projection, 2);
+
+        let pointer = projection.content(&messages[1]);
+        assert!(pointer.contains("superseded"), "{pointer}");
+        assert!(pointer.contains("Re-run the tool"), "{pointer}");
+        assert!(!pointer.contains("scratchpad note"), "{pointer}");
+        assert!(!pointer.contains("step completed"), "{pointer}");
+    }
+
+    #[test]
+    fn the_sweep_leaves_the_stored_transcript_unchanged() {
+        // #798: the raw output is the observation layer and never moves.
+        let big = "x".repeat(5000);
+        let mut messages = vec![
+            Message::assistant_with_tool_calls(vec![ToolCall::new("c1", "read_file", "{}")]),
+            tool_msg("c1", &big),
+        ];
+        let before = messages.clone();
+        let mut projection = ContextProjection::default();
+        evict_superseded_tool_results(&mut messages, &mut projection, 2);
+
+        assert_eq!(messages, before);
+        assert_eq!(messages[1].content, big);
+        assert!(
+            messages[1].distilled_into.is_empty(),
+            "a sweep names no note, so it must record no eviction decision"
+        );
+    }
+
+    #[test]
+    fn the_sweep_does_not_evict_a_result_twice() {
+        let big = "x".repeat(5000);
+        let mut messages = vec![
+            Message::assistant_with_tool_calls(vec![ToolCall::new("c1", "read_file", "{}")]),
+            tool_msg("c1", &big),
+        ];
+        let mut projection = ContextProjection::default();
+        let (first, _) = evict_superseded_tool_results(&mut messages, &mut projection, 2);
+        let (second, freed) = evict_superseded_tool_results(&mut messages, &mut projection, 2);
+
+        assert_eq!(first, 1);
+        assert_eq!(second, 0, "an already-compacted result is skipped");
+        assert_eq!(freed, 0);
+    }
+
+    #[test]
+    fn the_sweep_leaves_an_open_steps_scope_for_its_own_completion() {
+        // A step that is open will distil its own results into a note. Sweeping
+        // them first would replace that with a weaker pointer, so the caller's
+        // boundary has to hold.
+        let big = "x".repeat(5000);
+        let mut messages = vec![
+            Message::assistant_with_tool_calls(vec![ToolCall::new("c1", "read_file", "{}")]),
+            tool_msg("c1", &big),
+        ];
+        let mut stack = StepStack::new();
+        stack.begin("research", 0);
+        assert_eq!(stack.open_watermark(), Some(0));
+
+        let mut projection = ContextProjection::default();
+        let protected = stack.open_watermark().unwrap_or(messages.len());
+        let (swept, _) = evict_superseded_tool_results(&mut messages, &mut projection, protected);
+
+        assert_eq!(swept, 0, "an open step's scope is not the sweep's to take");
+    }
+
+    #[test]
+    fn the_sweep_ignores_a_result_too_small_to_be_worth_evicting() {
+        let mut messages = vec![
+            Message::assistant_with_tool_calls(vec![ToolCall::new("c1", "read_file", "{}")]),
+            tool_msg("c1", "ok"),
+        ];
+        let mut projection = ContextProjection::default();
+        let (swept, _) = evict_superseded_tool_results(&mut messages, &mut projection, 2);
+        assert_eq!(swept, 0);
+        assert_eq!(projection.content(&messages[1]), "ok");
+    }
+
+    #[test]
+    fn the_sweep_clamps_a_boundary_past_the_end() {
+        let big = "x".repeat(5000);
+        let mut messages = vec![
+            Message::assistant_with_tool_calls(vec![ToolCall::new("c1", "read_file", "{}")]),
+            tool_msg("c1", &big),
+        ];
+        let mut projection = ContextProjection::default();
+        let (swept, _) = evict_superseded_tool_results(&mut messages, &mut projection, 99);
+        assert_eq!(swept, 1, "a boundary past the end must not panic");
     }
 
     /// #798: the raw tool output is the conversation's observation layer. It
@@ -1246,6 +1445,7 @@ mod tests {
             0,
             &["outcome:1".to_string()],
             DistilledTrace::Written,
+            EvictReason::StepCompleted,
         );
 
         assert_eq!(evicted, 1, "the result still leaves the turn's view");
@@ -1288,6 +1488,7 @@ mod tests {
             0,
             &["outcome:1".to_string()],
             DistilledTrace::Written,
+            EvictReason::StepCompleted,
         );
 
         assert_eq!(
@@ -1317,6 +1518,7 @@ mod tests {
             0,
             &[],
             DistilledTrace::Absent,
+            EvictReason::StepCompleted,
         );
 
         assert_eq!(evicted, 1);
@@ -1356,6 +1558,7 @@ mod tests {
             0,
             &keys,
             DistilledTrace::Written,
+            EvictReason::StepCompleted,
         );
         assert_eq!(evicted, 1); // only the big one
         assert_eq!(projection.content(&messages[1]), "tiny");
@@ -1371,6 +1574,7 @@ mod tests {
             0,
             &keys,
             DistilledTrace::Written,
+            EvictReason::StepCompleted,
         );
         assert_eq!(evicted2, 0);
         assert_eq!(freed2, 0);
@@ -1386,6 +1590,7 @@ mod tests {
             99,
             &[],
             DistilledTrace::Absent,
+            EvictReason::StepCompleted,
         );
         assert_eq!((evicted, freed), (0, 0));
     }
@@ -1504,7 +1709,8 @@ mod tests {
 
         let live: std::collections::HashSet<String> = long_keys.iter().cloned().collect();
         assert!(
-            compaction_pointer(Some("read_file"), &long_keys).len() > modest.len(),
+            compaction_pointer(Some("read_file"), &long_keys, EvictReason::StepCompleted).len()
+                > modest.len(),
             "the fixture must build a pointer bigger than the result"
         );
 
@@ -1541,7 +1747,7 @@ mod tests {
 
     #[test]
     fn pointer_without_notes_says_dropped() {
-        let p = compaction_pointer(Some("geocode"), &[]);
+        let p = compaction_pointer(Some("geocode"), &[], EvictReason::StepCompleted);
         assert!(p.contains("geocode"));
         assert!(p.contains("no carry-forward"));
     }
