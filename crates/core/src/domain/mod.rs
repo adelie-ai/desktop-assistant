@@ -4,6 +4,8 @@ pub mod knowledge;
 pub mod knowledge_use;
 mod message;
 pub mod negative_memory;
+pub mod replay;
+pub mod salience;
 pub mod scratchpad;
 pub mod situation;
 pub mod skill;
@@ -20,6 +22,8 @@ pub use message::{Message, Role};
 pub use negative_memory::{
     Facet, NegativeMemory, NegativeMemoryKind, PendingAction, Scope, burns_that_fire,
 };
+pub use replay::replay_priority;
+pub use salience::{SalienceReading, SalienceSignal, SalienceSource};
 pub use scratchpad::{DEFAULT_NOTE_TYPE, ScratchpadNote};
 pub use situation::{
     FieldFan, MAX_SITUATION_VALUE_CHARS, MAX_SITUATION_VALUES_PER_FIELD, SITUATION_MIN_POPULATION,

@@ -172,6 +172,61 @@ stamp declared it current, so nothing would ever revisit it. Matching the body's
 modified time makes the write a no-op in that case; the line is discarded and the
 row stays in the worklist for the next cycle.
 
+## What the pass looks at first
+
+The pass examines every active entry, and until it had a priority it started at
+the first tag in alphabetical order and worked down. So the order in which a
+slice's expensive call was spent, and the material a cancelled or partly-failed
+pass never reached, were both decided by a string sort.
+
+The order now follows what re-examining an entry is worth today
+(`crates/core/src/domain/replay.rs`):
+
+```text
+P_i = retrieved + contradicted + salient
+```
+
+- **`retrieved`, not written.** Reconsolidation makes a memory editable at the
+  moment it is recalled, which is where a contradiction surfaces; a fact written
+  yesterday and never reached for has told nobody anything yet. The use log
+  (`docs/features/knowledge-use-log.md`) is what can tell the two apart, read
+  here without the weight a mark's judgement carries - the use a mark came with
+  still counts, because marking an entry means it was retrieved.
+- **`contradicted` adds here, where the retrieval score subtracts it.** A fact
+  that was retrieved and then found wrong is the highest-value thing a
+  consolidation pass can examine, so the signal that pushes it out of a
+  `[Recall]` block pulls it to the front of a review. It decays with the age of
+  the mark, because a contradiction nobody has acted on for a year is less
+  urgent - not because it has stopped being true.
+- **`salient`** is the same reading the recall block scores with, described in
+  `docs/features/pre-prompt-recall.md`.
+
+Every term is read through the activation weights the recall block already uses,
+so nothing here is a second set of coefficients to fit.
+
+**Whole slices move, never entries and not even tag groups.** The loader's
+`ORDER BY tags` is what puts near-duplicates side by side, and finding those is
+the work the pass exists to do. Ordering anything smaller than a slice moves
+entries across slice boundaries and can separate a pair the packing had together
+- `{invoice}` beside `{invoices}` is exactly the pair a merge is wanted for.
+Sorting whole slices leaves every slice's membership byte for byte what it was. A
+slice's priority is that of its best entry, and the sort is stable, so slices
+nothing separates keep the order they were packed in.
+
+It follows that **a store small enough for one slice is unaffected**, and the
+pass does not even read the use log for one. That is correct rather than a gap:
+such a pass shows the model everything in one call, so it has no order to get
+wrong.
+
+**It orders and does not select.** Nothing is dropped. Capping a day's material
+is a separate decision, and a cap laid over an arbitrary order would silently
+stop examining whatever sorted last.
+
+A use log that cannot be read costs two of the three terms and not the pass.
+Salience is read from the entries themselves, so the slices are still ordered on
+that term alone - not left in the order they were packed in - and the journal
+line says which terms the run was blind to.
+
 ## What consolidation may and may not do
 
 The model sees the whole active store and returns a plan. The plan is not applied

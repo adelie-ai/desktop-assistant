@@ -52,6 +52,25 @@ fn llm_returning(response: &str) -> DreamingLlmFn {
     })
 }
 
+/// A dreaming LLM that always returns `response` and keeps every user prompt it
+/// was given, so a test can assert what the model was actually shown.
+fn llm_capturing_prompts(
+    response: &str,
+) -> (DreamingLlmFn, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    let response = response.to_string();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = std::sync::Arc::clone(&seen);
+    let llm: DreamingLlmFn = Box::new(move |_system, user| {
+        captured
+            .lock()
+            .expect("the capture buffer is not poisoned")
+            .push(user);
+        let response = response.clone();
+        Box::pin(async move { Ok(response) })
+    });
+    (llm, seen)
+}
+
 /// An embedder that must never be called (the extraction facts in these tests
 /// carry no `new_tags`, which is the only thing that would invoke it).
 fn unused_embed_fn() -> BackfillEmbedFn {
@@ -72,6 +91,38 @@ async fn seed_kb(pool: &PgPool, user_id: &str, id: &str, content: &str) {
         .execute(pool)
         .await
         .expect("seed knowledge_base row");
+}
+
+/// Seed an active KB row carrying tags, which is what the daily pass groups by.
+async fn seed_kb_tagged(pool: &PgPool, user_id: &str, id: &str, content: &str, tags: &[&str]) {
+    let tags: Vec<String> = tags.iter().map(|t| (*t).to_string()).collect();
+    sqlx::query("INSERT INTO knowledge_base (id, user_id, content, tags) VALUES ($1, $2, $3, $4)")
+        .bind(id)
+        .bind(user_id)
+        .bind(content)
+        .bind(&tags)
+        .execute(pool)
+        .await
+        .expect("seed tagged knowledge_base row");
+}
+
+/// Record `opens` recent opens against an entry, as the use log stores them:
+/// counters plus the exact timestamps of the recent window.
+async fn seed_recent_opens(pool: &PgPool, user_id: &str, entry_id: &str, opens: i64) {
+    sqlx::query(
+        "INSERT INTO knowledge_use_stats \
+             (user_id, entry_id, offered_count, opened_count, first_seen_at, last_offered_at, \
+              recent_uses) \
+         SELECT $1, $2, $3, $3, NOW() - make_interval(hours => 6), NOW() - make_interval(mins => 5), \
+                array_agg(NOW() - make_interval(mins => 5 * g)) \
+         FROM generate_series(1, $3::int) AS g",
+    )
+    .bind(user_id)
+    .bind(entry_id)
+    .bind(opens)
+    .execute(pool)
+    .await
+    .expect("seed knowledge_use_stats row");
 }
 
 /// Seed an active KB row carrying an explicit `source` provenance value.
@@ -892,6 +943,115 @@ async fn empty_knowledge_base_consolidates_to_a_clean_no_op() {
         kb_deleted_kind(pool, "kb-gone").await,
         None,
         "an existing tombstone is not restamped by a no-op run"
+    );
+
+    fx.cleanup().await;
+}
+
+/// Acceptance (#1127): the daily pass reads the use log and examines a
+/// recently retrieved entry before one that was only recently written.
+///
+/// Driven through the real entry point, so it covers the whole path the unit
+/// tests cannot: the `knowledge_use_stats` read, its `user_id` predicate, the
+/// stitch into a domain record, the slice ordering, and the prompt the model is
+/// actually shown.
+///
+/// **Each entry is given a body big enough to fill a slice**, because ordering
+/// moves slices and not entries. A store that fits in one prompt is shown to the
+/// model in one call and has no order to get wrong, so a two-entry fixture would
+/// assert nothing. The never-retrieved entry is seeded first and sorts first by
+/// tag, so a pass that did not read the log would prompt it first.
+#[tokio::test]
+async fn the_daily_pass_prompts_a_recently_retrieved_entry_before_a_recently_written_one() {
+    let Some(fx) = support::DbFixture::try_new("dream1127").await else {
+        return;
+    };
+    let pool = &fx.pool;
+
+    // Comfortably over half the holistic prompt budget, so no two of these
+    // share a slice.
+    let filler = "the same sentence again and again. ".repeat(700);
+
+    seed_kb_tagged(
+        pool,
+        "u1",
+        "kb-written",
+        &format!("a fact nobody has reached for. {filler}"),
+        &["a-topic"],
+    )
+    .await;
+    seed_kb_tagged(
+        pool,
+        "u1",
+        "kb-retrieved",
+        &format!("a fact the work keeps needing. {filler}"),
+        &["b-topic"],
+    )
+    .await;
+    seed_recent_opens(pool, "u1", "kb-retrieved", 3).await;
+    // Another tenant's history, on an entry of its own. It must not reach u1's
+    // pass, and u1's must not reach this one.
+    seed_kb_tagged(
+        pool,
+        "u2",
+        "kb-other",
+        "another tenant's fact",
+        &["a-topic"],
+    )
+    .await;
+    seed_recent_opens(pool, "u2", "kb-other", 9).await;
+
+    let (llm, prompts) = llm_capturing_prompts(r#"{"operations":[]}"#);
+    run_consolidation_scan(
+        pool,
+        &llm,
+        KnowledgeDeletePolicy::default(),
+        &CancellationToken::new(),
+        None,
+    )
+    .await
+    .expect("consolidation scan succeeds");
+
+    // Taken out of the guard before the `await` below, so no lock is held
+    // across one.
+    let seen: Vec<String> = {
+        let captured = prompts.lock().expect("the capture buffer is not poisoned");
+        captured.clone()
+    };
+
+    let retrieved_at = seen
+        .iter()
+        .position(|p| p.contains("## kb-retrieved"))
+        .expect("user1's retrieved entry was prompted");
+    let written_at = seen
+        .iter()
+        .position(|p| p.contains("## kb-written"))
+        .expect("user1's written entry was prompted");
+    assert_ne!(
+        retrieved_at, written_at,
+        "precondition: the two entries are big enough to be sliced apart"
+    );
+    assert!(
+        retrieved_at < written_at,
+        "the slice holding the entry the log says was opened must be examined first; the \
+         prompts arrived in the order {:?}",
+        seen.iter()
+            .map(|p| p.lines().find(|l| l.starts_with("## ")).unwrap_or(""))
+            .collect::<Vec<_>>()
+    );
+
+    let for_u1 = &seen[retrieved_at];
+    assert!(
+        !for_u1.contains("kb-other"),
+        "another tenant's entry must never reach this prompt"
+    );
+    let for_u2 = seen
+        .iter()
+        .find(|p| p.contains("kb-other"))
+        .expect("user2's slice was prompted");
+    assert!(
+        !for_u2.contains("kb-retrieved") && !for_u2.contains("kb-written"),
+        "and user1's entries must never reach user2's"
     );
 
     fx.cleanup().await;

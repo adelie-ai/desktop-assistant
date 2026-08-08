@@ -10,7 +10,7 @@
 //! ## The score
 //!
 //! ```text
-//! A_i = semantic + reinforcement + situation
+//! A_i = semantic + reinforcement + situation + salience
 //! ```
 //!
 //! - **`semantic`** is how far the candidate stands out of its own source,
@@ -33,6 +33,11 @@
 //!   fan weighting behind it, and why the bound is a scale;
 //!   [`ActivationWeights::situation`] is the two lines that turn it into
 //!   deviations.
+//! - **`salience`** is how much of the salience information this build can
+//!   detect the entry carries (#1127), spent against the same lift.
+//!   [`crate::domain::salience`] states the signals, why they divide one lift
+//!   rather than each adding one, and why a reading of text is bounded by one
+//!   recorded use; [`ActivationWeights::salience`] turns it into deviations.
 //!
 //! [`RecallDispersion::deviations_below_median`]:
 //!     crate::ports::recall::RecallDispersion::deviations_below_median
@@ -76,7 +81,6 @@
 //! | term | where its input will come from |
 //! | --- | --- |
 //! | full-text rank | a recall lookup uses one mode at a time, so a vector candidate carries no rank and a lexical one carries no distance - see [`RecallRelevance`] |
-//! | salience | #1127 |
 //! | interference penalty | the entry disposition of #893, which no column holds yet |
 //!
 //! Each of them adds to `A_i` when it exists. The semantic term is already
@@ -220,18 +224,18 @@ impl ActivationWeights {
         self.use_lift * (sum.abs() / reference).ln_1p() * sum.signum()
     }
 
-    /// The most a full situation match is worth, in the source's own
-    /// deviations: **exactly what one use at [`USE_REFERENCE_AGE_SECONDS`] is
-    /// worth**.
+    /// What one use at [`USE_REFERENCE_AGE_SECONDS`] is worth, in the source's
+    /// own deviations.
     ///
-    /// Computed from [`Self::reinforcement`] rather than restated, so the two
-    /// cannot drift and there is one definition to argue with.
+    /// **The scale every cheap signal is spent against**, and the whole answer
+    /// to "why that number" for each of them. Computed from
+    /// [`Self::reinforcement`] rather than restated, so no two of them can drift
+    /// and there is one definition to argue with.
     ///
-    /// **This is the whole answer to "why that number", and it is a scale
-    /// rather than a fit.** It introduces no coefficient of its own. What it
-    /// states is an equivalence between two signals - "this entry recurs where
-    /// you are now" is worth what "you opened this yesterday" is worth - and an
-    /// equivalence transfers to a store nobody measured, which is precisely
+    /// It is a scale rather than a fit, and it introduces no coefficient of its
+    /// own. What it states is an equivalence between two signals - a cheap one
+    /// at full strength is worth what "you opened this yesterday" is worth - and
+    /// an equivalence transfers to a store nobody measured, which is precisely
     /// what [`DEFAULT_USE_LIFT`]'s value does not do. Three properties follow:
     ///
     /// - **No unit of its own.** It works out to `use_lift * ln 2` whatever the
@@ -239,19 +243,56 @@ impl ActivationWeights {
     ///   because the reinforcement term is already a ratio against its own
     ///   reference. It follows [`USE_REFERENCE_AGE_SECONDS`], which is a genuine
     ///   unit normalization, rather than [`DEFAULT_USE_LIFT`], which is not.
-    /// - **One number to fit, not two.** A deployment that fits `use_lift` from
-    ///   its own use log moves both terms together and keeps the stated
-    ///   relation.
+    /// - **One number to fit, not several.** A deployment that fits `use_lift`
+    ///   from its own use log moves every term that reads this together, and
+    ///   keeps the stated relations.
     /// - **A size that suits what it claims.** At the default weights it is
     ///   about a third of a deviation, which settles a near-tie between adjacent
-    ///   candidates and is a ninth of [`MAX_REINFORCEMENT_DEVIATIONS`]. The
-    ///   situation can reorder a bunched block; it can never overturn a semantic
-    ///   lead. Its influence is therefore largest exactly where the admitted
-    ///   band is narrowest, which is the weakly cued prompt - the case where the
-    ///   prompt named nothing the store really holds and the other signals
-    ///   should lead.
-    pub fn situation_lift(&self) -> f64 {
+    ///   candidates and is a ninth of [`MAX_REINFORCEMENT_DEVIATIONS`].
+    ///
+    ///   **What one such signal can and cannot do, exactly.** A third of a
+    ///   deviation is under the half a deviation that separates the bar from the
+    ///   weakest hit the measured prompts produced, so one cheap signal on its
+    ///   own cannot take the top line from any measured best match. Two of them
+    ///   together reach about seven tenths and can. That is not a leak: a best
+    ///   match half a deviation above the bar means the prompt named nothing the
+    ///   store really holds, and a weakly cued prompt is exactly when the
+    ///   non-semantic signals should lead - the same case
+    ///   [`DEFAULT_USE_LIFT`] describes for the use log, and the guarantee
+    ///   #1123 deliberately did not make. Beyond about seven tenths of a
+    ///   deviation the semantic lead stands against both cheap signals together.
+    ///   The use log is not one of them and is not bounded by this: see
+    ///   [`MAX_REINFORCEMENT_DEVIATIONS`].
+    pub fn reference_use_lift(&self) -> f64 {
         self.reinforcement(self.reference_sum())
+    }
+
+    /// The most a full situation match is worth, in the source's own
+    /// deviations: **exactly what one use at [`USE_REFERENCE_AGE_SECONDS`] is
+    /// worth**.
+    ///
+    /// [`Self::reference_use_lift`] holds the whole argument. The equivalence
+    /// this name states is that "this entry recurs where you are now" is worth
+    /// what "you opened this yesterday" is worth.
+    pub fn situation_lift(&self) -> f64 {
+        self.reference_use_lift()
+    }
+
+    /// The most a full salience reading is worth, in the source's own
+    /// deviations: **exactly what one use at [`USE_REFERENCE_AGE_SECONDS`] is
+    /// worth**, the same lift the situation gets.
+    ///
+    /// [`Self::reference_use_lift`] holds the whole argument. The equivalence
+    /// this name states is that "this entry carries everything that makes a fact
+    /// worth keeping" is worth what "you opened this yesterday" is worth.
+    ///
+    /// **Why the reading is not worth more than one recorded use**, when one of
+    /// the signals may be a person's own doing: a mark in the use log records a
+    /// judgement somebody made, and a salience signal is inferred from what an
+    /// entry happens to look like. A reading must not outweigh a record. See
+    /// [`crate::domain::salience`].
+    pub fn salience_lift(&self) -> f64 {
+        self.reference_use_lift()
     }
 
     /// What a situation coverage is worth, in the source's own deviations.
@@ -279,6 +320,30 @@ impl ActivationWeights {
         // subtract - the opposite of what every line above claims.
         self.situation_lift().max(0.0) * coverage.min(1.0)
     }
+
+    /// What a salience reading is worth, in the source's own deviations.
+    ///
+    /// `salience_lift * share`, over a share in `[0, 1]` -
+    /// [`SalienceReading::share`] answers that range and this holds it to the
+    /// range whatever it is handed, so the bound is a property of the function
+    /// and not of its caller.
+    ///
+    /// Never negative. An entry that carries no signal contributes exactly
+    /// zero, so a store this detector says nothing about ranks exactly as it
+    /// ranked before the term existed. Absence forfeits the lift; it does not
+    /// subtract, because "no deadline, no money, nobody asked for it" describes
+    /// most of what is worth keeping.
+    ///
+    /// [`SalienceReading::share`]: crate::domain::salience::SalienceReading::share
+    pub fn salience(&self, share: f64) -> f64 {
+        if !share.is_finite() || share <= 0.0 {
+            return 0.0;
+        }
+        // `max(0.0)` rather than a bare product, for the reason
+        // [`Self::situation`] gives: a deployment may fit its own `use_lift`,
+        // and a negative one would otherwise make a salient entry subtract.
+        self.salience_lift().max(0.0) * share.min(1.0)
+    }
 }
 
 /// A candidate the situation cannot grade, which is what every caller passes
@@ -288,6 +353,13 @@ impl ActivationWeights {
 /// "no situation signal" instead of a number whose meaning depends on the
 /// parameter it sits in.
 pub const NO_SITUATION: f64 = 0.0;
+
+/// A candidate no salience detector says anything about, which is what every
+/// caller passes where a source keeps no readable text of its own.
+///
+/// Named rather than written as a bare zero at each call site, for the reason
+/// [`NO_SITUATION`] is.
+pub const NO_SALIENCE: f64 = 0.0;
 
 /// What one candidate is worth, as of `now`.
 ///
@@ -300,19 +372,27 @@ pub const NO_SITUATION: f64 = 0.0;
 /// told us about this entry it did tell us
 /// ([`SituationCue::coverage`](crate::domain::situation::SituationCue::coverage)),
 /// and [`NO_SITUATION`] is the answer wherever there is no cue to read.
+/// `salience_share` is how much of the salience information this build can
+/// detect the entry carries
+/// ([`SalienceReading::share`](crate::domain::salience::SalienceReading::share)),
+/// and [`NO_SALIENCE`] is the answer for a source that carries no readable text.
 ///
-/// Both extra signals are handed in already dimensionless, exactly as the
-/// semantic one is. That is what lets a fourth source, or a fourth term, join
+/// Every extra signal is handed in already dimensionless, exactly as the
+/// semantic one is. That is what lets a fourth source, or a fifth term, join
 /// later without refitting anything already here.
 pub fn activation(
     semantic: f64,
     record: Option<&KnowledgeUseRecord>,
     situation_coverage: f64,
+    salience_share: f64,
     now: DateTime<Utc>,
     weights: &ActivationWeights,
 ) -> f64 {
     let sum = record.map_or(0.0, |record| record.use_sum(now, &weights.use_score));
-    semantic + weights.reinforcement(sum) + weights.situation(situation_coverage)
+    semantic
+        + weights.reinforcement(sum)
+        + weights.situation(situation_coverage)
+        + weights.salience(salience_share)
 }
 
 #[cfg(test)]
@@ -382,8 +462,8 @@ mod tests {
         let weights = ActivationWeights::default();
         let record = used(now, &[60, 600, 6_000], 3);
 
-        let first = activation(7.0, Some(&record), NO_SITUATION, now, &weights);
-        let again = activation(7.0, Some(&record), NO_SITUATION, now, &weights);
+        let first = activation(7.0, Some(&record), NO_SITUATION, NO_SALIENCE, now, &weights);
+        let again = activation(7.0, Some(&record), NO_SITUATION, NO_SALIENCE, now, &weights);
 
         assert_eq!(
             first, again,
@@ -424,8 +504,8 @@ mod tests {
             "precondition: equal elapsed time, so only the spacing differs"
         );
 
-        let spread_score = activation(7.0, Some(&spread), NO_SITUATION, now, &weights);
-        let massed_score = activation(7.0, Some(&massed), NO_SITUATION, now, &weights);
+        let spread_score = activation(7.0, Some(&spread), NO_SITUATION, NO_SALIENCE, now, &weights);
+        let massed_score = activation(7.0, Some(&massed), NO_SITUATION, NO_SALIENCE, now, &weights);
         assert!(
             spread_score > massed_score,
             "twenty uses spread over a year scored {spread_score}, twenty massed into a day \
@@ -460,12 +540,20 @@ mod tests {
             );
         }
 
-        let mut previous = activation(0.0, Some(&every_hour(now, 1)), NO_SITUATION, now, &weights);
+        let mut previous = activation(
+            0.0,
+            Some(&every_hour(now, 1)),
+            NO_SITUATION,
+            NO_SALIENCE,
+            now,
+            &weights,
+        );
         for count in [2u64, 4, 8, 16, 32, 64, 128, 256] {
             let doubled = activation(
                 0.0,
                 Some(&every_hour(now, count)),
                 NO_SITUATION,
+                NO_SALIENCE,
                 now,
                 &weights,
             );
@@ -495,11 +583,19 @@ mod tests {
         let weights = ActivationWeights::default();
         let bound = weights.use_lift * std::f64::consts::LN_2;
 
-        let once = activation(0.0, Some(&used(now, &[60], 1)), NO_SITUATION, now, &weights);
+        let once = activation(
+            0.0,
+            Some(&used(now, &[60], 1)),
+            NO_SITUATION,
+            NO_SALIENCE,
+            now,
+            &weights,
+        );
         let twice = activation(
             0.0,
             Some(&used(now, &[30, 60], 2)),
             NO_SITUATION,
+            NO_SALIENCE,
             now,
             &weights,
         );
@@ -553,7 +649,14 @@ mod tests {
         let now = now();
         let weights = ActivationWeights::default();
         let veteran = a_veteran(now);
-        let at_the_bar = activation(BAR, Some(&veteran), NO_SITUATION, now, &weights);
+        let at_the_bar = activation(
+            BAR,
+            Some(&veteran),
+            NO_SITUATION,
+            NO_SALIENCE,
+            now,
+            &weights,
+        );
 
         let wide: Vec<f64> = MEASURED_HITS
             .iter()
@@ -570,7 +673,7 @@ mod tests {
             .iter()
             .chain(std::iter::once(&(BAR + MAX_REINFORCEMENT_DEVIATIONS)))
         {
-            let cold = activation(*best, None, NO_SITUATION, now, &weights);
+            let cold = activation(*best, None, NO_SITUATION, NO_SALIENCE, now, &weights);
             assert!(
                 at_the_bar < cold,
                 "a veteran at the bar scored {at_the_bar} against a cold best match at \
@@ -602,9 +705,15 @@ mod tests {
         // context, which is the ordinary case rather than an extreme one.
         let worked_all_morning = evenly_over(now, 10, 1_800);
 
-        let best_cold_match = activation(7.3, None, NO_SITUATION, now, &weights);
-        let just_above_the_bar =
-            activation(6.9, Some(&worked_all_morning), NO_SITUATION, now, &weights);
+        let best_cold_match = activation(7.3, None, NO_SITUATION, NO_SALIENCE, now, &weights);
+        let just_above_the_bar = activation(
+            6.9,
+            Some(&worked_all_morning),
+            NO_SITUATION,
+            NO_SALIENCE,
+            now,
+            &weights,
+        );
 
         assert!(
             just_above_the_bar > best_cold_match,
@@ -643,6 +752,7 @@ mod tests {
             tight.deviations_below_median(near),
             Some(&record),
             NO_SITUATION,
+            NO_SALIENCE,
             now,
             &weights,
         );
@@ -650,6 +760,7 @@ mod tests {
             loose.deviations_below_median(far),
             Some(&record),
             NO_SITUATION,
+            NO_SALIENCE,
             now,
             &weights,
         );
@@ -671,7 +782,7 @@ mod tests {
 
         for semantic in [0.0, 6.8, 11.4, -3.0] {
             assert_eq!(
-                activation(semantic, None, NO_SITUATION, now, &weights),
+                activation(semantic, None, NO_SITUATION, NO_SALIENCE, now, &weights),
                 semantic,
                 "an unused entry must contribute nothing of its own"
             );
@@ -681,8 +792,8 @@ mod tests {
         // the same - the two differ only in whether a write ever happened.
         let unseen = KnowledgeUseRecord::unseen("kb-1", now);
         assert_eq!(
-            activation(6.8, Some(&unseen), NO_SITUATION, now, &weights),
-            activation(6.8, None, NO_SITUATION, now, &weights)
+            activation(6.8, Some(&unseen), NO_SITUATION, NO_SALIENCE, now, &weights),
+            activation(6.8, None, NO_SITUATION, NO_SALIENCE, now, &weights)
         );
     }
 
@@ -705,8 +816,14 @@ mod tests {
         }];
 
         assert!(
-            activation(7.0, Some(&refuted), NO_SITUATION, now, &weights)
-                < activation(7.0, None, NO_SITUATION, now, &weights)
+            activation(
+                7.0,
+                Some(&refuted),
+                NO_SITUATION,
+                NO_SALIENCE,
+                now,
+                &weights
+            ) < activation(7.0, None, NO_SITUATION, NO_SALIENCE, now, &weights)
         );
     }
 
@@ -747,6 +864,7 @@ mod tests {
             0.0,
             Some(&used(now, &[a_day], 1)),
             NO_SITUATION,
+            NO_SALIENCE,
             now,
             &weights,
         );
@@ -766,11 +884,12 @@ mod tests {
         let weights = ActivationWeights::default();
         let a_day = USE_REFERENCE_AGE_SECONDS as i64;
 
-        let nearer_but_unread = activation(9.10, None, NO_SITUATION, now, &weights);
+        let nearer_but_unread = activation(9.10, None, NO_SITUATION, NO_SALIENCE, now, &weights);
         let further_but_used = activation(
             9.00,
             Some(&used(now, &[a_day], 1)),
             NO_SITUATION,
+            NO_SALIENCE,
             now,
             &weights,
         );
@@ -795,7 +914,14 @@ mod tests {
         let now = now();
         let weights = ActivationWeights::default();
 
-        let lift = activation(0.0, Some(&a_veteran(now)), NO_SITUATION, now, &weights);
+        let lift = activation(
+            0.0,
+            Some(&a_veteran(now)),
+            NO_SITUATION,
+            NO_SALIENCE,
+            now,
+            &weights,
+        );
 
         assert!(
             (0.0..MAX_REINFORCEMENT_DEVIATIONS).contains(&lift),
@@ -804,15 +930,17 @@ mod tests {
         );
     }
 
-    /// Acceptance (#1125): the situation term is counted in the source's own
-    /// median absolute deviations, like the other two.
+    /// An equally placed and equally situated candidate scores the same against
+    /// any source, however differently that source's distances are spread.
     ///
-    /// The same test the semantic term gets, extended to the third: two sources
-    /// of quite different geometry, one candidate equally placed in each and
-    /// equally matched by the situation. The score is the same number, so
-    /// nothing here is a raw distance and nothing is a raw match count.
+    /// Named for what it checks rather than for the wider property it was once
+    /// called after: `situation` takes no dispersion, so it could not vary with
+    /// one even if it were a raw match count. What holds the term to the
+    /// semantic term's unit is its ceiling, and
+    /// `the_situation_term_is_bounded_by_one_use_at_the_reference_age` is where
+    /// that is checked.
     #[test]
-    fn the_situation_term_is_counted_in_the_sources_own_deviations() {
+    fn an_equally_placed_and_equally_situated_candidate_scores_the_same_against_any_source() {
         use crate::ports::recall::RecallDispersion;
 
         let now = now();
@@ -825,6 +953,7 @@ mod tests {
             tight.deviations_below_median(tight.distance_at(stands_out_by)),
             None,
             1.0,
+            NO_SALIENCE,
             now,
             &weights,
         );
@@ -832,6 +961,7 @@ mod tests {
             loose.deviations_below_median(loose.distance_at(stands_out_by)),
             None,
             1.0,
+            NO_SALIENCE,
             now,
             &weights,
         );
@@ -843,8 +973,10 @@ mod tests {
         );
     }
 
-    /// Acceptance (#1125): the situation term is bounded, and the bound is
-    /// exactly what one use at the reference age is worth.
+    /// Acceptance (#1125): the situation term is bounded, the bound is exactly
+    /// what one use at the reference age is worth, and it is therefore counted
+    /// in the source's own median absolute deviations rather than in a unit of
+    /// its own.
     ///
     /// Both halves. The ceiling holds over every coverage a caller could hand
     /// in, including the ones the type does not rule out - a value past one, a
@@ -863,6 +995,7 @@ mod tests {
             0.0,
             Some(&used(now, &[a_day], 1)),
             NO_SITUATION,
+            NO_SALIENCE,
             now,
             &weights,
         );
@@ -924,8 +1057,8 @@ mod tests {
         let now = now();
         let weights = ActivationWeights::default();
 
-        let recurs_here = activation(7.4, None, 1.0, now, &weights);
-        let written_elsewhere = activation(7.4, None, 0.0, now, &weights);
+        let recurs_here = activation(7.4, None, 1.0, NO_SALIENCE, now, &weights);
+        let written_elsewhere = activation(7.4, None, 0.0, NO_SALIENCE, now, &weights);
 
         assert!(
             recurs_here > written_elsewhere,
@@ -947,13 +1080,20 @@ mod tests {
         let record = used(now, &[60, 6_000], 2);
 
         for semantic in [0.0, 6.8, 7.3, 11.4, -3.0] {
-            let cold = activation(semantic, None, NO_SITUATION, now, &weights);
+            let cold = activation(semantic, None, NO_SITUATION, NO_SALIENCE, now, &weights);
             assert_eq!(
                 cold, semantic,
                 "an entry with no history and no situation must score its semantic signal alone"
             );
 
-            let used_only = activation(semantic, Some(&record), NO_SITUATION, now, &weights);
+            let used_only = activation(
+                semantic,
+                Some(&record),
+                NO_SITUATION,
+                NO_SALIENCE,
+                now,
+                &weights,
+            );
             assert_eq!(
                 used_only,
                 semantic + weights.reinforcement(record.use_sum(now, &weights.use_score)),
@@ -961,6 +1101,287 @@ mod tests {
                  else"
             );
         }
+    }
+
+    // --- Salience (#1127) ----------------------------------------------------
+
+    /// An equally placed and equally salient candidate scores the same against
+    /// any source, however differently that source's distances are spread.
+    ///
+    /// Narrower than "the term is counted in deviations", and named for what it
+    /// checks: `salience` takes no dispersion, so it could not vary with one
+    /// even if it were a raw count. What holds the term to the semantic term's
+    /// unit is its ceiling, and
+    /// `the_salience_term_is_bounded_by_one_use_at_the_reference_age` is where
+    /// that is checked - a term returning `share * 100` passes this test and
+    /// fails that one.
+    #[test]
+    fn an_equally_placed_and_equally_salient_candidate_scores_the_same_against_any_source() {
+        use crate::ports::recall::RecallDispersion;
+
+        let now = now();
+        let weights = ActivationWeights::default();
+        let tight = RecallDispersion::assumed(0.80, 0.05);
+        let loose = RecallDispersion::assumed(0.42, 0.30);
+        let stands_out_by = 7.5;
+
+        let in_tight = activation(
+            tight.deviations_below_median(tight.distance_at(stands_out_by)),
+            None,
+            NO_SITUATION,
+            1.0,
+            now,
+            &weights,
+        );
+        let in_loose = activation(
+            loose.deviations_below_median(loose.distance_at(stands_out_by)),
+            None,
+            NO_SITUATION,
+            1.0,
+            now,
+            &weights,
+        );
+
+        assert!(
+            (in_tight - in_loose).abs() < 1e-9,
+            "an equally-placed, equally-salient candidate scored {in_tight} against one source \
+             and {in_loose} against another"
+        );
+    }
+
+    /// Acceptance (#1127): the salience term's size does not grow with how many
+    /// signals a deployment can detect.
+    ///
+    /// The term is a fixed lift spent against a share, and the share is a
+    /// ratio, so what every signal is worth on its own sums to exactly one full
+    /// reading. A sixth signal takes from the five rather than adding a sixth
+    /// part, and the ceiling is the same number it was.
+    #[test]
+    fn the_salience_signals_divide_one_fixed_lift_rather_than_each_adding_one() {
+        use crate::domain::salience::{SalienceReading, SalienceSignal};
+
+        let weights = ActivationWeights::default();
+        let ceiling = weights.salience_lift();
+
+        let each: f64 = SalienceSignal::ALL
+            .iter()
+            .map(|signal| weights.salience(SalienceReading::of([*signal]).share()))
+            .sum();
+        assert!(
+            (each - ceiling).abs() < 1e-9,
+            "the signals are worth {each} deviations between them against a ceiling of \
+             {ceiling}; a term whose parts do not sum to its ceiling grows with how many parts \
+             there are"
+        );
+    }
+
+    /// Acceptance (#1127): the salience term is bounded, the bound is exactly
+    /// what one use at the reference age is worth, and it is therefore counted
+    /// in the source's own median absolute deviations rather than in a unit of
+    /// its own.
+    ///
+    /// Both halves. The ceiling holds over every share a caller could hand in,
+    /// including the ones the type does not rule out - a value past one, a
+    /// negative value, and a value that is not a number. And the ceiling is the
+    /// stated quantity rather than a number of its own: a full reading is worth
+    /// what an entry opened a day ago is worth, measured against a real record
+    /// rather than against the formula.
+    #[test]
+    fn the_salience_term_is_bounded_by_one_use_at_the_reference_age() {
+        let now = now();
+        let weights = ActivationWeights::default();
+        let a_day = USE_REFERENCE_AGE_SECONDS as i64;
+
+        let ceiling = weights.salience_lift();
+        let one_day_old_use = activation(
+            0.0,
+            Some(&used(now, &[a_day], 1)),
+            NO_SITUATION,
+            NO_SALIENCE,
+            now,
+            &weights,
+        );
+        assert!(
+            (ceiling - one_day_old_use).abs() < 1e-9,
+            "a full salience reading is worth {ceiling}, and one use a day old is worth \
+             {one_day_old_use}; the bound is supposed to be that equivalence"
+        );
+
+        for share in [0.0, 0.25, 0.5, 1.0, 1.5, 1e9, -1.0, f64::NAN, f64::INFINITY] {
+            let lift = weights.salience(share);
+            assert!(
+                (0.0..=ceiling).contains(&lift),
+                "a share of {share} lifted {lift}, outside the 0 to {ceiling} the term is \
+                 bounded to"
+            );
+        }
+    }
+
+    /// Acceptance (#1127): the bound is a stated scale rather than a value
+    /// fitted to one store.
+    ///
+    /// What separates the two, testably, is that a scale carries no unit of its
+    /// own. [`USE_REFERENCE_AGE_SECONDS`] is a genuine unit normalization -
+    /// restate the use log's ages in another unit and every term is unchanged -
+    /// and [`DEFAULT_USE_LIFT`] is not. The salience lift is on the first side
+    /// of that line: it is unmoved by the decay exponent, which is what decides
+    /// how the ages are counted, and it introduces no coefficient beyond the
+    /// `use_lift` a deployment already fits from its own use log.
+    #[test]
+    fn the_salience_bound_is_a_scale_and_carries_no_unit_of_its_own() {
+        for decay in [0.1, 0.3, 0.5, 0.7, 0.9] {
+            for use_lift in [0.2, DEFAULT_USE_LIFT, 1.3] {
+                let weights = ActivationWeights {
+                    use_lift,
+                    use_score: UseScoreWeights {
+                        decay,
+                        ..UseScoreWeights::default()
+                    },
+                };
+                let expected = use_lift * std::f64::consts::LN_2;
+                assert!(
+                    (weights.salience_lift() - expected).abs() < 1e-9,
+                    "at decay {decay} and lift {use_lift} the salience bound was {}, and a bound \
+                     that moves with how ages are counted is a fit rather than a scale",
+                    weights.salience_lift()
+                );
+                assert_eq!(
+                    weights.salience_lift(),
+                    weights.situation_lift(),
+                    "both cheap signals are spent against one reference use, so a change to one \
+                     must move the other"
+                );
+            }
+        }
+    }
+
+    /// Acceptance (#1127): a salient entry is ranked above an equally similar
+    /// entry that is not.
+    ///
+    /// Equal in every other respect - the same distance, no use history on
+    /// either, and no situation - so salience is the only thing that separates
+    /// them.
+    #[test]
+    fn a_salient_entry_outranks_an_equally_similar_one_that_is_not() {
+        let now = now();
+        let weights = ActivationWeights::default();
+
+        let salient = activation(7.4, None, NO_SITUATION, 1.0, now, &weights);
+        let plain = activation(7.4, None, NO_SITUATION, NO_SALIENCE, now, &weights);
+
+        assert!(
+            salient > plain,
+            "the salient entry scored {salient} and the plain one scored {plain}"
+        );
+    }
+
+    /// Acceptance (#1127): an entry no detector says anything about scores
+    /// exactly what it scored before the term existed.
+    ///
+    /// Not "close to" and not "usually": the same number, over the whole range
+    /// of semantic signals and over both an entry with a history and one
+    /// without. This is what makes salience a term and never a gate - a fact
+    /// nothing marks salient is stored, retrieved and ranked as it always was.
+    #[test]
+    fn an_entry_with_no_salience_signal_scores_exactly_what_it_scored_before_the_term_existed() {
+        let now = now();
+        let weights = ActivationWeights::default();
+        let record = used(now, &[60, 6_000], 2);
+
+        for semantic in [0.0, 6.8, 7.3, 11.4, -3.0] {
+            assert_eq!(
+                activation(semantic, None, NO_SITUATION, NO_SALIENCE, now, &weights),
+                semantic
+            );
+            assert_eq!(
+                activation(
+                    semantic,
+                    Some(&record),
+                    NO_SITUATION,
+                    NO_SALIENCE,
+                    now,
+                    &weights
+                ),
+                semantic + weights.reinforcement(record.use_sum(now, &weights.use_score))
+            );
+        }
+    }
+
+    /// What the two cheap terms do **together**, which neither term's own test
+    /// covers and which is not what either alone can do.
+    ///
+    /// Each is bounded by one reference use, about a third of a deviation, and
+    /// that is under the half a deviation between the bar and the weakest hit
+    /// the measured prompts produced - so neither alone takes the top line from
+    /// any measured best match. Both at once reach about seven tenths and take
+    /// it from the weakest. Pinned in both directions, because a reader who met
+    /// only the two single-term tests would carry away a bound that is half the
+    /// real one.
+    ///
+    /// The case where they win is the weakly cued prompt, which is when the
+    /// non-semantic signals are supposed to lead (#1123). The case where they
+    /// lose is every prompt that named something the store holds.
+    #[test]
+    fn the_two_cheap_terms_together_reach_twice_what_either_reaches_alone() {
+        let now = now();
+        let weights = ActivationWeights::default();
+        let one = weights.reference_use_lift();
+
+        let both_at_the_bar = activation(BAR, None, 1.0, 1.0, now, &weights);
+        assert!(
+            (both_at_the_bar - BAR - 2.0 * one).abs() < 1e-9,
+            "a fully situated, fully salient candidate at the bar scored {both_at_the_bar}, and \
+             the two terms are supposed to be worth {one} each"
+        );
+
+        let weakest = *MEASURED_HITS.last().expect("the corpus is not empty");
+        assert!(
+            weakest - BAR < 2.0 * one,
+            "precondition: the weakest measured hit leads the bar by {}, which the two terms \
+             together must be able to close",
+            weakest - BAR
+        );
+        assert!(
+            both_at_the_bar > activation(weakest, None, NO_SITUATION, NO_SALIENCE, now, &weights),
+            "on the most weakly cued prompt the corpus holds, an entry that recurs here and \
+             carries every salience signal is supposed to lead"
+        );
+
+        // And every lead wider than the two of them stands, over the measured
+        // corpus rather than at one favourable point.
+        let wide: Vec<f64> = MEASURED_HITS
+            .iter()
+            .copied()
+            .filter(|hit| hit - BAR > 2.0 * one)
+            .collect();
+        assert!(
+            wide.len() >= 3,
+            "the corpus must hold several prompts that lead by more than both terms: {wide:?}"
+        );
+        for best in wide {
+            assert!(
+                both_at_the_bar < activation(best, None, NO_SITUATION, NO_SALIENCE, now, &weights),
+                "a best match at {best} deviations must keep its line against both cheap terms"
+            );
+        }
+    }
+
+    /// An entry no detector reads forfeits the lift; it never subtracts.
+    ///
+    /// Most of what is worth keeping names no deadline, no money and nobody it
+    /// was promised to, so absence must not be evidence against an entry.
+    #[test]
+    fn an_unsalient_entry_forfeits_the_lift_rather_than_being_pushed_below_the_rest() {
+        let now = now();
+        let weights = ActivationWeights::default();
+        let record = used(now, &[600], 1);
+
+        let without = activation(7.0, Some(&record), NO_SITUATION, NO_SALIENCE, now, &weights);
+        assert_eq!(
+            activation(7.0, Some(&record), NO_SITUATION, 0.0, now, &weights),
+            without
+        );
+        assert!(activation(7.0, Some(&record), NO_SITUATION, 0.3, now, &weights) > without);
     }
 
     /// A mismatched situation forfeits the lift; it never subtracts.
@@ -973,9 +1394,12 @@ mod tests {
         let weights = ActivationWeights::default();
         let record = used(now, &[600], 1);
 
-        let without = activation(7.0, Some(&record), NO_SITUATION, now, &weights);
-        assert_eq!(activation(7.0, Some(&record), 0.0, now, &weights), without);
-        assert!(activation(7.0, Some(&record), 0.3, now, &weights) > without);
+        let without = activation(7.0, Some(&record), NO_SITUATION, NO_SALIENCE, now, &weights);
+        assert_eq!(
+            activation(7.0, Some(&record), 0.0, NO_SALIENCE, now, &weights),
+            without
+        );
+        assert!(activation(7.0, Some(&record), 0.3, NO_SALIENCE, now, &weights) > without);
     }
 
     /// The situation cannot overturn a semantic lead, which is the other half of
@@ -989,7 +1413,7 @@ mod tests {
         let now = now();
         let weights = ActivationWeights::default();
         let lift = weights.situation_lift();
-        let at_the_bar = activation(BAR, None, 1.0, now, &weights);
+        let at_the_bar = activation(BAR, None, 1.0, NO_SALIENCE, now, &weights);
 
         let wide: Vec<f64> = MEASURED_HITS
             .iter()
@@ -1003,7 +1427,7 @@ mod tests {
         );
         for best in wide {
             assert!(
-                at_the_bar < activation(best, None, NO_SITUATION, now, &weights),
+                at_the_bar < activation(best, None, NO_SITUATION, NO_SALIENCE, now, &weights),
                 "a fully-situated candidate at the bar scored {at_the_bar} against a cold best \
                  match at {best} deviations"
             );
@@ -1036,6 +1460,7 @@ mod tests {
                     7.0 + (i % 5) as f64,
                     Some(record),
                     NO_SITUATION,
+                    NO_SALIENCE,
                     now,
                     &weights,
                 )

@@ -35,6 +35,8 @@
 //! Row-level security is a non-FORCE backstop that the table owner bypasses,
 //! and the daemon connects as the owner, so these predicates are the guard.
 
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::knowledge_use::{
@@ -738,6 +740,82 @@ impl KnowledgeUseLog for PgKnowledgeUseLog {
             })
             .collect())
     }
+}
+
+/// Everything the log knows about every one of the current user's entries.
+///
+/// The whole-store read the daily consolidation pass needs (#1127), where
+/// [`KnowledgeUseLog::records`] answers about a named handful. Two statements
+/// rather than a join, and the same two the by-id read runs - a join over the
+/// marks would multiply the stats rows, and the stitch below is the one this
+/// module already trusts.
+///
+/// **Not on a per-turn path**, so it takes neither the caller's ceiling nor the
+/// read timeout the recall path sets: it runs once per user per day, in a
+/// background pass that owns its own cancellation. A statement timeout tuned
+/// for a turn would fail a legitimate read of a large store.
+///
+/// **Not one snapshot either**, for the same reason. The two statements run on
+/// their own connections, so a mark landing between them is read while the stats
+/// row it belongs to is not. What that costs is one night's ordering of one
+/// entry, and the next pass reads both; what a transaction would cost is a
+/// pooled connection held across a whole-store read on a pool of five.
+///
+/// Ids the log has never seen are absent, on the same terms as
+/// [`KnowledgeUseLog::records`], so a caller can tell an entry nothing has
+/// touched from one that was offered and ignored.
+pub(crate) async fn all_use_records(
+    pool: &sqlx::PgPool,
+    user_id: &str,
+) -> Result<Vec<KnowledgeUseRecord>, CoreError> {
+    let stats: Vec<StatsRow> = sqlx::query_as(
+        "SELECT entry_id, offered_count, opened_count, marked_count, first_seen_at, \
+                last_offered_at, recent_uses \
+         FROM knowledge_use_stats \
+         WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| CoreError::Storage(format!("dreaming: load use records failed: {e}")))?;
+
+    let marks: Vec<MarkRow> = sqlx::query_as(
+        "SELECT entry_id, marked_by, polarity, reason, marked_at \
+         FROM knowledge_use_marks \
+         WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| CoreError::Storage(format!("dreaming: load use marks failed: {e}")))?;
+
+    // Indexed rather than scanned, unlike the by-id read this is modelled on.
+    // There the id list is a handful and a linear filter per row costs nothing;
+    // here both sides are the whole store, and a scan per entry would be
+    // quadratic in it.
+    let mut by_entry: HashMap<&str, Vec<KnowledgeMark>> = HashMap::new();
+    for row in &marks {
+        if let Some(mark) = into_mark(row) {
+            by_entry
+                .entry(row.entry_id.as_str())
+                .or_default()
+                .push(mark);
+        }
+    }
+
+    Ok(stats
+        .into_iter()
+        .map(|row| KnowledgeUseRecord {
+            marks: by_entry.remove(row.entry_id.as_str()).unwrap_or_default(),
+            entry_id: row.entry_id,
+            offered_count: row.offered_count.max(0) as u64,
+            opened_count: row.opened_count.max(0) as u64,
+            marked_count: row.marked_count.max(0) as u64,
+            first_seen_at: row.first_seen_at,
+            last_offered_at: row.last_offered_at,
+            recent_uses: row.recent_uses,
+        })
+        .collect())
 }
 
 /// A stored mark row as a domain mark, or `None` when the row carries a value

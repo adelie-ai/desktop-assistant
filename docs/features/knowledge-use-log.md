@@ -178,6 +178,22 @@ itself, because it has to join it with a term of its own before either is
 compressed - see the activation score in
 `docs/features/pre-prompt-recall.md`.
 
+**The daily pass asks a different question and gets two other sums.** `S` answers
+"what is this entry worth", so a contradiction drives it down. "What is worth
+re-examining" needs the opposite, because a fact that was retrieved and then
+found wrong is the most valuable thing a consolidation pass can look at.
+
+So the log is read twice more. `retrieval_sum` answers how much the entry was
+reached for: the recent window and the tail, without the `mark_weight`
+multiplier `S` applies on top. **The use a mark came with still counts** - the
+writer prepends the stamp to the window in the same statement that moves
+`marked_count`, because marking an entry means it was retrieved - and what is
+left out is the judgement, not the retrieval. `contradiction_sum` reads the
+negative marks alone, as a magnitude. The pass adds the two, so a contradiction
+raises the priority where it lowers the score. See
+`docs/features/knowledge-maintenance.md`. Two sums rather than one sum and a sign
+convention that has to mean opposite things in two places.
+
 Three properties follow from that shape:
 
 - **Recency weighted.** Every term is an age raised to a negative power, so an

@@ -141,12 +141,18 @@ pub const MAX_DELETE_REASON_CHARS: usize = 500;
 /// quote is to name the shape that came back, which the first line of it does.
 pub const MAX_DROPPED_OP_EXCERPT_CHARS: usize = 160;
 
-/// `knowledge_base.source` for an entry that was promoted deliberately: the
-/// user asked for it, or Adele decided in the moment that it was worth keeping.
+/// `knowledge_base.source` for an entry written during a live turn: the user
+/// asked for it, or Adele decided in the moment that it was worth keeping. The
+/// column cannot separate those two.
 ///
 /// Consolidation may rewrite or merge such an entry, but never prunes one: a
-/// fact a person entered on purpose is not the model's to remove.
-pub const SOURCE_EXPLICIT: &str = "explicit";
+/// fact somebody entered on purpose is not the model's to remove.
+///
+/// The domain reads the same value as a salience signal, so there is one
+/// definition of it and this is the name storage knows it by. A second literal
+/// here would be a value two layers could disagree about, and the disagreement
+/// would show only as a signal that never fires.
+pub const SOURCE_EXPLICIT: &str = desktop_assistant_core::domain::salience::SOURCE_EXPLICIT;
 
 /// Why consolidation soft-deleted a row, recorded on the row itself.
 ///
@@ -202,4 +208,22 @@ pub struct ConsolidationStats {
     /// answer, not a deliberate refusal: it is reported so a repaired answer is
     /// never quietly smaller than the one the model sent.
     pub dropped_operations: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The constant is the string migration 026 writes into the column.
+    ///
+    /// One assertion, because there is only one thing left to check. This name
+    /// is an alias for the domain's constant rather than a second declaration,
+    /// so the two cannot disagree and a test comparing them would compare a
+    /// value with itself. What no type checks is that either of them matches the
+    /// schema, and a mismatch there is silent: the prune guard would stop
+    /// protecting live-turn entries and the salience signal would never fire.
+    #[test]
+    fn explicit_provenance_is_the_value_the_schema_writes() {
+        assert_eq!(SOURCE_EXPLICIT, "explicit");
+    }
 }

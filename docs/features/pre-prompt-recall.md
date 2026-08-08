@@ -380,14 +380,15 @@ offered; activation says in what order, and it is one function rather than a
 blend of multipliers:
 
 ```text
-A_i = semantic + reinforcement + situation
+A_i = semantic + reinforcement + situation + salience
 ```
 
 `semantic` is the same dimensionless deviation count the bar reads - never a raw
 distance, so a source added later joins on the same scale without refitting
 anything. `situation` is how well the entry's own record matches the situation
-the prompt arrived in, and it has its own section below. `reinforcement` is what
-the use log knows
+the prompt arrived in, and `salience` is how much of what makes a fact worth
+keeping the entry carries; both have their own section below. `reinforcement` is
+what the use log knows
 (`docs/features/knowledge-use-log.md`), read as
 `use_lift * ln(1 + S / S_ref)` and carrying `S`'s sign, where `S` is the ACT-R
 base-level sum over the entry's opens and marks and `S_ref` is the sum one use a
@@ -603,6 +604,95 @@ in the same situation records what this one missed.
 The rule is `crates/core/src/domain/situation.rs`; the table is
 `knowledge_situation`, created by `047_knowledge_situation.sql` and bounded per
 entry per field with the least recently seen value evicted first.
+
+## Salience
+
+Some facts matter more than others, and the software analogues of that are
+cheap. Five signals, none of which needs a model call:
+
+| signal | read from |
+| --- | --- |
+| the entry was written in a live turn rather than distilled overnight | the `source` column, where it is `explicit` |
+| the entry names a date something is wanted by | words in its text, summary and tags |
+| the entry is about money | words in its text, summary and tags |
+| the entry is about health | words in its text, summary and tags |
+| the entry records a promise made to somebody else | words in its text, summary and tags |
+
+The first one does **not** say a person asked. The `explicit` provenance covers
+both the user asking and the assistant deciding in the moment, and the column
+cannot separate them - which is why the signal is named `Deliberate` and priced
+like the rest.
+
+**Read at scoring time, never stored.** The reading is taken from the entry's own
+body, summary, tags and provenance, all of which the recall scan already selects,
+so there is no column, no write and no extra query. A detector added later
+applies to every entry ever written rather than only to the ones written after
+it, and an entry rewritten by consolidation is re-read. It also settles the "term,
+never a gate" rule by construction: salience has no write path to consult, so a
+low-salience fact is stored exactly as any other.
+
+**A cue is a word, not a run of letters.** "rent" sits inside "current", "tax"
+inside "syntax", "promised" inside "compromised" and "euros" inside
+"neuroscience", so a cue must start on a word boundary and end on one, give or
+take a three-character inflection - "invoices" still fires "invoice" and
+"taxonomy" no longer fires "tax". The fields are joined by a newline, so a phrase
+cue cannot be assembled out of two tags that each say nothing.
+
+**No bare topic word is a cue**, so an entry tagged only `health` carries no
+signal. That is a cost, and it is paid on purpose: every cue here is worth the
+same, a topic word is weak evidence where a specific one is strong, and "health
+check" and "service health" are ordinary in the engineering notes this store
+holds. A topic word wants a lower weight than a specific cue, which is a design
+change rather than a longer list.
+
+**The signals divide one fixed lift rather than each adding one.** The term is a
+ratio - of the signals this build can detect, how many does this entry carry - so
+it cannot grow with how many signals a deployment happens to be able to detect. A
+sixth signal takes from the five.
+
+Adding a detector is still a change to the ranking rather than a free extension.
+One that never fires cannot reorder two entries against each other on salience,
+because it scales both shares by the same factor - but it shrinks the whole term
+against the semantic and use-log terms beside it, so a pair salience was
+separating by a hair can change places. That is also what the English-only cue
+lists cost a store in another language: not nothing, but a smaller salience term
+on the entries that do carry a signal.
+
+**Every signal is worth the same**, deliberately. A deadline and a live-turn
+write are not equally strong evidence, but nothing in this store measures how
+much stronger either is, and an equal split is the honest reading of five signals
+nobody has weighed.
+
+**The bound is the same scale the situation gets:** a full reading is worth
+exactly what one use at the reference age is worth, about a third of a deviation.
+A mark in the use log records something that happened and a salience signal reads
+what text means, so a reading is bounded by one recorded use and never outweighs
+it.
+
+**One cheap term cannot take the top line; two can.** A third of a deviation is
+under the half a deviation between the bar and the weakest hit the measured
+prompts produced, so neither salience nor the situation alone overturns a
+measured best match. Both at once reach about seven tenths and overturn the
+weakest - which is the weakly cued prompt, where the non-semantic signals are
+supposed to lead.
+
+**It ranks and never admits**, on the same terms as the situation: it is applied
+after the bar, over the set the bar admitted, so the "and N more entries also
+matched" hedge stays true.
+
+**What is not detected, stated rather than left to be discovered.** A correction
+of something the assistant said is already recorded as a negative mark in the use
+log, which the reinforcement term reads and the daily pass reads again as its
+contradiction term - detecting it a third time from text would count one fact
+three times. Repetition across separate conversations has nothing to read,
+because recurrence today writes a second entry rather than reinforcing the first;
+it arrives with extraction-time matching. And *how near* a deadline is: the
+signal fires on an entry that names a date something is wanted by, and no date is
+parsed, so a deadline three years past reads exactly like one due tomorrow.
+
+The rule is `crates/core/src/domain/salience.rs`. A skill candidate answers no
+salience at all: every signal is read off a knowledge entry, and a skill holds
+none of those.
 
 **One scan states both.** The candidates and the spread are functions of the same
 query vector: the spread says what a distance from this store is worth, and the
@@ -902,6 +992,7 @@ measured.
 | The activation score | `crates/core/src/domain/activation.rs` |
 | The base-level sum it reads | `KnowledgeUseRecord::use_sum`, `crates/core/src/domain/knowledge_use.rs` |
 | The situation cue, and what it is worth | `crates/core/src/domain/situation.rs` |
+| The salience signals, and what a reading is worth | `crates/core/src/domain/salience.rs` |
 | The standing guidance for the block | `crates/core/src/prompts/sections/knowledge_base.txt` |
 | The port the daemon fills | `crates/core/src/ports/recall.rs` |
 | Looked up once per turn | `ConversationHandler::recall_lookup`, `crates/core/src/service.rs` |
