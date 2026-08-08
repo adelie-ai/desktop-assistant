@@ -50,6 +50,33 @@ Builds from this repo alone:
 podman build -t localhost/adele-daemon:dev -f Dockerfile .
 ```
 
+### Telemetry export: one build argument, off by default
+
+Both Dockerfiles take `--build-arg OTEL=1`, which compiles the OTLP exporter
+into the daemon - and, for the fleet image, into all 13 bundled MCP servers as
+well. Without it the image contains no exporter, and the `OTEL_*` variables the
+manifests set do nothing at all.
+
+```sh
+podman build --build-arg OTEL=1 -t localhost/adele-daemon:otel -f Dockerfile .
+```
+
+The argument takes `0` or `1` and nothing else; any other value fails the build
+rather than producing an image that looks instrumented and exports nothing. The
+finished image carries the answer as a label:
+
+```sh
+podman image inspect --format '{{index .Config.Labels "ai.adelie.otel"}}' <image>
+```
+
+The `OTEL=1` build takes noticeably longer and produces a larger binary. It
+needs no extra packages in the builder.
+
+An image that can export still exports nothing until an overlay opts the
+collector in and points it at a backend. Both steps, and how to confirm the
+signals arrive, are in
+[`deploy/k8s/README.md`](../deploy/k8s/README.md#telemetry).
+
 ### Fleet image
 
 The daemon and the fleet servers each build from their own source tree, so the
@@ -107,6 +134,11 @@ deploy/k8s/
     daemon.yaml            the daemon, its /state PVC, Service
     rls-bootstrap.yaml     Job provisioning the adele_query RLS role
     daemon.toml            seed config (an overlay replaces it)
+  components/
+    telemetry/             opt-in; an overlay lists it under `components:`
+      otel-collector.yaml  OpenTelemetry Collector DaemonSet + Service
+      otel-collector-config.yaml  collector pipeline (backend from the environment)
+      daemon-telemetry.yaml  patch: the daemon's OTEL_* wiring
   overlays/
     example/               the shape of an environment, with placeholder values
       kustomization.yaml

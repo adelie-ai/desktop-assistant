@@ -266,8 +266,16 @@ deploy-rls-bootstrap:
 # Validate the deploy manifests without touching a live cluster: the base and
 # the example overlay must both render, the rendered output is schema-validated
 # client-side, a dry-run of the generated rls-bootstrap-sql ConfigMap proves the
-# canonical SQL path resolves, and the #500 RLS-bootstrap shape/anti-drift
-# assertions run. Safe in CI; never contacts the API server.
+# canonical SQL path resolves, and the #500 RLS-bootstrap and telemetry
+# shape/anti-drift assertions run. Safe in CI; never contacts the API server.
+#
+# This recipe needs kubectl, so `just check` does not call it. The parts that
+# need nothing but python3 also run in the main gate - see
+# scripts/tests/k8s-telemetry.test.sh, which additionally proves each telemetry
+# check is able to fail. `check-telemetry-render.sh` runs only here, because it
+# asserts what kustomize renders rather than what the manifests say: telemetry
+# must be absent from an overlay that did not opt in, and present exactly once in
+# one that did.
 check-deploy:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -283,6 +291,8 @@ check-deploy:
         --from-file=rls_role.sql=crates/storage/bootstrap/rls_role.sql \
         --dry-run=client -o yaml | kubectl apply --dry-run=client -f - >/dev/null
     ./deploy/k8s/check-rls-bootstrap.sh
+    ./deploy/k8s/check-telemetry.sh
+    ./deploy/k8s/check-telemetry-render.sh
 
 # Install git hooks (pre-push runs `just check`). Local config; run once per clone.
 install-hooks:

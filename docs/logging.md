@@ -392,6 +392,14 @@ OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf \
 Each binary reports its own `service.name`: `adele-daemon` and
 `adele-dbus-bridge`.
 
+**`OTEL_SERVICE_NAME` does not change it.** The name is passed to the SDK's
+resource builder in code, and a value supplied there wins over the variable, so
+the variable is read and then overwritten. Verified in a running pod: with
+`OTEL_SERVICE_NAME` set to another value, every record still arrived as
+`service.name=adele-daemon`. Do not set it, and do not use it to tell two
+deployments apart - carry `OTEL_RESOURCE_ATTRIBUTES` for that, which the same
+builder merges rather than replaces. Tracked in `adelie-ai/adelie-telemetry#11`.
+
 ### Choosing a transport
 
 Two transports are compiled in and `OTEL_EXPORTER_OTLP_PROTOCOL` selects one at

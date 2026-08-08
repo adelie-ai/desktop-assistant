@@ -1,0 +1,24 @@
+# Where this environment's collector forwards to.
+#
+# The whole pipeline is not copied here on purpose: it is sixty lines that would
+# drift from the component's copy the first time a processor changed there. Only
+# the two values that are environment-specific are patched, and the pipeline
+# reads them through `${env:...}`.
+#
+# Both values below are still placeholders - this repo is public. A real overlay
+# names a real backend here.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: otel-collector
+spec:
+  template:
+    spec:
+      containers:
+        - name: collector
+          env:
+            - name: OTLP_BACKEND_ENDPOINT
+              value: "collector.example.com:4317"
+            # `true` only for a plaintext backend inside the cluster.
+            - name: OTLP_BACKEND_INSECURE
+              value: "false"

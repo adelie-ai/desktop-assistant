@@ -23,9 +23,24 @@ FROM rust:1.97-bookworm AS builder
 
 # libpam0g-dev is only needed by the daemon (WS local-system auth), but a single
 # builder keeps the toolchain + cargo registry/git cache shared across the fleet.
+#
+# Nothing else is needed for `OTEL=1`: its TLS backend compiles native code
+# through aws-lc-rs, which wants a C compiler and an assembler and not cmake,
+# and the base image already carries both.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends libpam0g-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# Whether this image can export telemetry - the daemon AND every fleet server,
+# built the same way. Off by default, so an unmodified build produces the image
+# it has always produced. `--build-arg OTEL=1` compiles the OTLP exporter in;
+# see desktop-assistant/scripts/cargo-otel.sh and the Telemetry section of
+# desktop-assistant/deploy/k8s/README.md.
+ARG OTEL=0
+
+# Ahead of the sources, because the fleet servers are built before
+# desktop-assistant/ is copied and they build through the same wrapper.
+COPY desktop-assistant/scripts/cargo-otel.sh /usr/local/bin/cargo-otel
 
 WORKDIR /build
 
@@ -50,12 +65,12 @@ RUN set -eux; \
     for d in command-mcp cve-mcp fileio-mcp geocode-mcp homeassistant-mcp \
              internet-radio-mcp openstreetmap-mcp skills-mcp tasks-mcp \
              terminal-mcp timeclock-mcp weather-forecast-mcp web-mcp; do \
-      ( cd "$d" && cargo build --release ); \
+      ( cd "$d" && cargo-otel build --release ); \
     done
 
 # Daemon last so a daemon source edit doesn't rebuild the fleet layers above.
 COPY desktop-assistant/ ./desktop-assistant/
-RUN cd desktop-assistant && cargo build --release --locked -p desktop-assistant-daemon
+RUN cd desktop-assistant && cargo-otel build --release --locked -p desktop-assistant-daemon
 
 # Collect + strip binaries into a clean staging tree.
 RUN set -eux; \
@@ -77,10 +92,20 @@ FROM debian:bookworm-slim
 # shared libs headless Chrome needs (libnss3, libgbm1, libasound2, ...); the
 # binary lands at /usr/bin/chromium. In a container it must run with
 # --no-sandbox (see the fleet config), and WEB_CHROME_PATH points web-mcp at it.
+#
+# ca-certificates is also load-bearing once telemetry is exported over https:
+# both OTLP transports read the operating system trust store, so an image
+# without a CA bundle fails every https export.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates libpam0g chromium fonts-liberation \
     && rm -rf /var/lib/apt/lists/*
+
+# Carried through from the builder stage so the finished image says whether it
+# can export. `1` means the OTLP exporter is compiled into the daemon and into
+# every fleet server.
+ARG OTEL=0
+LABEL ai.adelie.otel="${OTEL}"
 
 RUN useradd --create-home --uid 10001 assistant
 WORKDIR /home/assistant

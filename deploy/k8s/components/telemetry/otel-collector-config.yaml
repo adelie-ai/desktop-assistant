@@ -1,0 +1,74 @@
+# The collector's own pipeline. Rendered into the `otel-collector-config`
+# ConfigMap by the base's kustomization and mounted at /conf.
+#
+# THE BACKEND BELOW IS A PLACEHOLDER. An overlay replaces this whole file with
+# its own copy (`behavior: replace`) naming a real backend. This repo is public,
+# so no real hostname belongs here - see the header of kustomization.yaml.
+#
+# Traffic in: whatever the workloads on this node export. Traffic out: one
+# connection to the backend, for all three signals.
+
+receivers:
+  # Both transports, because a workload picks between them at run time with
+  # OTEL_EXPORTER_OTLP_PROTOCOL. Bound to 0.0.0.0 so the Service can reach it;
+  # the collector's own default is localhost, which no other pod can use.
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # First in every pipeline, per the collector's own guidance: it refuses new
+  # data while memory is over the soft limit, which sheds load instead of the
+  # container being killed and losing everything already buffered. The numbers
+  # sit under the container's memory limit in otel-collector.yaml; change both
+  # together.
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 400
+    spike_limit_mib: 100
+
+  # One export call per batch rather than per span. `timeout` bounds how long a
+  # record waits when traffic is light, so a quiet instance still reports.
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+
+exporters:
+  # `otlp_grpc`, not `otlp`. The plain name is a deprecated alias for this one
+  # and the collector says so at every start; an overlay that copies this file
+  # inherits the working name rather than the warning. Use `otlphttp` instead to
+  # reach a backend that speaks only OTLP over HTTP.
+  otlp_grpc:
+    # Read from the environment, so an overlay names its backend by patching two
+    # values on the DaemonSet rather than by copying this whole file. A copy
+    # would be sixty lines of pipeline duplicated per environment, and it would
+    # drift from this one the first time a processor changed here.
+    #
+    # The defaults are set in otel-collector.yaml and are placeholders. See
+    # ../../README.md ("Telemetry") for the patch, and for why a placeholder
+    # backend fails silently rather than loudly.
+    endpoint: ${env:OTLP_BACKEND_ENDPOINT}
+    tls:
+      # `true` for a plaintext in-cluster backend. Off-cluster backends keep TLS.
+      insecure: ${env:OTLP_BACKEND_INSECURE}
+
+service:
+  telemetry:
+    logs:
+      level: info
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp_grpc]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp_grpc]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp_grpc]

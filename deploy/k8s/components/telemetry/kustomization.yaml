@@ -1,0 +1,51 @@
+# Telemetry collection, as an opt-in component.
+#
+# An overlay that wants to collect telemetry lists this directory under
+# `components:`; an overlay that says nothing renders exactly what it rendered
+# before this existed. That is deliberate. Export is off by default, and a
+# collector that arrived with the base would not be off by default - it would
+# appear in every namespace the base renders into, whether or not anyone asked
+# for one, pointing at a placeholder backend.
+#
+# The daemon's own OTEL_* variables and its termination grace period come with
+# it, in daemon-telemetry.yaml, for the same reason: the endpoint names a Service
+# only this component creates, and the grace period protects a flush that only
+# happens when there is something to export. An overlay that does not opt in
+# therefore renders no telemetry at all - not a collector, and not a pod template
+# that mentions one - so applying this change to such an overlay restarts
+# nothing.
+#
+#   # <your-overlay>/kustomization.yaml
+#   components:
+#     - <relative path>/components/telemetry
+#
+# See ../../README.md ("Telemetry") for the whole path from a bare cluster to
+# visible telemetry, including how to point this at a real backend.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+resources:
+  - otel-collector.yaml
+
+patches:
+  # Adds the OTEL_* variables and the grace period to the daemon's pod. A
+  # strategic merge, so it appends to the base's environment rather than
+  # replacing it.
+  - path: daemon-telemetry.yaml
+
+configMapGenerator:
+  # The collector's pipeline, including the backend an overlay replaces.
+  #
+  # It keeps its content-hash name suffix, unlike the base's seed daemon.toml,
+  # because it is live config: the collector reads it at every start. The hash
+  # gives the ConfigMap a new name whenever the file changes, so applying an
+  # edit rolls the DaemonSet onto it. Without the hash the edit would sit in the
+  # cluster doing nothing until somebody restarted the pods by hand.
+  #
+  # An overlay that sets a global `generatorOptions: {disableNameSuffixHash:
+  # true}` takes that suffix off again and gets the silent behaviour back -
+  # kustomize folds a global `true` into every generator and a local `false`
+  # cannot override it. Set the option per generator instead.
+  - name: otel-collector-config
+    files:
+      - config.yaml=otel-collector-config.yaml
