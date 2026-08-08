@@ -17,6 +17,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use tempfile::TempDir;
+
 use desktop_assistant_core::ports::turn_telemetry::{resolve_turn_trace, with_turn_trace};
 use desktop_assistant_mcp_client::McpClient;
 use httpmock::prelude::*;
@@ -39,16 +41,24 @@ const ARGUMENT_SENTINEL: &str = "SENTINEL-ARGUMENT-a-path-the-model-chose";
 // stdio: the `_meta` vehicle.
 // ---------------------------------------------------------------------------
 
-/// Unique temp path for this test process.
-fn temp_path(label: &str) -> PathBuf {
-    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    std::env::temp_dir().join(format!("mcp-trace-{}-{}-{}", std::process::id(), n, label))
+/// A private directory for one test's files.
+///
+/// Not a path built from the process id in the shared temp directory. This test
+/// writes a shell script and then executes it, and on a host with a second
+/// local account - a shared build machine - a predictable name in a
+/// world-writable directory is a name somebody else can create first, as a
+/// symlink or as their own script. `TempDir` creates a randomly named directory
+/// with owner-only permissions and removes it on drop.
+fn temp_dir() -> TempDir {
+    tempfile::Builder::new()
+        .prefix("mcp-trace-")
+        .tempdir()
+        .expect("a private temporary directory")
 }
 
 /// A fake MCP server that answers `initialize` and `tools/call`, and writes the
 /// `tools/call` request line it received to `echo_file`.
-fn write_server(label: &str, echo_file: &Path) -> PathBuf {
+fn write_server(dir: &Path, echo_file: &Path) -> PathBuf {
     let script = format!(
         r#"#!/bin/sh
 while IFS= read -r line; do
@@ -65,15 +75,16 @@ done
 "#,
         echo = echo_file.display(),
     );
-    let path = temp_path(label);
+    let path = dir.join("server.sh");
     std::fs::write(&path, script).expect("write the fake server script");
     path
 }
 
 /// Call one tool over stdio and return the request the server actually read.
-async fn stdio_call(label: &str) -> Value {
-    let echo = temp_path(&format!("{label}-echo"));
-    let script = write_server(label, &echo);
+async fn stdio_call() -> Value {
+    let dir = temp_dir();
+    let echo = dir.path().join("echo.jsonl");
+    let script = write_server(dir.path(), &echo);
     let mut client = McpClient::connect(
         "/bin/sh",
         &[script.to_string_lossy().into_owned()],
@@ -88,8 +99,6 @@ async fn stdio_call(label: &str) -> Value {
     client.shutdown().await;
 
     let line = std::fs::read_to_string(&echo).unwrap_or_default();
-    let _ = std::fs::remove_file(&script);
-    let _ = std::fs::remove_file(&echo);
     serde_json::from_str(line.trim()).unwrap_or_else(|e| {
         panic!("the server must have read one JSON-RPC line, got {line:?}: {e}")
     })
@@ -99,7 +108,7 @@ async fn stdio_call(label: &str) -> Value {
 async fn stdio_mcp_call_carries_context_in_meta() {
     let request = with_turn_trace(
         Some(resolve_turn_trace(None, REQUEST_ID, CONVERSATION_ID)),
-        stdio_call("in-a-turn"),
+        stdio_call(),
     )
     .await;
 
@@ -127,7 +136,7 @@ async fn injecting_the_trace_adds_nothing_but_the_trace() {
     // in alongside.
     let request = with_turn_trace(
         Some(resolve_turn_trace(None, REQUEST_ID, CONVERSATION_ID)),
-        stdio_call("meta-contents"),
+        stdio_call(),
     )
     .await;
 
@@ -146,7 +155,7 @@ async fn a_stdio_call_outside_a_turn_carries_no_meta() {
     // A background handshake or a health probe has no trace. Injecting a
     // placeholder would make the server join a trace nobody started, which is
     // worse than the server starting its own.
-    let request = stdio_call("outside-a-turn").await;
+    let request = stdio_call().await;
     assert!(
         request["params"].get("_meta").is_none(),
         "nothing may be injected outside a turn: {request}"

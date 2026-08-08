@@ -1856,6 +1856,12 @@ fn request_id_and_trace_id_are_the_same_value() {
     //
     // This holds with the `otel` feature off, which is the build every desktop
     // install runs. What the feature adds is export, not correlation.
+    //
+    // It holds for a turn whose trace was minted here, which is every turn
+    // except one forwarded by a caller that already had a trace. That case is
+    // deliberate and is pinned by
+    // `incoming_traceparent_is_continued_not_replaced`, which asserts the two
+    // differ.
     let _serialised = serialised();
     let captured = run(Level::INFO, two_round_script(), ScriptedTools::ok());
     let turn = captured.span("turn");
@@ -1982,7 +1988,14 @@ fn llm_span_records_the_provider_request_id() {
     let _serialised = serialised();
     let captured = run(Level::INFO, two_round_script(), ScriptedTools::ok());
 
-    for span in captured.spans_named("llm.call") {
+    let calls = captured.spans_named("llm.call");
+    assert!(
+        !calls.is_empty(),
+        "no `llm.call` span opened, so this test would pass without any \
+         provider call happening at all; the run produced {:?}",
+        captured.span_names()
+    );
+    for span in calls {
         assert_eq!(
             span.field("provider_request_id"),
             Some(PROVIDER_REQUEST_ID),
@@ -2057,7 +2070,13 @@ fn a_provider_request_id_cannot_forge_a_log_line() {
         one_turn(&handler).await;
     });
 
-    for span in captured.spans_named("llm.call") {
+    let calls = captured.spans_named("llm.call");
+    assert!(
+        !calls.is_empty(),
+        "no `llm.call` span opened, so the field assertions below would be \
+         vacuous"
+    );
+    for span in calls {
         let Some(recorded) = span.field("provider_request_id") else {
             continue;
         };
@@ -2081,6 +2100,55 @@ fn a_provider_request_id_cannot_forge_a_log_line() {
                 .trim_start()
                 .starts_with("2026-01-01T00:00:00.0Z ERROR forged"),
             "a provider header forged a line that reads as the daemon's own\n\
+             --- console ---\n{}",
+            captured.console
+        );
+    }
+}
+
+/// A conversation id shaped like a whole log line. The id a turn carries is
+/// the one that arrived on the wire, and nothing between the socket and the
+/// span bounds it.
+const FORGED_CONVERSATION_ID: &str =
+    "c-91\n2026-01-01T00:00:00.0Z ERROR forged: the database is on fire\u{1b}[31m";
+
+#[test]
+fn a_conversation_id_cannot_forge_a_log_line() {
+    // Every span in a turn now carries the conversation id, and a `%` field
+    // reaches the console through `Display`, which does not escape what
+    // `Debug` would. The daemon mints conversation ids itself today, so this
+    // is defence in depth - but that invariant lives in another function, is
+    // not asserted anywhere, and would not survive a store that adopts a
+    // client-supplied id.
+    let _serialised = serialised();
+    let captured = capture(Level::INFO, async move {
+        let handler = ConversationHandler::with_tools(
+            MemStore::default(),
+            ScriptedLlm::new(two_round_script()),
+            ScriptedTools::ok(),
+            Box::new(|| FORGED_CONVERSATION_ID.to_string()),
+        );
+        one_turn(&handler).await;
+    });
+
+    for span in &captured.spans {
+        let Some(recorded) = span.field("conversation_id") else {
+            continue;
+        };
+        assert!(
+            !recorded.contains('\u{1b}'),
+            "an escape survived onto `{}.conversation_id`, which exports \
+             verbatim when the span closes; got {recorded:?}",
+            span.name
+        );
+    }
+
+    for line in captured.console.lines() {
+        assert!(
+            !line
+                .trim_start()
+                .starts_with("2026-01-01T00:00:00.0Z ERROR forged"),
+            "a conversation id forged a line that reads as the daemon's own\n\
              --- console ---\n{}",
             captured.console
         );

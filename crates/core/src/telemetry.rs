@@ -62,6 +62,12 @@
 //! which makes an unbounded value impossible to pass, and `provider` and
 //! `model` come from operator configuration rather than from a prompt.
 //!
+//! Two values on a span come from outside and go through [`Safe`] for that
+//! reason: the tool name, which the model writes, and the conversation id,
+//! which arrives on the wire. Neither is bounded otherwise, and a `%` field
+//! reaches the console line through `Display`, which does not escape what
+//! `Debug` would.
+//!
 //! One label is not bounded by its type, and it is the one to keep an eye on:
 //! `tool`, whose value the **model** writes. It is bounded at the call site
 //! instead - a name the turn did not advertise is recorded as [`UNKNOWN_TOOL`].
@@ -252,7 +258,7 @@ pub(crate) fn turn_span(
     let span = tracing::info_span!(
         "turn",
         request_id = request_id,
-        conversation_id = conversation_id,
+        conversation_id = %Safe::name(conversation_id),
         user_id = user_id,
         connection_id = route.connection_id(),
         model = route.model(),
@@ -277,7 +283,7 @@ pub(crate) fn round_span(round: usize) -> tracing::Span {
     tracing::info_span!(
         "turn.round",
         round = round,
-        conversation_id = %crate::ports::turn_telemetry::current_conversation_id(),
+        conversation_id = %Safe::name(crate::ports::turn_telemetry::current_conversation_id()),
         tools = tracing::field::Empty,
         outcome = tracing::field::Empty,
         input_tokens = tracing::field::Empty,
@@ -336,7 +342,7 @@ pub(crate) fn aux_llm_span(purpose: LlmPurpose) -> tracing::Span {
         purpose = purpose.as_label(),
         provider = route.provider(),
         model = route.model(),
-        conversation_id = %crate::ports::turn_telemetry::current_conversation_id(),
+        conversation_id = %Safe::name(crate::ports::turn_telemetry::current_conversation_id()),
         provider_request_id = tracing::field::Empty,
     )
 }
@@ -382,7 +388,7 @@ pub(crate) fn llm_span(parent: &tracing::Span, round: usize, route: &TurnRoute) 
         round = round,
         provider = route.provider(),
         model = route.model(),
-        conversation_id = %crate::ports::turn_telemetry::current_conversation_id(),
+        conversation_id = %Safe::name(crate::ports::turn_telemetry::current_conversation_id()),
         outcome = tracing::field::Empty,
         provider_request_id = tracing::field::Empty,
     )
@@ -401,7 +407,7 @@ pub(crate) fn tool_span(parent: &tracing::Span, tool: &str, runner: ToolRunner) 
         "tool.call",
         tool = %Safe::name(tool),
         runner = runner.as_label(),
-        conversation_id = %crate::ports::turn_telemetry::current_conversation_id(),
+        conversation_id = %Safe::name(crate::ports::turn_telemetry::current_conversation_id()),
         outcome = tracing::field::Empty,
     )
 }
@@ -409,7 +415,7 @@ pub(crate) fn tool_span(parent: &tracing::Span, tool: &str, runner: ToolRunner) 
 /// The turn's one pre-prompt recall lookup, which is where the embedding
 /// round-trip happens.
 pub(crate) fn recall_span(conversation_id: &str) -> tracing::Span {
-    tracing::info_span!("recall.lookup", conversation_id = conversation_id)
+    tracing::info_span!("recall.lookup", conversation_id = %Safe::name(conversation_id))
 }
 
 // ---------------------------------------------------------------------------

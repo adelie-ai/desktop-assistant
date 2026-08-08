@@ -49,24 +49,28 @@ pub(crate) fn bind_parent(span: &tracing::Span, trace: &TurnTrace) {
     let context = opentelemetry::trace::SpanContext::new(
         opentelemetry::trace::TraceId::from_bytes(origin.trace_id().to_bytes()),
         opentelemetry::trace::SpanId::from_bytes(parent_span.to_bytes()),
-        TraceFlags::SAMPLED,
+        if trace.sampled() {
+            TraceFlags::SAMPLED
+        } else {
+            TraceFlags::default()
+        },
         // Remote: this context describes a span another process owns, which is
         // what stops the exporter reporting it as one of ours.
         true,
         TraceState::default(),
     );
-    // A parent can only be set while the span has not yet been entered, and
-    // every call site here builds the span and binds it before instrumenting
-    // anything with it. A failure therefore means a new call site got the
-    // order wrong, and the symptom - a turn in a trace of its own - is one
-    // nobody would trace back here without a line saying so.
+    // Three things stop a parent being set, and only one of them is a defect
+    // here. `AlreadyStarted` means a call site built the span, entered it, and
+    // bound it afterwards, which is the wrong order. `SpanDisabled` is
+    // ordinary: a daemon run at `RUST_LOG=warn` disables the INFO turn span,
+    // and there is then no span to give a trace to. `LayerNotFound` means this
+    // process installed no OpenTelemetry layer, which a foreign subscriber
+    // already in place produces. So the error names itself rather than being
+    // asserted, and the level is DEBUG because two of the three are normal.
     if let Err(error) =
         span.set_parent(opentelemetry::Context::new().with_remote_span_context(context))
     {
-        tracing::debug!(
-            %error,
-            "a span was already started when its trace was bound, so it keeps the trace it had"
-        );
+        tracing::debug!(%error, "the turn span keeps whatever trace it had");
     }
 }
 

@@ -120,12 +120,33 @@ impl TurnTrace {
         }
     }
 
-    /// The `traceparent` header value naming this turn's root.
+    /// The `traceparent` header value naming the best parent this turn knows.
     ///
-    /// Deterministic, and derived from the trace id alone, so a process with no
-    /// span machinery of its own still produces a header a receiver can join.
+    /// A continued trace names the caller's own span, so a receiver hangs its
+    /// work where it belongs rather than under an id nobody exported. A minted
+    /// trace has no such span, and then the deterministic root
+    /// `adelie_telemetry::TraceParent::root_for` derives is named instead - the
+    /// same value the client that minted the id would derive, so the two agree
+    /// without either exporting anything.
+    ///
+    /// The `sampled` bit is the caller's answer where there is one. Replacing
+    /// it with `true` would override a caller that deliberately did not sample,
+    /// and a receiver running a parent-based sampler would then act on a
+    /// decision nobody made.
     pub fn root_header(&self) -> String {
-        TraceParent::root_for(self.trace.trace_id(), true).to_header()
+        match self.trace {
+            TraceOrigin::Continued(parent) => parent.to_header(),
+            TraceOrigin::Minted(trace_id) => TraceParent::root_for(trace_id, true).to_header(),
+        }
+    }
+
+    /// Whether the originator sampled this trace. A trace minted here is
+    /// sampled, because nothing upstream said otherwise.
+    pub fn sampled(&self) -> bool {
+        match self.trace {
+            TraceOrigin::Continued(parent) => parent.sampled(),
+            TraceOrigin::Minted(_) => true,
+        }
     }
 }
 
@@ -476,12 +497,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn there_is_no_outbound_traceparent_outside_a_turn() {
+    async fn a_continued_trace_names_the_callers_own_span() {
+        // A receiver hangs its work under the span that called it. Naming the
+        // deterministic root instead would put every server's work under an id
+        // nobody exported, which reads as an orphan subtree in the trace.
+        let trace = resolve_turn_trace(Some(INCOMING), CLIENT_ID, "conv-1");
+        let header = trace.root_header();
+        assert_eq!(
+            adelie_telemetry::extract_traceparent(&header)
+                .expect("the header this crate writes must parse")
+                .span_id()
+                .to_hex(),
+            "00f067aa0ba902b7",
+            "the caller's span id is the parent to name"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_callers_sampling_decision_is_carried_not_overridden() {
+        // A caller that deliberately did not sample must not be overruled. A
+        // receiver running a parent-based sampler would otherwise act on a
+        // decision nobody made.
+        let unsampled = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00";
+        let trace = resolve_turn_trace(Some(unsampled), CLIENT_ID, "conv-1");
+        assert!(!trace.sampled());
+        assert!(trace.root_header().ends_with("-00"));
+
+        let minted = resolve_turn_trace(None, CLIENT_ID, "conv-1");
+        assert!(
+            minted.sampled(),
+            "a trace minted here is sampled: nothing upstream said otherwise"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_default_build_injects_nothing_outside_a_turn() {
+        // Named for what it checks rather than for the wider property. With
+        // the `otel` feature on there is a second source - the open span's own
+        // context - so this holds unconditionally only in a build with no span
+        // ids at all, which is what a desktop install runs.
+        #[cfg(not(feature = "otel"))]
         assert_eq!(
             outbound_traceparent(),
             None,
             "a call made outside a turn must inject nothing rather than invent a trace"
         );
+        // With `otel` on and no subscriber installed there is no valid span
+        // context either, so the answer is the same for a different reason.
+        #[cfg(feature = "otel")]
+        assert_eq!(outbound_traceparent(), None);
     }
 
     #[tokio::test]

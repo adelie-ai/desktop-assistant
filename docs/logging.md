@@ -130,14 +130,21 @@ the turn writes carries it through span scope:
 INFO turn{request_id="4bf92f35-..." trace_id="4bf92f3577b34da6a3ce929d0e0e4736" conversation_id="c-91" user_id="alice"}: executing tool tool=web_fetch arg_bytes=214
 ```
 
-The `trace_id` beside it is the same value. A uuid is 16 bytes and a W3C trace
-id is 16 bytes, so the request id becomes the trace id directly, with no
-mapping table and no second identifier. One string therefore greps the pod log,
-appears in the client's own event stream, and finds the trace in a backend, and
-it can be pasted from any one of the three into any other.
+The `trace_id` beside it is normally the same value. A uuid is 16 bytes and a
+W3C trace id is 16 bytes, so the request id becomes the trace id directly, with
+no mapping table and no second identifier. One string therefore greps the pod
+log, appears in the client's own event stream, and finds the trace in a
+backend, and it can be pasted from any one of the three into any other.
 
 That holds with the `otel` feature off. What the feature adds is export, not
 correlation.
+
+**One case makes them differ, and it is worth knowing before you go looking.**
+When a caller supplies a `traceparent` - the web BFF forwarding a browser's
+turn - the daemon continues *that* trace, so `trace_id` is the caller's and
+`request_id` stays the correlation id the client reads its own stream by.
+Pasting the request id into a backend then finds nothing. The turn's own log
+line carries both, so the trace id is one grep away.
 
 ### Who mints it
 
@@ -149,6 +156,17 @@ not a degraded one.
 
 The daemon accepts a well-formed, non-nil uuid and falls back to minting for
 anything else. A malformed value never fails the turn.
+
+**`request_id` is no longer unique by construction.** The daemon used to mint it
+per send, so nothing could collide. A client now chooses it, and the daemon
+checks its shape and not its novelty. Nothing inside the daemon keys on it - the
+in-flight index and the idempotency store key on the user, the conversation and
+the idempotency key, and event delivery is scoped by user id - so a repeated
+value costs a confusing trace and nothing else there. A process that
+*multiplexes* several callers over one daemon connection is the exception: it
+must mint its own value for the daemon hop rather than forward what it was
+given, because it demultiplexes on what comes back. The web BFF is the one that
+does this today.
 
 The id is a correlation id and nothing else. It grants no capability and names
 no user, so it reaches no authorization or tenancy decision. It is also not the
@@ -165,7 +183,7 @@ boundaries is plain HTTP, so none of them gets it for free.
 | Client to daemon, over UDS, WebSocket or D-Bus | `turn_id` and `traceparent`, two optional fields on the `SendMessage` command. The frames are our own and have no header concept. |
 | Daemon to a stdio MCP server | `params._meta.traceparent` on the JSON-RPC request. A pipe has no headers, and `_meta` is the MCP spec's own place for protocol metadata. |
 | Daemon to a remote MCP server, over Streamable HTTP | A real `traceparent` request header, which is what a server nobody here owns understands. |
-| Browser to the web BFF to the daemon | The browser mints the id and sends it; the BFF forwards what it was given rather than replacing it. Three processes, one trace. |
+| Browser to the web BFF to the daemon | The browser mints an id and sends it. The BFF mints its own `turn_id` for the daemon hop and passes the browser's trace on in `traceparent`, so the daemon joins the browser's trace. Three processes, one trace. |
 
 Two boundaries deliberately carry nothing, and both are worth knowing about
 before an operator goes looking for the missing half:
