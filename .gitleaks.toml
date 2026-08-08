@@ -49,3 +49,61 @@ description = "Truncated example JWT in API documentation - \"...\" is literal, 
 regexes = [
   '''^eyJhbGciOiJIUzI1NiIs\.\.\.$''',
 ]
+
+# The rules below extend the scan to a second class: PRIVATE INFORMATION.
+# Nothing they match is a credential, which is why every one of them passed
+# this gate for as long as it sat in the tree. They arrive the same way each
+# time - someone illustrates a point with real output from the running system,
+# and the output carries the machine it came from.
+#
+# These rules match SHAPES, never site-specific values. This file is published
+# with the repository, so an instance name or a private domain written here
+# would be the leak, permanently, in git history. The site-specific literals
+# live in an optional host-local rules file outside the repository, which
+# scripts/secret-scan.sh appends when it is present - see AGENTS.md, "Secret
+# scanning". A clone that has no such file still scans and still passes on
+# these rules alone.
+#
+# Each rule reports a secretGroup rather than its whole match, and that is
+# load-bearing rather than cosmetic. gitleaks' bundled default configuration
+# carries a global allowlist whose regexes drop, silently, any finding whose
+# SECRET is a whole absolute path under /home (`^/(?:bin|etc|home|opt|tmp|usr|
+# var)/[\w ./-]+$`) or begins with the letters "true" (`(?i)^true|false|null$`
+# - the `^` binds to the first alternative only, so it matches any secret
+# starting with that word rather than the word alone). A rule reporting the
+# whole match therefore fires on some hosts and not others, with no output
+# either way. Reporting a narrow group that neither pattern can match makes
+# detection independent of both. Verified against the pinned binary, not
+# assumed.
+
+[[rules]]
+id = "adele-absolute-home-path"
+description = "An absolute home directory naming a real account (/home/<name>, /Users/<name>). It identifies the machine and the person, and it arrives without anyone deciding to write it - pasted terminal output, a captured log, an error message. Use a workspace-relative path, $HOME, ~ or /home/<user> instead (AGENTS.base.md rule 5.2). The account name is what is reported, so the placeholders below are exempted by name."
+regex = '''/(?:home|Users)/([A-Za-z][A-Za-z0-9._-]*)'''
+secretGroup = 1
+
+[[rules.allowlists]]
+description = "Account names that are placeholders, not people. The first two are the substitutes rule 5.2 names; the rest are the synthetic accounts this repository's own fixtures, documentation and container images already use, so the rule does not fail a clean tree. /home/<user>, /home/$USER, ${HOME} and ~ need no entry - none of them can match the rule's own account-name pattern. Adding a name here is a decision that the name identifies nobody; where it does identify someone, change the fixture instead."
+regexes = [
+  '''^(?:user|example|assistant|ada|ada-client|peer|x)$''',
+]
+
+[[rules.allowlists]]
+description = "The two files that must contain these patterns to define and to test them. gitleaks scans the working tree, so without this a clean checkout fails its own gate - and a clean tree that fails is exactly the noise that trains people to bypass it. Scoped to this rule rather than declared globally, so a real credential in either file is still caught by the default rule set. Matched by path suffix, so the exemption holds wherever the file is checked out - including under .claude/worktrees/. gitleaks' bundled default allowlist happens to cover the first path too; it is named here so the exemption stays this repository's decision rather than a side effect of the pinned version."
+paths = [
+  '''(^|/)\.gitleaks\.toml$''',
+  '''(^|/)scripts/tests/secret-scan-gate\.test\.sh$''',
+]
+
+[[rules]]
+id = "adele-private-network-hostname"
+description = "A hostname on a pseudo-TLD that public DNS never delegates (.lab, .lan, .corp, .home). Such a name resolves only inside one private network, so it identifies infrastructure that is not meant to be public, whatever the host is called - which is why this matches the suffix and needs no site name written into a public file. Use example.com, or a placeholder, in documentation instead (AGENTS.base.md rule 5.2). Lowercase only: hostnames are written lowercase, and the restriction keeps the rule off ordinary uppercase identifiers."
+regex = '''\b[a-z0-9][a-z0-9-]*(?:\.[a-z0-9-]+)*\.(lab|lan|corp|home)\b'''
+secretGroup = 1
+
+[[rules.allowlists]]
+description = "Same two files, same reason as the rule above: each must carry the pattern it defines or tests. Scoped to this rule and matched by path suffix for the same reasons."
+paths = [
+  '''(^|/)\.gitleaks\.toml$''',
+  '''(^|/)scripts/tests/secret-scan-gate\.test\.sh$''',
+]

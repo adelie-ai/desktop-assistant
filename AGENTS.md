@@ -216,6 +216,68 @@ different Rust toolchains. Bump the pin deliberately, after checking the new
 release's notes (base rule 6.1), not by installing whatever a package
 manager offers this week.
 
+The scan runs in **two layers**, because this repository is public.
+
+- **Layer 1 - the committed rules**, in `.gitleaks.toml`. Credentials, plus a
+  second class the gate also has to catch: **private information**. None of
+  that class is a credential, which is why an absolute home path, a private
+  hostname and a live instance name all passed this gate for as long as they
+  sat in the tree. They arrive the same way each time - somebody illustrates a
+  point with real output from the running system, and the output carries the
+  machine it came from. Layer 1 matches **shapes only**: an absolute home path
+  (`/home/<name>`, `/Users/<name>`) and a hostname on a pseudo-TLD that public
+  DNS never delegates (`.lab`, `.lan`, `.corp`, `.home`). No site-specific
+  value belongs in this file - it is published with the repository, so a value
+  written here is the leak, permanently, in git history.
+- **Layer 2 - the host-local rules**, at
+  `${XDG_CONFIG_HOME:-$HOME/.config}/adelie-ai/gitleaks-private.toml`, outside
+  any repository and never committed. This is where the site-specific
+  **literals** go: the names of deployed instances, private domains, a
+  registry host, a personal email domain. `scripts/secret-scan.sh` appends the
+  file to layer 1 when it exists.
+
+**Layer 2 is optional.** A fresh clone, a new machine and a first run all work
+without it: the scan runs, and passes, on layer 1 alone. What you lose is the
+site-specific half - a deployed instance name pasted into a document is caught
+on a machine that has the file and missed on a machine that does not. The
+summary line says which layers ran, so a run is never ambiguous about it.
+
+Write the file yourself, per machine. It holds `[[rules]]` blocks and nothing
+else - no `title`, no `[extend]`, because the two files are concatenated and a
+duplicated key makes gitleaks reject the merged config. Rejection is a hard
+failure, not a silent skip. Use obviously fake values as a model, and put the
+real ones only in your own copy:
+
+```toml
+[[rules]]
+id = "site-instance-name"
+description = "Names of the deployed instances at this site."
+regex = '''\b(?:acme-prod|acme-test)\b'''
+
+[[rules]]
+id = "site-private-domain"
+description = "This site's private domain and its personal email domain."
+regex = '''[a-z0-9-]+\.(internal\.example\.com)\b'''
+secretGroup = 1
+
+[[rules.allowlists]]
+description = "Files that must carry the pattern to define or test it."
+paths = [
+  '''(^|/)scripts/tests/secret-scan-gate\.test\.sh$''',
+]
+```
+
+Two mechanics are worth knowing before writing a rule of your own, both
+verified against the pinned binary rather than assumed. gitleaks' bundled
+default configuration carries a **global allowlist** that silently drops any
+finding whose secret is a whole absolute path under `/home`
+(`^/(?:bin|etc|home|opt|tmp|usr|var)/[\w ./-]+$`) or begins with the letters
+"true" (`(?i)^true|false|null$` - the `^` binds to the first alternative only).
+A rule that reports its whole match therefore detects on some inputs and not
+others, with no output either way; report a narrow `secretGroup` instead. And
+`targetRules` does not exist in this version, so an allowlist is either global
+or written inside the rule it applies to.
+
 Two files at the repo root configure the scan:
 
 - **`.gitleaks.toml`** extends (not replaces) gitleaks' default rule set.
@@ -239,7 +301,16 @@ Two files at the repo root configure the scan:
   file is exempted). Either way the match survives duplication: the same
   tracked fixture is exempt wherever `.claude/worktrees/` happens to have
   checked it out, not just at its canonical path. A path-**exact**
-  `.gitleaksignore` fingerprint does not have this property - see below.
+  `.gitleaksignore` fingerprint does not have this property - see below. The
+  two private-information rules each carry their own allowlists, scoped to
+  the rule rather than declared globally: the placeholder account names that
+  are not people (`user`, `example`, `assistant`, and the synthetic names
+  this repo's own fixtures use), and the two files that must contain these
+  patterns in order to define and to test them - `.gitleaks.toml` and
+  `scripts/tests/secret-scan-gate.test.sh`. Without that second exemption a
+  clean checkout fails its own gate, which is the noise that trains people to
+  bypass it. Scoping it to the rule keeps a real credential in either file
+  caught by the default rule set.
 - **`.gitleaksignore`** lists reviewed false positives by gitleaks fingerprint
   (`file:rule-id:start-line`) - currently empty. This mechanism is
   path-exact, which is right for a genuinely one-off finding but wrong for
@@ -268,6 +339,11 @@ Like the advisory scan, the step is deliberately unable to pass by accident:
   against): a fatal gitleaks error (bad config, bad path) exits non-zero and
   writes no report at all, so report-existence, not exit code alone, is what
   the script trusts.
+- **A malformed host-local rules file** - hard failure, by the same
+  report-existence check: gitleaks rejects the merged config and writes no
+  report, so a syntax error in a hand-written layer 2 cannot read as a clean
+  scan. A *missing* file is not a failure; it is the normal state on a
+  machine that has not set one up.
 - **A secret found** - hard failure, always. There is no suppress-and-warn
   path for a real finding the way there is for an informational RustSec
   advisory; add a reviewed `.gitleaksignore` entry for a genuine false

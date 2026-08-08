@@ -138,7 +138,42 @@ ignore="$repo_root/.gitleaksignore"
 
 report="$(mktemp)"
 scan_out="$(mktemp)"
-trap 'rm -f "$report" "$scan_out"' EXIT
+merged_config="$(mktemp)"
+trap 'rm -f "$report" "$scan_out" "$merged_config"' EXIT
+
+# The scan runs in two layers.
+#
+# Layer 1 is $config above, committed and public. It holds generic SHAPES - an
+# absolute home path, a hostname on a private-network pseudo-TLD - and no
+# site-specific value, because a value written into a public file is the leak
+# it was added to prevent.
+#
+# Layer 2 is this optional file, host-local and outside any repository. It
+# holds the literals that belong to one site and must not be published: the
+# names of deployed instances, private domains, a personal email domain. It is
+# OPTIONAL by design - a fresh clone, a new machine and CI all scan and pass
+# on layer 1 alone, and lose only the site-specific checks. See AGENTS.md,
+# "Secret scanning", for its shape and what belongs in it.
+#
+# Merged by concatenation into one temporary config rather than by gitleaks'
+# own `[extend] path`: `[extend]` accepts a path OR useDefault, never both, and
+# layer 1 needs useDefault to inherit the bundled credential rules. Two scans
+# would be the other option, and would mean two reports to reconcile before the
+# step can say what it found. Concatenation keeps one scan, one report, and one
+# exit status - and the public file never names the private one's contents.
+# The private file therefore holds `[[rules]]` blocks and nothing else;
+# anything that redefines a key already in layer 1 makes gitleaks reject the
+# config, which the report-existence check below turns into a loud hard
+# failure rather than a pass.
+private_config="${ADELE_SECRET_SCAN_PRIVATE_RULES:-${XDG_CONFIG_HOME:-$HOME/.config}/adelie-ai/gitleaks-private.toml}"
+if [ -f "$private_config" ]; then
+    cat "$config" "$private_config" >"$merged_config"
+    active_config="$merged_config"
+    layers='layer 1 + host-local rules'
+else
+    active_config="$config"
+    layers="layer 1 only (no host-local rules at $private_config)"
+fi
 
 # Scanned as `dir .` from inside the target, not `dir <absolute-path>`: gitleaks
 # reports each finding's "File" using whatever path style the target argument
@@ -148,7 +183,7 @@ trap 'rm -f "$report" "$scan_out"' EXIT
 # how the first version of this script failed its own clean-tree test.
 scan_status=0
 ( cd "$target" && gitleaks dir . \
-    --config "$config" \
+    --config "$active_config" \
     --gitleaks-ignore-path "$ignore" \
     --report-format json \
     --report-path "$report" \
@@ -201,4 +236,7 @@ if [ "$scan_status" -ne 0 ] || [ "$finding_count" -gt 0 ]; then
 fi
 
 bytes_scanned="$(grep -oE 'scanned ~[0-9]+ bytes[^"]*' "$scan_out" | head -1 || true)"
-printf 'secret-scan: clean%s\n' "${bytes_scanned:+ - $bytes_scanned}"
+# Which layers ran is part of the result, not a detail: "clean" means two
+# different things with and without the host-local rules, and a machine that
+# silently has no layer 2 otherwise reads as fully checked.
+printf 'secret-scan: clean - %s%s\n' "$layers" "${bytes_scanned:+ - $bytes_scanned}"
