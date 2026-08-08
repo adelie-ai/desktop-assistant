@@ -588,6 +588,272 @@ async fn assert_non_utf8_value_passes_through(var: &'static str) {
     );
 }
 
+// --- OTLP transport: what a spawned server needs to export at all ---------
+//
+// `StdioTransport::spawn` clears the environment, so before these entries a
+// spawned server received no export configuration and exported nothing - no
+// traces, no metrics and no log records, from any server in the fleet
+// (#1189). The daemon's own spans reached the collector throughout, which is
+// what made the gap read like a working pipeline.
+//
+// `adelie-telemetry` resolves a per-signal variable before the generic one,
+// so each per-signal form gets its own test: passing only the generic form
+// would silently drop a deployment that sends one signal somewhere else.
+
+/// The endpoint for all three signals. Without it a spawned server has no
+/// export configuration at all.
+#[tokio::test]
+async fn allowlisted_env_otlp_endpoint_reaches_child() {
+    assert_passes_through(
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "http://otel-collector.example.internal:4317",
+        "otlp-endpoint",
+    )
+    .await;
+}
+
+/// The traces endpoint, which beats the generic one for that signal.
+#[tokio::test]
+async fn allowlisted_env_otlp_traces_endpoint_reaches_child() {
+    assert_passes_through(
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+        "http://otel-collector.example.internal:4318/v1/traces",
+        "otlp-traces-endpoint",
+    )
+    .await;
+}
+
+/// The metrics endpoint, which beats the generic one for that signal.
+#[tokio::test]
+async fn allowlisted_env_otlp_metrics_endpoint_reaches_child() {
+    assert_passes_through(
+        "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+        "http://otel-collector.example.internal:4318/v1/metrics",
+        "otlp-metrics-endpoint",
+    )
+    .await;
+}
+
+/// The log-records endpoint, which beats the generic one for that signal.
+#[tokio::test]
+async fn allowlisted_env_otlp_logs_endpoint_reaches_child() {
+    assert_passes_through(
+        "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+        "http://otel-collector.example.internal:4318/v1/logs",
+        "otlp-logs-endpoint",
+    )
+    .await;
+}
+
+/// The transport for all three signals, `grpc` or `http/protobuf`. A server
+/// that keeps the compiled default while the collector listens only on the
+/// other port exports nothing, and the failure reads as a network fault.
+#[tokio::test]
+async fn allowlisted_env_otlp_protocol_reaches_child() {
+    assert_passes_through("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc", "otlp-protocol").await;
+}
+
+/// The traces transport, which beats the generic one for that signal.
+#[tokio::test]
+async fn allowlisted_env_otlp_traces_protocol_reaches_child() {
+    assert_passes_through(
+        "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
+        "http/protobuf",
+        "otlp-traces-protocol",
+    )
+    .await;
+}
+
+/// The metrics transport, which beats the generic one for that signal.
+#[tokio::test]
+async fn allowlisted_env_otlp_metrics_protocol_reaches_child() {
+    assert_passes_through(
+        "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL",
+        "http/protobuf",
+        "otlp-metrics-protocol",
+    )
+    .await;
+}
+
+/// The log-records transport, which beats the generic one for that signal.
+#[tokio::test]
+async fn allowlisted_env_otlp_logs_protocol_reaches_child() {
+    assert_passes_through(
+        "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL",
+        "http/protobuf",
+        "otlp-logs-protocol",
+    )
+    .await;
+}
+
+/// The export timeout for all three signals, in milliseconds.
+#[tokio::test]
+async fn allowlisted_env_otlp_timeout_reaches_child() {
+    assert_passes_through("OTEL_EXPORTER_OTLP_TIMEOUT", "10000", "otlp-timeout").await;
+}
+
+/// The traces timeout, which beats the generic one for that signal.
+#[tokio::test]
+async fn allowlisted_env_otlp_traces_timeout_reaches_child() {
+    assert_passes_through(
+        "OTEL_EXPORTER_OTLP_TRACES_TIMEOUT",
+        "10000",
+        "otlp-traces-timeout",
+    )
+    .await;
+}
+
+/// The metrics timeout, which beats the generic one for that signal.
+#[tokio::test]
+async fn allowlisted_env_otlp_metrics_timeout_reaches_child() {
+    assert_passes_through(
+        "OTEL_EXPORTER_OTLP_METRICS_TIMEOUT",
+        "10000",
+        "otlp-metrics-timeout",
+    )
+    .await;
+}
+
+/// The log-records timeout, which beats the generic one for that signal.
+#[tokio::test]
+async fn allowlisted_env_otlp_logs_timeout_reaches_child() {
+    assert_passes_through(
+        "OTEL_EXPORTER_OTLP_LOGS_TIMEOUT",
+        "10000",
+        "otlp-logs-timeout",
+    )
+    .await;
+}
+
+/// The deployment's own resource attributes - pod, namespace and node in the
+/// shipped k8s manifest. Without them a server's spans carry none of the
+/// deployment context the daemon's own spans carry, so a reader cannot tell
+/// which pod produced them. The SDK merges these; it does not let them
+/// replace the service name each server sets for itself in code.
+#[tokio::test]
+async fn allowlisted_env_otel_resource_attributes_reaches_child() {
+    assert_passes_through(
+        "OTEL_RESOURCE_ATTRIBUTES",
+        "k8s.namespace.name=adele,k8s.pod.name=adele-daemon-0",
+        "otel-resource-attributes",
+    )
+    .await;
+}
+
+/// One filter governs a server's console output and its exported log records
+/// together, so without this an operator cannot raise a deployed server's log
+/// level at all: its exported records stay fixed at the compiled default.
+#[tokio::test]
+async fn allowlisted_env_rust_log_reaches_child() {
+    assert_passes_through("RUST_LOG", "info,mcp_core=debug", "rust-log").await;
+}
+
+// --- OTLP variables that must NOT reach a spawned server ------------------
+//
+// The allowlist is a security control, so it names each telemetry variable
+// one at a time. A prefix rule on `OTEL_` would pass every variable below.
+
+/// `OTEL_EXPORTER_OTLP_HEADERS` is where a backend ingestion credential
+/// lives. Passing it would hand that credential to every spawned server,
+/// including a third-party one an operator adds - the leak #910 exists to
+/// prevent. Servers export to the in-cluster collector, and the collector is
+/// where backend credentials belong. A server that genuinely must reach a
+/// backend directly takes the scoped route, `inherit_env`.
+#[tokio::test]
+async fn spawned_server_does_not_inherit_otlp_headers() {
+    let _guard = EnvVarGuard::set(
+        "OTEL_EXPORTER_OTLP_HEADERS",
+        "authorization=Bearer EXAMPLE-INGEST-CREDENTIAL",
+    );
+
+    let seen = probe_env(
+        "otlp-headers",
+        &["OTEL_EXPORTER_OTLP_HEADERS"],
+        &HashMap::new(),
+    )
+    .await;
+
+    assert_eq!(
+        seen["OTEL_EXPORTER_OTLP_HEADERS"], UNSET,
+        "the OTLP ingestion credential must not reach a spawned MCP child"
+    );
+}
+
+/// The same credential, in the three per-signal spellings. These are the
+/// entries a later widening by `OTEL_EXPORTER_OTLP_` prefix would pass, so
+/// this test is what fails when someone reaches for the prefix.
+#[tokio::test]
+async fn spawned_server_does_not_inherit_per_signal_otlp_headers() {
+    let value = "authorization=Bearer EXAMPLE-INGEST-CREDENTIAL";
+    let _traces = EnvVarGuard::set("OTEL_EXPORTER_OTLP_TRACES_HEADERS", value);
+    let _metrics = EnvVarGuard::set("OTEL_EXPORTER_OTLP_METRICS_HEADERS", value);
+    let _logs = EnvVarGuard::set("OTEL_EXPORTER_OTLP_LOGS_HEADERS", value);
+
+    let seen = probe_env(
+        "otlp-per-signal-headers",
+        &[
+            "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+            "OTEL_EXPORTER_OTLP_METRICS_HEADERS",
+            "OTEL_EXPORTER_OTLP_LOGS_HEADERS",
+        ],
+        &HashMap::new(),
+    )
+    .await;
+
+    for var in [
+        "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+        "OTEL_EXPORTER_OTLP_METRICS_HEADERS",
+        "OTEL_EXPORTER_OTLP_LOGS_HEADERS",
+    ] {
+        assert_eq!(
+            seen[var], UNSET,
+            "{var} carries the same credential as the generic form and must not reach a child"
+        );
+    }
+}
+
+/// `OTEL_SERVICE_NAME` would make every spawned server report under the
+/// daemon's service name, and the traces would be unreadable. Each server
+/// names itself from its own config.
+#[tokio::test]
+async fn spawned_server_does_not_inherit_otel_service_name() {
+    let _guard = EnvVarGuard::set("OTEL_SERVICE_NAME", "adele-daemon");
+
+    let seen = probe_env("otel-service-name", &["OTEL_SERVICE_NAME"], &HashMap::new()).await;
+
+    assert_eq!(
+        seen["OTEL_SERVICE_NAME"], UNSET,
+        "a spawned server must not report under the daemon's service name"
+    );
+}
+
+/// Kubernetes injects legacy service-link variables for every Service in the
+/// namespace, so a Service named `otel-collector` puts `OTEL_COLLECTOR_PORT`
+/// and `OTEL_COLLECTOR_SERVICE_HOST` in the daemon's environment. They are
+/// not OpenTelemetry configuration and nothing reads them. They are here
+/// because they are what an `OTEL_` prefix rule would forward, together with
+/// any future credential variable that happens to start the same way.
+#[tokio::test]
+async fn spawned_server_does_not_inherit_kubernetes_service_link_variables() {
+    let _port = EnvVarGuard::set("OTEL_COLLECTOR_PORT", "tcp://192.0.2.10:4317");
+    let _host = EnvVarGuard::set("OTEL_COLLECTOR_SERVICE_HOST", "192.0.2.10");
+
+    let seen = probe_env(
+        "otel-service-links",
+        &["OTEL_COLLECTOR_PORT", "OTEL_COLLECTOR_SERVICE_HOST"],
+        &HashMap::new(),
+    )
+    .await;
+
+    for var in ["OTEL_COLLECTOR_PORT", "OTEL_COLLECTOR_SERVICE_HOST"] {
+        assert_eq!(
+            seen[var], UNSET,
+            "{var} is a Kubernetes service link, not telemetry configuration, and must not \
+             reach a spawned child"
+        );
+    }
+}
+
 // --- Diagnosability: a too-tight allowlist must fail loud, not silent ------
 //
 // If a server genuinely needs a variable this allowlist doesn't carry, it
