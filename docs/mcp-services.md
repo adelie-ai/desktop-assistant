@@ -125,6 +125,19 @@ environment:
 | `WEB_CHROME_PATH` | Path to a bundled Chromium binary (`web-mcp`) |
 | `SKILLS_MCP_ROOTS` | Skill-root search path (`skills-mcp`, enabled by default) |
 | `SKILLS_MCP_WRITE_ROOT` | Where `skills-mcp` (enabled by default) writes a new skill when the default root is not writable |
+| `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_PROTOCOL`, `OTEL_EXPORTER_OTLP_TIMEOUT`, and the `_TRACES_`, `_METRICS_` and `_LOGS_` form of each | Where a server exports its own traces, metrics and log records, and how. A server that receives none of these exports nothing — see [Logging and telemetry](logging.md) |
+| `OTEL_RESOURCE_ATTRIBUTES` | Deployment context (pod, namespace, node) on a server's own signals, so they read beside the daemon's |
+| `RUST_LOG` | Log filter. One filter governs a server's console output and its exported log records together, the same as for the daemon |
+
+`OTEL_EXPORTER_OTLP_HEADERS` is **not** passed, and neither are its
+per-signal forms. That variable carries the backend ingestion credential, and
+every spawned server — including a third-party one you add — would receive
+it. Servers export to the collector, and the collector holds the backend
+credential. A server that must reach a backend directly takes the scoped
+route below, `inherit_env`.
+
+`OTEL_SERVICE_NAME` is not passed either: every server would report under the
+daemon's service name. Each server names itself.
 
 Every other variable is stripped, even one the daemon itself received. A
 server that needs something else must receive it through its own `env` (or
