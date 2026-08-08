@@ -178,6 +178,15 @@ itself, because it has to join it with a term of its own before either is
 compressed - see the activation score in
 `docs/features/pre-prompt-recall.md`.
 
+**The daily pass asks a different question and gets two other sums.** `S` answers
+"what is this entry worth", so a contradiction drives it down. "What is worth
+re-examining" needs the opposite, because a fact that was retrieved and then
+found wrong is the most valuable thing a consolidation pass can look at. So
+`retrieval_sum` reads the opens with the marks left out, and `contradiction_sum`
+reads the negative marks alone as a magnitude, and the pass adds them - see
+`docs/features/knowledge-maintenance.md`. Two sums rather than one sum and a sign
+convention that has to mean opposite things in two places.
+
 Three properties follow from that shape:
 
 - **Recency weighted.** Every term is an age raised to a negative power, so an

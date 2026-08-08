@@ -78,8 +78,13 @@ pub fn replay_priority(
     now: DateTime<Utc>,
     weights: &ActivationWeights,
 ) -> f64 {
-    let _ = (record, salience_share, now, weights);
-    0.0
+    let retrieved = record.map_or(0.0, |record| {
+        weights.reinforcement(record.retrieval_sum(now, &weights.use_score))
+    });
+    let contradicted = record.map_or(0.0, |record| {
+        weights.reinforcement(record.contradiction_sum(now, &weights.use_score))
+    });
+    retrieved + contradicted + weights.salience(salience_share)
 }
 
 #[cfg(test)]

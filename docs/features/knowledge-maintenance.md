@@ -172,6 +172,50 @@ stamp declared it current, so nothing would ever revisit it. Matching the body's
 modified time makes the write a no-op in that case; the line is discarded and the
 row stays in the worklist for the next cycle.
 
+## What the pass looks at first
+
+The pass examines every active entry, and until it had a priority it started at
+the first tag in alphabetical order and worked down. So the order in which a
+slice's expensive call was spent, and the material a cancelled or partly-failed
+pass never reached, were both decided by a string sort.
+
+The order now follows what re-examining an entry is worth today
+(`crates/core/src/domain/replay.rs`):
+
+```text
+P_i = retrieved + contradicted + salient
+```
+
+- **`retrieved`, not written.** Reconsolidation makes a memory editable at the
+  moment it is recalled, which is where a contradiction surfaces; a fact written
+  yesterday and never reached for has told nobody anything yet. The use log
+  (`docs/features/knowledge-use-log.md`) is what can tell the two apart, read
+  here as its opens alone.
+- **`contradicted` adds here, where the retrieval score subtracts it.** A fact
+  that was retrieved and then found wrong is the highest-value thing a
+  consolidation pass can examine, so the signal that pushes it out of a
+  `[Recall]` block pulls it to the front of a review. It decays with the age of
+  the mark, because a contradiction nobody has acted on for a year is less
+  urgent - not because it has stopped being true.
+- **`salient`** is the same reading the recall block scores with, described in
+  `docs/features/pre-prompt-recall.md`.
+
+Every term is read through the activation weights the recall block already uses,
+so nothing here is a second set of coefficients to fit.
+
+**Whole tag groups move, never single entries.** Entries are loaded in tag order
+precisely so near-duplicates land in one slice, and redundancy is what the pass
+exists to find; an order that put the six most-retrieved entries first would
+scatter every cluster it depends on. A group is a run of entries carrying the
+identical tags, its priority is that of its best entry, and the sort is stable -
+so a store with no use history is sliced exactly as it was before this existed.
+
+**It orders and does not select.** Nothing is dropped. Capping a day's material
+is a separate decision, and a cap laid over an arbitrary order would silently
+stop examining whatever sorted last. A use log that cannot be read costs the
+order and not the pass: the run says so once in the journal and proceeds on the
+tag order alone.
+
 ## What consolidation may and may not do
 
 The model sees the whole active store and returns a plan. The plan is not applied

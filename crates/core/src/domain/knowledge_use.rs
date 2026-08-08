@@ -409,8 +409,14 @@ impl KnowledgeUseRecord {
     /// carries, which [`crate::domain::replay`] reads through
     /// [`Self::contradiction_sum`] instead.
     pub fn retrieval_sum(&self, now: DateTime<Utc>, weights: &UseScoreWeights) -> f64 {
-        let _ = (now, weights);
-        0.0
+        let d = weights.safe_decay();
+        let window: Vec<f64> = self
+            .recent_uses
+            .iter()
+            .map(|t| age_seconds(now, *t))
+            .collect();
+        let recent: f64 = window.iter().map(|age| age.powf(-d)).sum();
+        recent + self.tail_term(now, d, window.iter().copied().fold(0.0, f64::max))
     }
 
     /// How much standing evidence there is that this entry is **wrong**, on the
@@ -426,8 +432,15 @@ impl KnowledgeUseRecord {
     /// acted on for a year is less urgent than one from this morning - not
     /// because it has stopped being true.
     pub fn contradiction_sum(&self, now: DateTime<Utc>, weights: &UseScoreWeights) -> f64 {
-        let _ = (now, weights);
-        0.0
+        let d = weights.safe_decay();
+        self.marks
+            .iter()
+            .filter(|mark| mark.polarity == MarkPolarity::Negative)
+            .map(|mark| {
+                let age = age_seconds(now, mark.marked_at);
+                weights.mark_weight(mark.source) * age.powf(-d)
+            })
+            .sum()
     }
 
     /// The approximated contribution of the uses that fell out of the recent

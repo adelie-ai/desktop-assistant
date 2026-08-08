@@ -635,11 +635,29 @@ fn order_by_replay_priority(
         .map(|record| (record.entry_id.as_str(), record))
         .collect();
 
-    let _priorities: Vec<f64> = entries
-        .iter()
-        .map(|entry| entry.replay_priority(&by_id, now, &weights))
-        .collect();
-    entries
+    let mut groups: Vec<(f64, Vec<KbEntry>)> = Vec::new();
+    for entry in entries {
+        let priority = entry.replay_priority(&by_id, now, &weights);
+        match groups.last_mut() {
+            // A run of the identical tags is one group. Equality on the whole
+            // vector rather than on any one tag: that is exactly what
+            // `ORDER BY tags` groups by, so this cuts the runs the loader made
+            // and invents none of its own.
+            Some((best, group)) if group.last().is_some_and(|last| last.tags == entry.tags) => {
+                *best = best.max(priority);
+                group.push(entry);
+            }
+            _ => groups.push((priority, vec![entry])),
+        }
+    }
+
+    // `total_cmp` rather than `partial_cmp`, so the comparator is a total order
+    // and the sort cannot depend on which pair it happened to visit first. A
+    // priority that is not a number cannot reach here - every term is bounded
+    // arithmetic over stored timestamps - and if one did, `total_cmp` still
+    // orders it rather than making the sort incoherent.
+    groups.sort_by(|left, right| right.0.total_cmp(&left.0));
+    groups.into_iter().flat_map(|(_, group)| group).collect()
 }
 
 /// Greedily pack tag-ordered entries into slices under the prompt char budget.

@@ -166,6 +166,91 @@ impl SalienceSignal {
             Self::Deadline | Self::Money | Self::Health | Self::Commitment => MarkSource::Model,
         }
     }
+
+    /// What one occurrence of this signal is worth, before the ratio.
+    ///
+    /// Never a number of its own: it is the use log's own price for the source
+    /// that stated it.
+    fn weight(self, weights: &UseScoreWeights) -> f64 {
+        weights.mark_weight(self.source()).max(0.0)
+    }
+
+    /// The phrases that say this signal is present.
+    ///
+    /// Phrases rather than single words wherever the single word is ambiguous.
+    /// "due" alone fires on "due to", which is one of the commonest phrases in
+    /// English prose and says nothing about a deadline; "cost" fires on the cost
+    /// of a database query. A detector that fires on everything carries no
+    /// information, which the ratio would then spend a share of the lift on.
+    ///
+    /// English only, and stated rather than apologised for. A deployment whose
+    /// store is in another language sees these signals never fire, which scales
+    /// every entry's share by the same factor and therefore reorders nothing -
+    /// the store ranks as it did before this term existed.
+    fn cues(self) -> &'static [&'static str] {
+        match self {
+            // Provenance, not text. `Instructed` is decided by the `source`
+            // column, so it has no phrase of its own.
+            Self::Instructed => &[],
+            Self::Deadline => &[
+                "deadline",
+                "due date",
+                "due on",
+                "due by",
+                "overdue",
+                "expires",
+                "expiry",
+                "expiration",
+                "renewal",
+                "renews on",
+                "cutoff",
+                "no later than",
+            ],
+            Self::Money => &[
+                "invoice",
+                "payment",
+                "salary",
+                "rent",
+                "mortgage",
+                "tax",
+                "refund",
+                "budget",
+                "deposit",
+                "dollars",
+                "pounds sterling",
+                "euros",
+                "bank account",
+                "subscription",
+            ],
+            Self::Health => &[
+                "doctor",
+                "dentist",
+                "hospital",
+                "clinic",
+                "prescription",
+                "medication",
+                "diagnosis",
+                "allergy",
+                "allergic",
+                "surgery",
+                "therapy",
+                "symptom",
+                "vaccine",
+                "blood pressure",
+            ],
+            Self::Commitment => &[
+                "promised",
+                "agreed to",
+                "committed to",
+                "i owe",
+                "owes me",
+                "rsvp",
+                "said i would",
+                "on my behalf",
+                "signed up to",
+            ],
+        }
+    }
 }
 
 /// The stored text and provenance a reading is taken from.
@@ -214,8 +299,26 @@ impl SalienceReading {
     /// every text signal is a substring test over it. Provenance is read from
     /// the column rather than from the text.
     pub fn read(source: &SalienceSource<'_>) -> Self {
-        let _ = source;
-        Self::default()
+        let mut haystack = source.content.to_lowercase();
+        if let Some(summary) = source.summary {
+            haystack.push(' ');
+            haystack.push_str(&summary.to_lowercase());
+        }
+        for tag in source.tags {
+            haystack.push(' ');
+            haystack.push_str(&tag.to_lowercase());
+        }
+
+        let mut carried = BTreeSet::new();
+        if source.provenance == Some(SOURCE_EXPLICIT) {
+            carried.insert(SalienceSignal::Instructed);
+        }
+        for signal in SalienceSignal::ALL {
+            if signal.cues().iter().any(|cue| haystack.contains(cue)) {
+                carried.insert(signal);
+            }
+        }
+        Self(carried)
     }
 
     /// A reading that carries exactly `signals`.
@@ -254,8 +357,15 @@ impl SalienceReading {
     ///   handed, so the bound is a property of this function rather than of its
     ///   caller.
     pub fn share(&self, weights: &UseScoreWeights) -> f64 {
-        let _ = weights;
-        0.0
+        let detectable: f64 = SalienceSignal::ALL
+            .iter()
+            .map(|signal| signal.weight(weights))
+            .sum();
+        if detectable <= 0.0 || !detectable.is_finite() {
+            return 0.0;
+        }
+        let carried: f64 = self.0.iter().map(|signal| signal.weight(weights)).sum();
+        (carried / detectable).clamp(0.0, 1.0)
     }
 }
 

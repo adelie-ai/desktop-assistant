@@ -330,7 +330,10 @@ impl ActivationWeights {
         if !share.is_finite() || share <= 0.0 {
             return 0.0;
         }
-        0.0
+        // `max(0.0)` rather than a bare product, for the reason
+        // [`Self::situation`] gives: a deployment may fit its own `use_lift`,
+        // and a negative one would otherwise make a salient entry subtract.
+        self.salience_lift().max(0.0) * share.min(1.0)
     }
 }
 
@@ -1133,8 +1136,8 @@ mod tests {
     /// Acceptance (#1127): the salience term's size does not grow with how many
     /// signals a deployment can detect.
     ///
-    /// The term is a fixed lift spent against a share, and the share is a ratio
-    /// - so what every signal is worth on its own sums to exactly one full
+    /// The term is a fixed lift spent against a share, and the share is a
+    /// ratio, so what every signal is worth on its own sums to exactly one full
     /// reading. A sixth signal takes from the five rather than adding a sixth
     /// part, and the ceiling is the same number it was.
     #[test]
