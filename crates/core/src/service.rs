@@ -2533,8 +2533,16 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
             "tool discovery mode resolved"
         );
 
-        let mut activated_tools: std::collections::HashMap<String, ToolDefinition> =
-            std::collections::HashMap::new();
+        // Insertion-ordered, and a `Vec` for exactly that reason. A map
+        // iterates in an order nothing guarantees, so the advertised tool block
+        // could reorder between rounds with nothing activated - and the block
+        // is the outermost section a provider hashes for its prompt cache, so
+        // a reorder throws the cache away for the system block behind it too.
+        // Appending keeps each round's block a byte-identical prefix of the
+        // next, which is what lets a cache checkpoint move forward instead of
+        // being rebuilt (#1212). Activation counts are in the tens, so the
+        // linear membership checks below cost nothing worth measuring.
+        let mut activated_tools: Vec<ToolDefinition> = Vec::new();
         // Track whether hosted search has been demoted to local fallback.
         let mut hosted_search_demoted = false;
         // Tool-provenance gating (#741). A plain local of the turn: once a
@@ -2795,7 +2803,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
             } else {
                 core_tools_for_llm.clone()
             };
-            tool_defs.extend(activated_tools.values().cloned());
+            tool_defs.extend(activated_tools.iter().cloned());
             // Offer the connection's registered client-local tools alongside
             // the server-side set so the LLM can invoke them (#234). Skip any
             // whose name already collides with a server-side tool — the
@@ -3943,7 +3951,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 {
                     for tool_entry in tools_arr {
                         if let Some(name) = tool_entry.get("name").and_then(|v| v.as_str())
-                            && !activated_tools.contains_key(name)
+                            && !activated_tools.iter().any(|t| t.name == name)
                             && !core_tools.iter().any(|t| t.name == name)
                             && let Ok(Some(def)) = self.tools.tool_definition(name).await
                         {
@@ -3951,7 +3959,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                                 tool = %Safe::name(&def.name),
                                 "dynamically activated a tool"
                             );
-                            activated_tools.insert(def.name.clone(), def);
+                            activated_tools.push(def);
                         }
                     }
                 }
@@ -3961,13 +3969,13 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 // so full schemas are available in subsequent rounds.
                 if use_hosted_search
                     && !hosted_search_demoted
-                    && !activated_tools.contains_key(&tool_call.name)
+                    && !activated_tools.iter().any(|t| t.name == tool_call.name)
                     && !core_tools.iter().any(|t| t.name == tool_call.name)
                 {
                     for ns in &namespaces {
                         if ns.tools.iter().any(|t| t.name == tool_call.name) {
                             for t in &ns.tools {
-                                if !activated_tools.contains_key(&t.name)
+                                if !activated_tools.iter().any(|a| a.name == t.name)
                                     && !core_tools.iter().any(|ct| ct.name == t.name)
                                 {
                                     tracing::info!(
@@ -3975,7 +3983,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                                         tool = %Safe::name(&t.name),
                                         "activated a deferred tool from its namespace"
                                     );
-                                    activated_tools.insert(t.name.clone(), t.clone());
+                                    activated_tools.push(t.clone());
                                 }
                             }
                             break;
