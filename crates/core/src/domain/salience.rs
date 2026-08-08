@@ -183,6 +183,12 @@ impl SalienceSignal {
     /// of a database query. A detector that fires on everything carries no
     /// information, which the ratio would then spend a share of the lift on.
     ///
+    /// Matched as words rather than as substrings - see [`says`]. That is not
+    /// tidiness: "rent" sits inside "current", "tax" inside "syntax", "promised"
+    /// inside "compromised" and "euros" inside "neuroscience", so a substring
+    /// test would read an ordinary engineering note as being about money and a
+    /// promise.
+    ///
     /// English only, and stated rather than apologised for. A deployment whose
     /// store is in another language sees these signals never fire, which scales
     /// every entry's share by the same factor and therefore reorders nothing -
@@ -220,7 +226,6 @@ impl SalienceSignal {
                 "pounds sterling",
                 "euros",
                 "bank account",
-                "subscription",
             ],
             Self::Health => &[
                 "doctor",
@@ -241,7 +246,6 @@ impl SalienceSignal {
             Self::Commitment => &[
                 "promised",
                 "agreed to",
-                "committed to",
                 "i owe",
                 "owes me",
                 "rsvp",
@@ -251,6 +255,55 @@ impl SalienceSignal {
             ],
         }
     }
+}
+
+/// How much of a word a cue may fall short of and still be that word.
+///
+/// A cue is written in one form and a person writes it in several: one invoice
+/// and two invoices, a symptom and the symptoms, promised and promising. An
+/// inflection is at most three letters in English (`-s`, `-es`, `-ed`, `-ing`),
+/// so a cue followed by that much and then a boundary is the same word, and a
+/// cue followed by more is a different one. It is what keeps "tax" off
+/// "taxonomy" while leaving it on "taxes".
+///
+/// A bound rather than a list of endings, because the list is the part that
+/// would need maintaining and the bound is the part that does the work.
+///
+/// **An ending, never a stem.** "promising" is not "promised" plus three
+/// letters, so a cue written in one of those forms does not fire on the other.
+/// This is a bound on over-matching and not a stemmer, and the cue lists are
+/// written in the form a person is likeliest to use.
+const MAX_CUE_INFLECTION_CHARS: usize = 3;
+
+/// Whether `haystack` says `cue`, as a word rather than as a run of letters.
+///
+/// The start of a cue must fall on a word boundary, and its end must fall on one
+/// too, give or take an inflection of [`MAX_CUE_INFLECTION_CHARS`].
+///
+/// **The leading boundary is the half that matters.** "rent" sits inside
+/// "current", "tax" inside "syntax", "promised" inside "compromised" and "euros"
+/// inside "neuroscience" - every one of those is a cue buried in the middle of
+/// an unrelated word, and every one is refused by requiring the character before
+/// it to be something other than a letter or a digit.
+///
+/// `haystack` is already lowercased by [`SalienceReading::read`], and both sides
+/// are compared as bytes because every cue is ASCII: a byte index into a UTF-8
+/// string is a character boundary wherever a match was found, so slicing at one
+/// cannot split a multi-byte character.
+fn says(haystack: &str, cue: &str) -> bool {
+    haystack.match_indices(cue).any(|(at, _)| {
+        let starts_a_word = haystack[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric());
+        let tail = &haystack[at + cue.len()..];
+        let inflection = tail
+            .chars()
+            .take_while(|c| c.is_alphanumeric())
+            .take(MAX_CUE_INFLECTION_CHARS + 1)
+            .count();
+        starts_a_word && inflection <= MAX_CUE_INFLECTION_CHARS
+    })
 }
 
 /// The stored text and provenance a reading is taken from.
@@ -314,7 +367,7 @@ impl SalienceReading {
             carried.insert(SalienceSignal::Instructed);
         }
         for signal in SalienceSignal::ALL {
-            if signal.cues().iter().any(|cue| haystack.contains(cue)) {
+            if signal.cues().iter().any(|cue| says(&haystack, cue)) {
                 carried.insert(signal);
             }
         }
@@ -469,28 +522,71 @@ mod tests {
         assert!(with_prescription.carries(SalienceSignal::Health));
     }
 
-    /// The cues are phrases wherever the bare word is ambiguous, because a
-    /// detector that fires on ordinary prose carries no information and would
-    /// still be spending a share of the lift.
-    ///
-    /// The three that would bite hardest on a developer's own store.
+    /// A cue is a word, not a run of letters. Every cue this build ships is
+    /// checked against a longer word it is buried inside, so nothing here rests
+    /// on the handful a reviewer happened to think of.
     #[test]
-    fn a_cue_phrase_does_not_fire_on_the_ordinary_words_it_contains() {
+    fn no_cue_fires_when_it_is_buried_inside_a_longer_word() {
+        for signal in SalienceSignal::ALL {
+            for cue in signal.cues() {
+                let buried = format!("The zz{cue}zzzz of it is not the point.");
+                assert!(
+                    !body(&buried).carries(signal),
+                    "{buried:?} fired {}",
+                    signal.as_str()
+                );
+            }
+        }
+    }
+
+    /// The collisions a real store produces, named rather than generated, so a
+    /// cue added later that reintroduces one fails here with the sentence in the
+    /// message.
+    ///
+    /// Every line is ordinary prose from an engineering note, and every line
+    /// contains a shipped cue as a substring: "rent" in "current", "tax" in
+    /// "syntax" and "taxonomy", "promised" in "compromised", "euros" in
+    /// "neuroscience", and "due" in "due to". "cost" appears too, and is not a
+    /// cue for exactly this reason.
+    #[test]
+    fn ordinary_engineering_prose_carries_no_salience_signal() {
         for innocent in [
             "The build is slow due to the linker step.",
             "The query cost went up after the index was dropped.",
-            "The surgery of the argument parser was overdue for a rewrite.",
+            "The current parser is different from the one the parent crate uses.",
+            "The syntax of the taxonomy file changed.",
+            "A compromised token is rotated, not repaired.",
+            "The neuroscience paper is filed under reading.",
+            "The deployment is committed to main once the gate is green.",
         ] {
             let reading = body(innocent);
             assert!(
-                !reading.carries(SalienceSignal::Deadline) || innocent.contains("overdue"),
-                "{innocent:?} read as a deadline"
-            );
-            assert!(
-                !reading.carries(SalienceSignal::Money),
-                "{innocent:?} read as being about money"
+                reading.is_empty(),
+                "{innocent:?} read as carrying {:?}",
+                reading.signals().map(|s| s.as_str()).collect::<Vec<_>>()
             );
         }
+    }
+
+    /// One invoice and two invoices are the same word, so a cue written in one
+    /// form still fires where the text only adds an ending to it.
+    ///
+    /// Only an ending. A form that changes the stem - "promising" against the
+    /// cue "promised" - is a different string and is not detected, which is the
+    /// limit [`MAX_CUE_INFLECTION_CHARS`] states and this pins so that nobody
+    /// reads the rule as stemming.
+    #[test]
+    fn a_cue_fires_where_the_text_only_adds_an_ending_to_it() {
+        assert!(body("Two invoices arrived.").carries(SalienceSignal::Money));
+        assert!(body("The symptoms come and go.").carries(SalienceSignal::Health));
+        assert!(body("Both deadlines moved.").carries(SalienceSignal::Deadline));
+        assert!(body("She promised a draft.").carries(SalienceSignal::Commitment));
+
+        assert!(
+            !body("She is promising a draft.").carries(SalienceSignal::Commitment),
+            "the rule adds endings and does not stem, and a test that let this pass would be \
+             claiming otherwise"
+        );
     }
 
     /// Case is not a signal. The same fact typed in any case reads the same.
