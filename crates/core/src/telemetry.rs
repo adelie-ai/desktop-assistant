@@ -144,6 +144,85 @@ pub(crate) const TOKENS_CACHE_READ: &str = "llm.tokens.cache_read";
 pub(crate) const TOKENS_UNREPORTED: &str = "llm.tokens.unreported";
 
 // ---------------------------------------------------------------------------
+// Token counts on the provider-call span.
+//
+// The metrics above answer "how many tokens did this model burn today". They
+// cannot answer "what did this turn cost", because that needs a conversation
+// id, which is unbounded and would burn the 64-value cap described at the top
+// of this module on first contact. A span attribute has no cardinality budget,
+// and the provider-call span already carries the conversation id and the round,
+// so the counts go there as well.
+//
+// The four names below are the **OpenTelemetry GenAI semantic convention's**
+// own, not this project's, so a backend that special-cases GenAI attributes
+// renders a provider call natively instead of showing four fields it has no
+// meaning for.
+//
+// The convention is followed as a written specification rather than through a
+// crate: `opentelemetry-semantic-conventions` is not a dependency of this
+// workspace, and the GenAI registry has moved out of it into a repository of
+// its own. Followed here: the `gen_ai.usage.*` group of the OpenTelemetry
+// GenAI semantic conventions, read on 2026-08-08, which the main registry at
+// semconv 1.41.0 defers to for every GenAI attribute. That group is at
+// Development stability, so the names can still move; each is written once,
+// here, so a move is one edit.
+//
+// The metric names above are deliberately left alone. They are a separate
+// signal with separate consumers, and renaming a metric breaks the queries
+// already reading it - so the convention is adopted where it is new and free.
+// ---------------------------------------------------------------------------
+
+/// Prompt tokens the provider reported for one call.
+const GEN_AI_INPUT_TOKENS: &str = "gen_ai.usage.input_tokens";
+
+/// Completion tokens the provider reported for one call.
+const GEN_AI_OUTPUT_TOKENS: &str = "gen_ai.usage.output_tokens";
+
+/// Input tokens written into the provider's prompt cache.
+const GEN_AI_CACHE_CREATION_INPUT_TOKENS: &str = "gen_ai.usage.cache_creation.input_tokens";
+
+/// Input tokens served from the provider's prompt cache.
+const GEN_AI_CACHE_READ_INPUT_TOKENS: &str = "gen_ai.usage.cache_read.input_tokens";
+
+/// One token count on a span: the attribute it is recorded under, and how to
+/// read it off a provider's report.
+type GenAiCount = (&'static str, fn(&TokenUsage) -> Option<u64>);
+
+/// Each count a provider reports, and the attribute it is recorded under.
+///
+/// One list, read by the recording below, so a count cannot be read off the
+/// provider's report and written under another count's name.
+const GEN_AI_COUNTS: [GenAiCount; 4] = [
+    (GEN_AI_INPUT_TOKENS, |u| u.input_tokens),
+    (GEN_AI_OUTPUT_TOKENS, |u| u.output_tokens),
+    (GEN_AI_CACHE_CREATION_INPUT_TOKENS, |u| {
+        u.cache_creation_input_tokens
+    }),
+    (GEN_AI_CACHE_READ_INPUT_TOKENS, |u| {
+        u.cache_read_input_tokens
+    }),
+];
+
+/// Put one provider call's token counts on its `llm.call` span.
+///
+/// Only the counts the provider actually reported. An absent count leaves its
+/// attribute unrecorded rather than recording a zero, because a zero sums into
+/// a total that reads as a real measurement and there is no way afterwards to
+/// tell it from one. `llm.tokens.unreported` draws the same distinction on the
+/// metrics side.
+///
+/// The caller passes the span rather than this reading the current one: the
+/// counts are known only after the call returns, and by then the span is no
+/// longer the one the connector ran inside.
+pub(crate) fn record_genai_tokens_on_span(span: &tracing::Span, usage: &TokenUsage) {
+    for (attribute, read) in GEN_AI_COUNTS {
+        if let Some(value) = read(usage) {
+            span.record(attribute, value);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Outcomes. Each renders to a `&'static str`, so an unbounded value cannot
 // reach a label: it has the wrong lifetime.
 // ---------------------------------------------------------------------------
@@ -338,6 +417,8 @@ impl LlmPurpose {
 /// The turn span is current wherever these are built, so the parent is
 /// contextual rather than named. Unlike a round's call they have no round to
 /// hang from - they are the turn's own overheads.
+///
+/// The token attributes are declared empty for the reason [`llm_span`] gives.
 pub(crate) fn aux_llm_span(purpose: LlmPurpose) -> tracing::Span {
     let route = crate::ports::turn_telemetry::current_turn_route();
     tracing::info_span!(
@@ -347,22 +428,47 @@ pub(crate) fn aux_llm_span(purpose: LlmPurpose) -> tracing::Span {
         model = route.model(),
         conversation_id = %Safe::name(crate::ports::turn_telemetry::current_conversation_id()),
         provider_request_id = tracing::field::Empty,
+        gen_ai.usage.input_tokens = tracing::field::Empty,
+        gen_ai.usage.output_tokens = tracing::field::Empty,
+        gen_ai.usage.cache_creation.input_tokens = tracing::field::Empty,
+        gen_ai.usage.cache_read.input_tokens = tracing::field::Empty,
     )
 }
 
 /// Measure a provider call a turn makes outside its rounds.
 ///
-/// Returns whatever the call returned, so a call site wraps rather than
+/// Returns what the call returned, so a call site wraps rather than
 /// restructures. The measurement lands on the same histogram as a round's
 /// call, separated by the `purpose` label, so one query answers "where did the
 /// provider time go" for the whole turn.
-pub(crate) async fn measured_aux_call<F, T>(purpose: LlmPurpose, call: F) -> T
+///
+/// The response type is named rather than generic, because this reads the
+/// token counts off it and puts them on the span. Every call this wraps is a
+/// completion, so there is nothing else for it to carry.
+pub(crate) async fn measured_aux_call<F>(
+    purpose: LlmPurpose,
+    call: F,
+) -> Result<crate::ports::llm::LlmResponse, crate::CoreError>
 where
-    F: std::future::Future<Output = T>,
+    F: std::future::Future<Output = Result<crate::ports::llm::LlmResponse, crate::CoreError>>,
 {
     use tracing::Instrument;
+    // A handle of this function's own, so the span is still open when the call
+    // returns and the counts it reported can be recorded onto it. The
+    // instrumented future holds the only other handle and drops it as the await
+    // ends.
+    let span = aux_llm_span(purpose);
     let started = std::time::Instant::now();
-    let outcome = call.instrument(aux_llm_span(purpose)).await;
+    let outcome = call.instrument(span.clone()).await;
+    if let Ok(response) = &outcome
+        && let Some(usage) = &response.usage
+    {
+        record_genai_tokens_on_span(&span, usage);
+    }
+    // Closed here, by name. Left alone this handle would live to the end of the
+    // function, and an exported trace would draw the provider call across work
+    // that happened after it - the same trap the round's call site names.
+    drop(span);
     let route = crate::ports::turn_telemetry::current_turn_route();
     let [provider, model] = route_labels(&route);
     // These helpers absorb their own failures and answer with a fallback, so
@@ -383,6 +489,14 @@ where
 /// it would mean holding a span guard across an await, which attributes every
 /// other task polled on that thread to this round. Naming the parent gives the
 /// same tree with none of that risk.
+///
+/// The four token attributes are declared empty and filled in by
+/// [`record_genai_tokens_on_span`] when the response arrives, because a span
+/// fixes its field set when it opens and a count is known only after the call
+/// returns. A `record` against a field the span never declared is dropped
+/// silently and the span exports without it, so the names here and the names in
+/// [`GEN_AI_COUNTS`] have to agree; the tests in `tests/turn_telemetry.rs` are
+/// what holds them together, because nothing else would report the drift.
 pub(crate) fn llm_span(parent: &tracing::Span, round: usize, route: &TurnRoute) -> tracing::Span {
     tracing::info_span!(
         parent: parent,
@@ -394,6 +508,10 @@ pub(crate) fn llm_span(parent: &tracing::Span, round: usize, route: &TurnRoute) 
         conversation_id = %Safe::name(crate::ports::turn_telemetry::current_conversation_id()),
         outcome = tracing::field::Empty,
         provider_request_id = tracing::field::Empty,
+        gen_ai.usage.input_tokens = tracing::field::Empty,
+        gen_ai.usage.output_tokens = tracing::field::Empty,
+        gen_ai.usage.cache_creation.input_tokens = tracing::field::Empty,
+        gen_ai.usage.cache_read.input_tokens = tracing::field::Empty,
     )
 }
 
