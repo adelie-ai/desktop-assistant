@@ -15,6 +15,7 @@ pub mod knowledge;
 pub mod knowledge_delete;
 pub mod knowledge_use;
 pub mod migrate_json;
+pub mod negative_memory;
 pub mod pool;
 pub mod scratchpad;
 pub mod skill_index;
@@ -51,6 +52,7 @@ pub use migrate_json::{
     is_conversations_table_empty, is_knowledge_base_table_empty, migrate_conversations,
     migrate_knowledge,
 };
+pub use negative_memory::PgNegativeMemoryStore;
 pub use pool::{create_pool, run_migrations};
 pub use scratchpad::PgScratchpadStore;
 pub use skill_index::{

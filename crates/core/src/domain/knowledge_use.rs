@@ -173,8 +173,13 @@ pub struct KnowledgeMark {
     pub source: MarkSource,
     /// Whether it says the entry helped or says it was wrong.
     pub polarity: MarkPolarity,
-    /// Why, in the marker's own words, when one was given. A negative mark's
-    /// reason is the capture point negative memory reads.
+    /// Why, in the marker's own words, when one was given. What makes a
+    /// negative mark usable later: "this was wrong" with no account of how is
+    /// evidence that something is wrong and no help in deciding what.
+    ///
+    /// A mark is about an entry, and is never surfaced. The lesson about an
+    /// *action* is a separate mechanism with a separate store - see
+    /// [`crate::domain::negative_memory`], which nothing here reads or writes.
     pub reason: Option<String>,
     /// When the standing mark was last set.
     pub marked_at: DateTime<Utc>,

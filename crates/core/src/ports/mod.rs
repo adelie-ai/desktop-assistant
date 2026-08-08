@@ -41,6 +41,7 @@ pub mod auth;
 pub mod client_tools;
 pub mod conversation_ctx;
 pub mod knowledge_delete;
+pub mod negative_memory;
 pub mod notify;
 pub mod recall;
 pub mod request_scope;
@@ -68,6 +69,7 @@ mod tests {
         fn _assert_tools_exists<T: super::tools::ToolExecutor>() {}
         fn _assert_embedding_exists<T: super::embedding::EmbeddingClient>() {}
         fn _assert_knowledge_exists<T: super::knowledge::KnowledgeBaseStore>() {}
+        fn _assert_negative_memory_exists<T: super::negative_memory::NegativeMemoryStore>() {}
         fn _assert_scratchpad_exists<T: super::scratchpad::ScratchpadStore>() {}
         fn _assert_tool_registry_exists<T: super::tool_registry::ToolRegistryStore>() {}
         fn _assert_skill_index_exists<T: super::skill_index::SkillIndexStore>() {}
