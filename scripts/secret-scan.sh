@@ -129,21 +129,34 @@ else
         '    ADELE_SECRET_SCAN_ALLOW_UNPINNED=1 just secret-scan'
 fi
 
+# Two configs, because the gate makes two different promises and gitleaks can
+# only keep one of them per pass. $config finds CREDENTIALS and extends the
+# bundled rule set. $private_info_config finds PRIVATE INFORMATION and extends
+# NOTHING: the bundled config's global allowlist discards findings by their
+# content, and discards exactly the content those rules look for - see the
+# measurement recorded at the top of that file.
 config="$repo_root/.gitleaks.toml"
+private_info_config="$repo_root/.gitleaks-private-info.toml"
 ignore="$repo_root/.gitleaksignore"
 [ -f "$config" ] || die_loud 'SECRET SCAN DID NOT RUN: missing .gitleaks.toml' \
     "Expected the scan config at $config."
+[ -f "$private_info_config" ] || die_loud \
+    'SECRET SCAN DID NOT RUN: missing .gitleaks-private-info.toml' \
+    "Expected the private-information rules at $private_info_config." \
+    'The gate promises both passes, so a missing rule set fails it rather than' \
+    'quietly reducing what gets checked.'
 [ -f "$ignore" ] || die_loud 'SECRET SCAN DID NOT RUN: missing .gitleaksignore' \
     "Expected the reviewed-findings baseline at $ignore."
 
-report="$(mktemp)"
+report_credentials="$(mktemp)"
+report_private_info="$(mktemp)"
 scan_out="$(mktemp)"
 merged_config="$(mktemp)"
-trap 'rm -f "$report" "$scan_out" "$merged_config"' EXIT
+trap 'rm -f "$report_credentials" "$report_private_info" "$scan_out" "$merged_config"' EXIT
 
 # The scan runs in two layers.
 #
-# Layer 1 is $config above, committed and public. It holds generic SHAPES - an
+# Layer 1 is $private_info_config above, committed and public. It holds generic SHAPES - an
 # absolute home path, a hostname on a private-network pseudo-TLD - and no
 # site-specific value, because a value written into a public file is the leak
 # it was added to prevent.
@@ -161,10 +174,18 @@ trap 'rm -f "$report" "$scan_out" "$merged_config"' EXIT
 # would be the other option, and would mean two reports to reconcile before the
 # step can say what it found. Concatenation keeps one scan, one report, and one
 # exit status - and the public file never names the private one's contents.
-# The private file therefore holds `[[rules]]` blocks and nothing else;
-# anything that redefines a key already in layer 1 makes gitleaks reject the
-# config, which the report-existence check below turns into a loud hard
-# failure rather than a pass.
+# The private file therefore holds `[[rules]]` blocks and nothing else.
+#
+# Concatenation has one sharp edge, and it is checked below rather than
+# described and hoped for. Redefining something layer 1 already defines is NOT
+# uniformly rejected: a second `[extend]` table is a hard TOML error, but a
+# second `title` is accepted silently, and a second `[[rules]]` block reusing
+# an existing `id` is accepted silently AND REPLACES the original - so a
+# copy-paste in the host-local file can switch off a committed rule while the
+# scan still prints "clean". Verified against the pinned binary. Reserving a
+# rule-id prefix for the host-local layer removes the whole class: `site-`
+# cannot collide with layer 1's `adele-` ids, and matches none of the 222
+# rules bundled in gitleaks' default set.
 #
 # HOME is defaulted rather than required: with neither it nor XDG_CONFIG_HOME
 # set, the path simply does not exist and the scan runs on layer 1, which is
@@ -172,13 +193,21 @@ trap 'rm -f "$report" "$scan_out" "$merged_config"' EXIT
 # `set -u` abort here would fail the whole gate over an unset variable that
 # this step does not actually need.
 private_config="${ADELE_SECRET_SCAN_PRIVATE_RULES:-${XDG_CONFIG_HOME:-${HOME:-}/.config}/adelie-ai/gitleaks-private.toml}"
+
+# Rule ids declared in a gitleaks config, one per line. `id` sits at the top
+# level of a `[[rules]]` block; allowlist blocks have no such key.
+rule_ids_in() { # rule_ids_in <file>
+    grep -oE '^[[:space:]]*id[[:space:]]*=[[:space:]]*"[^"]+"' "$1" \
+        | sed -E 's/.*"([^"]+)"$/\1/' || true
+}
+
 if [ -f "$private_config" ]; then
     # A file that is present but unreadable is NOT the same as an absent one.
     # Absent means "this machine checks layer 1 only", which is a supported
     # state. Unreadable means the site-specific rules were meant to apply and
     # did not, so the scan is missing a layer it was asked for - and a scan
     # missing a layer must never report clean.
-    cat "$config" "$private_config" >"$merged_config" 2>/dev/null || die_loud \
+    cat "$private_info_config" "$private_config" >"$merged_config" 2>/dev/null || die_loud \
         'SECRET SCAN DID NOT RUN: the host-local rules file could not be read' \
         "Found the file but could not read it, so the site-specific rules were" \
         'not applied. This is not the same as having no such file: the rules' \
@@ -188,11 +217,34 @@ if [ -f "$private_config" ]; then
         '' \
         'Fix the file permissions, or remove the file to scan on the committed' \
         'rules alone.'
-    active_config="$merged_config"
-    layers='layer 1 + host-local rules'
+
+    shadowing_ids="$(rule_ids_in "$private_config" | grep -v '^site-' || true)"
+    [ -z "$shadowing_ids" ] || die_loud \
+        'SECRET SCAN DID NOT RUN: a host-local rule id is not reserved to that layer' \
+        'gitleaks resolves rules by id, and a later definition REPLACES an earlier' \
+        'one of the same name without saying so - which would let the host-local' \
+        'file switch off a committed rule while this step still reported clean.' \
+        '' \
+        'Host-local rule ids must therefore start with `site-`, which can collide' \
+        'neither with the committed rules nor with any rule gitleaks bundles.' \
+        '' \
+        'Rename these ids in the host-local rules file:' \
+        "$(printf '    %s\n' $shadowing_ids)"
+
+    duplicate_ids="$(rule_ids_in "$merged_config" | sort | uniq -d)"
+    [ -z "$duplicate_ids" ] || die_loud \
+        'SECRET SCAN DID NOT RUN: two rules share an id' \
+        'gitleaks keeps one rule per id, so the second definition silently' \
+        'replaces the first and the first stops matching anything.' \
+        '' \
+        'Give each of these its own id:' \
+        "$(printf '    %s\n' $duplicate_ids)"
+
+    active_private_info_config="$merged_config"
+    layers='private info: shapes + host-local rules'
 else
-    active_config="$config"
-    layers="layer 1 only (no host-local rules at $private_config)"
+    active_private_info_config="$private_info_config"
+    layers="private info: shapes only (no host-local rules at $private_config)"
 fi
 
 # Scanned as `dir .` from inside the target, not `dir <absolute-path>`: gitleaks
@@ -201,31 +253,45 @@ fi
 # (file:rule-id:line). An absolute target would make every fingerprint in
 # .gitleaksignore silently stop matching - not a hypothetical, this is exactly
 # how the first version of this script failed its own clean-tree test.
+run_scan() { # run_scan <config> <report-path>
+    local cfg="$1" rep="$2" status=0
+    ( cd "$target" && gitleaks dir . \
+        --config "$cfg" \
+        --gitleaks-ignore-path "$ignore" \
+        --report-format json \
+        --report-path "$rep" \
+        --redact \
+        --no-banner \
+        --no-color \
+        --exit-code 1 \
+        -v \
+        >>"$scan_out" 2>&1 ) || status=$?
+    return "$status"
+}
+
 scan_status=0
-( cd "$target" && gitleaks dir . \
-    --config "$active_config" \
-    --gitleaks-ignore-path "$ignore" \
-    --report-format json \
-    --report-path "$report" \
-    --redact \
-    --no-banner \
-    --no-color \
-    --exit-code 1 \
-    -v \
-    >"$scan_out" 2>&1 ) || scan_status=$?
+run_scan "$config" "$report_credentials" || scan_status=$?
+private_info_status=0
+run_scan "$active_private_info_config" "$report_private_info" || private_info_status=$?
 
 # A report is proof the scan ran; an exit status alone is not. Verified
 # against the real binary: a fatal error (bad config, bad path) exits
 # non-zero WITHOUT writing a report, so report-existence is a reliable signal
 # and not an assumption.
-if [ ! -s "$report" ] || ! grep -q '^\[' "$report"; then
-    die_loud 'SECRET SCAN DID NOT RUN: gitleaks produced no report' \
-        "gitleaks exited ${scan_status} without emitting a scan report, so nothing" \
-        'was checked.' \
+# Checked per pass, not once for both: a pass that produced no report checked
+# nothing, and a gate that promises credentials AND private information must
+# not report clean when only one of the two actually ran.
+check_report() { # check_report <report-path> <what> <status>
+    [ -s "$2" ] && grep -q '^\[' "$2" && return 0
+    die_loud "SECRET SCAN DID NOT RUN: no report from the $1 pass" \
+        "gitleaks exited ${3} without emitting a report for the $1 pass, so" \
+        'that half of the scan checked nothing.' \
         '' \
         'gitleaks said:' \
         "$(sed 's/^/    /' "$scan_out" | head -40)"
-fi
+}
+check_report credentials "$report_credentials" "$scan_status"
+check_report 'private information' "$report_private_info" "$private_info_status"
 
 # The findings, read back out of the JSON report rather than trusted from the
 # verbose stdout above: `-v` is gitleaks' own formatting and is not guaranteed
@@ -233,22 +299,30 @@ fi
 # the thing this whole step exists to insist on.
 findings_summary() {
     local files rules
-    files="$(grep -oE '"File": *"[^"]*"' "$report" | sed -E 's/.*: *"(.*)"$/\1/' || true)"
-    rules="$(grep -oE '"RuleID": *"[^"]*"' "$report" | sed -E 's/.*: *"(.*)"$/\1/' || true)"
+    files="$(grep -hoE '"File": *"[^"]*"' "$report_credentials" "$report_private_info" \
+        | sed -E 's/.*: *"(.*)"$/\1/' || true)"
+    rules="$(grep -hoE '"RuleID": *"[^"]*"' "$report_credentials" "$report_private_info" \
+        | sed -E 's/.*: *"(.*)"$/\1/' || true)"
     paste -d'\t' <(printf '%s\n' "$rules") <(printf '%s\n' "$files") \
         | awk -F'\t' '{printf "    %s  (rule: %s)\n", $2, $1}'
 }
 
-finding_count="$(grep -c '"RuleID"' "$report" || true)"
+# `|| true` because grep exits 1 when it matches nothing, which is the CLEAN
+# case here - without it, `set -e` ends the run at the very moment there is
+# nothing to report, and the step prints no summary at all.
+finding_count="$(grep -hc '"RuleID"' "$report_credentials" "$report_private_info" \
+    | awk '{total += $1} END {print total + 0}' || true)"
 
-if [ "$scan_status" -ne 0 ] || [ "$finding_count" -gt 0 ]; then
-    die_loud 'SECRETS FOUND IN THE WORKING TREE - hard gate failure' \
-        'gitleaks matched one or more secrets in checked-out files. Rotate and' \
-        'remove any real credential now - deleting the file alone is not enough' \
-        'if the value may already be cached or shipped elsewhere. If this is a' \
-        'reviewed false positive, add its fingerprint to .gitleaksignore with a' \
-        'comment explaining why (AGENTS.md, "Secret scanning") - never delete this' \
-        'step or weaken the rule set to make it pass.' \
+if [ "$scan_status" -ne 0 ] || [ "$private_info_status" -ne 0 ] || [ "$finding_count" -gt 0 ]; then
+    die_loud 'FOUND IN THE WORKING TREE - hard gate failure' \
+        'gitleaks matched a credential or private information in checked-out' \
+        'files. Rotate and remove any real credential now - deleting the file' \
+        'alone is not enough if the value may already be cached or shipped' \
+        'elsewhere. For private information, replace it with a placeholder:' \
+        'AGENTS.base.md rule 5.2 lists the substitutes. If this is a reviewed' \
+        'false positive, add its fingerprint to .gitleaksignore with a comment' \
+        'explaining why (AGENTS.md, "Secret scanning") - never delete this step' \
+        'or weaken the rule set to make it pass.' \
         '' \
         "$(findings_summary)" \
         '' \
@@ -256,7 +330,7 @@ if [ "$scan_status" -ne 0 ] || [ "$finding_count" -gt 0 ]; then
 fi
 
 bytes_scanned="$(grep -oE 'scanned ~[0-9]+ bytes[^"]*' "$scan_out" | head -1 || true)"
-# Which layers ran is part of the result, not a detail: "clean" means two
+# What actually ran is part of the result, not a detail. "clean" means two
 # different things with and without the host-local rules, and a machine that
-# silently has no layer 2 otherwise reads as fully checked.
-printf 'secret-scan: clean - %s%s\n' "$layers" "${bytes_scanned:+ - $bytes_scanned}"
+# silently has none otherwise reads as fully checked.
+printf 'secret-scan: clean - credentials; %s%s\n' "$layers" "${bytes_scanned:+ - $bytes_scanned}"

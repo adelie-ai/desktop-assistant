@@ -310,6 +310,81 @@ secret_scan_detects_an_absolute_home_path() {
     assert_contains "$RUN_ERR" 'docs/macos.md' 'names the file holding the macOS home path'
 }
 
+secret_scan_detects_home_paths_whose_account_names_the_bundled_allowlist_discards() {
+    # The reason the private-information rules run in their own pass, pinned as
+    # a test because it is invisible from the outside: gitleaks' bundled global
+    # allowlist discards a finding whose secret starts with "true", contains
+    # "false", ends with "null", or is one repeated letter - case-insensitively,
+    # and with no output at all. While these rules extended the bundled set,
+    # every account name below was silently missed and the scan exited 0.
+    without_private_rules
+    local fixture="$TEST_TMP/src" account
+    mkdir -p "$fixture"
+    for account in trueman TrueUser isfalseuser reginald-null xx; do
+        printf 'Ran it from /home/%s/Projects/adelie-ai and it worked.\n' "$account" \
+            >"$fixture/$account.md"
+    done
+
+    run_cmd "$SECRET_SCAN_SH" "$fixture"
+    [ "$RUN_STATUS" -ne 0 ] || fail 'account names the bundled allowlist discards must still be detected'
+    for account in trueman TrueUser isfalseuser reginald-null xx; do
+        assert_contains "$RUN_ERR" "$account.md" "detects the home path of account '$account'"
+    done
+}
+
+secret_scan_does_not_flag_a_placeholder_that_ends_a_sentence() {
+    # The account name is matched by a character class that includes a dot, so
+    # a placeholder written at the end of a sentence used to be read as a
+    # different name with the full stop attached - "user." rather than "user" -
+    # and stopped matching the exemption. This repository's prose ends
+    # sentences with a full stop, so the gate would fail on its own documented
+    # example.
+    without_private_rules
+    local fixture="$TEST_TMP/src" account
+    mkdir -p "$fixture"
+    for account in user example assistant ada; do
+        printf 'The fixture account is /home/%s.\n' "$account" >"$fixture/$account.md"
+    done
+
+    run_cmd "$SECRET_SCAN_SH" "$fixture"
+    assert_eq 0 "$RUN_STATUS" \
+        "a placeholder that ends a sentence is still that placeholder: $RUN_ERR"
+}
+
+secret_scan_does_not_flag_a_public_domain_that_uses_a_private_tld_as_a_subdomain() {
+    # The rule is about the LAST label. A public name that merely uses one of
+    # these words as a subdomain is an ordinary public FQDN, and a plausible
+    # naming convention - so matching it would fail the gate on clean content.
+    without_private_rules
+    local fixture="$TEST_TMP/src"
+    mkdir -p "$fixture"
+    cat >"$fixture/public.md" <<'EOF'
+See notebooks.lab.example.com for the shared workspace.
+Also try foo.lab.example.org and bar.corp.example.net.
+Published in the collab.labs directory.
+EOF
+
+    run_cmd "$SECRET_SCAN_SH" "$fixture"
+    assert_eq 0 "$RUN_STATUS" "a private-network word used as a subdomain of a public domain is not a private host: $RUN_ERR"
+}
+
+secret_scan_does_not_flag_field_access_that_reads_like_a_hostname() {
+    # `ctx.home_dir` has the shape of a host on the .home pseudo-TLD right up
+    # to the underscore. This workspace is full of them, so the rule has to
+    # stop at an identifier character as well as at a label character.
+    without_private_rules
+    local fixture="$TEST_TMP/src"
+    mkdir -p "$fixture"
+    cat >"$fixture/code.rs" <<'EOF'
+assert_eq!(ctx.home_dir, None);
+let home = peer.home_dir.clone();
+EOF
+    printf '[connections.home_bedrock]\nmodel = "x"\n' >"$fixture/config.toml"
+
+    run_cmd "$SECRET_SCAN_SH" "$fixture"
+    assert_eq 0 "$RUN_STATUS" "ordinary member access must not read as a private hostname: $RUN_ERR"
+}
+
 secret_scan_does_not_flag_documented_home_path_placeholders() {
     # This matters more than the detection above. A rule that fires on the
     # placeholder people are told to write instead gets disabled within a week,
@@ -394,6 +469,7 @@ secret_scan_does_not_flag_the_gate_files_that_carry_the_patterns() {
     local fixture="$TEST_TMP/src"
     mkdir -p "$fixture/scripts/tests"
     cp "$SCRIPT_TESTS_ROOT/.gitleaks.toml" "$fixture/.gitleaks.toml"
+    cp "$SCRIPT_TESTS_ROOT/.gitleaks-private-info.toml" "$fixture/.gitleaks-private-info.toml"
     cp "$SCRIPT_TESTS_ROOT/scripts/tests/secret-scan-gate.test.sh" \
         "$fixture/scripts/tests/secret-scan-gate.test.sh"
 
@@ -432,6 +508,26 @@ secret_scan_detects_a_site_literal_when_the_host_local_rules_are_present() {
     assert_contains "$RUN_ERR" 'runbook.md' 'names the file holding the site literal'
 }
 
+secret_scan_still_applies_the_committed_shapes_when_the_host_local_rules_are_present() {
+    # The host-local rules are APPENDED to the committed shapes, not
+    # substituted for them. Nothing in the output distinguishes the two, so
+    # without this test a merge that dropped the committed half would look
+    # exactly like a clean scan on a machine that has a host-local file - and
+    # the machines that have one are the machines with something to lose.
+    with_invented_private_rules
+    local fixture="$TEST_TMP/src"
+    mkdir -p "$fixture"
+    printf 'Ran it from /home/mallory/Projects/adelie-ai and it worked.\n' >"$fixture/home.md"
+    printf 'It answered at daemon.internal-site.lab this morning.\n' >"$fixture/host.md"
+    printf 'kubectl -n %s get pods\n' "$INVENTED_SITE_LITERAL" >"$fixture/site.md"
+
+    run_cmd "$SECRET_SCAN_SH" "$fixture"
+    [ "$RUN_STATUS" -ne 0 ] || fail 'the committed shapes must still apply alongside host-local rules'
+    assert_contains "$RUN_ERR" 'adele-absolute-home-path' 'the committed home-path rule still runs'
+    assert_contains "$RUN_ERR" 'adele-private-network-hostname' 'the committed hostname rule still runs'
+    assert_contains "$RUN_ERR" 'site-invented-instance-name' 'the host-local rule runs too'
+}
+
 secret_scan_does_not_detect_a_site_literal_when_the_host_local_rules_are_absent() {
     # The paired negative. Without it the test above proves only that the scan
     # fails, not that the host-local layer is what made it fail.
@@ -461,6 +557,59 @@ secret_scan_fails_loudly_when_the_host_local_rules_are_malformed() {
     run_cmd "$SECRET_SCAN_SH" "$fixture"
     [ "$RUN_STATUS" -ne 0 ] || fail 'a malformed host-local rules file must fail the step'
     assert_contains "$RUN_ERR" 'DID NOT RUN' 'names the real outcome'
+    assert_not_contains "$RUN_OUT" 'clean' 'must not claim a clean scan'
+}
+
+secret_scan_refuses_a_host_local_rule_that_would_shadow_a_committed_rule() {
+    # The sharp edge of merging two configs by concatenation. gitleaks keeps
+    # one rule per id and lets the LATER definition win, silently - so a
+    # host-local file that reuses a committed rule's id switches that rule off
+    # and the scan still prints "clean". A weaker gate that reports success is
+    # worse than no gate, because nobody goes looking. The fixture below is the
+    # committed home-path rule's own id, pointed at a regex that matches
+    # nothing, over content that rule is supposed to catch.
+    local file="$TEST_TMP/private-rules.toml"
+    cat >"$file" <<'TOML'
+[[rules]]
+id = "adele-absolute-home-path"
+description = "Reuses a committed rule's id, which would replace it."
+regex = '''\bmatches-nothing-at-all\b'''
+TOML
+    export ADELE_SECRET_SCAN_PRIVATE_RULES="$file"
+    local fixture="$TEST_TMP/src"
+    mkdir -p "$fixture"
+    printf 'Ran it from /home/mallory/Projects/adelie-ai and it worked.\n' >"$fixture/doc.md"
+
+    run_cmd "$SECRET_SCAN_SH" "$fixture"
+    [ "$RUN_STATUS" -ne 0 ] || fail 'a host-local rule that shadows a committed rule must fail the step'
+    assert_not_contains "$RUN_OUT" 'clean' 'must not report a clean scan on a rule set it silently weakened'
+    assert_contains "$RUN_ERR" 'adele-absolute-home-path' 'names the id that would have been replaced'
+}
+
+secret_scan_fails_loudly_when_two_host_local_rules_share_an_id() {
+    # The same replacement, entirely inside the host-local file: the second
+    # block wins and the first stops matching. Reserving the id prefix cannot
+    # catch this one, so it is checked separately.
+    local file="$TEST_TMP/private-rules.toml"
+    cat >"$file" <<'TOML'
+[[rules]]
+id = "site-duplicated"
+description = "First definition."
+regex = '''\bzephyr-prod\b'''
+
+[[rules]]
+id = "site-duplicated"
+description = "Second definition, which replaces the first."
+regex = '''\bmatches-nothing-at-all\b'''
+TOML
+    export ADELE_SECRET_SCAN_PRIVATE_RULES="$file"
+    local fixture="$TEST_TMP/src"
+    mkdir -p "$fixture"
+    printf 'Nothing private in here.\n' >"$fixture/README.md"
+
+    run_cmd "$SECRET_SCAN_SH" "$fixture"
+    [ "$RUN_STATUS" -ne 0 ] || fail 'two rules sharing an id must fail the step'
+    assert_contains "$RUN_ERR" 'site-duplicated' 'names the id that is defined twice'
     assert_not_contains "$RUN_OUT" 'clean' 'must not claim a clean scan'
 }
 
@@ -500,12 +649,17 @@ run_test secret_scan_does_not_flag_the_clean_tree
 run_test secret_scan_detects_a_key_under_claude_worktrees
 run_test secret_scan_does_not_flag_a_duplicated_known_fixture_under_claude_worktrees
 run_test secret_scan_detects_an_absolute_home_path
+run_test secret_scan_detects_home_paths_whose_account_names_the_bundled_allowlist_discards
+run_test secret_scan_does_not_flag_a_placeholder_that_ends_a_sentence
+run_test secret_scan_does_not_flag_a_public_domain_that_uses_a_private_tld_as_a_subdomain
+run_test secret_scan_does_not_flag_field_access_that_reads_like_a_hostname
 run_test secret_scan_does_not_flag_documented_home_path_placeholders
 run_test secret_scan_detects_a_private_network_hostname
 run_test secret_scan_does_not_flag_public_or_documentation_hostnames
 run_test secret_scan_does_not_flag_the_gate_files_that_carry_the_patterns
 run_test secret_scan_runs_and_says_so_when_the_host_local_rules_are_absent
 run_test secret_scan_detects_a_site_literal_when_the_host_local_rules_are_present
+run_test secret_scan_still_applies_the_committed_shapes_when_the_host_local_rules_are_present
 run_test secret_scan_does_not_detect_a_site_literal_when_the_host_local_rules_are_absent
 run_test secret_scan_fails_loudly_when_the_host_local_rules_are_malformed
 if [ "$(id -u)" -eq 0 ]; then
