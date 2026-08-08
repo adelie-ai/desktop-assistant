@@ -7628,9 +7628,11 @@ mod tests {
         }
     }
 
-    /// Build a capturing subscriber and an `llm.call` span shaped exactly
-    /// like core's `llm_span`/`aux_llm_span`: `provider_request_id` declared
-    /// as `tracing::field::Empty`. A connector's `record_provider_request_id`
+    /// Build a capturing subscriber and an `llm.call` span carrying the one
+    /// field this test needs, declared the way core's `llm_span` and
+    /// `aux_llm_span` declare it: `provider_request_id` as
+    /// `tracing::field::Empty`. Core's spans carry more than this - the
+    /// token counts among them - and none of it is what a connector records. A connector's `record_provider_request_id`
     /// call needs that declaration to have a field to land on - `tracing`
     /// silently drops a `record` for a field the span never declared, which
     /// is the trap this mirrors core's shape to avoid.

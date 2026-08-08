@@ -3104,6 +3104,16 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
             // would be missing from whichever arm nobody thought about.
             crate::telemetry::record_llm_call(llm_started.elapsed(), &route, llm_result.is_ok());
             llm_span.record("outcome", if llm_result.is_ok() { "ok" } else { "error" });
+            // The counts the provider reported, onto the span that made the
+            // call - recorded before the handles below drop, because a closed
+            // span takes no more fields. An error path has none to report and
+            // leaves all four off, which is the same distinction
+            // `llm.tokens.unreported` keeps on the metrics side.
+            if let Ok(response) = &llm_result
+                && let Some(usage) = &response.usage
+            {
+                crate::telemetry::record_genai_tokens_on_span(&llm_span, usage);
+            }
             // Both handles are dropped here, deliberately and by name. A span
             // ends when its last handle drops, and these are locals of the
             // round body - so left alone they would keep `llm.call` open until

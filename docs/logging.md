@@ -245,7 +245,7 @@ Field summary. Every span carries `conversation_id`.
 |---|---|
 | `turn` | `request_id`, `trace_id`, `conversation_id`, `user_id`, `connection_id`, `provider`, `model`, then `rounds`, `outcome` and `duration_ms` when it ends |
 | `turn.round` | `round` (one-based), `conversation_id`, `tools`, `outcome`, and the four token counts the provider reported |
-| `llm.call` | `purpose`, `provider`, `model`, `conversation_id`, `provider_request_id`, plus `round` and `outcome` for a round's own call |
+| `llm.call` | `purpose`, `provider`, `model`, `conversation_id`, `provider_request_id`, the four `gen_ai.usage.*` token counts below, plus `round` and `outcome` for a round's own call |
 | `tool.call` | `tool`, `runner` (`client` or `server`), `conversation_id`, `outcome` |
 | `recall.lookup` | `conversation_id` |
 
@@ -269,6 +269,37 @@ an empty compaction range, a recovery ladder that freed enough at its first
 step. A measurement taken at the helper's boundary would record a call that
 never happened, and the histogram's count is read as how many calls there
 were.
+
+### What a call cost
+
+Every `llm.call` span carries the token counts the provider reported for that
+call, under the OpenTelemetry GenAI semantic-convention names:
+
+| attribute | what it counts |
+|---|---|
+| `gen_ai.usage.input_tokens` | prompt tokens |
+| `gen_ai.usage.output_tokens` | completion tokens |
+| `gen_ai.usage.cache_creation.input_tokens` | input tokens written into the provider's prompt cache |
+| `gen_ai.usage.cache_read.input_tokens` | input tokens served from that cache |
+
+The convention's names rather than this project's, so a backend that
+special-cases GenAI attributes renders a provider call natively. The
+`llm.tokens.*` metrics keep their own names: renaming a metric breaks the
+queries already reading it, so the convention is adopted where it is new.
+
+The counts are on the span and not on the metrics for a reason. A metric
+labelled by conversation would answer "what did this turn cost", and a
+conversation id is unbounded - the registry caps a metric at 64 label sets with
+no eviction, so one such label burns that dimension until the process restarts.
+A span attribute has no cardinality budget, and the span already carries the
+conversation id and the round.
+
+**An absent count is absent, never zero.** A provider that reports no usage
+leaves all four attributes off the span, and a provider that does no prompt
+caching leaves the two cache attributes off. A recorded zero would sum into a
+total that reads as a real measurement, which is the distinction
+`llm.tokens.unreported` exists to keep. A failed call reports nothing and so
+carries none of the four.
 
 ### The two lines an operator greps
 
