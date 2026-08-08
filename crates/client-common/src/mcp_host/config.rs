@@ -378,7 +378,7 @@ mod tests {
 [[servers]]
 name = "filesystem"
 command = "fileio-mcp"
-args = ["serve", "--root", "/home/dave"]
+args = ["serve", "--root", "/home/<user>"]
 namespace = "fs"
 
 [[servers]]
@@ -573,7 +573,7 @@ command = "b"
         assert_eq!(reloaded.servers[0].namespace.as_deref(), Some("fs"));
         assert_eq!(
             reloaded.servers[0].args,
-            vec!["serve", "--root", "/home/dave"]
+            vec!["serve", "--root", "/home/<user>"]
         );
         assert_eq!(
             names(&reloaded.resolved_servers("gtk")),

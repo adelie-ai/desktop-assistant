@@ -48,7 +48,7 @@ for the full list and what to do if a server needs something else.
 [[servers]]
 name = "filesystem"
 command = "fileio-mcp"
-args = ["serve", "--root", "/home/dave"]
+args = ["serve", "--root", "/home/<user>"]
 namespace = "fs"
 
 [[servers]]

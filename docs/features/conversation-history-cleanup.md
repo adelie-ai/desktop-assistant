@@ -72,9 +72,9 @@ A stubbed conversation should include:
 Example stub content:
 
 ```
-Summary: Created a timeclock project for metersys and recorded that it is time-billed and requires time entries.
+Summary: Created a timeclock project for acme-utilities and recorded that it is time-billed and requires time entries.
 
-Archive: /home/dave/.local/share/desktop-assistant/conversation_archive/2026/02/2026-02-20_Timeclock-tools_and_metersys-project.json
+Archive: /home/<user>/.local/share/desktop-assistant/conversation_archive/2026/02/2026-02-20_Timeclock-tools_and_acme-utilities-project.json
 ```
 
 ---
@@ -85,8 +85,8 @@ Archive: /home/dave/.local/share/desktop-assistant/conversation_archive/2026/02/
 Store concrete key/value settings as preferences (paths, URLs, commands, IDs).
 
 - Examples:
-  - `project.adelie_platform.path = /home/dave/projects/adelie-platform`
-  - `project.metersys.path = /home/dave/projects/clients/metersys`
+  - `project.adelie_platform.path = /home/<user>/projects/adelie-platform`
+  - `project.acme_utilities.path = /home/<user>/projects/clients/acme-utilities`
 
 ### Memory
 Store durable factual context and rules-of-thumb as memory.
