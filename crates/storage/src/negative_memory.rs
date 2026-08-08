@@ -34,8 +34,10 @@
 //! ## The writer is the reaper
 //!
 //! There is no sweep. [`NegativeMemoryStore::record_burn`] first deletes this
-//! user's burns that nothing has confirmed for [`FORGET_DAYS`], and the foreign
-//! key takes each row's facets with it. That one path is enough to bound the
+//! user's rows that `NegativeMemory::is_forgotten` would call dead - nothing
+//! has confirmed them for [`FORGET_DAYS`], or their stamp sits further ahead of
+//! the clock than the domain will believe - and the foreign key takes each
+//! row's facets with it. That one path is enough to bound the
 //! table, because it is the only one that can add a lesson: a correction is
 //! written over a burn, so it cannot arrive before the write that would have
 //! reaped.
@@ -49,7 +51,8 @@
 use chrono::{DateTime, Utc};
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::negative_memory::{
-    FORGET_DAYS, MAX_LIVE_BURNS, NegativeMemory, NegativeMemoryKind, Scope,
+    FORGET_DAYS, FUTURE_STAMP_TOLERANCE_HOURS, MAX_LIVE_BURNS, NegativeMemory, NegativeMemoryKind,
+    Scope,
 };
 use desktop_assistant_core::ports::auth::current_user_id;
 use desktop_assistant_core::ports::negative_memory::{
@@ -227,19 +230,28 @@ impl NegativeMemoryStore for PgNegativeMemoryStore {
         // burn is always older than what corrected it, so reaping on each row's
         // own stamp would take the burn first and leave a correction naming
         // nothing - a row that says an unnamed lesson stopped applying.
+        //
+        // Two rules, the same two `NegativeMemory::is_forgotten` states, because
+        // what a reader believes and what actually happens have to be the same
+        // thing. Too old is the ordinary one. Too far in the FUTURE is the
+        // other: such a row scores zero and can never rise, so the age rule
+        // alone would keep it forever.
         sqlx::query(
             "DELETE FROM negative_memory nm \
              WHERE nm.user_id = $1 \
-               AND nm.last_confirmed_at < NOW() - make_interval(days => $2) \
+               AND ( nm.last_confirmed_at < NOW() - make_interval(days => $2) \
+                     OR nm.last_confirmed_at > NOW() + make_interval(hours => $3) ) \
                AND NOT EXISTS ( \
                    SELECT 1 FROM negative_memory partner \
                    WHERE partner.user_id = nm.user_id \
                      AND (partner.id = nm.superseded_by OR partner.superseded_by = nm.id) \
                      AND partner.last_confirmed_at >= NOW() - make_interval(days => $2) \
+                     AND partner.last_confirmed_at <= NOW() + make_interval(hours => $3) \
                )",
         )
         .bind(user_id)
-        .bind(FORGET_DAYS.round() as i32)
+        .bind(i32::try_from(FORGET_DAYS).unwrap_or(i32::MAX))
+        .bind(i32::try_from(FUTURE_STAMP_TOLERANCE_HOURS).unwrap_or(i32::MAX))
         .execute(&mut *tx)
         .await
         .map_err(storage_error)?;

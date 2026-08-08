@@ -29,10 +29,14 @@
 --   clock, computed by `domain::negative_memory`. A stored number would be
 --   wrong the moment nothing wrote it, and two readers would then disagree
 --   about whether a burn is still loud enough to interrupt anything.
--- * **The writer bounds the table.** There is no reaper. A burn nothing has
---   confirmed for long enough is deleted on the next write path, the same way
---   migration 047's situation record is bounded by its own writer. The
---   foreign key then takes its facets with it.
+-- * **The writer bounds the table.** There is no sweep. On the next write path
+--   a row the reader could never act on is deleted, the same way migration
+--   047's situation record is bounded by its own writer, and the foreign key
+--   then takes its facets with it. Two ways a row qualifies, and both are
+--   stated in `domain::negative_memory` as well, because what a reader believes
+--   and what the store does have to be the same thing: nothing has confirmed it
+--   for long enough, or its stamp sits so far AHEAD of the reader's clock that
+--   the strength arithmetic can never raise it.
 --
 -- Both tables are personal data. Each carries `user_id`, every query scopes by
 -- it, both enable their own RLS policy below (migration 029's policy list is

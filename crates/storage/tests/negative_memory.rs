@@ -21,6 +21,7 @@
 //! - `a_burn_and_the_correction_over_it_are_reaped_together`
 //! - `two_first_writes_of_one_act_at_once_make_one_lesson`
 //! - `two_corrections_of_one_burn_at_once_write_one_overlay`
+//! - `a_burn_stamped_beyond_the_clock_is_reaped_like_a_forgotten_one`
 //! - `a_burn_nothing_has_confirmed_is_reaped_on_the_next_write`
 //! - `a_reaped_burn_takes_its_facets_with_it`
 //! - `a_cross_tenant_read_of_a_negative_memory_returns_nothing`
@@ -134,8 +135,9 @@ async fn extinguish_as(
     .expect("writing a correction succeeds")
 }
 
-/// Backdate a burn's last confirmation, so the decay and reap rules can be
-/// exercised without waiting weeks.
+/// Move a burn's last confirmation by `days`, so the decay and reap rules can
+/// be exercised without waiting weeks. Negative `days` puts the stamp AHEAD of
+/// the clock, which is what a skewed database clock does.
 async fn backdate(pool: &PgPool, id: &str, days: i32) {
     sqlx::query(
         "UPDATE negative_memory \
@@ -490,7 +492,12 @@ async fn a_burn_nothing_has_confirmed_is_reaped_on_the_next_write() {
         observation(at_the_workshop(), "build is a mount point"),
     )
     .await;
-    backdate(&fx.pool, &old.id, FORGET_DAYS.round() as i32 + 1).await;
+    backdate(
+        &fx.pool,
+        &old.id,
+        i32::try_from(FORGET_DAYS).expect("the horizon fits") + 1,
+    )
+    .await;
 
     let elsewhere = at_the_workshop().with(Facet::Argument("cwd".to_string()), "/srv/other");
     burn_as(
@@ -524,7 +531,12 @@ async fn a_reaped_burn_takes_its_facets_with_it() {
         5,
         "two arguments and three situation values"
     );
-    backdate(&fx.pool, &old.id, FORGET_DAYS.round() as i32 + 1).await;
+    backdate(
+        &fx.pool,
+        &old.id,
+        i32::try_from(FORGET_DAYS).expect("the horizon fits") + 1,
+    )
+    .await;
 
     let elsewhere = at_the_workshop().with(Facet::Argument("cwd".to_string()), "/srv/other");
     burn_as(
@@ -617,7 +629,12 @@ async fn a_burn_and_the_correction_over_it_are_reaped_together() {
     .await;
     extinguish_as(&store, ALICE, vec![burn.id.clone()], "it works now").await;
     // The burn is well past the horizon; its correction is not.
-    backdate(&fx.pool, &burn.id, FORGET_DAYS.round() as i32 + 1).await;
+    backdate(
+        &fx.pool,
+        &burn.id,
+        i32::try_from(FORGET_DAYS).expect("the horizon fits") + 1,
+    )
+    .await;
 
     burn_as(
         &store,
@@ -642,7 +659,12 @@ async fn a_burn_and_the_correction_over_it_are_reaped_together() {
         held.iter().any(|m| m.id == burn.id) && held.iter().any(|m| m.id == correction_id),
         "the pair survives while its correction is still fresh"
     );
-    backdate(&fx.pool, &correction_id, FORGET_DAYS.round() as i32 + 1).await;
+    backdate(
+        &fx.pool,
+        &correction_id,
+        i32::try_from(FORGET_DAYS).expect("the horizon fits") + 1,
+    )
+    .await;
 
     burn_as(
         &store,
@@ -758,6 +780,46 @@ async fn two_corrections_of_one_burn_at_once_write_one_overlay() {
         Some(overlay.id.clone()),
         "and the burn names the one that was written"
     );
+    fx.cleanup().await;
+}
+
+/// The reap states both of `NegativeMemory::is_forgotten`'s rules, not just the
+/// ordinary one.
+///
+/// A stamp far ahead of the reader's clock scores zero and can never rise, so
+/// the age rule alone would keep the row forever. What a reader believes and
+/// what the store actually does have to be the same thing.
+#[tokio::test]
+async fn a_burn_stamped_beyond_the_clock_is_reaped_like_a_forgotten_one() {
+    let Some(fx) = fixture().await else { return };
+    let store = PgNegativeMemoryStore::new(fx.pool.clone());
+
+    let broken = burn_as(
+        &store,
+        ALICE,
+        observation(at_the_workshop(), "build is a mount point"),
+    )
+    .await;
+    // Far past ordinary database-to-daemon skew.
+    backdate(&fx.pool, &broken.id, -3).await;
+
+    burn_as(
+        &store,
+        ALICE,
+        observation_of(
+            "clean /srv/other",
+            Scope::new().with(Facet::Argument("cwd".to_string()), "/srv/other"),
+            "no such directory",
+        ),
+    )
+    .await;
+
+    let held = history_as(&store, ALICE).await;
+    assert!(
+        !held.iter().any(|m| m.id == broken.id),
+        "a row nothing can ever raise must not sit in the store forever"
+    );
+    assert_eq!(held.len(), 1, "and the lesson beside it is untouched");
     fx.cleanup().await;
 }
 

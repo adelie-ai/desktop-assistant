@@ -127,13 +127,35 @@ pub const HALF_LIFE_DAYS: f64 = 14.0;
 /// lesson - it just stops interrupting.
 pub const SILENCE_FLOOR: f64 = 0.25;
 
+/// How far ahead of the reader's clock a confirmation stamp may sit and still
+/// be believed, in hours.
+///
+/// The stamp is written by the database's `NOW()` and read against the daemon's
+/// clock, so a little skew between the two is ordinary and means nothing. An
+/// hour is far past ordinary.
+///
+/// A stamp further ahead than this is not a fresher lesson, it is a broken
+/// clock, and the arithmetic would otherwise read it as full strength for as
+/// long as the skew lasts - a burn that can be neither silenced nor reaped,
+/// firing the whole time. That is the fires-when-it-should-not direction, so
+/// such a stamp is disbelieved rather than trusted: the burn scores zero, goes
+/// quiet, and becomes reapable. See [`NegativeMemory::strength`].
+///
+/// Whole hours, and the type says so: the store binds this straight into an
+/// interval, so a fractional value would be rounded there and not here, and the
+/// two would disagree about which rows are dead.
+pub const FUTURE_STAMP_TOLERANCE_HOURS: u32 = 1;
+
 /// Days after which a burn nothing has confirmed is dropped from the store.
 ///
 /// Four half-lives, so a sixteenth of full strength and twice as long as
 /// silence. Deleting it loses nothing a reader would act on and bounds the
 /// table without a sweep: the writer reaps on its own path, the way the
 /// situation record's writer bounds itself.
-pub const FORGET_DAYS: f64 = 56.0;
+///
+/// Whole days, and the type says so, for the reason
+/// [`FUTURE_STAMP_TOLERANCE_HOURS`] gives.
+pub const FORGET_DAYS: u32 = 56;
 
 /// Most argument facets one burn records.
 ///
@@ -164,8 +186,13 @@ pub const MAX_WARNED_BURNS: usize = 3;
 /// Most live burns a read returns for one user.
 ///
 /// The whole live set is read once per turn and matched in memory, so this is
-/// what bounds that read. Well past what the reap at [`FORGET_DAYS`] leaves
-/// behind for any ordinary history.
+/// what bounds that read.
+///
+/// What happens past it, rather than a prediction that nobody gets there: the
+/// read is ordered by last confirmation, so a user holding more keeps the most
+/// recently confirmed and the rest stop firing. That is the safe direction - a
+/// lesson that goes quiet costs one repeat of a mistake, where the alternative
+/// bound is an unbounded read on every turn.
 pub const MAX_LIVE_BURNS: usize = 200;
 
 /// One dimension a burn is scoped by.
@@ -378,11 +405,23 @@ pub fn fingerprint(arguments: &serde_json::Value) -> String {
 /// How far into a nested argument the digest reads.
 ///
 /// Past this it writes one marker byte and stops, which folds two calls
-/// differing only below the limit into one act. The dispatch path cannot reach
-/// it - `serde_json` refuses to parse deeper than 128 - so this bounds a caller
-/// that builds a value programmatically, and bounds it without a stack
-/// overflow.
-const MAX_ARGUMENT_DEPTH: usize = 64;
+/// differing only below the limit into one act - the identity widening, and
+/// that is the one thing this module promises never happens. So the limit has
+/// to sit above anything that can reach it, not merely above anything likely
+/// to.
+///
+/// A tool call's arguments arrive as parsed JSON, and the parser refuses more
+/// than 128 levels of nesting, so 128 is the deepest value that can ever be
+/// handed to [`fingerprint`] on the dispatch path. This is twice that. What the
+/// marker path is left bounding is a value built programmatically rather than
+/// parsed: that has no depth limit of its own and would otherwise recurse until
+/// the stack ran out.
+///
+/// `the_digest_reads_every_argument_a_parser_will_accept` holds the claim
+/// against the parser in the tree rather than against the number written here,
+/// so a parser that grows a deeper limit fails the gate instead of quietly
+/// folding two acts into one.
+pub const MAX_ARGUMENT_DEPTH: usize = 256;
 
 /// Feed one JSON value into `hasher` in a form that depends on its content and
 /// not on how it was written.
@@ -568,12 +607,27 @@ impl NegativeMemory {
     /// carries no unit that anything else in the workspace reads - see the
     /// module header.
     pub fn strength(&self, now: DateTime<Utc>) -> f64 {
-        let elapsed = now.signed_duration_since(self.last_confirmed_at);
-        let days = elapsed.num_milliseconds() as f64 / (1000.0 * 60.0 * 60.0 * 24.0);
+        let days = self.days_since_confirmed(now);
+        // A stamp from beyond the reader's clock is a broken clock, not a
+        // fresher lesson - see `FUTURE_STAMP_TOLERANCE_HOURS`.
+        if days < -future_tolerance_days() {
+            return 0.0;
+        }
         if days <= 0.0 {
             return FULL_STRENGTH;
         }
         FULL_STRENGTH * 0.5_f64.powf(days / HALF_LIFE_DAYS)
+    }
+
+    /// Days since the last confirmation, negative when the stamp sits ahead of
+    /// `now`.
+    ///
+    /// One reading of the clock, so decay and reaping cannot come to different
+    /// conclusions about how old a burn is.
+    fn days_since_confirmed(&self, now: DateTime<Utc>) -> f64 {
+        now.signed_duration_since(self.last_confirmed_at)
+            .num_milliseconds() as f64
+            / (1000.0 * 60.0 * 60.0 * 24.0)
     }
 
     /// Whether this has decayed past the point of interrupting anything.
@@ -582,11 +636,18 @@ impl NegativeMemory {
     }
 
     /// Whether this should be dropped from the store.
+    ///
+    /// Two ways to qualify. The ordinary one is age: nothing has confirmed it
+    /// for [`FORGET_DAYS`]. The other is a stamp from beyond the reader's
+    /// clock, which scores zero and can never rise, so the row is dead weight
+    /// the age rule alone would keep forever.
+    ///
+    /// The store's own reap states the same two rules in SQL. They have to
+    /// agree - this is what a reader believes, and that is what actually
+    /// happens.
     pub fn is_forgotten(&self, now: DateTime<Utc>) -> bool {
-        now.signed_duration_since(self.last_confirmed_at)
-            .num_milliseconds() as f64
-            / (1000.0 * 60.0 * 60.0 * 24.0)
-            > FORGET_DAYS
+        let days = self.days_since_confirmed(now);
+        days > f64::from(FORGET_DAYS) || days < -future_tolerance_days()
     }
 
     /// Whether this burn interrupts `pending`.
@@ -715,6 +776,12 @@ fn facet_value(value: &serde_json::Value) -> Option<String> {
 /// a value a person reads back off a warning.
 fn storable_text(text: &str) -> bool {
     !text.is_empty() && !text.chars().any(char::is_control)
+}
+
+/// [`FUTURE_STAMP_TOLERANCE_HOURS`] as a fraction of a day, which is the unit
+/// the decay arithmetic works in.
+fn future_tolerance_days() -> f64 {
+    f64::from(FUTURE_STAMP_TOLERANCE_HOURS) / 24.0
 }
 
 /// Cut `outcome` to [`MAX_OUTCOME_CHARS`] on a character boundary.
@@ -986,14 +1053,39 @@ mod tests {
         assert!(!burn_aged(TimeDelta::days(55)).is_forgotten(now()));
     }
 
-    /// A clock that runs backwards must not read as a strengthened burn or a
-    /// silent one.
+    /// Ordinary skew between the database's clock and the reader's means
+    /// nothing: a stamp a few minutes ahead is a burn confirmed just now.
     #[test]
-    fn a_burn_confirmed_in_the_future_holds_full_strength() {
+    fn a_stamp_slightly_ahead_of_the_clock_reads_as_a_fresh_burn() {
         let mut ahead = fresh_burn();
-        ahead.last_confirmed_at = now() + TimeDelta::days(3);
+        ahead.last_confirmed_at = now() + TimeDelta::minutes(5);
         assert!((ahead.strength(now()) - FULL_STRENGTH).abs() < f64::EPSILON);
+        assert!(!ahead.is_silent(now()));
         assert!(!ahead.is_forgotten(now()));
+        assert!(ahead.fires(&the_call(), now()));
+    }
+
+    /// A stamp far ahead of the clock is a broken clock, not a fresher lesson.
+    ///
+    /// Read as fresh it would sit at full strength for as long as the skew
+    /// lasted - a burn that can be neither silenced nor reaped, interrupting
+    /// work the whole time. That is the fires-when-it-should-not direction, so
+    /// it is disbelieved: it scores zero, stays quiet, and is reapable.
+    #[test]
+    fn a_stamp_far_ahead_of_the_clock_is_disbelieved_rather_than_trusted() {
+        let mut broken = fresh_burn();
+        broken.last_confirmed_at = now() + TimeDelta::days(3);
+        assert_eq!(broken.strength(now()), 0.0);
+        assert!(broken.is_silent(now()));
+        assert!(
+            !broken.fires(&the_call(), now()),
+            "a lesson nobody can date must not interrupt an act"
+        );
+        assert!(
+            broken.is_forgotten(now()),
+            "and it must not sit in the store forever, since nothing can ever \
+             raise it"
+        );
     }
 
     // --- Acceptance: broadening needs a second occurrence -------------------
@@ -1424,6 +1516,70 @@ mod tests {
             &Situation::new(),
         );
         assert_ne!(framed.fingerprint, split.fingerprint);
+    }
+
+    /// The digest must read every argument a parser will hand it. Anything
+    /// shallower than the parser's own limit and two calls differing only below
+    /// the cut share a fingerprint - one burn firing on an act it was never
+    /// recorded against, which is the identity widening.
+    ///
+    /// Held against the parser in the tree, not against a number written beside
+    /// the constant: a parser that grows a deeper limit fails here rather than
+    /// quietly folding two acts into one.
+    #[test]
+    fn the_digest_reads_every_argument_a_parser_will_accept() {
+        /// `{"k":{"k":...{"k":<leaf>}}}`, `depth` objects deep.
+        fn nested(depth: usize, leaf: &str) -> String {
+            let mut text = format!("\"{leaf}\"");
+            for _ in 0..depth {
+                text = format!("{{\"k\":{text}}}");
+            }
+            text
+        }
+
+        let deepest_accepted = (1..=MAX_ARGUMENT_DEPTH + 8)
+            .take_while(|d| serde_json::from_str::<serde_json::Value>(&nested(*d, "a")).is_ok())
+            .last()
+            .expect("a one-level value parses");
+        assert!(
+            deepest_accepted <= MAX_ARGUMENT_DEPTH,
+            "the parser accepts {deepest_accepted} levels and the digest reads \
+             {MAX_ARGUMENT_DEPTH}; two calls differing below that would be one act"
+        );
+
+        let one: serde_json::Value = serde_json::from_str(&nested(deepest_accepted, "a"))
+            .expect("the deepest accepted value parses");
+        let other: serde_json::Value =
+            serde_json::from_str(&nested(deepest_accepted, "b")).expect("and so does its twin");
+        assert_ne!(
+            fingerprint(&one),
+            fingerprint(&other),
+            "two acts differing only at the deepest level a parser allows must \
+             not share one lesson"
+        );
+    }
+
+    /// What the bound is left doing: a value built in code rather than parsed
+    /// has no depth limit of its own, and the digest stops rather than
+    /// recursing until the stack runs out. Two such values differing only below
+    /// the cut do fold into one act - stated here because it is real, and
+    /// unreachable from a tool call.
+    #[test]
+    fn a_value_deeper_than_a_parser_allows_is_read_to_the_bound_and_no_further() {
+        fn built(depth: usize, leaf: &str) -> serde_json::Value {
+            let mut value = serde_json::Value::String(leaf.to_string());
+            for _ in 0..depth {
+                value = serde_json::json!({ "k": value });
+            }
+            value
+        }
+        let one = built(MAX_ARGUMENT_DEPTH + 4, "a");
+        let other = built(MAX_ARGUMENT_DEPTH + 4, "b");
+        assert_eq!(
+            fingerprint(&one),
+            fingerprint(&other),
+            "past the bound the digest stops, and it stops rather than overflowing"
+        );
     }
 
     // --- Stored form --------------------------------------------------------

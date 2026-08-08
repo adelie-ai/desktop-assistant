@@ -141,10 +141,16 @@ questions about different objects.
 - **Never fails a turn.** An unreadable store costs the turn its lessons and
   nothing else. Both writes run off the turn's path.
 - **The writer is the reaper.** There is no sweep. Recording a bad outcome first
-  drops this user's burns that nothing has confirmed past the forget horizon,
-  and the foreign key takes their facets with them. A burn and the correction
-  over it are one unit and go together, so a reap never leaves a correction
-  naming a lesson that is gone.
+  drops this user's rows that nothing has confirmed past the forget horizon, and
+  the foreign key takes their facets with them. A burn and the correction over
+  it are one unit and go together, so a reap never leaves a correction naming a
+  lesson that is gone.
+- **A skewed clock silences rather than entrenches.** The confirmation stamp is
+  written by the database and read against the daemon's clock. A little skew
+  means nothing. A stamp more than an hour ahead is not believed: read as fresh
+  it would sit at full strength for as long as the skew lasted, interrupting
+  work and unable to be silenced or reaped, so instead it scores zero, stays
+  quiet, and is reaped on the next write.
 - **Nothing an outside party wrote is replayed.** A burn is read back in
   another conversation, at the moment the model is deciding whether to act -
   the last place an outside party's sentence should reach. Two channels get
