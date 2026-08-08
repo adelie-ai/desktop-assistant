@@ -92,6 +92,26 @@ const REQUEST_ID: &str = "11111111-2222-4333-8444-555555555555";
 /// only thing an LLM boundary gives back that is worth quoting to a provider.
 const PROVIDER_REQUEST_ID: &str = "req_ExAmPlE0123456789";
 
+/// The four OpenTelemetry GenAI attribute names a provider call reports its
+/// token counts under.
+///
+/// Spelled out here rather than imported from the crate under test, so a
+/// rename at the recording site fails these tests instead of travelling with
+/// them. The names are the convention's, not this project's: see the constants
+/// beside them in `core::telemetry` for the version they follow.
+const GEN_AI_INPUT_TOKENS: &str = "gen_ai.usage.input_tokens";
+const GEN_AI_OUTPUT_TOKENS: &str = "gen_ai.usage.output_tokens";
+const GEN_AI_CACHE_CREATION_INPUT_TOKENS: &str = "gen_ai.usage.cache_creation.input_tokens";
+const GEN_AI_CACHE_READ_INPUT_TOKENS: &str = "gen_ai.usage.cache_read.input_tokens";
+
+/// All four, for the tests that assert on absence.
+const GEN_AI_TOKEN_ATTRIBUTES: [&str; 4] = [
+    GEN_AI_INPUT_TOKENS,
+    GEN_AI_OUTPUT_TOKENS,
+    GEN_AI_CACHE_CREATION_INPUT_TOKENS,
+    GEN_AI_CACHE_READ_INPUT_TOKENS,
+];
+
 const CONNECTION_ID: &str = "conn-primary";
 const PROVIDER: &str = "example-connector";
 const MODEL: &str = "example-model-v1";
@@ -824,12 +844,24 @@ fn handler(
     )
 }
 
+/// What a provider that does no prompt caching reports: two counts, and
+/// nothing for either cache.
 fn usage(input: u64, output: u64) -> TokenUsage {
     TokenUsage {
         input_tokens: Some(input),
         output_tokens: Some(output),
         cache_creation_input_tokens: None,
         cache_read_input_tokens: None,
+    }
+}
+
+/// What a caching provider reports: all four counts.
+fn caching_usage(input: u64, output: u64, cache_write: u64, cache_read: u64) -> TokenUsage {
+    TokenUsage {
+        input_tokens: Some(input),
+        output_tokens: Some(output),
+        cache_creation_input_tokens: Some(cache_write),
+        cache_read_input_tokens: Some(cache_read),
     }
 }
 
@@ -2003,6 +2035,233 @@ fn llm_span_records_the_provider_request_id() {
             span.fields
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Token counts on the provider-call span.
+//
+// The counts are already metrics, labelled by provider and model. That answers
+// "how many tokens did this model burn today" and cannot answer "what did this
+// turn cost", because a conversation id is unbounded and the registry caps a
+// metric at 64 label sets with no eviction. A span attribute has no such
+// budget, and the provider-call span already carries the conversation id and
+// the round - so the numbers belong there too.
+//
+// Every assertion below reads the span back in process. A span fixes its field
+// set when it opens, so a count that arrives afterwards has to be recorded into
+// a field declared empty at creation; `record` on a field the span never
+// declared is dropped with no warning, and the span exports without it. Nothing
+// prints a span field either, so a console assertion cannot see the difference.
+// ---------------------------------------------------------------------------
+
+/// The provider call one round made, found by parentage rather than by
+/// position: a turn also makes provider calls outside its rounds.
+fn round_llm_call(captured: &Captured, round: usize) -> &SpanRecord {
+    let rounds = captured.spans_named("turn.round");
+    let parent = rounds
+        .get(round)
+        .unwrap_or_else(|| {
+            panic!(
+                "the turn ran fewer than {} rounds, so there is no call to read; \
+                 the run produced {:?}",
+                round + 1,
+                captured.span_names()
+            )
+        })
+        .id
+        .clone();
+    captured
+        .spans_named("llm.call")
+        .into_iter()
+        .find(|s| s.parent.as_ref() == Some(&parent))
+        .unwrap_or_else(|| {
+            panic!(
+                "round {round} opened no `llm.call` span, so this test would \
+                 pass without any provider call happening at all; the run \
+                 produced {:?}",
+                captured.span_names()
+            )
+        })
+}
+
+#[test]
+fn llm_call_span_carries_every_token_count_a_caching_provider_reports() {
+    let _serialised = serialised();
+    let script = vec![
+        LlmResponse::text(REPLY_SENTINEL)
+            .with_usage(caching_usage(100, 10, 25, 50))
+            .into(),
+    ];
+    let captured = run(Level::INFO, script, ScriptedTools::ok());
+    let call = round_llm_call(&captured, 0);
+
+    assert_eq!(
+        call.field(GEN_AI_INPUT_TOKENS),
+        Some("100"),
+        "got {:?}",
+        call.fields
+    );
+    assert_eq!(
+        call.field(GEN_AI_OUTPUT_TOKENS),
+        Some("10"),
+        "got {:?}",
+        call.fields
+    );
+    assert_eq!(
+        call.field(GEN_AI_CACHE_CREATION_INPUT_TOKENS),
+        Some("25"),
+        "a cache write costs real money and is invisible in the input count \
+         alone; got {:?}",
+        call.fields
+    );
+    assert_eq!(
+        call.field(GEN_AI_CACHE_READ_INPUT_TOKENS),
+        Some("50"),
+        "a cache read costs a fraction of a fresh input token, so a well-cached \
+         call reads as a cold one without it; got {:?}",
+        call.fields
+    );
+}
+
+#[test]
+fn llm_call_span_leaves_the_cache_counts_off_a_provider_that_does_not_cache() {
+    let _serialised = serialised();
+    // Most providers report two counts and nothing about a cache, because they
+    // have none. Their calls must carry the two they do report, and must not
+    // claim a cache write of zero.
+    let captured = run(Level::INFO, two_round_script(), ScriptedTools::ok());
+    let call = round_llm_call(&captured, 0);
+
+    assert_eq!(
+        call.field(GEN_AI_INPUT_TOKENS),
+        Some("100"),
+        "got {:?}",
+        call.fields
+    );
+    assert_eq!(
+        call.field(GEN_AI_OUTPUT_TOKENS),
+        Some("10"),
+        "got {:?}",
+        call.fields
+    );
+    for absent in [
+        GEN_AI_CACHE_CREATION_INPUT_TOKENS,
+        GEN_AI_CACHE_READ_INPUT_TOKENS,
+    ] {
+        assert_eq!(
+            call.field(absent),
+            None,
+            "`{absent}` must be absent, not zero: this provider does no prompt \
+             caching, and a recorded `0` reads as a real measurement; got {:?}",
+            call.fields
+        );
+    }
+}
+
+#[test]
+fn llm_call_span_records_no_token_count_when_the_provider_reports_none() {
+    let _serialised = serialised();
+    // A connector that reports no usage at all. `llm.tokens.unreported` counts
+    // exactly this case, and a zero on the span would undermine it: an
+    // undercount that looks like data is worse than a gap that looks like one.
+    let script = vec![LlmResponse::text(REPLY_SENTINEL).into()];
+    let captured = run(Level::INFO, script, ScriptedTools::ok());
+    let call = round_llm_call(&captured, 0);
+
+    for absent in GEN_AI_TOKEN_ATTRIBUTES {
+        assert_eq!(
+            call.field(absent),
+            None,
+            "the provider reported nothing, so `{absent}` must carry nothing - \
+             not a zero, which sums into a total that looks real; got {:?}",
+            call.fields
+        );
+    }
+}
+
+#[test]
+fn a_failed_provider_call_closes_its_span_and_carries_no_token_count() {
+    let _serialised = serialised();
+    // An error path has no usage to report and must still close its span, so a
+    // trace of a failed turn draws the call at the length it really took.
+    let script = vec![Reply::Fail(CoreError::Llm("provider unavailable".into()))];
+    let captured = run(Level::INFO, script, ScriptedTools::ok());
+    let call = round_llm_call(&captured, 0);
+
+    assert_eq!(
+        call.field("outcome"),
+        Some("error"),
+        "this test only means something if the call really failed; got {:?}",
+        call.fields
+    );
+    assert!(
+        call.closed_at.is_some(),
+        "a failed provider call must still close its span, or the trace draws \
+         it running to the end of the turn"
+    );
+    for absent in GEN_AI_TOKEN_ATTRIBUTES {
+        assert_eq!(
+            call.field(absent),
+            None,
+            "a call that failed reported no usage, so `{absent}` must be \
+             absent; got {:?}",
+            call.fields
+        );
+    }
+}
+
+#[test]
+fn a_provider_call_outside_a_round_carries_its_token_counts_too() {
+    let _serialised = serialised();
+    // A turn spends provider time outside its rounds - here the title for a new
+    // conversation. Those calls cost tokens like any other, and they open their
+    // own `llm.call` span, so the same numbers have to reach it.
+    let script = vec![
+        LlmResponse::text(REPLY_SENTINEL)
+            .with_usage(usage(100, 10))
+            .into(),
+        LlmResponse::text("Example Channel Name")
+            .with_usage(caching_usage(7, 3, 1, 2))
+            .into(),
+    ];
+    let captured = run(Level::INFO, script, ScriptedTools::ok());
+
+    let title = captured
+        .spans_named("llm.call")
+        .into_iter()
+        .find(|s| s.field("purpose") == Some("title"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the turn's first message must generate a title through the \
+                 provider, or this test proves nothing; the run produced {:?}",
+                captured.span_names()
+            )
+        });
+
+    assert_eq!(
+        title.field(GEN_AI_INPUT_TOKENS),
+        Some("7"),
+        "got {:?}",
+        title.fields
+    );
+    assert_eq!(
+        title.field(GEN_AI_OUTPUT_TOKENS),
+        Some("3"),
+        "got {:?}",
+        title.fields
+    );
+    assert_eq!(
+        title.field(GEN_AI_CACHE_CREATION_INPUT_TOKENS),
+        Some("1"),
+        "got {:?}",
+        title.fields
+    );
+    assert_eq!(
+        title.field(GEN_AI_CACHE_READ_INPUT_TOKENS),
+        Some("2"),
+        "got {:?}",
+        title.fields
+    );
 }
 
 #[test]
