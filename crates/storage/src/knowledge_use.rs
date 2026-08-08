@@ -35,6 +35,8 @@
 //! Row-level security is a non-FORCE backstop that the table owner bypasses,
 //! and the daemon connects as the owner, so these predicates are the guard.
 
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::knowledge_use::{
@@ -753,6 +755,12 @@ impl KnowledgeUseLog for PgKnowledgeUseLog {
 /// background pass that owns its own cancellation. A statement timeout tuned
 /// for a turn would fail a legitimate read of a large store.
 ///
+/// **Not one snapshot either**, for the same reason. The two statements run on
+/// their own connections, so a mark landing between them is read while the stats
+/// row it belongs to is not. What that costs is one night's ordering of one
+/// entry, and the next pass reads both; what a transaction would cost is a
+/// pooled connection held across a whole-store read on a pool of five.
+///
 /// Ids the log has never seen are absent, on the same terms as
 /// [`KnowledgeUseLog::records`], so a caller can tell an entry nothing has
 /// touched from one that was offered and ignored.
@@ -781,14 +789,24 @@ pub(crate) async fn all_use_records(
     .await
     .map_err(|e| CoreError::Storage(format!("dreaming: load use marks failed: {e}")))?;
 
+    // Indexed rather than scanned, unlike the by-id read this is modelled on.
+    // There the id list is a handful and a linear filter per row costs nothing;
+    // here both sides are the whole store, and a scan per entry would be
+    // quadratic in it.
+    let mut by_entry: HashMap<&str, Vec<KnowledgeMark>> = HashMap::new();
+    for row in &marks {
+        if let Some(mark) = into_mark(row) {
+            by_entry
+                .entry(row.entry_id.as_str())
+                .or_default()
+                .push(mark);
+        }
+    }
+
     Ok(stats
         .into_iter()
         .map(|row| KnowledgeUseRecord {
-            marks: marks
-                .iter()
-                .filter(|m| m.entry_id == row.entry_id)
-                .filter_map(into_mark)
-                .collect(),
+            marks: by_entry.remove(row.entry_id.as_str()).unwrap_or_default(),
             entry_id: row.entry_id,
             offered_count: row.offered_count.max(0) as u64,
             opened_count: row.opened_count.max(0) as u64,
