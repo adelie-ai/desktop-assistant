@@ -293,6 +293,14 @@ pub fn read_transcript_message(request: &TranscriptReadRequest) -> String {
     let end = slice_end(&entry.content, start, capped);
     let slice = &entry.content[start..end];
 
+    // `next_offset` is an offset the caller can follow, so it is offered only
+    // when following it reads bytes this response did not return. A read that
+    // returned nothing while bytes remain - which only a `length` of zero
+    // does - would otherwise hand back the offset it started at, and a caller
+    // told to page by `next_offset` would ask the same question until its
+    // rounds ran out.
+    let advanced = end > start;
+    let unread_remain = end < total;
     let mut payload = serde_json::json!({
         "ok": true,
         "message_id": entry.id,
@@ -301,7 +309,7 @@ pub fn read_transcript_message(request: &TranscriptReadRequest) -> String {
         "total_bytes": total,
         "offset": start,
         "returned_bytes": slice.len(),
-        "next_offset": if end < total { Some(end) } else { None },
+        "next_offset": if unread_remain && advanced { Some(end) } else { None },
         "content": slice,
     });
     if requested > TRANSCRIPT_READ_MAX_BYTES {
@@ -309,6 +317,11 @@ pub fn read_transcript_message(request: &TranscriptReadRequest) -> String {
         payload["message"] = serde_json::json!(format!(
             "`length` was cut to the {TRANSCRIPT_READ_MAX_BYTES}-byte cap on one read. Read \
              the rest from `next_offset`."
+        ));
+    } else if unread_remain && !advanced {
+        payload["message"] = serde_json::json!(format!(
+            "`length` was 0, so this read returned no bytes and there is no `next_offset` to \
+             follow. Read again from offset {start} with a `length` of at least one byte."
         ));
     }
     // Provenance is decided from the WHOLE stored result, not from the slice
@@ -358,13 +371,14 @@ fn floor_char_boundary(s: &str, index: usize) -> usize {
 /// Snapped back to a char boundary, because a range that splits a character is
 /// not a string. When snapping back would return nothing at all - the next
 /// character is wider than the whole request - the end moves forward to the
-/// next boundary instead, so paging always advances rather than returning an
-/// empty slice at the same offset forever.
+/// next boundary instead, so a read that asked for bytes always returns some
+/// rather than an empty slice at the same offset.
 ///
 /// That widening applies only to a read that asked for at least one byte. A
-/// read of zero bytes returns zero: it is not stalled, and handing back a
-/// character nobody asked for would make the response disagree with its own
-/// request.
+/// read of zero bytes returns zero: handing back a character nobody asked for
+/// would make the response disagree with its own request. Such a read reports
+/// no `next_offset`, which is what keeps paging terminating - see
+/// [`read_transcript_message`].
 fn slice_end(s: &str, start: usize, len: usize) -> usize {
     let end = floor_char_boundary(s, start.saturating_add(len).min(s.len()));
     if end > start || start >= s.len() || len == 0 {
@@ -797,16 +811,19 @@ mod tests {
         );
     }
 
+    /// A response that carries a `next_offset` carries one the caller can
+    /// follow: reading from it returns bytes the caller does not already hold.
+    /// A response that cannot offer that carries no `next_offset` at all, so a
+    /// caller told to page by it can never repeat the same read forever.
     #[tokio::test]
     async fn paging_always_advances() {
-        // One character wider than the whole request: snapping the end back
-        // would return nothing and leave `next_offset` where it started.
         let body = "\u{1F600}\u{1F600}";
         let messages = vec![requested("c1", "read_file"), tool_result("c1", body)];
         let id = messages[1].id.clone();
-        let v = view("u", "conv", &messages);
 
-        let payload = scoped("u", "conv", v, async {
+        // A character wider than the whole request: snapping the end back would
+        // return nothing and leave `next_offset` where it started.
+        let payload = scoped("u", "conv", view("u", "conv", &messages), async {
             read_transcript_message(&TranscriptReadRequest {
                 message_id: id.clone(),
                 offset: 0,
@@ -814,10 +831,33 @@ mod tests {
             })
         })
         .await;
-
         let got = parse(&payload);
         assert_eq!(got["returned_bytes"], 4, "{payload}");
         assert_eq!(got["next_offset"], 4, "{payload}");
+
+        // A request for no bytes. There are bytes left, but the offset that
+        // would read them is the offset this read started at, so following it
+        // asks the same question again.
+        let payload = scoped("u", "conv", view("u", "conv", &messages), async {
+            read_transcript_message(&TranscriptReadRequest {
+                message_id: id.clone(),
+                offset: 0,
+                length: Some(0),
+            })
+        })
+        .await;
+        let got = parse(&payload);
+        assert_eq!(got["returned_bytes"], 0, "{payload}");
+        assert!(
+            got["next_offset"].is_null(),
+            "a read that returned nothing must not offer an offset to repeat it: {payload}"
+        );
+        assert!(
+            got["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("length")),
+            "the response must say how to read the rest: {payload}"
+        );
     }
 
     /// The progress rule widens a read that asked for at least one byte and

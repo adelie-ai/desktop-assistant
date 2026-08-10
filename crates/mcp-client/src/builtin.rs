@@ -1071,7 +1071,8 @@ impl BuiltinToolService {
                      reasoned about. Reads are partial and you page through them: give \
                      `offset` and `length`, and the response carries `total_bytes`, the \
                      `offset` it actually started at, `returned_bytes`, and `next_offset` \
-                     (null once you have reached the end). One read returns at most \
+                     (null once you have reached the end, and null for a read that \
+                     returned no bytes). One read returns at most \
                      {max} bytes, and a larger `length` is cut to that with \
                      `truncated: true`. Only this conversation's messages are readable, and \
                      an id it does not hold returns ok:false with a `code`, not an error.",
@@ -1092,7 +1093,7 @@ impl BuiltinToolService {
                         "length": {
                             "type": "integer",
                             "minimum": 0,
-                            "description": "How many bytes to return. Defaults to the per-read cap, and a larger value is cut to it."
+                            "description": "How many bytes to return. Defaults to the per-read cap, and a larger value is cut to it. A `length` of 0 returns no bytes and no `next_offset`, so ask for at least one byte."
                         }
                     },
                     "required": ["message_id"]
