@@ -155,7 +155,11 @@ pub(crate) fn rank_page(
 ///
 /// Both arms carry the whole scope - the user, the live-row predicate, and both
 /// tag filters. A predicate present on one arm and missing from the other would
-/// make the weaker arm a way around the scope the other enforces.
+/// make the weaker arm a way around the scope the other enforces. The user and
+/// the live-row predicate are repeated on the final join rather than trusted
+/// from the arms: an id can only reach it through one of them, but a scope
+/// predicate that appears once is a scope predicate one refactor can lose, and
+/// this table holds every tenant's knowledge.
 ///
 /// Only the vector arm is model-scoped ($8). A vector of another dimension
 /// makes pgvector raise rather than miss, and a table legitimately holds two
@@ -232,7 +236,8 @@ pub(crate) const HYBRID_SEARCH_SQL: &str = "\
      SELECT kb.id, kb.content, kb.tags, kb.metadata, kb.created_at, kb.updated_at, kb.summary,
             a.distance, s.median, s.rows_read, s.deviation
      FROM admitted a
-     JOIN knowledge_base kb ON kb.id = a.id AND kb.user_id = $6
+     JOIN knowledge_base kb
+       ON kb.id = a.id AND kb.user_id = $6 AND kb.deleted_at IS NULL
      CROSS JOIN s
      ORDER BY a.arm, a.seat";
 
