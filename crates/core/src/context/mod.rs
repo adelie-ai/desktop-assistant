@@ -1290,16 +1290,17 @@ fn find_largest_tool_result_above(
 ///
 /// The prefix is deliberately distinct from
 /// [`planning::COMPACTION_POINTER_PREFIX`]: that one names a scratchpad note
-/// the model can search. This one names none, so a re-run is the model's only
-/// way back to the output. The output itself is not lost - the conversation's
-/// stored transcript still holds it - but nothing carries it back into the
-/// turn on its own.
+/// the model can search, and this one names none, because a sweep distils
+/// nothing. Both name the message the output is still stored under, so the
+/// model reads the very bytes the earlier round reasoned about instead of
+/// running the tool a second time (#1226).
 fn overflow_compaction_notice(message_id: &str, original_bytes: usize) -> String {
-    let _ = message_id;
+    let tool = crate::ports::transcript::TRANSCRIPT_GET_TOOL;
     format!(
         "<earlier tool output omitted: {original_bytes} bytes are out of view to fit the \
-         model's context window. The call above and its arguments are unchanged; \
-         re-run the tool if you need this output again.>"
+         model's context window. The call above and its arguments are unchanged. Read the \
+         output back with {tool} message_id=\"{message_id}\" rather than running the tool \
+         again.>"
     )
 }
 
@@ -2684,12 +2685,9 @@ mod tests {
             user,
             with_conversation_id(
                 conversation,
-                with_transcript(
-                    view,
-                    std::future::ready(read_transcript_message(&TranscriptReadRequest::new(
-                        &oldest_id,
-                    ))),
-                ),
+                with_transcript(view, async {
+                    read_transcript_message(&TranscriptReadRequest::new(&oldest_id))
+                }),
             ),
         )
         .await;

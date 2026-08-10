@@ -4808,6 +4808,118 @@ mod tests {
         );
     }
 
+    // --- builtin_transcript_get (#1226) ------------------------------------
+
+    /// A turn with one tool result in it, and the scope that turn installs.
+    async fn with_a_turn_transcript<T>(content: &str, body: impl AsyncFnOnce(String) -> T) -> T {
+        use desktop_assistant_core::domain::{Message, ToolCall};
+        use desktop_assistant_core::ports::auth::{UserId, with_user_id};
+        use desktop_assistant_core::ports::transcript::{TranscriptView, with_transcript};
+
+        let messages = vec![
+            Message::assistant_with_tool_calls(vec![ToolCall::new("c1", "read_file", "{}")]),
+            Message::tool_result("c1", content),
+        ];
+        let id = messages[1].id.clone();
+        let user = UserId::new("u");
+        let conversation = ConversationId::from("c1");
+        let mut view = TranscriptView::new(user.clone(), conversation.clone());
+        view.absorb(&messages);
+
+        with_user_id(
+            user,
+            with_conversation_id(
+                conversation,
+                with_transcript(view, async move { body(id).await }),
+            ),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn transcript_get_returns_the_stored_message_through_the_tool() {
+        let service = BuiltinToolService::new();
+        let out = with_a_turn_transcript("the stored bytes", async |id| {
+            service
+                .execute_tool(TOOL_TRANSCRIPT_GET, serde_json::json!({"message_id": id}))
+                .await
+                .expect("the read is a normal tool call")
+        })
+        .await;
+
+        let got: serde_json::Value = serde_json::from_str(&out).expect("JSON");
+        assert_eq!(got["ok"], true, "{out}");
+        assert_eq!(got["content"], "the stored bytes");
+        assert_eq!(got["produced_by"], "read_file");
+    }
+
+    #[tokio::test]
+    async fn transcript_get_requires_a_message_id() {
+        let service = BuiltinToolService::new();
+        let err = service
+            .execute_tool(TOOL_TRANSCRIPT_GET, serde_json::json!({}))
+            .await
+            .expect_err("a call with no id names the missing argument");
+        assert!(err.to_string().contains("message_id"), "{err}");
+    }
+
+    /// Lenient in encoding, strict in value: providers render an integer
+    /// argument as a number or as a string, and both mean the same offset. A
+    /// value that is not a whole number of zero or more is refused rather than
+    /// read as zero, because a read from the wrong offset returns the wrong
+    /// bytes and says nothing about it.
+    #[tokio::test]
+    async fn transcript_get_accepts_a_numeric_string_offset_and_refuses_a_bad_one() {
+        let service = BuiltinToolService::new();
+
+        let out = with_a_turn_transcript("0123456789", async |id| {
+            service
+                .execute_tool(
+                    TOOL_TRANSCRIPT_GET,
+                    serde_json::json!({"message_id": id, "offset": "4", "length": "2"}),
+                )
+                .await
+                .expect("a numeric string is an offset")
+        })
+        .await;
+        let got: serde_json::Value = serde_json::from_str(&out).expect("JSON");
+        assert_eq!(got["content"], "45", "{out}");
+
+        for bad in [
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("soon"),
+        ] {
+            let err = service
+                .execute_tool(
+                    TOOL_TRANSCRIPT_GET,
+                    serde_json::json!({"message_id": "m", "offset": bad}),
+                )
+                .await
+                .expect_err("a value that is not a whole number is refused");
+            assert!(err.to_string().contains("offset"), "{err}");
+        }
+    }
+
+    /// Outside a turn there is no transcript, and the tool says so as a
+    /// structured decline rather than failing the call.
+    #[tokio::test]
+    async fn transcript_get_outside_a_turn_declines_rather_than_erroring() {
+        let service = BuiltinToolService::new();
+        let out = service
+            .execute_tool(
+                TOOL_TRANSCRIPT_GET,
+                serde_json::json!({"message_id": "anything"}),
+            )
+            .await
+            .expect("a decline is a normal outcome, not an error");
+
+        let got: serde_json::Value = serde_json::from_str(&out).expect("JSON");
+        assert_eq!(got["ok"], false, "{out}");
+        assert!(got["code"].is_string(), "{out}");
+        assert_eq!(got["retryable"], false, "{out}");
+    }
+
     /// With no embedding backend the tool still searches, handing over an empty
     /// vector -- the store reads that as "take the full-text path".
     #[tokio::test]

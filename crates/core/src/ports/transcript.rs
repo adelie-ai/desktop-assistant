@@ -72,7 +72,7 @@ use crate::tool_provenance::{EXTERNAL_CONTENT_MARKER, result_is_externally_contr
 /// LLM-visible name of the transcript read-back tool.
 ///
 /// Declared here, in `core`, rather than in the crate that implements it:
-/// [`crate::planning::compaction_pointer`] and
+/// `crate::planning::compaction_pointer` and
 /// `crate::context::overflow_compaction_notice` both name the tool in the text
 /// the model reads, and neither may depend on the MCP layer.
 pub const TRANSCRIPT_GET_TOOL: &str = "builtin_transcript_get";
@@ -279,17 +279,42 @@ pub fn read_transcript_message(request: &TranscriptReadRequest) -> String {
              you read it from.",
         );
     };
-    let _ = (
-        entry,
-        EXTERNAL_CONTENT_MARKER,
-        result_is_externally_controlled("", ""),
-        TRANSCRIPT_READ_MAX_BYTES,
-    );
-    decline(
-        CODE_NOT_FOUND,
-        "no message in this conversation has that id",
-        "This conversation holds no message with that id.",
-    )
+    let total = entry.content.len();
+    let requested = request.length.unwrap_or(TRANSCRIPT_READ_MAX_BYTES);
+    let capped = requested.min(TRANSCRIPT_READ_MAX_BYTES);
+    let start = floor_char_boundary(&entry.content, request.offset.min(total));
+    let end = slice_end(&entry.content, start, capped);
+    let slice = &entry.content[start..end];
+
+    let mut payload = serde_json::json!({
+        "ok": true,
+        "message_id": entry.id,
+        "role": entry.role,
+        "produced_by": entry.tool_name,
+        "total_bytes": total,
+        "offset": start,
+        "returned_bytes": slice.len(),
+        "next_offset": if end < total { Some(end) } else { None },
+        "content": slice,
+    });
+    if requested > TRANSCRIPT_READ_MAX_BYTES {
+        payload["truncated"] = serde_json::Value::Bool(true);
+        payload["message"] = serde_json::json!(format!(
+            "`length` was cut to the {TRANSCRIPT_READ_MAX_BYTES}-byte cap on one read. Read \
+             the rest from `next_offset`."
+        ));
+    }
+    // Provenance is decided from the WHOLE stored result, not from the slice
+    // returned: a range that happens to miss the marker is still a range of
+    // externally-controlled bytes.
+    if entry
+        .tool_name
+        .as_deref()
+        .is_some_and(|name| result_is_externally_controlled(name, &entry.content))
+    {
+        payload["provenance"] = serde_json::json!(EXTERNAL_CONTENT_MARKER);
+    }
+    payload.to_string()
 }
 
 /// A refusal that carries no bytes: a stable code, a description, a line for
@@ -303,6 +328,34 @@ fn decline(code: &str, description: &str, message: &str) -> String {
         "retryable": false,
     })
     .to_string()
+}
+
+/// The largest char boundary at or below `index`.
+fn floor_char_boundary(s: &str, index: usize) -> usize {
+    let mut i = index.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// Where a read starting at `start` and asking for `len` bytes ends.
+///
+/// Snapped back to a char boundary, because a range that splits a character is
+/// not a string. When snapping back would return nothing at all - one
+/// character wider than the whole request - the end moves forward to the next
+/// boundary instead, so paging always advances rather than returning an empty
+/// slice at the same offset forever.
+fn slice_end(s: &str, start: usize, len: usize) -> usize {
+    let end = floor_char_boundary(s, start.saturating_add(len).min(s.len()));
+    if end > start || start >= s.len() {
+        return end;
+    }
+    let mut i = start + 1;
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
 }
 
 #[cfg(test)]
@@ -422,7 +475,8 @@ mod tests {
         let got = parse(&payload);
         assert_eq!(got["ok"], true);
         assert_eq!(
-            got["returned_bytes"], TRANSCRIPT_READ_MAX_BYTES,
+            got["returned_bytes"],
+            TRANSCRIPT_READ_MAX_BYTES,
             "a read may not exceed the cap: {}",
             &payload[..200.min(payload.len())]
         );
@@ -443,7 +497,10 @@ mod tests {
     /// or stale scope cannot serve one user's bytes to another.
     #[tokio::test]
     async fn a_message_id_owned_by_another_user_is_refused() {
-        let messages = vec![requested("c1", "read_file"), tool_result("c1", "alice's bytes")];
+        let messages = vec![
+            requested("c1", "read_file"),
+            tool_result("c1", "alice's bytes"),
+        ];
         let id = messages[1].id.clone();
         let alices = view("alice", "conv", &messages);
 
@@ -464,7 +521,10 @@ mod tests {
     /// AC: a message id in another conversation is refused.
     #[tokio::test]
     async fn a_message_id_in_another_conversation_is_refused() {
-        let other = vec![requested("c1", "read_file"), tool_result("c1", "other bytes")];
+        let other = vec![
+            requested("c1", "read_file"),
+            tool_result("c1", "other bytes"),
+        ];
         let other_id = other[1].id.clone();
         // The active conversation holds its own, unrelated message.
         let mine = vec![requested("c9", "read_file"), tool_result("c9", "my bytes")];

@@ -44,6 +44,7 @@ use crate::ports::skill_use::SkillOfferedFn;
 use crate::ports::store::ConversationStore;
 use crate::ports::tool_observer::{ToolEvent, notify_tool_event};
 use crate::ports::tools::ToolExecutor;
+use crate::ports::transcript::{TranscriptView, with_transcript};
 use crate::ports::transport::{current_client_label, current_co_location, current_transport_kind};
 use crate::ports::turn_capability::{
     Delivery, TurnCapabilityChange, TurnCapabilityReason, notify_turn_capability_change,
@@ -2337,6 +2338,14 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
         self.carry_recorded_evictions(conversation_id, &conv, &mut projection)
             .await;
 
+        // The other side of the projection: what the model can read back when
+        // it needs the bytes the projection stopped showing it (#1226). The
+        // view is installed around each server-side tool execution and grows
+        // as the turn appends, so a result taken out of view on one round is
+        // still fetchable by its message id on a later one - including within
+        // this turn, whose rows storage does not hold until the turn ends.
+        let mut transcript = TranscriptView::new(current_user_id(), conversation_id.clone());
+
         // Whether this turn has already spent its one attempt at folding what
         // the assembler's pre-flight shrink dropped. See the call site.
         let mut preflight_folded = false;
@@ -3814,6 +3823,13 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                     // the `ToolExecutor` port growing a conversation parameter.
                     let exec = self.tools.execute_tool(&tool_call.name, arguments);
                     let scoped = with_conversation_id(conversation_id.clone(), exec);
+                    // Take in whatever the turn has appended since the last
+                    // dispatch, then install the transcript this tool may read
+                    // back from (#1226). Absorbing costs only the new
+                    // messages, and the view is scoped to this user and this
+                    // conversation, so a read can reach nothing else.
+                    transcript.absorb(&conv.messages);
+                    let scoped = with_transcript(transcript.clone(), scoped);
                     // For `spawn_subagent`, install the child scope minted above so
                     // the spawn-tool body adopts it for the child (#287); every other
                     // tool runs with no pending child scope. Fold both arms into one

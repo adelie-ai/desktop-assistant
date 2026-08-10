@@ -147,6 +147,15 @@ and `builtin_scratchpad_search` - close the gate when they do. Pinned notes
 render into later turns with no tool in the path and so are not covered; that
 needs a durable provenance marker rather than a third special case.
 
+Reading old bytes back is a route into a turn as much as reading a page is, so
+`builtin_transcript_get` - which hands back a message this conversation's
+transcript already holds - does not launder them. It resolves the tool that
+produced the fetched message from its `tool_call_id`, asks the same question
+the turn asked when the result first arrived, and stamps the external-content
+marker into its own payload when the answer is "outside content". Its
+classification is `Declared(ExternalContentMarker)`, so the marker closes the
+gate exactly as the original result did.
+
 The gate protects the turn that read the content. It does not stop a model that
 acts on the same text one turn later - that needs a taint marker persisted on
 the ingesting message, which is a later phase.
