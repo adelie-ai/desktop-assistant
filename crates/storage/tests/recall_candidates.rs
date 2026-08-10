@@ -736,7 +736,7 @@ async fn recall_block_scratchpad_arm_stays_within_the_current_conversation() {
             .await
             .expect("the read succeeds");
 
-        let keys: Vec<&str> = hits.iter().map(|(n, _)| n.key.as_str()).collect();
+        let keys: Vec<&str> = hits.notes.iter().map(|(n, _)| n.key.as_str()).collect();
         assert_eq!(
             keys,
             vec!["mine"],
@@ -775,7 +775,7 @@ async fn nearest_notes_never_cross_the_user_boundary() {
             .expect("the read succeeds");
 
         assert!(
-            hits.is_empty(),
+            hits.notes.is_empty(),
             "another tenant's pad must be invisible even by its own conversation id"
         );
     })
@@ -800,6 +800,7 @@ async fn nearest_notes_come_back_nearest_first_with_their_distance() {
             .await
             .expect("the read succeeds");
 
+        let hits = hits.notes;
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].0.key, "near", "nearest first");
         assert!(
@@ -844,7 +845,7 @@ async fn nearest_notes_ignore_a_note_embedded_by_another_model() {
             .await
             .expect("a row of another dimension must be skipped, not raise");
 
-        let keys: Vec<&str> = hits.iter().map(|(n, _)| n.key.as_str()).collect();
+        let keys: Vec<&str> = hits.notes.iter().map(|(n, _)| n.key.as_str()).collect();
         assert_eq!(keys, vec!["mine"]);
     })
     .await;
@@ -874,6 +875,7 @@ async fn nearest_notes_report_whether_a_note_is_pinned() {
             .expect("the read succeeds");
 
         let pinned: Vec<(&str, bool)> = hits
+            .notes
             .iter()
             .map(|(n, _)| (n.key.as_str(), n.pinned))
             .collect();
@@ -1036,7 +1038,7 @@ async fn nearest_notes_leave_out_the_goal_note_and_nothing_else() {
             .await
             .expect("the read succeeds");
 
-        let mut keys: Vec<&str> = hits.iter().map(|(n, _)| n.key.as_str()).collect();
+        let mut keys: Vec<&str> = hits.notes.iter().map(|(n, _)| n.key.as_str()).collect();
         keys.sort_unstable();
         assert_eq!(keys, vec!["1", "finding", "outcome:1.2"]);
     })
@@ -1106,11 +1108,14 @@ async fn nearest_notes_return_the_same_page_for_two_identical_reads() {
             .await
             .expect("the read succeeds");
 
-        let keys = |hits: &[(desktop_assistant_core::domain::ScratchpadNote, f64)]| {
-            hits.iter().map(|(n, _)| n.key.clone()).collect::<Vec<_>>()
+        let keys = |hits: &desktop_assistant_storage::NearestNotes| {
+            hits.notes
+                .iter()
+                .map(|(n, _)| n.key.clone())
+                .collect::<Vec<_>>()
         };
         assert_eq!(keys(&first), keys(&again), "the cut must be repeatable");
-        assert_eq!(first.len(), 3);
+        assert_eq!(first.notes.len(), 3);
     })
     .await;
 
@@ -1194,6 +1199,7 @@ async fn the_scratchpad_arm_honours_the_subagent_read_snapshot() {
 
         for keys in [
             nearest
+                .notes
                 .iter()
                 .map(|(n, _)| n.key.as_str())
                 .collect::<Vec<_>>(),
@@ -1333,8 +1339,14 @@ async fn the_pad_dispersion_never_crosses_the_conversation_boundary() {
     let pad = PgScratchpadStore::new(fx.pool.clone());
 
     with_user_id(UserId::new(USER), async {
-        convs.create(make_conversation("c1")).await.expect("conv c1");
-        convs.create(make_conversation("c2")).await.expect("conv c2");
+        convs
+            .create(make_conversation("c1"))
+            .await
+            .expect("conv c1");
+        convs
+            .create(make_conversation("c2"))
+            .await
+            .expect("conv c2");
         // The other conversation's pad states a dispersion on its own, so a
         // read that crossed the boundary would answer with one.
         seed_a_pad_spread(&pad, "c2", "theirs").await;

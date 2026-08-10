@@ -56,7 +56,7 @@ pub use migrate_json::{
 pub use negative_memory::PgNegativeMemoryStore;
 pub use pool::{create_pool, run_migrations};
 pub use scan_bound::begin_bounded;
-pub use scratchpad::PgScratchpadStore;
+pub use scratchpad::{NearestNotes, PgScratchpadStore};
 pub use skill_index::{
     NearestSkill, NearestSkills, PgSkillIndexStore, SKILL_RECALL_SCAN_STATEMENT_TIMEOUT,
 };
