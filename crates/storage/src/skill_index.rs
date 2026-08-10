@@ -260,16 +260,9 @@ impl PgSkillIndexStore {
         // A transaction, for one statement, because `SET LOCAL` is scoped to
         // one: it is what makes the ceiling the caller keeps a ceiling the
         // database keeps too.
-        let mut scan = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| CoreError::Storage(e.to_string()))?;
-        sqlx::query("SELECT set_config('statement_timeout', $1, true)")
-            .bind(SKILL_RECALL_SCAN_STATEMENT_TIMEOUT.as_millis().to_string())
-            .execute(&mut *scan)
-            .await
-            .map_err(|e| CoreError::Storage(e.to_string()))?;
+        let mut scan =
+            crate::scan_bound::begin_bounded(&self.pool, SKILL_RECALL_SCAN_STATEMENT_TIMEOUT)
+                .await?;
         let rows: Vec<SkillNearestRow> = sqlx::query_as(NEAREST_SKILLS_BY_EMBEDDING_SQL)
             .bind(Vector::from(query_embedding))
             .bind(user.as_str())
@@ -304,12 +297,33 @@ impl PgSkillIndexStore {
     ///
     /// The same approval filter and the same one-row-per-name rule as
     /// [`Self::nearest_by_embedding`], for the same reasons.
+    ///
+    /// The scan carries [`SKILL_RECALL_SCAN_STATEMENT_TIMEOUT`], so the
+    /// database stops working when the caller stops waiting. The `DISTINCT ON`
+    /// resolution reads the whole approved catalog before the match narrows it,
+    /// so this read's cost grows with the catalog and not with the query.
     pub async fn search_text_any_term(
         &self,
         query: &str,
         limit: usize,
     ) -> Result<Vec<NearestSkill>, CoreError> {
+        self.search_text_any_term_within(query, limit, SKILL_RECALL_SCAN_STATEMENT_TIMEOUT)
+            .await
+    }
+
+    /// [`Self::search_text_any_term`] under a stated ceiling.
+    ///
+    /// Exists so the bound can be proven against a real database without
+    /// waiting the deployment's own four seconds for it. Production has one
+    /// caller and it passes [`SKILL_RECALL_SCAN_STATEMENT_TIMEOUT`].
+    pub async fn search_text_any_term_within(
+        &self,
+        query: &str,
+        limit: usize,
+        ceiling: std::time::Duration,
+    ) -> Result<Vec<NearestSkill>, CoreError> {
         let user = current_user_id();
+        let mut scan = crate::scan_bound::begin_bounded(&self.pool, ceiling).await?;
         let rows: Vec<SkillTextRow> = sqlx::query_as(
             "WITH q AS (
                  SELECT to_tsquery('english', string_agg(quote_literal(lexeme), ' | ')) AS query
@@ -337,9 +351,12 @@ impl PgSkillIndexStore {
         .bind(query)
         .bind(limit as i64)
         .bind(user.as_str())
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *scan)
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;
+        scan.commit()
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
 
         Ok(rows.into_iter().map(SkillTextRow::into_candidate).collect())
     }

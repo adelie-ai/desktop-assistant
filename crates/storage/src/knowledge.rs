@@ -636,16 +636,8 @@ impl PgKnowledgeBaseStore {
         // one: it is what makes the ceiling the caller keeps a ceiling the
         // database keeps too. Abandoning the future stops the daemon waiting
         // and leaves the backend scanning, and recall runs before every turn.
-        let mut scan = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| CoreError::Storage(e.to_string()))?;
-        sqlx::query("SELECT set_config('statement_timeout', $1, true)")
-            .bind(RECALL_SCAN_STATEMENT_TIMEOUT.as_millis().to_string())
-            .execute(&mut *scan)
-            .await
-            .map_err(|e| CoreError::Storage(e.to_string()))?;
+        let mut scan =
+            crate::scan_bound::begin_bounded(&self.pool, RECALL_SCAN_STATEMENT_TIMEOUT).await?;
         let rows: Vec<KbNearestRow> = sqlx::query_as(NEAREST_BY_EMBEDDING_SQL)
             .bind(Vector::from(query_embedding))
             .bind(user_id.as_str())
@@ -695,12 +687,36 @@ impl PgKnowledgeBaseStore {
     /// widened match set does not put the weakest hit first.
     ///
     /// Scoped to the task-local user by an explicit `WHERE user_id` predicate.
+    ///
+    /// The scan carries [`RECALL_SCAN_STATEMENT_TIMEOUT`], so the database
+    /// stops working when the caller stops waiting - the same bound
+    /// [`Self::nearest_by_embedding`] carries, because this is the same lookup
+    /// on the turn where no embedding was available. It matters more here, not
+    /// less: this read has no vector index to ride and its cost grows with the
+    /// store.
     pub async fn search_text_any_term(
         &self,
         query: &str,
         limit: usize,
     ) -> Result<Vec<KnowledgeEntry>, CoreError> {
+        self.search_text_any_term_within(query, limit, RECALL_SCAN_STATEMENT_TIMEOUT)
+            .await
+    }
+
+    /// [`Self::search_text_any_term`] under a stated ceiling.
+    ///
+    /// Exists so the bound can be proven against a real database without
+    /// waiting the deployment's own four seconds for it - the same reason
+    /// `render_recall_with_width` takes a width. Production has one caller and
+    /// it passes [`RECALL_SCAN_STATEMENT_TIMEOUT`].
+    pub async fn search_text_any_term_within(
+        &self,
+        query: &str,
+        limit: usize,
+        ceiling: std::time::Duration,
+    ) -> Result<Vec<KnowledgeEntry>, CoreError> {
         let user_id = current_user_id();
+        let mut scan = crate::scan_bound::begin_bounded(&self.pool, ceiling).await?;
         let rows: Vec<KbRow> = sqlx::query_as(
             "WITH q AS (
                  SELECT to_tsquery('english', string_agg(quote_literal(lexeme), ' | ')) AS query
@@ -718,9 +734,12 @@ impl PgKnowledgeBaseStore {
         .bind(query)
         .bind(limit as i64)
         .bind(user_id.as_str())
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *scan)
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;
+        scan.commit()
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
 
         Ok(rows.into_iter().map(|r| r.into_entry()).collect())
     }

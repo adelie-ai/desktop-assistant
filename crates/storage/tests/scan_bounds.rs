@@ -29,8 +29,8 @@ mod support;
 use std::time::Duration;
 
 use desktop_assistant_core::ports::auth::{UserId, with_user_id};
-use desktop_assistant_storage::{PgKnowledgeBaseStore, PgSkillIndexStore, begin_bounded};
 use desktop_assistant_storage::knowledge_delete::KnowledgeDeletePolicy;
+use desktop_assistant_storage::{PgKnowledgeBaseStore, PgSkillIndexStore, begin_bounded};
 use sqlx::PgPool;
 
 /// A synthetic tenant, never a real identity.
