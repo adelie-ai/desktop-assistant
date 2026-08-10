@@ -60,6 +60,13 @@
 //! when the answer is yes. [`TRANSCRIPT_GET_TOOL`] is classified
 //! `Declared(ExternalContentMarker)`, so the marker closes the gate exactly as
 //! the original result did.
+//!
+//! A tool result whose producing tool cannot be resolved is graded as outside
+//! content, because the other way round fails open: an unattributable result
+//! would come back with no marker and read as the assistant's own bytes. Only
+//! a tool result is graded that way. The rest of the transcript is the
+//! conversation itself, which every turn replays untainted, so reading one of
+//! its own messages back changes nothing.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -307,11 +314,18 @@ pub fn read_transcript_message(request: &TranscriptReadRequest) -> String {
     // Provenance is decided from the WHOLE stored result, not from the slice
     // returned: a range that happens to miss the marker is still a range of
     // externally-controlled bytes.
-    if entry
-        .tool_name
-        .as_deref()
-        .is_some_and(|name| result_is_externally_controlled(name, &entry.content))
-    {
+    //
+    // A tool result whose producing tool cannot be resolved is graded as
+    // outside content. The other way round fails open: an unattributable
+    // result would come back with no marker and read as the assistant's own
+    // bytes. Only a tool result is graded this way - the rest of the
+    // transcript is the conversation itself, which every turn replays
+    // untainted.
+    let external = match entry.tool_name.as_deref() {
+        Some(name) => result_is_externally_controlled(name, &entry.content),
+        None => entry.role == Role::Tool,
+    };
+    if external {
         payload["provenance"] = serde_json::json!(EXTERNAL_CONTENT_MARKER);
     }
     payload.to_string()
@@ -342,13 +356,18 @@ fn floor_char_boundary(s: &str, index: usize) -> usize {
 /// Where a read starting at `start` and asking for `len` bytes ends.
 ///
 /// Snapped back to a char boundary, because a range that splits a character is
-/// not a string. When snapping back would return nothing at all - one
-/// character wider than the whole request - the end moves forward to the next
-/// boundary instead, so paging always advances rather than returning an empty
-/// slice at the same offset forever.
+/// not a string. When snapping back would return nothing at all - the next
+/// character is wider than the whole request - the end moves forward to the
+/// next boundary instead, so paging always advances rather than returning an
+/// empty slice at the same offset forever.
+///
+/// That widening applies only to a read that asked for at least one byte. A
+/// read of zero bytes returns zero: it is not stalled, and handing back a
+/// character nobody asked for would make the response disagree with its own
+/// request.
 fn slice_end(s: &str, start: usize, len: usize) -> usize {
     let end = floor_char_boundary(s, start.saturating_add(len).min(s.len()));
-    if end > start || start >= s.len() {
+    if end > start || start >= s.len() || len == 0 {
         return end;
     }
     let mut i = start + 1;
@@ -629,6 +648,63 @@ mod tests {
         assert!(!turn.ingested_external());
     }
 
+    /// A tool result whose request is not in view cannot be graded, so it is
+    /// taken as outside content rather than as trusted.
+    ///
+    /// The alternative fails open: an unattributable result would come back
+    /// with no marker and read as the assistant's own bytes, which is the one
+    /// thing a read-back may not do. A non-tool message is a separate case and
+    /// is not covered by this - see
+    /// `a_read_of_a_message_that_is_not_a_tool_result_does_not_taint_the_turn`.
+    #[tokio::test]
+    async fn a_read_of_a_tool_result_with_no_resolvable_tool_taints_the_turn() {
+        // The result is in the view; the assistant request that named the tool
+        // is not, so nothing says which tool produced these bytes.
+        let orphan = Message::tool_result("c-gone", "bytes nobody can attribute");
+        let messages = vec![orphan];
+        let id = messages[0].id.clone();
+        let v = view("u", "conv", &messages);
+        assert_eq!(
+            v.get(&id).and_then(|e| e.tool_name.clone()),
+            None,
+            "the fixture must leave the producing tool unresolvable"
+        );
+
+        let payload = scoped("u", "conv", v, async {
+            read_transcript_message(&TranscriptReadRequest::new(&id))
+        })
+        .await;
+
+        let mut turn = TurnProvenance::new();
+        assert_eq!(
+            turn.observe_result(TRANSCRIPT_GET_TOOL, &payload),
+            GateChange::JustClosed,
+            "a result that cannot be graded must not read as trusted: {payload}"
+        );
+    }
+
+    /// The other half of the rule above: the ordinary transcript is not a tool
+    /// result, and every turn replays it untainted, so reading one of its own
+    /// messages back changes nothing.
+    #[tokio::test]
+    async fn a_read_of_a_message_that_is_not_a_tool_result_does_not_taint_the_turn() {
+        let messages = vec![Message::new(Role::User, "what the user typed")];
+        let id = messages[0].id.clone();
+        let v = view("u", "conv", &messages);
+
+        let payload = scoped("u", "conv", v, async {
+            read_transcript_message(&TranscriptReadRequest::new(&id))
+        })
+        .await;
+
+        let mut turn = TurnProvenance::new();
+        assert_eq!(
+            turn.observe_result(TRANSCRIPT_GET_TOOL, &payload),
+            GateChange::Unchanged,
+            "the user's own words are not outside content: {payload}"
+        );
+    }
+
     #[tokio::test]
     async fn a_read_with_no_transcript_in_scope_is_refused() {
         let payload = with_user_id(UserId::new("u".to_string()), async {
@@ -742,6 +818,35 @@ mod tests {
         let got = parse(&payload);
         assert_eq!(got["returned_bytes"], 4, "{payload}");
         assert_eq!(got["next_offset"], 4, "{payload}");
+    }
+
+    /// The progress rule widens a read that asked for at least one byte and
+    /// would otherwise return none. A read that asked for none is not that
+    /// case, and must return none: handing back a byte nobody asked for is a
+    /// response that does not match its own request.
+    #[tokio::test]
+    async fn a_read_of_zero_bytes_returns_nothing() {
+        let messages = vec![requested("c1", "read_file"), tool_result("c1", "hello")];
+        let id = messages[1].id.clone();
+        let v = view("u", "conv", &messages);
+
+        let payload = scoped("u", "conv", v, async {
+            read_transcript_message(&TranscriptReadRequest {
+                message_id: id.clone(),
+                offset: 2,
+                length: Some(0),
+            })
+        })
+        .await;
+
+        let got = parse(&payload);
+        assert_eq!(got["ok"], true, "{payload}");
+        assert_eq!(got["content"], "", "{payload}");
+        assert_eq!(got["returned_bytes"], 0, "{payload}");
+        assert_eq!(
+            got["offset"], 2,
+            "the read must not move on from where it was asked to start: {payload}"
+        );
     }
 
     #[tokio::test]
