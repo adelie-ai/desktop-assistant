@@ -3437,17 +3437,30 @@ fn kb_get_row_within(entry: &KnowledgeEntry, budget: usize) -> (serde_json::Valu
 
 /// A non-negative integer argument, or `None` when the key is absent.
 ///
-/// Lenient in encoding, strict in value: a JSON number and a numeric string
-/// both parse, because providers differ in how they render an integer
-/// argument. A negative value, a fraction, or text that is not a number is
-/// refused rather than silently treated as zero - a read that starts at the
-/// wrong offset returns the wrong bytes and says nothing about it.
+/// Lenient in encoding, strict in value. Tool-call plumbing re-encodes an
+/// integer as a whole-valued float (`4.0`) or as a decimal string (`"4"`), and
+/// all three say the same number, so all three parse. A negative value, a
+/// fraction, a non-finite float, or text that is not a number says something
+/// else and is refused rather than silently treated as zero - a read that
+/// starts at the wrong offset returns the wrong bytes and says nothing about
+/// it.
 fn optional_usize(args: &serde_json::Value, key: &str) -> Result<Option<usize>, CoreError> {
     let Some(value) = args.get(key).filter(|v| !v.is_null()) else {
         return Ok(None);
     };
     let parsed = match value {
-        serde_json::Value::Number(n) => n.as_u64(),
+        serde_json::Value::Number(n) => n.as_u64().or_else(|| {
+            // Not an integer in serde_json's model, so it is a float. Only a
+            // finite, non-negative, whole, in-range one is the number it
+            // re-encodes; a cast saturates rather than failing, so the range is
+            // checked here and not left to it.
+            n.as_f64()
+                .filter(|f| f.is_finite() && *f >= 0.0 && f.fract() == 0.0)
+                .filter(|f| *f < u64::MAX as f64)
+                .map(|f| f as u64)
+        }),
+        // `u64::from_str` already refuses a fraction ("4.0"), a sign, padding,
+        // and a radix prefix, so a clean decimal string is all that passes.
         serde_json::Value::String(s) => s.trim().parse::<u64>().ok(),
         _ => None,
     };
@@ -4864,32 +4877,46 @@ mod tests {
         assert!(err.to_string().contains("message_id"), "{err}");
     }
 
-    /// Lenient in encoding, strict in value: providers render an integer
-    /// argument as a number or as a string, and both mean the same offset. A
-    /// value that is not a whole number of zero or more is refused rather than
-    /// read as zero, because a read from the wrong offset returns the wrong
-    /// bytes and says nothing about it.
+    /// Lenient in encoding, strict in value: a provider renders an integer
+    /// argument as a number, as a whole-valued float, or as a decimal string,
+    /// and all three mean the same offset. A value that is not a whole number
+    /// of zero or more is refused rather than read as zero, because a read from
+    /// the wrong offset returns the wrong bytes and says nothing about it.
     #[tokio::test]
-    async fn transcript_get_accepts_a_numeric_string_offset_and_refuses_a_bad_one() {
+    async fn transcript_get_accepts_every_lossless_encoding_of_a_number_and_refuses_the_rest() {
         let service = BuiltinToolService::new();
 
-        let out = with_a_turn_transcript("0123456789", async |id| {
-            service
-                .execute_tool(
-                    TOOL_TRANSCRIPT_GET,
-                    serde_json::json!({"message_id": id, "offset": "4", "length": "2"}),
-                )
-                .await
-                .expect("a numeric string is an offset")
-        })
-        .await;
-        let got: serde_json::Value = serde_json::from_str(&out).expect("JSON");
-        assert_eq!(got["content"], "45", "{out}");
+        for (offset, length) in [
+            (serde_json::json!(4), serde_json::json!(2)),
+            (serde_json::json!("4"), serde_json::json!("2")),
+            (serde_json::json!(4.0), serde_json::json!(2.0)),
+        ] {
+            let out = with_a_turn_transcript("0123456789", async |id| {
+                service
+                    .execute_tool(
+                        TOOL_TRANSCRIPT_GET,
+                        serde_json::json!({
+                            "message_id": id,
+                            "offset": offset,
+                            "length": length,
+                        }),
+                    )
+                    .await
+                    .expect("a lossless encoding of a whole number is a range")
+            })
+            .await;
+            let got: serde_json::Value = serde_json::from_str(&out).expect("JSON");
+            assert_eq!(got["content"], "45", "{out}");
+        }
 
         for bad in [
             serde_json::json!(-1),
+            serde_json::json!(-1.0),
             serde_json::json!(1.5),
+            serde_json::json!(1e30),
+            serde_json::json!("1.0"),
             serde_json::json!("soon"),
+            serde_json::json!(true),
         ] {
             let err = service
                 .execute_tool(
