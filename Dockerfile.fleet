@@ -50,7 +50,6 @@ COPY command-mcp/          ./command-mcp/
 COPY cve-mcp/              ./cve-mcp/
 COPY fileio-mcp/           ./fileio-mcp/
 COPY geocode-mcp/          ./geocode-mcp/
-COPY homeassistant-mcp/    ./homeassistant-mcp/
 COPY internet-radio-mcp/   ./internet-radio-mcp/
 COPY openstreetmap-mcp/    ./openstreetmap-mcp/
 COPY skills-mcp/           ./skills-mcp/
@@ -62,7 +61,7 @@ COPY web-mcp/              ./web-mcp/
 
 # Build every fleet server (shared cargo cache; binary name == crate/dir name).
 RUN set -eux; \
-    for d in command-mcp cve-mcp fileio-mcp geocode-mcp homeassistant-mcp \
+    for d in command-mcp cve-mcp fileio-mcp geocode-mcp \
              internet-radio-mcp openstreetmap-mcp skills-mcp tasks-mcp \
              terminal-mcp timeclock-mcp weather-forecast-mcp web-mcp; do \
       ( cd "$d" && cargo-otel build --release ); \
@@ -75,7 +74,7 @@ RUN cd desktop-assistant && cargo-otel build --release --locked -p desktop-assis
 # Collect + strip binaries into a clean staging tree.
 RUN set -eux; \
     mkdir -p /out/mcp; \
-    for d in command-mcp cve-mcp fileio-mcp geocode-mcp homeassistant-mcp \
+    for d in command-mcp cve-mcp fileio-mcp geocode-mcp \
              internet-radio-mcp openstreetmap-mcp skills-mcp tasks-mcp \
              terminal-mcp timeclock-mcp weather-forecast-mcp web-mcp; do \
       cp "$d/target/release/$d" "/out/mcp/$d"; \
