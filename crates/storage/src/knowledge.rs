@@ -457,18 +457,23 @@ impl PgKnowledgeBaseStore {
             .await
             .map_err(|e| CoreError::Storage(e.to_string()))?;
 
-        // Every row carries the same spread, so the first one states it.
-        let dispersion = rows
-            .first()
-            .and_then(KbSearchRow::dispersion)
-            .unwrap_or(desktop_assistant_core::recall::RECALL_ASSUMED_DISPERSION);
+        // Every row carries the same statistics, so the first one states them.
+        // The measured dispersion is what the lexical spread is read against,
+        // so both come from the same row and never from a fallback for one and
+        // a measurement for the other.
+        let measured = rows.first().and_then(KbSearchRow::dispersion);
+        let spread = rows.first().map_or(0.0, |r| r.spread(measured));
+        let dispersion =
+            measured.unwrap_or(desktop_assistant_core::recall::RECALL_ASSUMED_DISPERSION);
         let candidates: Vec<SearchCandidate> = rows
             .into_iter()
             .map(|r| {
                 let distance = r.distance;
+                let lexical_share = r.lexical_share;
                 SearchCandidate {
                     entry: r.into_entry(),
                     distance,
+                    lexical_share,
                 }
             })
             .collect();
@@ -479,6 +484,7 @@ impl PgKnowledgeBaseStore {
         Ok(crate::knowledge_search::rank_page(
             candidates,
             dispersion,
+            spread,
             &records,
             chrono::Utc::now(),
             limit,
@@ -1071,9 +1077,17 @@ struct KbSearchRow {
     /// `None` for a row the full-text arm admitted and the vector arm cannot
     /// compare - no stored vector, or one from another model.
     distance: Option<f64>,
+    /// Where this row stands among the rows the query's own words reached, and
+    /// zero for a row those words did not reach (#1239).
+    lexical_share: f64,
     median: Option<f64>,
     rows_read: i64,
     deviation: Option<f64>,
+    /// The nearest and furthest distance the scan reached, which state the
+    /// spread a full lexical match is worth. `None` where nothing was
+    /// comparable.
+    nearest: Option<f64>,
+    furthest: Option<f64>,
 }
 
 impl KbSearchRow {
@@ -1085,6 +1099,24 @@ impl KbSearchRow {
             self.deviation?,
             self.rows_read.max(0) as usize,
         )
+    }
+
+    /// How many of this source's own deviations separate its nearest row from
+    /// its furthest, for this query - the scale a full lexical match is spent
+    /// against (#1239).
+    ///
+    /// Zero where the source stated no dispersion to read the two extremes
+    /// against, or where it reached no comparable row at all. The lexical term
+    /// is then worth nothing, which is what it was worth before the term
+    /// existed.
+    fn spread(&self, dispersion: Option<RecallDispersion>) -> f64 {
+        let (Some(dispersion), Some(nearest), Some(furthest)) =
+            (dispersion, self.nearest, self.furthest)
+        else {
+            return 0.0;
+        };
+        (dispersion.deviations_below_median(nearest) - dispersion.deviations_below_median(furthest))
+            .max(0.0)
     }
 
     fn into_entry(self) -> KnowledgeEntry {

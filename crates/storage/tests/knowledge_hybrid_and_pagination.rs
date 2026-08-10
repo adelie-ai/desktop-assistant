@@ -1573,3 +1573,142 @@ async fn knowledge_hybrid_search_carries_provenance_so_salience_reads_the_same_a
     )
     .await;
 }
+
+// -- the query's own words (#1239) --------------------------------------------
+
+/// Seed the store the identifier measurement was taken over: thirty rows the
+/// query's words never reach, spread evenly in angle so the store states a real
+/// dispersion, plus one row carrying a distinctive token and embedded so that
+/// twelve of the thirty sit nearer to the query vector than it does.
+///
+/// Twelve nearer rows puts it at vector rank thirteen, which is where the
+/// measurement in #1167's review found it.
+async fn seed_the_identifier_store(pool: &PgPool, store: &PgKnowledgeBaseStore) {
+    with_user_id(UserId::new("alice"), async {
+        for i in 0..30u32 {
+            store
+                .write(KnowledgeEntry::new(
+                    format!("filler{i:02}"),
+                    format!("unrelated prose about other matters number {i}"),
+                    vec![],
+                ))
+                .await
+                .unwrap_or_else(|e| panic!("write filler{i:02}: {e}"));
+        }
+        store
+            .write(KnowledgeEntry::new(
+                "serial",
+                "the widget shipped under serial gronk48219",
+                vec![],
+            ))
+            .await
+            .expect("write serial");
+    })
+    .await;
+
+    // Angles spread from 0.02 to 0.60 radians off the query vector, so the
+    // store has a real distribution rather than two clumps.
+    for i in 0..30u32 {
+        let angle = 0.02 + (i as f32) * 0.02;
+        set_embedding(
+            pool,
+            &format!("filler{i:02}"),
+            vec![vec![angle.cos(), angle.sin(), 0.0]],
+        )
+        .await;
+    }
+    // Twelve fillers sit at angles below 0.26; "serial" sits at 0.26, so twelve
+    // rows are nearer and it is the thirteenth by distance.
+    set_embedding(
+        pool,
+        "serial",
+        vec![vec![0.26_f32.cos(), 0.26_f32.sin(), 0.0]],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn knowledge_hybrid_search_puts_an_exactly_named_row_at_the_top_of_the_page() {
+    // Acceptance (#1239): the measurement that blocked #1167, turned into a
+    // test rather than left as a claim in a report.
+    //
+    // Before: "serial" sat thirteenth by cosine distance, the page took the
+    // five nearest, and the row the query names exactly did not appear at all -
+    // so the only text search the model has could not find an identifier.
+    //
+    // After: the words it carries are worth the spread this store's own
+    // distances have, so it leads a page of five.
+    //
+    // MUTATION: returning `LexicalMatch::NONE` from `rank_page`, or dropping
+    // `a.lexical_share` from the scan's projection, puts "serial" back off the
+    // page -> RED.
+    with_fixture(
+        "knowledge_hybrid_search_puts_an_exactly_named_row_at_the_top_of_the_page",
+        |fx| async move {
+            let store =
+                PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
+            seed_the_identifier_store(&fx.pool, &store).await;
+
+            let hits = with_user_id(UserId::new("alice"), async {
+                store
+                    .search("gronk48219", vec![1.0, 0.0, 0.0], MODEL, None, None, 5)
+                    .await
+            })
+            .await
+            .expect("search")
+            .entries;
+
+            let ids: Vec<&str> = hits.iter().map(|e| e.id.as_str()).collect();
+            assert_eq!(
+                ids.first().copied(),
+                Some("serial"),
+                "a row the query names exactly must lead a page of five, not sit thirteenth \
+                 by distance; got {ids:?}"
+            );
+            fx
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn knowledge_hybrid_search_leaves_a_row_the_query_never_names_where_its_distance_puts_it() {
+    // Acceptance (#1239), the negative: a row with neither a text hit nor a
+    // good distance must not be lifted. Over the same store, a query whose
+    // words reach nothing leaves every row ranked on distance alone, so
+    // "serial" stays thirteenth and off a page of five.
+    //
+    // This is what says the term reads the query's words rather than merely
+    // reordering the page.
+    with_fixture(
+        "knowledge_hybrid_search_leaves_a_row_the_query_never_names_where_its_distance_puts_it",
+        |fx| async move {
+            let store =
+                PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
+            seed_the_identifier_store(&fx.pool, &store).await;
+
+            let hits = with_user_id(UserId::new("alice"), async {
+                store
+                    .search("zzznomatchzzz", vec![1.0, 0.0, 0.0], MODEL, None, None, 5)
+                    .await
+            })
+            .await
+            .expect("search")
+            .entries;
+
+            let ids: Vec<&str> = hits.iter().map(|e| e.id.as_str()).collect();
+            assert!(
+                !ids.contains(&"serial"),
+                "with nothing for the query's words to reach, the term must lift nobody; \
+                 got {ids:?}"
+            );
+            assert_eq!(
+                ids,
+                vec!["filler00", "filler01", "filler02", "filler03", "filler04"],
+                "and the page is the five nearest, in order; got {ids:?}"
+            );
+            fx
+        },
+    )
+    .await;
+}

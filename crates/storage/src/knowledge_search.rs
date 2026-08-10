@@ -26,37 +26,43 @@
 //!   score, and it keeps the order the database ranked it in and follows the
 //!   measured rows. See `rank_page`, which is private to this crate.
 //!
-//! ## The cost this accepts, stated rather than left to be found
+//! ## The query's own words are a term, not a tiebreak (#1239)
 //!
-//! **A lexical hit can be ranked off the page.** On a store whose rows are
-//! embedded, the full-text arm no longer decides any line of a full page: every
-//! candidate it admits that the vector arm can compare is ranked on that
-//! distance, and one the query names exactly but that the embedding puts in the
-//! middle of the store sinks below the nearest rows and is cut by the caller's
-//! own limit. Measured on a seeded store of thirty-one rows: a row whose content
-//! carries a distinctive identifier, embedded at vector rank thirteen, led the
-//! page under reciprocal-rank fusion and does not appear on a page of five or
-//! ten now.
+//! Ranking the admitted set on distance alone had one bad consequence, and it
+//! was measured rather than argued: on a seeded store of thirty-one rows, a row
+//! whose content carried a distinctive identifier sat thirteenth by distance, so
+//! a page of five did not hold it. `builtin_knowledge_base_search` is the only
+//! text search the model has, so an identifier, a serial number or a quoted
+//! phrase an embedding represents poorly could not be found at all.
 //!
-//! So a query whose whole signal is lexical - an identifier, a serial number, a
-//! quoted phrase an embedding represents poorly - is the case this change is
-//! worst for, and `builtin_knowledge_base_search` is the only text search the
-//! model has.
+//! The activation score's own full-text-rank term is what answers that, and this
+//! is the caller that supplies its input - a recall lookup uses one mode at a
+//! time and so carries no rank. Every candidate the full-text arm returns
+//! carries a share of this query's own best lexical match, and that share buys a
+//! share of the spread the source's own distances have.
+//! [`ActivationWeights::lexical`](desktop_assistant_core::domain::activation::ActivationWeights::lexical)
+//! states the equivalence, why the spread is the right scale, and why one
+//! reference use is not.
 //!
-//! What gives it back is the activation score's own full-text-rank term, which
-//! `activation`'s documentation lists as awaiting an input because a recall
-//! lookup uses one mode at a time and so supplies no rank. This path is the
-//! first that supplies both, and #1239 is where that term is designed. **The
-//! admission above is what makes that fixable**: a row excluded from the
-//! candidate set could never be lifted by any term, whatever weight it carried.
-//! A rank-shaped tiebreak bolted on here instead would reintroduce exactly what
-//! this change removes.
+//! Two properties keep it honest, and both are named tests:
+//! `knowledge_hybrid_search_puts_an_exactly_named_row_at_the_top_of_the_page`
+//! is the measurement above, and
+//! `knowledge_hybrid_search_leaves_a_row_the_query_never_names_where_its_distance_puts_it`
+//! is its negative - a row with neither a text hit nor a good distance is not
+//! lifted, however wide the store is spread.
+//!
+//! **What is still not a rank.** The share is read from `ts_rank_cd`'s own
+//! magnitude against this query's best, never from a position, and the seats the
+//! scan carries decide only the order candidates travel in. A rank-shaped
+//! tiebreak would reintroduce exactly what this module removed.
 
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 use desktop_assistant_core::domain::KnowledgeEntry;
-use desktop_assistant_core::domain::activation::{ActivationWeights, NO_SITUATION, activation};
+use desktop_assistant_core::domain::activation::{
+    ActivationWeights, LexicalMatch, NO_SITUATION, activation,
+};
 use desktop_assistant_core::domain::knowledge_use::KnowledgeUseRecord;
 use desktop_assistant_core::domain::salience::{SalienceReading, SalienceSource};
 use desktop_assistant_core::ports::recall::RecallDispersion;
@@ -70,6 +76,9 @@ pub(crate) struct SearchCandidate {
     /// arm admitted and the vector arm cannot compare - no stored vector, or
     /// one from another model.
     pub distance: Option<f64>,
+    /// Where this row stands among the rows the query's own words reached, in
+    /// `[0, 1]`, and [`NO_LEXICAL`] for a row those words did not reach.
+    pub lexical_share: f64,
 }
 
 /// Order one search page, best first, and cut it to `limit`.
@@ -80,6 +89,13 @@ pub(crate) struct SearchCandidate {
 /// query put it - plus what the use log knows about it and what its own text
 /// says about how salient it is. Nothing here is a rank: the distance survives
 /// into the score, which is the whole point of the change.
+///
+/// **The query's own words count too** (#1239). A candidate the full-text arm
+/// returned carries a share of this query's own best lexical match, and that
+/// share buys it a share of the spread the source's own distances have -
+/// [`ActivationWeights::lexical`] states the equivalence and why the spread is
+/// the right scale. It is what lets a row an exact-token query finds lead a row
+/// that is merely nearer, which is the whole reason the term exists.
 ///
 /// **Then the rows the store could not measure, in the order it gave them.**
 /// Such a row carries no distance, so there is no dimensionless term for the
@@ -99,6 +115,15 @@ pub(crate) struct SearchCandidate {
 /// may run several times, so paying for it again per call is a cost this change
 /// does not take on. #1240 tracks it.
 ///
+/// `spread` is how many of the source's own deviations separate its nearest row
+/// from its furthest for this query, which is what a full lexical match is
+/// worth. The scan states it; zero where the source stated none, which leaves
+/// every lexical term at nothing.
+///
+/// The scan answers one row per entry, so nothing here deduplicates: a row both
+/// arms admitted arrives once, carrying the distance one measured and the share
+/// the other read.
+///
 /// `records` may be empty: a use log that could not be read costs the order and
 /// never the page, exactly as it does on the recall path.
 ///
@@ -113,6 +138,7 @@ pub(crate) struct SearchCandidate {
 pub(crate) fn rank_page(
     candidates: Vec<SearchCandidate>,
     dispersion: RecallDispersion,
+    spread: f64,
     records: &HashMap<String, KnowledgeUseRecord>,
     now: DateTime<Utc>,
     limit: usize,
@@ -120,16 +146,17 @@ pub(crate) fn rank_page(
     let weights = ActivationWeights::default();
     let mut measured: Vec<(f64, KnowledgeEntry)> = Vec::new();
     let mut unmeasured: Vec<KnowledgeEntry> = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for candidate in candidates {
-        // The two arms admit independently, so a row the query names and the
-        // vector arm can compare arrives from both. The scan orders the vector
-        // arm's rows first, so the first copy is the one carrying a distance.
-        if !seen.insert(candidate.entry.id.clone()) {
-            continue;
-        }
+        let lexical = LexicalMatch {
+            share: candidate.lexical_share,
+            spread,
+        };
         let Some(distance) = candidate.distance else {
+            // A row nothing measured still carries the words that found it, but
+            // there is no semantic term for the lift to be added to - a lift on
+            // its own would place it by a number nobody measured. It keeps the
+            // order the database ranked it in, which is that lexical order.
             unmeasured.push(candidate.entry);
             continue;
         };
@@ -138,6 +165,7 @@ pub(crate) fn rank_page(
             records.get(&candidate.entry.id),
             NO_SITUATION,
             SalienceReading::read(&SalienceSource::of(&candidate.entry)).share(),
+            lexical,
             now,
             &weights,
         );
@@ -190,6 +218,22 @@ pub(crate) fn rank_page(
 /// over-fetches, because activation reorders it and a row it lifts has to be in
 /// the set to be lifted.
 ///
+/// `merged` folds the two admissions into one row per entry, carrying the
+/// distance whichever arm measured it and the share the full-text arm read. The
+/// seat it keeps is the vector arm's where that arm admitted the row, so the
+/// order rows travel in is the nearest-first order the scan produced and never
+/// a lexical position - which is what keeps a rank out of the ordering as well
+/// as out of the score. `arm` and `seat` decide only the order the candidates
+/// arrive in, which `rank_page` uses to break exact ties and to order the rows
+/// nothing could measure.
+///
+/// `best_rank` is the one extra pass this costs: the share is a ratio against
+/// this query's own best full-text match, so the best has to be known before
+/// any row's share can be. It rides the same `tsv` index the arm itself does.
+/// The alternative - a window function over the arm - would be computed after
+/// its `LIMIT` and so would divide by the best of the page rather than the best
+/// of the store.
+///
 /// Both arms carry the whole scope - the user, the live-row predicate, and both
 /// tag filters. A predicate present on one arm and missing from the other would
 /// make the weaker arm a way around the scope the other enforces. The user and
@@ -238,15 +282,29 @@ pub const HYBRID_SEARCH_SQL: &str = "\
      ),
      m AS (
          SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY distance) AS median,
-                count(*) AS rows_read
+                count(*) AS rows_read,
+                min(distance) AS nearest,
+                max(distance) AS furthest
          FROM d
      ),
      s AS (
          SELECT m.median,
                 m.rows_read,
+                m.nearest,
+                m.furthest,
                 (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY abs(d.distance - m.median))
                  FROM d) AS deviation
          FROM m
+     ),
+     best_rank AS (
+         SELECT max(ts_rank_cd(kb.tsv, query)) AS top
+         FROM knowledge_base kb
+         CROSS JOIN plainto_tsquery('english', $4) AS query
+         WHERE kb.user_id = $6
+           AND kb.deleted_at IS NULL
+           AND ($2::text[] IS NULL OR kb.tags && $2)
+           AND ($7::text[] IS NULL OR NOT (kb.tags && $7))
+           AND kb.tsv @@ query
      ),
      measured AS (
          SELECT id,
@@ -259,10 +317,13 @@ pub const HYBRID_SEARCH_SQL: &str = "\
      lexical AS (
          SELECT kb.id,
                 d.distance,
+                CASE WHEN b.top > 0 THEN ts_rank_cd(kb.tsv, query) / b.top ELSE 0 END
+                    AS lexical_share,
                 row_number() OVER (ORDER BY ts_rank_cd(kb.tsv, query) DESC,
                                             kb.updated_at DESC, kb.id DESC) AS seat
          FROM knowledge_base kb
          CROSS JOIN plainto_tsquery('english', $4) AS query
+         CROSS JOIN best_rank b
          LEFT JOIN d ON d.id = kb.id
          WHERE kb.user_id = $6
            AND kb.deleted_at IS NULL
@@ -273,14 +334,24 @@ pub const HYBRID_SEARCH_SQL: &str = "\
          LIMIT $5
      ),
      admitted AS (
-         SELECT id, distance, 0 AS arm, seat FROM measured
+         SELECT id, distance, 0::float8 AS lexical_share, 0 AS arm, seat FROM measured
          UNION ALL
-         SELECT id, distance, 1 AS arm, seat FROM lexical
+         SELECT id, distance, lexical_share::float8, 1 AS arm, seat FROM lexical
+     ),
+     merged AS (
+         SELECT id,
+                max(distance) AS distance,
+                max(lexical_share) AS lexical_share,
+                min(arm) AS arm,
+                coalesce(min(seat) FILTER (WHERE arm = 0), min(seat)) AS seat
+         FROM admitted
+         GROUP BY id
      )
      SELECT kb.id, kb.content, kb.tags, kb.metadata, kb.created_at, kb.updated_at,
             kb.source, kb.summary,
-            a.distance, s.median, s.rows_read, s.deviation
-     FROM admitted a
+            a.distance, a.lexical_share,
+            s.median, s.rows_read, s.deviation, s.nearest, s.furthest
+     FROM merged a
      JOIN knowledge_base kb
        ON kb.id = a.id AND kb.user_id = $6 AND kb.deleted_at IS NULL
      CROSS JOIN s
@@ -305,6 +376,16 @@ mod tests {
         SearchCandidate {
             entry: an_entry(id),
             distance: Some(distance),
+            lexical_share: 0.0,
+        }
+    }
+
+    /// A row the query's own words reached as well as the vector arm did.
+    fn named(id: &str, distance: f64, share: f64) -> SearchCandidate {
+        SearchCandidate {
+            entry: an_entry(id),
+            distance: Some(distance),
+            lexical_share: share,
         }
     }
 
@@ -312,6 +393,7 @@ mod tests {
         SearchCandidate {
             entry: an_entry(id),
             distance: None,
+            lexical_share: 1.0,
         }
     }
 
@@ -352,6 +434,10 @@ mod tests {
         RecallDispersion::assumed(0.80, 0.05)
     }
 
+    /// What a test passes where no candidate carries the query's words, so the
+    /// lexical term is worth nothing whatever the spread would have been.
+    const NO_SPREAD: f64 = 0.0;
+
     /// Acceptance (#1167): the page is ordered by the activation score, so what
     /// the use log knows about a candidate can take the top line from a
     /// marginally nearer one nothing has opened.
@@ -369,6 +455,7 @@ mod tests {
         let page = rank_page(
             vec![measured("nearest", 0.50), measured("used", 0.52)],
             a_store(),
+            NO_SPREAD,
             &records,
             now(),
             10,
@@ -399,6 +486,7 @@ mod tests {
         let tight = rank_page(
             candidates.clone(),
             RecallDispersion::assumed(0.80, 0.05),
+            NO_SPREAD,
             &records,
             now(),
             10,
@@ -406,6 +494,7 @@ mod tests {
         let loose = rank_page(
             candidates,
             RecallDispersion::assumed(0.80, 3.0),
+            NO_SPREAD,
             &records,
             now(),
             10,
@@ -440,6 +529,7 @@ mod tests {
                 measured("near", 0.50),
             ],
             a_store(),
+            NO_SPREAD,
             &HashMap::new(),
             now(),
             10,
@@ -456,6 +546,7 @@ mod tests {
         let page = rank_page(
             vec![lexical("first"), lexical("second"), lexical("third")],
             a_store(),
+            NO_SPREAD,
             &HashMap::new(),
             now(),
             10,
@@ -477,6 +568,7 @@ mod tests {
                 measured("used", 0.53),
             ],
             a_store(),
+            NO_SPREAD,
             &records,
             now(),
             1,
@@ -493,12 +585,147 @@ mod tests {
         let page = rank_page(
             vec![measured("far", 0.60), measured("near", 0.50)],
             a_store(),
+            NO_SPREAD,
             &HashMap::new(),
             now(),
             10,
         );
 
         assert_eq!(ids(&page), vec!["near", "far"]);
+    }
+
+    /// Acceptance (#1239): a row the query's own words name leads a row that is
+    /// merely nearer, so an exact-token search finds its entry.
+    ///
+    /// The unit half of the measurement `knowledge_hybrid_search_puts_an_exactly_named_row_at_the_top_of_the_page`
+    /// makes against a database. "named" sits at the store's median distance -
+    /// a middling row an embedding has no opinion about - and carries the
+    /// query's words as exclusively as anything in the store; "nearest" is the
+    /// closest row and carries none of them.
+    #[test]
+    fn a_row_the_querys_words_name_leads_a_row_that_is_merely_nearer() {
+        let spread = 4.0;
+
+        let page = rank_page(
+            vec![measured("nearest", 0.70), named("named", 0.80, 1.0)],
+            a_store(),
+            spread,
+            &HashMap::new(),
+            now(),
+            10,
+        );
+
+        assert_eq!(
+            ids(&page),
+            vec!["named", "nearest"],
+            "a row the query names must lead one that is merely nearer"
+        );
+    }
+
+    /// Acceptance (#1239): a row with neither a text hit nor a good distance is
+    /// not lifted by this term.
+    ///
+    /// The negative, and the property that makes the term safe: the lift is a
+    /// share of the spread, so a share of nothing is nothing however wide the
+    /// source is spread.
+    #[test]
+    fn a_row_with_no_text_hit_is_not_lifted_however_wide_the_source_is_spread() {
+        let far_and_unnamed = rank_page(
+            vec![measured("nearest", 0.70), measured("far", 0.90)],
+            a_store(),
+            20.0,
+            &HashMap::new(),
+            now(),
+            10,
+        );
+
+        assert_eq!(
+            ids(&far_and_unnamed),
+            vec!["nearest", "far"],
+            "a wide spread must lift nobody the query's words did not reach"
+        );
+    }
+
+    /// A source that stated no spread lifts nothing, so a store too small to
+    /// measure ranks exactly as it ranked before the term existed.
+    #[test]
+    fn a_source_with_no_measured_spread_ranks_as_it_did_before_the_term_existed() {
+        let page = rank_page(
+            vec![measured("nearest", 0.70), named("named", 0.80, 1.0)],
+            a_store(),
+            NO_SPREAD,
+            &HashMap::new(),
+            now(),
+            10,
+        );
+
+        assert_eq!(ids(&page), vec!["nearest", "named"]);
+    }
+
+    /// A partial text hit buys a partial lift, so a row that carries some of
+    /// the query's words does not rank as though it carried all of them.
+    #[test]
+    fn a_partial_text_hit_does_not_lift_as_far_as_a_full_one() {
+        let spread = 4.0;
+        let candidates = |share| vec![measured("nearest", 0.70), named("named", 0.80, share)];
+
+        assert_eq!(
+            ids(&rank_page(
+                candidates(1.0),
+                a_store(),
+                spread,
+                &HashMap::new(),
+                now(),
+                10
+            )),
+            vec!["named", "nearest"]
+        );
+        assert_eq!(
+            ids(&rank_page(
+                candidates(0.1),
+                a_store(),
+                spread,
+                &HashMap::new(),
+                now(),
+                10
+            )),
+            vec!["nearest", "named"],
+            "a tenth of the words must not buy the whole spread"
+        );
+    }
+
+    /// The columns the term reads reach the scorer.
+    ///
+    /// The lesson of the `source` column, which the projection dropped and
+    /// which silently disabled a salience signal: a term that reads a column
+    /// nothing selects is a term that never fires, and no ranking test can see
+    /// it. `the_hybrid_scan_selects_what_the_lexical_term_reads` is the same
+    /// check on the query.
+    #[test]
+    fn the_hybrid_scan_selects_what_the_lexical_term_reads() {
+        let projection = HYBRID_SEARCH_SQL
+            .rsplit("     SELECT kb.id")
+            .next()
+            .expect("the scan reads its rows after it measures");
+
+        for column in ["a.lexical_share", "s.nearest", "s.furthest"] {
+            assert!(
+                projection.contains(column),
+                "the scan does not select {column}, so the lexical term reads nothing: \
+                 \n{HYBRID_SEARCH_SQL}"
+            );
+        }
+    }
+
+    /// The scan answers one row per entry, so a row both arms admit is not
+    /// scored twice or shown twice.
+    #[test]
+    fn the_hybrid_scan_answers_one_row_per_entry() {
+        assert!(
+            HYBRID_SEARCH_SQL.contains("GROUP BY id"),
+            "the two arms admit independently, so the scan has to fold them: \
+             \n{HYBRID_SEARCH_SQL}"
+        );
     }
 
     /// Acceptance (#1167): the pass that measures the store's spread reads the

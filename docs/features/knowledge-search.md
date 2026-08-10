@@ -131,22 +131,17 @@ a query in a dense region of the store has a different distribution from one in
 a sparse region. A store too small to state one is read by the same stated
 estimate the block falls back to.
 
-**What this costs, stated rather than left to be found.** A lexical hit can be
-ranked off the page. On a store whose rows are embedded, the full-text arm no
-longer decides any line of a full page: every candidate it admits that the
-vector arm can compare is ranked on that distance, so a row the query names
-exactly but that the embedding puts in the middle of the store sinks below the
-nearest rows and is cut by the caller's own `limit`. Measured on a seeded store
-of thirty-one rows, a row carrying a distinctive identifier and embedded at
-vector rank thirteen led the page under the previous reciprocal-rank fusion and
-appears on neither a page of five nor a page of ten now.
+**The query's own words are a term of the score** (#1239), not a tiebreak. Every
+candidate the full-text arm returns carries a share of this query's own best
+lexical match - read from `ts_rank_cd`'s magnitude, never from a position - and
+that share buys it a share of the spread the store's own distances have for this
+query. So a row the query names exactly leads a row that is merely nearer, which
+is what an identifier or a serial number needs: measured on a seeded store of
+thirty-one rows, such a row sat thirteenth by distance and did not appear on a
+page of five before this, and leads that page now.
 
-A query whose whole signal is lexical - an identifier, a serial number, a quoted
-phrase an embedding represents poorly - is the case this is worst for, and
-`builtin_knowledge_base_search` is the only text search the model has. Issue
-#1239 tracks the activation score's own full-text-rank term, which is what gives
-that back without reintroducing a fused rank; the row stays in the candidate set
-so the term has something to lift.
+A row the query's words did not reach is not lifted, however widely the store is
+spread. The lift is a share of the spread, so a share of nothing is nothing.
 
 The four values:
 

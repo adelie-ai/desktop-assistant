@@ -221,7 +221,7 @@ mod tests {
     /// consolidation pass can examine behind every entry nobody has ever opened.
     #[test]
     fn a_contradiction_raises_replay_priority_where_it_lowers_the_retrieval_score() {
-        use crate::domain::activation::{NO_SITUATION, activation};
+        use crate::domain::activation::{LexicalMatch, NO_SITUATION, activation};
 
         let now = now();
         let weights = ActivationWeights::default();
@@ -234,8 +234,23 @@ mod tests {
             "a contradiction must pull an entry toward the front of a review"
         );
         assert!(
-            activation(7.0, Some(&wrong), NO_SITUATION, 0.0, now, &weights)
-                < activation(7.0, Some(&history), NO_SITUATION, 0.0, now, &weights),
+            activation(
+                7.0,
+                Some(&wrong),
+                NO_SITUATION,
+                0.0,
+                LexicalMatch::NONE,
+                now,
+                &weights
+            ) < activation(
+                7.0,
+                Some(&history),
+                NO_SITUATION,
+                0.0,
+                LexicalMatch::NONE,
+                now,
+                &weights
+            ),
             "and must still push it out of a [Recall] block"
         );
     }
