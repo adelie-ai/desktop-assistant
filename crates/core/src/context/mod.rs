@@ -171,9 +171,16 @@ const ACTIVE_TASK_ROUND_THRESHOLD: u32 = 5;
 const MAX_PREFLIGHT_SHRINK_ITERATIONS: u32 = 5;
 
 /// Build the replacement content used when a tool result is truncated in
-/// response to a `ContextOverflow` error. The text is addressed to the
-/// model so it learns to chunk subsequent requests more narrowly.
+/// response to a `ContextOverflow` error.
+///
+/// The text names the message the output is still stored under, so the model
+/// reads the very bytes the earlier round reasoned about instead of running the
+/// tool a second time (#1226) - the same offer
+/// [`overflow_compaction_notice`] makes on the next rung down. It also says how
+/// to ask the tool for less, because a result this size is one the model was
+/// going to have to page through either way.
 pub(crate) fn overflow_truncation_notice(
+    message_id: &str,
     original_bytes: usize,
     prompt_tokens: Option<u64>,
     max_tokens: Option<u64>,
@@ -182,11 +189,15 @@ pub(crate) fn overflow_truncation_notice(
         (Some(p), Some(m)) => format!(" (prompt was {p} tokens vs {m} max)"),
         _ => String::new(),
     };
+    let tool = crate::ports::transcript::TRANSCRIPT_GET_TOOL;
     format!(
         "<tool output omitted: {original_bytes} bytes exceeded the model's \
-         context window{measured}. Re-run the tool with a narrower request — \
-         for example read the file in smaller byte/line ranges, list a single \
-         directory level with filters, or query for only the fields you need.>"
+         context window{measured}. The call above and its arguments are \
+         unchanged. Read the output back in ranges with {tool} \
+         message_id=\"{message_id}\" rather than running the tool again. Where \
+         you do need to run it again, ask for a narrower request — for example \
+         read the file in smaller byte/line ranges, list a single directory \
+         level with filters, or query for only the fields you need.>"
     )
 }
 
@@ -1290,15 +1301,17 @@ fn find_largest_tool_result_above(
 ///
 /// The prefix is deliberately distinct from
 /// [`planning::COMPACTION_POINTER_PREFIX`]: that one names a scratchpad note
-/// the model can search. This one names none, so a re-run is the model's only
-/// way back to the output. The output itself is not lost - the conversation's
-/// stored transcript still holds it - but nothing carries it back into the
-/// turn on its own.
-fn overflow_compaction_notice(original_bytes: usize) -> String {
+/// the model can search, and this one names none, because a sweep distils
+/// nothing. Both name the message the output is still stored under, so the
+/// model reads the very bytes the earlier round reasoned about instead of
+/// running the tool a second time (#1226).
+fn overflow_compaction_notice(message_id: &str, original_bytes: usize) -> String {
+    let tool = crate::ports::transcript::TRANSCRIPT_GET_TOOL;
     format!(
         "<earlier tool output omitted: {original_bytes} bytes are out of view to fit the \
-         model's context window. The call above and its arguments are unchanged; \
-         re-run the tool if you need this output again.>"
+         model's context window. The call above and its arguments are unchanged. Read the \
+         output back with {tool} message_id=\"{message_id}\" rather than running the tool \
+         again.>"
     )
 }
 
@@ -1372,7 +1385,7 @@ fn compact_oldest_tool_groups(
             }
             let current = projection.content(msg).len();
             let current_tokens = estimate(projection.content(msg));
-            let notice = overflow_compaction_notice(current);
+            let notice = overflow_compaction_notice(&msg.id, current);
             // Never trade a result for something bigger, whatever the floor
             // above happens to be set to.
             let Some(freed) = current.checked_sub(notice.len()).filter(|f| *f > 0) else {
@@ -1809,8 +1822,9 @@ pub(crate) enum RecoveryOutcome {
 /// Recover from a `ContextOverflow` error by reducing prompt size.
 ///
 /// The ladder runs three steps:
-///   1. Read the largest tool result as a chunking notice (the tool_call and
-///      result pair stays, so the model still sees what it tried).
+///   1. Read the largest tool result as an [`overflow_truncation_notice`] (the
+///      tool_call and result pair stays, so the model still sees what it
+///      tried).
 ///   2. When step 1 frees nothing, read the oldest tool groups' results as
 ///      notices via [`compact_oldest_tool_groups`].
 ///   3. Shrink the active window and fold what that drops into the rolling
@@ -1860,7 +1874,7 @@ pub(crate) async fn recover_from_overflow<L: LlmClient>(
         let msg = &window[idx];
         let original_bytes = projection.content(msg).len();
         let before = estimate(projection.content(msg));
-        let notice = overflow_truncation_notice(original_bytes, prompt_tokens, max_tokens);
+        let notice = overflow_truncation_notice(&msg.id, original_bytes, prompt_tokens, max_tokens);
         let freed = before.saturating_sub(estimate(&notice));
         if freed > 0 {
             projection.replace(msg, notice);
@@ -1946,7 +1960,7 @@ pub(crate) async fn recover_from_overflow<L: LlmClient>(
 mod tests {
     use super::*;
     use crate::CoreError;
-    use crate::domain::{Conversation, ToolCall, ToolDefinition};
+    use crate::domain::{Conversation, ConversationId, ToolCall, ToolDefinition};
     use crate::ports::llm::{ChunkCallback, LlmResponse};
 
     /// Token estimator used by the existing assembly tests. Mirrors the
@@ -2616,6 +2630,204 @@ mod tests {
         );
     }
 
+    // --- #1226: the bytes overflow recovery drops stay fetchable -----------
+
+    /// A conversation whose newest result is over the rung-1 truncation floor,
+    /// so rung 1 takes that result and rung 2 never runs. Returns the
+    /// conversation and the bytes rung 1 replaces, under call id `c9`.
+    fn conv_with_a_rung_1_sized_result() -> (Conversation, String) {
+        let mut conv = conv_with_tool_groups(2);
+        let big = "b".repeat(8192);
+        conv.messages
+            .push(Message::assistant_with_tool_calls(vec![ToolCall::new(
+                "c9",
+                "read_file",
+                "{}",
+            )]));
+        conv.messages.push(Message::tool_result("c9", &big));
+        (conv, big)
+    }
+
+    /// AC (#1226): the pointer the model reads names the message id, on the
+    /// overflow-recovery path - rung 1, which replaces the largest in-window
+    /// result and is the rung an ordinary overflow reaches first.
+    #[tokio::test]
+    async fn the_rung_1_overflow_notice_names_the_message_id_and_the_read_back_tool() {
+        use crate::ports::transcript::TRANSCRIPT_GET_TOOL;
+
+        let (mut conv, _big) = conv_with_a_rung_1_sized_result();
+        let mut target_window = MAX_CONTEXT_MESSAGES;
+        let projection = recover_once(&mut conv, &mut target_window).await;
+
+        let replaced_id = conv
+            .messages
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("c9"))
+            .expect("the result row")
+            .id
+            .clone();
+        let notice = projected_result(&conv, &projection, "c9");
+        assert!(
+            notice.contains(&replaced_id),
+            "the notice must name the message id to fetch: {notice}"
+        );
+        assert!(
+            notice.contains(TRANSCRIPT_GET_TOOL),
+            "the notice must name the tool that fetches it: {notice}"
+        );
+    }
+
+    /// AC (#1226): a tool result replaced by the overflow-recovery notice is
+    /// read back in full by its message id, without a call to the original
+    /// tool - rung 1.
+    #[tokio::test]
+    async fn a_result_replaced_by_the_rung_1_overflow_notice_is_read_back_in_full_by_message_id() {
+        use crate::ports::auth::{UserId, with_user_id};
+        use crate::ports::conversation_ctx::with_conversation_id;
+        use crate::ports::transcript::{
+            TranscriptReadRequest, TranscriptView, read_transcript_message, with_transcript,
+        };
+
+        let (mut conv, big) = conv_with_a_rung_1_sized_result();
+        let mut target_window = MAX_CONTEXT_MESSAGES;
+        let projection = recover_once(&mut conv, &mut target_window).await;
+
+        let replaced_id = conv
+            .messages
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("c9"))
+            .expect("the result row")
+            .id
+            .clone();
+        let notice = projected_result(&conv, &projection, "c9");
+        assert!(
+            !notice.contains(&big),
+            "the round must have stopped reading the bytes"
+        );
+        assert!(
+            notice.contains(&replaced_id),
+            "the id read back below is the one the model finds in the notice: {notice}"
+        );
+
+        let user = UserId::new("u");
+        let conversation = ConversationId::from("conv".to_string());
+        let mut view = TranscriptView::new(user.clone(), conversation.clone());
+        view.absorb(&conv.messages);
+
+        let payload = with_user_id(
+            user,
+            with_conversation_id(
+                conversation,
+                with_transcript(view, async {
+                    read_transcript_message(&TranscriptReadRequest::new(&replaced_id))
+                }),
+            ),
+        )
+        .await;
+
+        let got: serde_json::Value =
+            serde_json::from_str(&payload).expect("the payload must be JSON");
+        assert_eq!(got["ok"], true, "{payload}");
+        assert_eq!(
+            got["total_bytes"].as_u64(),
+            Some(big.len() as u64),
+            "the response must state the whole size"
+        );
+        assert_eq!(
+            got["content"].as_str(),
+            Some(big.as_str()),
+            "the replaced result must come back whole from the transcript"
+        );
+    }
+
+    /// AC (#1226): the pointer the model reads names the message id, on the
+    /// overflow-recovery path - rung 2, which replaces the oldest tool groups
+    /// when rung 1 frees nothing.
+    #[tokio::test]
+    async fn the_rung_2_overflow_notice_names_the_message_id_and_the_read_back_tool() {
+        use crate::ports::transcript::TRANSCRIPT_GET_TOOL;
+
+        let mut conv = conv_with_tool_groups(4);
+        let mut target_window = MAX_CONTEXT_MESSAGES;
+        let projection = recover_once(&mut conv, &mut target_window).await;
+
+        let oldest_id = conv
+            .messages
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("c1"))
+            .expect("the result row")
+            .id
+            .clone();
+        let notice = projected_result(&conv, &projection, "c1");
+        assert!(
+            notice.contains(&oldest_id),
+            "the notice must name the message id to fetch: {notice}"
+        );
+        assert!(
+            notice.contains(TRANSCRIPT_GET_TOOL),
+            "the notice must name the tool that fetches it: {notice}"
+        );
+    }
+
+    /// AC (#1226): a tool result replaced by the overflow-recovery notice is
+    /// read back in full by its message id, without a call to the original
+    /// tool - rung 2.
+    #[tokio::test]
+    async fn a_result_replaced_by_the_rung_2_overflow_notice_is_read_back_in_full_by_message_id() {
+        use crate::ports::auth::{UserId, with_user_id};
+        use crate::ports::conversation_ctx::with_conversation_id;
+        use crate::ports::transcript::{
+            TranscriptReadRequest, TranscriptView, read_transcript_message, with_transcript,
+        };
+
+        let mut conv = conv_with_tool_groups(4);
+        let mut target_window = MAX_CONTEXT_MESSAGES;
+        let projection = recover_once(&mut conv, &mut target_window).await;
+
+        let original = mid_sized_result('r');
+        let oldest_id = conv
+            .messages
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("c1"))
+            .expect("the result row")
+            .id
+            .clone();
+        assert!(
+            !projected_result(&conv, &projection, "c1").contains(&original),
+            "the round must have stopped reading the bytes"
+        );
+
+        let user = UserId::new("u");
+        let conversation = ConversationId::from("conv".to_string());
+        let mut view = TranscriptView::new(user.clone(), conversation.clone());
+        view.absorb(&conv.messages);
+
+        let payload = with_user_id(
+            user,
+            with_conversation_id(
+                conversation,
+                with_transcript(view, async {
+                    read_transcript_message(&TranscriptReadRequest::new(&oldest_id))
+                }),
+            ),
+        )
+        .await;
+
+        let got: serde_json::Value =
+            serde_json::from_str(&payload).expect("the payload must be JSON");
+        assert_eq!(got["ok"], true, "{payload}");
+        assert_eq!(
+            got["total_bytes"].as_u64(),
+            Some(original.len() as u64),
+            "the response must state the whole size"
+        );
+        assert_eq!(
+            got["content"].as_str(),
+            Some(original.as_str()),
+            "the dropped result must come back whole from the transcript"
+        );
+    }
+
     #[tokio::test]
     async fn overflow_recovery_rung2_preserves_the_tool_call_audit_trail() {
         let mut conv = conv_with_tool_groups(4);
@@ -3215,7 +3427,7 @@ mod tests {
 
     #[test]
     fn overflow_truncation_notice_includes_byte_count_and_hint() {
-        let notice = overflow_truncation_notice(12_345, Some(203_524), Some(200_000));
+        let notice = overflow_truncation_notice("m-1", 12_345, Some(203_524), Some(200_000));
         assert!(notice.contains("12345 bytes"));
         assert!(notice.contains("203524"));
         assert!(notice.contains("200000"));
@@ -3226,7 +3438,7 @@ mod tests {
 
     #[test]
     fn overflow_truncation_notice_omits_counts_when_unknown() {
-        let notice = overflow_truncation_notice(500, None, None);
+        let notice = overflow_truncation_notice("m-1", 500, None, None);
         assert!(notice.contains("500 bytes"));
         assert!(!notice.contains("prompt was"));
     }

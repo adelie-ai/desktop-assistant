@@ -46,6 +46,7 @@
 use crate::context::ContextProjection;
 use crate::domain::{Message, Role, ToolDefinition};
 use crate::ports::scratchpad::{NOTE_KEY_MAX_CHARS, SCRATCHPAD_GOAL_KEY};
+use crate::ports::transcript::TRANSCRIPT_GET_TOOL;
 
 /// Tool the model calls to begin a (possibly nested) step. Advertised in the
 /// per-turn tool set and intercepted by name in the dispatch loop.
@@ -248,16 +249,11 @@ pub(crate) fn truncate_on_char_boundary(s: &str, max_bytes: usize) -> String {
     s[..cut].to_string()
 }
 
-/// Build the pointer the turn reads in place of an evicted tool result.
-/// Addressed to the model, so it knows the detail still exists - in the named
-/// note, or a re-run away - and left the turn only to keep it lean. The
-/// conversation's stored transcript is unaffected either way.
 /// Why a result left the turn's working context.
 ///
 /// The pointer text differs because the model's next move differs. A step that
 /// completed distilled the result into a note it can re-read. A sweep names no
-/// note, so re-running the tool is the only route back, and the text has to say
-/// so rather than send the model looking for a note that was never written.
+/// note, so the stored output is the only account of what the tool returned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EvictReason {
     /// The step covering this result completed.
@@ -266,8 +262,21 @@ pub(crate) enum EvictReason {
     Superseded,
 }
 
+/// Build the pointer the turn reads in place of an evicted tool result.
+///
+/// Addressed to the model, so it knows the detail still exists - in the named
+/// note, and in the transcript - and left the turn only to keep it lean. The
+/// conversation's stored transcript is unaffected either way.
+///
+/// It names `message_id` and
+/// [`crate::ports::transcript::TRANSCRIPT_GET_TOOL`], because the bytes are
+/// still there and a re-run is the wrong way back to them: the tool may have
+/// changed something, its answer may have moved on, and the call may have been
+/// expensive. What the model reads is what the turn already reasoned about
+/// (#1226).
 pub(crate) fn compaction_pointer(
     tool_name: Option<&str>,
+    message_id: &str,
     note_keys: &[String],
     reason: EvictReason,
 ) -> String {
@@ -284,7 +293,8 @@ pub(crate) fn compaction_pointer(
         };
         return format!(
             "{COMPACTION_POINTER_PREFIX}{ran}: this result was dropped from working \
-             context {cause}. Re-run the tool if you need it again.>"
+             context {cause}. Read it back with {TRANSCRIPT_GET_TOOL} message_id=\
+             \"{message_id}\" rather than running the tool again.>"
         );
     }
     let keys = note_keys
@@ -295,7 +305,8 @@ pub(crate) fn compaction_pointer(
     format!(
         "{COMPACTION_POINTER_PREFIX}{ran}: this result was distilled into scratchpad \
          note(s) {keys} and dropped from working context to keep the turn lean. Re-read \
-         the note(s) with builtin_scratchpad_search, or re-run the tool for the full output.>"
+         the note(s) with builtin_scratchpad_search, or read the full output back with \
+         {TRANSCRIPT_GET_TOOL} message_id=\"{message_id}\" rather than running the tool again.>"
     )
 }
 
@@ -381,8 +392,16 @@ pub(crate) fn evict_tool_results(
             .as_deref()
             .and_then(|id| names.get(id))
             .map(String::as_str);
-        let pointer = compaction_pointer(tool_name, note_keys, reason);
-        freed += current.len().saturating_sub(pointer.len());
+        let pointer = compaction_pointer(tool_name, &m.id, note_keys, reason);
+        // A pointer no smaller than what it replaces makes the prompt bigger,
+        // which is the one thing an eviction may not do. `carry_evictions`
+        // holds the same line for the pointers it rebuilds. Reachable at the
+        // small end: a result only just over the threshold, and a pointer
+        // naming several long note keys as well as the message id.
+        let Some(saving) = current.len().checked_sub(pointer.len()).filter(|s| *s > 0) else {
+            continue;
+        };
+        freed += saving;
         evicted += 1;
         if trace == DistilledTrace::Written && !note_keys.is_empty() {
             m.distilled_into = note_keys.to_vec();
@@ -465,7 +484,12 @@ pub(crate) fn carry_evictions(
             .as_deref()
             .and_then(|id| names.get(id))
             .map(String::as_str);
-        let pointer = compaction_pointer(tool_name, &m.distilled_into, EvictReason::StepCompleted);
+        let pointer = compaction_pointer(
+            tool_name,
+            &m.id,
+            &m.distilled_into,
+            EvictReason::StepCompleted,
+        );
         // A pointer longer than what it replaces makes the prompt bigger, which
         // is the one thing this may not do. Reachable at the small end: the
         // eviction threshold is [`COMPACTION_MIN_EVICT_BYTES`] and a pointer
@@ -1330,8 +1354,9 @@ mod tests {
 
     #[test]
     fn the_sweep_pointer_does_not_send_the_model_after_a_note_that_was_never_written() {
-        // No step ran, so no note exists. The text must say re-run the tool,
-        // and must not mention a step completing or a note to re-read.
+        // No step ran, so no note exists. The text must send the model to the
+        // stored output, and must not mention a step completing or a note to
+        // re-read.
         let big = "x".repeat(5000);
         let mut messages = vec![
             Message::assistant_with_tool_calls(vec![ToolCall::new("c1", "read_file", "{}")]),
@@ -1342,7 +1367,7 @@ mod tests {
 
         let pointer = projection.content(&messages[1]);
         assert!(pointer.contains("superseded"), "{pointer}");
-        assert!(pointer.contains("Re-run the tool"), "{pointer}");
+        assert!(pointer.contains(TRANSCRIPT_GET_TOOL), "{pointer}");
         assert!(!pointer.contains("scratchpad note"), "{pointer}");
         assert!(!pointer.contains("step completed"), "{pointer}");
     }
@@ -1709,7 +1734,13 @@ mod tests {
 
         let live: std::collections::HashSet<String> = long_keys.iter().cloned().collect();
         assert!(
-            compaction_pointer(Some("read_file"), &long_keys, EvictReason::StepCompleted).len()
+            compaction_pointer(
+                Some("read_file"),
+                "m-1",
+                &long_keys,
+                EvictReason::StepCompleted
+            )
+            .len()
                 > modest.len(),
             "the fixture must build a pointer bigger than the result"
         );
@@ -1747,9 +1778,188 @@ mod tests {
 
     #[test]
     fn pointer_without_notes_says_dropped() {
-        let p = compaction_pointer(Some("geocode"), &[], EvictReason::StepCompleted);
+        let p = compaction_pointer(Some("geocode"), "m-1", &[], EvictReason::StepCompleted);
         assert!(p.contains("geocode"));
         assert!(p.contains("no carry-forward"));
+    }
+
+    // --- #1226: the bytes an eviction takes out of view stay fetchable ------
+
+    /// AC (#1226): the pointer the model reads names the message id, on the
+    /// step-completion path.
+    #[test]
+    fn the_step_eviction_pointer_names_the_message_id_and_the_read_back_tool() {
+        let big = "x".repeat(5000);
+        let mut messages = vec![
+            Message::assistant_with_tool_calls(vec![ToolCall::new("c1", "read_file", "{}")]),
+            tool_msg("c1", &big),
+        ];
+        let id = messages[1].id.clone();
+        let mut projection = ContextProjection::default();
+        evict_tool_results(
+            &mut messages,
+            &mut projection,
+            0,
+            &["outcome:1".to_string()],
+            DistilledTrace::Written,
+            EvictReason::StepCompleted,
+        );
+
+        let pointer = projection.content(&messages[1]);
+        assert!(
+            pointer.contains(&id),
+            "the pointer must name the message id to fetch: {pointer}"
+        );
+        assert!(
+            pointer.contains(TRANSCRIPT_GET_TOOL),
+            "the pointer must name the tool that fetches it: {pointer}"
+        );
+
+        // The same must hold for the pointer a LATER turn rebuilds, which is
+        // the one that survives past the turn that evicted.
+        let mut later = ContextProjection::default();
+        let live: std::collections::HashSet<String> =
+            ["outcome:1".to_string()].into_iter().collect();
+        let (carried, _) = carry_evictions(&messages, &mut later, &live);
+        assert_eq!(carried, 1);
+        let carried_pointer = later.content(&messages[1]);
+        assert!(carried_pointer.contains(&id), "{carried_pointer}");
+        assert!(
+            carried_pointer.contains(TRANSCRIPT_GET_TOOL),
+            "{carried_pointer}"
+        );
+    }
+
+    /// The whole point of an eviction is a smaller prompt, so a pointer that
+    /// is not smaller must not replace anything. Reachable at the small end: a
+    /// result only just over [`COMPACTION_MIN_EVICT_BYTES`], and a pointer
+    /// naming several long note keys as well as the message id.
+    #[test]
+    fn a_pointer_no_smaller_than_the_result_does_not_replace_it() {
+        let long_keys: Vec<String> = (0..4)
+            .map(|i| format!("{OUTCOME_KEY_PREFIX}{}", "k".repeat(120 + i)))
+            .collect();
+        let modest = "x".repeat(COMPACTION_MIN_EVICT_BYTES + 1);
+        let mut messages = vec![
+            Message::assistant_with_tool_calls(vec![ToolCall::new("c1", "read_file", "{}")]),
+            tool_msg("c1", &modest),
+        ];
+        assert!(
+            compaction_pointer(
+                Some("read_file"),
+                &messages[1].id,
+                &long_keys,
+                EvictReason::StepCompleted
+            )
+            .len()
+                > modest.len(),
+            "the fixture must build a pointer bigger than the result"
+        );
+
+        let mut projection = ContextProjection::default();
+        let (evicted, freed) = evict_tool_results(
+            &mut messages,
+            &mut projection,
+            0,
+            &long_keys,
+            DistilledTrace::Written,
+            EvictReason::StepCompleted,
+        );
+
+        assert_eq!(evicted, 0);
+        assert_eq!(freed, 0);
+        assert_eq!(
+            projection.content(&messages[1]),
+            modest,
+            "the turn keeps reading the result, because the pointer costs more"
+        );
+        assert!(
+            messages[1].distilled_into.is_empty(),
+            "a replacement that never happened must record no decision for a later turn"
+        );
+    }
+
+    /// AC (#1226): a tool result evicted by a completed step is read back in
+    /// full by its message id, without a call to the original tool.
+    ///
+    /// The read takes no tool executor and cannot reach one, so "without a
+    /// call to the original tool" is a property of the signature; what this
+    /// test proves is that the bytes come back whole from the transcript
+    /// alone, after the round has stopped reading them.
+    #[tokio::test]
+    async fn a_result_evicted_by_a_completed_step_is_read_back_in_full_by_message_id() {
+        let big = "x".repeat(5000);
+        let mut messages = vec![
+            Message::assistant_with_tool_calls(vec![ToolCall::new("c1", "read_file", "{}")]),
+            tool_msg("c1", &big),
+        ];
+        let id = messages[1].id.clone();
+        let mut projection = ContextProjection::default();
+        evict_tool_results(
+            &mut messages,
+            &mut projection,
+            0,
+            &["outcome:1".to_string()],
+            DistilledTrace::Written,
+            EvictReason::StepCompleted,
+        );
+        assert!(
+            projection
+                .content(&messages[1])
+                .starts_with(COMPACTION_POINTER_PREFIX),
+            "the round must have stopped reading the bytes"
+        );
+
+        let read = read_back(&messages, &id, big.len()).await;
+        assert_eq!(
+            read, big,
+            "the evicted result must come back whole from the transcript"
+        );
+    }
+
+    /// Read `message_id` back out of `messages` through the transcript port,
+    /// paging until the whole content is assembled.
+    async fn read_back(messages: &[Message], message_id: &str, expect_bytes: usize) -> String {
+        use crate::ports::auth::{UserId, with_user_id};
+        use crate::ports::conversation_ctx::with_conversation_id;
+        use crate::ports::transcript::{
+            TranscriptReadRequest, TranscriptView, read_transcript_message, with_transcript,
+        };
+
+        let user = UserId::new("u");
+        let conversation = crate::domain::ConversationId::from("conv".to_string());
+        let mut view = TranscriptView::new(user.clone(), conversation.clone());
+        view.absorb(messages);
+
+        with_user_id(
+            user,
+            with_conversation_id(conversation, async move {
+                let mut assembled = String::new();
+                let mut offset = Some(0usize);
+                while let Some(at) = offset {
+                    let payload = with_transcript(view.clone(), async {
+                        read_transcript_message(&TranscriptReadRequest {
+                            message_id: message_id.to_string(),
+                            offset: at,
+                            length: None,
+                        })
+                    })
+                    .await;
+                    let got: serde_json::Value =
+                        serde_json::from_str(&payload).expect("the payload must be JSON");
+                    assert_eq!(got["ok"], true, "{payload}");
+                    assert_eq!(
+                        got["total_bytes"].as_u64(),
+                        Some(expect_bytes as u64),
+                        "{payload}"
+                    );
+                    assembled.push_str(got["content"].as_str().expect("content is a string"));
+                    offset = got["next_offset"].as_u64().map(|n| n as usize);
+                }
+                assembled
+            }),
+        )
+        .await
     }
 
     #[test]

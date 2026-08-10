@@ -51,6 +51,7 @@ pub mod skill_index;
 pub mod skill_use;
 pub mod tool_observer;
 pub mod tool_usage;
+pub mod transcript;
 pub mod transport;
 pub mod turn_capability;
 pub mod turn_interactivity;

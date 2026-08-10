@@ -315,6 +315,11 @@ const TOOL_SYS_PROPS: &str = "builtin_sys_props";
 const TOOL_DB_QUERY: &str = "builtin_db_query";
 const TOOL_MCP_CONTROL: &str = "builtin_mcp_control";
 const TOOL_CONV_SEARCH: &str = "builtin_conversation_search";
+/// Reading a message back out of the transcript is named in the two eviction
+/// pointers the model reads (`core::planning::compaction_pointer` and the
+/// overflow-recovery notice), so the name is owned by `core` rather than
+/// declared twice.
+const TOOL_TRANSCRIPT_GET: &str = desktop_assistant_core::ports::transcript::TRANSCRIPT_GET_TOOL;
 const TOOL_SCRATCHPAD_WRITE: &str = "builtin_scratchpad_write";
 const TOOL_SCRATCHPAD_SEARCH: &str = "builtin_scratchpad_search";
 const TOOL_SCRATCHPAD_DELETE: &str = "builtin_scratchpad_delete";
@@ -1054,6 +1059,47 @@ impl BuiltinToolService {
                 }),
             ),
             ToolDefinition::new(
+                TOOL_TRANSCRIPT_GET,
+                format!(
+                    "Read one message of THIS conversation back by its id, exactly as it was \
+                     stored. Use it when a tool result has left your working view and a \
+                     pointer names its message id - a \"<compacted to scratchpad ...>\" \
+                     pointer or an \"<earlier tool output omitted ...>\" notice - instead of \
+                     running the tool again. Re-running is the wrong move when the tool \
+                     changes something, when its answer moves with time, or when the call was \
+                     slow or expensive; this returns the very bytes the earlier round \
+                     reasoned about. Reads are partial and you page through them: give \
+                     `offset` and `length`, and the response carries `total_bytes`, the \
+                     `offset` it actually started at, `returned_bytes`, and `next_offset` \
+                     (null once you have reached the end, and null for a read that \
+                     returned no bytes). One read returns at most \
+                     {max} bytes, and a larger `length` is cut to that with \
+                     `truncated: true`. Only this conversation's messages are readable, and \
+                     an id it does not hold returns ok:false with a `code`, not an error.",
+                    max = desktop_assistant_core::ports::transcript::TRANSCRIPT_READ_MAX_BYTES,
+                ),
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "message_id": {
+                            "type": "string",
+                            "description": "The message id named by the pointer you are reading back."
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "Byte offset to start at (default 0). Pass the `next_offset` of the previous read to continue. An offset that lands inside a multi-byte character moves back to the character before it, and the response says where the read actually started."
+                        },
+                        "length": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "How many bytes to return. Defaults to the per-read cap, and a larger value is cut to it. A `length` of 0 returns no bytes and no `next_offset`, so ask for at least one byte."
+                        }
+                    },
+                    "required": ["message_id"]
+                }),
+            ),
+            ToolDefinition::new(
                 TOOL_MCP_CONTROL,
                 "Check status, start, stop, or restart MCP (Model Context Protocol) \
                  servers. Use this when a tool call fails because an MCP server is \
@@ -1336,8 +1382,8 @@ impl BuiltinToolService {
         ),
         (
             "recall",
-            "Search past conversations by full-text query to recall what was \
-             discussed or decided.",
+            "Recall what was said before: search past conversations by full-text \
+             query, and read one message of this conversation back by its id.",
         ),
         (
             "system",
@@ -1380,6 +1426,7 @@ impl BuiltinToolService {
         TOOL_DB_QUERY,
         TOOL_MCP_CONTROL,
         TOOL_CONV_SEARCH,
+        TOOL_TRANSCRIPT_GET,
         TOOL_SCRATCHPAD_WRITE,
         TOOL_SCRATCHPAD_SEARCH,
         TOOL_SCRATCHPAD_DELETE,
@@ -1402,7 +1449,7 @@ impl BuiltinToolService {
             | TOOL_SCRATCHPAD_DELETE
             | TOOL_SCRATCHPAD_PIN => Some("scratchpad"),
             TOOL_DB_QUERY => Some("database"),
-            TOOL_CONV_SEARCH => Some("recall"),
+            TOOL_CONV_SEARCH | TOOL_TRANSCRIPT_GET => Some("recall"),
             TOOL_SYS_PROPS | TOOL_NOTIFY => Some("system"),
             TOOL_SEARCH | TOOL_MCP_CONTROL => Some("tool-meta"),
             TOOL_SKILL_SEARCH | TOOL_SKILL_GET => Some("skills"),
@@ -1441,6 +1488,7 @@ impl BuiltinToolService {
             TOOL_DB_QUERY => self.db_query(arguments).await,
             TOOL_MCP_CONTROL => self.mcp_control(arguments).await,
             TOOL_CONV_SEARCH => self.conversation_search(arguments).await,
+            TOOL_TRANSCRIPT_GET => Self::transcript_get(&arguments),
             TOOL_SCRATCHPAD_WRITE => self.scratchpad_write(arguments).await,
             TOOL_SCRATCHPAD_SEARCH => self.scratchpad_search(arguments).await,
             TOOL_SCRATCHPAD_DELETE => self.scratchpad_delete(arguments).await,
@@ -2132,6 +2180,32 @@ impl BuiltinToolService {
                     .to_string(),
             ),
         }
+    }
+
+    /// Read one message of the active conversation back by its id
+    /// (`builtin_transcript_get`).
+    ///
+    /// Argument parsing only. The read itself, its scoping and its provenance
+    /// stamp all live in `desktop_assistant_core::ports::transcript`, beside
+    /// the two pointer texts that advertise it and the classification table
+    /// that grades it.
+    ///
+    /// Nothing is wired into this tool: it reads the transcript the turn loop
+    /// installs as a task-local. Outside a turn it declines, which is the same
+    /// answer it gives for an id the conversation does not hold.
+    fn transcript_get(arguments: &serde_json::Value) -> Result<String, CoreError> {
+        use desktop_assistant_core::ports::transcript::{
+            TranscriptReadRequest, read_transcript_message,
+        };
+
+        let message_id = required_string(arguments, "message_id")?;
+        let offset = optional_usize(arguments, "offset")?.unwrap_or(0);
+        let length = optional_usize(arguments, "length")?;
+        Ok(read_transcript_message(&TranscriptReadRequest {
+            message_id,
+            offset,
+            length,
+        }))
     }
 
     async fn conversation_search(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
@@ -3359,6 +3433,49 @@ fn kb_get_row_within(entry: &KnowledgeEntry, budget: usize) -> (serde_json::Valu
     let cut = lo < total;
     let content: String = entry.content.chars().take(lo).collect();
     (kb_get_row(entry, &content, cut), cut)
+}
+
+/// A non-negative integer argument, or `None` when the key is absent or null.
+///
+/// Lenient in encoding, strict in value. Tool-call plumbing re-encodes an
+/// integer as a whole-valued float (`4.0`) or as a decimal string (`"4"`), and
+/// all three say the same number, so all three parse. A negative value, a
+/// fraction, a number too large for the type, or text that is not a number says
+/// something else and is refused rather than silently treated as zero - a read
+/// that starts at the wrong offset returns the wrong bytes and says nothing
+/// about it.
+///
+/// A `null` is an argument the caller did not supply, so it takes the default.
+/// That is also where a non-finite float lands: JSON carries no NaN and no
+/// infinity, so encoding one produces `null`, and a literal too large for a
+/// double fails to parse before any value exists.
+fn optional_usize(args: &serde_json::Value, key: &str) -> Result<Option<usize>, CoreError> {
+    let Some(value) = args.get(key).filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    let parsed = match value {
+        serde_json::Value::Number(n) => n.as_u64().or_else(|| {
+            // Not an integer in serde_json's model, so it is a float. Only a
+            // non-negative, whole, in-range one is the number it re-encodes; a
+            // cast saturates rather than failing, so the range is checked here
+            // and not left to it.
+            n.as_f64()
+                .filter(|f| *f >= 0.0 && f.fract() == 0.0 && *f < u64::MAX as f64)
+                .map(|f| f as u64)
+        }),
+        // `u64::from_str` already refuses a fraction ("4.0"), a sign, padding,
+        // and a radix prefix, so a clean decimal string is all that passes.
+        serde_json::Value::String(s) => s.trim().parse::<u64>().ok(),
+        _ => None,
+    };
+    parsed
+        .map(|n| usize::try_from(n).unwrap_or(usize::MAX))
+        .map(Some)
+        .ok_or_else(|| {
+            CoreError::ToolExecution(format!(
+                "`{key}` must be a whole number of zero or more, got {value}"
+            ))
+        })
 }
 
 fn optional_string(args: &serde_json::Value, key: &str) -> Option<String> {
@@ -4707,6 +4824,164 @@ mod tests {
             Some((vec![0.5_f32, 0.25], "nomic-embed-text@abc".to_string())),
             "the query vector and its model must both reach the store"
         );
+    }
+
+    // --- builtin_transcript_get (#1226) ------------------------------------
+
+    /// A turn with one tool result in it, and the scope that turn installs.
+    async fn with_a_turn_transcript<T>(content: &str, body: impl AsyncFnOnce(String) -> T) -> T {
+        use desktop_assistant_core::domain::{Message, ToolCall};
+        use desktop_assistant_core::ports::auth::{UserId, with_user_id};
+        use desktop_assistant_core::ports::transcript::{TranscriptView, with_transcript};
+
+        let messages = vec![
+            Message::assistant_with_tool_calls(vec![ToolCall::new("c1", "read_file", "{}")]),
+            Message::tool_result("c1", content),
+        ];
+        let id = messages[1].id.clone();
+        let user = UserId::new("u");
+        let conversation = ConversationId::from("c1");
+        let mut view = TranscriptView::new(user.clone(), conversation.clone());
+        view.absorb(&messages);
+
+        with_user_id(
+            user,
+            with_conversation_id(
+                conversation,
+                with_transcript(view, async move { body(id).await }),
+            ),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn transcript_get_returns_the_stored_message_through_the_tool() {
+        let service = BuiltinToolService::new();
+        let out = with_a_turn_transcript("the stored bytes", async |id| {
+            service
+                .execute_tool(TOOL_TRANSCRIPT_GET, serde_json::json!({"message_id": id}))
+                .await
+                .expect("the read is a normal tool call")
+        })
+        .await;
+
+        let got: serde_json::Value = serde_json::from_str(&out).expect("JSON");
+        assert_eq!(got["ok"], true, "{out}");
+        assert_eq!(got["content"], "the stored bytes");
+        assert_eq!(got["produced_by"], "read_file");
+    }
+
+    #[tokio::test]
+    async fn transcript_get_requires_a_message_id() {
+        let service = BuiltinToolService::new();
+        let err = service
+            .execute_tool(TOOL_TRANSCRIPT_GET, serde_json::json!({}))
+            .await
+            .expect_err("a call with no id names the missing argument");
+        assert!(err.to_string().contains("message_id"), "{err}");
+    }
+
+    /// Lenient in encoding, strict in value: a provider renders an integer
+    /// argument as a number, as a whole-valued float, or as a decimal string,
+    /// and all three mean the same offset. A value that is not a whole number
+    /// of zero or more is refused rather than read as zero, because a read from
+    /// the wrong offset returns the wrong bytes and says nothing about it.
+    #[tokio::test]
+    async fn transcript_get_accepts_every_lossless_encoding_of_a_number_and_refuses_the_rest() {
+        let service = BuiltinToolService::new();
+
+        for (offset, length) in [
+            (serde_json::json!(4), serde_json::json!(2)),
+            (serde_json::json!("4"), serde_json::json!("2")),
+            (serde_json::json!(4.0), serde_json::json!(2.0)),
+        ] {
+            let out = with_a_turn_transcript("0123456789", async |id| {
+                service
+                    .execute_tool(
+                        TOOL_TRANSCRIPT_GET,
+                        serde_json::json!({
+                            "message_id": id,
+                            "offset": offset,
+                            "length": length,
+                        }),
+                    )
+                    .await
+                    .expect("a lossless encoding of a whole number is a range")
+            })
+            .await;
+            let got: serde_json::Value = serde_json::from_str(&out).expect("JSON");
+            assert_eq!(got["content"], "45", "{out}");
+        }
+
+        for bad in [
+            serde_json::json!(-1),
+            serde_json::json!(-1.0),
+            serde_json::json!(1.5),
+            serde_json::json!(1e30),
+            serde_json::json!("1.0"),
+            serde_json::json!("soon"),
+            serde_json::json!(true),
+        ] {
+            let err = service
+                .execute_tool(
+                    TOOL_TRANSCRIPT_GET,
+                    serde_json::json!({"message_id": "m", "offset": bad}),
+                )
+                .await
+                .expect_err("a value that is not a whole number is refused");
+            assert!(err.to_string().contains("offset"), "{err}");
+        }
+    }
+
+    /// A `null` argument is an argument the caller did not supply, so the read
+    /// takes the default rather than being refused.
+    ///
+    /// This is the one thing a non-finite float can be: `serde_json` has no
+    /// number for NaN or an infinity, so encoding one produces `null`, and the
+    /// parser refuses an out-of-range literal before a value exists. A read
+    /// that starts at 0 is the same read the caller gets by leaving the
+    /// argument out, which is what `null` says.
+    #[tokio::test]
+    async fn transcript_get_reads_a_null_argument_as_one_that_was_not_supplied() {
+        let service = BuiltinToolService::new();
+
+        let out = with_a_turn_transcript("0123456789", async |id| {
+            service
+                .execute_tool(
+                    TOOL_TRANSCRIPT_GET,
+                    serde_json::json!({
+                        "message_id": id,
+                        "offset": serde_json::Value::Null,
+                        "length": serde_json::json!(f64::NAN),
+                    }),
+                )
+                .await
+                .expect("a null argument is not a refusal")
+        })
+        .await;
+
+        let got: serde_json::Value = serde_json::from_str(&out).expect("JSON");
+        assert_eq!(got["offset"], 0, "{out}");
+        assert_eq!(got["content"], "0123456789", "{out}");
+    }
+
+    /// Outside a turn there is no transcript, and the tool says so as a
+    /// structured decline rather than failing the call.
+    #[tokio::test]
+    async fn transcript_get_outside_a_turn_declines_rather_than_erroring() {
+        let service = BuiltinToolService::new();
+        let out = service
+            .execute_tool(
+                TOOL_TRANSCRIPT_GET,
+                serde_json::json!({"message_id": "anything"}),
+            )
+            .await
+            .expect("a decline is a normal outcome, not an error");
+
+        let got: serde_json::Value = serde_json::from_str(&out).expect("JSON");
+        assert_eq!(got["ok"], false, "{out}");
+        assert!(got["code"].is_string(), "{out}");
+        assert_eq!(got["retryable"], false, "{out}");
     }
 
     /// With no embedding backend the tool still searches, handing over an empty
