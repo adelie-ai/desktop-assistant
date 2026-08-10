@@ -525,25 +525,56 @@ mod tests {
 
     /// AC: a message id owned by another user is refused.
     ///
-    /// The enforcer is the user recorded on the view: a view minted for one
-    /// user returns nothing while another user's id is in force, so a leaked
-    /// or stale scope cannot serve one user's bytes to another.
+    /// Both directions, because two different things hold them. The primary
+    /// boundary is the view itself: the turn builds it from the conversation it
+    /// loaded under the calling user's id, so another user's message is not in
+    /// it to begin with. The second is the user stamped on the view, which
+    /// refuses a view minted for another user - defence in depth, for a view
+    /// that leaked or went stale.
     #[tokio::test]
     async fn a_message_id_owned_by_another_user_is_refused() {
-        let messages = vec![
+        let alices = vec![
             requested("c1", "read_file"),
             tool_result("c1", "alice's bytes"),
         ];
-        let id = messages[1].id.clone();
-        let alices = view("alice", "conv", &messages);
+        let alices_id = alices[1].id.clone();
+        // The active turn is bob's, and holds his own, unrelated message.
+        let bobs = vec![
+            requested("c9", "read_file"),
+            tool_result("c9", "bob's bytes"),
+        ];
 
-        let payload = scoped("bob", "conv", alices, async {
-            read_transcript_message(&TranscriptReadRequest::new(&id))
+        let payload = scoped("bob", "conv", view("bob", "conv", &bobs), async {
+            read_transcript_message(&TranscriptReadRequest::new(&alices_id))
         })
         .await;
 
         let got = parse(&payload);
         assert_eq!(got["ok"], false, "{payload}");
+        assert_eq!(
+            got["code"], CODE_NOT_FOUND,
+            "bob's own view holds no such id, which is the boundary this case \
+             exercises: {payload}"
+        );
+        assert!(
+            got.get("content").is_none(),
+            "a refusal must carry no bytes: {payload}"
+        );
+        assert!(!payload.contains("alice's bytes"), "{payload}");
+
+        // And the other direction: alice's own view, in force while bob is the
+        // user, reads nothing either.
+        let payload = scoped("bob", "conv", view("alice", "conv", &alices), async {
+            read_transcript_message(&TranscriptReadRequest::new(&alices_id))
+        })
+        .await;
+
+        let got = parse(&payload);
+        assert_eq!(got["ok"], false, "{payload}");
+        assert_eq!(
+            got["code"], CODE_OUT_OF_SCOPE,
+            "the view's own user stamp is the boundary this case exercises: {payload}"
+        );
         assert!(
             got.get("content").is_none(),
             "a refusal must carry no bytes: {payload}"
