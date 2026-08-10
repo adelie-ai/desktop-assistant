@@ -3435,15 +3435,20 @@ fn kb_get_row_within(entry: &KnowledgeEntry, budget: usize) -> (serde_json::Valu
     (kb_get_row(entry, &content, cut), cut)
 }
 
-/// A non-negative integer argument, or `None` when the key is absent.
+/// A non-negative integer argument, or `None` when the key is absent or null.
 ///
 /// Lenient in encoding, strict in value. Tool-call plumbing re-encodes an
 /// integer as a whole-valued float (`4.0`) or as a decimal string (`"4"`), and
 /// all three say the same number, so all three parse. A negative value, a
-/// fraction, a non-finite float, or text that is not a number says something
-/// else and is refused rather than silently treated as zero - a read that
-/// starts at the wrong offset returns the wrong bytes and says nothing about
-/// it.
+/// fraction, a number too large for the type, or text that is not a number says
+/// something else and is refused rather than silently treated as zero - a read
+/// that starts at the wrong offset returns the wrong bytes and says nothing
+/// about it.
+///
+/// A `null` is an argument the caller did not supply, so it takes the default.
+/// That is also where a non-finite float lands: JSON carries no NaN and no
+/// infinity, so encoding one produces `null`, and a literal too large for a
+/// double fails to parse before any value exists.
 fn optional_usize(args: &serde_json::Value, key: &str) -> Result<Option<usize>, CoreError> {
     let Some(value) = args.get(key).filter(|v| !v.is_null()) else {
         return Ok(None);
@@ -3451,12 +3456,11 @@ fn optional_usize(args: &serde_json::Value, key: &str) -> Result<Option<usize>, 
     let parsed = match value {
         serde_json::Value::Number(n) => n.as_u64().or_else(|| {
             // Not an integer in serde_json's model, so it is a float. Only a
-            // finite, non-negative, whole, in-range one is the number it
-            // re-encodes; a cast saturates rather than failing, so the range is
-            // checked here and not left to it.
+            // non-negative, whole, in-range one is the number it re-encodes; a
+            // cast saturates rather than failing, so the range is checked here
+            // and not left to it.
             n.as_f64()
-                .filter(|f| f.is_finite() && *f >= 0.0 && f.fract() == 0.0)
-                .filter(|f| *f < u64::MAX as f64)
+                .filter(|f| *f >= 0.0 && f.fract() == 0.0 && *f < u64::MAX as f64)
                 .map(|f| f as u64)
         }),
         // `u64::from_str` already refuses a fraction ("4.0"), a sign, padding,
@@ -4927,6 +4931,38 @@ mod tests {
                 .expect_err("a value that is not a whole number is refused");
             assert!(err.to_string().contains("offset"), "{err}");
         }
+    }
+
+    /// A `null` argument is an argument the caller did not supply, so the read
+    /// takes the default rather than being refused.
+    ///
+    /// This is the one thing a non-finite float can be: `serde_json` has no
+    /// number for NaN or an infinity, so encoding one produces `null`, and the
+    /// parser refuses an out-of-range literal before a value exists. A read
+    /// that starts at 0 is the same read the caller gets by leaving the
+    /// argument out, which is what `null` says.
+    #[tokio::test]
+    async fn transcript_get_reads_a_null_argument_as_one_that_was_not_supplied() {
+        let service = BuiltinToolService::new();
+
+        let out = with_a_turn_transcript("0123456789", async |id| {
+            service
+                .execute_tool(
+                    TOOL_TRANSCRIPT_GET,
+                    serde_json::json!({
+                        "message_id": id,
+                        "offset": serde_json::Value::Null,
+                        "length": serde_json::json!(f64::NAN),
+                    }),
+                )
+                .await
+                .expect("a null argument is not a refusal")
+        })
+        .await;
+
+        let got: serde_json::Value = serde_json::from_str(&out).expect("JSON");
+        assert_eq!(got["offset"], 0, "{out}");
+        assert_eq!(got["content"], "0123456789", "{out}");
     }
 
     /// Outside a turn there is no transcript, and the tool says so as a
