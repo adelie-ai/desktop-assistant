@@ -26,8 +26,12 @@
 //! [`crate::ports::conversation_ctx`]'s `ConversationId`. See AGENTS.md
 //! ("cross-cutting context propagates via `tokio::task_local!`").
 //!
-//! The view is built once per turn and grows as the turn appends messages, so
-//! a round pays for the messages it added and not for the whole transcript.
+//! The view is built once per turn and grows as the turn appends messages.
+//! The first [`TranscriptView::absorb`] of a turn copies the content of every
+//! message the conversation already holds, because that whole list is what the
+//! turn loaded; each later one copies only what the round appended. Installing
+//! the view around a tool costs nothing beyond that: the messages sit behind an
+//! `Arc`, so cloning a view copies the two scope values and a pointer.
 //!
 //! ## Scope, and how it fails
 //!
