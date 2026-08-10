@@ -300,7 +300,7 @@ pub fn read_transcript_message(request: &TranscriptReadRequest) -> String {
     let total = entry.content.len();
     let requested = request.length.unwrap_or(TRANSCRIPT_READ_MAX_BYTES);
     let capped = requested.min(TRANSCRIPT_READ_MAX_BYTES);
-    let start = floor_char_boundary(&entry.content, request.offset.min(total));
+    let start = entry.content.floor_char_boundary(request.offset);
     let end = slice_end(&entry.content, start, capped);
     let slice = &entry.content[start..end];
 
@@ -368,15 +368,6 @@ fn decline(code: &str, description: &str, message: &str) -> String {
     .to_string()
 }
 
-/// The largest char boundary at or below `index`.
-fn floor_char_boundary(s: &str, index: usize) -> usize {
-    let mut i = index.min(s.len());
-    while i > 0 && !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    i
-}
-
 /// Where a read starting at `start` and asking for `len` bytes ends.
 ///
 /// Snapped back to a char boundary, because a range that splits a character is
@@ -391,15 +382,13 @@ fn floor_char_boundary(s: &str, index: usize) -> usize {
 /// no `next_offset`, which is what keeps paging terminating - see
 /// [`read_transcript_message`].
 fn slice_end(s: &str, start: usize, len: usize) -> usize {
-    let end = floor_char_boundary(s, start.saturating_add(len).min(s.len()));
+    let end = s.floor_char_boundary(start.saturating_add(len));
     if end > start || start >= s.len() || len == 0 {
         return end;
     }
-    let mut i = start + 1;
-    while i < s.len() && !s.is_char_boundary(i) {
-        i += 1;
-    }
-    i
+    // `start` is inside the string here, so `start + 1` is a byte index it
+    // holds and the widening never asks past the end.
+    s.ceil_char_boundary(start + 1)
 }
 
 #[cfg(test)]
