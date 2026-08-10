@@ -96,7 +96,7 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use sha2::{Digest, Sha256};
 
 use crate::domain::situation::{MAX_SITUATION_VALUE_CHARS, Situation, SituationField};
@@ -182,6 +182,23 @@ pub const MAX_OUTCOME_CHARS: usize = 400;
 /// A wall of past failures is not a warning, it is noise, and the model has to
 /// read all of it before it can act.
 pub const MAX_WARNED_BURNS: usize = 3;
+
+/// Longest slice of an outcome the person-facing hold notice repeats.
+///
+/// The notice is one entry in an activity feed, beside the tool calls that did
+/// run, so it has one line to say which lesson held the call and roughly what
+/// that lesson was. The whole outcome is a click away by id; this is the label,
+/// not the record.
+pub const MAX_HOLD_NOTICE_CHARS: usize = 120;
+
+/// What a person's own clear writes into the correction, when they give no
+/// reason of their own.
+///
+/// A clear and a success write the same overlay, so the note is the only thing
+/// that says which of the two happened. Left to a client to phrase, two clients
+/// would phrase it differently and a reader could not tell a person's judgement
+/// from an observed success.
+pub const CLEARED_BY_PERSON: &str = "Cleared by the person this memory belongs to.";
 
 /// Most live burns a read returns for one user.
 ///
@@ -635,6 +652,20 @@ impl NegativeMemory {
         self.strength(now) < SILENCE_FLOOR
     }
 
+    /// When this stops interrupting anything, if nothing confirms it again.
+    ///
+    /// The one thing a person asking "how long will this hold my work?" needs,
+    /// and the reason it is here rather than computed by each client: a client
+    /// that derived it from [`HALF_LIFE_DAYS`] and [`SILENCE_FLOOR`] itself
+    /// would keep showing the old date after either constant moved.
+    ///
+    /// A confirmation moves this, because it moves
+    /// [`last_confirmed_at`](Self::last_confirmed_at) and nothing else does.
+    pub fn goes_quiet_at(&self) -> DateTime<Utc> {
+        let seconds = silence_after_days() * 24.0 * 60.0 * 60.0;
+        self.last_confirmed_at + TimeDelta::milliseconds((seconds * 1000.0) as i64)
+    }
+
     /// Whether this should be dropped from the store.
     ///
     /// Two ways to qualify. The ordinary one is age: nothing has confirmed it
@@ -782,6 +813,57 @@ fn storable_text(text: &str) -> bool {
 /// the decay arithmetic works in.
 fn future_tolerance_days() -> f64 {
     f64::from(FUTURE_STAMP_TOLERANCE_HOURS) / 24.0
+}
+
+/// Days from a burn's last confirmation to the moment it stops firing.
+///
+/// Derived rather than chosen: strength halves every [`HALF_LIFE_DAYS`] and
+/// stops mattering under [`SILENCE_FLOOR`], so this is the one number those two
+/// already imply. Written out here, in one place, so a date shown to a person
+/// and the rule that silences a burn cannot disagree - which is the failure a
+/// third constant would guarantee.
+pub fn silence_after_days() -> f64 {
+    HALF_LIFE_DAYS * (FULL_STRENGTH / SILENCE_FLOOR).log2()
+}
+
+/// One line for a person's activity feed, saying that a stored lesson held a
+/// call and naming which. `None` when nothing fired.
+///
+/// This is the person's half of the interruption, and the only half they ever
+/// see: [`render_warning`] goes to the model in place of the tool result and
+/// never reaches a screen. Without the id the reticence has no name, and a burn
+/// that fires wrongly is indistinguishable from an assistant that will not act.
+///
+/// Every lesson that fired is named rather than the first few. The set is small
+/// by construction and not by hope: a burn fires only on an exact act, and the
+/// store holds one live lesson per act - the partial unique index on
+/// `(user_id, action, fingerprint)` is what makes that true.
+pub fn render_hold_notice(fired: &[&NegativeMemory]) -> Option<String> {
+    let first = fired.first()?;
+    let ids = fired
+        .iter()
+        .map(|burn| burn.id.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let held_by = match fired.len() {
+        1 => "a stored lesson".to_string(),
+        n => format!("{n} stored lessons"),
+    };
+    Some(format!(
+        "held by {held_by} ({ids}): {}",
+        one_capped_line(&first.outcome)
+    ))
+}
+
+/// The first line of `text`, cut to [`MAX_HOLD_NOTICE_CHARS`] on a character
+/// boundary.
+///
+/// One line because the feed shows one line per call, and a multi-line entry
+/// would misalign every entry after it. Cut by characters rather than bytes so
+/// a multi-byte outcome cannot panic the notice.
+fn one_capped_line(text: &str) -> String {
+    let line = text.lines().next().unwrap_or_default().trim();
+    line.chars().take(MAX_HOLD_NOTICE_CHARS).collect()
 }
 
 /// Cut `outcome` to [`MAX_OUTCOME_CHARS`] on a character boundary.

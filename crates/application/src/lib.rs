@@ -25,6 +25,9 @@ use desktop_assistant_core::ports::inbound::{
     SettingsService,
 };
 use desktop_assistant_core::ports::knowledge_delete::{DeleteInitiator, with_delete_initiator};
+use desktop_assistant_core::ports::negative_memory::{
+    ExtinguishBurnsFn, InspectBurnFn, LiveBurnsFn,
+};
 use desktop_assistant_core::ports::request_scope::RequestScope;
 use desktop_assistant_core::ports::scratchpad::{
     MAX_KEYS_PER_CALL, MAX_NOTE_BYTES, MAX_RESULTS_CEILING, NewScratchpadNote, ScratchpadClearFn,
@@ -565,6 +568,16 @@ where
     /// every other connection viewing that conversation. `None` keeps the prior
     /// behaviour: turn events reach only the initiating connection.
     conversation_subs: Option<Arc<crate::conversation_subs::ConversationSubscriptions>>,
+    /// Negative memory as a person meets it (#1186): list what is held, read
+    /// one in full, clear one. All three or none - a list a person cannot act
+    /// on and a clear they cannot aim are each half a surface.
+    ///
+    /// `None` where there is no database, and the three commands then report
+    /// that this deployment cannot answer rather than answering an empty list.
+    /// The difference matters here more than usual: a person asking why the
+    /// assistant will not do something would read an empty list as "nothing is
+    /// holding it", which is the wrong answer twice over.
+    negative_memory: Option<NegativeMemoryWiring>,
     /// Optional on-demand knowledge-maintenance service (dream-cycle controls).
     /// When attached, `StartKnowledgeMaintenance` spawns the requested pass
     /// (extraction / consolidation / embedding recompute) as a tracked,
@@ -572,6 +585,19 @@ where
     /// return a clear "not configured" error. Held as a trait object (the port
     /// is `async_trait`) so no extra generic threads through the handler.
     maintenance: Option<Arc<dyn KnowledgeMaintenanceService>>,
+}
+
+/// The three reads and the one write a person's view of negative memory needs
+/// (#1186). Held together because the surface is one thing: nothing here is
+/// useful without the rest.
+#[derive(Clone)]
+struct NegativeMemoryWiring {
+    list: LiveBurnsFn,
+    inspect: InspectBurnFn,
+    /// The same closure a successful call uses to correct a lesson it
+    /// disproved. Clearing and succeeding write the same overlay, so they share
+    /// the one write rather than having a person-only path beside it.
+    clear: ExtinguishBurnsFn,
 }
 
 /// The handler-resident client-tool dependencies (#234). Both halves are
@@ -616,8 +642,29 @@ where
             inflight: Arc::new(InFlightRegistry::default()),
             client_tools: None,
             conversation_subs: None,
+            negative_memory: None,
             maintenance: None,
         }
+    }
+
+    /// Attach the person-facing half of negative memory (#1186): list what the
+    /// assistant is held back by, read one in full, clear one.
+    ///
+    /// The daemon wires all three to the same store the dispatch loop writes
+    /// to. A caller that skips this leaves the three commands reporting that
+    /// the deployment cannot answer.
+    pub fn with_negative_memory(
+        mut self,
+        list: LiveBurnsFn,
+        inspect: InspectBurnFn,
+        clear: ExtinguishBurnsFn,
+    ) -> Self {
+        self.negative_memory = Some(NegativeMemoryWiring {
+            list,
+            inspect,
+            clear,
+        });
+        self
     }
 
     /// Attach the shared client-tool coordinator + turn-state store (#234) so
@@ -1505,6 +1552,69 @@ fn knowledge_entry_to_view(e: KnowledgeEntry) -> api::KnowledgeEntryView {
     }
 }
 
+/// One negative memory as a person reads it (#1186).
+///
+/// `now` is read once by the caller and passed in, so every row in one list
+/// reports its strength against the same instant. Two rows scored a
+/// millisecond apart would be ordered by an accident of the loop.
+fn negative_memory_to_view(
+    memory: &desktop_assistant_core::domain::negative_memory::NegativeMemory,
+    now: chrono::DateTime<chrono::Utc>,
+) -> api::NegativeMemoryView {
+    let facets = |identity: bool| -> Vec<api::NegativeMemoryFacetView> {
+        memory
+            .scope
+            .iter()
+            .filter(|(facet, _)| facet.is_identity() == identity)
+            .map(|(facet, value)| api::NegativeMemoryFacetView {
+                name: facet.name().to_string(),
+                value: value.to_string(),
+            })
+            .collect()
+    };
+    api::NegativeMemoryView {
+        id: memory.id.clone(),
+        action: memory.action.clone(),
+        arguments: facets(true),
+        circumstances: facets(false),
+        outcome: memory.outcome.clone(),
+        occurrences: memory.occurrences,
+        strength: memory.strength(now),
+        firing: !memory.is_silent(now),
+        written_at: memory.written_at.to_rfc3339(),
+        last_confirmed_at: memory.last_confirmed_at.to_rfc3339(),
+        goes_quiet_at: memory.goes_quiet_at().to_rfc3339(),
+        cleared: memory.superseded_by.is_some(),
+    }
+}
+
+/// One negative memory read on its own (#1186), with what widened it and what
+/// corrected it.
+fn negative_memory_record_to_view(
+    record: desktop_assistant_core::ports::negative_memory::BurnRecord,
+    now: chrono::DateTime<chrono::Utc>,
+) -> api::NegativeMemoryDetailView {
+    api::NegativeMemoryDetailView {
+        memory: negative_memory_to_view(&record.memory, now),
+        dropped: record
+            .dropped
+            .into_iter()
+            .map(|d| api::DroppedFacetView {
+                name: d.facet.name().to_string(),
+                value: d.value,
+                dropped_at: d.dropped_at.to_rfc3339(),
+            })
+            .collect(),
+        correction: record
+            .correction
+            .map(|c| api::NegativeMemoryCorrectionView {
+                id: c.id,
+                outcome: c.outcome,
+                written_at: c.written_at.to_rfc3339(),
+            }),
+    }
+}
+
 fn scratchpad_note_to_view(n: ScratchpadNote) -> api::ScratchpadNoteView {
     api::ScratchpadNoteView {
         id: n.id,
@@ -2173,6 +2283,53 @@ where
             }
 
             // MCP server management
+            api::Command::ListNegativeMemories => {
+                let wiring = self.negative_memory.as_ref().ok_or(ApiError::Unsupported)?;
+                let held = (wiring.list)().await.map_err(Self::map_core_err)?;
+                // One reading of the clock for the whole list, so two rows are
+                // never scored against two instants.
+                let now = chrono::Utc::now();
+                let mut rows: Vec<api::NegativeMemoryView> = held
+                    .iter()
+                    .map(|memory| negative_memory_to_view(memory, now))
+                    .collect();
+                // Strongest first, then by id, so the same set answers in the
+                // same order twice and a person's list does not reshuffle
+                // between two reads that learned nothing.
+                rows.sort_by(|a, b| {
+                    b.strength
+                        .total_cmp(&a.strength)
+                        .then_with(|| a.id.cmp(&b.id))
+                });
+                Ok(api::CommandResult::NegativeMemories(rows))
+            }
+            api::Command::GetNegativeMemory { id } => {
+                let wiring = self.negative_memory.as_ref().ok_or(ApiError::Unsupported)?;
+                let record = (wiring.inspect)(id).await.map_err(Self::map_core_err)?;
+                let now = chrono::Utc::now();
+                Ok(api::CommandResult::NegativeMemory(record.map(|r| {
+                    Box::new(negative_memory_record_to_view(r, now))
+                })))
+            }
+            api::Command::ClearNegativeMemory { id, note } => {
+                let wiring = self.negative_memory.as_ref().ok_or(ApiError::Unsupported)?;
+                // The daemon's own line when the person gave none, so a reader
+                // months later can tell a person's judgement from the act
+                // simply succeeding - the two write the same overlay, and the
+                // note is the only thing that differs.
+                let note = note.filter(|n| !n.trim().is_empty()).unwrap_or_else(|| {
+                    desktop_assistant_core::domain::negative_memory::CLEARED_BY_PERSON.to_string()
+                });
+                let cleared = (wiring.clear)(vec![id], note)
+                    .await
+                    .map_err(Self::map_core_err)?;
+                // A memory already cleared, or one this user does not hold,
+                // reports nothing cleared. Neither is a failure: the memory is
+                // in the state the caller asked for either way (base rule 8.2).
+                Ok(api::CommandResult::NegativeMemoryCleared {
+                    cleared: !cleared.is_empty(),
+                })
+            }
             api::Command::ListMcpServers => {
                 let servers = self
                     .settings

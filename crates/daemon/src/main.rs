@@ -3095,6 +3095,33 @@ async fn main() -> Result<()> {
         api_handler_impl =
             api_handler_impl.with_scratchpad(write, get_many, list, delete_many, clear);
     }
+    // #1186: the person-facing half of negative memory - list what the
+    // assistant is held back by, read one in full, clear one. The same store
+    // the dispatch loop writes to, because a person clearing a lesson and a
+    // call succeeding where it once failed write the same correction overlay.
+    // Gated on a database, like the loop's own half: without one there is
+    // nothing held and the three commands report that this deployment cannot
+    // answer.
+    if let Some(store) = &negative_memory {
+        use desktop_assistant_core::ports::negative_memory::NegativeMemoryStore;
+        let list = Arc::clone(store);
+        let inspect = Arc::clone(store);
+        let clear = Arc::clone(store);
+        api_handler_impl = api_handler_impl.with_negative_memory(
+            Arc::new(move || {
+                let store = Arc::clone(&list);
+                Box::pin(async move { store.live_burns().await })
+            }),
+            Arc::new(move |id: String| {
+                let store = Arc::clone(&inspect);
+                Box::pin(async move { store.burn(id).await })
+            }),
+            Arc::new(move |ids: Vec<String>, note: String| {
+                let store = Arc::clone(&clear);
+                Box::pin(async move { store.extinguish(ids, note).await })
+            }),
+        );
+    }
     // Dream-cycle controls (#knowledge maintenance): when a pool + embeddings
     // are configured, serve `StartKnowledgeMaintenance` by spawning the requested
     // pass through the shared service. The same `Arc` the timer loops drive, so

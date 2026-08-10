@@ -46,8 +46,10 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
+
 use crate::CoreError;
-use crate::domain::negative_memory::{NegativeMemory, Scope};
+use crate::domain::negative_memory::{Facet, NegativeMemory, Scope};
 
 /// One bad outcome, as the store is told about it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +84,44 @@ pub struct BurnWrite {
     /// Situation facets this occurrence dropped, because the failure happened
     /// without them. Zero on a first write, because there is nothing to widen.
     pub widened_by: usize,
+}
+
+/// A circumstance a burn once required and no longer does.
+///
+/// The only thing in the whole feature that makes a burn wider is a second
+/// occurrence dropping the situation facets it disagreed with. So a dropped
+/// facet is the one visible trace of over-generalization, and that is why it is
+/// kept rather than deleted: a person looking at a burn that fires everywhere
+/// needs to see that it started at one host on one morning, and when it stopped
+/// asking for that.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DroppedFacet {
+    /// Which circumstance it was. Always a
+    /// [`Facet::Situation`](crate::domain::negative_memory::Facet::Situation) -
+    /// an argument facet is the burn's identity and is never dropped.
+    pub facet: Facet,
+    /// The value the burn was born requiring, which is what says how narrow it
+    /// started.
+    pub value: String,
+    /// When the occurrence that disagreed with it was recorded.
+    pub dropped_at: DateTime<Utc>,
+}
+
+/// One negative memory read on its own, in full.
+///
+/// Three things a list row cannot carry and a person deciding whether to clear
+/// one needs: what it still requires, what it stopped requiring, and whether
+/// anything has already corrected it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BurnRecord {
+    /// The memory itself, live or already corrected. Not filtered on
+    /// `superseded_by`: a corrected memory stays readable, which is the whole
+    /// reason clearing is an overlay and not a delete.
+    pub memory: NegativeMemory,
+    /// The circumstances a later occurrence dropped, oldest drop first.
+    pub dropped: Vec<DroppedFacet>,
+    /// The correction written over it, when one has been.
+    pub correction: Option<NegativeMemory>,
 }
 
 /// The store behind negative memory.
@@ -128,6 +168,13 @@ pub trait NegativeMemoryStore: Send + Sync {
         note: String,
     ) -> impl Future<Output = Result<Vec<String>, CoreError>> + Send;
 
+    /// One memory read in full, by id, whether or not it has been corrected.
+    ///
+    /// `None` for an id this user does not hold, which covers both a memory
+    /// that was reaped and one another tenant holds - a caller cannot tell the
+    /// two apart, and must not be able to.
+    fn burn(&self, id: String) -> impl Future<Output = Result<Option<BurnRecord>, CoreError>> + Send;
+
     /// Everything ever recorded against `action`: live burns, extinguished
     /// ones, and the corrections written over them.
     ///
@@ -153,8 +200,24 @@ pub type RecordBurnFn = Arc<
         + Sync,
 >;
 
+/// Boxed async closure reading one memory in full, by id.
+///
+/// The read behind a person's "why will it not do this?", so it answers for a
+/// corrected memory as well as a live one.
+pub type InspectBurnFn = Arc<
+    dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<Option<BurnRecord>, CoreError>> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Boxed async closure writing a correction over burns that stopped applying.
 /// Args: `(burn_ids, note)`.
+///
+/// One closure serves both writers, because both write the same thing. A tool
+/// call succeeding where it once failed and a person deciding a lesson is wrong
+/// are the same event to the store: this lesson stopped applying, and here is
+/// the note saying why. A separate person-only path would be a second way to
+/// write one row, and the two would drift.
 pub type ExtinguishBurnsFn = Arc<
     dyn Fn(
             Vec<String>,

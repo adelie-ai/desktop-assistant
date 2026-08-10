@@ -294,6 +294,16 @@ fn classify(cmd: &api::Command) -> (&'static str, Capability) {
         // Client-side tool execution runs on the caller's own machine.
         api::Command::RegisterClientTools { .. } => ("register_client_tools", Tenant),
         api::Command::ClientToolResult { .. } => ("client_tool_result", Tenant),
+
+        // Negative memory: the caller's own record of what went badly, and
+        // their own judgement about it (#1186). Tenant, not admin - what one
+        // person's assistant tried is that person's, on the same footing as
+        // their knowledge and their scratchpads, and requiring administration
+        // would put a single-user desktop's own memory out of its owner's
+        // reach on any multi-tenant deployment.
+        api::Command::ListNegativeMemories => ("list_negative_memories", Tenant),
+        api::Command::GetNegativeMemory { .. } => ("get_negative_memory", Tenant),
+        api::Command::ClearNegativeMemory { .. } => ("clear_negative_memory", Tenant),
     }
 }
 

@@ -586,6 +586,13 @@ command_table! {
                 error: None,
             },
             Tenant),
+    ListNegativeMemories => (api::Command::ListNegativeMemories, Tenant),
+    GetNegativeMemory => (api::Command::GetNegativeMemory { id: "nm-1".to_string() }, Tenant),
+    ClearNegativeMemory => (api::Command::ClearNegativeMemory {
+                id: "nm-1".to_string(),
+                note: None,
+            },
+            Tenant),
 }
 
 /// Classifications that depend on the command's *payload* rather than its

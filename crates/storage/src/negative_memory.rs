@@ -15,14 +15,27 @@
 //!
 //! [`NegativeMemoryStore::record_burn`] does one of two things. With no live
 //! row for this identity it writes one, at full strength, scoped to every facet
-//! observed. With a live row it moves the confirmation stamp and deletes the
-//! situation facets this occurrence disagreed with - the failure happened
-//! without them, so they were not the cause.
+//! observed. With a live row it moves the confirmation stamp and marks the
+//! situation facets this occurrence disagreed with as dropped - the failure
+//! happened without them, so they were not the cause.
 //!
 //! A first write therefore cannot widen anything, because there is nothing to
 //! widen, and that is what makes broadening need a second occurrence. The two
 //! branches run in one transaction, so a concurrent second failure of the same
 //! act either creates the row or confirms it, never both.
+//!
+//! ## Widening is marked, not deleted
+//!
+//! A dropped facet keeps its row and gains a `dropped_at` stamp (#1186). Every
+//! scope read filters `dropped_at IS NULL`, so what the burn requires is
+//! unchanged by this; what changes is that the burn's own history of getting
+//! wider survives, and [`NegativeMemoryStore::burn`] reads it back.
+//!
+//! The reason is the same one the whole feature is shaped by. Widening is the
+//! only mechanism that over-generalizes a burn, over-generalization presents as
+//! reticence rather than as an error, and the deleted row was the only trace it
+//! left. A person looking at a burn that fires everywhere has to be able to see
+//! that it began at one host on one morning.
 //!
 //! ## Extinction copies rather than moves
 //!
@@ -51,12 +64,12 @@
 use chrono::{DateTime, Utc};
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::negative_memory::{
-    FORGET_DAYS, FUTURE_STAMP_TOLERANCE_HOURS, MAX_LIVE_BURNS, NegativeMemory, NegativeMemoryKind,
-    Scope,
+    FORGET_DAYS, FUTURE_STAMP_TOLERANCE_HOURS, Facet, MAX_LIVE_BURNS, NegativeMemory,
+    NegativeMemoryKind, Scope,
 };
 use desktop_assistant_core::ports::auth::current_user_id;
 use desktop_assistant_core::ports::negative_memory::{
-    BurnObservation, BurnWrite, NegativeMemoryStore,
+    BurnObservation, BurnRecord, BurnWrite, DroppedFacet, NegativeMemoryStore,
 };
 use sqlx::PgPool;
 
@@ -93,6 +106,9 @@ struct FacetRow {
     kind: String,
     name: String,
     value: String,
+    /// When a later occurrence dropped this requirement, if one has (#1186).
+    /// `None` is what the burn still requires; anything else is history.
+    dropped_at: Option<DateTime<Utc>>,
 }
 
 fn storage_error(e: sqlx::Error) -> CoreError {
@@ -128,10 +144,13 @@ fn assemble(rows: Vec<MemoryRow>, facets: Vec<FacetRow>) -> Vec<NegativeMemory> 
                 );
                 None
             })?;
+            // A dropped facet is history, not a requirement (#1186). It is read
+            // back only by the one-memory read, which shows a person how a burn
+            // got wider; the scope a burn is matched on is what is left.
             let scope = Scope::from_stored(
                 facets
                     .iter()
-                    .filter(|f| f.memory_id == row.id)
+                    .filter(|f| f.memory_id == row.id && f.dropped_at.is_none())
                     .map(|f| (f.kind.as_str(), f.name.as_str(), f.value.clone())),
             )
             .or_else(|| {
@@ -173,7 +192,7 @@ where
         return Ok(Vec::new());
     }
     sqlx::query_as::<_, FacetRow>(
-        "SELECT memory_id, kind, name, value \
+        "SELECT memory_id, kind, name, value, dropped_at \
          FROM negative_memory_facet \
          WHERE user_id = $1 AND memory_id = ANY($2)",
     )
@@ -378,6 +397,7 @@ impl NegativeMemoryStore for PgNegativeMemoryStore {
                 // occurrence pass unrecorded rather than make the burn wider.
                 let Some(current) = Scope::from_stored(
                     held.iter()
+                        .filter(|f| f.dropped_at.is_none())
                         .map(|f| (f.kind.as_str(), f.name.as_str(), f.value.clone())),
                 ) else {
                     return Err(CoreError::Storage(format!(
@@ -392,10 +412,18 @@ impl NegativeMemoryStore for PgNegativeMemoryStore {
                     .map(|(facet, _)| (facet.kind(), facet.name().to_string()))
                     .collect();
 
+                // Marked, not deleted (#1186). The burn stops requiring the
+                // facet either way - every scope read filters `dropped_at IS
+                // NULL` - and the stamped row is what lets a person see a burn
+                // widen. `dropped_at IS NULL` in the predicate keeps the stamp
+                // at the first drop: a facet is dropped once, and re-stamping
+                // it would date the widening to the last confirmation instead.
                 for (kind, name) in &dropped {
                     sqlx::query(
-                        "DELETE FROM negative_memory_facet \
-                         WHERE user_id = $1 AND memory_id = $2 AND kind = $3 AND name = $4",
+                        "UPDATE negative_memory_facet \
+                         SET dropped_at = NOW() \
+                         WHERE user_id = $1 AND memory_id = $2 AND kind = $3 AND name = $4 \
+                           AND dropped_at IS NULL",
                     )
                     .bind(user_id)
                     .bind(&row.id)
@@ -494,11 +522,15 @@ impl NegativeMemoryStore for PgNegativeMemoryStore {
                 )));
             }
 
+            // The correction states what the burn required when it was
+            // corrected, so a facet the burn had already dropped is left out
+            // (#1186). Copying one would have the correction assert a
+            // requirement the lesson itself had given up.
             sqlx::query(
                 "INSERT INTO negative_memory_facet (user_id, memory_id, kind, name, value) \
                  SELECT user_id, $1, kind, name, value \
                  FROM negative_memory_facet \
-                 WHERE user_id = $2 AND memory_id = $3 \
+                 WHERE user_id = $2 AND memory_id = $3 AND dropped_at IS NULL \
                  ON CONFLICT (user_id, memory_id, kind, name) DO NOTHING",
             )
             .bind(&correction_id)
@@ -533,6 +565,89 @@ impl NegativeMemoryStore for PgNegativeMemoryStore {
         }
         tx.commit().await.map_err(storage_error)?;
         Ok(extinguished)
+    }
+
+    async fn burn(&self, id: String) -> Result<Option<BurnRecord>, CoreError> {
+        let user_id = current_user_id();
+        let user_id = user_id.as_str();
+
+        // Deliberately not filtered on `kind` or on `superseded_by`. A person
+        // asking why a call was held reaches this read, and a memory that was
+        // corrected between the hold and the question must still answer -
+        // "cleared" is the answer they need, and an empty result reads as "gone"
+        // instead.
+        let rows = sqlx::query_as::<_, MemoryRow>(sqlx::AssertSqlSafe(format!(
+            "SELECT {MEMORY_COLUMNS} FROM negative_memory WHERE user_id = $1 AND id = $2"
+        )))
+        .bind(user_id)
+        .bind(&id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(storage_error)?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+
+        let facets = facets_for(&self.pool, user_id, std::slice::from_ref(&id)).await?;
+        // What a later occurrence dropped: read before `assemble`, which keeps
+        // only what the burn still requires. Oldest drop first, so the list
+        // reads as the order the burn widened in.
+        let mut dropped: Vec<DroppedFacet> = facets
+            .iter()
+            .filter_map(|f| {
+                let dropped_at = f.dropped_at?;
+                let facet = Facet::from_stored(&f.kind, &f.name).or_else(|| {
+                    // Same rule as `assemble`: a dimension this build cannot
+                    // name is one it cannot describe either, so it is left out
+                    // of the answer rather than guessed at.
+                    tracing::warn!(
+                        kind = %f.kind,
+                        "a dropped negative memory facet names a dimension this build \
+                         cannot read; leaving it out of the record"
+                    );
+                    None
+                })?;
+                Some(DroppedFacet {
+                    facet,
+                    value: f.value.clone(),
+                    dropped_at,
+                })
+            })
+            .collect();
+        dropped.sort_by(|a, b| {
+            a.dropped_at
+                .cmp(&b.dropped_at)
+                .then_with(|| a.facet.name().cmp(b.facet.name()))
+        });
+
+        // `assemble` drops a row this build cannot read whole, which is why the
+        // answer can still be `None` after a row came back.
+        let Some(memory) = assemble(rows, facets).into_iter().next() else {
+            return Ok(None);
+        };
+
+        let correction = match memory.superseded_by.as_deref() {
+            None => None,
+            Some(correction_id) => {
+                let rows = sqlx::query_as::<_, MemoryRow>(sqlx::AssertSqlSafe(format!(
+                    "SELECT {MEMORY_COLUMNS} FROM negative_memory WHERE user_id = $1 AND id = $2"
+                )))
+                .bind(user_id)
+                .bind(correction_id)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(storage_error)?;
+                let ids: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
+                let facets = facets_for(&self.pool, user_id, &ids).await?;
+                assemble(rows, facets).into_iter().next()
+            }
+        };
+
+        Ok(Some(BurnRecord {
+            memory,
+            dropped,
+            correction,
+        }))
     }
 
     async fn history(&self, action: String) -> Result<Vec<NegativeMemory>, CoreError> {

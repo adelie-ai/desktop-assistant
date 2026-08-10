@@ -7,7 +7,8 @@ use crate::context::{
     window_start,
 };
 use crate::domain::negative_memory::{
-    NegativeMemory, PendingAction, burns_that_fire, clamp_outcome, render_warning,
+    NegativeMemory, PendingAction, burns_that_fire, clamp_outcome, render_hold_notice,
+    render_warning,
 };
 use crate::domain::skill::{detect_kind, skill_content_hash};
 use crate::domain::{
@@ -3678,14 +3679,14 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 // The digest costs a hash, so it is taken once and shared by
                 // the places that need it.
                 let burn_identity = pending_action.as_ref().map(burn_key);
-                if let Some((pending, identity)) =
-                    pending_action.as_ref().zip(burn_identity.as_deref())
-                    && !live_burns.is_empty()
+                let fired_burns = pending_action
+                    .as_ref()
+                    .filter(|_| !live_burns.is_empty())
+                    .map(|pending| burns_that_fire(&live_burns, pending, Utc::now()))
+                    .unwrap_or_default();
+                if let Some(identity) = burn_identity.as_deref()
                     && !burns_met_this_turn.contains(identity)
-                    && let Some(warning) = render_warning(
-                        &burns_that_fire(&live_burns, pending, Utc::now()),
-                        Utc::now(),
-                    )
+                    && let Some(warning) = render_warning(&fired_burns, Utc::now())
                 {
                     tracing::info!(
                         tool = %Safe::name(&tool_call.name),
@@ -3696,10 +3697,18 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                         name: summarize_tool_name(&tool_call.name),
                         args: summarize_tool_value(&arguments),
                     });
+                    // The person's half of the interruption (#1186). The
+                    // warning above goes to the model in place of the tool
+                    // result and never reaches a screen, so without this the
+                    // held call reads as an assistant that simply would not
+                    // act - which is exactly how an over-general burn hides.
+                    // The notice names the lesson by id, so the reticence can
+                    // be looked up and cleared.
                     notify_tool_event(ToolEvent::Finished {
                         name: summarize_tool_name(&tool_call.name),
                         ok: false,
-                        output: "held: this act went badly before".to_string(),
+                        output: render_hold_notice(&fired_burns)
+                            .unwrap_or_else(|| "held: this act went badly before".to_string()),
                     });
                     conv.messages
                         .push(Message::tool_result(&tool_call.id, &warning));
