@@ -44,9 +44,16 @@
 //!   stale view then returns nothing instead of another scope's bytes.
 //! - No view installed means no read. There is no fallback to storage.
 //!
-//! A refusal never says which of those applied, and never says whether a
-//! message id exists somewhere else. An id in another conversation, an id
-//! belonging to another user, and an id nobody holds are one case to a caller.
+//! A refusal carries no bytes, and it never says whether a message id exists
+//! somewhere else. Two codes separate the two shapes of refusal, and neither
+//! describes another scope's data:
+//!
+//! - `TRANSCRIPT_OUT_OF_SCOPE` says nothing was readable here - no view
+//!   installed, or a view minted for another user or another conversation.
+//! - `MESSAGE_NOT_FOUND` says the transcript in scope holds no such id. That
+//!   is the one answer for an id in another conversation, an id belonging to
+//!   another user, and an id nobody holds, so the caller cannot tell those
+//!   three apart.
 //!
 //! ## Provenance
 //!
@@ -601,6 +608,10 @@ mod tests {
 
         let got = parse(&payload);
         assert_eq!(got["ok"], false, "{payload}");
+        assert_eq!(
+            got["code"], CODE_NOT_FOUND,
+            "the view holds no such id, and says only that: {payload}"
+        );
         assert!(got.get("content").is_none(), "{payload}");
         assert!(!payload.contains("other bytes"), "{payload}");
 
@@ -613,6 +624,10 @@ mod tests {
         .await;
         let got = parse(&payload);
         assert_eq!(got["ok"], false, "{payload}");
+        assert_eq!(
+            got["code"], CODE_OUT_OF_SCOPE,
+            "the view's own conversation stamp is the boundary this case exercises: {payload}"
+        );
         assert!(!payload.contains("other bytes"), "{payload}");
     }
 
