@@ -746,6 +746,12 @@ mod tests {
         RecallDispersion::measured(0.80, 0.06, 400).expect("a store's own statistics")
     }
 
+    /// A pad that measured its own, and put its distances somewhere else: a
+    /// note embeds `"<key> <content>"`, which is terser than an entry's body.
+    fn a_pad_dispersion() -> RecallDispersion {
+        RecallDispersion::measured(0.55, 0.09, 40).expect("a pad's own statistics")
+    }
+
     fn a_skill() -> RecallSkill {
         RecallSkill::new(
             "publish-a-crate",
@@ -839,6 +845,48 @@ mod tests {
         .expect("every arm answered");
 
         assert_eq!(candidates.entry_dispersion, Some(a_dispersion()));
+    }
+
+    /// Acceptance (#1167): the pad's own measured dispersion travels with its
+    /// notes, so the note arm is read against the pad's own geometry.
+    ///
+    /// This is what says the stated estimate is no longer what the arm is read
+    /// by. Before this the field was written `None` at this call site whatever
+    /// the pad answered, so a measurement could not reach the block however
+    /// many rows the pad held.
+    #[tokio::test]
+    async fn the_pads_measured_dispersion_travels_with_its_notes() {
+        let candidates = gather(
+            async { Ok((vec![], Some(a_dispersion()), None)) },
+            async { Ok((vec![a_note()], Some(a_pad_dispersion()))) },
+            no_skills(),
+        )
+        .await
+        .expect("every arm answered");
+
+        assert_eq!(candidates.note_dispersion, Some(a_pad_dispersion()));
+        assert_ne!(
+            candidates.note_dispersion,
+            candidates.entry_dispersion,
+            "the pad is its own source, so its spread is not the store's"
+        );
+    }
+
+    /// Acceptance (#1167): a pad too small to measure states nothing, and the
+    /// core then falls back to its stated estimate - which is the ordinary case
+    /// for one conversation's pad.
+    #[tokio::test]
+    async fn a_pad_that_states_no_dispersion_leaves_the_field_unmeasured() {
+        let candidates = gather(
+            async { Ok((vec![], Some(a_dispersion()), None)) },
+            async { Ok((vec![a_note()], None)) },
+            no_skills(),
+        )
+        .await
+        .expect("every arm answered");
+
+        assert_eq!(candidates.notes.len(), 1, "the notes still travel");
+        assert_eq!(candidates.note_dispersion, None);
     }
 
     /// A store that could not be measured costs the block its unit and nothing

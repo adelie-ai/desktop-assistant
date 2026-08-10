@@ -1214,3 +1214,144 @@ async fn the_scratchpad_arm_honours_the_subagent_read_snapshot() {
 
     fx.cleanup().await;
 }
+
+// -- the pad's own dispersion (#1167, was #1146) ------------------------------
+
+/// Seed enough embedded notes, evenly spread in angle, for the pad to state its
+/// own dispersion.
+///
+/// Spread rather than clustered, for the reason `seed_a_spread` gives on the
+/// knowledge side: half the rows at one distance and half at another gives a
+/// median absolute deviation of zero, which a measurement refuses as
+/// degenerate.
+async fn seed_a_pad_spread(pad: &PgScratchpadStore, conversation_id: &str, key_prefix: &str) {
+    for i in 0..RECALL_DISPERSION_MIN_ROWS {
+        seed_note(
+            pad,
+            conversation_id,
+            &format!("{key_prefix}-{i}"),
+            "a working note",
+            at_angle((i + 1) as f32 * 0.1),
+            MODEL,
+        )
+        .await;
+    }
+}
+
+/// Acceptance (#1167): the pad states its own dispersion where it holds enough
+/// rows to measure one, so the note arm is read against the pad's own geometry
+/// rather than a stated estimate fitted to neither source.
+///
+/// A note embeds `"<key> <content>"`, which is terser and more telegraphic than
+/// a knowledge entry's body, so the pad genuinely puts its distances somewhere
+/// else. That is the whole reason the estimate was the weakest part of the arm.
+#[tokio::test]
+async fn the_pad_measures_the_dispersion_of_its_own_distances() {
+    let Some(fx) = fixture().await else { return };
+    let convs = PgConversationStore::new(fx.pool.clone());
+    let pad = PgScratchpadStore::new(fx.pool.clone());
+
+    with_user_id(UserId::new(USER), async {
+        convs.create(make_conversation("c1")).await.expect("conv");
+        seed_a_pad_spread(&pad, "c1", "spread").await;
+
+        let measured = pad
+            .nearest_by_embedding("c1", axis(0), MODEL, 10)
+            .await
+            .expect("the read succeeds")
+            .dispersion
+            .expect("a pad of this size states its own geometry");
+
+        let median = measured.distance_at(0.0);
+        assert!(
+            (0.3..0.7).contains(&median),
+            "the median of an evenly spread pad is a middling distance: {median}"
+        );
+        assert!(
+            measured.deviations_below_median(0.0) > 1.0,
+            "a note on the query's own axis stands out of that median: {measured:?}"
+        );
+    })
+    .await;
+
+    fx.cleanup().await;
+}
+
+/// Acceptance (#1167): a pad under the sample floor states nothing, and the
+/// block falls back to its stated estimate.
+///
+/// One conversation's pad is usually this small, so this is the ordinary case
+/// rather than the edge one. A median absolute deviation over a handful of rows
+/// is noise, and a noisy unit makes the dimensionless bar meaningless.
+#[tokio::test]
+async fn a_pad_under_the_sample_floor_states_no_dispersion() {
+    let Some(fx) = fixture().await else { return };
+    let convs = PgConversationStore::new(fx.pool.clone());
+    let pad = PgScratchpadStore::new(fx.pool.clone());
+
+    with_user_id(UserId::new(USER), async {
+        convs.create(make_conversation("c1")).await.expect("conv");
+        for i in 0..(RECALL_DISPERSION_MIN_ROWS - 1) {
+            seed_note(
+                &pad,
+                "c1",
+                &format!("small-{i}"),
+                "a working note",
+                at_angle((i + 1) as f32 * 0.1),
+                MODEL,
+            )
+            .await;
+        }
+
+        let answered = pad
+            .nearest_by_embedding("c1", axis(0), MODEL, 50)
+            .await
+            .expect("the read succeeds");
+
+        assert_eq!(
+            answered.notes.len(),
+            RECALL_DISPERSION_MIN_ROWS - 1,
+            "the notes still travel; only the measurement is refused"
+        );
+        assert_eq!(
+            answered.dispersion, None,
+            "a handful of rows is not a distribution"
+        );
+    })
+    .await;
+
+    fx.cleanup().await;
+}
+
+/// The measurement is this pad's, so it stops at the conversation boundary the
+/// way every other read here does. Another conversation's notes would move the
+/// median the bar is read against.
+#[tokio::test]
+async fn the_pad_dispersion_never_crosses_the_conversation_boundary() {
+    let Some(fx) = fixture().await else { return };
+    let convs = PgConversationStore::new(fx.pool.clone());
+    let pad = PgScratchpadStore::new(fx.pool.clone());
+
+    with_user_id(UserId::new(USER), async {
+        convs.create(make_conversation("c1")).await.expect("conv c1");
+        convs.create(make_conversation("c2")).await.expect("conv c2");
+        // The other conversation's pad states a dispersion on its own, so a
+        // read that crossed the boundary would answer with one.
+        seed_a_pad_spread(&pad, "c2", "theirs").await;
+        seed_note(&pad, "c1", "mine", "this task's finding", axis(0), MODEL).await;
+
+        let answered = pad
+            .nearest_by_embedding("c1", axis(0), MODEL, 10)
+            .await
+            .expect("the read succeeds");
+
+        assert_eq!(answered.notes.len(), 1, "this pad holds one note");
+        assert_eq!(
+            answered.dispersion, None,
+            "one note is not a distribution, whatever another conversation holds"
+        );
+    })
+    .await;
+
+    fx.cleanup().await;
+}
