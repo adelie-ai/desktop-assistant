@@ -32,9 +32,12 @@ use sqlx::{PgPool, Postgres, Transaction};
 /// differ on it, and this function deliberately does not settle it for them.
 ///
 /// **A zero `ceiling` means no timeout at all in PostgreSQL**, so passing one
-/// disables the bound rather than tightening it. Nothing here rejects that: the
-/// value comes from a constant beside its own call site, and each of those is
-/// pinned by a test that says the constant is positive.
+/// disables the bound rather than tightening it. Nothing here rejects that, and
+/// nothing downstream would notice: a store built with
+/// `with_scan_ceiling(Duration::ZERO)` runs unbounded and reports no error.
+/// What holds the deployment path is that each store's default is a constant
+/// pinned positive by its own test, and that the override exists for tests
+/// rather than for configuration - no daemon call site passes one.
 pub async fn begin_bounded(
     pool: &PgPool,
     ceiling: Duration,

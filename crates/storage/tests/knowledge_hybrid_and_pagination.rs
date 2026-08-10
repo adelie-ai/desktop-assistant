@@ -1441,3 +1441,135 @@ async fn the_hybrid_scan_still_answers_when_no_row_can_be_compared() {
     )
     .await;
 }
+
+#[tokio::test]
+async fn knowledge_hybrid_search_admits_a_row_the_query_names_even_when_the_vector_arm_ranks_it_low()
+ {
+    // The defect this arm's admission exists to avoid, and the one shape of it
+    // that no later ranking term could ever repair: a row the query names
+    // exactly, which the vector arm CAN compare but ranks in the middle of the
+    // store, must still reach the candidate set. Excluding every row the vector
+    // arm reached - which is what "the full-text arm covers what the vector arm
+    // cannot" reduces to on an embedded store - made the arm return nothing at
+    // all, so no weight on any term could have lifted such a row back.
+    //
+    // MUTATION: adding `AND NOT EXISTS (SELECT 1 FROM d WHERE d.id = kb.id)`
+    // back to the lexical arm drops "serial" from the answer entirely -> RED.
+    //
+    // The page ORDER is deliberately not asserted. On an embedded store this
+    // row is ranked by its distance and sinks; #1239 is the term that would
+    // lift it, and this test is what says the term will have something to lift.
+    with_fixture(
+        "knowledge_hybrid_search_admits_a_row_the_query_names_even_when_the_vector_arm_ranks_it_low",
+        |fx| async move {
+            let store =
+                PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
+
+            with_user_id(UserId::new("alice"), async {
+                store
+                    .write(KnowledgeEntry::new(
+                        "serial",
+                        "the widget carries serial gronk48219",
+                        vec![],
+                    ))
+                    .await
+                    .expect("write serial");
+                for i in 0..8u32 {
+                    store
+                        .write(KnowledgeEntry::new(
+                            format!("filler{i:02}"),
+                            format!("unrelated prose about other matters {i}"),
+                            vec![],
+                        ))
+                        .await
+                        .unwrap_or_else(|e| panic!("write filler{i:02}: {e}"));
+                }
+            })
+            .await;
+            // Every filler row sits nearer the query vector than "serial" does,
+            // so the vector arm ranks "serial" last of the nine.
+            for i in 0..8u32 {
+                let f = i as f32 * 0.01;
+                set_embedding(
+                    &fx.pool,
+                    &format!("filler{i:02}"),
+                    vec![vec![1.0 - f, f, 0.0]],
+                )
+                .await;
+            }
+            set_embedding(&fx.pool, "serial", vec![vec![0.0, 1.0, 0.0]]).await;
+
+            let hits = with_user_id(UserId::new("alice"), async {
+                store
+                    .search("gronk48219", vec![1.0, 0.0, 0.0], MODEL, None, None, 20)
+                    .await
+            })
+            .await
+            .expect("search")
+            .entries;
+            let ids: Vec<&str> = hits.iter().map(|e| e.id.as_str()).collect();
+            assert!(
+                ids.contains(&"serial"),
+                "a row the query names exactly must reach the candidate set however the vector \
+                 arm ranks it; got {ids:?}"
+            );
+            assert_eq!(
+                ids.iter().filter(|id| **id == "serial").count(),
+                1,
+                "both arms admit it, and the page must carry it once; got {ids:?}"
+            );
+            fx
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn knowledge_hybrid_search_carries_provenance_so_salience_reads_the_same_as_the_block() {
+    // The salience term reads an entry's own provenance, so a page that dropped
+    // the column scored every deliberately-written entry below what the
+    // [Recall] block scores it - the drift this work exists to remove, in the
+    // one field the search projection did not carry.
+    //
+    // MUTATION: dropping `kb.source` from the projection, or restoring
+    // `source: None` in `KbSearchRow::into_entry`, turns this RED.
+    with_fixture(
+        "knowledge_hybrid_search_carries_provenance_so_salience_reads_the_same_as_the_block",
+        |fx| async move {
+            let store =
+                PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
+
+            with_user_id(UserId::new("alice"), async {
+                let mut entry = KnowledgeEntry::new("deliberate", "the deploy window", vec![]);
+                entry.source = Some("explicit".to_string());
+                store.write(entry).await.expect("write deliberate");
+            })
+            .await;
+            set_embedding(&fx.pool, "deliberate", vec![vec![1.0, 0.0, 0.0]]).await;
+
+            let hits = with_user_id(UserId::new("alice"), async {
+                store
+                    .search(
+                        "the deploy window",
+                        vec![1.0, 0.0, 0.0],
+                        MODEL,
+                        None,
+                        None,
+                        10,
+                    )
+                    .await
+            })
+            .await
+            .expect("search")
+            .entries;
+
+            assert_eq!(
+                hits.first().and_then(|e| e.source.as_deref()),
+                Some("explicit"),
+                "the search page must carry the provenance the salience term reads"
+            );
+            fx
+        },
+    )
+    .await;
+}

@@ -18,26 +18,38 @@
 //! - The vector arm measures every in-scope row this query can be compared
 //!   with, states the store's own median and median absolute deviation over
 //!   those distances, and admits the nearest of them.
-//! - The full-text arm admits rows the vector arm cannot compare at all - a row
-//!   written since the last embedding backfill, or one still stamped with a
-//!   superseded model. Such a row carries no distance, so it carries no
-//!   semantic term and no activation score; it keeps the order the database
-//!   ranked it in and follows the measured rows. See `rank_page`, which is
-//!   private to this crate.
+//! - The full-text arm admits every row that carries the query's words, whether
+//!   or not the vector arm can compare it. One it can compare arrives with its
+//!   distance and is scored like any other; one it cannot - a row written since
+//!   the last embedding backfill, or one still stamped with a superseded model -
+//!   carries no distance, so it carries no semantic term and no activation
+//!   score, and it keeps the order the database ranked it in and follows the
+//!   measured rows. See `rank_page`, which is private to this crate.
 //!
 //! ## The cost this accepts, stated rather than left to be found
 //!
-//! On a store whose rows are embedded, the full-text arm no longer decides any
-//! line of a full page: it fills the page only where the vector arm returned
-//! fewer rows than were asked for. A query whose whole signal is lexical - an
-//! identifier, a serial number, a quoted phrase an embedding represents poorly -
-//! therefore loses the ranking help reciprocal-rank fusion gave it.
+//! **A lexical hit can be ranked off the page.** On a store whose rows are
+//! embedded, the full-text arm no longer decides any line of a full page: every
+//! candidate it admits that the vector arm can compare is ranked on that
+//! distance, and one the query names exactly but that the embedding puts in the
+//! middle of the store sinks below the nearest rows and is cut by the caller's
+//! own limit. Measured on a seeded store of thirty-one rows: a row whose content
+//! carries a distinctive identifier, embedded at vector rank thirteen, led the
+//! page under reciprocal-rank fusion and does not appear on a page of five or
+//! ten now.
 //!
-//! What would give it back is the activation score's own full-text-rank term,
-//! which `activation`'s documentation lists as awaiting an input because a
-//! recall lookup uses one mode at a time and so supplies no rank. This path is
-//! the first that supplies both, and #1239 is where that term is tracked. A
-//! rank-shaped tiebreak bolted on here instead would reintroduce exactly what
+//! So a query whose whole signal is lexical - an identifier, a serial number, a
+//! quoted phrase an embedding represents poorly - is the case this change is
+//! worst for, and `builtin_knowledge_base_search` is the only text search the
+//! model has.
+//!
+//! What gives it back is the activation score's own full-text-rank term, which
+//! `activation`'s documentation lists as awaiting an input because a recall
+//! lookup uses one mode at a time and so supplies no rank. This path is the
+//! first that supplies both, and #1239 is where that term is designed. **The
+//! admission above is what makes that fixable**: a row excluded from the
+//! candidate set could never be lifted by any term, whatever weight it carried.
+//! A rank-shaped tiebreak bolted on here instead would reintroduce exactly what
 //! this change removes.
 
 use std::collections::HashMap;
@@ -89,6 +101,15 @@ pub(crate) struct SearchCandidate {
 ///
 /// `records` may be empty: a use log that could not be read costs the order and
 /// never the page, exactly as it does on the recall path.
+///
+/// **This is the second implementation of the ranking policy**, beside
+/// `core::recall`'s own, and the two already differ on the mixed set: that one
+/// refuses to rank at all where some candidates carry a distance and some do
+/// not, because for its caller a mixed set means an adapter fused two modes.
+/// Here a mixed set is what the two arms produce by construction, so refusing
+/// would turn the ranking off on every call. Both read one `activation`, so the
+/// score has one definition; nothing holds the policy or the inputs together,
+/// and #1244 is where that is fixed.
 pub(crate) fn rank_page(
     candidates: Vec<SearchCandidate>,
     dispersion: RecallDispersion,
@@ -99,8 +120,15 @@ pub(crate) fn rank_page(
     let weights = ActivationWeights::default();
     let mut measured: Vec<(f64, KnowledgeEntry)> = Vec::new();
     let mut unmeasured: Vec<KnowledgeEntry> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for candidate in candidates {
+        // The two arms admit independently, so a row the query names and the
+        // vector arm can compare arrives from both. The scan orders the vector
+        // arm's rows first, so the first copy is the one carrying a distance.
+        if !seen.insert(candidate.entry.id.clone()) {
+            continue;
+        }
         let Some(distance) = candidate.distance else {
             unmeasured.push(candidate.entry);
             continue;
@@ -148,12 +176,19 @@ pub(crate) fn rank_page(
 /// measured in the pass that ranks, or they describe a geometry nothing here
 /// saw.
 ///
-/// `lexical` excludes every row `d` reached, by id, so the two lists never hold
-/// the same row and a row the vector arm can compare is never ranked as though
-/// it could not be. It is cut to `$5` - the caller's own page size - because
-/// nothing reorders it: at most a whole page of such rows can ever show.
-/// `measured` is cut to `$3`, which over-fetches, because activation reorders
-/// it and a row it lifts has to be in the set to be lifted.
+/// **`lexical` admits on the query's words alone, whether or not `d` reached the
+/// row.** It left-joins `d`, so a row the vector arm can compare arrives with
+/// its distance and is scored like any other, and a row it cannot arrives with
+/// none. Excluding the rows `d` reached - which was this query's first shape -
+/// made the full-text arm return nothing at all on a store whose rows are
+/// embedded, so a row the query names exactly was not merely ranked low but
+/// absent from the candidate set, and no later term could ever lift it. The two
+/// lists may now hold the same row twice; `rank_page` keeps the first.
+///
+/// `lexical` is cut to `$5`, the caller's own page size: nothing can put more
+/// than a page of them in front of the caller. `measured` is cut to `$3`, which
+/// over-fetches, because activation reorders it and a row it lifts has to be in
+/// the set to be lifted.
 ///
 /// Both arms carry the whole scope - the user, the live-row predicate, and both
 /// tag filters. A predicate present on one arm and missing from the other would
@@ -223,16 +258,17 @@ pub const HYBRID_SEARCH_SQL: &str = "\
      ),
      lexical AS (
          SELECT kb.id,
-                NULL::float8 AS distance,
+                d.distance,
                 row_number() OVER (ORDER BY ts_rank_cd(kb.tsv, query) DESC,
                                             kb.updated_at DESC, kb.id DESC) AS seat
-         FROM knowledge_base kb, plainto_tsquery('english', $4) query
+         FROM knowledge_base kb
+         CROSS JOIN plainto_tsquery('english', $4) AS query
+         LEFT JOIN d ON d.id = kb.id
          WHERE kb.user_id = $6
            AND kb.deleted_at IS NULL
            AND ($2::text[] IS NULL OR kb.tags && $2)
            AND ($7::text[] IS NULL OR NOT (kb.tags && $7))
            AND kb.tsv @@ query
-           AND NOT EXISTS (SELECT 1 FROM d WHERE d.id = kb.id)
          ORDER BY ts_rank_cd(kb.tsv, query) DESC, kb.updated_at DESC, kb.id DESC
          LIMIT $5
      ),
@@ -241,7 +277,8 @@ pub const HYBRID_SEARCH_SQL: &str = "\
          UNION ALL
          SELECT id, distance, 1 AS arm, seat FROM lexical
      )
-     SELECT kb.id, kb.content, kb.tags, kb.metadata, kb.created_at, kb.updated_at, kb.summary,
+     SELECT kb.id, kb.content, kb.tags, kb.metadata, kb.created_at, kb.updated_at,
+            kb.source, kb.summary,
             a.distance, s.median, s.rows_read, s.deviation
      FROM admitted a
      JOIN knowledge_base kb
@@ -501,9 +538,13 @@ mod tests {
     /// enforces - and this table holds every tenant's knowledge.
     #[test]
     fn both_arms_of_the_hybrid_scan_carry_the_same_scope() {
+        // Bounded at the next CTE, so the slice is the arm alone. Reaching past
+        // it would take in the final join, which repeats the same scope - and a
+        // test that reads the scope twice cannot see it removed from the arm.
         let lexical = HYBRID_SEARCH_SQL
             .split("lexical AS (")
             .nth(1)
+            .and_then(|arm| arm.split("     admitted AS (").next())
             .expect("the scan has a full-text arm");
         let measured = HYBRID_SEARCH_SQL
             .split("     m AS (")

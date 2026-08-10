@@ -140,9 +140,12 @@ pub struct NearestNotes {
 ///
 /// The three scope bounds - the user, the conversation, and the caller's
 /// `owner_todo` read snapshot - sit on `d`, so they bound the measurement as
-/// well as the candidates, and are repeated on the join that reads the rows.
-/// A scope predicate that appears once is a scope predicate one refactor can
-/// lose, and this table holds every tenant's working notes.
+/// well as the candidates. The join that reads the rows repeats the two that a
+/// row can be addressed by, the user and the conversation: a scope predicate
+/// that appears once is a scope predicate one refactor can lose, and this table
+/// holds every tenant's working notes. The `owner_todo` snapshot and the goal
+/// exclusion are not repeated, because the join is on `d.id` and a row `d` never
+/// selected cannot arrive through it.
 ///
 /// An empty pad yields no rows at all: `d` is empty, so `s` is empty, and the
 /// cross join answers with nothing rather than with a spread of nothing.
@@ -678,6 +681,23 @@ impl PgScratchpadStore {
     /// ordinary answer rather than the exceptional one; what the measurement
     /// buys is the long conversation, whose pad is both large enough to measure
     /// and least like the store.
+    ///
+    /// **A pad whose distances are widely spread renders nothing, and that is
+    /// the bar working rather than the arm failing.** The bar is stated in
+    /// deviations, so a source whose deviation is more than about a seventh of
+    /// its median puts the bar past any distance a cosine can take, and no note
+    /// of it is exceptional enough to show. That is the same rule
+    /// `no_raw_cosine_constant_decides_whether_the_block_renders` (#1121) pins
+    /// for the knowledge store, and refusing such a measurement would put a
+    /// fixed distance back in charge of who renders - which is what the whole
+    /// dimensionless bar exists to prevent.
+    ///
+    /// It does mean a real behaviour change the moment a pad is large enough to
+    /// measure: before this the pad was always read by the stated estimate, so
+    /// it rendered whatever sat inside 0.31 of cosine distance. A pad that
+    /// measures wide now renders nothing where it used to render lines. #1243
+    /// is where a real pad's geometry is measured against a real embedding
+    /// model, because nothing here knows whether real pads are wide.
     ///
     /// Scoped by an explicit `WHERE user_id` **and** `conversation_id`
     /// predicate, plus the caller's `owner_todo` read snapshot - the same three

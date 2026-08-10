@@ -321,18 +321,8 @@ impl PgKnowledgeUseLog {
     /// would otherwise accumulate abandoned reads at the rate turns arrive.
     /// Same rule, and the same reason, as
     /// `PgKnowledgeBaseStore::nearest_by_embedding`.
-    async fn bounded_read(&self) -> Result<sqlx::Transaction<'_, sqlx::Postgres>, CoreError> {
-        let mut read = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| CoreError::Storage(e.to_string()))?;
-        sqlx::query("SELECT set_config('statement_timeout', $1, true)")
-            .bind(USE_LOG_READ_STATEMENT_TIMEOUT.as_millis().to_string())
-            .execute(&mut *read)
-            .await
-            .map_err(|e| CoreError::Storage(e.to_string()))?;
-        Ok(read)
+    async fn bounded_read(&self) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, CoreError> {
+        crate::scan_bound::begin_bounded(&self.pool, USE_LOG_READ_STATEMENT_TIMEOUT).await
     }
 
     /// One attempt at the mark write, in its own transaction.

@@ -1277,6 +1277,13 @@ async fn the_pad_measures_the_dispersion_of_its_own_distances() {
             measured.deviations_below_median(0.0) > 1.0,
             "a note on the query's own axis stands out of that median: {measured:?}"
         );
+        // Deliberately not an assertion that the arm renders. This fixture is
+        // spread far wider in angle than one conversation's notes are, so what
+        // it proves is that the pad states its own geometry - not that a note
+        // clears the bar under it. `RECALL_DISPERSION_MAX_RELATIVE_SPREAD` is
+        // what keeps a spread this wide from silencing the arm, and
+        // `a_source_at_the_widest_readable_spread_can_still_clear_the_bar`
+        // is where that is checked.
     })
     .await;
 

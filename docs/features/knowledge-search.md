@@ -105,8 +105,9 @@ Reporting that as a match count would state a falsehood.
 ## What decides the order (#1167)
 
 `results` is ordered by the **activation score**, the same score the `[Recall]`
-block ranks by, so a person cannot get one ordering from the tool and another
-from the block.
+block ranks by, so the tool and the block read one rule rather than two. The
+rule is shared; what is not yet held mechanically is that both paths feed it the
+same inputs, which issue #1244 covers.
 
 The two arms admit and the score ranks:
 
@@ -117,11 +118,12 @@ The two arms admit and the score ranks:
   - never a raw distance, which means nothing across a store or an embedding
   model. Added to it: what the use log knows about the entry, and what the
   entry's own text says about how salient it is.
-- The **full-text arm** admits rows the vector arm cannot compare at all: one
-  written since the last embedding backfill, or one still stamped with a
-  superseded model. Such a row carries no distance, so it carries no semantic
-  term and no score. It keeps the order the database ranked it in and follows
-  the rows that were measured.
+- The **full-text arm** admits every row that carries the query's words,
+  whether or not the vector arm can compare it. One it can compare arrives with
+  its distance and is scored like any other. One it cannot - a row written since
+  the last embedding backfill, or one still stamped with a superseded model -
+  carries no distance, so it carries no semantic term and no score, and it keeps
+  the order the database ranked it in and follows the rows that were measured.
 
 The spread is measured in the pass that ranks and is never cached: the median
 and the deviation are statistics of the distances from *this* query's point, so
@@ -129,14 +131,22 @@ a query in a dense region of the store has a different distribution from one in
 a sparse region. A store too small to state one is read by the same stated
 estimate the block falls back to.
 
-**What this costs, stated rather than left to be found.** On a store whose rows
-are embedded, the full-text arm no longer decides any line of a full page - it
-fills the page only where the vector arm returned fewer rows than were asked
-for. A query whose whole signal is lexical (an identifier, a serial number, a
-quoted phrase an embedding represents poorly) therefore lost the ranking help
-the previous reciprocal-rank fusion gave it. Issue #1239 tracks the activation
-score's own full-text-rank term, which is what gives that back without
-reintroducing a fused rank.
+**What this costs, stated rather than left to be found.** A lexical hit can be
+ranked off the page. On a store whose rows are embedded, the full-text arm no
+longer decides any line of a full page: every candidate it admits that the
+vector arm can compare is ranked on that distance, so a row the query names
+exactly but that the embedding puts in the middle of the store sinks below the
+nearest rows and is cut by the caller's own `limit`. Measured on a seeded store
+of thirty-one rows, a row carrying a distinctive identifier and embedded at
+vector rank thirteen led the page under the previous reciprocal-rank fusion and
+appears on neither a page of five nor a page of ten now.
+
+A query whose whole signal is lexical - an identifier, a serial number, a quoted
+phrase an embedding represents poorly - is the case this is worst for, and
+`builtin_knowledge_base_search` is the only text search the model has. Issue
+#1239 tracks the activation score's own full-text-rank term, which is what gives
+that back without reintroducing a fused rank; the row stays in the candidate set
+so the term has something to lift.
 
 The four values:
 

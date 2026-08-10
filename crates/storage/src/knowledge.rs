@@ -411,8 +411,11 @@ impl PgKnowledgeBaseStore {
     /// store has a different distribution from one in a sparse region. A store
     /// too small to state one leaves the page on
     /// [`RECALL_ASSUMED_DISPERSION`](desktop_assistant_core::recall::RECALL_ASSUMED_DISPERSION),
-    /// which is the same estimate the `[Recall]` block falls back to - one rule
-    /// and one estimate, so the tool and the block cannot drift.
+    /// which is the same estimate the `[Recall]` block falls back to: one
+    /// estimate rather than two, read through one `activation`. What is *not*
+    /// held mechanically is that the two paths hand that function the same
+    /// inputs - #1244 - so a column this projection drops is a difference
+    /// nothing here would catch.
     ///
     /// The scan carries [`RECALL_SCAN_STATEMENT_TIMEOUT`]: it reads every
     /// comparable row in scope to state the spread, so it is a full scan and it
@@ -1057,6 +1060,13 @@ struct KbSearchRow {
     metadata: serde_json::Value,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
+    /// Read by the search page, unlike the pre-#1167 projection which dropped
+    /// it. Provenance is one of the signals
+    /// [`SalienceReading`](desktop_assistant_core::domain::salience::SalienceReading)
+    /// reads, so a page that dropped it scored every deliberately-written entry
+    /// below what the `[Recall]` block scores it - which is exactly the drift
+    /// this work exists to remove.
+    source: Option<String>,
     summary: Option<String>,
     /// `None` for a row the full-text arm admitted and the vector arm cannot
     /// compare - no stored vector, or one from another model.
@@ -1085,8 +1095,7 @@ impl KbSearchRow {
             metadata: self.metadata,
             created_at: self.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
             updated_at: self.updated_at.format("%Y-%m-%d %H:%M:%S").to_string(),
-            // Search does not select provenance; the audit/list path does.
-            source: None,
+            source: self.source,
             // Search does select the summary: it is what a caller reads to
             // decide whether a hit is worth pulling the body for.
             summary: self.summary,

@@ -57,9 +57,12 @@ const UNMEETABLE: Duration = Duration::from_millis(1);
 
 /// How many rows the fixture seeds.
 ///
-/// Measured rather than guessed: over this corpus the full-text read takes
-/// more than a millisecond every time, so the cancellation below is the bound
-/// firing and not a flake waiting to happen.
+/// Chosen by measurement rather than by guess: over this corpus the full-text
+/// read took several milliseconds on every run here, so a one-millisecond bound
+/// fires on the scan rather than racing it. It is a margin, not a proof - a
+/// machine fast enough to finish this scan inside a millisecond would turn
+/// these tests green for the wrong reason, so raise the corpus rather than
+/// trusting the number if that ever happens.
 const CORPUS: i32 = 2_000;
 
 async fn fixture() -> Option<support::DbFixture> {

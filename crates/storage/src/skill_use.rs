@@ -227,16 +227,8 @@ impl SkillUseLog for PgSkillUseLog {
         // caller gives up first, and abandoning a future stops the daemon
         // waiting while leaving the backend working. `SET LOCAL` is scoped to a
         // transaction, so the read runs inside one.
-        let mut read = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| CoreError::Storage(e.to_string()))?;
-        sqlx::query("SELECT set_config('statement_timeout', $1, true)")
-            .bind(USE_LOG_READ_STATEMENT_TIMEOUT.as_millis().to_string())
-            .execute(&mut *read)
-            .await
-            .map_err(|e| CoreError::Storage(e.to_string()))?;
+        let mut read =
+            crate::scan_bound::begin_bounded(&self.pool, USE_LOG_READ_STATEMENT_TIMEOUT).await?;
 
         let stats: Vec<StatsRow> = sqlx::query_as(
             "SELECT skill_name, offered_count, opened_count, first_seen_at, \
