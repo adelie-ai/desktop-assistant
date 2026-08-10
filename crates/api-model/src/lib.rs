@@ -804,7 +804,9 @@ pub enum Command {
     /// requiring, and whether anything has corrected it.
     ///
     /// Returns [`CommandResult::NegativeMemory`], `None` for an id this user
-    /// does not hold.
+    /// does not hold and for the id of a correction - a correction is a record
+    /// of a lesson that stopped applying, not a lesson, and it is readable on
+    /// the memory it corrects.
     GetNegativeMemory {
         id: String,
     },
@@ -1314,15 +1316,24 @@ pub struct NegativeMemoryView {
     /// How much of full strength is left, `0.0` to `1.0`, at the moment the
     /// daemon answered. Halves every two weeks without a repeat.
     pub strength: f64,
-    /// Whether it is still strong enough to hold a call. A memory below the
-    /// floor stays readable and stops interrupting.
+    /// Whether this memory would hold a call today.
+    ///
+    /// **This, not `strength`, is what says whether a person's work is held.**
+    /// The two come apart: clearing a memory leaves its confirmation stamp
+    /// alone - the record keeps everything it had - so a memory cleared a
+    /// second ago still reads at full strength and holds nothing.
     pub firing: bool,
     /// When the lesson was first recorded, RFC 3339.
     pub written_at: String,
     /// When the same act last went badly, RFC 3339. Decay runs from here.
     pub last_confirmed_at: String,
     /// When it stops holding calls, if nothing confirms it again, RFC 3339.
-    /// Already in the past for a memory that has gone quiet on its own.
+    ///
+    /// In the future only when `firing` is true. A memory that has gone quiet
+    /// by decay reports the day it fell silent; one silenced any other way -
+    /// cleared, or carrying a stamp from beyond the daemon's clock - reports
+    /// the moment it was read. So a date still to come always means work still
+    /// held, and a client can render it without checking `firing` first.
     pub goes_quiet_at: String,
     /// Whether a correction has been written over it - by a person clearing it,
     /// or by the same act succeeding. A cleared memory holds nothing and is

@@ -124,6 +124,13 @@ shapes. They are gated on a database, like the rest of the feature, and report
 `unsupported` rather than an empty list without one - a person asking why the
 assistant will not act would read an empty list as "nothing is holding it".
 
+Strength and holding are two different questions, and the surface answers the
+second. A burn keeps its confirmation stamp when it is cleared, because the
+record is overlaid rather than changed, so a burn cleared a second ago still
+reads at full strength and holds nothing. `firing` asks the question the
+dispatch loop asks, and the expiry is in the future only where `firing` is
+true.
+
 **A widened burn shows how it widened.** A situation facet a second occurrence
 dropped keeps its row and gains a `dropped_at` stamp, and
 `get_negative_memory` returns those beside the scope. Widening is the only

@@ -39,6 +39,7 @@
 //! - `reading_a_burn_another_user_holds_returns_nothing`
 //! - `reading_a_burn_by_an_unknown_id_returns_nothing`
 //! - `a_third_occurrence_does_not_drop_a_facet_that_is_already_dropped`
+//! - `reading_a_correction_by_its_own_id_returns_nothing`
 //!
 //! ## Running locally
 //!
@@ -1274,6 +1275,41 @@ async fn a_third_occurrence_does_not_drop_a_facet_that_is_already_dropped() {
             "weekday".to_string()
         ],
         "with each circumstance dropped once, not once per later occurrence"
+    );
+    fx.cleanup().await;
+}
+
+/// A correction is not a lesson: it holds nothing and was never scoped to fire.
+/// The one-memory read answers for burns, so a correction's own id is a miss -
+/// the correction is readable where it belongs, on the burn it corrects.
+#[tokio::test]
+async fn reading_a_correction_by_its_own_id_returns_nothing() {
+    let Some(fx) = fixture().await else { return };
+    let store = PgNegativeMemoryStore::new(fx.pool.clone());
+
+    let burn = burn_as(
+        &store,
+        ALICE,
+        observation(at_the_workshop(), "build is a mount point"),
+    )
+    .await;
+    extinguish_as(&store, ALICE, vec![burn.id.clone()], "it works now").await;
+
+    let correction_id = read_burn_as(&store, ALICE, &burn.id)
+        .await
+        .expect("the cleared burn is readable")
+        .correction
+        .expect("and carries the correction over it")
+        .id;
+
+    assert!(
+        read_burn_as(&store, ALICE, &correction_id).await.is_none(),
+        "a correction does not answer as though it were an act being held"
+    );
+    assert!(
+        read_burn_as(&store, ALICE, &burn.id).await.is_some(),
+        "and the burn it corrects still does, so the miss above is the kind \
+         filter and not a broken read"
     );
     fx.cleanup().await;
 }

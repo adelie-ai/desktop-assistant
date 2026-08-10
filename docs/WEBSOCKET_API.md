@@ -343,12 +343,17 @@ memory, strongest first:
 ```
 
 `strength` is a fraction of full at the moment the daemon answered; it halves
-every two weeks without a repeat. `firing` says whether it is still strong
-enough to hold a call, and `goes_quiet_at` is when it stops - already in the
-past for a memory that has gone quiet on its own. `arguments` and
-`circumstances` are separate lists on purpose: an argument is the act's
-identity and never widens, a circumstance is provisional, and an argument may
-itself be *named* `host`.
+every two weeks without a repeat. **`firing`, not `strength`, is what says
+whether a person's work is held**: the two come apart, because clearing a
+memory leaves its confirmation stamp alone, so a memory cleared a second ago
+still reads at full strength and holds nothing. `goes_quiet_at` is in the
+future only when `firing` is true - a memory silenced by decay reports the day
+it fell silent, and one silenced any other way reports the moment it was read -
+so a date still to come always means work still held.
+
+`arguments` and `circumstances` are separate lists on purpose: an argument is
+the act's identity and never widens, a circumstance is provisional, and an
+argument may itself be *named* `host`.
 
 **The list is capped at 200 rows**, ordered by last confirmation, newest first.
 It is deliberately the same read a turn makes to decide what may hold a call,
@@ -359,7 +364,10 @@ memories confirmed more recently than the one dropped, and a memory that holds
 anything was confirmed inside the last four weeks.
 
 **`get_negative_memory { id }`** returns `negative_memory`, either `null` or one
-memory in full. Two fields a list row does not carry:
+memory in full. It answers for a cleared memory as well as a live one, and it
+answers `null` for a correction's own id - a correction is the record of a
+lesson that stopped applying rather than a lesson, and it is readable on the
+memory it corrects. Two fields a list row does not carry:
 
 - `dropped` - the circumstances the memory once required and no longer does,
   each with the value it was born requiring and the date it was dropped. A

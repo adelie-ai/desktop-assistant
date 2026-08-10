@@ -662,18 +662,24 @@ impl NegativeMemory {
     /// A confirmation moves this, because it moves
     /// [`last_confirmed_at`](Self::last_confirmed_at) and nothing else does.
     ///
-    /// `now` is taken rather than implied because one state cannot be answered
-    /// from the stamp alone. A stamp from beyond the reader's clock is a broken
-    /// clock rather than a fresher lesson, so [`Self::strength`] scores it zero
-    /// and it is silent already - and the arithmetic on its own would report a
-    /// date in the future for a burn that holds nothing. `now` is the honest
-    /// answer there: it went quiet the moment it was read.
+    /// `now` is taken rather than implied because decay is not the only way a
+    /// memory stops holding calls, and the other ways cannot be read off the
+    /// stamp. A memory a person cleared keeps its confirmation stamp - the
+    /// record is unchanged, only overlaid - so the decay arithmetic alone would
+    /// promise four more weeks of a memory that already holds nothing. A stamp
+    /// from beyond the reader's clock is the same shape of lie.
+    ///
+    /// **The invariant this holds: the date is in the future only for a memory
+    /// that can still fire.** Anything that holds nothing reports a date that
+    /// has already passed - its own, where decay is what silenced it, and `now`
+    /// where something else did.
     pub fn goes_quiet_at(&self, now: DateTime<Utc>) -> DateTime<Utc> {
-        if self.days_since_confirmed(now) < -future_tolerance_days() {
+        let seconds = silence_after_days() * 24.0 * 60.0 * 60.0;
+        let by_decay = self.last_confirmed_at + TimeDelta::milliseconds((seconds * 1000.0) as i64);
+        if by_decay > now && !self.can_fire(now) {
             return now;
         }
-        let seconds = silence_after_days() * 24.0 * 60.0 * 60.0;
-        self.last_confirmed_at + TimeDelta::milliseconds((seconds * 1000.0) as i64)
+        by_decay
     }
 
     /// Whether this should be dropped from the store.
@@ -691,19 +697,37 @@ impl NegativeMemory {
         days > f64::from(FORGET_DAYS) || days < -future_tolerance_days()
     }
 
+    /// Whether this could interrupt anything at all, before any particular
+    /// call is considered.
+    ///
+    /// Three of the ways a burn can be wrong about right now, and the three
+    /// that do not depend on what is about to be run: it must be a lesson
+    /// rather than a correction, nothing must have corrected it, and it must
+    /// still be loud enough.
+    ///
+    /// Split out because two callers ask different questions of the same rule.
+    /// The dispatch loop has a call in hand and asks [`Self::fires`]; a person
+    /// reading their own list has no call in hand and asks only this. Written
+    /// once, with `fires` built on it, so a reader cannot be told a memory
+    /// still holds their work while the loop would never fire it - which is
+    /// what a second hand-written copy of these three conditions would
+    /// eventually say.
+    pub fn can_fire(&self, now: DateTime<Utc>) -> bool {
+        self.kind == NegativeMemoryKind::Burn
+            && self.superseded_by.is_none()
+            && !self.is_silent(now)
+    }
+
     /// Whether this burn interrupts `pending`.
     ///
     /// Six conditions, and every one of them is a way the burn could be wrong
-    /// about right now: it must be a lesson rather than a correction, it must
-    /// not have been extinguished, it must be about this tool, it must be about
-    /// this call rather than another call of the same tool, it must still be
-    /// loud enough, and its circumstance must hold.
+    /// about right now: the three of [`Self::can_fire`], plus it must be about
+    /// this tool, about this call rather than another call of the same tool,
+    /// and its circumstance must hold.
     pub fn fires(&self, pending: &PendingAction, now: DateTime<Utc>) -> bool {
-        self.kind == NegativeMemoryKind::Burn
-            && self.superseded_by.is_none()
+        self.can_fire(now)
             && self.action == pending.action
             && self.fingerprint == pending.fingerprint
-            && !self.is_silent(now)
             && self.scope.matches(&pending.scope)
     }
 }
@@ -1832,22 +1856,73 @@ mod tests {
         );
     }
 
-    /// A stamp from beyond the reader's clock is a broken clock rather than a
-    /// fresher lesson, so the burn is silent already. The expiry a person is
-    /// shown has to say that, not a date four weeks out for a burn that holds
-    /// nothing.
+    /// The expiry a person is shown promises the future only where there is
+    /// something left to hold their work.
+    ///
+    /// Every way a memory can stop holding calls, because each reaches the
+    /// expiry by a different route and only one of them moves the confirmation
+    /// stamp the arithmetic reads.
     #[test]
-    fn a_burn_stamped_beyond_the_clock_is_shown_as_already_quiet() {
-        // `burn_aged` takes an age, so a negative age puts the stamp ahead.
-        let skewed = burn_aged(-TimeDelta::days(3));
+    fn the_expiry_is_in_the_future_only_for_a_memory_that_can_still_fire() {
+        let live = fresh_burn();
+        assert!(live.can_fire(now()));
         assert!(
-            skewed.is_silent(now()),
-            "a disbelieved stamp scores zero, so it is already quiet"
+            live.goes_quiet_at(now()) > now(),
+            "a live lesson is held until a date still to come"
+        );
+
+        // Cleared: the record keeps its stamp, so decay alone would promise
+        // four more weeks of a memory that holds nothing.
+        let mut cleared = fresh_burn();
+        cleared.superseded_by = Some("nm-correction".to_string());
+        assert!(!cleared.can_fire(now()));
+        assert!(
+            cleared.goes_quiet_at(now()) <= now(),
+            "a cleared memory went quiet when it was cleared, not four weeks on"
+        );
+
+        // A correction is a record and never fired in the first place.
+        let mut correction = fresh_burn();
+        correction.kind = NegativeMemoryKind::Correction;
+        assert!(correction.goes_quiet_at(now()) <= now());
+
+        // A stamp from beyond the reader's clock is a broken clock, not a
+        // fresher lesson: it scores zero and is quiet already.
+        let skewed = burn_aged(-TimeDelta::days(3));
+        assert!(!skewed.can_fire(now()));
+        assert!(skewed.goes_quiet_at(now()) <= now());
+
+        // Decayed on its own: the real date it went quiet, which is worth
+        // keeping rather than flattening to now.
+        let quiet = burn_aged(TimeDelta::days(40));
+        assert!(!quiet.can_fire(now()));
+        assert_eq!(
+            quiet.goes_quiet_at(now()),
+            quiet.last_confirmed_at + TimeDelta::days(28),
+            "decay reports the day it actually fell silent"
+        );
+    }
+
+    /// A held call always has something to say about itself.
+    ///
+    /// The two renderings are driven from one fired set and are guarded by one
+    /// of them, so they have to agree about emptiness. If they ever stop
+    /// agreeing, a call is held while the person is told nothing - which is the
+    /// state #1186 exists to remove, arriving silently.
+    #[test]
+    fn a_fired_set_renders_a_warning_and_a_hold_notice_together_or_neither() {
+        let held = [fresh_burn()];
+        let fired = burns_that_fire(&held, &the_call(), now());
+        assert!(!fired.is_empty());
+        assert_eq!(
+            render_warning(&fired, now()).is_some(),
+            render_hold_notice(&fired).is_some(),
+            "a fired set that warns the model also names the lesson for the person"
         );
         assert_eq!(
-            skewed.goes_quiet_at(now()),
-            now(),
-            "and the expiry says so, rather than a date it will never reach"
+            render_warning(&[], now()).is_some(),
+            render_hold_notice(&[]).is_some(),
+            "and an empty set does neither"
         );
     }
 
@@ -1916,5 +1991,39 @@ mod tests {
     #[test]
     fn no_fired_burn_renders_no_hold_notice() {
         assert!(render_hold_notice(&[]).is_none());
+    }
+
+    /// A memory a person is told is still holding their work has to be one the
+    /// dispatch loop would actually fire.
+    ///
+    /// The three call-independent conditions are asked once and `fires` is
+    /// built on them, so this checks that the shared answer agrees with the
+    /// loop's in all three of the ways it can be false - and that it does not
+    /// simply return false always.
+    #[test]
+    fn a_memory_that_cannot_fire_is_one_the_dispatch_loop_would_not_fire_either() {
+        let live = fresh_burn();
+        assert!(live.can_fire(now()), "a fresh lesson can hold a call");
+        assert!(live.fires(&the_call(), now()), "and it does hold its own");
+
+        let mut cleared = fresh_burn();
+        cleared.superseded_by = Some("nm-correction".to_string());
+        assert!(
+            !cleared.can_fire(now()),
+            "a cleared lesson holds nothing, whatever its strength"
+        );
+        assert!(!cleared.fires(&the_call(), now()));
+
+        let mut correction = fresh_burn();
+        correction.kind = NegativeMemoryKind::Correction;
+        assert!(
+            !correction.can_fire(now()),
+            "a correction is a record, not a lesson"
+        );
+        assert!(!correction.fires(&the_call(), now()));
+
+        let quiet = burn_aged(TimeDelta::days(40));
+        assert!(!quiet.can_fire(now()), "a decayed lesson holds nothing");
+        assert!(!quiet.fires(&the_call(), now()));
     }
 }

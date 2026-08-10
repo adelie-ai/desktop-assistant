@@ -144,16 +144,7 @@ fn assemble(rows: Vec<MemoryRow>, facets: Vec<FacetRow>) -> Vec<NegativeMemory> 
                 );
                 None
             })?;
-            // A dropped facet is history, not a requirement (#1186). It is read
-            // back only by the one-memory read, which shows a person how a burn
-            // got wider; the scope a burn is matched on is what is left.
-            let scope = Scope::from_stored(
-                facets
-                    .iter()
-                    .filter(|f| f.memory_id == row.id && f.dropped_at.is_none())
-                    .map(|f| (f.kind.as_str(), f.name.as_str(), f.value.clone())),
-            )
-            .or_else(|| {
+            let scope = live_scope(&facets, &row.id).or_else(|| {
                 tracing::warn!(
                     "negative memory row is scoped by a facet this build cannot name; \
                      skipping it"
@@ -176,7 +167,31 @@ fn assemble(rows: Vec<MemoryRow>, facets: Vec<FacetRow>) -> Vec<NegativeMemory> 
         .collect()
 }
 
+/// What memory `id` still requires, read out of a set of facet rows.
+///
+/// **The one place in this adapter that turns stored facets into a scope.** A
+/// dropped facet keeps its row so a person can see a burn widen (#1186), and it
+/// is history rather than a requirement, so every scope has to leave it out.
+/// Written once rather than as a filter repeated at each reader, because the
+/// cost of one reader forgetting is not a wrong display: it is a burn that
+/// silently requires less than it was written with, which is the
+/// over-generalization the whole feature exists to avoid.
+///
+/// `None` when a row names a dimension this build cannot resolve - the same
+/// answer [`Scope::from_stored`] gives, and for its reason.
+fn live_scope(facets: &[FacetRow], id: &str) -> Option<Scope> {
+    Scope::from_stored(
+        facets
+            .iter()
+            .filter(|f| f.memory_id == id && f.dropped_at.is_none())
+            .map(|f| (f.kind.as_str(), f.name.as_str(), f.value.clone())),
+    )
+}
+
 /// The facet rows for `ids`, or an empty set when there are none to ask about.
+///
+/// Dropped rows included: this is the raw read, and [`live_scope`] is what
+/// decides which of them a burn still requires.
 ///
 /// Generic over the executor so the confirm branch can read inside its own
 /// transaction, where the row it is about is already locked.
@@ -395,11 +410,7 @@ impl NegativeMemoryStore for PgNegativeMemoryStore {
                 // safely: dropping the unreadable facet would remove a
                 // requirement the lesson was written with. Refuse, and let the
                 // occurrence pass unrecorded rather than make the burn wider.
-                let Some(current) = Scope::from_stored(
-                    held.iter()
-                        .filter(|f| f.dropped_at.is_none())
-                        .map(|f| (f.kind.as_str(), f.name.as_str(), f.value.clone())),
-                ) else {
+                let Some(current) = live_scope(&held, &row.id) else {
                     return Err(CoreError::Storage(format!(
                         "negative memory {} is scoped by a facet this build cannot name",
                         row.id
@@ -571,24 +582,42 @@ impl NegativeMemoryStore for PgNegativeMemoryStore {
         let user_id = current_user_id();
         let user_id = user_id.as_str();
 
-        // Deliberately not filtered on `kind` or on `superseded_by`. A person
-        // asking why a call was held reaches this read, and a memory that was
-        // corrected between the hold and the question must still answer -
-        // "cleared" is the answer they need, and an empty result reads as "gone"
-        // instead.
+        // Three reads make one answer, and a turn confirming this act between
+        // them would tear it: an occurrence count from before the write beside
+        // the facets it dropped, which is a state widening cannot produce and a
+        // person cannot make sense of. One snapshot for all three. Read-only,
+        // so the stricter isolation costs a snapshot and can raise nothing.
+        let mut tx = self.pool.begin().await.map_err(storage_error)?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .execute(&mut *tx)
+            .await
+            .map_err(storage_error)?;
+
+        // Filtered on `kind`, and deliberately NOT on `superseded_by`.
+        //
+        // Not on `superseded_by`, because a person asking why a call was held
+        // must still get an answer for a memory cleared since - "cleared" is
+        // the answer they need, and an empty result reads as "gone".
+        //
+        // On `kind`, because a correction is not a lesson: it holds nothing and
+        // it was never scoped to fire. Answering with one would describe a
+        // record as though it were an act being held, and the reader has no
+        // field to tell them otherwise. A correction is readable where it
+        // belongs, on the burn it corrects.
         let rows = sqlx::query_as::<_, MemoryRow>(sqlx::AssertSqlSafe(format!(
-            "SELECT {MEMORY_COLUMNS} FROM negative_memory WHERE user_id = $1 AND id = $2"
+            "SELECT {MEMORY_COLUMNS} FROM negative_memory \
+             WHERE user_id = $1 AND id = $2 AND kind = 'burn'"
         )))
         .bind(user_id)
         .bind(&id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await
         .map_err(storage_error)?;
         if rows.is_empty() {
             return Ok(None);
         }
 
-        let facets = facets_for(&self.pool, user_id, std::slice::from_ref(&id)).await?;
+        let facets = facets_for(&mut *tx, user_id, std::slice::from_ref(&id)).await?;
         // What a later occurrence dropped: read before `assemble`, which keeps
         // only what the burn still requires. Oldest drop first, so the list
         // reads as the order the burn widened in.
@@ -634,15 +663,19 @@ impl NegativeMemoryStore for PgNegativeMemoryStore {
                 )))
                 .bind(user_id)
                 .bind(correction_id)
-                .fetch_all(&self.pool)
+                .fetch_all(&mut *tx)
                 .await
                 .map_err(storage_error)?;
                 let ids: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
-                let facets = facets_for(&self.pool, user_id, &ids).await?;
+                let facets = facets_for(&mut *tx, user_id, &ids).await?;
                 assemble(rows, facets).into_iter().next()
             }
         };
 
+        // Nothing was written, so this releases the snapshot rather than
+        // committing anything. A rollback would do as well; a commit says the
+        // read finished rather than gave up.
+        tx.commit().await.map_err(storage_error)?;
         Ok(Some(BurnRecord {
             memory,
             dropped,

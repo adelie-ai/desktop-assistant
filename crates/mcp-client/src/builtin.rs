@@ -3892,20 +3892,20 @@ mod tests {
         }
     }
 
-    /// Acceptance (#1186): clearing a negative memory is a person's judgement
-    /// about the assistant's own memory, so the model must not hold a tool that
-    /// does it.
+    /// Clearing a negative memory is a person's judgement about the assistant's
+    /// own memory (#1186), so no tool offered to the model may be about one.
     ///
-    /// What this checks and what it does not, plainly. The model's whole
-    /// affordance is the set of tool definitions it is offered, so this walks
-    /// the catalog a fully-wired runtime advertises and asserts that no entry
-    /// offers to clear one. It does not, and cannot, prove the model has no
-    /// other route: the other two routes are checked where they live -
+    /// **Named for what it checks, which is narrower than the property it
+    /// serves.** This walks the catalog a fully-wired runtime advertises and
+    /// looks for the words - so it catches a tool added under this feature's
+    /// own name, and it would not catch one called `forget_lesson` described in
+    /// other words. It is one of three legs and the weakest:
     /// `the_sql_tool_cannot_clear_a_negative_memory` in `storage::database`
-    /// holds the one SQL door, and the clear itself is an `api::Command`, which
-    /// arrives from an authenticated client connection and never from a turn.
+    /// holds the one SQL door, and the load-bearing leg is not a test at all -
+    /// the clear is an `api::Command`, which arrives from an authenticated
+    /// client connection and can never be constructed from inside a turn.
     #[test]
-    fn no_builtin_tool_advertises_a_way_to_clear_a_negative_memory() {
+    fn no_builtin_tool_names_or_describes_negative_memory() {
         for def in fully_wired_service().tool_definitions() {
             let described = format!("{} {}", def.name, def.description).to_lowercase();
             assert!(

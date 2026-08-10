@@ -1580,7 +1580,12 @@ fn negative_memory_to_view(
         outcome: memory.outcome.clone(),
         occurrences: memory.occurrences,
         strength: memory.strength(now),
-        firing: !memory.is_silent(now),
+        // `can_fire`, not `!is_silent`: clearing a memory leaves its
+        // confirmation stamp alone, so a memory cleared a second ago still
+        // reads at full strength. Answering off the strength would tell a
+        // person their work is still held at the exact moment they acted to
+        // free it. The domain asks the same question the dispatch loop asks.
+        firing: memory.can_fire(now),
         written_at: memory.written_at.to_rfc3339(),
         last_confirmed_at: memory.last_confirmed_at.to_rfc3339(),
         goes_quiet_at: memory.goes_quiet_at(now).to_rfc3339(),
@@ -2317,9 +2322,20 @@ where
                 // months later can tell a person's judgement from the act
                 // simply succeeding - the two write the same overlay, and the
                 // note is the only thing that differs.
-                let note = note.filter(|n| !n.trim().is_empty()).unwrap_or_else(|| {
-                    desktop_assistant_core::domain::negative_memory::CLEARED_BY_PERSON.to_string()
-                });
+                //
+                // Clamped like any other outcome: the note a person writes is
+                // external input on its way to the same column a failure's own
+                // error text lands in, and that path has always been bounded.
+                // Clamped here, at the boundary the input arrives at, rather
+                // than in the store, which serves a caller that has already
+                // bounded its text.
+                let note = note
+                    .filter(|n| !n.trim().is_empty())
+                    .map(|n| desktop_assistant_core::domain::negative_memory::clamp_outcome(&n))
+                    .unwrap_or_else(|| {
+                        desktop_assistant_core::domain::negative_memory::CLEARED_BY_PERSON
+                            .to_string()
+                    });
                 let cleared = (wiring.clear)(vec![id], note)
                     .await
                     .map_err(Self::map_core_err)?;
@@ -7937,12 +7953,20 @@ mod tests {
         }
     }
 
-    /// The three closures the handler needs, over one shared burn. Clearing
-    /// writes the same correction overlay a success writes: the original keeps
-    /// every field it had and gains a `superseded_by`.
+    /// The three closures the handler needs, over one shared burn, plus the
+    /// notes the clears wrote. Clearing writes the same correction overlay a
+    /// success writes: the original keeps every field it had - its confirmation
+    /// stamp included, which is why a just-cleared memory still reads at full
+    /// strength - and gains a `superseded_by`.
     #[allow(clippy::type_complexity)]
-    fn in_memory_negative_memory() -> (LiveBurnsFn, InspectBurnFn, ExtinguishBurnsFn) {
+    fn in_memory_negative_memory() -> (
+        LiveBurnsFn,
+        InspectBurnFn,
+        ExtinguishBurnsFn,
+        Arc<Mutex<Vec<String>>>,
+    ) {
         let held: Arc<Mutex<Burn>> = Arc::new(Mutex::new(a_widened_burn()));
+        let notes: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
 
         let l = Arc::clone(&held);
         let list: LiveBurnsFn = Arc::new(move || {
@@ -7981,9 +8005,12 @@ mod tests {
         });
 
         let c = Arc::clone(&held);
-        let clear: ExtinguishBurnsFn = Arc::new(move |ids: Vec<String>, _note: String| {
+        let written = Arc::clone(&notes);
+        let clear: ExtinguishBurnsFn = Arc::new(move |ids: Vec<String>, note: String| {
             let held = Arc::clone(&c);
+            let written = Arc::clone(&written);
             Box::pin(async move {
+                written.lock().unwrap().push(note);
                 let mut burn = held.lock().unwrap();
                 if !ids.contains(&burn.id) || burn.superseded_by.is_some() {
                     return Ok(Vec::new());
@@ -7993,7 +8020,7 @@ mod tests {
             })
         });
 
-        (list, inspect, clear)
+        (list, inspect, clear, notes)
     }
 
     fn negative_memory_handler() -> DefaultAssistantApiHandler<
@@ -8003,7 +8030,7 @@ mod tests {
         FakeConnections,
         FakeKnowledge,
     > {
-        let (list, inspect, clear) = in_memory_negative_memory();
+        let (list, inspect, clear, _notes) = in_memory_negative_memory();
         DefaultAssistantApiHandler::new(
             Arc::new(FakeAssistant),
             Arc::new(FakeConversations),
@@ -8149,6 +8176,88 @@ mod tests {
         );
         let correction = detail.correction.expect("and carrying what cleared it");
         assert_eq!(correction.outcome, CLEARED_BY_PERSON);
+    }
+
+    /// Acceptance (#1186): once cleared, a memory is not reported as still
+    /// holding calls.
+    ///
+    /// Clearing does not touch the confirmation stamp - the record keeps
+    /// everything it had - so a memory cleared a second ago is still at full
+    /// strength. Reading "still holding your calls" off the strength alone
+    /// would answer the exact question this surface exists to answer, wrongly,
+    /// at the exact moment a person has just acted.
+    #[tokio::test]
+    async fn a_cleared_negative_memory_is_not_reported_as_still_holding_calls() {
+        let h = negative_memory_handler();
+        let ctx = || RequestContext::from(UserId::new("alice"));
+
+        h.handle_command_for(
+            ctx(),
+            api::Command::ClearNegativeMemory {
+                id: "nm-1".to_string(),
+                note: None,
+            },
+        )
+        .await
+        .expect("clearing succeeds");
+
+        let api::CommandResult::NegativeMemory(detail) = h
+            .handle_command_for(
+                ctx(),
+                api::Command::GetNegativeMemory {
+                    id: "nm-1".to_string(),
+                },
+            )
+            .await
+            .expect("reading one succeeds")
+        else {
+            panic!("expected NegativeMemory");
+        };
+        let detail = detail.expect("the original survives its own clearing");
+        assert!(
+            detail.memory.strength > 0.99,
+            "clearing is not decay: the record is unchanged, only overlaid"
+        );
+        assert!(
+            !detail.memory.firing,
+            "and it holds nothing, however strong the record still reads"
+        );
+    }
+
+    /// A note a person writes is external input on the way to a stored column,
+    /// so it is cut to what a memory can hold, the same as the outcome a
+    /// failure records.
+    #[tokio::test]
+    async fn a_clear_note_longer_than_a_memory_can_hold_is_cut_before_it_is_written() {
+        use desktop_assistant_core::domain::negative_memory::MAX_OUTCOME_CHARS;
+
+        let (list, inspect, clear, notes) = in_memory_negative_memory();
+        let h = DefaultAssistantApiHandler::new(
+            Arc::new(FakeAssistant),
+            Arc::new(FakeConversations),
+            Arc::new(FakeSettings),
+            Arc::new(FakeConnections),
+            Arc::new(FakeKnowledge),
+        )
+        .with_negative_memory(list, inspect, clear);
+
+        h.handle_command_for(
+            RequestContext::from(UserId::new("alice")),
+            api::Command::ClearNegativeMemory {
+                id: "nm-1".to_string(),
+                note: Some("e\u{301}".repeat(MAX_OUTCOME_CHARS * 2)),
+            },
+        )
+        .await
+        .expect("clearing succeeds");
+
+        let written = notes.lock().unwrap();
+        assert_eq!(written.len(), 1);
+        assert_eq!(
+            written[0].chars().count(),
+            MAX_OUTCOME_CHARS,
+            "cut to what the column holds, on a character boundary"
+        );
     }
 
     /// Clearing something no memory answers to reports that nothing was

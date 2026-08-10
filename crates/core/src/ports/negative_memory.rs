@@ -167,11 +167,17 @@ pub trait NegativeMemoryStore: Send + Sync {
         note: String,
     ) -> impl Future<Output = Result<Vec<String>, CoreError>> + Send;
 
-    /// One memory read in full, by id, whether or not it has been corrected.
+    /// One lesson read in full, by id, whether or not it has been corrected.
     ///
     /// `None` for an id this user does not hold, which covers both a memory
     /// that was reaped and one another tenant holds - a caller cannot tell the
-    /// two apart, and must not be able to.
+    /// two apart, and must not be able to. `None` too for a correction's own
+    /// id: a correction is the record of a lesson that stopped applying rather
+    /// than a lesson, so answering with one would describe a record as though
+    /// it were an act being held. It is readable on the burn it corrects.
+    ///
+    /// The three parts of the answer come from one snapshot, so an occurrence
+    /// count and the facets that occurrence dropped can never disagree.
     fn burn(
         &self,
         id: String,
