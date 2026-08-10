@@ -414,7 +414,18 @@ rule the base does not have.
 
 ### 3.1 The gate for this repo (addition)
 
-The `adelie-ai` repos have no CI. The gate is local and the author runs it: `just check`.
+The `adelie-ai` repos have no CI, so the gate is local and the author runs it. It
+is split in two, because one gate serving both purposes made every push cost the
+merge's price:
+
+- **`just check-fast`** runs on every push, via the pre-push hook: both scans,
+  format, lint, build, workspace tests. About two minutes.
+- **`just check`** is the full gate - the same plus rustdoc and the `sqlite`,
+  `mcp-host` and `otel` repeats of lint, doc and test. About ten minutes, and
+  nothing reaches `main` without it.
+- **`just merge`** runs the full `check` and merges only if it passes. Use it
+  instead of `gh pr merge`, and instead of the web interface, which runs no gate
+  at all.
 **Build hygiene** above states exactly what that covers and what it does not, including the
 DB-gated suites that `just check` cannot prove. Say in the pull request which of `just check`
 and `just test-db` you ran. Run `just install-hooks` once per clone to put the same gate on

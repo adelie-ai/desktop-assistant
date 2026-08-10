@@ -4,5 +4,5 @@
 # Bypass in an emergency with: git push --no-verify
 set -euo pipefail
 
-echo "==> pre-push: running 'just check' (bypass with --no-verify)"
-exec just check
+echo "==> pre-push: running 'just check-fast' (full gate runs at merge, via 'just merge')"
+exec just check-fast
