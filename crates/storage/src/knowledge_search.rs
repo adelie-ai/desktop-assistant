@@ -22,7 +22,8 @@
 //!   written since the last embedding backfill, or one still stamped with a
 //!   superseded model. Such a row carries no distance, so it carries no
 //!   semantic term and no activation score; it keeps the order the database
-//!   ranked it in and follows the measured rows. See [`rank_page`].
+//!   ranked it in and follows the measured rows. See `rank_page`, which is
+//!   private to this crate.
 //!
 //! ## The cost this accepts, stated rather than left to be found
 //!
@@ -127,7 +128,8 @@ pub(crate) fn rank_page(
     page
 }
 
-/// What [`crate::PgKnowledgeBaseStore::search`]'s hybrid arm reads.
+/// What [`PgKnowledgeBaseStore`](crate::PgKnowledgeBaseStore)'s hybrid search
+/// arm reads.
 ///
 /// One scan, four uses, on the same construction the recall scan uses. `d`
 /// computes one distance per comparable row and carries nothing else, so the
@@ -175,9 +177,15 @@ pub(crate) fn rank_page(
 /// Every returned row repeats the same three statistics, which is the price of
 /// stating them in the same answer as the candidates.
 ///
-/// Held as its own string so the projection can be asserted on without a
-/// database - see `the_hybrid_scan_measures_before_it_reads_any_entry`.
-pub(crate) const HYBRID_SEARCH_SQL: &str = "\
+/// Held as its own string, and public, for two different checks. Its
+/// projection and its arms' scope can be asserted without a database (see
+/// `the_hybrid_scan_measures_before_it_reads_any_entry`), and the three
+/// statistics it computes cannot: `search_hybrid` consumes them and answers
+/// with entries, so nothing downstream can see a median that is wrong rather
+/// than merely absent - and a wrong spread silently changes every near tie the
+/// reinforcement term exists to settle. `crates/storage/tests/knowledge_hybrid_and_pagination.rs`
+/// binds this against a seeded store and asserts the numbers.
+pub const HYBRID_SEARCH_SQL: &str = "\
     WITH d AS (
          SELECT id, MIN(chunk <=> $1) AS distance
          FROM knowledge_base, unnest(embedding) AS chunk
@@ -307,16 +315,18 @@ mod tests {
         RecallDispersion::assumed(0.80, 0.05)
     }
 
-    /// Acceptance (#1167): the page is ordered by the activation score, and not
-    /// by any fusion of the two arms' ranks.
+    /// Acceptance (#1167): the page is ordered by the activation score, so what
+    /// the use log knows about a candidate can take the top line from a
+    /// marginally nearer one nothing has opened.
     ///
-    /// The distinguishing case, because it is one no rank fusion can express: a
-    /// candidate the vector arm ranked *second* takes the top line on what the
-    /// use log knows about it. A fused rank has discarded both the distance and
-    /// the log by the time it is a position, so under fusion the nearer row
-    /// leads whatever its history.
+    /// Named for exactly that, and no wider: this function has no concept of an
+    /// arm or of a rank, so it cannot check that nothing is fused.
+    /// `the_hybrid_scan_states_no_reciprocal_rank_fusion` checks the query, and
+    /// `knowledge_hybrid_search_orders_by_activation_and_not_by_a_fused_rank`
+    /// checks the whole path against a database over a fixture where the two
+    /// rules disagree.
     #[test]
-    fn the_search_page_is_ordered_by_the_activation_score_and_not_by_a_fused_rank() {
+    fn a_used_entry_leads_a_marginally_nearer_one_nothing_has_opened() {
         let records = log(vec![used("used", 12, 600)]);
 
         let page = rank_page(

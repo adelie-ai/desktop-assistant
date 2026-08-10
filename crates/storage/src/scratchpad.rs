@@ -64,11 +64,30 @@ fn read_snapshot() -> (Option<String>, String, Vec<String>) {
 /// Postgres adapter for the per-conversation scratchpad table.
 pub struct PgScratchpadStore {
     pool: PgPool,
+    scan_ceiling: std::time::Duration,
 }
 
 impl PgScratchpadStore {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            scan_ceiling: crate::RECALL_SCAN_STATEMENT_TIMEOUT,
+        }
+    }
+
+    /// The same store, whose full scans the database gives up on after
+    /// `ceiling` instead of after
+    /// [`RECALL_SCAN_STATEMENT_TIMEOUT`](crate::RECALL_SCAN_STATEMENT_TIMEOUT).
+    ///
+    /// Exists so the bound can be proven on the path a deployment actually
+    /// runs - see
+    /// [`PgKnowledgeBaseStore::with_scan_ceiling`](crate::PgKnowledgeBaseStore::with_scan_ceiling)
+    /// for why a bounded variant reached past the public method would prove
+    /// nothing.
+    #[must_use]
+    pub fn with_scan_ceiling(mut self, ceiling: std::time::Duration) -> Self {
+        self.scan_ceiling = ceiling;
+        self
     }
 }
 
@@ -703,9 +722,7 @@ impl PgScratchpadStore {
         }
         let user_id = current_user_id();
         let (vb, me, ancestors) = read_snapshot();
-        let mut scan =
-            crate::scan_bound::begin_bounded(&self.pool, crate::RECALL_SCAN_STATEMENT_TIMEOUT)
-                .await?;
+        let mut scan = crate::scan_bound::begin_bounded(&self.pool, self.scan_ceiling).await?;
         let rows: Vec<SpNearestRow> = sqlx::query_as(NEAREST_NOTES_BY_EMBEDDING_SQL)
             .bind(Vector::from(query_embedding))
             .bind(user_id.as_str())
@@ -758,6 +775,12 @@ impl PgScratchpadStore {
     /// Carries the same `user_id` / `conversation_id` / `owner_todo` scope as
     /// every other read here, and leaves out the same `goal` note as
     /// [`Self::nearest_by_embedding`].
+    ///
+    /// The scan carries this store's own ceiling, like its measured
+    /// counterpart. This pad's rows are few, so the bound is cheaper insurance
+    /// here than on the knowledge base - but a read that states no ceiling at
+    /// all leaves the backend working for a caller that has given up, and one
+    /// of two sibling reads being bounded is the shape a later reader misreads.
     pub async fn search_text_any_term(
         &self,
         conversation_id: &str,
@@ -766,6 +789,7 @@ impl PgScratchpadStore {
     ) -> Result<Vec<ScratchpadNote>, CoreError> {
         let user_id = current_user_id();
         let (vb, me, ancestors) = read_snapshot();
+        let mut scan = crate::scan_bound::begin_bounded(&self.pool, self.scan_ceiling).await?;
         let rows: Vec<SpRow> = sqlx::query_as(
             "WITH q AS (
                  SELECT to_tsquery('english', string_agg(quote_literal(lexeme), ' | ')) AS query
@@ -791,9 +815,12 @@ impl PgScratchpadStore {
         .bind(ancestors)
         .bind(limit as i64)
         .bind(SCRATCHPAD_GOAL_KEY)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *scan)
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;
+        scan.commit()
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
         Ok(rows.into_iter().map(SpRow::into_note).collect())
     }
 }

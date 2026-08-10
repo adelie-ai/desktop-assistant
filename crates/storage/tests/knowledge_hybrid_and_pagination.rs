@@ -1289,3 +1289,155 @@ async fn fused_search_truncates_to_a_defined_row_when_rrf_scores_tie() {
     )
     .await;
 }
+
+// -- hybrid search: the spread it measures (#1167) ----------------------------
+
+/// The three statistics `HYBRID_SEARCH_SQL` computes, for the one query below.
+#[derive(sqlx::FromRow)]
+struct MeasuredSpread {
+    median: Option<f64>,
+    rows_read: i64,
+    deviation: Option<f64>,
+}
+
+/// Bind the search scan and read back what it says the store's spread is.
+///
+/// `search_hybrid` consumes those three numbers and answers with entries, so
+/// nothing downstream can tell a median that is wrong from one that is merely
+/// absent - and a wrong spread silently changes every near tie the
+/// reinforcement term exists to settle. This is why the query is held as its
+/// own public string.
+async fn measured_spread(pool: &PgPool, user: &str) -> MeasuredSpread {
+    with_user_id(UserId::new(user), async {
+        sqlx::query_as(desktop_assistant_storage::knowledge_search::HYBRID_SEARCH_SQL)
+            .bind(Vector::from(vec![1.0_f32, 0.0, 0.0]))
+            .bind(None::<Vec<String>>)
+            .bind(100_i64)
+            .bind("zzznomatchzzz")
+            .bind(50_i64)
+            .bind(user)
+            .bind(None::<Vec<String>>)
+            .bind(MODEL)
+            .fetch_one(pool)
+            .await
+            .expect("the scan answers")
+    })
+    .await
+}
+
+#[tokio::test]
+async fn the_hybrid_scan_measures_the_stores_own_median_and_deviation() {
+    // Acceptance (#1167): the semantic term is the distance read against the
+    // store's own spread, so the spread has to be the store's real one. The
+    // seeded rows sit at known cosine distances - `1 - cos(angle)` for a unit
+    // vector `angle` radians off the query - so both statistics are arithmetic
+    // a reader can check by hand rather than numbers only the database knows.
+    //
+    // Twenty rows, evenly spread in angle, is also the smallest sample
+    // `RecallDispersion::measured` will trust.
+    with_fixture(
+        "the_hybrid_scan_measures_the_stores_own_median_and_deviation",
+        |fx| async move {
+            let store =
+                PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
+            let mut distances: Vec<f64> = Vec::new();
+            with_user_id(UserId::new("alice"), async {
+                for i in 0..20u32 {
+                    store
+                        .write(KnowledgeEntry::new(
+                            format!("row{i:02}"),
+                            "a stored fact",
+                            vec![],
+                        ))
+                        .await
+                        .unwrap_or_else(|e| panic!("write row{i:02}: {e}"));
+                }
+            })
+            .await;
+            for i in 0..20u32 {
+                let angle = (i + 1) as f32 * 0.1;
+                set_embedding(
+                    &fx.pool,
+                    &format!("row{i:02}"),
+                    vec![vec![angle.cos(), angle.sin(), 0.0]],
+                )
+                .await;
+                distances.push(1.0 - f64::from(angle.cos()));
+            }
+
+            let measured = measured_spread(&fx.pool, "alice").await;
+
+            distances.sort_by(f64::total_cmp);
+            let expected_median = (distances[9] + distances[10]) / 2.0;
+            let mut spread: Vec<f64> = distances
+                .iter()
+                .map(|d| (d - expected_median).abs())
+                .collect();
+            spread.sort_by(f64::total_cmp);
+            let expected_deviation = (spread[9] + spread[10]) / 2.0;
+
+            assert_eq!(measured.rows_read, 20, "every comparable row is measured");
+            let median = measured
+                .median
+                .expect("a store of this size states a median");
+            let deviation = measured
+                .deviation
+                .expect("a store of this size states a deviation");
+            assert!(
+                (median - expected_median).abs() < 1e-6,
+                "the scan reported a median of {median} where the seeded distances give \
+                 {expected_median}"
+            );
+            assert!(
+                (deviation - expected_deviation).abs() < 1e-6,
+                "the scan reported a deviation of {deviation} where the seeded distances give \
+                 {expected_deviation}"
+            );
+            fx
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn the_hybrid_scan_still_answers_when_no_row_can_be_compared() {
+    // The construction that makes this work is the one place this scan differs
+    // from the recall scan: its `s` selects from `m` rather than cross-joining
+    // `d`, so it yields a row - with both statistics NULL - even when nothing
+    // is embedded. Cross-joining an empty `d` would annihilate the whole
+    // result, and the full-text arm's rows would vanish with it, which is the
+    // ordinary state of a store between a write and the next backfill pass.
+    with_fixture(
+        "the_hybrid_scan_still_answers_when_no_row_can_be_compared",
+        |fx| async move {
+            let store =
+                PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
+            with_user_id(UserId::new("alice"), async {
+                store
+                    .write(KnowledgeEntry::new("only", "quantum widget report", vec![]))
+                    .await
+                    .expect("write only");
+            })
+            .await;
+            // No embedding is stamped: nothing in this store can be compared.
+
+            let hits = with_user_id(UserId::new("alice"), async {
+                store
+                    .search("quantum widget", vec![1.0, 0.0, 0.0], MODEL, None, None, 10)
+                    .await
+            })
+            .await
+            .expect("search")
+            .entries;
+
+            let ids: Vec<&str> = hits.iter().map(|e| e.id.as_str()).collect();
+            assert_eq!(
+                ids,
+                vec!["only"],
+                "a store with nothing to compare must still answer from its full-text arm"
+            );
+            fx
+        },
+    )
+    .await;
+}

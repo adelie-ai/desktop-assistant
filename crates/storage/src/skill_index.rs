@@ -36,12 +36,30 @@ use sqlx::PgPool;
 /// Postgres-backed [`SkillIndexStore`].
 pub struct PgSkillIndexStore {
     pool: PgPool,
+    scan_ceiling: std::time::Duration,
 }
 
 impl PgSkillIndexStore {
     /// Construct a store over the given pool.
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            scan_ceiling: SKILL_RECALL_SCAN_STATEMENT_TIMEOUT,
+        }
+    }
+
+    /// The same store, whose full scans the database gives up on after
+    /// `ceiling` instead of after [`SKILL_RECALL_SCAN_STATEMENT_TIMEOUT`].
+    ///
+    /// Exists so the bound can be proven on the path a deployment actually
+    /// runs - see
+    /// [`PgKnowledgeBaseStore::with_scan_ceiling`](crate::PgKnowledgeBaseStore::with_scan_ceiling)
+    /// for why a bounded variant reached past the public method would prove
+    /// nothing.
+    #[must_use]
+    pub fn with_scan_ceiling(mut self, ceiling: std::time::Duration) -> Self {
+        self.scan_ceiling = ceiling;
+        self
     }
 
     /// Upsert one skill, preserving the row's embedding when its content hash is
@@ -260,9 +278,7 @@ impl PgSkillIndexStore {
         // A transaction, for one statement, because `SET LOCAL` is scoped to
         // one: it is what makes the ceiling the caller keeps a ceiling the
         // database keeps too.
-        let mut scan =
-            crate::scan_bound::begin_bounded(&self.pool, SKILL_RECALL_SCAN_STATEMENT_TIMEOUT)
-                .await?;
+        let mut scan = crate::scan_bound::begin_bounded(&self.pool, self.scan_ceiling).await?;
         let rows: Vec<SkillNearestRow> = sqlx::query_as(NEAREST_SKILLS_BY_EMBEDDING_SQL)
             .bind(Vector::from(query_embedding))
             .bind(user.as_str())
@@ -298,32 +314,19 @@ impl PgSkillIndexStore {
     /// The same approval filter and the same one-row-per-name rule as
     /// [`Self::nearest_by_embedding`], for the same reasons.
     ///
-    /// The scan carries [`SKILL_RECALL_SCAN_STATEMENT_TIMEOUT`], so the
-    /// database stops working when the caller stops waiting. The `DISTINCT ON`
-    /// resolution reads the whole approved catalog before the match narrows it,
-    /// so this read's cost grows with the catalog and not with the query.
+    /// The scan carries this store's own ceiling
+    /// ([`SKILL_RECALL_SCAN_STATEMENT_TIMEOUT`] unless
+    /// [`Self::with_scan_ceiling`] overrode it), so the database stops working
+    /// when the caller stops waiting. The `DISTINCT ON` resolution reads the
+    /// whole approved catalog before the match narrows it, so this read's cost
+    /// grows with the catalog and not with the query.
     pub async fn search_text_any_term(
         &self,
         query: &str,
         limit: usize,
     ) -> Result<Vec<NearestSkill>, CoreError> {
-        self.search_text_any_term_within(query, limit, SKILL_RECALL_SCAN_STATEMENT_TIMEOUT)
-            .await
-    }
-
-    /// [`Self::search_text_any_term`] under a stated ceiling.
-    ///
-    /// Exists so the bound can be proven against a real database without
-    /// waiting the deployment's own four seconds for it. Production has one
-    /// caller and it passes [`SKILL_RECALL_SCAN_STATEMENT_TIMEOUT`].
-    pub async fn search_text_any_term_within(
-        &self,
-        query: &str,
-        limit: usize,
-        ceiling: std::time::Duration,
-    ) -> Result<Vec<NearestSkill>, CoreError> {
         let user = current_user_id();
-        let mut scan = crate::scan_bound::begin_bounded(&self.pool, ceiling).await?;
+        let mut scan = crate::scan_bound::begin_bounded(&self.pool, self.scan_ceiling).await?;
         let rows: Vec<SkillTextRow> = sqlx::query_as(
             "WITH q AS (
                  SELECT to_tsquery('english', string_agg(quote_literal(lexeme), ' | ')) AS query

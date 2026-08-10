@@ -16,6 +16,7 @@ use crate::knowledge_search::SearchCandidate;
 pub struct PgKnowledgeBaseStore {
     pool: PgPool,
     delete_policy: KnowledgeDeletePolicy,
+    scan_ceiling: std::time::Duration,
 }
 
 impl PgKnowledgeBaseStore {
@@ -31,7 +32,23 @@ impl PgKnowledgeBaseStore {
         Self {
             pool,
             delete_policy,
+            scan_ceiling: RECALL_SCAN_STATEMENT_TIMEOUT,
         }
+    }
+
+    /// The same store, whose full scans the database gives up on after
+    /// `ceiling` instead of after [`RECALL_SCAN_STATEMENT_TIMEOUT`].
+    ///
+    /// **This exists so the bound can be proven, and proven on the path a
+    /// deployment actually runs.** A test that reached past the public method
+    /// to a bounded variant would go on passing if the public method stopped
+    /// applying the bound - the bound would be stated and unheld, which is the
+    /// defect this whole change is about. Overriding the ceiling instead leaves
+    /// the delegation itself under test.
+    #[must_use]
+    pub fn with_scan_ceiling(mut self, ceiling: std::time::Duration) -> Self {
+        self.scan_ceiling = ceiling;
+        self
     }
 }
 
@@ -420,8 +437,7 @@ impl PgKnowledgeBaseStore {
         let fetch_limit = (limit.saturating_mul(2)) as i64;
         let lexical_limit = limit as i64;
 
-        let mut scan =
-            crate::scan_bound::begin_bounded(&self.pool, RECALL_SCAN_STATEMENT_TIMEOUT).await?;
+        let mut scan = crate::scan_bound::begin_bounded(&self.pool, self.scan_ceiling).await?;
         let rows: Vec<KbSearchRow> = sqlx::query_as(crate::knowledge_search::HYBRID_SEARCH_SQL)
             .bind(embedding_vec)
             .bind(tags)
@@ -698,8 +714,10 @@ impl PgKnowledgeBaseStore {
     ///
     /// Scoped to the task-local user by an explicit `WHERE user_id` predicate.
     ///
-    /// The scan carries [`RECALL_SCAN_STATEMENT_TIMEOUT`], so the database
-    /// stops working when the caller stops waiting - the same bound
+    /// The scan carries this store's own ceiling
+    /// ([`RECALL_SCAN_STATEMENT_TIMEOUT`] unless
+    /// [`Self::with_scan_ceiling`] overrode it), so the database stops working
+    /// when the caller stops waiting - the same bound
     /// [`Self::nearest_by_embedding`] carries, because this is the same lookup
     /// on the turn where no embedding was available. It matters more here, not
     /// less: this read has no vector index to ride and its cost grows with the
@@ -709,24 +727,8 @@ impl PgKnowledgeBaseStore {
         query: &str,
         limit: usize,
     ) -> Result<Vec<KnowledgeEntry>, CoreError> {
-        self.search_text_any_term_within(query, limit, RECALL_SCAN_STATEMENT_TIMEOUT)
-            .await
-    }
-
-    /// [`Self::search_text_any_term`] under a stated ceiling.
-    ///
-    /// Exists so the bound can be proven against a real database without
-    /// waiting the deployment's own four seconds for it - the same reason
-    /// `render_recall_with_width` takes a width. Production has one caller and
-    /// it passes [`RECALL_SCAN_STATEMENT_TIMEOUT`].
-    pub async fn search_text_any_term_within(
-        &self,
-        query: &str,
-        limit: usize,
-        ceiling: std::time::Duration,
-    ) -> Result<Vec<KnowledgeEntry>, CoreError> {
         let user_id = current_user_id();
-        let mut scan = crate::scan_bound::begin_bounded(&self.pool, ceiling).await?;
+        let mut scan = crate::scan_bound::begin_bounded(&self.pool, self.scan_ceiling).await?;
         let rows: Vec<KbRow> = sqlx::query_as(
             "WITH q AS (
                  SELECT to_tsquery('english', string_agg(quote_literal(lexeme), ' | ')) AS query

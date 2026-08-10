@@ -23,7 +23,7 @@ The response therefore reports what was searched, not only what was found.
 
 | Field | Meaning |
 | ----- | ------- |
-| `results` | The matched entries, best match first. Each carries a `summary`: one line condensing what that entry says, so a caller can judge a hit without reading the whole `content`. It is `null` for an entry that has none: one stored before the field existed, one whose write named no summary, or one whose summary was cleared. |
+| `results` | The matched entries, best first by the activation score - see **What decides the order** below, which also says where the rows nothing could measure sit. Each carries a `summary`: one line condensing what that entry says, so a caller can judge a hit without reading the whole `content`. It is `null` for an entry that has none: one stored before the field existed, one whose write named no summary, or one whose summary was cleared. |
 | `returned` | How many entries are in `results`. Same name `builtin_scratchpad_search` uses. |
 | `truncated` | Present, and `true`, only when the page filled up (`returned` reached `limit`) **and** the scope is larger than the page. A full page under `FEW` carries neither it nor `message`, because `FEW` already means the page holds the whole scope. It always travels with `message`, which says how to narrow. Its absence is the claim that nothing was left behind. |
 | `scope_size` | `NONE`, `FEW`, `MANY`, or `UNKNOWN`. See below. |

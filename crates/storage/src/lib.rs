@@ -13,7 +13,7 @@ pub mod idempotency_keys;
 pub mod kb_metadata;
 pub mod knowledge;
 pub mod knowledge_delete;
-pub(crate) mod knowledge_search;
+pub mod knowledge_search;
 pub mod knowledge_use;
 pub mod migrate_json;
 pub mod negative_memory;
