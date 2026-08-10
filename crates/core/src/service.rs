@@ -13306,6 +13306,152 @@ mod tests {
         );
     }
 
+    // --- #1226: the turn installs the transcript its tools read back -------
+
+    /// What the `emit` tool below returns, and what the read-back must hand
+    /// straight back.
+    const EMITTED_RESULT: &str = "the bytes this turn produced";
+
+    /// LLM that reads a message id out of the prompt it was given and asks for
+    /// that message back, the way a model reads an id out of an eviction
+    /// pointer.
+    ///
+    /// The first round calls `emit`, which puts a tool result into the turn.
+    /// The second finds that result in the prompt and calls the read-back tool
+    /// with its id. The third closes the turn. Each choice is made from the
+    /// prompt's own content, so a side call - title generation, the
+    /// summariser - cannot shift the script.
+    struct ReadBackDrivingLlm;
+
+    #[async_trait::async_trait]
+    impl LlmClient for ReadBackDrivingLlm {
+        async fn stream_completion(
+            &self,
+            messages: Vec<Message>,
+            _tools: &[ToolDefinition],
+            _reasoning: ReasoningConfig,
+            _on_chunk: ChunkCallback,
+        ) -> Result<LlmResponse, CoreError> {
+            let read_back_ran = messages
+                .iter()
+                .any(|m| m.tool_call_id.as_deref() == Some("c2"));
+            let emitted = messages
+                .iter()
+                .find(|m| m.role == Role::Tool && m.content == EMITTED_RESULT);
+            Ok(match (emitted, read_back_ran) {
+                (_, true) => LlmResponse::text("done"),
+                (Some(result), false) => LlmResponse::with_tool_calls(
+                    "",
+                    vec![ToolCall::new(
+                        "c2",
+                        crate::ports::transcript::TRANSCRIPT_GET_TOOL,
+                        serde_json::json!({ "message_id": result.id }).to_string(),
+                    )],
+                ),
+                (None, false) => {
+                    LlmResponse::with_tool_calls("", vec![ToolCall::new("c1", "emit", "{}")])
+                }
+            })
+        }
+    }
+
+    /// The server-side tool surface for the read-back turn: `emit` writes bytes
+    /// into the turn, and the read-back tool is dispatched the way
+    /// `BuiltinToolService::transcript_get` dispatches it - take the argument,
+    /// then read whatever transcript the dispatch loop installed.
+    struct ReadBackExecutor {
+        tools: Vec<ToolDefinition>,
+    }
+
+    impl ToolExecutor for ReadBackExecutor {
+        async fn core_tools(&self) -> Vec<ToolDefinition> {
+            self.tools.clone()
+        }
+        async fn search_tools(&self, _query: &str) -> Result<Vec<ToolDefinition>, CoreError> {
+            Ok(vec![])
+        }
+        async fn tool_definition(&self, name: &str) -> Result<Option<ToolDefinition>, CoreError> {
+            Ok(self.tools.iter().find(|t| t.name == name).cloned())
+        }
+        async fn execute_tool(
+            &self,
+            name: &str,
+            arguments: serde_json::Value,
+        ) -> Result<String, CoreError> {
+            use crate::ports::transcript::{TranscriptReadRequest, read_transcript_message};
+
+            if name == crate::ports::transcript::TRANSCRIPT_GET_TOOL {
+                let message_id = arguments["message_id"]
+                    .as_str()
+                    .expect("the driving model always passes an id")
+                    .to_string();
+                return Ok(read_transcript_message(&TranscriptReadRequest::new(
+                    message_id,
+                )));
+            }
+            Ok(EMITTED_RESULT.to_string())
+        }
+    }
+
+    /// AC (#1226): a tool result this turn wrote is readable back by its
+    /// message id from inside the same turn.
+    ///
+    /// The read runs through the dispatch loop with no transcript built by
+    /// hand, so it holds the wiring - the `absorb` that takes in what the turn
+    /// has appended, and the scope that installs it - and not only the read.
+    /// Without both, every read in a real turn declines.
+    #[tokio::test]
+    async fn a_tool_result_this_turn_wrote_is_read_back_through_the_dispatch_path() {
+        let object = serde_json::json!({"type": "object"});
+        let executor = ReadBackExecutor {
+            tools: vec![
+                ToolDefinition::new("emit", "emit bytes", object.clone()),
+                ToolDefinition::new(
+                    crate::ports::transcript::TRANSCRIPT_GET_TOOL,
+                    "read a message back",
+                    object,
+                ),
+            ],
+        };
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            ReadBackDrivingLlm,
+            executor,
+            Box::new(|| "conv-read-back-1".to_string()),
+        );
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
+            .await
+            .expect("the turn must finish");
+
+        let stored = handler.get_conversation(&conv.id).await.unwrap();
+        let payload = stored
+            .messages
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("c2"))
+            .expect("the read-back result must be in the transcript")
+            .content
+            .clone();
+        let got: serde_json::Value =
+            serde_json::from_str(&payload).expect("the read-back payload must be JSON");
+        assert_eq!(
+            got["ok"], true,
+            "the turn must install the transcript its own tools read: {payload}"
+        );
+        assert_eq!(
+            got["content"], EMITTED_RESULT,
+            "the read must return the bytes the turn wrote: {payload}"
+        );
+        assert_eq!(
+            got["produced_by"], "emit",
+            "the read must name the tool that produced them: {payload}"
+        );
+    }
+
     /// LLM that captures the messages from every invocation, so we can assert
     /// how the task anchor was assembled. (First-message title generation
     /// also calls `stream_completion`, so we record all calls and inspect
