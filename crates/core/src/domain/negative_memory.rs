@@ -1709,4 +1709,91 @@ mod tests {
         assert_eq!(clamped.chars().count(), MAX_OUTCOME_CHARS);
         assert_eq!(clamp_outcome("  spaced  "), "spaced");
     }
+
+    // --- What a person reads (#1186) ---------------------------------------
+
+    /// Acceptance (#1186): the moment a list shows as a burn's expiry is the
+    /// moment the burn actually stops firing.
+    ///
+    /// Checked against [`NegativeMemory::is_silent`] rather than against the
+    /// number 28, so the two rules cannot drift apart: whichever of
+    /// [`HALF_LIFE_DAYS`] and [`SILENCE_FLOOR`] moves, this fails unless the
+    /// shown expiry moves with it.
+    #[test]
+    fn a_burn_goes_quiet_at_the_moment_its_strength_falls_under_the_silence_floor() {
+        let burn = fresh_burn();
+        let quiet_at = burn.goes_quiet_at();
+        let a_second = TimeDelta::seconds(1);
+        assert!(
+            !burn.is_silent(quiet_at - a_second),
+            "a burn still fires a second before the expiry a person was shown"
+        );
+        assert!(
+            burn.is_silent(quiet_at + a_second),
+            "and it does not fire a second after it"
+        );
+    }
+
+    /// Acceptance (#1186): a held call names the stored lesson that held it, so
+    /// a person can go and read that lesson rather than guess.
+    #[test]
+    fn the_hold_notice_names_the_memory_that_held_the_call() {
+        let held = [fresh_burn()];
+        let fired = burns_that_fire(&held, &the_call(), now());
+        let notice = render_hold_notice(&fired).expect("a fired burn renders a hold notice");
+        assert!(
+            notice.contains("nm-1"),
+            "the notice carries the id a person needs to look the lesson up: {notice}"
+        );
+        assert!(
+            notice.contains("mount point"),
+            "and enough of the outcome to recognise it without looking: {notice}"
+        );
+        assert!(
+            notice.contains("stored lesson"),
+            "and it says a stored lesson is what held the call: {notice}"
+        );
+    }
+
+    /// Every lesson that held the call is named, not only the first, so nothing
+    /// holds a call anonymously.
+    #[test]
+    fn the_hold_notice_names_every_memory_that_held_the_call() {
+        let mut second = fresh_burn();
+        second.id = "nm-2".to_string();
+        let held = [fresh_burn(), second];
+        let fired = burns_that_fire(&held, &the_call(), now());
+        let notice = render_hold_notice(&fired).expect("a fired burn renders a hold notice");
+        assert!(notice.contains("nm-1"), "{notice}");
+        assert!(notice.contains("nm-2"), "{notice}");
+    }
+
+    /// The notice goes into a one-line activity feed, so it takes one line of
+    /// the outcome and no more than [`MAX_HOLD_NOTICE_CHARS`] of it.
+    #[test]
+    fn the_hold_notice_shortens_the_outcome_to_one_capped_line() {
+        let mut burn = fresh_burn();
+        burn.outcome = format!("{}\nand a second line nobody asked for", "x".repeat(500));
+        let held = [burn];
+        let fired = burns_that_fire(&held, &the_call(), now());
+        let notice = render_hold_notice(&fired).expect("a fired burn renders a hold notice");
+        assert!(
+            !notice.contains('\n'),
+            "an activity-feed entry is one line: {notice}"
+        );
+        assert!(
+            !notice.contains("second line"),
+            "so only the first line of the outcome is repeated: {notice}"
+        );
+        assert!(
+            notice.matches('x').count() <= MAX_HOLD_NOTICE_CHARS,
+            "and that line is capped: {notice}"
+        );
+    }
+
+    /// Nothing fired means nothing held the call, so there is nothing to say.
+    #[test]
+    fn no_fired_burn_renders_no_hold_notice() {
+        assert!(render_hold_notice(&[]).is_none());
+    }
 }

@@ -15207,6 +15207,61 @@ mod tests {
         );
     }
 
+    /// Acceptance (#1186): a held call tells the person which stored lesson
+    /// held it, by id, so the reticence has a name to look up rather than
+    /// reading as an assistant that simply would not.
+    ///
+    /// The activity feed is where a person meets a tool call, so that is where
+    /// the notice has to land - the warning itself goes to the model and a
+    /// person never sees it.
+    #[tokio::test]
+    async fn a_held_call_tells_the_activity_feed_which_stored_lesson_held_it() {
+        let executor = ScriptedToolExecutor::new(risky_tool(), vec![]);
+        let responses = vec![
+            LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new("c1", "risky", r#"{"path":"/srv/app"}"#)],
+            ),
+            LlmResponse::text("I will not, then"),
+        ];
+        let (handler, _log) =
+            handler_with_burns(responses, executor, vec![burn_on_risky("/srv/app")]);
+        let conv = handler
+            .create_conversation("Chat".into(), vec![])
+            .await
+            .unwrap();
+
+        let (result, events) = capture_tool_events(handler.send_prompt(
+            &conv.id,
+            "Do it".into(),
+            noop_callback(),
+            noop_status(),
+        ))
+        .await;
+        result.expect("turn completes");
+
+        let held: Vec<String> = events
+            .iter()
+            .filter_map(|e| match e {
+                ToolEvent::Finished { name, ok, output } if name == "risky" && !ok => {
+                    Some(output.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(held.len(), 1, "one held call, one notice; events={events:?}");
+        assert!(
+            held[0].contains("nm-1"),
+            "the notice names the lesson that held the call, so a person can read it: {}",
+            held[0]
+        );
+        assert!(
+            held[0].contains("stored lesson"),
+            "and says a stored lesson is why the call did not run: {}",
+            held[0]
+        );
+    }
+
     /// Acceptance (#1126): a burn is not surfaced by a prompt that merely
     /// mentions its subject. The user quotes the outcome word for word, and the
     /// turn calls a tool the burn is not about - which runs, unwarned.

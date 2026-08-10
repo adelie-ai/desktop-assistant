@@ -7741,4 +7741,293 @@ mod tests {
             "the successful retry records its reply under the key"
         );
     }
+
+    // --- Negative memory: see one, read one, clear one (#1186) ---------------
+
+    use desktop_assistant_core::domain::negative_memory::{
+        CLEARED_BY_PERSON, Facet as BurnFacet, NegativeMemory as Burn,
+        NegativeMemoryKind as BurnKind, Scope as BurnScope,
+    };
+    use desktop_assistant_core::domain::SituationField;
+    use desktop_assistant_core::ports::negative_memory::{
+        BurnRecord, DroppedFacet, ExtinguishBurnsFn, InspectBurnFn, LiveBurnsFn,
+    };
+
+    /// One lesson, widened once: it no longer requires the host it was born at,
+    /// and that dropped requirement is still readable.
+    fn a_widened_burn() -> Burn {
+        Burn {
+            id: "nm-1".to_string(),
+            action: "terminal_run".to_string(),
+            fingerprint: "abc123".to_string(),
+            kind: BurnKind::Burn,
+            scope: BurnScope::new()
+                .with(BurnFacet::Argument("command".to_string()), "rm -rf build")
+                .with(BurnFacet::Situation(SituationField::Weekday), "thursday"),
+            outcome: "build is a mount point".to_string(),
+            occurrences: 2,
+            written_at: chrono::Utc::now() - chrono::Duration::days(6),
+            last_confirmed_at: chrono::Utc::now(),
+            superseded_by: None,
+        }
+    }
+
+    fn dropped_host() -> DroppedFacet {
+        DroppedFacet {
+            facet: BurnFacet::Situation(SituationField::Host),
+            value: "workshop".to_string(),
+            dropped_at: chrono::Utc::now(),
+        }
+    }
+
+    /// The three closures the handler needs, over one shared burn. Clearing
+    /// writes the same correction overlay a success writes: the original keeps
+    /// every field it had and gains a `superseded_by`.
+    #[allow(clippy::type_complexity)]
+    fn in_memory_negative_memory() -> (LiveBurnsFn, InspectBurnFn, ExtinguishBurnsFn) {
+        let held: Arc<Mutex<Burn>> = Arc::new(Mutex::new(a_widened_burn()));
+
+        let l = Arc::clone(&held);
+        let list: LiveBurnsFn = Arc::new(move || {
+            let held = Arc::clone(&l);
+            Box::pin(async move {
+                let burn = held.lock().unwrap().clone();
+                Ok(if burn.superseded_by.is_some() {
+                    Vec::new()
+                } else {
+                    vec![burn]
+                })
+            })
+        });
+
+        let g = Arc::clone(&held);
+        let inspect: InspectBurnFn = Arc::new(move |id: String| {
+            let held = Arc::clone(&g);
+            Box::pin(async move {
+                let burn = held.lock().unwrap().clone();
+                if burn.id != id {
+                    return Ok(None);
+                }
+                let correction = burn.superseded_by.as_ref().map(|cid| Burn {
+                    id: cid.clone(),
+                    kind: BurnKind::Correction,
+                    outcome: CLEARED_BY_PERSON.to_string(),
+                    superseded_by: None,
+                    ..burn.clone()
+                });
+                Ok(Some(BurnRecord {
+                    memory: burn,
+                    dropped: vec![dropped_host()],
+                    correction,
+                }))
+            })
+        });
+
+        let c = Arc::clone(&held);
+        let clear: ExtinguishBurnsFn = Arc::new(move |ids: Vec<String>, _note: String| {
+            let held = Arc::clone(&c);
+            Box::pin(async move {
+                let mut burn = held.lock().unwrap();
+                if !ids.contains(&burn.id) || burn.superseded_by.is_some() {
+                    return Ok(Vec::new());
+                }
+                burn.superseded_by = Some("nm-correction".to_string());
+                Ok(vec![burn.id.clone()])
+            })
+        });
+
+        (list, inspect, clear)
+    }
+
+    fn negative_memory_handler() -> DefaultAssistantApiHandler<
+        FakeAssistant,
+        FakeConversations,
+        FakeSettings,
+        FakeConnections,
+        FakeKnowledge,
+    > {
+        let (list, inspect, clear) = in_memory_negative_memory();
+        DefaultAssistantApiHandler::new(
+            Arc::new(FakeAssistant),
+            Arc::new(FakeConversations),
+            Arc::new(FakeSettings),
+            Arc::new(FakeConnections),
+            Arc::new(FakeKnowledge),
+        )
+        .with_negative_memory(list, inspect, clear)
+    }
+
+    /// Acceptance (#1186): a person can list what the assistant has been burned
+    /// by, with the act, the scope, the strength and the expiry on each row.
+    #[tokio::test]
+    async fn listing_negative_memories_reports_the_act_the_scope_the_strength_and_the_expiry() {
+        let h = negative_memory_handler();
+        let api::CommandResult::NegativeMemories(rows) = h
+            .handle_command_for(
+                RequestContext::from(UserId::new("alice")),
+                api::Command::ListNegativeMemories,
+            )
+            .await
+            .expect("listing succeeds")
+        else {
+            panic!("expected NegativeMemories");
+        };
+
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.action, "terminal_run", "the act it holds");
+        assert_eq!(
+            row.arguments,
+            vec![api::NegativeMemoryFacetView {
+                name: "command".to_string(),
+                value: "rm -rf build".to_string(),
+            }],
+            "the call it is about"
+        );
+        assert_eq!(
+            row.circumstances,
+            vec![api::NegativeMemoryFacetView {
+                name: "weekday".to_string(),
+                value: "thursday".to_string(),
+            }],
+            "and the circumstance it still requires, apart from the arguments"
+        );
+        assert!(row.strength > 0.99, "confirmed now, so it is at full strength");
+        assert!(row.firing, "and at full strength it holds calls");
+        assert!(
+            row.goes_quiet_at > row.last_confirmed_at,
+            "the expiry is in the future of the last confirmation: {row:?}"
+        );
+        assert_eq!(row.occurrences, 2);
+    }
+
+    /// Acceptance (#1186): a person can read one memory in full, including the
+    /// circumstance a later occurrence dropped - the one visible trace of a
+    /// memory that grew wider than the failure it was written for.
+    #[tokio::test]
+    async fn reading_one_negative_memory_reports_the_circumstance_that_widened_it() {
+        let h = negative_memory_handler();
+        let api::CommandResult::NegativeMemory(detail) = h
+            .handle_command_for(
+                RequestContext::from(UserId::new("alice")),
+                api::Command::GetNegativeMemory {
+                    id: "nm-1".to_string(),
+                },
+            )
+            .await
+            .expect("reading one succeeds")
+        else {
+            panic!("expected NegativeMemory");
+        };
+        let detail = detail.expect("the memory is there to read");
+        assert_eq!(detail.memory.id, "nm-1");
+        assert_eq!(detail.memory.outcome, "build is a mount point");
+        assert_eq!(
+            detail.dropped,
+            vec![api::DroppedFacetView {
+                name: "host".to_string(),
+                value: "workshop".to_string(),
+                dropped_at: detail.dropped[0].dropped_at.clone(),
+            }],
+            "the host it stopped requiring is named, with the value it was born with"
+        );
+        assert!(detail.correction.is_none(), "nothing has corrected it yet");
+    }
+
+    /// Acceptance (#1186): a person can clear a memory, and the original stays
+    /// readable afterwards - clearing writes the correction overlay a success
+    /// writes, and deletes nothing.
+    #[tokio::test]
+    async fn clearing_a_negative_memory_leaves_the_original_readable() {
+        let h = negative_memory_handler();
+        let ctx = || RequestContext::from(UserId::new("alice"));
+
+        let api::CommandResult::NegativeMemoryCleared { cleared } = h
+            .handle_command_for(
+                ctx(),
+                api::Command::ClearNegativeMemory {
+                    id: "nm-1".to_string(),
+                    note: None,
+                },
+            )
+            .await
+            .expect("clearing succeeds")
+        else {
+            panic!("expected NegativeMemoryCleared");
+        };
+        assert!(cleared, "the memory a person named was cleared");
+
+        let api::CommandResult::NegativeMemories(rows) = h
+            .handle_command_for(ctx(), api::Command::ListNegativeMemories)
+            .await
+            .expect("listing succeeds")
+        else {
+            panic!("expected NegativeMemories");
+        };
+        assert!(rows.is_empty(), "a cleared memory no longer holds calls");
+
+        let api::CommandResult::NegativeMemory(detail) = h
+            .handle_command_for(
+                ctx(),
+                api::Command::GetNegativeMemory {
+                    id: "nm-1".to_string(),
+                },
+            )
+            .await
+            .expect("reading one succeeds")
+        else {
+            panic!("expected NegativeMemory");
+        };
+        let detail = detail.expect("the original survives its own clearing");
+        assert_eq!(
+            detail.memory.outcome, "build is a mount point",
+            "with the lesson it was written with"
+        );
+        assert!(detail.memory.cleared, "marked as cleared rather than deleted");
+        let correction = detail.correction.expect("and carrying what cleared it");
+        assert_eq!(correction.outcome, CLEARED_BY_PERSON);
+    }
+
+    /// Clearing something no memory answers to reports that nothing was
+    /// cleared, rather than reporting success over an empty write.
+    #[tokio::test]
+    async fn clearing_a_negative_memory_that_is_not_held_reports_nothing_cleared() {
+        let h = negative_memory_handler();
+        let api::CommandResult::NegativeMemoryCleared { cleared } = h
+            .handle_command_for(
+                RequestContext::from(UserId::new("alice")),
+                api::Command::ClearNegativeMemory {
+                    id: "nm-nobody-holds".to_string(),
+                    note: None,
+                },
+            )
+            .await
+            .expect("clearing an absent memory is not an error")
+        else {
+            panic!("expected NegativeMemoryCleared");
+        };
+        assert!(!cleared);
+    }
+
+    /// A deployment with no database holds no negative memory at all. It says
+    /// so, rather than answering an empty list, because "nothing is held" and
+    /// "this deployment cannot answer" are different answers and a person
+    /// reading an empty list would take the first.
+    #[tokio::test]
+    async fn a_deployment_without_negative_memory_says_so_rather_than_listing_none() {
+        let h = DefaultAssistantApiHandler::new(
+            Arc::new(FakeAssistant),
+            Arc::new(FakeConversations),
+            Arc::new(FakeSettings),
+            Arc::new(FakeConnections),
+            Arc::new(FakeKnowledge),
+        );
+        let refused = h
+            .handle_command_for(
+                RequestContext::from(UserId::new("alice")),
+                api::Command::ListNegativeMemories,
+            )
+            .await;
+        assert!(matches!(refused, Err(ApiError::Unsupported)));
+    }
 }

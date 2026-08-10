@@ -30,6 +30,15 @@
 //! - `writing_a_negative_memory_does_not_mark_a_knowledge_entry`
 //! - `the_live_read_is_bounded`
 //!
+//! What a person reads and clears (#1186) adds:
+//!
+//! - `reading_one_burn_shows_the_situation_facets_a_later_occurrence_dropped`
+//! - `reading_one_burn_after_a_clear_returns_the_original_and_its_correction`
+//! - `a_correction_copies_only_the_facets_the_burn_still_requires`
+//! - `recording_the_same_act_after_a_clear_leaves_the_cleared_burn_cleared`
+//! - `reading_a_burn_another_user_holds_returns_nothing`
+//! - `reading_a_burn_by_an_unknown_id_returns_nothing`
+//!
 //! ## Running locally
 //!
 //! ```sh
@@ -48,7 +57,7 @@ use desktop_assistant_core::domain::{KnowledgeEntry, MarkPolarity, MarkSource, S
 use desktop_assistant_core::ports::knowledge::KnowledgeBaseStore;
 use desktop_assistant_core::ports::knowledge_use::{KnowledgeUseLog, MarkRequest};
 use desktop_assistant_core::ports::negative_memory::{
-    BurnObservation, BurnWrite, NegativeMemoryStore,
+    BurnObservation, BurnRecord, BurnWrite, NegativeMemoryStore,
 };
 use desktop_assistant_storage::knowledge_delete::KnowledgeDeletePolicy;
 use desktop_assistant_storage::{
@@ -149,6 +158,31 @@ async fn backdate(pool: &PgPool, id: &str, days: i32) {
     .execute(pool)
     .await
     .expect("backdate the confirmation stamp");
+}
+
+async fn read_burn_as(store: &PgNegativeMemoryStore, user: &str, id: &str) -> Option<BurnRecord> {
+    with_user_id(UserId::new(user), async { store.burn(id.to_string()).await })
+        .await
+        .expect("reading one burn succeeds")
+}
+
+/// The situation facets one burn no longer requires, by name, sorted.
+fn dropped_names(record: &BurnRecord) -> Vec<String> {
+    let mut names: Vec<String> = record
+        .dropped
+        .iter()
+        .map(|d| d.facet.name().to_string())
+        .collect();
+    names.sort();
+    names
+}
+
+/// The act itself, with no circumstance left: what a burn widened by a second
+/// occurrence somewhere else still requires.
+fn the_act_alone() -> Scope {
+    Scope::new()
+        .with(Facet::Argument("command".to_string()), "rm -rf build")
+        .with(Facet::Argument("cwd".to_string()), "/srv/app")
 }
 
 async fn count(pool: &PgPool, sql: &str) -> i64 {
@@ -943,5 +977,226 @@ async fn writing_a_negative_memory_does_not_mark_a_knowledge_entry() {
         count(&fx.pool, "SELECT count(*) FROM knowledge_use_stats").await,
         0
     );
+    fx.cleanup().await;
+}
+
+// --- What a person reads and clears (#1186) ---------------------------------
+
+/// Acceptance (#1186): reading one burn shows what widened it.
+///
+/// The only thing in the whole feature that makes a burn wider is a second
+/// occurrence dropping the situation facets it disagreed with. A dropped facet
+/// is therefore the one visible trace of over-generalization, and dropping the
+/// row would leave a person looking at a wide burn with nothing to say how it
+/// got wide.
+#[tokio::test]
+async fn reading_one_burn_shows_the_situation_facets_a_later_occurrence_dropped() {
+    let Some(fx) = fixture().await else { return };
+    let store = PgNegativeMemoryStore::new(fx.pool.clone());
+
+    let burn = burn_as(
+        &store,
+        ALICE,
+        observation(at_the_workshop(), "build is a mount point"),
+    )
+    .await;
+    burn_as(
+        &store,
+        ALICE,
+        observation(on_a_laptop(), "build is a mount point here too"),
+    )
+    .await;
+
+    let record = read_burn_as(&store, ALICE, &burn.id)
+        .await
+        .expect("the burn is readable one at a time");
+    assert_eq!(
+        record.memory.scope,
+        the_act_alone(),
+        "what the burn still requires is the act both occurrences shared"
+    );
+    assert_eq!(
+        dropped_names(&record),
+        vec![
+            "host".to_string(),
+            "time_of_day".to_string(),
+            "weekday".to_string()
+        ],
+        "and the three circumstances it stopped requiring are still readable"
+    );
+    let host = record
+        .dropped
+        .iter()
+        .find(|d| d.facet == Facet::Situation(SituationField::Host))
+        .expect("the host it was born at is one of them");
+    assert_eq!(
+        host.value, "workshop",
+        "with the value the burn was born with, which is what says how narrow it started"
+    );
+    fx.cleanup().await;
+}
+
+/// Acceptance (#1186): a cleared burn stays readable in full, and the read
+/// carries the correction written over it.
+#[tokio::test]
+async fn reading_one_burn_after_a_clear_returns_the_original_and_its_correction() {
+    let Some(fx) = fixture().await else { return };
+    let store = PgNegativeMemoryStore::new(fx.pool.clone());
+
+    let burn = burn_as(
+        &store,
+        ALICE,
+        observation(at_the_workshop(), "build is a mount point"),
+    )
+    .await;
+    extinguish_as(
+        &store,
+        ALICE,
+        vec![burn.id.clone()],
+        "the person cleared this",
+    )
+    .await;
+
+    let record = read_burn_as(&store, ALICE, &burn.id)
+        .await
+        .expect("a cleared burn is still readable, because clearing is an overlay");
+    assert_eq!(
+        record.memory.outcome, "build is a mount point",
+        "the lesson it was written with survives the clear"
+    );
+    assert_eq!(
+        record.memory.scope,
+        at_the_workshop(),
+        "and so does everything it was scoped to"
+    );
+    let correction = record
+        .correction
+        .expect("the read carries the correction the clear wrote");
+    assert_eq!(correction.kind, NegativeMemoryKind::Correction);
+    assert!(
+        correction.outcome.contains("the person cleared this"),
+        "so a person can see why it stopped applying"
+    );
+    fx.cleanup().await;
+}
+
+/// A correction carries the burn's scope as it stood, not as it was born. A
+/// dropped facet is kept for reading, so the copy has to leave it out or the
+/// correction would state a requirement the burn had already given up.
+#[tokio::test]
+async fn a_correction_copies_only_the_facets_the_burn_still_requires() {
+    let Some(fx) = fixture().await else { return };
+    let store = PgNegativeMemoryStore::new(fx.pool.clone());
+
+    let burn = burn_as(
+        &store,
+        ALICE,
+        observation(at_the_workshop(), "build is a mount point"),
+    )
+    .await;
+    burn_as(
+        &store,
+        ALICE,
+        observation(on_a_laptop(), "build is a mount point here too"),
+    )
+    .await;
+    extinguish_as(&store, ALICE, vec![burn.id.clone()], "it works now").await;
+
+    let history = history_as(&store, ALICE).await;
+    let correction = history
+        .iter()
+        .find(|m| m.kind == NegativeMemoryKind::Correction)
+        .expect("the clear wrote a correction");
+    assert_eq!(
+        correction.scope,
+        the_act_alone(),
+        "the correction states what the burn required when it was corrected"
+    );
+    fx.cleanup().await;
+}
+
+/// Acceptance (#1186): a cleared burn is not brought back by the act failing
+/// again. The new failure is new evidence and starts its own lesson; the
+/// cleared row keeps its correction, its count and its stamp.
+#[tokio::test]
+async fn recording_the_same_act_after_a_clear_leaves_the_cleared_burn_cleared() {
+    let Some(fx) = fixture().await else { return };
+    let store = PgNegativeMemoryStore::new(fx.pool.clone());
+
+    let first = burn_as(
+        &store,
+        ALICE,
+        observation(at_the_workshop(), "build is a mount point"),
+    )
+    .await;
+    extinguish_as(&store, ALICE, vec![first.id.clone()], "the person cleared this").await;
+    let cleared_at = read_burn_as(&store, ALICE, &first.id)
+        .await
+        .expect("the cleared burn is readable")
+        .memory
+        .last_confirmed_at;
+
+    let second = burn_as(
+        &store,
+        ALICE,
+        observation(at_the_workshop(), "it is a mount point again"),
+    )
+    .await;
+    assert_ne!(second.id, first.id, "a fresh lesson, not the old one revived");
+
+    let cleared = read_burn_as(&store, ALICE, &first.id)
+        .await
+        .expect("the cleared burn is still readable");
+    assert!(
+        cleared.memory.superseded_by.is_some(),
+        "the clear stands: a later failure of the same act does not undo it"
+    );
+    assert_eq!(
+        cleared.memory.occurrences, 1,
+        "and the later failure was not counted against the cleared lesson"
+    );
+    assert_eq!(
+        cleared.memory.last_confirmed_at, cleared_at,
+        "nor did it move the cleared lesson's stamp back to full strength"
+    );
+    assert!(
+        live_as(&store, ALICE).await.iter().all(|m| m.id != first.id),
+        "and the cleared lesson is still absent from what fires"
+    );
+    fx.cleanup().await;
+}
+
+/// The tenant boundary holds on the one-burn read as it does on every other:
+/// naming another user's row answers nothing rather than answering theirs.
+#[tokio::test]
+async fn reading_a_burn_another_user_holds_returns_nothing() {
+    let Some(fx) = fixture().await else { return };
+    let store = PgNegativeMemoryStore::new(fx.pool.clone());
+
+    let hers = burn_as(
+        &store,
+        ALICE,
+        observation(at_the_workshop(), "build is a mount point"),
+    )
+    .await;
+    assert!(
+        read_burn_as(&store, BOB, &hers.id).await.is_none(),
+        "one tenant cannot read another tenant's negative memory by id"
+    );
+    assert!(
+        read_burn_as(&store, ALICE, &hers.id).await.is_some(),
+        "and the owner still can, so the miss above is the boundary and not a broken read"
+    );
+    fx.cleanup().await;
+}
+
+/// An id nothing holds is a miss, not an error: a client asking about a burn
+/// that has since been reaped gets an empty answer it can render.
+#[tokio::test]
+async fn reading_a_burn_by_an_unknown_id_returns_nothing() {
+    let Some(fx) = fixture().await else { return };
+    let store = PgNegativeMemoryStore::new(fx.pool.clone());
+
+    assert!(read_burn_as(&store, ALICE, "nm-nobody-holds").await.is_none());
     fx.cleanup().await;
 }

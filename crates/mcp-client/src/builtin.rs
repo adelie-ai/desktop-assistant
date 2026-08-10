@@ -3892,6 +3892,31 @@ mod tests {
         }
     }
 
+    /// Acceptance (#1186): clearing a negative memory is a person's judgement
+    /// about the assistant's own memory, so the model must not hold a tool that
+    /// does it.
+    ///
+    /// What this checks and what it does not, plainly. The model's whole
+    /// affordance is the set of tool definitions it is offered, so this walks
+    /// the catalog a fully-wired runtime advertises and asserts that no entry
+    /// offers to clear one. It does not, and cannot, prove the model has no
+    /// other route: the other two routes are checked where they live -
+    /// `the_sql_tool_cannot_clear_a_negative_memory` in `storage::database`
+    /// holds the one SQL door, and the clear itself is an `api::Command`, which
+    /// arrives from an authenticated client connection and never from a turn.
+    #[test]
+    fn no_builtin_tool_advertises_a_way_to_clear_a_negative_memory() {
+        for def in fully_wired_service().tool_definitions() {
+            let described = format!("{} {}", def.name, def.description).to_lowercase();
+            assert!(
+                !described.contains("negative memory") && !described.contains("negative_memory"),
+                "builtin '{}' offers the model something about negative memory; \
+                 clearing one is a person's judgement and must not be a tool",
+                def.name
+            );
+        }
+    }
+
     /// The pre-#141 docstring on `with_database` claimed "read-only SQL
     /// access" — which the implementation did not enforce. Comment-vs-
     /// behaviour drift on a security-relevant surface is a real bug;

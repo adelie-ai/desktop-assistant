@@ -5204,4 +5204,102 @@ mod tests {
         let body = serde_json::to_value(&view).expect("serialize");
         assert!(body.get("tool_tier").is_none());
     }
+
+    // --- Negative memory, as a person reads it (#1186) -----------------------
+
+    /// Acceptance (#1186): a list row carries the act, the scope, the strength
+    /// and the expiry, so a client can render all four without a second call.
+    #[test]
+    fn a_negative_memory_view_carries_the_act_the_scope_the_strength_and_the_expiry() {
+        let view = NegativeMemoryView {
+            id: "nm-1".to_string(),
+            action: "terminal_run".to_string(),
+            arguments: vec![NegativeMemoryFacetView {
+                name: "command".to_string(),
+                value: "rm -rf build".to_string(),
+            }],
+            circumstances: vec![NegativeMemoryFacetView {
+                name: "host".to_string(),
+                value: "workshop".to_string(),
+            }],
+            outcome: "build is a mount point".to_string(),
+            occurrences: 2,
+            strength: 1.0,
+            firing: true,
+            written_at: "2026-08-01T09:00:00Z".to_string(),
+            last_confirmed_at: "2026-08-07T09:00:00Z".to_string(),
+            goes_quiet_at: "2026-09-04T09:00:00Z".to_string(),
+            cleared: false,
+        };
+        let body = serde_json::to_value(&view).expect("serialize");
+        for field in [
+            "action",
+            "arguments",
+            "circumstances",
+            "strength",
+            "firing",
+            "goes_quiet_at",
+        ] {
+            assert!(body.get(field).is_some(), "a list row must carry {field}");
+        }
+        let back: NegativeMemoryView = serde_json::from_value(body).expect("deserialize");
+        assert_eq!(back, view);
+    }
+
+    /// Acceptance (#1186): the detail view names the circumstances a later
+    /// occurrence dropped, which is the only visible trace of a memory that
+    /// became wider than the failure it was written for.
+    #[test]
+    fn a_negative_memory_detail_names_the_circumstances_a_later_occurrence_dropped() {
+        let detail = NegativeMemoryDetailView {
+            memory: NegativeMemoryView {
+                id: "nm-1".to_string(),
+                action: "terminal_run".to_string(),
+                arguments: Vec::new(),
+                circumstances: Vec::new(),
+                outcome: "build is a mount point".to_string(),
+                occurrences: 2,
+                strength: 1.0,
+                firing: true,
+                written_at: "2026-08-01T09:00:00Z".to_string(),
+                last_confirmed_at: "2026-08-07T09:00:00Z".to_string(),
+                goes_quiet_at: "2026-09-04T09:00:00Z".to_string(),
+                cleared: false,
+            },
+            dropped: vec![DroppedFacetView {
+                name: "host".to_string(),
+                value: "workshop".to_string(),
+                dropped_at: "2026-08-07T09:00:00Z".to_string(),
+            }],
+            correction: None,
+        };
+        let body = serde_json::to_value(&detail).expect("serialize");
+        let dropped = body
+            .get("dropped")
+            .and_then(|d| d.as_array())
+            .expect("the detail carries what was dropped");
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0]["name"], "host");
+        assert_eq!(dropped[0]["value"], "workshop");
+        assert!(
+            dropped[0].get("dropped_at").is_some(),
+            "and when it was dropped, so a person can date the widening"
+        );
+        let back: NegativeMemoryDetailView = serde_json::from_value(body).expect("deserialize");
+        assert_eq!(back, detail);
+    }
+
+    /// The note on a clear is optional on the wire: a client that offers no
+    /// reason box still sends a parseable command.
+    #[test]
+    fn clearing_a_negative_memory_may_omit_its_note_on_the_wire() {
+        let parsed: Command =
+            serde_json::from_str(r#"{"clear_negative_memory":{"id":"nm-1"}}"#)
+                .expect("a clear with no note must parse");
+        let Command::ClearNegativeMemory { id, note } = parsed else {
+            panic!("expected ClearNegativeMemory");
+        };
+        assert_eq!(id, "nm-1");
+        assert_eq!(note, None);
+    }
 }
