@@ -350,6 +350,14 @@ past for a memory that has gone quiet on its own. `arguments` and
 identity and never widens, a circumstance is provisional, and an argument may
 itself be *named* `host`.
 
+**The list is capped at 200 rows**, ordered by last confirmation, newest first.
+It is deliberately the same read a turn makes to decide what may hold a call,
+with the same bound and the same order, so a memory this list omits is one the
+daemon would not have fired either. A person cannot therefore be shown a list
+that is missing the memory holding their work: reaching the cap needs 200
+memories confirmed more recently than the one dropped, and a memory that holds
+anything was confirmed inside the last four weeks.
+
 **`get_negative_memory { id }`** returns `negative_memory`, either `null` or one
 memory in full. Two fields a list row does not carry:
 

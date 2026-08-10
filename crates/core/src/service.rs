@@ -3679,13 +3679,19 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 // The digest costs a hash, so it is taken once and shared by
                 // the places that need it.
                 let burn_identity = pending_action.as_ref().map(burn_key);
-                let fired_burns = pending_action
-                    .as_ref()
-                    .filter(|_| !live_burns.is_empty())
-                    .map(|pending| burns_that_fire(&live_burns, pending, Utc::now()))
-                    .unwrap_or_default();
+                // Matched only when a match could change anything. An identity
+                // already met this turn runs whatever is held against it, so
+                // scoring the live set for it would be work thrown away on
+                // every call of a repeated act.
+                let fired_burns = match pending_action.as_ref().zip(burn_identity.as_deref()) {
+                    Some((pending, identity))
+                        if !live_burns.is_empty() && !burns_met_this_turn.contains(identity) =>
+                    {
+                        burns_that_fire(&live_burns, pending, Utc::now())
+                    }
+                    _ => Vec::new(),
+                };
                 if let Some(identity) = burn_identity.as_deref()
-                    && !burns_met_this_turn.contains(identity)
                     && let Some(warning) = render_warning(&fired_burns, Utc::now())
                 {
                     tracing::info!(

@@ -661,7 +661,17 @@ impl NegativeMemory {
     ///
     /// A confirmation moves this, because it moves
     /// [`last_confirmed_at`](Self::last_confirmed_at) and nothing else does.
-    pub fn goes_quiet_at(&self) -> DateTime<Utc> {
+    ///
+    /// `now` is taken rather than implied because one state cannot be answered
+    /// from the stamp alone. A stamp from beyond the reader's clock is a broken
+    /// clock rather than a fresher lesson, so [`Self::strength`] scores it zero
+    /// and it is silent already - and the arithmetic on its own would report a
+    /// date in the future for a burn that holds nothing. `now` is the honest
+    /// answer there: it went quiet the moment it was read.
+    pub fn goes_quiet_at(&self, now: DateTime<Utc>) -> DateTime<Utc> {
+        if self.days_since_confirmed(now) < -future_tolerance_days() {
+            return now;
+        }
         let seconds = silence_after_days() * 24.0 * 60.0 * 60.0;
         self.last_confirmed_at + TimeDelta::milliseconds((seconds * 1000.0) as i64)
     }
@@ -856,14 +866,20 @@ pub fn render_hold_notice(fired: &[&NegativeMemory]) -> Option<String> {
 }
 
 /// The first line of `text`, cut to [`MAX_HOLD_NOTICE_CHARS`] on a character
-/// boundary.
+/// boundary, and marked when it was cut.
 ///
 /// One line because the feed shows one line per call, and a multi-line entry
 /// would misalign every entry after it. Cut by characters rather than bytes so
-/// a multi-byte outcome cannot panic the notice.
+/// a multi-byte outcome cannot panic the notice. Marked because a silent cut
+/// reads as a complete sentence, and a person deciding whether a lesson still
+/// applies would be judging half of it without knowing.
 fn one_capped_line(text: &str) -> String {
     let line = text.lines().next().unwrap_or_default().trim();
-    line.chars().take(MAX_HOLD_NOTICE_CHARS).collect()
+    if line.chars().count() <= MAX_HOLD_NOTICE_CHARS {
+        return line.to_string();
+    }
+    let kept: String = line.chars().take(MAX_HOLD_NOTICE_CHARS).collect();
+    format!("{kept}...")
 }
 
 /// Cut `outcome` to [`MAX_OUTCOME_CHARS`] on a character boundary.
@@ -1804,7 +1820,7 @@ mod tests {
     #[test]
     fn a_burn_goes_quiet_at_the_moment_its_strength_falls_under_the_silence_floor() {
         let burn = fresh_burn();
-        let quiet_at = burn.goes_quiet_at();
+        let quiet_at = burn.goes_quiet_at(now());
         let a_second = TimeDelta::seconds(1);
         assert!(
             !burn.is_silent(quiet_at - a_second),
@@ -1813,6 +1829,25 @@ mod tests {
         assert!(
             burn.is_silent(quiet_at + a_second),
             "and it does not fire a second after it"
+        );
+    }
+
+    /// A stamp from beyond the reader's clock is a broken clock rather than a
+    /// fresher lesson, so the burn is silent already. The expiry a person is
+    /// shown has to say that, not a date four weeks out for a burn that holds
+    /// nothing.
+    #[test]
+    fn a_burn_stamped_beyond_the_clock_is_shown_as_already_quiet() {
+        // `burn_aged` takes an age, so a negative age puts the stamp ahead.
+        let skewed = burn_aged(-TimeDelta::days(3));
+        assert!(
+            skewed.is_silent(now()),
+            "a disbelieved stamp scores zero, so it is already quiet"
+        );
+        assert_eq!(
+            skewed.goes_quiet_at(now()),
+            now(),
+            "and the expiry says so, rather than a date it will never reach"
         );
     }
 
@@ -1870,6 +1905,10 @@ mod tests {
         assert!(
             notice.matches('x').count() <= MAX_HOLD_NOTICE_CHARS,
             "and that line is capped: {notice}"
+        );
+        assert!(
+            notice.ends_with("..."),
+            "and says it was cut, so half an outcome does not read as a whole one: {notice}"
         );
     }
 

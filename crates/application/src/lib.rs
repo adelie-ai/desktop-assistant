@@ -1583,7 +1583,7 @@ fn negative_memory_to_view(
         firing: !memory.is_silent(now),
         written_at: memory.written_at.to_rfc3339(),
         last_confirmed_at: memory.last_confirmed_at.to_rfc3339(),
-        goes_quiet_at: memory.goes_quiet_at().to_rfc3339(),
+        goes_quiet_at: memory.goes_quiet_at(now).to_rfc3339(),
         cleared: memory.superseded_by.is_some(),
     }
 }

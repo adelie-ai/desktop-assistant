@@ -205,6 +205,13 @@ questions about different objects.
   commands and the hold notice exist on the wire. Until a client shows them, a
   person still meets a held call as an assistant that would not act - the
   reason is now readable, but nothing on screen reads it.
+- **A clear does not reach a turn already running.** The turn reads its live
+  burns once, before its first round, so a burn cleared while a turn is in
+  flight still holds that turn's calls; it holds nothing from the next turn on.
+  An accepted cost, not an oversight: the alternative is a database round trip
+  in front of every tool call, which is exactly what the single batched read
+  exists to avoid. What would remove it is a per-turn invalidation signal, and
+  a window of one turn does not pay for one.
 - **A cleared burn is not resurrected by a later failure.** The act failing
   again writes a fresh lesson at full strength beside the cleared one. That is
   new evidence and it should count; what it must not do is confirm the cleared

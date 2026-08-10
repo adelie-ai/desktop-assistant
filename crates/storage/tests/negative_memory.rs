@@ -38,6 +38,7 @@
 //! - `recording_the_same_act_after_a_clear_leaves_the_cleared_burn_cleared`
 //! - `reading_a_burn_another_user_holds_returns_nothing`
 //! - `reading_a_burn_by_an_unknown_id_returns_nothing`
+//! - `a_third_occurrence_does_not_drop_a_facet_that_is_already_dropped`
 //!
 //! ## Running locally
 //!
@@ -1215,6 +1216,64 @@ async fn reading_a_burn_by_an_unknown_id_returns_nothing() {
         read_burn_as(&store, ALICE, "nm-nobody-holds")
             .await
             .is_none()
+    );
+    fx.cleanup().await;
+}
+
+/// A facet is dropped once. A third occurrence must not read a dropped facet
+/// back as a live requirement, drop it a second time, and report a widening
+/// that did not happen - the count is what a caller logs, and a burn that looks
+/// like it is still widening reads as one still generalizing.
+#[tokio::test]
+async fn a_third_occurrence_does_not_drop_a_facet_that_is_already_dropped() {
+    let Some(fx) = fixture().await else { return };
+    let store = PgNegativeMemoryStore::new(fx.pool.clone());
+
+    let first = burn_as(
+        &store,
+        ALICE,
+        observation(at_the_workshop(), "build is a mount point"),
+    )
+    .await;
+    let second = burn_as(
+        &store,
+        ALICE,
+        observation(on_a_laptop(), "build is a mount point here too"),
+    )
+    .await;
+    assert_eq!(
+        second.widened_by, 3,
+        "the second occurrence drops all three"
+    );
+
+    let third = burn_as(
+        &store,
+        ALICE,
+        observation(on_a_laptop(), "and once more on the laptop"),
+    )
+    .await;
+    assert_eq!(
+        third.widened_by, 0,
+        "there is nothing left to drop, so nothing widened"
+    );
+    assert_eq!(third.occurrences, 3);
+
+    let record = read_burn_as(&store, ALICE, &first.id)
+        .await
+        .expect("the burn is readable");
+    assert_eq!(
+        record.memory.scope,
+        the_act_alone(),
+        "and the burn still requires exactly the act"
+    );
+    assert_eq!(
+        dropped_names(&record),
+        vec![
+            "host".to_string(),
+            "time_of_day".to_string(),
+            "weekday".to_string()
+        ],
+        "with each circumstance dropped once, not once per later occurrence"
     );
     fx.cleanup().await;
 }
