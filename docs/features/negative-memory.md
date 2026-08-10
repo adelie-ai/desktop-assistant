@@ -105,12 +105,52 @@ The turn reads its live burns once, before its first round, and matches them in
 memory. A read per tool call would put a database round trip in front of every
 one.
 
+## What a person sees, and what they can do about it
+
+Over-generalization presents as reticence rather than as an error, so a burn
+that is wrong is invisible by construction. Three things make it visible.
+
+**The held call says which lesson held it.** A held call reports on the activity
+feed as a finished tool call with `ok: false` and an output of the form
+`held by a stored lesson (<id>): <what went wrong>`. The warning above goes to
+the model in place of the tool result and never reaches a screen, so without
+this line the reticence has no name and nothing to look up.
+
+**Three commands, all tenant-level.** `list_negative_memories` gives the act,
+the recorded arguments, the circumstances still required, the strength now and
+the date it goes quiet. `get_negative_memory` gives one in full.
+`clear_negative_memory` overrules one. `docs/WEBSOCKET_API.md` carries the wire
+shapes. They are gated on a database, like the rest of the feature, and report
+`unsupported` rather than an empty list without one - a person asking why the
+assistant will not act would read an empty list as "nothing is holding it".
+
+**A widened burn shows how it widened.** A situation facet a second occurrence
+dropped keeps its row and gains a `dropped_at` stamp, and
+`get_negative_memory` returns those beside the scope. Widening is the only
+mechanism that over-generalizes a burn, so this is the trace it leaves: an empty
+circumstance list beside a long list of dropped ones is exactly what a burn that
+now fires everywhere looks like. Every scope read filters `dropped_at IS NULL`,
+so keeping the row changes nothing about what a burn requires.
+
+Clearing is a person's judgement about the assistant's own memory, and it stays
+out of the model's reach. No tool the model is offered mentions negative memory;
+the one SQL door takes `SELECT` and nothing else on the read path and refuses
+the table outright on the write path; and the clear is a command, which arrives
+from an authenticated client connection rather than from a turn.
+
 ## Extinction is an overlay
 
 A burn that stops applying is not deleted. The same call succeeding writes a
 `correction` row carrying the burn's own action and scope, and the burn's
 `superseded_by` names it. The burn keeps every column it had, and
 `history(action)` reads both.
+
+A person clearing a burn writes that same overlay, by the same store call. The
+note is the only thing that differs: a person who gives no reason gets the
+daemon's own line saying a person cleared it, so a later reader can tell a
+judgement from an observed success. A cleared burn stops firing, stops being
+listed, and stays readable by id - which is the property a delete path would
+have cost.
 
 Only the burns a success would actually have fired are extinguished: a success
 elsewhere says nothing about a lesson whose context still holds. That covers
@@ -161,10 +201,15 @@ questions about different objects.
   saying why, and the recorded arguments are left out. The act is the digest, so
   the lesson still fires on exactly the call it was about; only what a warning
   can say about it is lost.
-- **No surface yet for reading or clearing a burn.** A person meets this only as
-  the assistant saying it tried something before and it went badly. A wrong burn
-  goes quiet four weeks after its last occurrence on its own, and the moment the
-  same call succeeds. A tool to list and clear them is not built.
+- **The daemon carries the surface; a client has to render it.** The three
+  commands and the hold notice exist on the wire. Until a client shows them, a
+  person still meets a held call as an assistant that would not act - the
+  reason is now readable, but nothing on screen reads it.
+- **A cleared burn is not resurrected by a later failure.** The act failing
+  again writes a fresh lesson at full strength beside the cleared one. That is
+  new evidence and it should count; what it must not do is confirm the cleared
+  row back to life, and the confirm path cannot, because it only ever selects a
+  row whose `superseded_by` is null.
 - **Personal data.** Both tables carry `user_id`, enable their own row-level
   security, and are registered in `PERSONAL_DATA_TABLES`. What a person's
   assistant tried and how it failed is as personal as the work it was doing.

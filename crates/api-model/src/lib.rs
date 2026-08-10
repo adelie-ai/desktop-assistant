@@ -5455,9 +5455,8 @@ mod tests {
     /// reason box still sends a parseable command.
     #[test]
     fn clearing_a_negative_memory_may_omit_its_note_on_the_wire() {
-        let parsed: Command =
-            serde_json::from_str(r#"{"clear_negative_memory":{"id":"nm-1"}}"#)
-                .expect("a clear with no note must parse");
+        let parsed: Command = serde_json::from_str(r#"{"clear_negative_memory":{"id":"nm-1"}}"#)
+            .expect("a clear with no note must parse");
         let Command::ClearNegativeMemory { id, note } = parsed else {
             panic!("expected ClearNegativeMemory");
         };

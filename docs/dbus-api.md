@@ -176,3 +176,11 @@ busctl --user call org.desktopAssistant \
 - WebSocket auth uses bearer JWTs, minted off the D-Bus surface entirely; see
   [WEBSOCKET_API.md](WEBSOCKET_API.md). Multiple tokens can be valid at once
   until expiry.
+- Negative memory is **not on this surface**. The daemon holds a tool call back
+  when the same act went badly before, and `list_negative_memories`,
+  `get_negative_memory` and `clear_negative_memory` are what let a person see
+  and overrule that (see [WEBSOCKET_API.md](WEBSOCKET_API.md)). This bridge
+  carries a curated subset of the command surface and has no method for them
+  yet, so a D-Bus client cannot list or clear one. Nothing an existing D-Bus
+  caller does changes; what such a client cannot do is show a person why a call
+  was held.

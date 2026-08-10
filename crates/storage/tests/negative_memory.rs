@@ -161,9 +161,11 @@ async fn backdate(pool: &PgPool, id: &str, days: i32) {
 }
 
 async fn read_burn_as(store: &PgNegativeMemoryStore, user: &str, id: &str) -> Option<BurnRecord> {
-    with_user_id(UserId::new(user), async { store.burn(id.to_string()).await })
-        .await
-        .expect("reading one burn succeeds")
+    with_user_id(UserId::new(user), async {
+        store.burn(id.to_string()).await
+    })
+    .await
+    .expect("reading one burn succeeds")
 }
 
 /// The situation facets one burn no longer requires, by name, sorted.
@@ -1129,7 +1131,13 @@ async fn recording_the_same_act_after_a_clear_leaves_the_cleared_burn_cleared() 
         observation(at_the_workshop(), "build is a mount point"),
     )
     .await;
-    extinguish_as(&store, ALICE, vec![first.id.clone()], "the person cleared this").await;
+    extinguish_as(
+        &store,
+        ALICE,
+        vec![first.id.clone()],
+        "the person cleared this",
+    )
+    .await;
     let cleared_at = read_burn_as(&store, ALICE, &first.id)
         .await
         .expect("the cleared burn is readable")
@@ -1142,7 +1150,10 @@ async fn recording_the_same_act_after_a_clear_leaves_the_cleared_burn_cleared() 
         observation(at_the_workshop(), "it is a mount point again"),
     )
     .await;
-    assert_ne!(second.id, first.id, "a fresh lesson, not the old one revived");
+    assert_ne!(
+        second.id, first.id,
+        "a fresh lesson, not the old one revived"
+    );
 
     let cleared = read_burn_as(&store, ALICE, &first.id)
         .await
@@ -1160,7 +1171,10 @@ async fn recording_the_same_act_after_a_clear_leaves_the_cleared_burn_cleared() 
         "nor did it move the cleared lesson's stamp back to full strength"
     );
     assert!(
-        live_as(&store, ALICE).await.iter().all(|m| m.id != first.id),
+        live_as(&store, ALICE)
+            .await
+            .iter()
+            .all(|m| m.id != first.id),
         "and the cleared lesson is still absent from what fires"
     );
     fx.cleanup().await;
@@ -1197,6 +1211,10 @@ async fn reading_a_burn_by_an_unknown_id_returns_nothing() {
     let Some(fx) = fixture().await else { return };
     let store = PgNegativeMemoryStore::new(fx.pool.clone());
 
-    assert!(read_burn_as(&store, ALICE, "nm-nobody-holds").await.is_none());
+    assert!(
+        read_burn_as(&store, ALICE, "nm-nobody-holds")
+            .await
+            .is_none()
+    );
     fx.cleanup().await;
 }

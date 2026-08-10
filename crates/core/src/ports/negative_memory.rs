@@ -96,9 +96,8 @@ pub struct BurnWrite {
 /// asking for that.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DroppedFacet {
-    /// Which circumstance it was. Always a
-    /// [`Facet::Situation`](crate::domain::negative_memory::Facet::Situation) -
-    /// an argument facet is the burn's identity and is never dropped.
+    /// Which circumstance it was. Always a [`Facet::Situation`] - an argument
+    /// facet is the burn's identity and is never dropped.
     pub facet: Facet,
     /// The value the burn was born requiring, which is what says how narrow it
     /// started.
@@ -173,7 +172,10 @@ pub trait NegativeMemoryStore: Send + Sync {
     /// `None` for an id this user does not hold, which covers both a memory
     /// that was reaped and one another tenant holds - a caller cannot tell the
     /// two apart, and must not be able to.
-    fn burn(&self, id: String) -> impl Future<Output = Result<Option<BurnRecord>, CoreError>> + Send;
+    fn burn(
+        &self,
+        id: String,
+    ) -> impl Future<Output = Result<Option<BurnRecord>, CoreError>> + Send;
 
     /// Everything ever recorded against `action`: live burns, extinguished
     /// ones, and the corrections written over them.

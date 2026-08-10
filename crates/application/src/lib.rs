@@ -2307,9 +2307,9 @@ where
                 let wiring = self.negative_memory.as_ref().ok_or(ApiError::Unsupported)?;
                 let record = (wiring.inspect)(id).await.map_err(Self::map_core_err)?;
                 let now = chrono::Utc::now();
-                Ok(api::CommandResult::NegativeMemory(record.map(|r| {
-                    Box::new(negative_memory_record_to_view(r, now))
-                })))
+                Ok(api::CommandResult::NegativeMemory(
+                    record.map(|r| Box::new(negative_memory_record_to_view(r, now))),
+                ))
             }
             api::Command::ClearNegativeMemory { id, note } => {
                 let wiring = self.negative_memory.as_ref().ok_or(ApiError::Unsupported)?;
@@ -7901,11 +7901,11 @@ mod tests {
 
     // --- Negative memory: see one, read one, clear one (#1186) ---------------
 
+    use desktop_assistant_core::domain::SituationField;
     use desktop_assistant_core::domain::negative_memory::{
         CLEARED_BY_PERSON, Facet as BurnFacet, NegativeMemory as Burn,
         NegativeMemoryKind as BurnKind, Scope as BurnScope,
     };
-    use desktop_assistant_core::domain::SituationField;
     use desktop_assistant_core::ports::negative_memory::{
         BurnRecord, DroppedFacet, ExtinguishBurnsFn, InspectBurnFn, LiveBurnsFn,
     };
@@ -8049,7 +8049,10 @@ mod tests {
             }],
             "and the circumstance it still requires, apart from the arguments"
         );
-        assert!(row.strength > 0.99, "confirmed now, so it is at full strength");
+        assert!(
+            row.strength > 0.99,
+            "confirmed now, so it is at full strength"
+        );
         assert!(row.firing, "and at full strength it holds calls");
         assert!(
             row.goes_quiet_at > row.last_confirmed_at,
@@ -8140,7 +8143,10 @@ mod tests {
             detail.memory.outcome, "build is a mount point",
             "with the lesson it was written with"
         );
-        assert!(detail.memory.cleared, "marked as cleared rather than deleted");
+        assert!(
+            detail.memory.cleared,
+            "marked as cleared rather than deleted"
+        );
         let correction = detail.correction.expect("and carrying what cleared it");
         assert_eq!(correction.outcome, CLEARED_BY_PERSON);
     }

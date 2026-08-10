@@ -15258,7 +15258,11 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(held.len(), 1, "one held call, one notice; events={events:?}");
+        assert_eq!(
+            held.len(),
+            1,
+            "one held call, one notice; events={events:?}"
+        );
         assert!(
             held[0].contains("nm-1"),
             "the notice names the lesson that held the call, so a person can read it: {}",

@@ -307,8 +307,76 @@ Current command variants:
 - `set_persistence_settings { enabled, remote_url?, remote_name?, push_on_update }`
 - `get_database_settings`
 - `set_database_settings { url, max_connections }`
+- `list_negative_memories`
+- `get_negative_memory { id }`
+- `clear_negative_memory { id, note? }`
 
 Result payloads are typed variants (`pong`, `status`, `conversation_id`, `conversations`, `conversation`, `config`, `ack`, etc.).
+
+### Negative memory: what is holding a call back
+
+The daemon holds a tool call back when the same act went badly before, and the
+model reads the stored lesson in place of the tool result. A person sees only
+that the call did not run, so these three commands are what make the reason
+visible - and what lets a person overrule it.
+
+Read them together with the activity feed. A held call reports as a finished
+tool call with `ok: false` and an output of the form
+`held by a stored lesson (<id>): <what went wrong>`. That id is what
+`get_negative_memory` takes.
+
+**`list_negative_memories`** returns `negative_memories`, one row per live
+memory, strongest first:
+
+```json
+{"result": {"negative_memories": [{
+  "id": "0199...", "action": "terminal_run",
+  "arguments": [{"name": "command", "value": "rm -rf build"}],
+  "circumstances": [{"name": "host", "value": "workshop"}],
+  "outcome": "build is a mount point", "occurrences": 2,
+  "strength": 0.71, "firing": true,
+  "written_at": "2026-08-01T09:00:00Z",
+  "last_confirmed_at": "2026-08-05T09:00:00Z",
+  "goes_quiet_at": "2026-09-02T09:00:00Z",
+  "cleared": false
+}]}}
+```
+
+`strength` is a fraction of full at the moment the daemon answered; it halves
+every two weeks without a repeat. `firing` says whether it is still strong
+enough to hold a call, and `goes_quiet_at` is when it stops - already in the
+past for a memory that has gone quiet on its own. `arguments` and
+`circumstances` are separate lists on purpose: an argument is the act's
+identity and never widens, a circumstance is provisional, and an argument may
+itself be *named* `host`.
+
+**`get_negative_memory { id }`** returns `negative_memory`, either `null` or one
+memory in full. Two fields a list row does not carry:
+
+- `dropped` - the circumstances the memory once required and no longer does,
+  each with the value it was born requiring and the date it was dropped. A
+  memory widens in exactly one way: a later occurrence of the same act,
+  somewhere else, drops the circumstances it disagreed with. **This list is the
+  whole history of a memory getting wider, and an empty `circumstances` beside
+  a long `dropped` is what a memory that now fires everywhere looks like.**
+- `correction` - `{ id, outcome, written_at }` when the memory has been
+  cleared. `outcome` says why it stopped applying and `written_at` is when.
+
+**`clear_negative_memory { id, note? }`** returns
+`{"negative_memory_cleared": {"cleared": true}}`. Nothing is deleted: this
+writes the same `correction` overlay that the act succeeding writes, so the
+original stays readable and `get_negative_memory` keeps answering for it.
+`note` is what the correction says; omit it and the daemon writes its own line
+recording that a person cleared it, which is what tells a later reader a
+person's judgement from an observed success. `cleared: false` means the memory
+was already cleared or this user does not hold it - neither is an error, and
+the memory is in the state you asked for either way.
+
+All three need only the tenant capability, and all three report
+`{"error": {"code": "unsupported"}}` on a deployment with no database, where
+negative memory does not run at all. That is deliberately not an empty list: a
+person asking why the assistant will not do something would read an empty list
+as "nothing is holding it".
 
 ### Credentials in connection URLs
 

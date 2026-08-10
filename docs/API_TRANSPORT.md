@@ -154,6 +154,15 @@ tenants through the operator's provider, consolidation rewrites every user's
 knowledge base, and extraction's archival phase widens to all users under the
 default-subject sentinel.
 
+`ListNegativeMemories`, `GetNegativeMemory` and `ClearNegativeMemory` are
+tenant work. What one person's assistant tried and how it failed is that
+person's, on the same footing as their knowledge and their scratchpads, and
+requiring the administrator capability would put a single-user desktop's own
+memory out of its owner's reach on any multi-tenant deployment. Clearing is
+still a person's judgement rather than the model's: it is a command, which
+arrives from an authenticated client connection and never from a turn, and no
+tool the model is offered reaches it.
+
 Every other command is tenant work, including `ClearAllHistory`, which clears
 only the calling user's conversations.
 
