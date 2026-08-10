@@ -55,7 +55,19 @@ build:
 # to precede either. The `-sqlite` and `-mcp-host` steps are separate because
 # that adapter/module is compiled out of the workspace steps entirely; see
 # `lint-sqlite` and `lint-mcp-host`.
+# The full gate. Eighteen recipes across four feature sets. This is what a
+# merge must pass, and what `just merge` runs.
 check: audit secret-scan no-otel fmt-check lint lint-sqlite lint-mcp-host lint-otel doc doc-sqlite doc-mcp-host doc-otel build test test-sqlite test-mcp-host test-otel test-scripts
+
+# The push gate: everything that catches an ordinary mistake, and nothing that
+# repeats per feature set. Roughly two minutes against ten.
+#
+# What is deliberately NOT here: the sqlite, mcp-host and otel repeats of lint,
+# doc and test, plus rustdoc. Those are real checks - `lint-otel` alone is 74
+# seconds - and they belong to the merge, not to every push of a work in
+# progress. `just merge` runs the full `check`, so nothing reaches main without
+# them.
+check-fast: audit secret-scan no-otel fmt-check lint build test
 
 # Prove a default build resolves no opentelemetry crate. Telemetry export sits
 # behind an off-by-default `otel` feature, and the promise that goes with it is
@@ -529,3 +541,17 @@ package-all-docker:
     just package-deb-docker
     just package-rpm-docker
     just package-flatpak-docker
+
+# Merge this branch's pull request, but only behind the FULL gate.
+#
+# The push gate is deliberately narrow (see `check-fast`), so this is where the
+# feature-variant checks actually run. It refuses rather than merging when the
+# gate fails, and it will not merge a pull request that is not green on its own
+# terms either.
+merge:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "==> full gate before merge"
+    just check
+    echo "==> gate green; merging"
+    gh pr merge --squash
