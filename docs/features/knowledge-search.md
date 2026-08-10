@@ -96,11 +96,47 @@ pass the caller's `tags` and `exclude_tags` filters. Neither describes the
 entries that matched the query.
 
 The number of query matches cannot be computed for this tool. The search is
-hybrid RRF (`crates/storage/src/knowledge.rs`): the full-text arm is
+hybrid (`crates/storage/src/knowledge_search.rs`): the full-text arm is
 query-scoped (`tsv @@ query`), but the vector arm is not, because a cosine
 distance is defined for every embedded row. "Entries matching the query" is
 therefore every embedded row plus the full-text hits, which is the whole store.
 Reporting that as a match count would state a falsehood.
+
+## What decides the order (#1167)
+
+`results` is ordered by the **activation score**, the same score the `[Recall]`
+block ranks by, so a person cannot get one ordering from the tool and another
+from the block.
+
+The two arms admit and the score ranks:
+
+- The **vector arm** measures every in-scope row this query can be compared
+  with, states the store's own median and median absolute deviation over those
+  distances, and admits the nearest of them. Each admitted row's semantic term
+  is how many of the store's own deviations below its median this query put it
+  - never a raw distance, which means nothing across a store or an embedding
+  model. Added to it: what the use log knows about the entry, and what the
+  entry's own text says about how salient it is.
+- The **full-text arm** admits rows the vector arm cannot compare at all: one
+  written since the last embedding backfill, or one still stamped with a
+  superseded model. Such a row carries no distance, so it carries no semantic
+  term and no score. It keeps the order the database ranked it in and follows
+  the rows that were measured.
+
+The spread is measured in the pass that ranks and is never cached: the median
+and the deviation are statistics of the distances from *this* query's point, so
+a query in a dense region of the store has a different distribution from one in
+a sparse region. A store too small to state one is read by the same stated
+estimate the block falls back to.
+
+**What this costs, stated rather than left to be found.** On a store whose rows
+are embedded, the full-text arm no longer decides any line of a full page - it
+fills the page only where the vector arm returned fewer rows than were asked
+for. A query whose whole signal is lexical (an identifier, a serial number, a
+quoted phrase an embedding represents poorly) therefore lost the ranking help
+the previous reciprocal-rank fusion gave it. Issue #1239 tracks the activation
+score's own full-text-rank term, which is what gives that back without
+reintroducing a fused rank.
 
 The four values:
 
@@ -230,9 +266,10 @@ knowledge-base prompt section states the procedure:
 Two of those are worth stating plainly, because both invite a wrong instruction.
 
 **A larger search `limit` does find more entries, and is still the wrong
-retry.** It finds more: `search_hybrid` derives `fetch_limit` as `limit * 2` for
-both retrieval arms and `result_limit` as `limit` for the page, so a bigger
-limit really does surface entries a smaller one truncated away. It is the wrong
+retry.** It finds more: `search_hybrid` admits `limit * 2` rows from the vector
+arm, so that activation ranking has rows to lift, and `limit` from the full-text
+arm, so a bigger limit really does surface entries a smaller one truncated
+away. It is the wrong
 move for a different reason - the model cannot tell how far down the ranking the
 entry sits, so the retry is a guess that costs an embedding round-trip and may
 still miss. A sweep is bounded and it reports what has already been read. The

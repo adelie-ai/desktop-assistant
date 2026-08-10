@@ -80,7 +80,7 @@
 //!
 //! | term | where its input will come from |
 //! | --- | --- |
-//! | full-text rank | a recall lookup uses one mode at a time, so a vector candidate carries no rank and a lexical one carries no distance - see [`RecallRelevance`] |
+//! | full-text rank | a recall lookup uses one mode at a time, so a vector candidate carries no rank and a lexical one carries no distance - see [`RecallRelevance`]. The knowledge-search tool runs both modes over one store in one call (#1167), so it is the first caller that could supply one; #1239 is where the term is designed |
 //! | interference penalty | the entry disposition of #893, which no column holds yet |
 //!
 //! Each of them adds to `A_i` when it exists. The semantic term is already

@@ -1,5 +1,6 @@
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::KnowledgeEntry;
+use desktop_assistant_core::domain::knowledge_use::KnowledgeUseRecord;
 use desktop_assistant_core::ports::auth::current_user_id;
 use desktop_assistant_core::ports::knowledge::{
     AVAILABLE_TAGS_LIMIT, KNOWLEDGE_TAG_CENSUS_SAMPLE, KnowledgeBaseStore, KnowledgeListPage,
@@ -10,6 +11,7 @@ use pgvector::Vector;
 use sqlx::PgPool;
 
 use crate::knowledge_delete::{HardDeleteTarget, KnowledgeDeletePolicy, hard_delete_knowledge};
+use crate::knowledge_search::SearchCandidate;
 
 pub struct PgKnowledgeBaseStore {
     pool: PgPool,
@@ -377,7 +379,27 @@ impl PgKnowledgeBaseStore {
         Ok((scope_size, row.available_tags))
     }
 
-    /// The vector + full-text (RRF) arm of [`KnowledgeBaseStore::search`].
+    /// The vector + full-text arm of [`KnowledgeBaseStore::search`], ranked by
+    /// the activation score (#1167).
+    ///
+    /// The two arms admit and the score ranks -
+    /// [`crate::knowledge_search`] holds the whole argument, the shape of the
+    /// scan, and the cost the change accepts. What lives here is the
+    /// composition: one bounded scan, one batched read of the use log, and the
+    /// ranking those two feed.
+    ///
+    /// **The store's spread is measured in the same pass that ranks, and is
+    /// never cached.** The median and the deviation are statistics of the
+    /// distances from *this* query's point, so a query in a dense region of the
+    /// store has a different distribution from one in a sparse region. A store
+    /// too small to state one leaves the page on
+    /// [`RECALL_ASSUMED_DISPERSION`](desktop_assistant_core::recall::RECALL_ASSUMED_DISPERSION),
+    /// which is the same estimate the `[Recall]` block falls back to - one rule
+    /// and one estimate, so the tool and the block cannot drift.
+    ///
+    /// The scan carries [`RECALL_SCAN_STATEMENT_TIMEOUT`]: it reads every
+    /// comparable row in scope to state the spread, so it is a full scan and it
+    /// is one the model can run several times inside a turn.
     ///
     /// Both tag filters must already be normalized (`normalize_tag_filter`).
     async fn search_hybrid(
@@ -391,113 +413,101 @@ impl PgKnowledgeBaseStore {
     ) -> Result<Vec<KnowledgeEntry>, CoreError> {
         let user_id = current_user_id();
         let embedding_vec = Vector::from(query_embedding);
-        // Over-fetch each arm so the fusion has something to fuse: a row that
-        // ranks well on one arm and modestly on the other must still be
-        // reachable from both lists.
-        //
-        // Both `vector_ranked` and `text_ranked` below carry an explicit
-        // `ORDER BY` before their `LIMIT`, and both are load-bearing rather
-        // than decorative (#1107). `ORDER BY` inside `OVER (…)` orders the
-        // window computation, not the statement's output, so a `LIMIT` with
-        // no statement-level order truncates an undefined set: the arm still
-        // returns rows and the fusion still ranks them, so the caller gets a
-        // plausible page that quietly omits the best matches. Removing either
-        // one costs nothing at the time and breaks recall later.
-        //
-        // The final `ORDER BY rrf_score DESC, updated_at DESC, id DESC` is the
-        // same defect one level out, and just as load-bearing: RRF ties
-        // exactly by construction (a row found by only one arm at rank 1
-        // scores exactly `1/(60+1)`, whichever arm found it), so `rrf_score`
-        // alone would leave the final `LIMIT` truncation undefined between
-        // tied rows. `updated_at` breaks most ties in a content-relevant way
-        // (prefer the more recently touched entry); `id` is the last resort
-        // because it is the only column guaranteed unique, so the order is
-        // always total. Mirrors `scratchpad.rs`'s `search_hybrid`.
-        let fetch_limit = (limit * 2) as i64;
-        let result_limit = limit as i64;
+        // The vector arm over-fetches because activation reorders it: a row it
+        // lifts has to be in the admitted set to be lifted. The full-text arm
+        // does not, because nothing reorders it - at most a whole page of rows
+        // the vector arm cannot compare can ever show. See `rank_page`.
+        let fetch_limit = (limit.saturating_mul(2)) as i64;
+        let lexical_limit = limit as i64;
 
-        // $7 = exclude_tags: drop any row carrying one of these tags.
-        //
-        // $8 = the model that produced $1. Only rows embedded by that model can
-        // be compared against it, so the predicate belongs on this branch and
-        // this branch alone: `text_ranked` below stays model-blind, which is
-        // what turns a model change into degraded (lexical-only) recall instead
-        // of content that cannot be found at all.
-        //
-        // Sameness is decided on the digest half of the `<name>@<digest>` stamp
-        // wherever both sides carry one, matching
-        // `embedding_backfill::invalidate_stale_embeddings`: a purely cosmetic
-        // rename leaves usable vectors in place, and hiding them until the
-        // sweep restamps them would blank semantic search for no reason.
-        // `split_part(x, '@', 2)` yields '' when there is no '@', so the
-        // non-empty test doubles as "both sides carry a digest". A NULL stamp is
-        // a vector of unknown provenance, hence unknown dimension, and is
-        // excluded.
-        let rows: Vec<KbSearchRow> = sqlx::query_as(
-            "WITH chunk_distances AS (
-                SELECT id, content, tags, metadata, created_at, updated_at, summary,
-                       MIN(chunk <=> $1) AS min_distance
-                FROM knowledge_base, unnest(embedding) AS chunk
-                WHERE user_id = $6
-                  AND deleted_at IS NULL
-                  AND ($2::text[] IS NULL OR tags && $2)
-                  AND ($7::text[] IS NULL OR NOT (tags && $7))
-                  AND embedding IS NOT NULL
-                  AND embedding_model IS NOT NULL
-                  AND (embedding_model = $8
-                       OR (split_part($8, '@', 2) <> ''
-                           AND split_part(embedding_model, '@', 2)
-                               = split_part($8, '@', 2)))
-                GROUP BY id, content, tags, metadata, created_at, updated_at, summary
-            ),
-            vector_ranked AS (
-                SELECT id, content, tags, metadata, created_at, updated_at, summary,
-                       ROW_NUMBER() OVER (ORDER BY min_distance) AS rank_v
-                FROM chunk_distances
-                ORDER BY min_distance
-                LIMIT $3
-            ),
-            text_ranked AS (
-                SELECT id, content, tags, metadata, created_at, updated_at, summary,
-                       ROW_NUMBER() OVER (ORDER BY ts_rank_cd(tsv, query) DESC) AS rank_t
-                FROM knowledge_base, plainto_tsquery('english', $4) query
-                WHERE user_id = $6
-                  AND deleted_at IS NULL
-                  AND ($2::text[] IS NULL OR tags && $2)
-                  AND ($7::text[] IS NULL OR NOT (tags && $7))
-                  AND tsv @@ query
-                ORDER BY ts_rank_cd(tsv, query) DESC
-                LIMIT $3
-            ),
-            fused AS (
-                SELECT COALESCE(v.id, t.id) AS id,
-                       COALESCE(v.content, t.content) AS content,
-                       COALESCE(v.tags, t.tags) AS tags,
-                       COALESCE(v.metadata, t.metadata) AS metadata,
-                       COALESCE(v.created_at, t.created_at) AS created_at,
-                       COALESCE(v.updated_at, t.updated_at) AS updated_at,
-                       COALESCE(v.summary, t.summary) AS summary,
-                       (COALESCE(1.0 / (60 + v.rank_v), 0) +
-                        COALESCE(1.0 / (60 + t.rank_t), 0))::FLOAT8 AS rrf_score
-                FROM vector_ranked v
-                FULL OUTER JOIN text_ranked t ON v.id = t.id
-            )
-            SELECT id, content, tags, metadata, created_at, updated_at, summary
-            FROM fused ORDER BY rrf_score DESC, updated_at DESC, id DESC LIMIT $5",
-        )
-        .bind(embedding_vec)
-        .bind(tags)
-        .bind(fetch_limit)
-        .bind(query)
-        .bind(result_limit)
-        .bind(user_id.as_str())
-        .bind(exclude_tags)
-        .bind(embedding_model)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CoreError::Storage(e.to_string()))?;
+        let mut scan =
+            crate::scan_bound::begin_bounded(&self.pool, RECALL_SCAN_STATEMENT_TIMEOUT).await?;
+        let rows: Vec<KbSearchRow> = sqlx::query_as(crate::knowledge_search::HYBRID_SEARCH_SQL)
+            .bind(embedding_vec)
+            .bind(tags)
+            .bind(fetch_limit)
+            .bind(query)
+            .bind(lexical_limit)
+            .bind(user_id.as_str())
+            .bind(exclude_tags)
+            .bind(embedding_model)
+            .fetch_all(&mut *scan)
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
+        scan.commit()
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
 
-        Ok(rows.into_iter().map(|r| r.into_entry()).collect())
+        // Every row carries the same spread, so the first one states it.
+        let dispersion = rows
+            .first()
+            .and_then(KbSearchRow::dispersion)
+            .unwrap_or(desktop_assistant_core::recall::RECALL_ASSUMED_DISPERSION);
+        let candidates: Vec<SearchCandidate> = rows
+            .into_iter()
+            .map(|r| {
+                let distance = r.distance;
+                SearchCandidate {
+                    entry: r.into_entry(),
+                    distance,
+                }
+            })
+            .collect();
+        let records = self
+            .use_records(candidates.iter().map(|c| c.entry.id.clone()).collect())
+            .await;
+
+        Ok(crate::knowledge_search::rank_page(
+            candidates,
+            dispersion,
+            &records,
+            chrono::Utc::now(),
+            limit,
+        ))
+    }
+
+    /// What the use log knows about `ids`, keyed by id, and an empty map where
+    /// it could not be read.
+    ///
+    /// **A read that fails costs the ranking and never the page.** The
+    /// reinforcement half of the activation score is the half search worked
+    /// without until now, so an entry with no record ranks on its semantic
+    /// signal alone - which is exactly how every entry ranked before the log
+    /// existed. This is the same bargain the recall path's `use_records` makes,
+    /// and it is why the read is one batched statement after the scan rather
+    /// than a join inside it: a joined read cannot degrade on its own.
+    ///
+    /// One round trip per search, bounded server-side by
+    /// [`USE_LOG_READ_STATEMENT_TIMEOUT`](crate::USE_LOG_READ_STATEMENT_TIMEOUT),
+    /// so a slow log stops the backend as well as the caller. Ids the log has
+    /// never seen are simply absent, which is the same `None` a failed read
+    /// gives - both mean "nothing to add".
+    async fn use_records(
+        &self,
+        ids: Vec<String>,
+    ) -> std::collections::HashMap<String, KnowledgeUseRecord> {
+        use desktop_assistant_core::ports::knowledge_use::KnowledgeUseLog;
+
+        if ids.is_empty() {
+            return std::collections::HashMap::new();
+        }
+        match crate::knowledge_use::PgKnowledgeUseLog::new(self.pool.clone())
+            .records(ids)
+            .await
+        {
+            Ok(records) => records
+                .into_iter()
+                .map(|record| (record.entry_id.clone(), record))
+                .collect(),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "knowledge search: the use log could not be read; ranking on the semantic \
+                     signal alone"
+                );
+                std::collections::HashMap::new()
+            }
+        }
     }
 
     /// FTS-only search with both include- and exclude-tag filters. Backs the
@@ -1035,6 +1045,8 @@ struct CensusRow {
     available_tags: Vec<String>,
 }
 
+/// One row the hybrid search admitted: the entry, what the vector arm could
+/// measure about it, and the spread every row of the answer repeats.
 #[derive(sqlx::FromRow)]
 struct KbSearchRow {
     id: String,
@@ -1044,9 +1056,25 @@ struct KbSearchRow {
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
     summary: Option<String>,
+    /// `None` for a row the full-text arm admitted and the vector arm cannot
+    /// compare - no stored vector, or one from another model.
+    distance: Option<f64>,
+    median: Option<f64>,
+    rows_read: i64,
+    deviation: Option<f64>,
 }
 
 impl KbSearchRow {
+    /// What this row says the store's spread is, where it says one it can be
+    /// trusted for - see [`RecallDispersion::measured`].
+    fn dispersion(&self) -> Option<RecallDispersion> {
+        RecallDispersion::measured(
+            self.median?,
+            self.deviation?,
+            self.rows_read.max(0) as usize,
+        )
+    }
+
     fn into_entry(self) -> KnowledgeEntry {
         KnowledgeEntry {
             id: self.id,
