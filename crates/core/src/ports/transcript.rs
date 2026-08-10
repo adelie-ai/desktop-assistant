@@ -840,12 +840,26 @@ mod tests {
         let got = parse(&payload);
         assert_eq!(got["ok"], true, "{payload}");
         let content = got["content"].as_str().expect("content is a string");
+        let offset = got["offset"].as_u64().expect("offset is a number") as usize;
+        let returned = got["returned_bytes"]
+            .as_u64()
+            .expect("returned_bytes is a number") as usize;
         assert!(
-            body.contains(content),
-            "the slice must be a real substring: {payload}"
+            !content.is_empty(),
+            "a read that asked for bytes must return some: {payload}"
         );
-        assert!(
-            got["offset"].as_u64().is_some_and(|o| o == 0),
+        assert_eq!(
+            content,
+            &body[offset..offset + returned],
+            "the content must be exactly the range the response describes: {payload}"
+        );
+        assert_eq!(
+            content, "\u{1F600}",
+            "a 6-byte request over 4-byte characters returns the one whole \
+             character that fits: {payload}"
+        );
+        assert_eq!(
+            offset, 0,
             "the offset must snap back to a character boundary: {payload}"
         );
     }
