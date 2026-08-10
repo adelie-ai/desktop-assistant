@@ -25,6 +25,9 @@ use desktop_assistant_core::ports::inbound::{
     SettingsService,
 };
 use desktop_assistant_core::ports::knowledge_delete::{DeleteInitiator, with_delete_initiator};
+use desktop_assistant_core::ports::negative_memory::{
+    ExtinguishBurnsFn, InspectBurnFn, LiveBurnsFn,
+};
 use desktop_assistant_core::ports::request_scope::RequestScope;
 use desktop_assistant_core::ports::scratchpad::{
     MAX_KEYS_PER_CALL, MAX_NOTE_BYTES, MAX_RESULTS_CEILING, NewScratchpadNote, ScratchpadClearFn,
@@ -565,6 +568,16 @@ where
     /// every other connection viewing that conversation. `None` keeps the prior
     /// behaviour: turn events reach only the initiating connection.
     conversation_subs: Option<Arc<crate::conversation_subs::ConversationSubscriptions>>,
+    /// Negative memory as a person meets it (#1186): list what is held, read
+    /// one in full, clear one. All three or none - a list a person cannot act
+    /// on and a clear they cannot aim are each half a surface.
+    ///
+    /// `None` where there is no database, and the three commands then report
+    /// that this deployment cannot answer rather than answering an empty list.
+    /// The difference matters here more than usual: a person asking why the
+    /// assistant will not do something would read an empty list as "nothing is
+    /// holding it", which is the wrong answer twice over.
+    negative_memory: Option<NegativeMemoryWiring>,
     /// Optional on-demand knowledge-maintenance service (dream-cycle controls).
     /// When attached, `StartKnowledgeMaintenance` spawns the requested pass
     /// (extraction / consolidation / embedding recompute) as a tracked,
@@ -572,6 +585,19 @@ where
     /// return a clear "not configured" error. Held as a trait object (the port
     /// is `async_trait`) so no extra generic threads through the handler.
     maintenance: Option<Arc<dyn KnowledgeMaintenanceService>>,
+}
+
+/// The three reads and the one write a person's view of negative memory needs
+/// (#1186). Held together because the surface is one thing: nothing here is
+/// useful without the rest.
+#[derive(Clone)]
+struct NegativeMemoryWiring {
+    list: LiveBurnsFn,
+    inspect: InspectBurnFn,
+    /// The same closure a successful call uses to correct a lesson it
+    /// disproved. Clearing and succeeding write the same overlay, so they share
+    /// the one write rather than having a person-only path beside it.
+    clear: ExtinguishBurnsFn,
 }
 
 /// The handler-resident client-tool dependencies (#234). Both halves are
@@ -616,8 +642,29 @@ where
             inflight: Arc::new(InFlightRegistry::default()),
             client_tools: None,
             conversation_subs: None,
+            negative_memory: None,
             maintenance: None,
         }
+    }
+
+    /// Attach the person-facing half of negative memory (#1186): list what the
+    /// assistant is held back by, read one in full, clear one.
+    ///
+    /// The daemon wires all three to the same store the dispatch loop writes
+    /// to. A caller that skips this leaves the three commands reporting that
+    /// the deployment cannot answer.
+    pub fn with_negative_memory(
+        mut self,
+        list: LiveBurnsFn,
+        inspect: InspectBurnFn,
+        clear: ExtinguishBurnsFn,
+    ) -> Self {
+        self.negative_memory = Some(NegativeMemoryWiring {
+            list,
+            inspect,
+            clear,
+        });
+        self
     }
 
     /// Attach the shared client-tool coordinator + turn-state store (#234) so
@@ -1505,6 +1552,74 @@ fn knowledge_entry_to_view(e: KnowledgeEntry) -> api::KnowledgeEntryView {
     }
 }
 
+/// One negative memory as a person reads it (#1186).
+///
+/// `now` is read once by the caller and passed in, so every row in one list
+/// reports its strength against the same instant. Two rows scored a
+/// millisecond apart would be ordered by an accident of the loop.
+fn negative_memory_to_view(
+    memory: &desktop_assistant_core::domain::negative_memory::NegativeMemory,
+    now: chrono::DateTime<chrono::Utc>,
+) -> api::NegativeMemoryView {
+    let facets = |identity: bool| -> Vec<api::NegativeMemoryFacetView> {
+        memory
+            .scope
+            .iter()
+            .filter(|(facet, _)| facet.is_identity() == identity)
+            .map(|(facet, value)| api::NegativeMemoryFacetView {
+                name: facet.name().to_string(),
+                value: value.to_string(),
+            })
+            .collect()
+    };
+    api::NegativeMemoryView {
+        id: memory.id.clone(),
+        action: memory.action.clone(),
+        arguments: facets(true),
+        circumstances: facets(false),
+        outcome: memory.outcome.clone(),
+        occurrences: memory.occurrences,
+        strength: memory.strength(now),
+        // `can_fire`, not `!is_silent`: clearing a memory leaves its
+        // confirmation stamp alone, so a memory cleared a second ago still
+        // reads at full strength. Answering off the strength would tell a
+        // person their work is still held at the exact moment they acted to
+        // free it. The domain asks the same question the dispatch loop asks.
+        firing: memory.can_fire(now),
+        written_at: memory.written_at.to_rfc3339(),
+        last_confirmed_at: memory.last_confirmed_at.to_rfc3339(),
+        goes_quiet_at: memory.goes_quiet_at(now).to_rfc3339(),
+        cleared: memory.superseded_by.is_some(),
+    }
+}
+
+/// One negative memory read on its own (#1186), with what widened it and what
+/// corrected it.
+fn negative_memory_record_to_view(
+    record: desktop_assistant_core::ports::negative_memory::BurnRecord,
+    now: chrono::DateTime<chrono::Utc>,
+) -> api::NegativeMemoryDetailView {
+    api::NegativeMemoryDetailView {
+        memory: negative_memory_to_view(&record.memory, now),
+        dropped: record
+            .dropped
+            .into_iter()
+            .map(|d| api::DroppedFacetView {
+                name: d.facet.name().to_string(),
+                value: d.value,
+                dropped_at: d.dropped_at.to_rfc3339(),
+            })
+            .collect(),
+        correction: record
+            .correction
+            .map(|c| api::NegativeMemoryCorrectionView {
+                id: c.id,
+                outcome: c.outcome,
+                written_at: c.written_at.to_rfc3339(),
+            }),
+    }
+}
+
 fn scratchpad_note_to_view(n: ScratchpadNote) -> api::ScratchpadNoteView {
     api::ScratchpadNoteView {
         id: n.id,
@@ -2173,6 +2288,64 @@ where
             }
 
             // MCP server management
+            api::Command::ListNegativeMemories => {
+                let wiring = self.negative_memory.as_ref().ok_or(ApiError::Unsupported)?;
+                let held = (wiring.list)().await.map_err(Self::map_core_err)?;
+                // One reading of the clock for the whole list, so two rows are
+                // never scored against two instants.
+                let now = chrono::Utc::now();
+                let mut rows: Vec<api::NegativeMemoryView> = held
+                    .iter()
+                    .map(|memory| negative_memory_to_view(memory, now))
+                    .collect();
+                // Strongest first, then by id, so the same set answers in the
+                // same order twice and a person's list does not reshuffle
+                // between two reads that learned nothing.
+                rows.sort_by(|a, b| {
+                    b.strength
+                        .total_cmp(&a.strength)
+                        .then_with(|| a.id.cmp(&b.id))
+                });
+                Ok(api::CommandResult::NegativeMemories(rows))
+            }
+            api::Command::GetNegativeMemory { id } => {
+                let wiring = self.negative_memory.as_ref().ok_or(ApiError::Unsupported)?;
+                let record = (wiring.inspect)(id).await.map_err(Self::map_core_err)?;
+                let now = chrono::Utc::now();
+                Ok(api::CommandResult::NegativeMemory(
+                    record.map(|r| Box::new(negative_memory_record_to_view(r, now))),
+                ))
+            }
+            api::Command::ClearNegativeMemory { id, note } => {
+                let wiring = self.negative_memory.as_ref().ok_or(ApiError::Unsupported)?;
+                // The daemon's own line when the person gave none, so a reader
+                // months later can tell a person's judgement from the act
+                // simply succeeding - the two write the same overlay, and the
+                // note is the only thing that differs.
+                //
+                // Clamped like any other outcome: the note a person writes is
+                // external input on its way to the same column a failure's own
+                // error text lands in, and that path has always been bounded.
+                // Clamped here, at the boundary the input arrives at, rather
+                // than in the store, which serves a caller that has already
+                // bounded its text.
+                let note = note
+                    .filter(|n| !n.trim().is_empty())
+                    .map(|n| desktop_assistant_core::domain::negative_memory::clamp_outcome(&n))
+                    .unwrap_or_else(|| {
+                        desktop_assistant_core::domain::negative_memory::CLEARED_BY_PERSON
+                            .to_string()
+                    });
+                let cleared = (wiring.clear)(vec![id], note)
+                    .await
+                    .map_err(Self::map_core_err)?;
+                // A memory already cleared, or one this user does not hold,
+                // reports nothing cleared. Neither is a failure: the memory is
+                // in the state the caller asked for either way (base rule 8.2).
+                Ok(api::CommandResult::NegativeMemoryCleared {
+                    cleared: !cleared.is_empty(),
+                })
+            }
             api::Command::ListMcpServers => {
                 let servers = self
                     .settings
@@ -7740,5 +7913,393 @@ mod tests {
             Some("recovered"),
             "the successful retry records its reply under the key"
         );
+    }
+
+    // --- Negative memory: see one, read one, clear one (#1186) ---------------
+
+    use desktop_assistant_core::domain::SituationField;
+    use desktop_assistant_core::domain::negative_memory::{
+        CLEARED_BY_PERSON, Facet as BurnFacet, NegativeMemory as Burn,
+        NegativeMemoryKind as BurnKind, Scope as BurnScope,
+    };
+    use desktop_assistant_core::ports::negative_memory::{
+        BurnRecord, DroppedFacet, ExtinguishBurnsFn, InspectBurnFn, LiveBurnsFn,
+    };
+
+    /// One lesson, widened once: it no longer requires the host it was born at,
+    /// and that dropped requirement is still readable.
+    fn a_widened_burn() -> Burn {
+        Burn {
+            id: "nm-1".to_string(),
+            action: "terminal_run".to_string(),
+            fingerprint: "abc123".to_string(),
+            kind: BurnKind::Burn,
+            scope: BurnScope::new()
+                .with(BurnFacet::Argument("command".to_string()), "rm -rf build")
+                .with(BurnFacet::Situation(SituationField::Weekday), "thursday"),
+            outcome: "build is a mount point".to_string(),
+            occurrences: 2,
+            written_at: chrono::Utc::now() - chrono::Duration::days(6),
+            last_confirmed_at: chrono::Utc::now(),
+            superseded_by: None,
+        }
+    }
+
+    fn dropped_host() -> DroppedFacet {
+        DroppedFacet {
+            facet: BurnFacet::Situation(SituationField::Host),
+            value: "workshop".to_string(),
+            dropped_at: chrono::Utc::now(),
+        }
+    }
+
+    /// The three closures the handler needs, over one shared burn, plus the
+    /// notes the clears wrote. Clearing writes the same correction overlay a
+    /// success writes: the original keeps every field it had - its confirmation
+    /// stamp included, which is why a just-cleared memory still reads at full
+    /// strength - and gains a `superseded_by`.
+    #[allow(clippy::type_complexity)]
+    fn in_memory_negative_memory() -> (
+        LiveBurnsFn,
+        InspectBurnFn,
+        ExtinguishBurnsFn,
+        Arc<Mutex<Vec<String>>>,
+    ) {
+        let held: Arc<Mutex<Burn>> = Arc::new(Mutex::new(a_widened_burn()));
+        let notes: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let l = Arc::clone(&held);
+        let list: LiveBurnsFn = Arc::new(move || {
+            let held = Arc::clone(&l);
+            Box::pin(async move {
+                let burn = held.lock().unwrap().clone();
+                Ok(if burn.superseded_by.is_some() {
+                    Vec::new()
+                } else {
+                    vec![burn]
+                })
+            })
+        });
+
+        let g = Arc::clone(&held);
+        let inspect: InspectBurnFn = Arc::new(move |id: String| {
+            let held = Arc::clone(&g);
+            Box::pin(async move {
+                let burn = held.lock().unwrap().clone();
+                if burn.id != id {
+                    return Ok(None);
+                }
+                let correction = burn.superseded_by.as_ref().map(|cid| Burn {
+                    id: cid.clone(),
+                    kind: BurnKind::Correction,
+                    outcome: CLEARED_BY_PERSON.to_string(),
+                    superseded_by: None,
+                    ..burn.clone()
+                });
+                Ok(Some(BurnRecord {
+                    memory: burn,
+                    dropped: vec![dropped_host()],
+                    correction,
+                }))
+            })
+        });
+
+        let c = Arc::clone(&held);
+        let written = Arc::clone(&notes);
+        let clear: ExtinguishBurnsFn = Arc::new(move |ids: Vec<String>, note: String| {
+            let held = Arc::clone(&c);
+            let written = Arc::clone(&written);
+            Box::pin(async move {
+                written.lock().unwrap().push(note);
+                let mut burn = held.lock().unwrap();
+                if !ids.contains(&burn.id) || burn.superseded_by.is_some() {
+                    return Ok(Vec::new());
+                }
+                burn.superseded_by = Some("nm-correction".to_string());
+                Ok(vec![burn.id.clone()])
+            })
+        });
+
+        (list, inspect, clear, notes)
+    }
+
+    fn negative_memory_handler() -> DefaultAssistantApiHandler<
+        FakeAssistant,
+        FakeConversations,
+        FakeSettings,
+        FakeConnections,
+        FakeKnowledge,
+    > {
+        let (list, inspect, clear, _notes) = in_memory_negative_memory();
+        DefaultAssistantApiHandler::new(
+            Arc::new(FakeAssistant),
+            Arc::new(FakeConversations),
+            Arc::new(FakeSettings),
+            Arc::new(FakeConnections),
+            Arc::new(FakeKnowledge),
+        )
+        .with_negative_memory(list, inspect, clear)
+    }
+
+    /// Acceptance (#1186): a person can list what the assistant has been burned
+    /// by, with the act, the scope, the strength and the expiry on each row.
+    #[tokio::test]
+    async fn listing_negative_memories_reports_the_act_the_scope_the_strength_and_the_expiry() {
+        let h = negative_memory_handler();
+        let api::CommandResult::NegativeMemories(rows) = h
+            .handle_command_for(
+                RequestContext::from(UserId::new("alice")),
+                api::Command::ListNegativeMemories,
+            )
+            .await
+            .expect("listing succeeds")
+        else {
+            panic!("expected NegativeMemories");
+        };
+
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.action, "terminal_run", "the act it holds");
+        assert_eq!(
+            row.arguments,
+            vec![api::NegativeMemoryFacetView {
+                name: "command".to_string(),
+                value: "rm -rf build".to_string(),
+            }],
+            "the call it is about"
+        );
+        assert_eq!(
+            row.circumstances,
+            vec![api::NegativeMemoryFacetView {
+                name: "weekday".to_string(),
+                value: "thursday".to_string(),
+            }],
+            "and the circumstance it still requires, apart from the arguments"
+        );
+        assert!(
+            row.strength > 0.99,
+            "confirmed now, so it is at full strength"
+        );
+        assert!(row.firing, "and at full strength it holds calls");
+        assert!(
+            row.goes_quiet_at > row.last_confirmed_at,
+            "the expiry is in the future of the last confirmation: {row:?}"
+        );
+        assert_eq!(row.occurrences, 2);
+    }
+
+    /// Acceptance (#1186): a person can read one memory in full, including the
+    /// circumstance a later occurrence dropped - the one visible trace of a
+    /// memory that grew wider than the failure it was written for.
+    #[tokio::test]
+    async fn reading_one_negative_memory_reports_the_circumstance_that_widened_it() {
+        let h = negative_memory_handler();
+        let api::CommandResult::NegativeMemory(detail) = h
+            .handle_command_for(
+                RequestContext::from(UserId::new("alice")),
+                api::Command::GetNegativeMemory {
+                    id: "nm-1".to_string(),
+                },
+            )
+            .await
+            .expect("reading one succeeds")
+        else {
+            panic!("expected NegativeMemory");
+        };
+        let detail = detail.expect("the memory is there to read");
+        assert_eq!(detail.memory.id, "nm-1");
+        assert_eq!(detail.memory.outcome, "build is a mount point");
+        assert_eq!(
+            detail.dropped,
+            vec![api::DroppedFacetView {
+                name: "host".to_string(),
+                value: "workshop".to_string(),
+                dropped_at: detail.dropped[0].dropped_at.clone(),
+            }],
+            "the host it stopped requiring is named, with the value it was born with"
+        );
+        assert!(detail.correction.is_none(), "nothing has corrected it yet");
+    }
+
+    /// Acceptance (#1186): a person can clear a memory, and the original stays
+    /// readable afterwards - clearing writes the correction overlay a success
+    /// writes, and deletes nothing.
+    #[tokio::test]
+    async fn clearing_a_negative_memory_leaves_the_original_readable() {
+        let h = negative_memory_handler();
+        let ctx = || RequestContext::from(UserId::new("alice"));
+
+        let api::CommandResult::NegativeMemoryCleared { cleared } = h
+            .handle_command_for(
+                ctx(),
+                api::Command::ClearNegativeMemory {
+                    id: "nm-1".to_string(),
+                    note: None,
+                },
+            )
+            .await
+            .expect("clearing succeeds")
+        else {
+            panic!("expected NegativeMemoryCleared");
+        };
+        assert!(cleared, "the memory a person named was cleared");
+
+        let api::CommandResult::NegativeMemories(rows) = h
+            .handle_command_for(ctx(), api::Command::ListNegativeMemories)
+            .await
+            .expect("listing succeeds")
+        else {
+            panic!("expected NegativeMemories");
+        };
+        assert!(rows.is_empty(), "a cleared memory no longer holds calls");
+
+        let api::CommandResult::NegativeMemory(detail) = h
+            .handle_command_for(
+                ctx(),
+                api::Command::GetNegativeMemory {
+                    id: "nm-1".to_string(),
+                },
+            )
+            .await
+            .expect("reading one succeeds")
+        else {
+            panic!("expected NegativeMemory");
+        };
+        let detail = detail.expect("the original survives its own clearing");
+        assert_eq!(
+            detail.memory.outcome, "build is a mount point",
+            "with the lesson it was written with"
+        );
+        assert!(
+            detail.memory.cleared,
+            "marked as cleared rather than deleted"
+        );
+        let correction = detail.correction.expect("and carrying what cleared it");
+        assert_eq!(correction.outcome, CLEARED_BY_PERSON);
+    }
+
+    /// Acceptance (#1186): once cleared, a memory is not reported as still
+    /// holding calls.
+    ///
+    /// Clearing does not touch the confirmation stamp - the record keeps
+    /// everything it had - so a memory cleared a second ago is still at full
+    /// strength. Reading "still holding your calls" off the strength alone
+    /// would answer the exact question this surface exists to answer, wrongly,
+    /// at the exact moment a person has just acted.
+    #[tokio::test]
+    async fn a_cleared_negative_memory_is_not_reported_as_still_holding_calls() {
+        let h = negative_memory_handler();
+        let ctx = || RequestContext::from(UserId::new("alice"));
+
+        h.handle_command_for(
+            ctx(),
+            api::Command::ClearNegativeMemory {
+                id: "nm-1".to_string(),
+                note: None,
+            },
+        )
+        .await
+        .expect("clearing succeeds");
+
+        let api::CommandResult::NegativeMemory(detail) = h
+            .handle_command_for(
+                ctx(),
+                api::Command::GetNegativeMemory {
+                    id: "nm-1".to_string(),
+                },
+            )
+            .await
+            .expect("reading one succeeds")
+        else {
+            panic!("expected NegativeMemory");
+        };
+        let detail = detail.expect("the original survives its own clearing");
+        assert!(
+            detail.memory.strength > 0.99,
+            "clearing is not decay: the record is unchanged, only overlaid"
+        );
+        assert!(
+            !detail.memory.firing,
+            "and it holds nothing, however strong the record still reads"
+        );
+    }
+
+    /// A note a person writes is external input on the way to a stored column,
+    /// so it is cut to what a memory can hold, the same as the outcome a
+    /// failure records.
+    #[tokio::test]
+    async fn a_clear_note_longer_than_a_memory_can_hold_is_cut_before_it_is_written() {
+        use desktop_assistant_core::domain::negative_memory::MAX_OUTCOME_CHARS;
+
+        let (list, inspect, clear, notes) = in_memory_negative_memory();
+        let h = DefaultAssistantApiHandler::new(
+            Arc::new(FakeAssistant),
+            Arc::new(FakeConversations),
+            Arc::new(FakeSettings),
+            Arc::new(FakeConnections),
+            Arc::new(FakeKnowledge),
+        )
+        .with_negative_memory(list, inspect, clear);
+
+        h.handle_command_for(
+            RequestContext::from(UserId::new("alice")),
+            api::Command::ClearNegativeMemory {
+                id: "nm-1".to_string(),
+                note: Some("e\u{301}".repeat(MAX_OUTCOME_CHARS * 2)),
+            },
+        )
+        .await
+        .expect("clearing succeeds");
+
+        let written = notes.lock().unwrap();
+        assert_eq!(written.len(), 1);
+        assert_eq!(
+            written[0].chars().count(),
+            MAX_OUTCOME_CHARS,
+            "cut to what the column holds, on a character boundary"
+        );
+    }
+
+    /// Clearing something no memory answers to reports that nothing was
+    /// cleared, rather than reporting success over an empty write.
+    #[tokio::test]
+    async fn clearing_a_negative_memory_that_is_not_held_reports_nothing_cleared() {
+        let h = negative_memory_handler();
+        let api::CommandResult::NegativeMemoryCleared { cleared } = h
+            .handle_command_for(
+                RequestContext::from(UserId::new("alice")),
+                api::Command::ClearNegativeMemory {
+                    id: "nm-nobody-holds".to_string(),
+                    note: None,
+                },
+            )
+            .await
+            .expect("clearing an absent memory is not an error")
+        else {
+            panic!("expected NegativeMemoryCleared");
+        };
+        assert!(!cleared);
+    }
+
+    /// A deployment with no database holds no negative memory at all. It says
+    /// so, rather than answering an empty list, because "nothing is held" and
+    /// "this deployment cannot answer" are different answers and a person
+    /// reading an empty list would take the first.
+    #[tokio::test]
+    async fn a_deployment_without_negative_memory_says_so_rather_than_listing_none() {
+        let h = DefaultAssistantApiHandler::new(
+            Arc::new(FakeAssistant),
+            Arc::new(FakeConversations),
+            Arc::new(FakeSettings),
+            Arc::new(FakeConnections),
+            Arc::new(FakeKnowledge),
+        );
+        let refused = h
+            .handle_command_for(
+                RequestContext::from(UserId::new("alice")),
+                api::Command::ListNegativeMemories,
+            )
+            .await;
+        assert!(matches!(refused, Err(ApiError::Unsupported)));
     }
 }

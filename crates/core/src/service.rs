@@ -7,7 +7,8 @@ use crate::context::{
     window_start,
 };
 use crate::domain::negative_memory::{
-    NegativeMemory, PendingAction, burns_that_fire, clamp_outcome, render_warning,
+    NegativeMemory, PendingAction, burns_that_fire, clamp_outcome, render_hold_notice,
+    render_warning,
 };
 use crate::domain::skill::{detect_kind, skill_content_hash};
 use crate::domain::{
@@ -3678,14 +3679,20 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 // The digest costs a hash, so it is taken once and shared by
                 // the places that need it.
                 let burn_identity = pending_action.as_ref().map(burn_key);
-                if let Some((pending, identity)) =
-                    pending_action.as_ref().zip(burn_identity.as_deref())
-                    && !live_burns.is_empty()
-                    && !burns_met_this_turn.contains(identity)
-                    && let Some(warning) = render_warning(
-                        &burns_that_fire(&live_burns, pending, Utc::now()),
-                        Utc::now(),
-                    )
+                // Matched only when a match could change anything. An identity
+                // already met this turn runs whatever is held against it, so
+                // scoring the live set for it would be work thrown away on
+                // every call of a repeated act.
+                let fired_burns = match pending_action.as_ref().zip(burn_identity.as_deref()) {
+                    Some((pending, identity))
+                        if !live_burns.is_empty() && !burns_met_this_turn.contains(identity) =>
+                    {
+                        burns_that_fire(&live_burns, pending, Utc::now())
+                    }
+                    _ => Vec::new(),
+                };
+                if let Some(identity) = burn_identity.as_deref()
+                    && let Some(warning) = render_warning(&fired_burns, Utc::now())
                 {
                     tracing::info!(
                         tool = %Safe::name(&tool_call.name),
@@ -3696,10 +3703,25 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                         name: summarize_tool_name(&tool_call.name),
                         args: summarize_tool_value(&arguments),
                     });
+                    // The person's half of the interruption (#1186). The
+                    // warning above goes to the model in place of the tool
+                    // result and never reaches a screen, so without this the
+                    // held call reads as an assistant that simply would not
+                    // act - which is exactly how an over-general burn hides.
+                    // The notice names the lesson by id, so the reticence can
+                    // be looked up and cleared.
+                    //
+                    // Through `summarize_tool_text` like every other entry in
+                    // this feed, and for the same reason: the outcome it quotes
+                    // is a tool's own error text, which may be a remote
+                    // server's words. One bound on what reaches the feed, not a
+                    // second one beside it.
+                    let notice = render_hold_notice(&fired_burns)
+                        .unwrap_or_else(|| "held: this act went badly before".to_string());
                     notify_tool_event(ToolEvent::Finished {
                         name: summarize_tool_name(&tool_call.name),
                         ok: false,
-                        output: "held: this act went badly before".to_string(),
+                        output: summarize_tool_text(&notice),
                     });
                     conv.messages
                         .push(Message::tool_result(&tool_call.id, &warning));
@@ -15204,6 +15226,65 @@ mod tests {
         assert!(
             read.contains("not a refusal"),
             "and reads it as a candidate to check; got {read}"
+        );
+    }
+
+    /// Acceptance (#1186): a held call tells the person which stored lesson
+    /// held it, by id, so the reticence has a name to look up rather than
+    /// reading as an assistant that simply would not.
+    ///
+    /// The activity feed is where a person meets a tool call, so that is where
+    /// the notice has to land - the warning itself goes to the model and a
+    /// person never sees it.
+    #[tokio::test]
+    async fn a_held_call_tells_the_activity_feed_which_stored_lesson_held_it() {
+        let executor = ScriptedToolExecutor::new(risky_tool(), vec![]);
+        let responses = vec![
+            LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new("c1", "risky", r#"{"path":"/srv/app"}"#)],
+            ),
+            LlmResponse::text("I will not, then"),
+        ];
+        let (handler, _log) =
+            handler_with_burns(responses, executor, vec![burn_on_risky("/srv/app")]);
+        let conv = handler
+            .create_conversation("Chat".into(), vec![])
+            .await
+            .unwrap();
+
+        let (result, events) = capture_tool_events(handler.send_prompt(
+            &conv.id,
+            "Do it".into(),
+            noop_callback(),
+            noop_status(),
+        ))
+        .await;
+        result.expect("turn completes");
+
+        let held: Vec<String> = events
+            .iter()
+            .filter_map(|e| match e {
+                ToolEvent::Finished { name, ok, output } if name == "risky" && !ok => {
+                    Some(output.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            held.len(),
+            1,
+            "one held call, one notice; events={events:?}"
+        );
+        assert!(
+            held[0].contains("nm-1"),
+            "the notice names the lesson that held the call, so a person can read it: {}",
+            held[0]
+        );
+        assert!(
+            held[0].contains("stored lesson"),
+            "and says a stored lesson is why the call did not run: {}",
+            held[0]
         );
     }
 

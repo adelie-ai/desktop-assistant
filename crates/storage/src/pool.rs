@@ -229,6 +229,7 @@ const MIGRATIONS: &[Migration] = &[
     // taken again. Extinction is an overlay, so a corrected burn stays
     // readable beside the correction written over it.
     migration!("049_negative_memory.sql"),
+    migration!("050_negative_memory_widening.sql"),
 ];
 
 /// Second half of the advisory-lock key: the schema the migrations write to.

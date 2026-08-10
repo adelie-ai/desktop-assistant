@@ -1897,6 +1897,40 @@ mod tests {
         }
     }
 
+    /// Acceptance (#1186): clearing a negative memory is a person's judgement,
+    /// so the model's one SQL door must not be a way round the person-facing
+    /// command that makes it.
+    ///
+    /// Both halves of the door are checked, because they refuse for different
+    /// reasons and either alone would leave the other open: the read path takes
+    /// SELECT and nothing else, and the write path is a namespace allowlist
+    /// that `public.negative_memory` sits outside.
+    #[test]
+    fn the_sql_tool_cannot_clear_a_negative_memory() {
+        for sql in [
+            "UPDATE public.negative_memory SET superseded_by = 'nm-2'",
+            "DELETE FROM public.negative_memory WHERE kind = 'burn'",
+            "DELETE FROM public.negative_memory_facet WHERE name = 'host'",
+            "INSERT INTO public.negative_memory (id, user_id, action, fingerprint, kind, outcome) \
+             VALUES ('x', 'alice', 'terminal_run', 'abc', 'correction', 'cleared')",
+        ] {
+            assert_write_refused(sql);
+            assert!(
+                rewrite_select(sql, "alice").is_err(),
+                "the read path must refuse {sql:?} too, not only the write path"
+            );
+        }
+        // Reading is not clearing: the model may still ask what it has been
+        // burned by, grafted to its own user, which is what a warning is built
+        // from in the first place.
+        let read = rewrite_select("SELECT id, outcome FROM negative_memory", "alice")
+            .expect("reading one's own negative memory stays allowed");
+        assert!(
+            read.contains("user_id"),
+            "and that read is still scoped to the asking user: {read}"
+        );
+    }
+
     #[test]
     fn write_path_refuses_updates_to_skill_index() {
         // #738: `skill_index` is not personal data by the old list's

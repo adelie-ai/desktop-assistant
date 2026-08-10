@@ -3892,6 +3892,31 @@ mod tests {
         }
     }
 
+    /// Clearing a negative memory is a person's judgement about the assistant's
+    /// own memory (#1186), so no tool offered to the model may be about one.
+    ///
+    /// **Named for what it checks, which is narrower than the property it
+    /// serves.** This walks the catalog a fully-wired runtime advertises and
+    /// looks for the words - so it catches a tool added under this feature's
+    /// own name, and it would not catch one called `forget_lesson` described in
+    /// other words. It is one of three legs and the weakest:
+    /// `the_sql_tool_cannot_clear_a_negative_memory` in `storage::database`
+    /// holds the one SQL door, and the load-bearing leg is not a test at all -
+    /// the clear is an `api::Command`, which arrives from an authenticated
+    /// client connection and can never be constructed from inside a turn.
+    #[test]
+    fn no_builtin_tool_names_or_describes_negative_memory() {
+        for def in fully_wired_service().tool_definitions() {
+            let described = format!("{} {}", def.name, def.description).to_lowercase();
+            assert!(
+                !described.contains("negative memory") && !described.contains("negative_memory"),
+                "builtin '{}' offers the model something about negative memory; \
+                 clearing one is a person's judgement and must not be a tool",
+                def.name
+            );
+        }
+    }
+
     /// The pre-#141 docstring on `with_database` claimed "read-only SQL
     /// access" — which the implementation did not enforce. Comment-vs-
     /// behaviour drift on a security-relevant surface is a real bug;

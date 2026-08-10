@@ -785,6 +785,49 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+
+    // --- Negative memory: see one, read one, clear one (#1186) -------------
+    //
+    // The assistant holds an act back when the same act went badly before. The
+    // dangerous failure of that is a lesson that grew wider than the failure it
+    // was written for, and it presents as reticence rather than as an error:
+    // nobody sees a mistake, they see an assistant that quietly will not do
+    // something. These three commands are what makes it visible - and the third
+    // is what a person does about it.
+    /// List what this user's assistant is currently being held back by.
+    ///
+    /// Returns [`CommandResult::NegativeMemories`], one row per live memory,
+    /// strongest first. A memory that has been cleared is not listed; read it
+    /// by id with [`Command::GetNegativeMemory`], which still answers.
+    ListNegativeMemories,
+    /// Read one negative memory in full: what it holds, what it stopped
+    /// requiring, and whether anything has corrected it.
+    ///
+    /// Returns [`CommandResult::NegativeMemory`], `None` for an id this user
+    /// does not hold and for the id of a correction - a correction is a record
+    /// of a lesson that stopped applying, not a lesson, and it is readable on
+    /// the memory it corrects.
+    GetNegativeMemory {
+        id: String,
+    },
+    /// Clear one negative memory, on this person's judgement.
+    ///
+    /// Nothing is deleted. This writes the same `correction` overlay that the
+    /// act succeeding writes, so the original stays readable and a later reader
+    /// can see both that the lesson was learned and that it stopped applying.
+    ///
+    /// `note` is what the correction says. Omit it and the daemon writes its
+    /// own line saying a person cleared it, which is what distinguishes a
+    /// person's judgement from an observed success.
+    ///
+    /// Returns [`CommandResult::NegativeMemoryCleared`]. Clearing one already
+    /// cleared, or one this user does not hold, reports nothing cleared and is
+    /// not an error.
+    ClearNegativeMemory {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
 }
 
 /// Single entry in a `RegisterClientTools` request. Mirrors the shape of
@@ -866,6 +909,21 @@ pub enum CommandResult {
     /// removed. `0` when the trash was already empty (#657).
     KnowledgeTrashEmptied {
         deleted_count: u32,
+    },
+
+    /// Response to `ListNegativeMemories` (#1186): what this user's assistant
+    /// is currently held back by, strongest first.
+    NegativeMemories(Vec<NegativeMemoryView>),
+    /// Response to `GetNegativeMemory` (#1186). `None` for an id this user does
+    /// not hold - which covers a memory that was reaped and one another tenant
+    /// holds, and a caller cannot tell those apart.
+    NegativeMemory(Option<Box<NegativeMemoryDetailView>>),
+    /// Response to `ClearNegativeMemory` (#1186): whether this call is the one
+    /// that cleared it. `false` for a memory already cleared, and for one this
+    /// user does not hold - neither is an error, and the memory is in the state
+    /// the caller asked for either way.
+    NegativeMemoryCleared {
+        cleared: bool,
     },
 
     /// Response to `GetConversationScratchpad` / `SetScratchpadNote` — the
@@ -1180,6 +1238,121 @@ pub enum MaintenanceOp {
     /// or corrupted vectors). Routine model changes are handled automatically
     /// by the periodic backfill.
     RecalculateEmbeddings,
+}
+
+/// One dimension a negative memory is scoped by, as a person reads it (#1186).
+///
+/// Arguments and circumstances are carried apart on
+/// [`NegativeMemoryView`] rather than mixed into one list, because they mean
+/// different things - an argument is the act's identity and never widens, a
+/// circumstance is provisional - and because an argument may be *named* `host`,
+/// which would otherwise read exactly like the situation field of that name.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NegativeMemoryFacetView {
+    /// The argument's name, or the situation field's (`host`, `time_of_day`,
+    /// `weekday`).
+    pub name: String,
+    /// The value the act was taken with, and must be taken with again before
+    /// this memory holds a call.
+    pub value: String,
+}
+
+/// A circumstance a negative memory once required and no longer does (#1186).
+///
+/// This is what a person reads to see a memory that grew wider than the failure
+/// it was written for. A memory widens in exactly one way - a later occurrence
+/// of the same act, somewhere else, drops the circumstances it disagreed with -
+/// so a list of these is the whole history of it getting wider.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DroppedFacetView {
+    /// The situation field it was: `host`, `time_of_day`, `weekday`.
+    pub name: String,
+    /// The value the memory was born requiring, which is what says how narrow
+    /// it started.
+    pub value: String,
+    /// When the occurrence that disagreed with it was recorded, RFC 3339.
+    pub dropped_at: String,
+}
+
+/// The correction written over a negative memory that stopped applying (#1186).
+///
+/// Its own row, not a field on the memory: the memory keeps everything it had,
+/// and this says what changed and when. `outcome` is the note - either what the
+/// person gave, or the daemon's own line saying a person cleared it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NegativeMemoryCorrectionView {
+    pub id: String,
+    /// Why the memory stopped applying, in the words of whatever corrected it.
+    pub outcome: String,
+    /// When it was written - which is when the memory was cleared. RFC 3339.
+    pub written_at: String,
+}
+
+/// One thing the assistant learned by being burned, as a person reads it
+/// (#1186).
+///
+/// Enough for a list row to stand on its own: what act is held, in what
+/// circumstances, how strong the lesson is now, and when it goes quiet. A
+/// person meeting this is usually asking why the assistant will not do
+/// something, so every field is there to answer that without a second call.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NegativeMemoryView {
+    pub id: String,
+    /// The tool the memory is about.
+    pub action: String,
+    /// The call's own arguments, as far as the memory could record them. Not
+    /// what it is matched on - that is a digest of every argument at full
+    /// length - so a call with none of these listed may still be held.
+    pub arguments: Vec<NegativeMemoryFacetView>,
+    /// The circumstances that must hold before this memory holds a call. Empty
+    /// means it holds the act wherever and whenever it is taken, which is the
+    /// state worth looking at.
+    pub circumstances: Vec<NegativeMemoryFacetView>,
+    /// What went wrong, in the words of whatever recorded it.
+    pub outcome: String,
+    /// How many times the same act went badly. Widening evidence, not strength:
+    /// a memory recorded seven times is no stronger than one recorded once.
+    pub occurrences: u32,
+    /// How much of full strength is left, `0.0` to `1.0`, at the moment the
+    /// daemon answered. Halves every two weeks without a repeat.
+    pub strength: f64,
+    /// Whether this memory would hold a call today.
+    ///
+    /// **This, not `strength`, is what says whether a person's work is held.**
+    /// The two come apart: clearing a memory leaves its confirmation stamp
+    /// alone - the record keeps everything it had - so a memory cleared a
+    /// second ago still reads at full strength and holds nothing.
+    pub firing: bool,
+    /// When the lesson was first recorded, RFC 3339.
+    pub written_at: String,
+    /// When the same act last went badly, RFC 3339. Decay runs from here.
+    pub last_confirmed_at: String,
+    /// When it stops holding calls, if nothing confirms it again, RFC 3339.
+    ///
+    /// In the future only when `firing` is true. A memory that has gone quiet
+    /// by decay reports the day it fell silent; one silenced any other way -
+    /// cleared, or carrying a stamp from beyond the daemon's clock - reports
+    /// the moment it was read. So a date still to come always means work still
+    /// held, and a client can render it without checking `firing` first.
+    pub goes_quiet_at: String,
+    /// Whether a correction has been written over it - by a person clearing it,
+    /// or by the same act succeeding. A cleared memory holds nothing and is
+    /// still readable.
+    pub cleared: bool,
+}
+
+/// One negative memory read on its own, in full (#1186).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NegativeMemoryDetailView {
+    pub memory: NegativeMemoryView,
+    /// The circumstances a later occurrence dropped, oldest first. This is the
+    /// only visible trace of a memory becoming wider than the failure it was
+    /// written for, so an empty list means the memory still holds exactly the
+    /// circumstance it was born in.
+    pub dropped: Vec<DroppedFacetView>,
+    /// The correction over it, when it has been cleared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correction: Option<NegativeMemoryCorrectionView>,
 }
 
 /// Wire-format view of a scratchpad note. Mirrors
@@ -5203,5 +5376,102 @@ mod tests {
         assert!(view.tool_tier.is_none());
         let body = serde_json::to_value(&view).expect("serialize");
         assert!(body.get("tool_tier").is_none());
+    }
+
+    // --- Negative memory, as a person reads it (#1186) -----------------------
+
+    /// Acceptance (#1186): a list row carries the act, the scope, the strength
+    /// and the expiry, so a client can render all four without a second call.
+    #[test]
+    fn a_negative_memory_view_carries_the_act_the_scope_the_strength_and_the_expiry() {
+        let view = NegativeMemoryView {
+            id: "nm-1".to_string(),
+            action: "terminal_run".to_string(),
+            arguments: vec![NegativeMemoryFacetView {
+                name: "command".to_string(),
+                value: "rm -rf build".to_string(),
+            }],
+            circumstances: vec![NegativeMemoryFacetView {
+                name: "host".to_string(),
+                value: "workshop".to_string(),
+            }],
+            outcome: "build is a mount point".to_string(),
+            occurrences: 2,
+            strength: 1.0,
+            firing: true,
+            written_at: "2026-08-01T09:00:00Z".to_string(),
+            last_confirmed_at: "2026-08-07T09:00:00Z".to_string(),
+            goes_quiet_at: "2026-09-04T09:00:00Z".to_string(),
+            cleared: false,
+        };
+        let body = serde_json::to_value(&view).expect("serialize");
+        for field in [
+            "action",
+            "arguments",
+            "circumstances",
+            "strength",
+            "firing",
+            "goes_quiet_at",
+        ] {
+            assert!(body.get(field).is_some(), "a list row must carry {field}");
+        }
+        let back: NegativeMemoryView = serde_json::from_value(body).expect("deserialize");
+        assert_eq!(back, view);
+    }
+
+    /// Acceptance (#1186): the detail view names the circumstances a later
+    /// occurrence dropped, which is the only visible trace of a memory that
+    /// became wider than the failure it was written for.
+    #[test]
+    fn a_negative_memory_detail_names_the_circumstances_a_later_occurrence_dropped() {
+        let detail = NegativeMemoryDetailView {
+            memory: NegativeMemoryView {
+                id: "nm-1".to_string(),
+                action: "terminal_run".to_string(),
+                arguments: Vec::new(),
+                circumstances: Vec::new(),
+                outcome: "build is a mount point".to_string(),
+                occurrences: 2,
+                strength: 1.0,
+                firing: true,
+                written_at: "2026-08-01T09:00:00Z".to_string(),
+                last_confirmed_at: "2026-08-07T09:00:00Z".to_string(),
+                goes_quiet_at: "2026-09-04T09:00:00Z".to_string(),
+                cleared: false,
+            },
+            dropped: vec![DroppedFacetView {
+                name: "host".to_string(),
+                value: "workshop".to_string(),
+                dropped_at: "2026-08-07T09:00:00Z".to_string(),
+            }],
+            correction: None,
+        };
+        let body = serde_json::to_value(&detail).expect("serialize");
+        let dropped = body
+            .get("dropped")
+            .and_then(|d| d.as_array())
+            .expect("the detail carries what was dropped");
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0]["name"], "host");
+        assert_eq!(dropped[0]["value"], "workshop");
+        assert!(
+            dropped[0].get("dropped_at").is_some(),
+            "and when it was dropped, so a person can date the widening"
+        );
+        let back: NegativeMemoryDetailView = serde_json::from_value(body).expect("deserialize");
+        assert_eq!(back, detail);
+    }
+
+    /// The note on a clear is optional on the wire: a client that offers no
+    /// reason box still sends a parseable command.
+    #[test]
+    fn clearing_a_negative_memory_may_omit_its_note_on_the_wire() {
+        let parsed: Command = serde_json::from_str(r#"{"clear_negative_memory":{"id":"nm-1"}}"#)
+            .expect("a clear with no note must parse");
+        let Command::ClearNegativeMemory { id, note } = parsed else {
+            panic!("expected ClearNegativeMemory");
+        };
+        assert_eq!(id, "nm-1");
+        assert_eq!(note, None);
     }
 }
