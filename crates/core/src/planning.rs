@@ -268,9 +268,11 @@ pub(crate) enum EvictReason {
 
 pub(crate) fn compaction_pointer(
     tool_name: Option<&str>,
+    message_id: &str,
     note_keys: &[String],
     reason: EvictReason,
 ) -> String {
+    let _ = message_id;
     let ran = match tool_name {
         Some(n) if !n.is_empty() => format!(" (ran {n})"),
         _ => String::new(),
@@ -381,7 +383,7 @@ pub(crate) fn evict_tool_results(
             .as_deref()
             .and_then(|id| names.get(id))
             .map(String::as_str);
-        let pointer = compaction_pointer(tool_name, note_keys, reason);
+        let pointer = compaction_pointer(tool_name, &m.id, note_keys, reason);
         freed += current.len().saturating_sub(pointer.len());
         evicted += 1;
         if trace == DistilledTrace::Written && !note_keys.is_empty() {
@@ -465,7 +467,8 @@ pub(crate) fn carry_evictions(
             .as_deref()
             .and_then(|id| names.get(id))
             .map(String::as_str);
-        let pointer = compaction_pointer(tool_name, &m.distilled_into, EvictReason::StepCompleted);
+        let pointer =
+            compaction_pointer(tool_name, &m.id, &m.distilled_into, EvictReason::StepCompleted);
         // A pointer longer than what it replaces makes the prompt bigger, which
         // is the one thing this may not do. Reachable at the small end: the
         // eviction threshold is [`COMPACTION_MIN_EVICT_BYTES`] and a pointer
@@ -1179,6 +1182,7 @@ mod tests {
     use crate::ports::scratchpad::{
         MAX_PINNED_NOTES, PINNED_BLOCK_BYTE_BUDGET, PINNED_ENTRY_MAX_CHARS,
     };
+    use crate::ports::transcript::TRANSCRIPT_GET_TOOL;
 
     #[test]
     fn stack_auto_numbers_roots_and_nested_children() {
@@ -1709,7 +1713,8 @@ mod tests {
 
         let live: std::collections::HashSet<String> = long_keys.iter().cloned().collect();
         assert!(
-            compaction_pointer(Some("read_file"), &long_keys, EvictReason::StepCompleted).len()
+            compaction_pointer(Some("read_file"), "m-1", &long_keys, EvictReason::StepCompleted)
+                .len()
                 > modest.len(),
             "the fixture must build a pointer bigger than the result"
         );
@@ -1747,9 +1752,137 @@ mod tests {
 
     #[test]
     fn pointer_without_notes_says_dropped() {
-        let p = compaction_pointer(Some("geocode"), &[], EvictReason::StepCompleted);
+        let p = compaction_pointer(Some("geocode"), "m-1", &[], EvictReason::StepCompleted);
         assert!(p.contains("geocode"));
         assert!(p.contains("no carry-forward"));
+    }
+
+    // --- #1226: the bytes an eviction takes out of view stay fetchable ------
+
+    /// AC (#1226): the pointer the model reads names the message id, on the
+    /// step-completion path.
+    #[test]
+    fn the_step_eviction_pointer_names_the_message_id_and_the_read_back_tool() {
+        let big = "x".repeat(5000);
+        let mut messages = vec![
+            Message::assistant_with_tool_calls(vec![ToolCall::new("c1", "read_file", "{}")]),
+            tool_msg("c1", &big),
+        ];
+        let id = messages[1].id.clone();
+        let mut projection = ContextProjection::default();
+        evict_tool_results(
+            &mut messages,
+            &mut projection,
+            0,
+            &["outcome:1".to_string()],
+            DistilledTrace::Written,
+            EvictReason::StepCompleted,
+        );
+
+        let pointer = projection.content(&messages[1]);
+        assert!(
+            pointer.contains(&id),
+            "the pointer must name the message id to fetch: {pointer}"
+        );
+        assert!(
+            pointer.contains(TRANSCRIPT_GET_TOOL),
+            "the pointer must name the tool that fetches it: {pointer}"
+        );
+
+        // The same must hold for the pointer a LATER turn rebuilds, which is
+        // the one that survives past the turn that evicted.
+        let mut later = ContextProjection::default();
+        let live: std::collections::HashSet<String> =
+            ["outcome:1".to_string()].into_iter().collect();
+        let (carried, _) = carry_evictions(&messages, &mut later, &live);
+        assert_eq!(carried, 1);
+        let carried_pointer = later.content(&messages[1]);
+        assert!(carried_pointer.contains(&id), "{carried_pointer}");
+        assert!(
+            carried_pointer.contains(TRANSCRIPT_GET_TOOL),
+            "{carried_pointer}"
+        );
+    }
+
+    /// AC (#1226): a tool result evicted by a completed step is read back in
+    /// full by its message id, without a call to the original tool.
+    ///
+    /// The read takes no tool executor and cannot reach one, so "without a
+    /// call to the original tool" is a property of the signature; what this
+    /// test proves is that the bytes come back whole from the transcript
+    /// alone, after the round has stopped reading them.
+    #[tokio::test]
+    async fn a_result_evicted_by_a_completed_step_is_read_back_in_full_by_message_id() {
+        let big = "x".repeat(5000);
+        let mut messages = vec![
+            Message::assistant_with_tool_calls(vec![ToolCall::new("c1", "read_file", "{}")]),
+            tool_msg("c1", &big),
+        ];
+        let id = messages[1].id.clone();
+        let mut projection = ContextProjection::default();
+        evict_tool_results(
+            &mut messages,
+            &mut projection,
+            0,
+            &["outcome:1".to_string()],
+            DistilledTrace::Written,
+            EvictReason::StepCompleted,
+        );
+        assert!(
+            projection
+                .content(&messages[1])
+                .starts_with(COMPACTION_POINTER_PREFIX),
+            "the round must have stopped reading the bytes"
+        );
+
+        let read = read_back(&messages, &id, big.len()).await;
+        assert_eq!(
+            read, big,
+            "the evicted result must come back whole from the transcript"
+        );
+    }
+
+    /// Read `message_id` back out of `messages` through the transcript port,
+    /// paging until the whole content is assembled.
+    async fn read_back(messages: &[Message], message_id: &str, expect_bytes: usize) -> String {
+        use crate::ports::auth::{UserId, with_user_id};
+        use crate::ports::conversation_ctx::with_conversation_id;
+        use crate::ports::transcript::{
+            TranscriptReadRequest, TranscriptView, read_transcript_message, with_transcript,
+        };
+
+        let user = UserId::new("u");
+        let conversation = crate::domain::ConversationId::from("conv".to_string());
+        let mut view = TranscriptView::new(user.clone(), conversation.clone());
+        view.absorb(messages);
+
+        with_user_id(user, with_conversation_id(conversation, async move {
+            let mut assembled = String::new();
+            let mut offset = Some(0usize);
+            while let Some(at) = offset {
+                let payload = with_transcript(
+                    view.clone(),
+                    std::future::ready(read_transcript_message(&TranscriptReadRequest {
+                        message_id: message_id.to_string(),
+                        offset: at,
+                        length: None,
+                    })),
+                )
+                .await;
+                let got: serde_json::Value =
+                    serde_json::from_str(&payload).expect("the payload must be JSON");
+                assert_eq!(got["ok"], true, "{payload}");
+                assert_eq!(
+                    got["total_bytes"].as_u64(),
+                    Some(expect_bytes as u64),
+                    "{payload}"
+                );
+                assembled.push_str(got["content"].as_str().expect("content is a string"));
+                offset = got["next_offset"].as_u64().map(|n| n as usize);
+            }
+            assembled
+        }))
+        .await
     }
 
     #[test]

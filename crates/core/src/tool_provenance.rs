@@ -507,6 +507,17 @@ pub const CLASSIFIED_SOURCES: &[ClassifiedSource] = &[
             // Starts, stops, and restarts MCP server processes on the host.
             tool("builtin_mcp_control", Execution, Trusted),
             tool("builtin_conversation_search", Read, Trusted),
+            // Re-surfaces bytes this conversation's transcript already holds,
+            // so its provenance is whatever the tool that produced them had.
+            // The read resolves that tool and stamps
+            // [`EXTERNAL_CONTENT_MARKER`] into its own payload when the answer
+            // is "outside content", which is what makes this entry correct
+            // rather than a laundering route.
+            tool(
+                crate::ports::transcript::TRANSCRIPT_GET_TOOL,
+                Read,
+                Declared(ExternalContentMarker),
+            ),
             tool("builtin_scratchpad_write", Mutate, Trusted),
             // The pad holds notes a subagent wrote from its own turn, and
             // that turn may have read outside content. Such a note is
@@ -981,6 +992,28 @@ pub fn carries_external_marker(text: &str) -> bool {
     text.contains(EXTERNAL_CONTENT_MARKER)
 }
 
+/// Whether `result`, as returned by the tool named `name`, holds bytes an
+/// outside party could influence.
+///
+/// The one place that answer is computed. [`TurnProvenance::observe_result`]
+/// folds it into a running turn; a tool that re-surfaces stored bytes asks it
+/// about the tool those bytes originally came from, so a read-back taints
+/// exactly as the original result did rather than laundering it (see
+/// [`crate::ports::transcript`]).
+///
+/// A [`ResultProvenance::Declared`] tool states its own provenance per call,
+/// so `result` is read only for those; for the other two the name decides.
+#[must_use]
+pub fn result_is_externally_controlled(name: &str, result: &str) -> bool {
+    match classify_tool(name).provenance {
+        Trusted => false,
+        ExternallyControlled => true,
+        Declared(SkillTrustTier) => !skill_result_is_local_only(result),
+        Declared(ExternalContentMarker) => carries_external_marker(result),
+        Declared(SubagentAnswer) => subagent_payload_carries_an_answer(result),
+    }
+}
+
 /// What the gate decided about one model-chosen tool call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolGate {
@@ -1095,14 +1128,7 @@ impl TurnProvenance {
         if self.ingested_external {
             return GateChange::Unchanged;
         }
-        let external = match classify_tool(name).provenance {
-            Trusted => false,
-            ExternallyControlled => true,
-            Declared(SkillTrustTier) => !skill_result_is_local_only(result),
-            Declared(ExternalContentMarker) => carries_external_marker(result),
-            Declared(SubagentAnswer) => subagent_payload_carries_an_answer(result),
-        };
-        if !external {
+        if !result_is_externally_controlled(name, result) {
             return GateChange::Unchanged;
         }
         self.ingested_external = true;
@@ -1242,6 +1268,13 @@ mod tests {
         // the skill tools state their own provenance per call
         ("builtin_skill_search", Read, Declared(SkillTrustTier)),
         ("builtin_skill_get", Read, Declared(SkillTrustTier)),
+        // Hands back bytes another tool returned earlier in this
+        // conversation, so it is as trustworthy as that tool was.
+        (
+            "builtin_transcript_get",
+            Read,
+            Declared(ExternalContentMarker),
+        ),
         // A child's report carries whatever the child read, but only some of
         // these calls return a report at all.
         ("spawn_subagent", Execution, Declared(SubagentAnswer)),
