@@ -3704,11 +3704,18 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                     // act - which is exactly how an over-general burn hides.
                     // The notice names the lesson by id, so the reticence can
                     // be looked up and cleared.
+                    //
+                    // Through `summarize_tool_text` like every other entry in
+                    // this feed, and for the same reason: the outcome it quotes
+                    // is a tool's own error text, which may be a remote
+                    // server's words. One bound on what reaches the feed, not a
+                    // second one beside it.
+                    let notice = render_hold_notice(&fired_burns)
+                        .unwrap_or_else(|| "held: this act went badly before".to_string());
                     notify_tool_event(ToolEvent::Finished {
                         name: summarize_tool_name(&tool_call.name),
                         ok: false,
-                        output: render_hold_notice(&fired_burns)
-                            .unwrap_or_else(|| "held: this act went badly before".to_string()),
+                        output: summarize_tool_text(&notice),
                     });
                     conv.messages
                         .push(Message::tool_result(&tool_call.id, &warning));
