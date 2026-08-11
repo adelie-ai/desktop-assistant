@@ -113,6 +113,12 @@ impl UdsClient {
     /// can compute exact co-location; `client_context` (#549) rides the same
     /// frame, `None` omitting it.
     ///
+    /// `shares_client_context` is the caller's `share_client_context` setting
+    /// (#783). `false` puts an explicit refusal on the handshake, so the daemon
+    /// attaches no client context of its own making either. A client that
+    /// connects for somebody else sets it: its own process environment belongs
+    /// to the machine it runs on, not to the person it serves.
+    ///
     /// `bearer_token` is `None` for the local peer-cred path (#407): the daemon
     /// authenticates the connection by its kernel `SO_PEERCRED`, so no JWT is
     /// sent and the handshake omits the `jwt` field entirely. A `Some(token)` is
@@ -124,6 +130,7 @@ impl UdsClient {
         system_id: Option<&str>,
         host_label: Option<&str>,
         client_context: Option<&api::ClientContext>,
+        shares_client_context: bool,
     ) -> Result<(
         Self,
         mpsc::UnboundedReceiver<SignalEvent>,
@@ -142,6 +149,7 @@ impl UdsClient {
             system_id,
             host_label,
             client_context,
+            shares_client_context,
             Arc::clone(&pending),
             signal_tx.clone(),
             drop_tx.clone(),
@@ -166,8 +174,9 @@ impl UdsClient {
     /// `drop_tx`. Returns the new writer handle. Shared by the initial
     /// [`connect`](Self::connect) and [`reconnect`](Self::reconnect) (#246).
     // Each argument is a distinct handshake input (endpoint, credential, the
-    // #248 id/label, the #549 client context) plus the three persistent
-    // channels; bundling them into a struct would just relocate the fan-out.
+    // #248 id/label, the #549 client context and the #783 declaration about it)
+    // plus the three persistent channels; bundling them into a struct would just
+    // relocate the fan-out.
     #[allow(clippy::too_many_arguments)]
     async fn spawn_connection(
         socket_path: &Path,
@@ -175,6 +184,7 @@ impl UdsClient {
         system_id: Option<&str>,
         host_label: Option<&str>,
         client_context: Option<&api::ClientContext>,
+        shares_client_context: bool,
         pending: Arc<Mutex<PendingState>>,
         signal_tx: mpsc::UnboundedSender<SignalEvent>,
         drop_tx: mpsc::UnboundedSender<()>,
@@ -199,6 +209,11 @@ impl UdsClient {
             // client opts out or nothing resolves — the field is then skipped on
             // the wire, keeping the handshake byte-identical to older clients.
             client_context: client_context.cloned(),
+            // The refusal (#783) is the one case the daemon cannot infer from an
+            // absent context, so only a refusal is stated. A sharing client sends
+            // no such field, which keeps its handshake byte-identical to the
+            // pre-#783 shape.
+            share_client_context: (!shares_client_context).then_some(false),
         })?;
         write_frame(&mut write_half, &handshake)
             .await
@@ -278,11 +293,11 @@ impl UdsClient {
     /// `&TransportClient` resumes working; on failure the error is returned so
     /// the supervisor can back off and retry.
     ///
-    /// The system id + host label (#248) and the client context (#549) are
-    /// re-sent on every reconnect — the caller (`TransportClient::reconnect`)
-    /// re-derives them from the stored `ConnectionConfig`, so a handshake field
-    /// added in #248 / #549 survives a daemon restart exactly like the bearer
-    /// token does.
+    /// The system id + host label (#248), the client context (#549) and the
+    /// declaration about it (#783) are re-sent on every reconnect — the caller
+    /// (`TransportClient::reconnect`) re-derives them from the stored
+    /// `ConnectionConfig`, so a handshake field added in #248 / #549 / #783
+    /// survives a daemon restart exactly like the bearer token does.
     pub(crate) async fn reconnect(
         &self,
         socket_path: &Path,
@@ -290,6 +305,7 @@ impl UdsClient {
         system_id: Option<&str>,
         host_label: Option<&str>,
         client_context: Option<&api::ClientContext>,
+        shares_client_context: bool,
     ) -> Result<()> {
         let outbound_tx = Self::spawn_connection(
             socket_path,
@@ -297,6 +313,7 @@ impl UdsClient {
             system_id,
             host_label,
             client_context,
+            shares_client_context,
             Arc::clone(&self.pending),
             self.signal_tx.clone(),
             self.drop_tx.clone(),

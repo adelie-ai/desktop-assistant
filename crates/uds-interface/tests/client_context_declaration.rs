@@ -17,9 +17,7 @@ use desktop_assistant_auth_jwt as jwt;
 use desktop_assistant_core::ports::transport::current_client_context;
 use desktop_assistant_core::prompts::render_client_context;
 use desktop_assistant_peer_cred::PeerIdentity;
-use desktop_assistant_uds::{
-    UdsAuth, UdsAuthValidator, UdsServer, UdsServerConfig, write_frame,
-};
+use desktop_assistant_uds::{UdsAuth, UdsAuthValidator, UdsServer, UdsServerConfig, write_frame};
 use tempfile::TempDir;
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
@@ -169,9 +167,12 @@ async fn client_context_block_for_one_turn(
     let mut stream = UnixStream::connect(&harness.path)
         .await
         .expect("connect to the listener");
-    write_frame(&mut stream, &serde_json::to_vec(&handshake).expect("encode"))
-        .await
-        .expect("write handshake");
+    write_frame(
+        &mut stream,
+        &serde_json::to_vec(&handshake).expect("encode"),
+    )
+    .await
+    .expect("write handshake");
 
     let req = api::WsRequest {
         id: "turn-1".into(),

@@ -417,7 +417,7 @@ impl UdsServer {
     }
 }
 
-/// Resolve the client context to attach for a UDS connection (#549/#558).
+/// Resolve the client context to attach for a UDS connection (#549/#558/#783).
 ///
 /// A client that reported a non-empty context keeps it verbatim. Otherwise the
 /// local, co-located client sent none (e.g. the KDE FFI client, which cannot
@@ -426,13 +426,28 @@ impl UdsServer {
 /// fallback fills ONLY those user-identity fields — peer-cred does not attest a
 /// device hostname / OS / timezone, so those stay absent rather than borrowing
 /// the daemon host's. Returns `None` when nothing at all is known.
+///
+/// `shares_context` is the client's own declaration (#783). `Some(false)` is a
+/// refusal and suppresses the peer fallback entirely: the client is telling the
+/// daemon that the process at the other end of this socket is not the person
+/// being served, so its identity describes the wrong human. The client's
+/// declaration wins over the daemon's inference, because only the client knows
+/// who it is connecting for. `Some(true)` and `None` behave identically — `None`
+/// is what every client that predates the field sends.
+///
+/// Held by `crates/uds-interface/tests/client_context_declaration.rs`.
 fn resolve_local_client_context(
     reported: Option<api::ClientContext>,
+    shares_context: Option<bool>,
     peer: Option<&PeerIdentity>,
 ) -> Option<api::ClientContext> {
     // A non-empty self-report always wins.
     if let Some(ctx) = reported.filter(|c| !c.is_empty()) {
         return Some(ctx);
+    }
+    // An explicit refusal ends it here: no self-report, and no substitute.
+    if shares_context == Some(false) {
+        return None;
     }
     // No usable self-report: ground the prompt from the kernel peer identity.
     let peer = peer?;
@@ -457,6 +472,16 @@ async fn handle_connection(
     // (`peer_cred` is a `UnixStream` method). On local transports this is the
     // authentication (#407); `None` if the OS couldn't supply it (the auth
     // policy then falls back to the bearer token, if any).
+    //
+    // This identity has two separate uses and they must not be merged. It
+    // always authenticates the connection. It grounds the system prompt only
+    // when the client did not refuse (`resolve_local_client_context`), because
+    // the process at the other end of the socket is not always the person being
+    // served: a client that connects for somebody else refuses, and then this
+    // identity reaches authentication and nothing else. Held by
+    // `crates/uds-interface/tests/client_context_declaration.rs`, whose
+    // `declining_the_client_context_keeps_peer_cred_authentication` exercises
+    // both uses on one connection.
     let peer = extract_peer_identity(&stream).ok();
 
     let (mut read_half, mut write_half) = stream.into_split();
@@ -506,8 +531,13 @@ async fn handle_connection(
     // #248 system-id fields. Best-effort display data, not a trust boundary. When
     // a local client sent none (e.g. the KDE FFI client), fall back to the kernel
     // peer identity so the user's name / login / home still ground the prompt
-    // (#558).
-    let client_context = resolve_local_client_context(handshake.client_context, peer.as_ref());
+    // (#558) - unless the client declared that it shares no client context
+    // (#783), which suppresses that fallback.
+    let client_context = resolve_local_client_context(
+        handshake.client_context,
+        handshake.share_client_context,
+        peer.as_ref(),
+    );
 
     // Authenticate from the (optional) token and the kernel peer-cred. The
     // default validator requires a valid token; a local-trust daemon (#407)
@@ -660,6 +690,7 @@ mod tests {
         };
         let resolved = resolve_local_client_context(
             Some(reported.clone()),
+            None,
             Some(&peer_with(Some("Peer Name"), Some("/home/peer"))),
         );
         assert_eq!(resolved, Some(reported));
@@ -670,6 +701,7 @@ mod tests {
         // #558: a local client that sent no context (None) still grounds the
         // prompt with the peer's name / login / home from kernel peer-cred.
         let resolved = resolve_local_client_context(
+            None,
             None,
             Some(&peer_with(Some("Ada Lovelace"), Some("/home/ada"))),
         )
@@ -689,6 +721,7 @@ mod tests {
         // fallback still applies.
         let resolved = resolve_local_client_context(
             Some(api::ClientContext::default()),
+            None,
             Some(&peer_with(None, Some("/home/ada"))),
         )
         .expect("empty reported context should fall back to peer");
@@ -701,7 +734,7 @@ mod tests {
     fn peer_without_name_or_home_still_yields_username() {
         // The peer identity always carries a username, so even with no GECOS name
         // / home dir the fallback is a non-empty context (username only).
-        let resolved = resolve_local_client_context(None, Some(&peer_with(None, None)))
+        let resolved = resolve_local_client_context(None, None, Some(&peer_with(None, None)))
             .expect("username-only peer still yields a context");
         assert_eq!(resolved.username.as_deref(), Some("ada"));
         assert_eq!(resolved.real_name, None);
@@ -712,7 +745,54 @@ mod tests {
     fn no_context_and_no_peer_is_none() {
         // A remote connection (no peer-cred) that sent no context yields nothing
         // to attach.
-        assert_eq!(resolve_local_client_context(None, None), None);
+        assert_eq!(resolve_local_client_context(None, None, None), None);
+    }
+
+    #[test]
+    fn a_declined_context_suppresses_the_peer_fallback() {
+        // #783: the client refused, so the peer identity - which describes the
+        // process at the other end of the socket, not the person being served -
+        // must not become the prompt's grounding.
+        assert_eq!(
+            resolve_local_client_context(
+                None,
+                Some(false),
+                Some(&peer_with(Some("Ada Lovelace"), Some("/home/ada"))),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_declined_context_still_keeps_a_non_empty_self_report() {
+        // The refusal governs the daemon's substitute, not the client's own
+        // report. A client that reports a context has not refused anything, so
+        // an inconsistent pair keeps the report rather than discarding data.
+        let reported = api::ClientContext {
+            timezone: Some("Europe/London".into()),
+            ..api::ClientContext::default()
+        };
+        assert_eq!(
+            resolve_local_client_context(
+                Some(reported.clone()),
+                Some(false),
+                Some(&peer_with(Some("Peer Name"), Some("/home/peer"))),
+            ),
+            Some(reported)
+        );
+    }
+
+    #[test]
+    fn an_explicit_share_declaration_keeps_the_peer_fallback() {
+        // `Some(true)` is not a refusal, so it behaves exactly like the absent
+        // declaration every pre-#783 client sends.
+        let resolved = resolve_local_client_context(
+            None,
+            Some(true),
+            Some(&peer_with(Some("Ada Lovelace"), Some("/home/ada"))),
+        )
+        .expect("a client that did not refuse keeps the peer fallback");
+        assert_eq!(resolved.username.as_deref(), Some("ada"));
     }
 
     /// #807: the trait's own token-only policy resolved identity with

@@ -153,6 +153,7 @@ impl TransportClient {
                         config.system_id.as_deref(),
                         config.host_label.as_deref(),
                         client_context.as_ref(),
+                        config.share_client_context,
                     )
                     .await
             }
@@ -475,6 +476,7 @@ pub async fn connect_transport(
                 config.system_id.as_deref(),
                 config.host_label.as_deref(),
                 client_context.as_ref(),
+                config.share_client_context,
             )
             .await?;
             Ok((TransportClient::Uds(client), signal_rx, Some(drop_rx)))

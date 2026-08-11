@@ -265,6 +265,47 @@ What an integrator must do:
 
 No field was added or removed, and the wire bytes are unchanged.
 
+## The UDS handshake: declaring what you share about the user
+
+The first frame on a Unix-socket connection is a JSON handshake. Every field in
+it is optional, so the historic `{"jwt": "..."}` still parses.
+
+| Field | Purpose |
+|---|---|
+| `jwt` | Bearer token. A local client authenticates by kernel peer credentials and sends none. |
+| `system_id` | The client's per-machine id, for exact tool co-location. |
+| `host_label` | A friendly name for that machine, for the remote-tool note. |
+| `client_context` | What the client knows about the user and the device: name, username, home directory, hostname, timezone, OS. It grounds the system prompt. |
+| `share_client_context` | The client's declaration about the field above. |
+
+A client that reports no `client_context` gets one anyway: the daemon reads the
+kernel-attested identity of the connecting process and grounds the prompt with
+that user's name, login and home directory. This is correct for a desktop client
+that runs as the person using it, and wrong for a client that connects for
+somebody else - a server-side client serving remote users describes its own host,
+not the person it serves.
+
+`share_client_context: false` is how a client refuses that substitution. The
+daemon then attaches no client context to the connection at all, and the system
+prompt carries no block about the user or the device. The kernel peer identity
+still authenticates the connection; it only stops grounding the prompt.
+
+An absent `share_client_context`, and an explicit `true`, both mean "no
+refusal", and behave exactly as the daemon behaved before the field existed. A
+client that shares its context sends no such field, so its handshake bytes are
+unchanged.
+
+### What an integrator must do
+
+- A client that runs as the person it serves needs no change.
+- A client that connects on behalf of other people sends
+  `share_client_context: false`, and supplies each real user's context per turn
+  on `SendMessage.client_context` instead. Without the declaration the daemon
+  substitutes the connecting process's own identity whenever a turn carries no
+  per-turn context.
+- The WebSocket door has no such substitution to refuse: it reads the client
+  context from an upgrade header and infers nothing when the header is absent.
+
 ## Implementation notes
 - WebSocket is the remote-friendly transport; D-Bus remains best for local desktop integration.
 - Both adapters should be covered by integration tests that replay the same command/event scenarios.
