@@ -453,10 +453,10 @@ async fn lookup(
 
 /// One scanned skill as a recall candidate.
 ///
-/// The name, the description and the presence flag travel; nothing is rendered
-/// here, and the body was never read. How much of a description a line may
-/// spend, and how a skill whose files are gone is marked, are the core's
-/// decisions.
+/// The name, the description, the provenance and the presence flag travel;
+/// nothing is rendered here, and the body was never read. How much of a
+/// description a line may spend, and how a skill whose files are gone or whose
+/// text came from outside this machine is marked, are the core's decisions.
 fn to_recall_skill(skill: NearestSkill) -> RecallSkill {
     // The row states which kind of relevance it carries, rather than the call
     // site stating it: the measured read and the degraded one answer with the
@@ -470,6 +470,7 @@ fn to_recall_skill(skill: NearestSkill) -> RecallSkill {
     RecallSkill::new(
         skill.name,
         skill.description,
+        skill.trust_tier,
         skill.present_on_disk,
         relevance,
     )
@@ -825,6 +826,7 @@ mod tests {
         RecallSkill::new(
             "publish-a-crate",
             "Cut a release and push it to the registry.",
+            desktop_assistant_core::domain::TrustTier::Local,
             true,
             RecallRelevance::Distance(0.12),
         )

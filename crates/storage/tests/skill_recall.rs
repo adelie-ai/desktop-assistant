@@ -446,18 +446,18 @@ async fn the_degraded_full_text_read_also_withholds_an_unapproved_skill() {
     fx.cleanup().await;
 }
 
-/// Acceptance (#1154): a skill that came from outside this machine is not
-/// offered.
+/// Acceptance (#1175): a skill that came from outside this machine is offered,
+/// and every row carries the tier its line is marked with.
 ///
 /// The block is a system message with no tool call in it, so nothing taints
-/// and the tool gate stays open. `builtin_skill_search` returns the same
-/// `description` field and is classified `Declared(SkillTrustTier)`, which
-/// means the platform already rules that a non-local skill's text is
-/// third-party content that must close the gate. Delivering the same bytes
-/// through a more trusted channel with less checking is the defect this
-/// excludes.
+/// and the tool gate stays open - which is why #1154 dropped these rows
+/// outright. What replaces the drop is the mark: the tier travels with the
+/// candidate and the core renders it on the line, so the model is told whose
+/// words the description is rather than reading it as the assistant's own
+/// memory. Both reads carry it, because a backend outage must not quietly
+/// launder what the measured read discloses.
 #[tokio::test]
-async fn a_skill_from_outside_this_machine_is_absent_from_the_recall_scan() {
+async fn an_installed_skill_reaches_the_recall_scan_carrying_the_tier_that_marks_it() {
     let Some(fx) = fixture().await else { return };
     let store = PgSkillIndexStore::new(fx.pool.clone());
 
@@ -482,18 +482,37 @@ async fn a_skill_from_outside_this_machine_is_absent_from_the_recall_scan() {
             .nearest_by_embedding(axis(0), MODEL, 10)
             .await
             .expect("the scan answers");
-        let names: Vec<&str> = found.skills.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, vec!["written-here"]);
+        let mut tiers: Vec<(&str, TrustTier)> = found
+            .skills
+            .iter()
+            .map(|s| (s.name.as_str(), s.trust_tier))
+            .collect();
+        tiers.sort_by_key(|(name, _)| *name);
+        assert_eq!(
+            tiers,
+            vec![
+                ("from-github", TrustTier::Github),
+                ("written-here", TrustTier::Local),
+            ],
+            "both are offered, and each says where its text came from"
+        );
 
         let lexical = store
             .search_text_any_term("a procedure", 10)
             .await
             .expect("the degraded read answers");
-        let names: Vec<&str> = lexical.iter().map(|s| s.name.as_str()).collect();
+        let mut tiers: Vec<(&str, TrustTier)> = lexical
+            .iter()
+            .map(|s| (s.name.as_str(), s.trust_tier))
+            .collect();
+        tiers.sort_by_key(|(name, _)| *name);
         assert_eq!(
-            names,
-            vec!["written-here"],
-            "a backend outage must not turn into an offer of third-party text"
+            tiers,
+            vec![
+                ("from-github", TrustTier::Github),
+                ("written-here", TrustTier::Local),
+            ],
+            "a backend outage must not turn a marked offer into an unmarked one"
         );
     })
     .await;
@@ -501,14 +520,15 @@ async fn a_skill_from_outside_this_machine_is_absent_from_the_recall_scan() {
     fx.cleanup().await;
 }
 
-/// A non-local skill shadowing a local one by name must not leave the block
-/// offering the local line while a fetch hands back the non-local body.
+/// A non-local skill shadowing a local one by name is offered as the row a
+/// fetch would return, marked, rather than as the row underneath it.
 ///
-/// The trust rule therefore applies to the row a name resolved to, not to the
-/// set it resolves from: the name is dropped outright rather than falling
-/// through to the row underneath it.
+/// The line has to describe the procedure `builtin_skill_get` hands back, or
+/// the model is briefed on one method and given another's steps. So the tier
+/// that marks the line is the resolved row's, and the description is the
+/// resolved row's too.
 #[tokio::test]
-async fn a_name_whose_resolved_row_came_from_outside_is_dropped_rather_than_falling_through() {
+async fn a_shadowed_name_is_offered_as_the_row_a_fetch_returns_and_marked_as_that_row() {
     let Some(fx) = fixture().await else { return };
     let store = PgSkillIndexStore::new(fx.pool.clone());
 
@@ -534,11 +554,20 @@ async fn a_name_whose_resolved_row_came_from_outside_is_dropped_rather_than_fall
             .await
             .expect("the scan answers");
 
-        assert!(
-            found.skills.is_empty(),
-            "the fetch would return the installed personal row, so offering the global \
-             line would describe a procedure the model will not be given: {:?}",
+        assert_eq!(
+            found.skills.len(),
+            1,
+            "one row per name: {:?}",
             found.skills
+        );
+        assert_eq!(
+            found.skills[0].description, "My own copy, installed from elsewhere.",
+            "the line describes the row a fetch returns"
+        );
+        assert_eq!(
+            found.skills[0].trust_tier,
+            TrustTier::Github,
+            "and it is marked as that row, not as the one it shadows"
         );
     })
     .await;
@@ -694,11 +723,11 @@ async fn a_name_resolves_over_the_catalog_rather_than_over_the_rows_that_matched
 
 /// The spread describes the set the arm draws from.
 ///
-/// A catalog of mostly installed skills would otherwise report a measurement
+/// A catalog mostly awaiting approval would otherwise report a measurement
 /// taken over rows the arm can never show: `RECALL_DISPERSION_MIN_ROWS` would
-/// count them, so a handful of local skills among a large installed library
-/// would be graded against the installed library's geometry rather than left
-/// on the caller's stated estimate.
+/// count them, so a handful of followable skills among a large pending library
+/// would be graded against the pending library's geometry rather than left on
+/// the caller's stated estimate.
 #[tokio::test]
 async fn the_spread_is_measured_over_the_skills_the_arm_can_offer() {
     let Some(fx) = fixture().await else { return };
@@ -708,15 +737,12 @@ async fn the_spread_is_measured_over_the_skills_the_arm_can_offer() {
         // Well past the minimum sample, but only three of them are offerable.
         for i in 0..(RECALL_DISPERSION_MIN_ROWS + 5) {
             let radians = 0.05 + (i as f32) * 0.03;
-            let mut row = a_skill(
+            let row = a_skill(
                 &format!("procedure-{i:02}"),
                 "A procedure in a catalog of procedures.",
                 None,
             );
-            if i >= 3 {
-                row.trust_tier = TrustTier::Github;
-            }
-            seed(&store, &fx.pool, &row, at_angle(radians), true).await;
+            seed(&store, &fx.pool, &row, at_angle(radians), i < 3).await;
         }
 
         let found = store
@@ -724,11 +750,15 @@ async fn the_spread_is_measured_over_the_skills_the_arm_can_offer() {
             .await
             .expect("the scan answers");
 
-        assert_eq!(found.skills.len(), 3, "only the local skills are offerable");
+        assert_eq!(
+            found.skills.len(),
+            3,
+            "only the approved skills are offerable"
+        );
         assert_eq!(
             found.dispersion, None,
             "three rows is no sample at all, so the caller falls back to its stated estimate \
-             rather than being handed the installed library's geometry"
+             rather than being handed the pending library's geometry"
         );
     })
     .await;

@@ -66,6 +66,7 @@ use crate::domain::activation::{NO_SALIENCE, NO_SITUATION};
 use crate::domain::knowledge_use::KnowledgeUseRecord;
 use crate::domain::salience::{SalienceReading, SalienceSource};
 use crate::domain::situation::{SituationCue, SituationRecord};
+use crate::domain::skill::TrustTier;
 
 /// How near a candidate is to the prompt, and in which sense.
 ///
@@ -314,6 +315,17 @@ impl Activatable for RecallEntry {
 /// carries the name it can be fetched by and the one line that says what it is
 /// for, and nothing else of what it holds.
 ///
+/// **An installed skill is marked, never laundered** (#1175). The catalog's
+/// larger half is usually installed rather than written here, and an arm that
+/// could offer only self-authored skills offered the smaller half. What kept it
+/// out was real: `builtin_skill_search` returns this same description field and
+/// is classified `Declared(SkillTrustTier)`, so a non-local hit taints the turn
+/// and closes the tool gate, where this block has no tool call in it and
+/// nothing would taint. So the line carries the mark instead, and the mark
+/// survives into the prompt the model reads - it is part of the rendered line,
+/// not metadata beside it. Acting on the line still means a fetch, and the
+/// fetch taints exactly as it always did.
+///
 /// **An unapproved skill is never a candidate.** Approval (#1155) records that
 /// a person agreed the procedure may be followed, and nothing in the system
 /// will hand its body over until they have: `builtin_skill_get` refuses one by
@@ -327,7 +339,26 @@ pub struct RecallSkill {
     /// The catalog name, which is also the handle the skill is fetched by.
     pub name: String,
     /// The skill's own "when to use" line, as its frontmatter states it.
+    ///
+    /// **Whose words these are depends on [`Self::provenance`].** On an
+    /// installed skill this is text somebody outside this machine wrote, and it
+    /// renders into a system message ahead of the user's prompt. It may only be
+    /// shown marked - see [`Self::provenance`].
     pub description: String,
+    /// Where the skill's text came from (#1175).
+    ///
+    /// A constructor argument rather than a defaulted field, because a default
+    /// is what laundering looks like: a construction site that forgets would
+    /// present third-party text as the assistant's own memory, silently, and no
+    /// test of any *particular* site would catch the next one. Making it
+    /// unforgettable is the mechanism; the marker on the line is what the
+    /// model reads.
+    ///
+    /// This is provenance and not consent, and the two are separate axes. An
+    /// installed skill can be approved, and a skill Adele wrote for herself is
+    /// [`TrustTier::Local`] and may still not be followed until somebody says
+    /// so - which the adapter enforces by excluding it from the scan.
+    pub provenance: TrustTier,
     /// Whether the skill's files were on disk at the last scan of its scope.
     ///
     /// `false` does **not** make the skill unusable, which is why it is marked
@@ -356,12 +387,14 @@ impl RecallSkill {
     pub fn new(
         name: impl Into<String>,
         description: impl Into<String>,
+        provenance: TrustTier,
         present_on_disk: bool,
         relevance: RecallRelevance,
     ) -> Self {
         Self {
             name: name.into(),
             description: description.into(),
+            provenance,
             present_on_disk,
             relevance,
             use_record: None,

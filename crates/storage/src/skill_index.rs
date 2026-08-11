@@ -220,25 +220,20 @@ impl PgSkillIndexStore {
     /// never an open. Filtering inside the scan also keeps the spread a
     /// statement about the catalog the arm actually draws from.
     ///
-    /// **Only a locally authored skill is offered.** A skill from a GitHub or
-    /// `.well-known` source carries a description its author wrote, and the
-    /// platform already rules that such text is third-party content:
-    /// `builtin_skill_search` returns the same field and is classified
-    /// `Declared(SkillTrustTier)`, so a non-local hit taints the turn and
-    /// closes the tool gate. This block has no tool call in it, so nothing
-    /// would taint - the text would land in a system message, ahead of the
-    /// user prompt, with every tier still open. Dropping is the answer rather
-    /// than tainting, for the reason the scratchpad arm drops a note stamped
-    /// as external: a catalog row lives indefinitely, and closing the gate
-    /// whenever one happened to rank near the prompt would degrade the
-    /// conversation permanently. An installed skill stays reachable through
-    /// `builtin_skill_search`, which taints correctly.
+    /// **An installed skill is offered with its tier, never without it**
+    /// (#1175). A skill from a GitHub or `.well-known` source carries a
+    /// description its author wrote, and the platform rules that such text is
+    /// third-party content: `builtin_skill_search` returns the same field and
+    /// is classified `Declared(SkillTrustTier)`, so a non-local hit taints the
+    /// turn and closes the tool gate. This block has no tool call in it, so
+    /// nothing would taint - which is why #1154 dropped these rows outright,
+    /// and why the answer now is the mark rather than the drop: the tier
+    /// travels with the candidate and the core renders it on the line, so the
+    /// model is told whose words it is reading. Acting on the line still means
+    /// a fetch, and the fetch taints exactly as it always did.
     ///
-    /// The predicate applies after a name has resolved to one row, and before
-    /// the spread is measured. Filtering earlier would let a local global skill
-    /// be offered while the fetch returned the non-local personal one that
-    /// shadows it; filtering later would grade the offerable rows against a
-    /// spread measured over rows the arm can never show.
+    /// The tier is read off the row a name resolved to, so the mark describes
+    /// the procedure `builtin_skill_get` hands back rather than one it shadows.
     ///
     /// **One row per name, and it is the row the fetch returns.** The catalog
     /// can hold a global skill and this user's own under one name. Two lines
@@ -311,8 +306,10 @@ impl PgSkillIndexStore {
     /// model-authored query of two or three words and wrong for a whole user
     /// sentence. A fallback that answers nothing is not a fallback.
     ///
-    /// The same approval filter and the same one-row-per-name rule as
-    /// [`Self::nearest_by_embedding`], for the same reasons.
+    /// The same approval filter, the same one-row-per-name rule and the same
+    /// tier carried through to the line, as [`Self::nearest_by_embedding`] and
+    /// for the same reasons. A backend outage must not turn a marked offer into
+    /// an unmarked one.
     ///
     /// The scan carries this store's own ceiling
     /// ([`SKILL_RECALL_SCAN_STATEMENT_TIMEOUT`] unless
@@ -342,11 +339,10 @@ impl PgSkillIndexStore {
                                WHEN owner_key = '' THEN 1
                                ELSE 2 END
              )
-             SELECT si.name, si.description, si.present_on_disk
+             SELECT si.name, si.description, si.trust_tier, si.present_on_disk
              FROM resolved r
              JOIN skill_index si ON si.name = r.name AND si.owner_key = r.owner_key, q
-             WHERE r.trust_tier = 'local'
-               AND q.query IS NOT NULL
+             WHERE q.query IS NOT NULL
                AND si.tsv @@ q.query
              ORDER BY ts_rank_cd(si.tsv, q.query) DESC, si.name
              LIMIT $2",
@@ -662,8 +658,8 @@ pub const SKILL_RECALL_SCAN_STATEMENT_TIMEOUT: std::time::Duration =
 /// **The order of the passes is the whole design here.** `resolved` cuts the
 /// approved scope to one row per name, by `builtin_skill_get`'s own rule - its
 /// own row when the files are on disk, else the global one, else its own
-/// tombstone. `offerable` then drops a name whose resolved row is not local.
-/// Only after that does `d` measure a distance, and `m` and `s` the spread.
+/// tombstone. Only after that does `d` measure a distance, and `m` and `s` the
+/// spread.
 ///
 /// Each step has to be where it is:
 ///
@@ -673,12 +669,14 @@ pub const SKILL_RECALL_SCAN_STATEMENT_TIMEOUT: std::time::Duration =
 ///   ordinary case. Resolving over the matched set instead would let the block
 ///   offer the global row's line while the fetch handed back the personal
 ///   row's body.
-/// - **Trust comes after resolution.** A non-local row shadowing a local one
-///   must drop the name outright; filtering earlier would offer the row
-///   underneath, which is again not the row the fetch returns.
-/// - **The spread is measured after both.** It has to describe the set the arm
-///   draws from, or the bar grades a candidate against rows it could never
-///   show - and `RECALL_DISPERSION_MIN_ROWS` would count them too, so a
+/// - **The tier is read off the resolved row** and travels with the candidate
+///   (#1175). It is a mark and no longer a filter: the block renders it on the
+///   line, so a description written outside this machine is disclosed rather
+///   than dropped. Reading it off the resolved row rather than off any row of
+///   that name is what keeps the mark describing the procedure a fetch returns.
+/// - **The spread is measured after resolution.** It has to describe the set
+///   the arm draws from, or the bar grades a candidate against rows it could
+///   never show - and `RECALL_DISPERSION_MIN_ROWS` would count them too, so a
 ///   catalog of three offerable skills among twenty-five would report a
 ///   measurement where it has none.
 ///
@@ -712,13 +710,10 @@ const NEAREST_SKILLS_BY_EMBEDDING_SQL: &str = "\
                        WHEN owner_key = '' THEN 1
                        ELSE 2 END
      ),
-     offerable AS (
-         SELECT name, owner_key FROM resolved WHERE trust_tier = 'local'
-     ),
      d AS (
          SELECT si.name, si.owner_key, MIN(chunk <=> $1) AS distance
-         FROM offerable o
-         JOIN skill_index si ON si.name = o.name AND si.owner_key = o.owner_key
+         FROM resolved r
+         JOIN skill_index si ON si.name = r.name AND si.owner_key = r.owner_key
          CROSS JOIN LATERAL unnest(si.embedding) AS chunk
          WHERE si.embedding IS NOT NULL
            AND si.embedding_model IS NOT NULL
@@ -741,7 +736,7 @@ const NEAREST_SKILLS_BY_EMBEDDING_SQL: &str = "\
          FROM d CROSS JOIN m
          GROUP BY m.median, m.rows_read
      )
-     SELECT si.name, si.description, si.present_on_disk,
+     SELECT si.name, si.description, si.trust_tier, si.present_on_disk,
             d.distance, s.median, s.rows_read, s.deviation
      FROM d
      JOIN skill_index si
@@ -759,6 +754,10 @@ pub struct NearestSkill {
     pub name: String,
     /// The skill's own "when to use" line.
     pub description: String,
+    /// Where that line's words came from (#1175). It travels because the block
+    /// marks the line with it: a description written outside this machine
+    /// renders into a system message, and it may only render marked.
+    pub trust_tier: TrustTier,
     /// Whether the skill's files were on disk at the last scan of its scope.
     pub present_on_disk: bool,
     /// The cosine distance that ranked it. `None` from the degraded full-text
@@ -784,6 +783,7 @@ pub struct NearestSkills {
 struct SkillNearestRow {
     name: String,
     description: String,
+    trust_tier: String,
     present_on_disk: bool,
     distance: f64,
     median: Option<f64>,
@@ -796,6 +796,7 @@ impl SkillNearestRow {
         NearestSkill {
             name: self.name,
             description: self.description,
+            trust_tier: TrustTier::from_db(&self.trust_tier),
             present_on_disk: self.present_on_disk,
             distance: Some(self.distance),
         }
@@ -817,6 +818,7 @@ impl SkillNearestRow {
 struct SkillTextRow {
     name: String,
     description: String,
+    trust_tier: String,
     present_on_disk: bool,
 }
 
@@ -825,6 +827,7 @@ impl SkillTextRow {
         NearestSkill {
             name: self.name,
             description: self.description,
+            trust_tier: TrustTier::from_db(&self.trust_tier),
             present_on_disk: self.present_on_disk,
             distance: None,
         }
