@@ -716,9 +716,42 @@ nothing of what either source holds.
 
 Before a source can measure its own, the block reads it by a stated estimate,
 which is deliberately narrow. A measurement is refused, and the estimate stands,
-when the sample is under 20 rows, when a value is not a number, or when the
-spread is under two percent of the median - a store of near-identical rows would
-otherwise report almost no spread and put half of itself past any bar.
+when the sample is under 20 rows, when a value is not a number, when the spread
+is under two percent of the median, or when it is over the bar's own reciprocal
+of it. The two spread rules are one rule read from both ends: a store of
+near-identical rows reports almost no spread and would put half of itself past
+any bar, and a source whose spread is wider than `median / bar` puts the bar
+below zero, where a cosine distance never reaches, so it admits nothing at all.
+Neither can separate one row from another, and neither is a calibration.
+
+**A real scratchpad found the second rule** (#1243). Measured against a real pad
+and a real embedding model, a single-task pad probed by text about its own
+subject reported a deviation near a sixth of its median, past the seventh the bar
+allows. Read literally it refused every note including one at distance zero - a
+perfect match - while the same pad probed by unrelated text admitted notes out to
+0.71. The arm surfaced least on exactly the prompts it exists to serve.
+
+The cause is that a dispersion bar needs a population to calibrate against. A
+knowledge store holds many facts about many things, so most rows are unrelated to
+any one prompt, the median sits out among them, and the deviation stays small -
+measured near a twenty-fifth of the median, nowhere near the threshold. One
+conversation's pad holds a handful of notes about a single task, so there is no
+unrelated mass to set a baseline; an on-subject prompt spreads the distances
+rather than separating a few from many, and the more informative the prompt, the
+wider the spread and the higher the bar climbs.
+
+The threshold is the bar's reciprocal rather than a chosen number, so nothing is
+fitted to the pad that found it. The cost is stated rather than hidden: for a
+source refused this way, the estimate decides who renders, and the estimate is a
+fixed distance - the thing this design exists to remove. The same cost is already
+paid by the sample floor and the narrow-spread rule. The invariant holds where it
+means anything, among sources the bar can actually read.
+
+Only pads at or above the 20-row floor measure at all, and most real pads sit
+below it, so this changes nothing for them. `scripts/measure-pad-geometry.sql` is
+the query, with both guards applied; re-run it once several pads cross the floor.
+A population of measured pads whose on-subject spread still crosses the threshold
+would say the pad wants a bar of its own. One pad cannot say that.
 
 **A token budget, and a line budget derived from it.** The whole block is
 allowed 2,560 tokens in the worst case. That is two percent of a

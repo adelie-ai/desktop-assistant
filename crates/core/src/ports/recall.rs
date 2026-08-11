@@ -176,6 +176,29 @@ pub const RECALL_DISPERSION_MIN_ROWS: usize = 20;
 /// models the same way the bar does.
 pub const RECALL_DISPERSION_MIN_RELATIVE_SPREAD: f64 = 0.02;
 
+/// The widest spread a measurement may claim, as a fraction of its own median.
+///
+/// The mirror of [`RECALL_DISPERSION_MIN_RELATIVE_SPREAD`], and refused for the
+/// same reason: a measurement that cannot separate one row from another is not
+/// a calibration. Too narrow a spread admits the whole source; too wide a one
+/// admits nothing at all, including an exact match.
+///
+/// It is the bar's own reciprocal rather than a chosen number. The bar is
+/// stated in deviations, so a source whose deviation exceeds `median / bar` has
+/// `distance_at(bar) <= 0` - and a cosine distance is never negative, so no row
+/// can clear however near it is. A source measured that way has not become
+/// strict, it has become unreadable.
+///
+/// **Measured, not assumed** (#1243). A knowledge store measures a deviation
+/// near a twenty-fifth of its median and never approaches this, so the guard
+/// costs the store nothing. A single-task scratchpad measures near a sixth and
+/// crosses it on about half of on-subject prompts - which is the case that
+/// found this: on such a prompt the pad refused every note including a perfect
+/// match, while an *unrelated* prompt, whose distances group tightly far away,
+/// admitted notes freely. The arm was inverted on exactly the prompts it exists
+/// to serve, and a bar out of reach is what did it.
+pub const RECALL_DISPERSION_MAX_RELATIVE_SPREAD: f64 = 1.0 / crate::recall::RECALL_BAR;
+
 impl RecallDispersion {
     /// A stated estimate, for a source whose own geometry is not known yet.
     ///
@@ -190,16 +213,22 @@ impl RecallDispersion {
     ///
     /// `rows` is how many rows the two statistics were measured over. The
     /// answer is `None` for a sample under [`RECALL_DISPERSION_MIN_ROWS`], for a
-    /// value that is not finite, and for a spread under
-    /// [`RECALL_DISPERSION_MIN_RELATIVE_SPREAD`] of the median. Every one of
-    /// those leaves the caller on its stated estimate, which is the quiet
-    /// answer rather than the loud one.
+    /// value that is not finite, for a spread under
+    /// [`RECALL_DISPERSION_MIN_RELATIVE_SPREAD`] of the median, and for one over
+    /// [`RECALL_DISPERSION_MAX_RELATIVE_SPREAD`] of it. Every one of those
+    /// leaves the caller on its stated estimate, which is the quiet answer
+    /// rather than the loud one.
+    ///
+    /// The two spread guards are one rule read from both ends: a measurement
+    /// that cannot separate one row from another is refused whether it would
+    /// admit everything or nothing.
     pub fn measured(median: f64, deviation: f64, rows: usize) -> Option<Self> {
         if rows < RECALL_DISPERSION_MIN_ROWS
             || !median.is_finite()
             || !deviation.is_finite()
             || median <= 0.0
             || deviation < median * RECALL_DISPERSION_MIN_RELATIVE_SPREAD
+            || deviation > median * RECALL_DISPERSION_MAX_RELATIVE_SPREAD
         {
             return None;
         }
@@ -575,6 +604,98 @@ mod tests {
         // returned, so there is no distance to compare and nothing to drop.
         assert!(RecallRelevance::LexicalMatch.clears_bar(a_source(), 0.0));
         assert!(RecallRelevance::LexicalMatch.clears_bar(a_source(), 1_000.0));
+    }
+
+    /// Both directions of the measured read, against geometry taken from a real
+    /// pad and a real embedding model (#1243).
+    ///
+    /// **This pins the arithmetic, not the pad arm.** It exercises
+    /// [`RecallDispersion`] and [`RecallRelevance::clears_bar`] on fixed values,
+    /// so it stays green if the pad arm stops consulting its own measurement
+    /// altogether - `a_note_is_read_against_the_pads_own_dispersion` in
+    /// `crate::recall` is the test that fails for that. The two cover the
+    /// property together and neither covers it alone.
+    ///
+    /// The estimate is a bar in a fixed place, so it does two wrong things
+    /// rather than one: it admits freely when the prompt lands near the pad,
+    /// and it admits nothing at all when the pad sits beyond 0.31 however
+    /// clearly one note stands out. Naming only the first half would let a
+    /// later change turn the pad arm into a one-way filter and still pass.
+    #[test]
+    fn a_measured_pad_admits_where_the_estimate_is_dark_and_refuses_where_it_floods() {
+        let rows = RECALL_DISPERSION_MIN_ROWS;
+        let estimate = crate::recall::RECALL_ASSUMED_DISPERSION;
+        let bar = crate::recall::RECALL_BAR;
+
+        // A source the bar can read, whose spread is wide enough that a
+        // distance inside the estimate's fixed 0.31 is nothing special.
+        let spread = RecallDispersion::measured(0.50, 0.07, rows)
+            .expect("a seventh of the median is inside the band a measurement may claim");
+        let near = RecallRelevance::Distance(0.30);
+        assert!(
+            near.clears_bar(estimate, bar),
+            "0.30 sits inside the estimate's fixed 0.31, so the estimate floods"
+        );
+        assert!(
+            !near.clears_bar(spread, bar),
+            "the measurement refuses it: against this source 0.30 is an ordinary row"
+        );
+
+        // The geometry a real pad measured on an unrelated prompt: every
+        // distance far away and tightly grouped, so the estimate admits nothing
+        // at all while the measurement can still name what stands out.
+        let tight = RecallDispersion::measured(0.901, 0.028, rows)
+            .expect("a thirtieth of the median clears the degenerate-spread floor");
+        let far = RecallRelevance::Distance(0.70);
+        assert!(
+            !far.clears_bar(estimate, bar),
+            "0.70 is past the estimate's fixed 0.31, so the estimate is dark"
+        );
+        assert!(
+            far.clears_bar(tight, bar),
+            "the measurement admits it: it stands out from a source that is \
+             otherwise uniformly further away"
+        );
+    }
+
+    /// The two spread guards are one rule read from both ends (#1243).
+    ///
+    /// A spread too narrow admits the whole source; a spread too wide admits
+    /// nothing at all, including a distance of zero. Neither can separate one
+    /// row from another, so neither is a calibration, and both leave the caller
+    /// on its stated estimate.
+    #[test]
+    fn a_spread_too_wide_to_admit_anything_is_refused_like_one_too_narrow() {
+        let rows = RECALL_DISPERSION_MIN_ROWS;
+        let bar = crate::recall::RECALL_BAR;
+
+        // The geometry a real scratchpad measured on a prompt about its own
+        // subject. Read literally it puts the bar below zero, so a note at
+        // distance zero - a perfect match to the prompt - could not clear it.
+        let unreadable = RecallDispersion::assumed(0.776, 0.125);
+        assert!(
+            unreadable.distance_at(bar) < 0.0,
+            "the fixture must be a geometry that admits nothing, or this test \
+             is not exercising the case it is named for"
+        );
+        assert!(
+            !RecallRelevance::Distance(0.0).clears_bar(unreadable, bar),
+            "read literally, not even an exact match clears it"
+        );
+        assert_eq!(
+            RecallDispersion::measured(0.776, 0.125, rows),
+            None,
+            "so the measurement is refused rather than applied"
+        );
+
+        // Either side of the threshold, which is the bar's own reciprocal.
+        let median = 0.80;
+        let widest = median * RECALL_DISPERSION_MAX_RELATIVE_SPREAD;
+        assert!(RecallDispersion::measured(median, widest, rows).is_some());
+        assert_eq!(
+            RecallDispersion::measured(median, widest * 1.01, rows),
+            None
+        );
     }
 
     #[test]

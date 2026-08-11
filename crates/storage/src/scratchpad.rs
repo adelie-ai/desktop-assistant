@@ -694,10 +694,70 @@ impl PgScratchpadStore {
     ///
     /// It does mean a real behaviour change the moment a pad is large enough to
     /// measure: before this the pad was always read by the stated estimate, so
-    /// it rendered whatever sat inside 0.31 of cosine distance. A pad that
-    /// measures wide now renders nothing where it used to render lines. #1243
-    /// is where a real pad's geometry is measured against a real embedding
-    /// model, because nothing here knows whether real pads are wide.
+    /// it rendered whatever sat inside 0.31 of cosine distance.
+    ///
+    /// **Measured against a real pad and a real embedding model** (#1243,
+    /// `amazon.titan-embed-text-v2:0`), and the measurement found the arm
+    /// inverted rather than merely narrowed.
+    ///
+    /// **One pad, not several.** #1243 asked for a measurement over more than
+    /// one real conversation and that was not met. Eight pads were probed and
+    /// exactly one reached [`RECALL_DISPERSION_MIN_ROWS`]; the rest never
+    /// measure, so they read as they did before - identically, not
+    /// approximately. Every figure here is that one pad, over 31 probes.
+    ///
+    /// Read against its own spread, that pad measured:
+    ///
+    /// | probed by | deviation / median | renders |
+    /// |---|---|---|
+    /// | its own subject | about a sixth | 23 of 31 probes render nothing |
+    /// | unrelated text | about a thirtieth | admits notes out to 0.71 |
+    ///
+    /// The second row is the arm working. The first is the arm **backwards**:
+    /// the bar is stated in deviations, so a deviation past a seventh of the
+    /// median puts `distance_at(bar)` below zero, and a cosine distance never
+    /// is. On such a prompt the pad refused every note *including one at
+    /// distance zero* - a perfect match - while a prompt about something else
+    /// admitted notes freely. The arm surfaced least on exactly the prompts it
+    /// exists to serve.
+    ///
+    /// **Why the pad meets this and the store does not.** A dispersion bar
+    /// needs a population to calibrate against. A knowledge store holds many
+    /// facts about many things, so most rows are unrelated to any one prompt,
+    /// the median sits out among them and the deviation stays small - measured
+    /// near a twenty-fifth of the median, nowhere near the threshold. One
+    /// conversation's pad holds a handful of notes about a single task. There
+    /// is no unrelated mass to set a baseline, so an on-subject prompt spreads
+    /// the distances instead of separating a few from many, and the more
+    /// informative the prompt the wider the spread and the higher the bar
+    /// climbs.
+    ///
+    /// **The fix is a guard, not a pad-specific bar.**
+    /// [`RECALL_DISPERSION_MAX_RELATIVE_SPREAD`] refuses a measurement whose
+    /// spread is too wide to admit anything, exactly as
+    /// `RECALL_DISPERSION_MIN_RELATIVE_SPREAD` already refuses one too narrow
+    /// to refuse anything. Both say the same thing: a measurement that cannot
+    /// separate one row from another is not a calibration, and the caller falls
+    /// back to its stated estimate. The threshold is the bar's own reciprocal
+    /// rather than a chosen number, so nothing here is fitted to the pad that
+    /// found it - the pad is corroboration, and the argument stands without it.
+    ///
+    /// **What it costs, stated plainly.** For a source refused this way the
+    /// estimate decides who renders, which is a fixed distance - the thing
+    /// `no_raw_cosine_constant_decides_whether_the_block_renders` (#1121) exists
+    /// to keep out of the mechanism. That cost is already paid by the sample
+    /// floor and by the narrow-spread guard, and it buys back an arm that
+    /// answers on-subject prompts. The invariant holds where it means anything:
+    /// among sources the bar can actually read.
+    ///
+    /// Re-measure with `scripts/measure-pad-geometry.sql` once several pads sit
+    /// above [`RECALL_DISPERSION_MIN_ROWS`]. A population of measured pads whose
+    /// on-subject spread still crosses the threshold would say the pad wants its
+    /// own bar after all; one pad cannot say that, which is why it is not
+    /// claimed here.
+    ///
+    /// [`RECALL_DISPERSION_MIN_ROWS`]: desktop_assistant_core::ports::recall::RECALL_DISPERSION_MIN_ROWS
+    /// [`RECALL_DISPERSION_MAX_RELATIVE_SPREAD`]: desktop_assistant_core::ports::recall::RECALL_DISPERSION_MAX_RELATIVE_SPREAD
     ///
     /// Scoped by an explicit `WHERE user_id` **and** `conversation_id`
     /// predicate, plus the caller's `owner_todo` read snapshot - the same three
