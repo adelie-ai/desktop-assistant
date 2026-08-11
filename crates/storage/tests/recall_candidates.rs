@@ -1280,10 +1280,13 @@ async fn the_pad_measures_the_dispersion_of_its_own_distances() {
         // Deliberately not an assertion that the arm renders. This fixture is
         // spread far wider in angle than one conversation's notes are, so what
         // it proves is that the pad states its own geometry - not that a note
-        // clears the bar under it. `RECALL_DISPERSION_MAX_RELATIVE_SPREAD` is
-        // what keeps a spread this wide from silencing the arm, and
-        // `a_source_at_the_widest_readable_spread_can_still_clear_the_bar`
-        // is where that is checked.
+        // clears the bar under it. `admission_dispersion` in the core is what
+        // keeps a spread this wide from silencing the arm - it reads the bar
+        // against the stated estimate wherever a source's own measurement could
+        // admit nothing - and
+        // `a_spread_too_wide_to_reach_the_bar_admits_by_the_estimate_and_ranks_by_itself`
+        // is where that is checked, together with the half that matters just as
+        // much: the ranking still uses this measurement, at its own width.
     })
     .await;
 

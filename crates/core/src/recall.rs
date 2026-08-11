@@ -668,7 +668,10 @@ fn render_recall_with_width(
     let above_bar: Vec<&RecallEntry> = candidates
         .entries
         .iter()
-        .filter(|hit| hit.relevance.clears_bar(entry_dispersion, RECALL_BAR))
+        .filter(|hit| {
+            hit.relevance
+                .clears_bar(admission_dispersion(entry_dispersion), RECALL_BAR)
+        })
         .collect();
 
     // Whether the count below is a lower bound is decided here, on the bar
@@ -746,7 +749,10 @@ fn render_recall_with_width(
     let notes_above_bar: Vec<&RecallNote> = candidates
         .notes
         .iter()
-        .filter(|note| note.relevance.clears_bar(note_dispersion, RECALL_BAR))
+        .filter(|note| {
+            note.relevance
+                .clears_bar(admission_dispersion(note_dispersion), RECALL_BAR)
+        })
         .collect();
     let notes_capped = candidates.notes.len() >= surface.note_scan_limit
         && notes_above_bar.len() == candidates.notes.len();
@@ -788,7 +794,11 @@ fn render_recall_with_width(
     let skills_above_bar: Vec<&RecallSkill> = candidates
         .skills
         .iter()
-        .filter(|skill| skill.relevance.clears_bar(skill_dispersion, RECALL_BAR))
+        .filter(|skill| {
+            skill
+                .relevance
+                .clears_bar(admission_dispersion(skill_dispersion), RECALL_BAR)
+        })
         .collect();
     let skills_capped = candidates.skills.len() >= surface.skill_scan_limit
         && skills_above_bar.len() == candidates.skills.len();
@@ -947,6 +957,40 @@ fn render_recall_with_width(
 /// [`Activatable::situation_coverage`] and the term contributes zero, which is
 /// how it ranked before the cue existed. `situation` is the arm's own cue,
 /// never another's, on the same terms as `dispersion`.
+/// The dispersion to read [`RECALL_BAR`] against: a source's own measurement
+/// wherever it can admit anything, and the stated estimate where it cannot.
+///
+/// The bar is stated in deviations, so a source whose deviation passes
+/// `median / RECALL_BAR` has `distance_at(RECALL_BAR)` at or below zero - and a
+/// cosine distance never is. Such a source admits nothing at all, *including a
+/// row at distance zero*, which is a perfect match to the prompt. A real
+/// single-task scratchpad measures that way on about half of the prompts about
+/// its own subject, so the pad answered least on exactly the prompts it exists
+/// to serve, while an unrelated prompt - whose distances group tightly far away
+/// - admitted notes freely (#1243).
+///
+/// **This is the admission half only, and the split is the point.**
+/// [`RecallDispersion`] answers two questions. Admission needs a scale that can
+/// reach something. Ranking needs only an order, and
+/// `deviations_below_median` is monotonic in distance at any width, so a wide
+/// spread ranks correctly. An earlier fix refused the wide measurement in
+/// `RecallDispersion::measured` itself, which fixed admission and broke
+/// ranking: every caller fell back to the estimate's median as well, the
+/// semantic term was distorted against the lexical one, and a row a query named
+/// exactly sank below its fillers. So the width rule lives here, where the bar
+/// is read, and the measurement reaches the ranking untouched.
+///
+/// Nothing is fitted to the pad that found this: the threshold is the bar's own
+/// reciprocal. A knowledge store measures a deviation near a twenty-fifth of its
+/// median and never approaches it.
+fn admission_dispersion(measured: RecallDispersion) -> RecallDispersion {
+    if measured.distance_at(RECALL_BAR) > 0.0 {
+        measured
+    } else {
+        RECALL_ASSUMED_DISPERSION
+    }
+}
+
 fn rank_by_activation<'a, T: Activatable>(
     showable: Vec<(&'a T, String)>,
     dispersion: RecallDispersion,
@@ -1610,11 +1654,11 @@ mod tests {
     fn no_raw_cosine_constant_decides_whether_the_block_renders() {
         let distance = 0.45;
         let tight = RecallDispersion::measured(0.80, 0.05, 400).expect("a store's statistics");
-        // Loose, but still inside the band a measurement may claim: a deviation
-        // past `RECALL_DISPERSION_MAX_RELATIVE_SPREAD` of the median is refused
-        // outright and falls back to the estimate, which would test the
+        // Loose, but still a spread the bar can reach: a deviation past
+        // `median / RECALL_BAR` puts the bar below zero, and `admission_dispersion`
+        // then reads that source against the estimate - which would test the
         // estimate rather than the bar. The property here is about two sources
-        // the bar can actually read, so both fixtures are measurable ones.
+        // the bar can actually read, so both fixtures are readable ones.
         let loose = RecallDispersion::measured(0.80, 0.11, 400).expect("a store's statistics");
 
         let against = |source| RecallCandidates {
@@ -4902,6 +4946,56 @@ mod tests {
                 RECALL_SKILL_PROVENANCE_MARKER_MAX_BYTES
             );
         }
+    }
+
+    /// A spread too wide to reach the bar is read against the estimate for
+    /// admission, and still ranks by its own geometry (#1243, #1245).
+    ///
+    /// The two halves are tested together on purpose. An earlier fix refused
+    /// the wide measurement outright, which fixed the first half and broke the
+    /// second: ranking fell back to the estimate's median too, and a row a
+    /// query named exactly sank below its fillers. A test naming only the
+    /// admission half would have passed while that happened.
+    #[test]
+    fn a_spread_too_wide_to_reach_the_bar_admits_by_the_estimate_and_ranks_by_itself() {
+        // A real pad's on-subject geometry: a deviation past a seventh of the
+        // median, so the bar sits below zero and nothing could clear it.
+        let unreadable = RecallDispersion::assumed(0.776, 0.125);
+        assert!(
+            unreadable.distance_at(RECALL_BAR) < 0.0,
+            "the fixture must put the bar out of reach, or this test is not \
+             exercising the case it is named for"
+        );
+
+        // Admission falls back, so a note nearer than the estimate's own cutoff
+        // renders where it would otherwise have been refused with everything else.
+        assert_eq!(
+            admission_dispersion(unreadable),
+            RECALL_ASSUMED_DISPERSION,
+            "a scale that can admit nothing is not the scale to admit against"
+        );
+        let candidates = RecallCandidates {
+            notes: vec![note("finding", "the pool leaks connections", 0.30)],
+            note_dispersion: Some(unreadable),
+            ..RecallCandidates::default()
+        };
+        assert!(
+            render(&candidates).is_some(),
+            "a note the estimate admits must still render when the pad's own \
+             measurement could admit nothing at all"
+        );
+
+        // Ranking keeps the source's own geometry, which orders correctly at
+        // any width - this is what the earlier fix destroyed.
+        assert!(
+            unreadable.deviations_below_median(0.30) > unreadable.deviations_below_median(0.40),
+            "the nearer row must score higher against the measurement itself"
+        );
+        assert!(
+            admission_dispersion(RecallDispersion::assumed(0.80, 0.05))
+                == RecallDispersion::assumed(0.80, 0.05),
+            "a source that can reach the bar is admitted against its own spread"
+        );
     }
 
     /// A catalog the size real ones actually are answers with no cue at all,

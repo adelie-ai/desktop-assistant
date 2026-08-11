@@ -732,15 +732,23 @@ impl PgScratchpadStore {
     /// informative the prompt the wider the spread and the higher the bar
     /// climbs.
     ///
-    /// **The fix is a guard, not a pad-specific bar.**
-    /// [`RECALL_DISPERSION_MAX_RELATIVE_SPREAD`] refuses a measurement whose
-    /// spread is too wide to admit anything, exactly as
-    /// `RECALL_DISPERSION_MIN_RELATIVE_SPREAD` already refuses one too narrow
-    /// to refuse anything. Both say the same thing: a measurement that cannot
-    /// separate one row from another is not a calibration, and the caller falls
-    /// back to its stated estimate. The threshold is the bar's own reciprocal
-    /// rather than a chosen number, so nothing here is fitted to the pad that
-    /// found it - the pad is corroboration, and the argument stands without it.
+    /// **The fix is a guard on admission, not a pad-specific bar.**
+    /// `desktop_assistant_core::recall::admission_dispersion` reads the bar
+    /// against the stated estimate wherever a source's own measurement could
+    /// admit nothing - `distance_at(bar)` at or below zero - and against the
+    /// source's own spread everywhere else. The threshold is the bar's own
+    /// reciprocal rather than a chosen number, so nothing here is fitted to the
+    /// pad that found it; the pad is corroboration and the argument stands
+    /// without it.
+    ///
+    /// **It guards admission only, and that distinction was learned the hard
+    /// way** (#1245's regression). The first attempt refused the wide
+    /// measurement in `RecallDispersion::measured` itself. That fixed the pad
+    /// and broke ranking everywhere: a refused measurement sends the caller to
+    /// the estimate's median as well, which distorted the semantic term against
+    /// the lexical one until a row a query named exactly sank below its
+    /// fillers. Ranking wants the source's own geometry at any width, because
+    /// the order it produces is right whatever the scale.
     ///
     /// **What it costs, stated plainly.** For a source refused this way the
     /// estimate decides who renders, which is a fixed distance - the thing
@@ -757,7 +765,6 @@ impl PgScratchpadStore {
     /// claimed here.
     ///
     /// [`RECALL_DISPERSION_MIN_ROWS`]: desktop_assistant_core::ports::recall::RECALL_DISPERSION_MIN_ROWS
-    /// [`RECALL_DISPERSION_MAX_RELATIVE_SPREAD`]: desktop_assistant_core::ports::recall::RECALL_DISPERSION_MAX_RELATIVE_SPREAD
     ///
     /// Scoped by an explicit `WHERE user_id` **and** `conversation_id`
     /// predicate, plus the caller's `owner_todo` read snapshot - the same three
