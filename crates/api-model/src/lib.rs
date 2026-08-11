@@ -1345,6 +1345,15 @@ pub struct SkillView {
     /// meaningless while `approved` is `false`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approved_by: Option<String>,
+    /// The knowledge entry this skill was proposed from (#1175), where it was
+    /// proposed rather than written.
+    ///
+    /// The sweep that finds a procedure stored as a fact writes the skill and
+    /// leaves the entry alone, so this is the other half of the split: it says
+    /// which entry a person may want to retire once they approve this. Absent
+    /// on every skill that did not come from one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposed_from_entry_id: Option<String>,
     /// The skill's frontmatter tags.
     #[serde(default)]
     pub tags: Vec<String>,

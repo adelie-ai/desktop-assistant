@@ -482,7 +482,7 @@ fn build_extraction_system_prompt(registry: &[TagRecord]) -> String {
     // Methods go to the skill catalog, not the fact list (#1155). Stated before
     // the tag registry, because the first question is WHICH store this belongs
     // in and the tags only matter once the answer is "a fact".
-    prompt.push_str(skills::SKILL_ROUTING_PROMPT);
+    prompt.push_str(&skills::skill_routing_prompt());
     prompt.push_str(
         "## Tag registry\n\
         \n",

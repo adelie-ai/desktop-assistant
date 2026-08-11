@@ -341,6 +341,11 @@ can see: the host-global ones plus their own.
 ]}
 ```
 
+A row carrying `proposed_from_entry_id` was not written by the assistant from
+its own work: it was **proposed** from a knowledge entry that turned out to be a
+procedure. The entry is untouched, so that field is the other half of the split
+- it names the entry a person may want to retire once they approve the skill.
+
 An unapproved skill is **listed**, with `approved: false`. That is the point of
 the command: silence would be indistinguishable from a library with nothing in
 it, and a skill nobody can see is a skill nobody will ever approve. `approved_at`

@@ -50,14 +50,19 @@ pub(crate) use desktop_assistant_core::skill_promotion::EXTRACTED_SOURCE;
 /// Kept beside the code that parses the answer, because the two are one
 /// contract: a change to the shape asked for here is a change to
 /// [`parse_extracted_skills`].
+///
+/// The rule itself is not written here. `{RULE}` is replaced by
+/// [`METHOD_IS_NOT_A_FACT`](desktop_assistant_core::skill_promotion::METHOD_IS_NOT_A_FACT)
+/// in [`skill_routing_prompt`], because three paths write knowledge entries and
+/// three wordings of one rule drift. What stays here is the shape of the
+/// answer, which is this path's alone.
 pub(crate) const SKILL_ROUTING_PROMPT: &str = "\
         ## A method is not a fact\n\
         \n\
-        Knowledge records what is TRUE. A skill records HOW TO DO something. \
-        When what you found is a method - ordered steps, a repeatable how-to - \
-        return it in a `skills` array INSTEAD of writing it as a fact. A method \
-        filed as a fact reads badly, competes with real facts for attention, \
-        and cannot be followed by anything.\n\
+        {RULE}\n\
+        \n\
+        When what you found is a method, return it in a `skills` array INSTEAD \
+        of writing it as a fact.\n\
         \n\
         Each skill has:\n\
         - `name` (string): a short kebab-case name, e.g. `weekly-status-report`.\n\
@@ -68,14 +73,20 @@ pub(crate) const SKILL_ROUTING_PROMPT: &str = "\
         produces, or how you know it worked).\n\
         - `tags` (array of strings, optional).\n\
         \n\
-        A skill's PREFERENCES stay knowledge. Put the method in the skill; put \
-        which sources to use, in what order, what to skip, and what \"done\" \
-        looks like for this person in `facts`. Those change independently of \
-        the method, and they are exactly what a fact is for.\n\
+        Put the method in the skill and its preferences in `facts`: those \
+        change independently of the method.\n\
         \n\
         Return `{\"skills\": []}` when you found no method. A skill written \
         this way is UNAPPROVED and is not followed until a person approves it.\n\
         \n";
+
+/// [`SKILL_ROUTING_PROMPT`] with the shared rule spent into it.
+pub(crate) fn skill_routing_prompt() -> String {
+    SKILL_ROUTING_PROMPT.replace(
+        "{RULE}",
+        desktop_assistant_core::skill_promotion::METHOD_IS_NOT_A_FACT,
+    )
+}
 
 /// One method as proposed by the extraction model, before validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,7 +114,7 @@ pub(crate) fn parse_extracted_skills(root: &serde_json::Value) -> Vec<ExtractedS
     items.iter().filter_map(parse_one_skill).collect()
 }
 
-fn parse_one_skill(value: &serde_json::Value) -> Option<ExtractedSkill> {
+pub(crate) fn parse_one_skill(value: &serde_json::Value) -> Option<ExtractedSkill> {
     let name = value.get("name")?.as_str()?.trim();
     let description = value.get("description")?.as_str()?.trim();
     if name.is_empty() || description.is_empty() {
@@ -240,19 +251,42 @@ pub(crate) async fn write_extracted_skills(
     if proposals.is_empty() {
         return Ok(0);
     }
+    let mut skills = Vec::with_capacity(proposals.len());
+    for proposed in proposals {
+        match to_indexed_skill(proposed) {
+            Some(skill) => skills.push(skill),
+            None => tracing::debug!(
+                name = %proposed.name,
+                steps = proposed.steps.len(),
+                "dreaming: extracted method did not clear the skill bar"
+            ),
+        }
+    }
+    write_proposed_skills(pool, &skills).await
+}
+
+/// Write each of `skills` as an unapproved proposal, skipping any name that is
+/// not the assistant's own unadopted draft, and report how many landed.
+///
+/// The guarded half of [`write_extracted_skills`], shared with the mis-filed
+/// sweep (#1175) so both proposal paths keep one rule about what they may
+/// overwrite. `is_own_draft` is the same rule the interactive promotion tool
+/// applies, and it has to be the same rule here: `write_authored` replaces the
+/// body, relabels the provenance and marks the row absent from disk, so
+/// pointing it at a skill a person approved, placed in a skill root, or
+/// installed from elsewhere would destroy their work.
+pub(crate) async fn write_proposed_skills(
+    pool: &PgPool,
+    skills: &[IndexedSkill],
+) -> Result<usize, CoreError> {
+    if skills.is_empty() {
+        return Ok(0);
+    }
     let store = PgSkillIndexStore::new(pool.clone());
     let now = Utc::now();
     let mut written = 0usize;
 
-    for proposed in proposals {
-        let Some(skill) = to_indexed_skill(proposed) else {
-            tracing::debug!(
-                name = %proposed.name,
-                steps = proposed.steps.len(),
-                "dreaming: extracted method did not clear the skill bar"
-            );
-            continue;
-        };
+    for skill in skills {
         match store.get(&skill.name, skill.owner_user_id.as_deref()).await {
             Ok(Some(existing)) if !is_own_draft(&existing) => {
                 tracing::info!(
@@ -269,13 +303,13 @@ pub(crate) async fn write_extracted_skills(
                 continue;
             }
         }
-        match store.write_authored(&skill, now).await {
+        match store.write_authored(skill, now).await {
             Ok(()) => {
                 written += 1;
                 tracing::info!(
                     skill = %skill.name,
-                    steps = proposed.steps.len(),
-                    "dreaming: recorded an extracted method as an unapproved skill"
+                    source = skill.source.as_deref().unwrap_or("(none)"),
+                    "dreaming: recorded a proposed method as an unapproved skill"
                 );
             }
             Err(e) => {

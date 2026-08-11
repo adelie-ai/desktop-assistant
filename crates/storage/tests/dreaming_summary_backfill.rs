@@ -105,6 +105,18 @@ fn recorded(prompts: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
     prompts.lock().expect("prompt log is not poisoned").clone()
 }
 
+/// The subset of those prompts the summary pass asked.
+///
+/// One cycle runs several passes that call the model, so a log of every prompt
+/// is not a log of this pass's spend. The mis-filed-procedure sweep (#1175)
+/// reads knowledge entries too, and heads its user prompt with its own title.
+fn summary_prompts(prompts: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+    recorded(prompts)
+        .into_iter()
+        .filter(|p| !p.starts_with("# Entries to audit"))
+        .collect()
+}
+
 /// A dreaming LLM that answers every entry by echoing the body it was shown, so
 /// a test asserts the seeded content back and a line written for the wrong entry
 /// is visible as such.
@@ -333,11 +345,8 @@ async fn dream_summary_pass_leaves_an_existing_summary_alone() {
         "a summary that still describes the content is not rewritten"
     );
     assert!(
-        prompts
-            .lock()
-            .expect("prompt log is not poisoned")
-            .is_empty(),
-        "a store with nothing to summarise must not spend a model call"
+        summary_prompts(&prompts).is_empty(),
+        "a store with nothing to summarise must not spend a summary call"
     );
 
     fx.cleanup().await;
@@ -706,7 +715,7 @@ async fn dream_summary_pass_asks_for_a_batch_of_entries_in_one_call() {
     let prompts = Arc::new(Mutex::new(Vec::new()));
     run_cycle(pool, &llm_summarising_everything(prompts.clone())).await;
 
-    let calls = recorded(&prompts);
+    let calls = summary_prompts(&prompts);
     assert!(
         calls.len() < 8,
         "8 entries must not cost 8 model calls, made {}",
@@ -951,7 +960,7 @@ async fn dream_summary_pass_gives_the_model_the_entry_tags() {
     let prompts = Arc::new(Mutex::new(Vec::new()));
     run_cycle(pool, &llm_summarising_everything(prompts.clone())).await;
 
-    let calls = recorded(&prompts);
+    let calls = summary_prompts(&prompts);
     let asked = calls.first().expect("the pass asked the model once");
     assert!(
         asked.contains("preference") && asked.contains("project:adelie-ai"),

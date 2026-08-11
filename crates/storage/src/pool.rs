@@ -234,6 +234,9 @@ const MIGRATIONS: &[Migration] = &[
     // built can reach the procedural arm #1154 shipped without it. The same
     // shape as 047's, keyed on the catalog name rather than an entry id.
     migration!("051_skill_situation.sql"),
+    // #1175: what the mis-filed-procedure sweep has already judged, so a store
+    // is read once per entry per edit rather than once per entry per night.
+    migration!("052_knowledge_procedure_sweep.sql"),
 ];
 
 /// Second half of the advisory-lock key: the schema the migrations write to.

@@ -1615,6 +1615,14 @@ fn skill_to_view(skill: &desktop_assistant_core::domain::IndexedSkill) -> api::S
         approved: skill.is_approved(),
         approved_at: skill.approved_at.map(|at| at.to_rfc3339()),
         approved_by: skill.approved_by.clone(),
+        // Read off the row the mis-filed sweep wrote (#1175). A metadata key
+        // rather than a column, because it describes how one proposal came to
+        // exist rather than anything the catalog is keyed or searched on.
+        proposed_from_entry_id: skill
+            .metadata
+            .get("from_entry")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
         tags: skill.tags.clone(),
     }
 }

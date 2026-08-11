@@ -679,7 +679,15 @@ impl BuiltinToolService {
         let mut defs = vec![
             ToolDefinition::new(
                 TOOL_KB_WRITE,
-                "Write or update knowledge base entries. Use for storing preferences, facts, \
+                // The rule that says what is NOT a knowledge entry, stated once
+                // in the domain and spent by every path that writes one
+                // (#1175). This is the path a person's own turn goes through,
+                // so it is the one that files a routine as a fact while
+                // somebody is watching.
+                format!(
+                    "{}\n\n{}",
+                    desktop_assistant_core::skill_promotion::METHOD_IS_NOT_A_FACT,
+                    "Write or update knowledge base entries. Use for storing preferences, facts, \
                  instructions, project context, or any durable information the user wants remembered. \
                  Content should be self-contained prose that describes both the context (when/why \
                  this information is useful) and the information itself. Provide either a single \
@@ -701,7 +709,8 @@ impl BuiltinToolService {
                  description is what the check compares. When the response carries \
                  `tag_check: \"UNKNOWN\"`, at least one tag on that write was stored without \
                  being checked, so treat those tags as your own wording and not as established \
-                 vocabulary.",
+                 vocabulary."
+                ),
                 serde_json::json!({
                     "type": "object",
                     "properties": {

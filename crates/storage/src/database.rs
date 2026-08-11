@@ -129,6 +129,10 @@ const PERSONAL_DATA_TABLES: &[&str] = &[
     // name and the hours somebody works are personal data in their own right,
     // on the same terms as `knowledge_situation`.
     "skill_situation",
+    // 052 - which of one person's entries the mis-filed-procedure sweep has
+    // read, and what it proposed. It names this person's entries and nothing
+    // else, which is as personal as the entries themselves.
+    "knowledge_procedure_sweep",
     // 049 - negative memory. What one person's assistant tried, how it failed,
     // and the host and hours it failed in. As personal as the work it was
     // doing, before any of the work itself is read.
