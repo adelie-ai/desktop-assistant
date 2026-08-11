@@ -56,6 +56,31 @@ impl ToolLocality {
     pub fn is_client(&self) -> bool {
         matches!(self, Self::Client { .. })
     }
+
+    /// The stable token that names this host wherever the model reads or
+    /// writes one: the `runs_on` value of a tool-search hit, and the `__host`
+    /// argument of a capability that more than one host offers (#1216).
+    ///
+    /// Why a token and not the label: a host is renamed, and a tool's identity
+    /// is the pair (capability name, host), so the half of the key the model
+    /// writes must not move when the name of a machine does. The spellings are
+    /// [`ToolRunner`]'s, so the model answers in the vocabulary a search result
+    /// taught it.
+    pub fn host_token(&self) -> &'static str {
+        match self {
+            Self::Server { .. } => ToolRunner::Daemon.as_str(),
+            Self::Client { .. } => ToolRunner::Device.as_str(),
+        }
+    }
+
+    /// The human-readable name of this host, for a person or a prompt to read.
+    /// Empty when the client reported none; each renderer phrases that itself.
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Server { host } => host,
+            Self::Client { label, .. } => label,
+        }
+    }
 }
 
 /// What a tool acts on, as tool discovery reports it to the model (issue

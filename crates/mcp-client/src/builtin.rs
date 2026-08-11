@@ -8711,6 +8711,77 @@ mod tests {
         );
     }
 
+    /// #1216 AC3: a hit carries the host it runs on, by name. A model asked to
+    /// read a file "on the laptop" cannot pick from a result that names no
+    /// machine, and `runs_on` alone does not name one.
+    #[tokio::test]
+    async fn tool_search_result_names_the_host_of_each_hit() {
+        use desktop_assistant_core::ports::transport::with_client_label;
+        use std::collections::HashMap;
+
+        let service = BuiltinToolService::new()
+            .with_tool_registry(
+                fixed_search(vec![ToolDefinition::new(
+                    "fileio__read_file",
+                    "Read a file from disk",
+                    serde_json::json!({}),
+                )]),
+                noop_definition_fn(),
+            )
+            .with_topology("daemon-host", false);
+        let json = with_client_label(
+            Some("laptop".to_string()),
+            search_with_client_tools(
+                &service,
+                "read a file",
+                vec![ToolDefinition::new(
+                    "device__read_file",
+                    "Read a file on the user's own computer",
+                    serde_json::json!({}),
+                )],
+            ),
+        )
+        .await;
+        let hosts: HashMap<&str, &str> = json["tools"]
+            .as_array()
+            .expect("hits")
+            .iter()
+            .map(|t| {
+                (
+                    t["name"].as_str().expect("a name"),
+                    t["host"].as_str().unwrap_or("<no host>"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            hosts["fileio__read_file"], "daemon-host",
+            "a daemon hit names the daemon's machine: {json}"
+        );
+        assert_eq!(
+            hosts["device__read_file"], "laptop",
+            "a device hit names the client's machine: {json}"
+        );
+    }
+
+    /// A client that reported no host label still leaves every hit with a host
+    /// a person can read, rather than an empty string.
+    #[tokio::test]
+    async fn a_device_hit_from_an_unlabelled_client_still_names_a_host() {
+        let service = BuiltinToolService::new()
+            .with_tool_registry(fixed_search(Vec::new()), noop_definition_fn());
+        let json = search_with_client_tools(
+            &service,
+            "read a file",
+            vec![ToolDefinition::new(
+                "device__read_file",
+                "Read a file on the user's own computer",
+                serde_json::json!({}),
+            )],
+        )
+        .await;
+        assert_eq!(json["tools"][0]["host"], "your device");
+    }
+
     #[tokio::test]
     async fn client_tools_match_the_query_and_join_the_results() {
         // The registry hit and the client tool answer the same need on two

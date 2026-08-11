@@ -5059,6 +5059,10 @@ mod tests {
         responses: Mutex<Vec<LlmResponse>>,
         /// Every prompt the handler assembled, in order.
         seen: Arc<Mutex<Vec<Vec<Message>>>>,
+        /// Every advertised tool set the handler assembled, in order. What the
+        /// model was *shown* is a different question from what it was told
+        /// (#1216), and the only place the two can disagree is here.
+        advertised: Arc<Mutex<Vec<Vec<ToolDefinition>>>>,
     }
 
     impl ToolCallingLlm {
@@ -5066,7 +5070,14 @@ mod tests {
             Self {
                 responses: Mutex::new(responses),
                 seen: Arc::new(Mutex::new(Vec::new())),
+                advertised: Arc::new(Mutex::new(Vec::new())),
             }
+        }
+
+        /// Handle on the recorded tool sets, taken before the handler takes
+        /// ownership.
+        fn advertised(&self) -> Arc<Mutex<Vec<Vec<ToolDefinition>>>> {
+            Arc::clone(&self.advertised)
         }
 
         /// Handle on the recorded prompts, taken before the handler takes
@@ -5082,11 +5093,12 @@ mod tests {
         async fn stream_completion(
             &self,
             messages: Vec<Message>,
-            _tools: &[ToolDefinition],
+            tools: &[ToolDefinition],
             _reasoning: ReasoningConfig,
             mut on_chunk: ChunkCallback,
         ) -> Result<LlmResponse, CoreError> {
             self.seen.lock().unwrap().push(messages);
+            self.advertised.lock().unwrap().push(tools.to_vec());
             let response = {
                 let mut responses = self.responses.lock().unwrap();
                 if responses.is_empty() {
@@ -10822,6 +10834,376 @@ mod tests {
         let out = with_tool_observer(sink, fut).await;
         let captured = events.lock().unwrap().clone();
         (out, captured)
+    }
+
+    // --- #1216: a tool's identity is the pair (capability name, host) ---
+
+    /// A server-side executor that records what it ran and with what arguments.
+    ///
+    /// `core` is advertised every round. `registry` is reachable only through a
+    /// tool search, which is where a device hit and a daemon hit of one name
+    /// meet.
+    struct RecordingToolExecutor {
+        core: Vec<ToolDefinition>,
+        registry: Vec<ToolDefinition>,
+        results: HashMap<String, String>,
+        executed: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+    }
+
+    impl ToolExecutor for RecordingToolExecutor {
+        async fn core_tools(&self) -> Vec<ToolDefinition> {
+            self.core.clone()
+        }
+
+        async fn search_tools(&self, _query: &str) -> Result<Vec<ToolDefinition>, CoreError> {
+            Ok(self.registry.clone())
+        }
+
+        async fn tool_definition(&self, name: &str) -> Result<Option<ToolDefinition>, CoreError> {
+            Ok(self
+                .core
+                .iter()
+                .chain(self.registry.iter())
+                .find(|t| t.name == name)
+                .cloned())
+        }
+
+        async fn execute_tool(
+            &self,
+            name: &str,
+            arguments: serde_json::Value,
+        ) -> Result<String, CoreError> {
+            self.executed
+                .lock()
+                .unwrap()
+                .push((name.to_string(), arguments));
+            self.results
+                .get(name)
+                .cloned()
+                .ok_or_else(|| CoreError::ToolExecution(format!("unknown tool: {name}")))
+        }
+    }
+
+    fn read_file_schema() -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {"path": {"type": "string"}}})
+    }
+
+    fn daemon_read_file() -> ToolDefinition {
+        ToolDefinition::new("read_file", "DAEMON read_file", read_file_schema())
+    }
+
+    fn device_read_file() -> ToolDefinition {
+        ToolDefinition::new("read_file", "DEVICE read_file", read_file_schema())
+    }
+
+    /// A handler whose daemon side and client side both offer `read_file`.
+    /// Returns the handler and a handle on every tool set the model was shown.
+    #[allow(clippy::type_complexity)]
+    fn collided_handler(
+        responses: Vec<LlmResponse>,
+        core: Vec<ToolDefinition>,
+        registry: Vec<ToolDefinition>,
+        results: HashMap<String, String>,
+        executed: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+    ) -> (
+        ConversationHandler<MockStore, ToolCallingLlm, RecordingToolExecutor>,
+        Arc<Mutex<Vec<Vec<ToolDefinition>>>>,
+    ) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let llm = ToolCallingLlm::new(responses);
+        let advertised = llm.advertised();
+        let counter = Arc::new(AtomicU64::new(0));
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            llm,
+            RecordingToolExecutor {
+                core,
+                registry,
+                results,
+                executed,
+            },
+            Box::new(move || {
+                let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                format!("conv-{n}")
+            }),
+        )
+        .with_host("daemon-host");
+        (handler, advertised)
+    }
+
+    /// #1216 AC2: the schema the model is shown and the host that executes
+    /// always agree. Pinned for the collision case: one capability name, one
+    /// definition on each side, one call.
+    #[tokio::test]
+    async fn advertised_schema_and_executing_host_agree_on_a_collided_name() {
+        use crate::ports::client_tools::with_client_tools;
+
+        let responses = vec![
+            LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new("c1", "read_file", r#"{"path":"/etc/hosts"}"#)],
+            ),
+            LlmResponse::text("done"),
+        ];
+        let daemon_ran = Arc::new(Mutex::new(Vec::new()));
+        let (handler, advertised) = collided_handler(
+            responses,
+            vec![daemon_read_file()],
+            vec![],
+            HashMap::from([("read_file".to_string(), "daemon result".to_string())]),
+            Arc::clone(&daemon_ran),
+        );
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
+        let device_ran = Arc::new(Mutex::new(Vec::new()));
+        let port: Arc<dyn crate::ports::client_tools::ClientToolPort> =
+            Arc::new(FakeClientToolPort::ok(
+                vec![device_read_file()],
+                Arc::clone(&device_ran),
+                "device result",
+            ));
+        with_client_tools(
+            port,
+            handler.send_prompt(&conv.id, "read it".into(), noop_callback(), noop_status()),
+        )
+        .await
+        .expect("turn completes");
+
+        let rounds = advertised.lock().unwrap().clone();
+        let shown: Vec<&ToolDefinition> = rounds
+            .first()
+            .expect("the model was called")
+            .iter()
+            .filter(|t| t.name == "read_file")
+            .collect();
+        assert_eq!(shown.len(), 1, "one capability name, one advertised entry");
+
+        let on_daemon = daemon_ran
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(name, _)| name == "read_file");
+        let on_device = !device_ran.lock().unwrap().is_empty();
+        assert!(
+            on_daemon ^ on_device,
+            "exactly one host runs the call: daemon={on_daemon} device={on_device}"
+        );
+        let expected = if on_device {
+            "DEVICE read_file"
+        } else {
+            "DAEMON read_file"
+        };
+        assert_eq!(
+            shown[0].description, expected,
+            "the model was shown one host's schema and the call ran on the other"
+        );
+    }
+
+    /// #1216 AC1: the same capability on two hosts is two addressable things.
+    /// The model reaches each one deliberately by naming the host, and the
+    /// name it calls is the same in both cases.
+    #[tokio::test]
+    async fn both_hosts_of_a_collided_capability_are_reachable_by_naming_the_host() {
+        use crate::ports::client_tools::with_client_tools;
+
+        let responses = vec![
+            LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new(
+                    "c1",
+                    "read_file",
+                    r#"{"path":"/etc/hosts","__host":"device"}"#,
+                )],
+            ),
+            LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new(
+                    "c2",
+                    "read_file",
+                    r#"{"path":"/etc/hosts","__host":"daemon"}"#,
+                )],
+            ),
+            LlmResponse::text("done"),
+        ];
+        let daemon_ran = Arc::new(Mutex::new(Vec::new()));
+        let (handler, _advertised) = collided_handler(
+            responses,
+            vec![daemon_read_file()],
+            vec![],
+            HashMap::from([("read_file".to_string(), "daemon result".to_string())]),
+            Arc::clone(&daemon_ran),
+        );
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
+        let device_ran = Arc::new(Mutex::new(Vec::new()));
+        let port: Arc<dyn crate::ports::client_tools::ClientToolPort> =
+            Arc::new(FakeClientToolPort::ok(
+                vec![device_read_file()],
+                Arc::clone(&device_ran),
+                "device result",
+            ));
+        with_client_tools(
+            port,
+            handler.send_prompt(&conv.id, "read both".into(), noop_callback(), noop_status()),
+        )
+        .await
+        .expect("turn completes");
+
+        let on_device: Vec<String> = device_ran
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, name)| name.clone())
+            .collect();
+        let on_daemon: Vec<String> = daemon_ran
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect();
+        assert_eq!(
+            on_device,
+            vec!["read_file".to_string()],
+            "the call that named the device must run there"
+        );
+        assert_eq!(
+            on_daemon,
+            vec!["read_file".to_string()],
+            "the call that named the daemon must run there"
+        );
+    }
+
+    /// The host is routing metadata, not a tool parameter: the tool runs with
+    /// the arguments the model wrote for it and nothing else.
+    #[tokio::test]
+    async fn the_host_argument_is_removed_before_the_tool_runs() {
+        use crate::ports::client_tools::with_client_tools;
+
+        let responses = vec![
+            LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new(
+                    "c1",
+                    "read_file",
+                    r#"{"path":"/etc/hosts","__host":"daemon"}"#,
+                )],
+            ),
+            LlmResponse::text("done"),
+        ];
+        let daemon_ran = Arc::new(Mutex::new(Vec::new()));
+        let (handler, _advertised) = collided_handler(
+            responses,
+            vec![daemon_read_file()],
+            vec![],
+            HashMap::from([("read_file".to_string(), "daemon result".to_string())]),
+            Arc::clone(&daemon_ran),
+        );
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
+        let device_ran = Arc::new(Mutex::new(Vec::new()));
+        let port: Arc<dyn crate::ports::client_tools::ClientToolPort> =
+            Arc::new(FakeClientToolPort::ok(
+                vec![device_read_file()],
+                Arc::clone(&device_ran),
+                "device result",
+            ));
+        with_client_tools(
+            port,
+            handler.send_prompt(&conv.id, "read it".into(), noop_callback(), noop_status()),
+        )
+        .await
+        .expect("turn completes");
+
+        let ran = daemon_ran.lock().unwrap().clone();
+        let (_, arguments) = ran.first().expect("the daemon ran the call");
+        assert_eq!(
+            arguments,
+            &serde_json::json!({"path": "/etc/hosts"}),
+            "the routing field must not reach the tool"
+        );
+    }
+
+    /// A tool-search hit carries the host it runs on, and activation keeps it:
+    /// a hit that runs on the device must not activate the daemon's tool of
+    /// the same name, which would swap the schema under the model mid-turn
+    /// while the route stayed where it was.
+    #[tokio::test]
+    async fn a_device_search_hit_does_not_activate_the_daemon_tool_of_the_same_name() {
+        use crate::ports::client_tools::with_client_tools;
+
+        let search_tool = ToolDefinition::new(
+            "builtin_tool_search",
+            "find tools",
+            serde_json::json!({"type": "object", "properties": {"query": {"type": "string"}}}),
+        );
+        let responses = vec![
+            LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new(
+                    "c1",
+                    "builtin_tool_search",
+                    r#"{"query":"read a file"}"#,
+                )],
+            ),
+            LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new("c2", "read_file", r#"{"path":"/etc/hosts"}"#)],
+            ),
+            LlmResponse::text("done"),
+        ];
+        let daemon_ran = Arc::new(Mutex::new(Vec::new()));
+        let (handler, advertised) = collided_handler(
+            responses,
+            vec![search_tool],
+            vec![daemon_read_file()],
+            HashMap::from([(
+                "builtin_tool_search".to_string(),
+                r#"{"ok":true,"tools":[{"name":"read_file","description":"DEVICE read_file","runs_on":"device"}]}"#
+                    .to_string(),
+            )]),
+            Arc::clone(&daemon_ran),
+        );
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
+        let device_ran = Arc::new(Mutex::new(Vec::new()));
+        let port: Arc<dyn crate::ports::client_tools::ClientToolPort> =
+            Arc::new(FakeClientToolPort::ok(
+                vec![device_read_file()],
+                Arc::clone(&device_ran),
+                "device result",
+            ));
+        with_client_tools(
+            port,
+            handler.send_prompt(&conv.id, "read it".into(), noop_callback(), noop_status()),
+        )
+        .await
+        .expect("turn completes");
+
+        let rounds = advertised.lock().unwrap().clone();
+        let after_search = rounds
+            .get(1)
+            .expect("the model was called again after the search");
+        let shown: Vec<&ToolDefinition> = after_search
+            .iter()
+            .filter(|t| t.name == "read_file")
+            .collect();
+        assert_eq!(shown.len(), 1, "one capability name, one advertised entry");
+        assert_eq!(
+            shown[0].description, "DEVICE read_file",
+            "a device hit must not activate the daemon's tool of the same name"
+        );
+        assert!(
+            !device_ran.lock().unwrap().is_empty(),
+            "the call must run on the host whose schema was shown"
+        );
     }
 
     #[tokio::test]
