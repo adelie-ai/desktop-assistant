@@ -2146,4 +2146,34 @@ mod tests {
         assert!(ToolPolicy::Standard.stamps_durable_writes());
         assert!(!ToolPolicy::Lax.stamps_durable_writes());
     }
+
+    // --- the placeholder wording, and the rows carrying an older one (#1250) -
+
+    #[test]
+    fn the_current_placeholder_is_recognised() {
+        assert!(super::is_withheld_step_text(super::WITHHELD_STEP_TEXT));
+    }
+
+    #[test]
+    fn the_retired_placeholder_is_still_recognised() {
+        // The reason this module keeps a list rather than one constant. Notes
+        // written by an older daemon are durable and carry the old wording, and
+        // every test that builds its rows from the constant passes whether or
+        // not those rows are still recognised.
+        assert!(super::is_withheld_step_text("[step text not recorded]"));
+    }
+
+    #[test]
+    fn a_note_that_merely_contains_the_phrase_is_not_a_placeholder() {
+        // The recogniser matches the whole value, so a step whose real wording
+        // quotes the placeholder is still the model's own wording.
+        assert!(!super::is_withheld_step_text(
+            "the note said [withheld by security policy] and I moved on"
+        ));
+    }
+
+    #[test]
+    fn surrounding_space_does_not_hide_a_placeholder() {
+        assert!(super::is_withheld_step_text("  [withheld by security policy]  "));
+    }
 }
