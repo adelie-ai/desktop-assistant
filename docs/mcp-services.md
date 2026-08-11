@@ -529,7 +529,9 @@ When the daemon and the connected client both offer a capability under one name:
 
 - The advertised schema gains an optional `__host` argument, whose values are
   the `runs_on` tokens of the hosts that offer it (`daemon`, `device`). The
-  model sets it when the task is about a particular machine.
+  model sets it when the task is about a particular machine. A hit that reports
+  `runs_on: remote-service` is issued from the daemon, so `daemon` names it -
+  that value says what a tool reaches, not which machine makes the call.
 - With no `__host` stated, the routing policy chooses. The policy is
   `prefer-co-located`: the call stays on the daemon, which is the process
   running the turn, rather than crossing a socket to a client that may
@@ -538,6 +540,11 @@ When the daemon and the connected client both offer a capability under one name:
   runs, so no tool receives it.
 - A capability only one host offers carries no `__host` argument: there is
   nothing to choose.
+
+Where a connector carries the daemon's fleet through its own tool search, the
+same table decides what that search may offer: a name a client-registered tool
+already answers for is left out of it, so the model is never shown two schemas
+for one name.
 
 An operator who wants a client-registered tool to be the default for a name the
 daemon also holds should give it a name of its own - a namespace on the client's
