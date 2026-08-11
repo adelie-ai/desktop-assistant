@@ -489,7 +489,16 @@ pub struct RecallCandidates {
     /// `None` where the adapter could not measure one, which leaves the block on
     /// its stated estimate.
     pub entry_dispersion: Option<RecallDispersion>,
-    /// The scratchpad source's own dispersion, on the same terms.
+    /// The scratchpad source's own dispersion, on the same terms (#1167).
+    ///
+    /// Its own, and never the knowledge arm's. A note embeds
+    /// `"<key> <content>"`, which is terser and more telegraphic than an
+    /// entry's body, so the pad puts its distances somewhere else. `None` is
+    /// the ordinary answer rather than the exceptional one, because one
+    /// conversation's pad is usually under
+    /// [`RECALL_DISPERSION_MIN_ROWS`]; what the measurement buys is the long
+    /// conversation, whose pad is both large enough to measure and least like
+    /// the store.
     pub note_dispersion: Option<RecallDispersion>,
     /// The present situation, read against the knowledge source (#1125).
     ///

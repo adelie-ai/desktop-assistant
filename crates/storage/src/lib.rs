@@ -13,10 +13,12 @@ pub mod idempotency_keys;
 pub mod kb_metadata;
 pub mod knowledge;
 pub mod knowledge_delete;
+pub mod knowledge_search;
 pub mod knowledge_use;
 pub mod migrate_json;
 pub mod negative_memory;
 pub mod pool;
+pub mod scan_bound;
 pub mod scratchpad;
 pub mod skill_index;
 pub mod skill_use;
@@ -54,7 +56,8 @@ pub use migrate_json::{
 };
 pub use negative_memory::PgNegativeMemoryStore;
 pub use pool::{create_pool, run_migrations};
-pub use scratchpad::PgScratchpadStore;
+pub use scan_bound::begin_bounded;
+pub use scratchpad::{NearestNotes, PgScratchpadStore};
 pub use skill_index::{
     NearestSkill, NearestSkills, PgSkillIndexStore, SKILL_RECALL_SCAN_STATEMENT_TIMEOUT,
 };

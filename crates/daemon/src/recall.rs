@@ -16,11 +16,19 @@
 //! ## What a distance is worth, and who says so
 //!
 //! A cosine distance means nothing on its own, so the core reads each candidate
-//! against the spread of the source it came from. Only the store can say what
-//! its own geometry is, so the knowledge arm's read answers with both: the
-//! candidates, and the spread of the same query's distances over every row the
-//! scan could reach. One scan states both, so the spread always describes the
-//! query whose candidates it grades.
+//! against the spread of the source it came from. Only a source can say what its
+//! own geometry is, so each measured arm's read answers with both: the
+//! candidates, and the spread of the same query's distances over every row that
+//! arm's scan could reach. One scan states both, so the spread always describes
+//! the query whose candidates it grades.
+//!
+//! All three arms do this (#1167). The pad was the last one read by the stated
+//! estimate, and it is the arm the estimate fitted worst: a note embeds
+//! `"<key> <content>"`, which is terser and more telegraphic than an entry's
+//! body. A source that holds too little to measure still answers `None`, and
+//! one conversation's pad usually does - what the measurement buys is the long
+//! conversation, whose pad is both large enough to measure and least like the
+//! store.
 //!
 //! ## What the use log adds, and what it costs
 //!
@@ -209,8 +217,8 @@ async fn lookup(
                 ))
             },
             async {
-                Ok(pad
-                    .search_text_any_term(
+                Ok((
+                    pad.search_text_any_term(
                         &request.conversation_id,
                         &request.prompt,
                         request.note_limit,
@@ -218,7 +226,11 @@ async fn lookup(
                     .await?
                     .into_iter()
                     .map(|note| to_recall_note(note, RecallRelevance::LexicalMatch))
-                    .collect())
+                    .collect(),
+                    // A lexical row carries no distance, so there is nothing to
+                    // read against a spread and nothing to measure one over.
+                    None,
+                ))
             },
             async {
                 let Some(skills) = skill_store else {
@@ -324,17 +336,24 @@ async fn lookup(
             ))
         },
         async {
-            Ok(pad
+            let found = pad
                 .nearest_by_embedding(
                     &request.conversation_id,
                     vector_for_notes,
                     embedding_model,
                     request.note_limit,
                 )
-                .await?
-                .into_iter()
-                .map(|(note, distance)| to_recall_note(note, RecallRelevance::Distance(distance)))
-                .collect())
+                .await?;
+            Ok((
+                found
+                    .notes
+                    .into_iter()
+                    .map(|(note, distance)| {
+                        to_recall_note(note, RecallRelevance::Distance(distance))
+                    })
+                    .collect(),
+                found.dispersion,
+            ))
         },
         async {
             let Some(skills) = skill_store else {
@@ -502,8 +521,9 @@ async fn situation_signal(
 /// logged even on the turn where the knowledge arm's error is about to end the
 /// lookup.
 ///
-/// The knowledge arm and the skill arm each answer with their own source's
-/// spread beside their candidates, because one scan states both.
+/// Every arm answers with its own source's spread beside its candidates,
+/// because one scan states both (#1167). A source that cannot measure one
+/// answers `None` and the core reads it by its stated estimate.
 async fn gather(
     entries: impl Future<
         Output = Result<
@@ -515,11 +535,11 @@ async fn gather(
             CoreError,
         >,
     >,
-    notes: impl Future<Output = Result<Vec<RecallNote>, CoreError>>,
+    notes: impl Future<Output = Result<(Vec<RecallNote>, Option<RecallDispersion>), CoreError>>,
     skills: impl Future<Output = Result<(Vec<RecallSkill>, Option<RecallDispersion>), CoreError>>,
 ) -> Result<RecallCandidates, CoreError> {
     let (entries, notes, skills) = tokio::join!(entries, notes, skills);
-    let notes = notes_or_none(notes);
+    let (notes, note_dispersion) = notes_or_none(notes);
     let (skills, skill_dispersion) = skills_or_none(skills);
     let (entries, entry_dispersion, situation_cue) = entries?;
     // Which sources stated their own geometry, and which the block will read by
@@ -529,7 +549,7 @@ async fn gather(
     // bar is that no fixed distance decides.
     tracing::debug!(
         knowledge = how_the_distances_are_read(entry_dispersion),
-        scratchpad = how_the_distances_are_read(None),
+        scratchpad = how_the_distances_are_read(note_dispersion),
         skills = how_the_distances_are_read(skill_dispersion),
         "recall: how each source's distances are read"
     );
@@ -538,11 +558,7 @@ async fn gather(
         notes,
         skills,
         entry_dispersion,
-        // The pad is read against the stated estimate. One conversation's pad
-        // rarely holds enough rows for a median absolute deviation over it to
-        // be a measurement rather than noise, and the pad read is already the
-        // block's most expensive query - see #1146.
-        note_dispersion: None,
+        note_dispersion,
         situation_cue,
         skill_dispersion,
     })
@@ -575,7 +591,7 @@ fn to_recall_note(note: ScratchpadNote, relevance: RecallRelevance) -> RecallNot
     }
 }
 
-/// The scratchpad arm's rows, or none.
+/// The scratchpad arm's rows and its spread, or neither.
 ///
 /// The arm reads a different table from the knowledge arm, so it fails on its
 /// own - and when it does it must cost its own lines and nothing else. The
@@ -585,15 +601,21 @@ fn to_recall_note(note: ScratchpadNote, relevance: RecallRelevance) -> RecallNot
 /// knowledge arm that cannot read is the block's whole point failing, so that
 /// error travels to the caller, which drops the block and runs the turn anyway.
 /// Losing the pad lines is a smaller loss than losing the block.
-fn notes_or_none(found: Result<Vec<RecallNote>, CoreError>) -> Vec<RecallNote> {
+///
+/// The spread goes with the rows, for the reason [`skills_or_none`] gives: a
+/// spread with no candidates to grade is nothing, and it must not be left
+/// standing as though the pad had been measured.
+fn notes_or_none(
+    found: Result<(Vec<RecallNote>, Option<RecallDispersion>), CoreError>,
+) -> (Vec<RecallNote>, Option<RecallDispersion>) {
     match found {
-        Ok(notes) => notes,
+        Ok(answer) => answer,
         Err(e) => {
             tracing::warn!(
                 error = %e,
                 "recall: the scratchpad arm failed; the other arms still render"
             );
-            Vec::new()
+            (Vec::new(), None)
         }
     }
 }
@@ -746,6 +768,12 @@ mod tests {
         RecallDispersion::measured(0.80, 0.06, 400).expect("a store's own statistics")
     }
 
+    /// A pad that measured its own, and put its distances somewhere else: a
+    /// note embeds `"<key> <content>"`, which is terser than an entry's body.
+    fn a_pad_dispersion() -> RecallDispersion {
+        RecallDispersion::measured(0.55, 0.09, 40).expect("a pad's own statistics")
+    }
+
     fn a_skill() -> RecallSkill {
         RecallSkill::new(
             "publish-a-crate",
@@ -799,7 +827,7 @@ mod tests {
     async fn the_scratchpad_arm_passes_its_rows_through_when_it_answers() {
         let candidates = gather(
             async { Ok((vec![], Some(a_dispersion()), None)) },
-            async { Ok(vec![a_note()]) },
+            async { Ok((vec![a_note()], None)) },
             no_skills(),
         )
         .await
@@ -832,13 +860,54 @@ mod tests {
     async fn the_measured_dispersion_travels_with_the_candidates() {
         let candidates = gather(
             async { Ok((vec![an_entry()], Some(a_dispersion()), None)) },
-            async { Ok(vec![]) },
+            async { Ok((vec![], None)) },
             no_skills(),
         )
         .await
         .expect("every arm answered");
 
         assert_eq!(candidates.entry_dispersion, Some(a_dispersion()));
+    }
+
+    /// Acceptance (#1167): the pad's own measured dispersion travels with its
+    /// notes, so the note arm is read against the pad's own geometry.
+    ///
+    /// This is what says the stated estimate is no longer what the arm is read
+    /// by. Before this the field was written `None` at this call site whatever
+    /// the pad answered, so a measurement could not reach the block however
+    /// many rows the pad held.
+    #[tokio::test]
+    async fn the_pads_measured_dispersion_travels_with_its_notes() {
+        let candidates = gather(
+            async { Ok((vec![], Some(a_dispersion()), None)) },
+            async { Ok((vec![a_note()], Some(a_pad_dispersion()))) },
+            no_skills(),
+        )
+        .await
+        .expect("every arm answered");
+
+        assert_eq!(candidates.note_dispersion, Some(a_pad_dispersion()));
+        assert_ne!(
+            candidates.note_dispersion, candidates.entry_dispersion,
+            "the pad is its own source, so its spread is not the store's"
+        );
+    }
+
+    /// Acceptance (#1167): a pad too small to measure states nothing, and the
+    /// core then falls back to its stated estimate - which is the ordinary case
+    /// for one conversation's pad.
+    #[tokio::test]
+    async fn a_pad_that_states_no_dispersion_leaves_the_field_unmeasured() {
+        let candidates = gather(
+            async { Ok((vec![], Some(a_dispersion()), None)) },
+            async { Ok((vec![a_note()], None)) },
+            no_skills(),
+        )
+        .await
+        .expect("every arm answered");
+
+        assert_eq!(candidates.notes.len(), 1, "the notes still travel");
+        assert_eq!(candidates.note_dispersion, None);
     }
 
     /// A store that could not be measured costs the block its unit and nothing
@@ -848,7 +917,7 @@ mod tests {
     async fn a_store_that_cannot_be_measured_still_answers_with_its_candidates() {
         let candidates = gather(
             async { Ok((vec![an_entry()], None, None)) },
-            async { Ok(vec![]) },
+            async { Ok((vec![], None)) },
             no_skills(),
         )
         .await
@@ -865,7 +934,7 @@ mod tests {
     async fn a_failing_knowledge_arm_ends_the_lookup() {
         let answer = gather(
             async { Err(CoreError::Storage("the store is down".into())) },
-            async { Ok(vec![a_note()]) },
+            async { Ok((vec![a_note()], None)) },
             no_skills(),
         )
         .await;
@@ -888,7 +957,7 @@ mod tests {
             },
             async move {
                 tokio::time::sleep(hold).await;
-                Ok(vec![a_note()])
+                Ok((vec![a_note()], None))
             },
             async move {
                 tokio::time::sleep(hold).await;

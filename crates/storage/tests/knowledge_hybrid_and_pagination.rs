@@ -29,10 +29,14 @@ use std::sync::Arc;
 
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::KnowledgeEntry;
+use desktop_assistant_core::domain::situation::Situation;
 use desktop_assistant_core::ports::knowledge::{
     KnowledgeBaseStore, KnowledgeListQuery, ListOrder, ListOrderOpt,
 };
-use desktop_assistant_storage::{PgKnowledgeBaseStore, UserId, run_migrations, with_user_id};
+use desktop_assistant_core::ports::knowledge_use::{KnowledgeUseLog, OfferScope};
+use desktop_assistant_storage::{
+    PgKnowledgeBaseStore, PgKnowledgeUseLog, UserId, run_migrations, with_user_id,
+};
 use pgvector::Vector;
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
@@ -315,20 +319,26 @@ async fn knowledge_hybrid_search_excludes_tags() {
     .await;
 }
 
-// -- hybrid search: RRF fusion ordering --------------------------------------
+// -- hybrid search: activation ordering (#1167) ------------------------------
 
 #[tokio::test]
-async fn knowledge_hybrid_search_rrf_orders_by_fused_rank() {
-    // Reciprocal-rank fusion: a doc present in BOTH the vector list and the text
-    // list scores `1/(60+rank_v) + 1/(60+rank_t)`, which outranks a doc present
-    // in only one list. We build exactly that: a "both" doc (embedded + FTS),
-    // a "vec_only" doc (embedded, no FTS match), and a "text_only" doc (NULL
-    // embedding, FTS match). "both" must land first.
+async fn knowledge_hybrid_search_orders_by_activation_and_not_by_a_fused_rank() {
+    // Acceptance (#1167): the page is ordered by the activation score, over the
+    // store's own spread, and not by any fusion of the two arms' ranks.
     //
-    // MUTATION: flipping `ORDER BY rrf_score DESC` to `ASC` puts "both" last
-    // → RED.
+    // The fixture is built so the two rules disagree. "further" is embedded a
+    // little away from the query vector AND carries the query's words, so
+    // reciprocal-rank fusion scores it `1/(60+2) + 1/(60+1)` - the highest
+    // score on the page. "nearest" is embedded exactly at the query vector and
+    // carries none of the query's words, so fusion scores it `1/(60+1)` alone
+    // and puts it second.
+    //
+    // Under activation the distance survives into the score instead of being
+    // discarded for a position, so "nearest" leads. MUTATION: restoring the RRF
+    // ordering flips this pair, which is what makes it a real red-to-green
+    // reproduction rather than a pin.
     with_fixture(
-        "knowledge_hybrid_search_rrf_orders_by_fused_rank",
+        "knowledge_hybrid_search_orders_by_activation_and_not_by_a_fused_rank",
         |fx| async move {
             let store =
                 PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
@@ -336,34 +346,24 @@ async fn knowledge_hybrid_search_rrf_orders_by_fused_rank() {
             with_user_id(UserId::new("alice"), async {
                 store
                     .write(KnowledgeEntry::new(
-                        "both",
+                        "further",
                         "quantum widget engine",
                         vec!["k".into()],
                     ))
                     .await
-                    .expect("w both");
+                    .expect("w further");
                 store
                     .write(KnowledgeEntry::new(
-                        "vec_only",
+                        "nearest",
                         "unrelated prose xyzzy",
                         vec!["k".into()],
                     ))
                     .await
-                    .expect("w vec_only");
-                store
-                    .write(KnowledgeEntry::new(
-                        "text_only",
-                        "quantum widget report",
-                        vec!["k".into()],
-                    ))
-                    .await
-                    .expect("w text_only");
+                    .expect("w nearest");
             })
             .await;
-            // "both" and "vec_only" are embedded at the query vector; "text_only"
-            // stays NULL-embedded so it appears only in the text branch.
-            set_embedding(&fx.pool, "both", vec![vec![1.0, 0.0, 0.0]]).await;
-            set_embedding(&fx.pool, "vec_only", vec![vec![1.0, 0.0, 0.0]]).await;
+            set_embedding(&fx.pool, "nearest", vec![vec![1.0, 0.0, 0.0]]).await;
+            set_embedding(&fx.pool, "further", vec![vec![0.9, 0.44, 0.0]]).await;
 
             let hits = with_user_id(UserId::new("alice"), async {
                 store
@@ -373,12 +373,147 @@ async fn knowledge_hybrid_search_rrf_orders_by_fused_rank() {
             .await
             .expect("search")
             .entries;
-            let ids: Vec<_> = hits.iter().map(|e| e.id.clone()).collect();
+            let ids: Vec<&str> = hits.iter().map(|e| e.id.as_str()).collect();
             assert_eq!(
-                ids.first().map(String::as_str),
-                Some("both"),
-                "the doc present in BOTH the vector and text lists must have the \
-                 highest fused RRF score; got {ids:?}"
+                ids,
+                vec!["nearest", "further"],
+                "the nearer row must lead, because the distance survives into the score \
+                 instead of being discarded for a rank; got {ids:?}"
+            );
+            fx
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn knowledge_hybrid_search_puts_a_row_it_cannot_compare_after_the_ones_it_measured() {
+    // A row with no stored vector carries no distance, so there is no
+    // dimensionless term for the score to add and no honest place for it among
+    // the measured rows. It keeps the order the database ranked it in and
+    // follows - which is what keeps an entry written since the last embedding
+    // backfill reachable at all.
+    with_fixture(
+        "knowledge_hybrid_search_puts_a_row_it_cannot_compare_after_the_ones_it_measured",
+        |fx| async move {
+            let store =
+                PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
+
+            with_user_id(UserId::new("alice"), async {
+                store
+                    .write(KnowledgeEntry::new(
+                        "unembedded",
+                        "quantum widget report",
+                        vec![],
+                    ))
+                    .await
+                    .expect("w unembedded");
+                store
+                    .write(KnowledgeEntry::new(
+                        "embedded",
+                        "quantum widget engine",
+                        vec![],
+                    ))
+                    .await
+                    .expect("w embedded");
+            })
+            .await;
+            // "unembedded" is left NULL-embedded on purpose: it is the state
+            // every entry is in between its write and the next backfill pass.
+            set_embedding(&fx.pool, "embedded", vec![vec![1.0, 0.0, 0.0]]).await;
+
+            let hits = with_user_id(UserId::new("alice"), async {
+                store
+                    .search("quantum widget", vec![1.0, 0.0, 0.0], MODEL, None, None, 10)
+                    .await
+            })
+            .await
+            .expect("search")
+            .entries;
+            let ids: Vec<&str> = hits.iter().map(|e| e.id.as_str()).collect();
+            assert_eq!(
+                ids,
+                vec!["embedded", "unembedded"],
+                "a row nothing measured must still travel, after the rows that were measured; \
+                 got {ids:?}"
+            );
+            fx
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn knowledge_hybrid_search_ranks_an_opened_entry_above_a_nearer_unopened_one() {
+    // Acceptance (#1167): the reinforcement half of the activation score
+    // reaches the search tool, so the tool and the [Recall] block rank by one
+    // rule. This is the half no rank fusion can express at all: a position has
+    // discarded both the distance and the use log by the time it is a position.
+    //
+    // "used" sits a little further from the query vector than "unread" and has
+    // been offered and opened; "unread" has never been read. The gap in
+    // distance is small enough that the log decides it, which is exactly the
+    // near-tie the term exists to settle.
+    with_fixture(
+        "knowledge_hybrid_search_ranks_an_opened_entry_above_a_nearer_unopened_one",
+        |fx| async move {
+            let store =
+                PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
+            let log = PgKnowledgeUseLog::new(fx.pool.clone());
+
+            with_user_id(UserId::new("alice"), async {
+                store
+                    .write(KnowledgeEntry::new("used", "the deploy window", vec![]))
+                    .await
+                    .expect("w used");
+                store
+                    .write(KnowledgeEntry::new("unread", "the deploy window", vec![]))
+                    .await
+                    .expect("w unread");
+            })
+            .await;
+            // Two hundredths of cosine distance apart, which the store's
+            // stated estimate reads as about four tenths of a deviation - the
+            // near tie the reinforcement term exists to settle, rather than a
+            // gap so small any term at all would close it.
+            set_embedding(&fx.pool, "unread", vec![vec![1.0, 0.0, 0.0]]).await;
+            set_embedding(&fx.pool, "used", vec![vec![0.98, 0.199, 0.0]]).await;
+
+            let ids = with_user_id(UserId::new("alice"), async {
+                // Ten offers taken up: an entry the work keeps needing.
+                for _ in 0..10 {
+                    log.record_offered(OfferScope::recall("conv-1"), vec!["used".to_string()])
+                        .await
+                        .expect("record the offer");
+                    log.record_opened(
+                        "conv-1".to_string(),
+                        vec!["used".to_string()],
+                        Situation::new(),
+                    )
+                    .await
+                    .expect("record the open");
+                }
+                let hits = store
+                    .search(
+                        "the deploy window",
+                        vec![1.0, 0.0, 0.0],
+                        MODEL,
+                        None,
+                        None,
+                        10,
+                    )
+                    .await
+                    .expect("search")
+                    .entries;
+                hits.into_iter().map(|e| e.id).collect::<Vec<_>>()
+            })
+            .await;
+
+            assert_eq!(
+                ids,
+                vec!["used".to_string(), "unread".to_string()],
+                "an entry the work keeps needing must lead a marginally nearer one nothing \
+                 has opened; got {ids:?}"
             );
             fx
         },
@@ -1148,6 +1283,429 @@ async fn fused_search_truncates_to_a_defined_row_when_rrf_scores_tie() {
                  truncation to 1 row must be decided by id DESC (\"tie-b\" > \
                  \"tie-a\"), not by an undefined physical row order; got \
                  {ids:?}"
+            );
+            fx
+        },
+    )
+    .await;
+}
+
+// -- hybrid search: the spread it measures (#1167) ----------------------------
+
+/// The three statistics `HYBRID_SEARCH_SQL` computes, for the one query below.
+#[derive(sqlx::FromRow)]
+struct MeasuredSpread {
+    median: Option<f64>,
+    rows_read: i64,
+    deviation: Option<f64>,
+}
+
+/// Bind the search scan and read back what it says the store's spread is.
+///
+/// `search_hybrid` consumes those three numbers and answers with entries, so
+/// nothing downstream can tell a median that is wrong from one that is merely
+/// absent - and a wrong spread silently changes every near tie the
+/// reinforcement term exists to settle. This is why the query is held as its
+/// own public string.
+async fn measured_spread(pool: &PgPool, user: &str) -> MeasuredSpread {
+    with_user_id(UserId::new(user), async {
+        sqlx::query_as(desktop_assistant_storage::knowledge_search::HYBRID_SEARCH_SQL)
+            .bind(Vector::from(vec![1.0_f32, 0.0, 0.0]))
+            .bind(None::<Vec<String>>)
+            .bind(100_i64)
+            .bind("zzznomatchzzz")
+            .bind(50_i64)
+            .bind(user)
+            .bind(None::<Vec<String>>)
+            .bind(MODEL)
+            .fetch_one(pool)
+            .await
+            .expect("the scan answers")
+    })
+    .await
+}
+
+#[tokio::test]
+async fn the_hybrid_scan_measures_the_stores_own_median_and_deviation() {
+    // Acceptance (#1167): the semantic term is the distance read against the
+    // store's own spread, so the spread has to be the store's real one. The
+    // seeded rows sit at known cosine distances - `1 - cos(angle)` for a unit
+    // vector `angle` radians off the query - so both statistics are arithmetic
+    // a reader can check by hand rather than numbers only the database knows.
+    //
+    // Twenty rows, evenly spread in angle, is also the smallest sample
+    // `RecallDispersion::measured` will trust.
+    with_fixture(
+        "the_hybrid_scan_measures_the_stores_own_median_and_deviation",
+        |fx| async move {
+            let store =
+                PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
+            let mut distances: Vec<f64> = Vec::new();
+            with_user_id(UserId::new("alice"), async {
+                for i in 0..20u32 {
+                    store
+                        .write(KnowledgeEntry::new(
+                            format!("row{i:02}"),
+                            "a stored fact",
+                            vec![],
+                        ))
+                        .await
+                        .unwrap_or_else(|e| panic!("write row{i:02}: {e}"));
+                }
+            })
+            .await;
+            for i in 0..20u32 {
+                let angle = (i + 1) as f32 * 0.1;
+                set_embedding(
+                    &fx.pool,
+                    &format!("row{i:02}"),
+                    vec![vec![angle.cos(), angle.sin(), 0.0]],
+                )
+                .await;
+                distances.push(1.0 - f64::from(angle.cos()));
+            }
+
+            let measured = measured_spread(&fx.pool, "alice").await;
+
+            distances.sort_by(f64::total_cmp);
+            let expected_median = (distances[9] + distances[10]) / 2.0;
+            let mut spread: Vec<f64> = distances
+                .iter()
+                .map(|d| (d - expected_median).abs())
+                .collect();
+            spread.sort_by(f64::total_cmp);
+            let expected_deviation = (spread[9] + spread[10]) / 2.0;
+
+            assert_eq!(measured.rows_read, 20, "every comparable row is measured");
+            let median = measured
+                .median
+                .expect("a store of this size states a median");
+            let deviation = measured
+                .deviation
+                .expect("a store of this size states a deviation");
+            assert!(
+                (median - expected_median).abs() < 1e-6,
+                "the scan reported a median of {median} where the seeded distances give \
+                 {expected_median}"
+            );
+            assert!(
+                (deviation - expected_deviation).abs() < 1e-6,
+                "the scan reported a deviation of {deviation} where the seeded distances give \
+                 {expected_deviation}"
+            );
+            fx
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn the_hybrid_scan_still_answers_when_no_row_can_be_compared() {
+    // The construction that makes this work is the one place this scan differs
+    // from the recall scan: its `s` selects from `m` rather than cross-joining
+    // `d`, so it yields a row - with both statistics NULL - even when nothing
+    // is embedded. Cross-joining an empty `d` would annihilate the whole
+    // result, and the full-text arm's rows would vanish with it, which is the
+    // ordinary state of a store between a write and the next backfill pass.
+    with_fixture(
+        "the_hybrid_scan_still_answers_when_no_row_can_be_compared",
+        |fx| async move {
+            let store =
+                PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
+            with_user_id(UserId::new("alice"), async {
+                store
+                    .write(KnowledgeEntry::new("only", "quantum widget report", vec![]))
+                    .await
+                    .expect("write only");
+            })
+            .await;
+            // No embedding is stamped: nothing in this store can be compared.
+
+            let hits = with_user_id(UserId::new("alice"), async {
+                store
+                    .search("quantum widget", vec![1.0, 0.0, 0.0], MODEL, None, None, 10)
+                    .await
+            })
+            .await
+            .expect("search")
+            .entries;
+
+            let ids: Vec<&str> = hits.iter().map(|e| e.id.as_str()).collect();
+            assert_eq!(
+                ids,
+                vec!["only"],
+                "a store with nothing to compare must still answer from its full-text arm"
+            );
+            fx
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn knowledge_hybrid_search_admits_a_row_the_query_names_even_when_the_vector_arm_ranks_it_low()
+ {
+    // The defect this arm's admission exists to avoid, and the one shape of it
+    // that no later ranking term could ever repair: a row the query names
+    // exactly, which the vector arm CAN compare but ranks in the middle of the
+    // store, must still reach the candidate set. Excluding every row the vector
+    // arm reached - which is what "the full-text arm covers what the vector arm
+    // cannot" reduces to on an embedded store - made the arm return nothing at
+    // all, so no weight on any term could have lifted such a row back.
+    //
+    // MUTATION: adding `AND NOT EXISTS (SELECT 1 FROM d WHERE d.id = kb.id)`
+    // back to the lexical arm drops "serial" from the answer entirely -> RED.
+    //
+    // The page ORDER is deliberately not asserted. On an embedded store this
+    // row is ranked by its distance and sinks; #1239 is the term that would
+    // lift it, and this test is what says the term will have something to lift.
+    with_fixture(
+        "knowledge_hybrid_search_admits_a_row_the_query_names_even_when_the_vector_arm_ranks_it_low",
+        |fx| async move {
+            let store =
+                PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
+
+            with_user_id(UserId::new("alice"), async {
+                store
+                    .write(KnowledgeEntry::new(
+                        "serial",
+                        "the widget carries serial gronk48219",
+                        vec![],
+                    ))
+                    .await
+                    .expect("write serial");
+                for i in 0..8u32 {
+                    store
+                        .write(KnowledgeEntry::new(
+                            format!("filler{i:02}"),
+                            format!("unrelated prose about other matters {i}"),
+                            vec![],
+                        ))
+                        .await
+                        .unwrap_or_else(|e| panic!("write filler{i:02}: {e}"));
+                }
+            })
+            .await;
+            // Every filler row sits nearer the query vector than "serial" does,
+            // so the vector arm ranks "serial" last of the nine.
+            for i in 0..8u32 {
+                let f = i as f32 * 0.01;
+                set_embedding(
+                    &fx.pool,
+                    &format!("filler{i:02}"),
+                    vec![vec![1.0 - f, f, 0.0]],
+                )
+                .await;
+            }
+            set_embedding(&fx.pool, "serial", vec![vec![0.0, 1.0, 0.0]]).await;
+
+            let hits = with_user_id(UserId::new("alice"), async {
+                store
+                    .search("gronk48219", vec![1.0, 0.0, 0.0], MODEL, None, None, 20)
+                    .await
+            })
+            .await
+            .expect("search")
+            .entries;
+            let ids: Vec<&str> = hits.iter().map(|e| e.id.as_str()).collect();
+            assert!(
+                ids.contains(&"serial"),
+                "a row the query names exactly must reach the candidate set however the vector \
+                 arm ranks it; got {ids:?}"
+            );
+            assert_eq!(
+                ids.iter().filter(|id| **id == "serial").count(),
+                1,
+                "both arms admit it, and the page must carry it once; got {ids:?}"
+            );
+            fx
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn knowledge_hybrid_search_carries_provenance_so_salience_reads_the_same_as_the_block() {
+    // The salience term reads an entry's own provenance, so a page that dropped
+    // the column scored every deliberately-written entry below what the
+    // [Recall] block scores it - the drift this work exists to remove, in the
+    // one field the search projection did not carry.
+    //
+    // MUTATION: dropping `kb.source` from the projection, or restoring
+    // `source: None` in `KbSearchRow::into_entry`, turns this RED.
+    with_fixture(
+        "knowledge_hybrid_search_carries_provenance_so_salience_reads_the_same_as_the_block",
+        |fx| async move {
+            let store =
+                PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
+
+            with_user_id(UserId::new("alice"), async {
+                let mut entry = KnowledgeEntry::new("deliberate", "the deploy window", vec![]);
+                entry.source = Some("explicit".to_string());
+                store.write(entry).await.expect("write deliberate");
+            })
+            .await;
+            set_embedding(&fx.pool, "deliberate", vec![vec![1.0, 0.0, 0.0]]).await;
+
+            let hits = with_user_id(UserId::new("alice"), async {
+                store
+                    .search(
+                        "the deploy window",
+                        vec![1.0, 0.0, 0.0],
+                        MODEL,
+                        None,
+                        None,
+                        10,
+                    )
+                    .await
+            })
+            .await
+            .expect("search")
+            .entries;
+
+            assert_eq!(
+                hits.first().and_then(|e| e.source.as_deref()),
+                Some("explicit"),
+                "the search page must carry the provenance the salience term reads"
+            );
+            fx
+        },
+    )
+    .await;
+}
+
+// -- the query's own words (#1239) --------------------------------------------
+
+/// Seed the store the identifier measurement was taken over: thirty rows the
+/// query's words never reach, spread evenly in angle so the store states a real
+/// dispersion, plus one row carrying a distinctive token and embedded so that
+/// twelve of the thirty sit nearer to the query vector than it does.
+///
+/// Twelve nearer rows puts it at vector rank thirteen, which is where the
+/// measurement in #1167's review found it.
+async fn seed_the_identifier_store(pool: &PgPool, store: &PgKnowledgeBaseStore) {
+    with_user_id(UserId::new("alice"), async {
+        for i in 0..30u32 {
+            store
+                .write(KnowledgeEntry::new(
+                    format!("filler{i:02}"),
+                    format!("unrelated prose about other matters number {i}"),
+                    vec![],
+                ))
+                .await
+                .unwrap_or_else(|e| panic!("write filler{i:02}: {e}"));
+        }
+        store
+            .write(KnowledgeEntry::new(
+                "serial",
+                "the widget shipped under serial gronk48219",
+                vec![],
+            ))
+            .await
+            .expect("write serial");
+    })
+    .await;
+
+    // Angles spread from 0.02 to 0.60 radians off the query vector, so the
+    // store has a real distribution rather than two clumps.
+    for i in 0..30u32 {
+        let angle = 0.02 + (i as f32) * 0.02;
+        set_embedding(
+            pool,
+            &format!("filler{i:02}"),
+            vec![vec![angle.cos(), angle.sin(), 0.0]],
+        )
+        .await;
+    }
+    // Twelve fillers sit at angles below 0.26; "serial" sits at 0.26, so twelve
+    // rows are nearer and it is the thirteenth by distance.
+    set_embedding(
+        pool,
+        "serial",
+        vec![vec![0.26_f32.cos(), 0.26_f32.sin(), 0.0]],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn knowledge_hybrid_search_puts_an_exactly_named_row_at_the_top_of_the_page() {
+    // Acceptance (#1239): the measurement that blocked #1167, turned into a
+    // test rather than left as a claim in a report.
+    //
+    // Before: "serial" sat thirteenth by cosine distance, the page took the
+    // five nearest, and the row the query names exactly did not appear at all -
+    // so the only text search the model has could not find an identifier.
+    //
+    // After: the words it carries are worth the spread this store's own
+    // distances have, so it leads a page of five.
+    //
+    // MUTATION: returning `LexicalMatch::NONE` from `rank_page`, or dropping
+    // `a.lexical_share` from the scan's projection, puts "serial" back off the
+    // page -> RED.
+    with_fixture(
+        "knowledge_hybrid_search_puts_an_exactly_named_row_at_the_top_of_the_page",
+        |fx| async move {
+            let store =
+                PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
+            seed_the_identifier_store(&fx.pool, &store).await;
+
+            let hits = with_user_id(UserId::new("alice"), async {
+                store
+                    .search("gronk48219", vec![1.0, 0.0, 0.0], MODEL, None, None, 5)
+                    .await
+            })
+            .await
+            .expect("search")
+            .entries;
+
+            let ids: Vec<&str> = hits.iter().map(|e| e.id.as_str()).collect();
+            assert_eq!(
+                ids.first().copied(),
+                Some("serial"),
+                "a row the query names exactly must lead a page of five, not sit thirteenth \
+                 by distance; got {ids:?}"
+            );
+            fx
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn knowledge_hybrid_search_leaves_a_row_the_query_never_names_where_its_distance_puts_it() {
+    // Acceptance (#1239), the negative: a row with neither a text hit nor a
+    // good distance must not be lifted. Over the same store, a query whose
+    // words reach nothing leaves every row ranked on distance alone, so
+    // "serial" stays thirteenth and off a page of five.
+    //
+    // This is what says the term reads the query's words rather than merely
+    // reordering the page.
+    with_fixture(
+        "knowledge_hybrid_search_leaves_a_row_the_query_never_names_where_its_distance_puts_it",
+        |fx| async move {
+            let store =
+                PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
+            seed_the_identifier_store(&fx.pool, &store).await;
+
+            let hits = with_user_id(UserId::new("alice"), async {
+                store
+                    .search("zzznomatchzzz", vec![1.0, 0.0, 0.0], MODEL, None, None, 5)
+                    .await
+            })
+            .await
+            .expect("search")
+            .entries;
+
+            let ids: Vec<&str> = hits.iter().map(|e| e.id.as_str()).collect();
+            assert!(
+                !ids.contains(&"serial"),
+                "with nothing for the query's words to reach, the term must lift nobody; \
+                 got {ids:?}"
+            );
+            assert_eq!(
+                ids,
+                vec!["filler00", "filler01", "filler02", "filler03", "filler04"],
+                "and the page is the five nearest, in order; got {ids:?}"
             );
             fx
         },

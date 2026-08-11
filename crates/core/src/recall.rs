@@ -76,7 +76,7 @@
 
 use std::sync::OnceLock;
 
-use crate::domain::activation::{ActivationWeights, activation};
+use crate::domain::activation::{ActivationWeights, LexicalMatch, activation};
 use crate::domain::situation::SituationCue;
 use crate::ports::recall::{
     Activatable, RecallCandidates, RecallDispersion, RecallEntry, RecallNote, RecallSkill,
@@ -891,6 +891,7 @@ fn rank_by_activation<'a, T: Activatable>(
                     hit.use_record(),
                     hit.situation_coverage(situation),
                     hit.salience_share(),
+                    LexicalMatch::NONE,
                     now,
                     &weights,
                 )

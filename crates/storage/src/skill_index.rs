@@ -36,12 +36,30 @@ use sqlx::PgPool;
 /// Postgres-backed [`SkillIndexStore`].
 pub struct PgSkillIndexStore {
     pool: PgPool,
+    scan_ceiling: std::time::Duration,
 }
 
 impl PgSkillIndexStore {
     /// Construct a store over the given pool.
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            scan_ceiling: SKILL_RECALL_SCAN_STATEMENT_TIMEOUT,
+        }
+    }
+
+    /// The same store, whose full scans the database gives up on after
+    /// `ceiling` instead of after [`SKILL_RECALL_SCAN_STATEMENT_TIMEOUT`].
+    ///
+    /// Exists so the bound can be proven on the path a deployment actually
+    /// runs - see
+    /// [`PgKnowledgeBaseStore::with_scan_ceiling`](crate::PgKnowledgeBaseStore::with_scan_ceiling)
+    /// for why a bounded variant reached past the public method would prove
+    /// nothing.
+    #[must_use]
+    pub fn with_scan_ceiling(mut self, ceiling: std::time::Duration) -> Self {
+        self.scan_ceiling = ceiling;
+        self
     }
 
     /// Upsert one skill, preserving the row's embedding when its content hash is
@@ -260,16 +278,7 @@ impl PgSkillIndexStore {
         // A transaction, for one statement, because `SET LOCAL` is scoped to
         // one: it is what makes the ceiling the caller keeps a ceiling the
         // database keeps too.
-        let mut scan = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| CoreError::Storage(e.to_string()))?;
-        sqlx::query("SELECT set_config('statement_timeout', $1, true)")
-            .bind(SKILL_RECALL_SCAN_STATEMENT_TIMEOUT.as_millis().to_string())
-            .execute(&mut *scan)
-            .await
-            .map_err(|e| CoreError::Storage(e.to_string()))?;
+        let mut scan = crate::scan_bound::begin_bounded(&self.pool, self.scan_ceiling).await?;
         let rows: Vec<SkillNearestRow> = sqlx::query_as(NEAREST_SKILLS_BY_EMBEDDING_SQL)
             .bind(Vector::from(query_embedding))
             .bind(user.as_str())
@@ -304,12 +313,20 @@ impl PgSkillIndexStore {
     ///
     /// The same approval filter and the same one-row-per-name rule as
     /// [`Self::nearest_by_embedding`], for the same reasons.
+    ///
+    /// The scan carries this store's own ceiling
+    /// ([`SKILL_RECALL_SCAN_STATEMENT_TIMEOUT`] unless
+    /// [`Self::with_scan_ceiling`] overrode it), so the database stops working
+    /// when the caller stops waiting. The `DISTINCT ON` resolution reads the
+    /// whole approved catalog before the match narrows it, so this read's cost
+    /// grows with the catalog and not with the query.
     pub async fn search_text_any_term(
         &self,
         query: &str,
         limit: usize,
     ) -> Result<Vec<NearestSkill>, CoreError> {
         let user = current_user_id();
+        let mut scan = crate::scan_bound::begin_bounded(&self.pool, self.scan_ceiling).await?;
         let rows: Vec<SkillTextRow> = sqlx::query_as(
             "WITH q AS (
                  SELECT to_tsquery('english', string_agg(quote_literal(lexeme), ' | ')) AS query
@@ -337,9 +354,12 @@ impl PgSkillIndexStore {
         .bind(query)
         .bind(limit as i64)
         .bind(user.as_str())
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *scan)
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;
+        scan.commit()
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
 
         Ok(rows.into_iter().map(SkillTextRow::into_candidate).collect())
     }

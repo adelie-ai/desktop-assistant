@@ -23,7 +23,7 @@ The response therefore reports what was searched, not only what was found.
 
 | Field | Meaning |
 | ----- | ------- |
-| `results` | The matched entries, best match first. Each carries a `summary`: one line condensing what that entry says, so a caller can judge a hit without reading the whole `content`. It is `null` for an entry that has none: one stored before the field existed, one whose write named no summary, or one whose summary was cleared. |
+| `results` | The matched entries, best first by the activation score - see **What decides the order** below, which also says where the rows nothing could measure sit. Each carries a `summary`: one line condensing what that entry says, so a caller can judge a hit without reading the whole `content`. It is `null` for an entry that has none: one stored before the field existed, one whose write named no summary, or one whose summary was cleared. |
 | `returned` | How many entries are in `results`. Same name `builtin_scratchpad_search` uses. |
 | `truncated` | Present, and `true`, only when the page filled up (`returned` reached `limit`) **and** the scope is larger than the page. A full page under `FEW` carries neither it nor `message`, because `FEW` already means the page holds the whole scope. It always travels with `message`, which says how to narrow. Its absence is the claim that nothing was left behind. |
 | `scope_size` | `NONE`, `FEW`, `MANY`, or `UNKNOWN`. See below. |
@@ -96,11 +96,52 @@ pass the caller's `tags` and `exclude_tags` filters. Neither describes the
 entries that matched the query.
 
 The number of query matches cannot be computed for this tool. The search is
-hybrid RRF (`crates/storage/src/knowledge.rs`): the full-text arm is
+hybrid (`crates/storage/src/knowledge_search.rs`): the full-text arm is
 query-scoped (`tsv @@ query`), but the vector arm is not, because a cosine
 distance is defined for every embedded row. "Entries matching the query" is
 therefore every embedded row plus the full-text hits, which is the whole store.
 Reporting that as a match count would state a falsehood.
+
+## What decides the order (#1167)
+
+`results` is ordered by the **activation score**, the same score the `[Recall]`
+block ranks by, so the tool and the block read one rule rather than two. The
+rule is shared; what is not yet held mechanically is that both paths feed it the
+same inputs, which issue #1244 covers.
+
+The two arms admit and the score ranks:
+
+- The **vector arm** measures every in-scope row this query can be compared
+  with, states the store's own median and median absolute deviation over those
+  distances, and admits the nearest of them. Each admitted row's semantic term
+  is how many of the store's own deviations below its median this query put it
+  - never a raw distance, which means nothing across a store or an embedding
+  model. Added to it: what the use log knows about the entry, and what the
+  entry's own text says about how salient it is.
+- The **full-text arm** admits every row that carries the query's words,
+  whether or not the vector arm can compare it. One it can compare arrives with
+  its distance and is scored like any other. One it cannot - a row written since
+  the last embedding backfill, or one still stamped with a superseded model -
+  carries no distance, so it carries no semantic term and no score, and it keeps
+  the order the database ranked it in and follows the rows that were measured.
+
+The spread is measured in the pass that ranks and is never cached: the median
+and the deviation are statistics of the distances from *this* query's point, so
+a query in a dense region of the store has a different distribution from one in
+a sparse region. A store too small to state one is read by the same stated
+estimate the block falls back to.
+
+**The query's own words are a term of the score** (#1239), not a tiebreak. Every
+candidate the full-text arm returns carries a share of this query's own best
+lexical match - read from `ts_rank_cd`'s magnitude, never from a position - and
+that share buys it a share of the spread the store's own distances have for this
+query. So a row the query names exactly leads a row that is merely nearer, which
+is what an identifier or a serial number needs: measured on a seeded store of
+thirty-one rows, such a row sat thirteenth by distance and did not appear on a
+page of five before this, and leads that page now.
+
+A row the query's words did not reach is not lifted, however widely the store is
+spread. The lift is a share of the spread, so a share of nothing is nothing.
 
 The four values:
 
@@ -230,9 +271,10 @@ knowledge-base prompt section states the procedure:
 Two of those are worth stating plainly, because both invite a wrong instruction.
 
 **A larger search `limit` does find more entries, and is still the wrong
-retry.** It finds more: `search_hybrid` derives `fetch_limit` as `limit * 2` for
-both retrieval arms and `result_limit` as `limit` for the page, so a bigger
-limit really does surface entries a smaller one truncated away. It is the wrong
+retry.** It finds more: `search_hybrid` admits `limit * 2` rows from the vector
+arm, so that activation ranking has rows to lift, and `limit` from the full-text
+arm, so a bigger limit really does surface entries a smaller one truncated
+away. It is the wrong
 move for a different reason - the model cannot tell how far down the ranking the
 entry sits, so the retry is a guess that costs an embedding round-trip and may
 still miss. A sweep is bounded and it reports what has already been read. The

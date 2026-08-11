@@ -26,6 +26,7 @@
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::ScratchpadNote;
 use desktop_assistant_core::ports::auth::current_user_id;
+use desktop_assistant_core::ports::recall::RecallDispersion;
 use desktop_assistant_core::ports::scratchpad::{
     NewScratchpadNote, SCRATCHPAD_GOAL_KEY, ScratchpadStore,
 };
@@ -63,22 +64,132 @@ fn read_snapshot() -> (Option<String>, String, Vec<String>) {
 /// Postgres adapter for the per-conversation scratchpad table.
 pub struct PgScratchpadStore {
     pool: PgPool,
+    scan_ceiling: std::time::Duration,
 }
 
 impl PgScratchpadStore {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            scan_ceiling: crate::RECALL_SCAN_STATEMENT_TIMEOUT,
+        }
+    }
+
+    /// The same store, whose full scans the database gives up on after
+    /// `ceiling` instead of after
+    /// [`RECALL_SCAN_STATEMENT_TIMEOUT`](crate::RECALL_SCAN_STATEMENT_TIMEOUT).
+    ///
+    /// Exists so the bound can be proven on the path a deployment actually
+    /// runs - see
+    /// [`PgKnowledgeBaseStore::with_scan_ceiling`](crate::PgKnowledgeBaseStore::with_scan_ceiling)
+    /// for why a bounded variant reached past the public method would prove
+    /// nothing.
+    #[must_use]
+    pub fn with_scan_ceiling(mut self, ceiling: std::time::Duration) -> Self {
+        self.scan_ceiling = ceiling;
+        self
     }
 }
 
-/// An [`SpRow`] plus the cosine distance that ranked it, for
+/// An [`SpRow`] plus the cosine distance that ranked it and the spread every
+/// row of the answer repeats, for
 /// [`PgScratchpadStore::nearest_by_embedding`].
 #[derive(sqlx::FromRow)]
 struct SpNearestRow {
     #[sqlx(flatten)]
     row: SpRow,
     distance: f64,
+    median: Option<f64>,
+    rows_read: i64,
+    deviation: Option<f64>,
 }
+
+impl SpNearestRow {
+    /// What this row says the pad's spread is, where it says one it can be
+    /// trusted for - see [`RecallDispersion::measured`].
+    fn dispersion(&self) -> Option<RecallDispersion> {
+        RecallDispersion::measured(
+            self.median?,
+            self.deviation?,
+            self.rows_read.max(0) as usize,
+        )
+    }
+}
+
+/// What [`PgScratchpadStore::nearest_by_embedding`] answers with: the notes the
+/// block may show, and what a distance from this pad is worth.
+#[derive(Debug, Default)]
+pub struct NearestNotes {
+    /// The nearest notes, each with the cosine distance that ranked it,
+    /// nearest first.
+    pub notes: Vec<(ScratchpadNote, f64)>,
+    /// The spread of this query's distances over the whole pad, or `None`
+    /// where the pad holds too little to measure one. The caller then reads the
+    /// source by a stated estimate.
+    pub dispersion: Option<RecallDispersion>,
+}
+
+/// What [`PgScratchpadStore::nearest_by_embedding`] reads.
+///
+/// One scan, three uses, exactly as the knowledge base's own scan does it. `d`
+/// computes one distance per note and carries nothing else, so the pass that
+/// measures the pad's spread reads no note content: `m` takes the median of
+/// those distances and `s` the median of each distance's own distance from it.
+/// The notes the block may show are then read whole, by primary key, and only
+/// those.
+///
+/// The three scope bounds - the user, the conversation, and the caller's
+/// `owner_todo` read snapshot - sit on `d`, so they bound the measurement as
+/// well as the candidates. The join that reads the rows repeats the two that a
+/// row can be addressed by, the user and the conversation: a scope predicate
+/// that appears once is a scope predicate one refactor can lose, and this table
+/// holds every tenant's working notes. The `owner_todo` snapshot and the goal
+/// exclusion are not repeated, because the join is on `d.id` and a row `d` never
+/// selected cannot arrive through it.
+///
+/// An empty pad yields no rows at all: `d` is empty, so `s` is empty, and the
+/// cross join answers with nothing rather than with a spread of nothing.
+///
+/// Held as its own string so the projection can be asserted on without a
+/// database - see `the_pad_scan_measures_before_it_reads_any_note`.
+const NEAREST_NOTES_BY_EMBEDDING_SQL: &str = "\
+    WITH d AS (
+         SELECT id, MIN(chunk <=> $1) AS distance
+         FROM scratchpads, unnest(embedding) AS chunk
+         WHERE user_id = $2 AND conversation_id = $3
+           AND ($4::text IS NULL OR (owner_todo = $5 OR owner_todo LIKE $5 || '.%'
+                OR (id COLLATE \"C\" < $4 AND owner_todo = ANY($6::text[]))))
+           AND note_key <> $9
+           AND embedding IS NOT NULL
+           AND embedding_model IS NOT NULL
+           AND (embedding_model = $7
+                OR (split_part($7, '@', 2) <> ''
+                    AND split_part(embedding_model, '@', 2)
+                        = split_part($7, '@', 2)))
+         GROUP BY id
+     ),
+     m AS (
+         SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY distance) AS median,
+                count(*) AS rows_read
+         FROM d
+     ),
+     s AS (
+         SELECT m.median,
+                m.rows_read,
+                percentile_cont(0.5) WITHIN GROUP (ORDER BY abs(d.distance - m.median))
+                    AS deviation
+         FROM d CROSS JOIN m
+         GROUP BY m.median, m.rows_read
+     )
+     SELECT sp.id, sp.conversation_id, sp.owner_todo, sp.note_key, sp.content, sp.note_type,
+            sp.seq, sp.done, sp.pinned, sp.knowledge_entry_id, sp.created_at, sp.updated_at,
+            d.distance, s.median, s.rows_read, s.deviation
+     FROM d
+     JOIN scratchpads sp
+       ON sp.id = d.id AND sp.user_id = $2 AND sp.conversation_id = $3
+     CROSS JOIN s
+     ORDER BY d.distance, sp.id DESC
+     LIMIT $8";
 
 #[derive(sqlx::FromRow)]
 struct SpRow {
@@ -539,7 +650,8 @@ impl ScratchpadStore for PgScratchpadStore {
 /// the core's business, and it drops those keys at render time.
 impl PgScratchpadStore {
     /// The conversation's notes nearest a query embedding, with the cosine
-    /// distance that put them there, nearest first.
+    /// distance that put them there, nearest first, and how spread out this
+    /// query's distances are over the whole pad.
     ///
     /// A plain vector search rather than the hybrid [`ScratchpadStore::search`],
     /// because the block reads each candidate against the spread of its
@@ -548,12 +660,54 @@ impl PgScratchpadStore {
     /// against any query. A cosine distance is comparable, so a distribution
     /// over it means something.
     ///
+    /// **The pad is its own source, so it states its own spread** (#1167). A
+    /// note embeds `"<key> <content>"`, which is terser and more telegraphic
+    /// than a knowledge entry's body, so the pad puts its distances somewhere
+    /// else than the store does - and a bar read against one source says
+    /// nothing about the other. Reading the pad by the estimate a source falls
+    /// back to when it cannot state its own geometry was the weakest part of
+    /// the arm, because that estimate is fitted to neither.
+    ///
+    /// **The candidates and the spread come from one scan**, on the same terms
+    /// as [`crate::PgKnowledgeBaseStore::nearest_by_embedding`]: both are
+    /// functions of the same query vector, and the pass that measures reads one
+    /// distance per note and none of its content. Only the notes the block may
+    /// show are read whole.
+    ///
+    /// **A small pad states nothing**, and the caller falls back to its stated
+    /// estimate - see
+    /// [`RecallDispersion::measured`](desktop_assistant_core::ports::recall::RecallDispersion::measured).
+    /// One conversation's pad is usually under the sample floor, so that is the
+    /// ordinary answer rather than the exceptional one; what the measurement
+    /// buys is the long conversation, whose pad is both large enough to measure
+    /// and least like the store.
+    ///
+    /// **A pad whose distances are widely spread renders nothing, and that is
+    /// the bar working rather than the arm failing.** The bar is stated in
+    /// deviations, so a source whose deviation is more than about a seventh of
+    /// its median puts the bar past any distance a cosine can take, and no note
+    /// of it is exceptional enough to show. That is the same rule
+    /// `no_raw_cosine_constant_decides_whether_the_block_renders` (#1121) pins
+    /// for the knowledge store, and refusing such a measurement would put a
+    /// fixed distance back in charge of who renders - which is what the whole
+    /// dimensionless bar exists to prevent.
+    ///
+    /// It does mean a real behaviour change the moment a pad is large enough to
+    /// measure: before this the pad was always read by the stated estimate, so
+    /// it rendered whatever sat inside 0.31 of cosine distance. A pad that
+    /// measures wide now renders nothing where it used to render lines. #1243
+    /// is where a real pad's geometry is measured against a real embedding
+    /// model, because nothing here knows whether real pads are wide.
+    ///
     /// Scoped by an explicit `WHERE user_id` **and** `conversation_id`
     /// predicate, plus the caller's `owner_todo` read snapshot - the same three
-    /// bounds every other read here carries. Row-level security is a backstop
-    /// the table owner bypasses, so the predicates are the guard.
+    /// bounds every other read here carries, on the pass that measures as much
+    /// as on the one that reads. Row-level security is a backstop the table
+    /// owner bypasses, so the predicates are the guard.
     ///
-    /// The `goal` note is left out, as the impl block above states.
+    /// The `goal` note is left out, as the impl block above states - of the
+    /// spread as well as of the candidates, so the geometry describes the notes
+    /// the arm can actually offer.
     ///
     /// `embedding_model` identifies the model that produced `query_embedding`,
     /// and only rows embedded by that model take part, matched on the digest
@@ -566,61 +720,58 @@ impl PgScratchpadStore {
     /// position, which moves after any `VACUUM` or update - and notes written in
     /// one batch carry one vector each, so exact ties are ordinary here.
     ///
-    /// An empty `query_embedding` yields no rows: the vector operator raises on
-    /// a zero-dimension vector, and a caller with no embedding has
-    /// [`Self::search_text_any_term`] to fall back to.
+    /// An empty `query_embedding` yields no rows and no spread: the vector
+    /// operator raises on a zero-dimension vector, and a caller with no
+    /// embedding has [`Self::search_text_any_term`] to fall back to.
+    ///
+    /// The scan carries
+    /// [`RECALL_SCAN_STATEMENT_TIMEOUT`](crate::RECALL_SCAN_STATEMENT_TIMEOUT),
+    /// so the database stops working when the caller stops waiting. It is the
+    /// block's most expensive read - the pad's vectors have no index, because
+    /// the query unnests every note's chunks and groups on the row - so it is
+    /// the one that most needs the bound.
     pub async fn nearest_by_embedding(
         &self,
         conversation_id: &str,
         query_embedding: Vec<f32>,
         embedding_model: &str,
         limit: usize,
-    ) -> Result<Vec<(ScratchpadNote, f64)>, CoreError> {
+    ) -> Result<NearestNotes, CoreError> {
         if query_embedding.is_empty() {
-            return Ok(Vec::new());
+            return Ok(NearestNotes::default());
         }
         let user_id = current_user_id();
         let (vb, me, ancestors) = read_snapshot();
-        let rows: Vec<SpNearestRow> = sqlx::query_as(
-            "SELECT id, conversation_id, owner_todo, note_key, content, note_type,
-                    seq, done, pinned, knowledge_entry_id, created_at, updated_at,
-                    MIN(chunk <=> $1) AS distance
-             FROM scratchpads, unnest(embedding) AS chunk
-             WHERE user_id = $2 AND conversation_id = $3
-               AND ($4::text IS NULL OR (owner_todo = $5 OR owner_todo LIKE $5 || '.%'
-                    OR (id COLLATE \"C\" < $4 AND owner_todo = ANY($6::text[]))))
-               AND note_key <> $9
-               AND embedding IS NOT NULL
-               AND embedding_model IS NOT NULL
-               AND (embedding_model = $7
-                    OR (split_part($7, '@', 2) <> ''
-                        AND split_part(embedding_model, '@', 2)
-                            = split_part($7, '@', 2)))
-             GROUP BY id, conversation_id, owner_todo, note_key, content, note_type,
-                      seq, done, pinned, knowledge_entry_id, created_at, updated_at
-             ORDER BY distance, id DESC
-             LIMIT $8",
-        )
-        .bind(Vector::from(query_embedding))
-        .bind(user_id.as_str())
-        .bind(conversation_id)
-        .bind(vb)
-        .bind(me)
-        .bind(ancestors)
-        .bind(embedding_model)
-        .bind(limit as i64)
-        .bind(SCRATCHPAD_GOAL_KEY)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CoreError::Storage(e.to_string()))?;
+        let mut scan = crate::scan_bound::begin_bounded(&self.pool, self.scan_ceiling).await?;
+        let rows: Vec<SpNearestRow> = sqlx::query_as(NEAREST_NOTES_BY_EMBEDDING_SQL)
+            .bind(Vector::from(query_embedding))
+            .bind(user_id.as_str())
+            .bind(conversation_id)
+            .bind(vb)
+            .bind(me)
+            .bind(ancestors)
+            .bind(embedding_model)
+            .bind(limit as i64)
+            .bind(SCRATCHPAD_GOAL_KEY)
+            .fetch_all(&mut *scan)
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
+        scan.commit()
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
 
-        Ok(rows
-            .into_iter()
-            .map(|r| {
-                let distance = r.distance;
-                (r.row.into_note(), distance)
-            })
-            .collect())
+        // Every row carries the same spread, so the first one states it.
+        let dispersion = rows.first().and_then(SpNearestRow::dispersion);
+        Ok(NearestNotes {
+            notes: rows
+                .into_iter()
+                .map(|r| {
+                    let distance = r.distance;
+                    (r.row.into_note(), distance)
+                })
+                .collect(),
+            dispersion,
+        })
     }
 
     /// Full-text search over the conversation's notes that asks for **any** of
@@ -644,6 +795,12 @@ impl PgScratchpadStore {
     /// Carries the same `user_id` / `conversation_id` / `owner_todo` scope as
     /// every other read here, and leaves out the same `goal` note as
     /// [`Self::nearest_by_embedding`].
+    ///
+    /// The scan carries this store's own ceiling, like its measured
+    /// counterpart. This pad's rows are few, so the bound is cheaper insurance
+    /// here than on the knowledge base - but a read that states no ceiling at
+    /// all leaves the backend working for a caller that has given up, and one
+    /// of two sibling reads being bounded is the shape a later reader misreads.
     pub async fn search_text_any_term(
         &self,
         conversation_id: &str,
@@ -652,6 +809,7 @@ impl PgScratchpadStore {
     ) -> Result<Vec<ScratchpadNote>, CoreError> {
         let user_id = current_user_id();
         let (vb, me, ancestors) = read_snapshot();
+        let mut scan = crate::scan_bound::begin_bounded(&self.pool, self.scan_ceiling).await?;
         let rows: Vec<SpRow> = sqlx::query_as(
             "WITH q AS (
                  SELECT to_tsquery('english', string_agg(quote_literal(lexeme), ' | ')) AS query
@@ -677,9 +835,12 @@ impl PgScratchpadStore {
         .bind(ancestors)
         .bind(limit as i64)
         .bind(SCRATCHPAD_GOAL_KEY)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *scan)
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;
+        scan.commit()
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
         Ok(rows.into_iter().map(SpRow::into_note).collect())
     }
 }
@@ -855,5 +1016,64 @@ impl PgScratchpadStore {
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;
         Ok(rows.into_iter().map(SpRow::into_note).collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Acceptance (#1167): the pass that measures the pad's spread reads the
+    /// geometry and none of the content - one distance per note, and no column
+    /// of the note itself. Only the notes the block may show are read whole.
+    #[test]
+    fn the_pad_scan_measures_before_it_reads_any_note() {
+        let measured = NEAREST_NOTES_BY_EMBEDDING_SQL
+            .split("     SELECT sp.id")
+            .next()
+            .expect("the scan selects the notes it will show after it measures the spread");
+
+        for column in ["content", "note_type", "knowledge_entry_id"] {
+            assert!(
+                !measured.contains(column),
+                "the pass that measures the spread reads {column}, which it has no use for"
+            );
+        }
+    }
+
+    /// The three scope bounds sit on the pass that measures, not only on the one
+    /// that reads. A spread measured over another tenant's pad, or another
+    /// conversation's, would grade this pad's notes against a geometry nothing
+    /// here saw.
+    #[test]
+    fn the_pad_scan_scopes_the_pass_that_measures_the_spread() {
+        let measured = NEAREST_NOTES_BY_EMBEDDING_SQL
+            .split("     SELECT sp.id")
+            .next()
+            .expect("the scan measures the spread before it reads the notes");
+
+        for bound in ["user_id = $2", "conversation_id = $3", "owner_todo"] {
+            assert!(
+                measured.contains(bound),
+                "the pass that measures the spread is not bounded by {bound}: \
+                 \n{NEAREST_NOTES_BY_EMBEDDING_SQL}"
+            );
+        }
+    }
+
+    /// The reserved `goal` note is out of the spread as well as out of the
+    /// candidates, so the geometry describes the notes the arm can offer.
+    #[test]
+    fn the_pad_scan_leaves_the_goal_note_out_of_the_spread() {
+        let measured = NEAREST_NOTES_BY_EMBEDDING_SQL
+            .split("     SELECT sp.id")
+            .next()
+            .expect("the scan measures the spread before it reads the notes");
+
+        assert!(
+            measured.contains("note_key <> $9"),
+            "the goal note must be absent from the spread as well as from the candidates: \
+             \n{NEAREST_NOTES_BY_EMBEDDING_SQL}"
+        );
     }
 }

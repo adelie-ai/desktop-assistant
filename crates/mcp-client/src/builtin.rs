@@ -300,9 +300,10 @@ const TOOL_KB_SEARCH: &str = "builtin_knowledge_base_search";
 /// Largest `limit` `builtin_knowledge_base_search` will honour, matching the
 /// cap `builtin_knowledge_base_list` already advertises.
 ///
-/// Why a cap at all: the storage layer over-fetches with `limit * 2` to feed
-/// the RRF fusion, so an unbounded caller-supplied limit overflows there rather
-/// than merely returning a large page.
+/// Why a cap at all: the storage layer over-fetches the vector arm with
+/// `limit * 2`, so that activation ranking has rows to lift, and an unbounded
+/// caller-supplied limit overflows there rather than merely returning a large
+/// page.
 const KB_SEARCH_MAX_LIMIT: u64 = 500;
 
 const TOOL_KB_DELETE: &str = "builtin_knowledge_base_delete";

@@ -176,10 +176,21 @@ pub trait KnowledgeBaseStore: Send + Sync {
         entry: KnowledgeEntry,
     ) -> impl Future<Output = Result<KnowledgeEntry, CoreError>> + Send;
 
-    /// Hybrid search combining vector similarity and full-text search via RRF.
-    /// The caller generates the embedding; Postgres runs both searches.
-    /// `tags` requires at least one matching tag (overlap); `exclude_tags`
-    /// removes any row carrying one of those tags.
+    /// Hybrid search over vector similarity and full-text match, ranked by the
+    /// activation score ([`crate::domain::activation`]).
+    ///
+    /// The caller generates the embedding; the adapter runs both arms. `tags`
+    /// requires at least one matching tag (overlap); `exclude_tags` removes any
+    /// row carrying one of those tags.
+    ///
+    /// **The arms admit and the score ranks** (#1167). The vector arm states
+    /// the store's own spread for this query and admits the nearest rows; the
+    /// full-text arm admits rows the vector arm cannot compare at all. Nothing
+    /// fuses two ranks any more: a rank is a position, and a position has
+    /// discarded the distance that produced it, so a fused score could not
+    /// carry the one dimensionless quantity the rest of retrieval ranks by.
+    /// Entries come back best first on that score, with the rows nothing could
+    /// measure after them in the order the database ranked them.
     ///
     /// `embedding_model` identifies the model that produced `query_embedding`
     /// and travels with it: only rows embedded by that model take part in the

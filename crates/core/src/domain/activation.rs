@@ -10,7 +10,7 @@
 //! ## The score
 //!
 //! ```text
-//! A_i = semantic + reinforcement + situation + salience
+//! A_i = semantic + lexical + reinforcement + situation + salience
 //! ```
 //!
 //! - **`semantic`** is how far the candidate stands out of its own source,
@@ -33,6 +33,12 @@
 //!   fan weighting behind it, and why the bound is a scale;
 //!   [`ActivationWeights::situation`] is the two lines that turn it into
 //!   deviations.
+//! - **`lexical`** is how much of the query's own words the candidate carries,
+//!   spent against the spread this query's own source has (#1239). It is the
+//!   full-text-rank term the table below listed as awaiting an input for as
+//!   long as no caller ran both modes at once; the knowledge-search tool runs
+//!   both over one store in one call, so it is the caller that supplies one.
+//!   [`ActivationWeights::lexical`] states the equivalence.
 //! - **`salience`** is how much of the salience information this build can
 //!   detect the entry carries (#1127), spent against the same lift.
 //!   [`crate::domain::salience`] states the signals, why they divide one lift
@@ -80,12 +86,14 @@
 //!
 //! | term | where its input will come from |
 //! | --- | --- |
-//! | full-text rank | a recall lookup uses one mode at a time, so a vector candidate carries no rank and a lexical one carries no distance - see [`RecallRelevance`] |
 //! | interference penalty | the entry disposition of #893, which no column holds yet |
 //!
 //! Each of them adds to `A_i` when it exists. The semantic term is already
 //! dimensionless, so a new term states its own weight in the same deviations and
-//! nothing already fitted has to move.
+//! nothing already fitted has to move - which is exactly how the lexical term
+//! joined, and what a recall lookup still answers
+//! [`NO_LEXICAL`] to, because it uses one mode at a time and so carries no rank
+//! (see [`RecallRelevance`]).
 //!
 //! [`RecallRelevance`]: crate::ports::recall::RecallRelevance
 
@@ -321,6 +329,54 @@ impl ActivationWeights {
         self.situation_lift().max(0.0) * coverage.min(1.0)
     }
 
+    /// What one query's own words are worth, in the source's own deviations.
+    ///
+    /// `spread * share`, over a share in `[0, 1]` - and this holds it to that
+    /// range whatever it is handed, so the bound is a property of the function
+    /// and not of its caller.
+    ///
+    /// **The equivalence, stated so it can be argued with.** A row that carries
+    /// the query's words better than anything else in the store stands as far
+    /// out of that store as its nearest row stands from its furthest. It is a
+    /// scale rather than a fit for the reason [`Self::reference_use_lift`] is:
+    /// it states a relation between two signals and computes the number, and it
+    /// introduces no coefficient of its own. Both factors are measured over the
+    /// same source in the same pass, so nothing here is carried from one
+    /// deployment to another.
+    ///
+    /// **Why the spread rather than one reference use.** The two cheap signals
+    /// are bounded by what one day-old use is worth, about a third of a
+    /// deviation, because each is a reading of something the entry happens to
+    /// look like. This is not that. A row the query names exactly, and that
+    /// nothing else in the store names, is the strongest evidence a text search
+    /// has - and a third of a deviation cannot move it off the bottom of a
+    /// page: measured on a seeded store, such a row sat thirteenth by distance,
+    /// and a lift that size left it thirteenth. A term too small to change an
+    /// order is a term that is not there.
+    ///
+    /// **Why the spread rather than the nearest row's own standing.** That
+    /// would make a full lexical match tie the best semantic match rather than
+    /// lead it, and a tie is settled by whatever the sort visited first - so
+    /// the answer would depend on the scan's order instead of on the score.
+    ///
+    /// Never negative. A row the query's words did not reach contributes
+    /// exactly zero, so a search over a store with no full-text hit ranks
+    /// exactly as it ranked before this term existed. Absence forfeits the
+    /// lift; it does not subtract.
+    ///
+    /// The spread is an extreme rather than a robust statistic, and that is a
+    /// deliberate exception to the rule the median and the deviation follow. It
+    /// is a **ceiling on a bounded share** here, not a unit anything is divided
+    /// by, so an unusual row at either end widens a lift rather than corrupting
+    /// every score - and the share is zero for every row the query's words did
+    /// not reach, so a widened ceiling reaches nobody who did not match.
+    pub fn lexical(&self, lexical: LexicalMatch) -> f64 {
+        if !lexical.share.is_finite() || lexical.share <= 0.0 || !lexical.spread.is_finite() {
+            return 0.0;
+        }
+        lexical.spread.max(0.0) * lexical.share.min(1.0)
+    }
+
     /// What a salience reading is worth, in the source's own deviations.
     ///
     /// `salience_lift * share`, over a share in `[0, 1]` -
@@ -345,6 +401,67 @@ impl ActivationWeights {
         self.salience_lift().max(0.0) * share.min(1.0)
     }
 }
+
+/// What one query's own words found, and how far this source lets anything
+/// stand out for that query (#1239).
+///
+/// **The full-text signal has no dispersion of its own that can be measured.**
+/// A `ts_rank` is a bare number, like a raw cosine distance, and it cannot
+/// cross a source boundary - but the obvious mirror of the semantic term does
+/// not work either: a full-text query usually matches a handful of rows, and
+/// the median absolute deviation of a handful is noise. Worse, the case this
+/// term exists for is the one where **one** row matches, where a spread over
+/// the matched set is not merely noisy but undefined.
+///
+/// So the two halves are measured separately, and both against the source:
+///
+/// - [`Self::share`] is where the row stands among the rows this query's words
+///   did reach - a ratio, so it carries no unit and needs no spread of its own.
+/// - [`Self::spread`] is how many of the source's own median absolute
+///   deviations separate its nearest row from its furthest, for this query. It
+///   is what turns the ratio into deviations, and it is a property of the
+///   source and of the query together, so it is measured in the pass that ranks
+///   and never cached.
+///
+/// [`ActivationWeights::lexical`] states what the two are worth together.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LexicalMatch {
+    /// Where this candidate stands among the rows the query's own words
+    /// reached, in `[0, 1]`: one for the best of them, zero for a row those
+    /// words did not reach at all.
+    ///
+    /// A ratio against this query's own best match rather than a raw rank, for
+    /// the reason the type's own documentation gives. A row the full-text arm
+    /// never returned carries [`NO_LEXICAL`].
+    pub share: f64,
+    /// How many of the source's own median absolute deviations separate its
+    /// nearest row from its furthest, for this query.
+    ///
+    /// Measured over every row the scan could reach, never over the rows it
+    /// returned: the returned rows are the near tail, which is the part a cued
+    /// query moves.
+    pub spread: f64,
+}
+
+impl LexicalMatch {
+    /// A candidate the query's own words did not reach, which is what every
+    /// caller with no full-text arm passes.
+    ///
+    /// Named rather than written as a pair of zeroes at each call site, for the
+    /// reason [`NO_SITUATION`] is. A recall lookup uses one mode at a time, so
+    /// its candidates carry either a distance or a rank and never both - see
+    /// [`RecallRelevance`](crate::ports::recall::RecallRelevance).
+    pub const NONE: Self = Self {
+        share: NO_LEXICAL,
+        spread: 0.0,
+    };
+}
+
+/// A share for a candidate the query's own words did not reach.
+///
+/// Named rather than written as a bare zero, for the reason [`NO_SITUATION`]
+/// is.
+pub const NO_LEXICAL: f64 = 0.0;
 
 /// A candidate the situation cannot grade, which is what every caller passes
 /// where no cue was measured or the entry has no record of its own.
@@ -376,6 +493,10 @@ pub const NO_SALIENCE: f64 = 0.0;
 /// detect the entry carries
 /// ([`SalienceReading::share`](crate::domain::salience::SalienceReading::share)),
 /// and [`NO_SALIENCE`] is the answer for a source that carries no readable text.
+/// `lexical` is how much of the query's own words the candidate carries and how
+/// far this source lets anything stand out for that query (#1239), and
+/// [`LexicalMatch::NONE`] is the answer wherever there is no full-text arm to
+/// read - which is every recall lookup, because one uses one mode at a time.
 ///
 /// Every extra signal is handed in already dimensionless, exactly as the
 /// semantic one is. That is what lets a fourth source, or a fifth term, join
@@ -385,11 +506,13 @@ pub fn activation(
     record: Option<&KnowledgeUseRecord>,
     situation_coverage: f64,
     salience_share: f64,
+    lexical: LexicalMatch,
     now: DateTime<Utc>,
     weights: &ActivationWeights,
 ) -> f64 {
     let sum = record.map_or(0.0, |record| record.use_sum(now, &weights.use_score));
     semantic
+        + weights.lexical(lexical)
         + weights.reinforcement(sum)
         + weights.situation(situation_coverage)
         + weights.salience(salience_share)
@@ -462,8 +585,24 @@ mod tests {
         let weights = ActivationWeights::default();
         let record = used(now, &[60, 600, 6_000], 3);
 
-        let first = activation(7.0, Some(&record), NO_SITUATION, NO_SALIENCE, now, &weights);
-        let again = activation(7.0, Some(&record), NO_SITUATION, NO_SALIENCE, now, &weights);
+        let first = activation(
+            7.0,
+            Some(&record),
+            NO_SITUATION,
+            NO_SALIENCE,
+            LexicalMatch::NONE,
+            now,
+            &weights,
+        );
+        let again = activation(
+            7.0,
+            Some(&record),
+            NO_SITUATION,
+            NO_SALIENCE,
+            LexicalMatch::NONE,
+            now,
+            &weights,
+        );
 
         assert_eq!(
             first, again,
@@ -504,8 +643,24 @@ mod tests {
             "precondition: equal elapsed time, so only the spacing differs"
         );
 
-        let spread_score = activation(7.0, Some(&spread), NO_SITUATION, NO_SALIENCE, now, &weights);
-        let massed_score = activation(7.0, Some(&massed), NO_SITUATION, NO_SALIENCE, now, &weights);
+        let spread_score = activation(
+            7.0,
+            Some(&spread),
+            NO_SITUATION,
+            NO_SALIENCE,
+            LexicalMatch::NONE,
+            now,
+            &weights,
+        );
+        let massed_score = activation(
+            7.0,
+            Some(&massed),
+            NO_SITUATION,
+            NO_SALIENCE,
+            LexicalMatch::NONE,
+            now,
+            &weights,
+        );
         assert!(
             spread_score > massed_score,
             "twenty uses spread over a year scored {spread_score}, twenty massed into a day \
@@ -545,6 +700,7 @@ mod tests {
             Some(&every_hour(now, 1)),
             NO_SITUATION,
             NO_SALIENCE,
+            LexicalMatch::NONE,
             now,
             &weights,
         );
@@ -554,6 +710,7 @@ mod tests {
                 Some(&every_hour(now, count)),
                 NO_SITUATION,
                 NO_SALIENCE,
+                LexicalMatch::NONE,
                 now,
                 &weights,
             );
@@ -588,6 +745,7 @@ mod tests {
             Some(&used(now, &[60], 1)),
             NO_SITUATION,
             NO_SALIENCE,
+            LexicalMatch::NONE,
             now,
             &weights,
         );
@@ -596,6 +754,7 @@ mod tests {
             Some(&used(now, &[30, 60], 2)),
             NO_SITUATION,
             NO_SALIENCE,
+            LexicalMatch::NONE,
             now,
             &weights,
         );
@@ -654,6 +813,7 @@ mod tests {
             Some(&veteran),
             NO_SITUATION,
             NO_SALIENCE,
+            LexicalMatch::NONE,
             now,
             &weights,
         );
@@ -673,7 +833,15 @@ mod tests {
             .iter()
             .chain(std::iter::once(&(BAR + MAX_REINFORCEMENT_DEVIATIONS)))
         {
-            let cold = activation(*best, None, NO_SITUATION, NO_SALIENCE, now, &weights);
+            let cold = activation(
+                *best,
+                None,
+                NO_SITUATION,
+                NO_SALIENCE,
+                LexicalMatch::NONE,
+                now,
+                &weights,
+            );
             assert!(
                 at_the_bar < cold,
                 "a veteran at the bar scored {at_the_bar} against a cold best match at \
@@ -705,12 +873,21 @@ mod tests {
         // context, which is the ordinary case rather than an extreme one.
         let worked_all_morning = evenly_over(now, 10, 1_800);
 
-        let best_cold_match = activation(7.3, None, NO_SITUATION, NO_SALIENCE, now, &weights);
+        let best_cold_match = activation(
+            7.3,
+            None,
+            NO_SITUATION,
+            NO_SALIENCE,
+            LexicalMatch::NONE,
+            now,
+            &weights,
+        );
         let just_above_the_bar = activation(
             6.9,
             Some(&worked_all_morning),
             NO_SITUATION,
             NO_SALIENCE,
+            LexicalMatch::NONE,
             now,
             &weights,
         );
@@ -753,6 +930,7 @@ mod tests {
             Some(&record),
             NO_SITUATION,
             NO_SALIENCE,
+            LexicalMatch::NONE,
             now,
             &weights,
         );
@@ -761,6 +939,7 @@ mod tests {
             Some(&record),
             NO_SITUATION,
             NO_SALIENCE,
+            LexicalMatch::NONE,
             now,
             &weights,
         );
@@ -782,7 +961,15 @@ mod tests {
 
         for semantic in [0.0, 6.8, 11.4, -3.0] {
             assert_eq!(
-                activation(semantic, None, NO_SITUATION, NO_SALIENCE, now, &weights),
+                activation(
+                    semantic,
+                    None,
+                    NO_SITUATION,
+                    NO_SALIENCE,
+                    LexicalMatch::NONE,
+                    now,
+                    &weights
+                ),
                 semantic,
                 "an unused entry must contribute nothing of its own"
             );
@@ -792,8 +979,24 @@ mod tests {
         // the same - the two differ only in whether a write ever happened.
         let unseen = KnowledgeUseRecord::unseen("kb-1", now);
         assert_eq!(
-            activation(6.8, Some(&unseen), NO_SITUATION, NO_SALIENCE, now, &weights),
-            activation(6.8, None, NO_SITUATION, NO_SALIENCE, now, &weights)
+            activation(
+                6.8,
+                Some(&unseen),
+                NO_SITUATION,
+                NO_SALIENCE,
+                LexicalMatch::NONE,
+                now,
+                &weights
+            ),
+            activation(
+                6.8,
+                None,
+                NO_SITUATION,
+                NO_SALIENCE,
+                LexicalMatch::NONE,
+                now,
+                &weights
+            )
         );
     }
 
@@ -821,9 +1024,18 @@ mod tests {
                 Some(&refuted),
                 NO_SITUATION,
                 NO_SALIENCE,
+                LexicalMatch::NONE,
+                now,
+                &weights,
+            ) < activation(
+                7.0,
+                None,
+                NO_SITUATION,
+                NO_SALIENCE,
+                LexicalMatch::NONE,
                 now,
                 &weights
-            ) < activation(7.0, None, NO_SITUATION, NO_SALIENCE, now, &weights)
+            )
         );
     }
 
@@ -865,6 +1077,7 @@ mod tests {
             Some(&used(now, &[a_day], 1)),
             NO_SITUATION,
             NO_SALIENCE,
+            LexicalMatch::NONE,
             now,
             &weights,
         );
@@ -884,12 +1097,21 @@ mod tests {
         let weights = ActivationWeights::default();
         let a_day = USE_REFERENCE_AGE_SECONDS as i64;
 
-        let nearer_but_unread = activation(9.10, None, NO_SITUATION, NO_SALIENCE, now, &weights);
+        let nearer_but_unread = activation(
+            9.10,
+            None,
+            NO_SITUATION,
+            NO_SALIENCE,
+            LexicalMatch::NONE,
+            now,
+            &weights,
+        );
         let further_but_used = activation(
             9.00,
             Some(&used(now, &[a_day], 1)),
             NO_SITUATION,
             NO_SALIENCE,
+            LexicalMatch::NONE,
             now,
             &weights,
         );
@@ -919,6 +1141,7 @@ mod tests {
             Some(&a_veteran(now)),
             NO_SITUATION,
             NO_SALIENCE,
+            LexicalMatch::NONE,
             now,
             &weights,
         );
@@ -954,6 +1177,7 @@ mod tests {
             None,
             1.0,
             NO_SALIENCE,
+            LexicalMatch::NONE,
             now,
             &weights,
         );
@@ -962,6 +1186,7 @@ mod tests {
             None,
             1.0,
             NO_SALIENCE,
+            LexicalMatch::NONE,
             now,
             &weights,
         );
@@ -996,6 +1221,7 @@ mod tests {
             Some(&used(now, &[a_day], 1)),
             NO_SITUATION,
             NO_SALIENCE,
+            LexicalMatch::NONE,
             now,
             &weights,
         );
@@ -1057,8 +1283,24 @@ mod tests {
         let now = now();
         let weights = ActivationWeights::default();
 
-        let recurs_here = activation(7.4, None, 1.0, NO_SALIENCE, now, &weights);
-        let written_elsewhere = activation(7.4, None, 0.0, NO_SALIENCE, now, &weights);
+        let recurs_here = activation(
+            7.4,
+            None,
+            1.0,
+            NO_SALIENCE,
+            LexicalMatch::NONE,
+            now,
+            &weights,
+        );
+        let written_elsewhere = activation(
+            7.4,
+            None,
+            0.0,
+            NO_SALIENCE,
+            LexicalMatch::NONE,
+            now,
+            &weights,
+        );
 
         assert!(
             recurs_here > written_elsewhere,
@@ -1080,7 +1322,15 @@ mod tests {
         let record = used(now, &[60, 6_000], 2);
 
         for semantic in [0.0, 6.8, 7.3, 11.4, -3.0] {
-            let cold = activation(semantic, None, NO_SITUATION, NO_SALIENCE, now, &weights);
+            let cold = activation(
+                semantic,
+                None,
+                NO_SITUATION,
+                NO_SALIENCE,
+                LexicalMatch::NONE,
+                now,
+                &weights,
+            );
             assert_eq!(
                 cold, semantic,
                 "an entry with no history and no situation must score its semantic signal alone"
@@ -1091,6 +1341,7 @@ mod tests {
                 Some(&record),
                 NO_SITUATION,
                 NO_SALIENCE,
+                LexicalMatch::NONE,
                 now,
                 &weights,
             );
@@ -1130,6 +1381,7 @@ mod tests {
             None,
             NO_SITUATION,
             1.0,
+            LexicalMatch::NONE,
             now,
             &weights,
         );
@@ -1138,6 +1390,7 @@ mod tests {
             None,
             NO_SITUATION,
             1.0,
+            LexicalMatch::NONE,
             now,
             &weights,
         );
@@ -1198,6 +1451,7 @@ mod tests {
             Some(&used(now, &[a_day], 1)),
             NO_SITUATION,
             NO_SALIENCE,
+            LexicalMatch::NONE,
             now,
             &weights,
         );
@@ -1266,8 +1520,24 @@ mod tests {
         let now = now();
         let weights = ActivationWeights::default();
 
-        let salient = activation(7.4, None, NO_SITUATION, 1.0, now, &weights);
-        let plain = activation(7.4, None, NO_SITUATION, NO_SALIENCE, now, &weights);
+        let salient = activation(
+            7.4,
+            None,
+            NO_SITUATION,
+            1.0,
+            LexicalMatch::NONE,
+            now,
+            &weights,
+        );
+        let plain = activation(
+            7.4,
+            None,
+            NO_SITUATION,
+            NO_SALIENCE,
+            LexicalMatch::NONE,
+            now,
+            &weights,
+        );
 
         assert!(
             salient > plain,
@@ -1290,7 +1560,15 @@ mod tests {
 
         for semantic in [0.0, 6.8, 7.3, 11.4, -3.0] {
             assert_eq!(
-                activation(semantic, None, NO_SITUATION, NO_SALIENCE, now, &weights),
+                activation(
+                    semantic,
+                    None,
+                    NO_SITUATION,
+                    NO_SALIENCE,
+                    LexicalMatch::NONE,
+                    now,
+                    &weights
+                ),
                 semantic
             );
             assert_eq!(
@@ -1299,8 +1577,9 @@ mod tests {
                     Some(&record),
                     NO_SITUATION,
                     NO_SALIENCE,
+                    LexicalMatch::NONE,
                     now,
-                    &weights
+                    &weights,
                 ),
                 semantic + weights.reinforcement(record.use_sum(now, &weights.use_score))
             );
@@ -1327,7 +1606,7 @@ mod tests {
         let weights = ActivationWeights::default();
         let one = weights.reference_use_lift();
 
-        let both_at_the_bar = activation(BAR, None, 1.0, 1.0, now, &weights);
+        let both_at_the_bar = activation(BAR, None, 1.0, 1.0, LexicalMatch::NONE, now, &weights);
         assert!(
             (both_at_the_bar - BAR - 2.0 * one).abs() < 1e-9,
             "a fully situated, fully salient candidate at the bar scored {both_at_the_bar}, and \
@@ -1342,7 +1621,16 @@ mod tests {
             weakest - BAR
         );
         assert!(
-            both_at_the_bar > activation(weakest, None, NO_SITUATION, NO_SALIENCE, now, &weights),
+            both_at_the_bar
+                > activation(
+                    weakest,
+                    None,
+                    NO_SITUATION,
+                    NO_SALIENCE,
+                    LexicalMatch::NONE,
+                    now,
+                    &weights
+                ),
             "on the most weakly cued prompt the corpus holds, an entry that recurs here and \
              carries every salience signal is supposed to lead"
         );
@@ -1360,7 +1648,16 @@ mod tests {
         );
         for best in wide {
             assert!(
-                both_at_the_bar < activation(best, None, NO_SITUATION, NO_SALIENCE, now, &weights),
+                both_at_the_bar
+                    < activation(
+                        best,
+                        None,
+                        NO_SITUATION,
+                        NO_SALIENCE,
+                        LexicalMatch::NONE,
+                        now,
+                        &weights
+                    ),
                 "a best match at {best} deviations must keep its line against both cheap terms"
             );
         }
@@ -1376,12 +1673,38 @@ mod tests {
         let weights = ActivationWeights::default();
         let record = used(now, &[600], 1);
 
-        let without = activation(7.0, Some(&record), NO_SITUATION, NO_SALIENCE, now, &weights);
+        let without = activation(
+            7.0,
+            Some(&record),
+            NO_SITUATION,
+            NO_SALIENCE,
+            LexicalMatch::NONE,
+            now,
+            &weights,
+        );
         assert_eq!(
-            activation(7.0, Some(&record), NO_SITUATION, 0.0, now, &weights),
+            activation(
+                7.0,
+                Some(&record),
+                NO_SITUATION,
+                0.0,
+                LexicalMatch::NONE,
+                now,
+                &weights
+            ),
             without
         );
-        assert!(activation(7.0, Some(&record), NO_SITUATION, 0.3, now, &weights) > without);
+        assert!(
+            activation(
+                7.0,
+                Some(&record),
+                NO_SITUATION,
+                0.3,
+                LexicalMatch::NONE,
+                now,
+                &weights
+            ) > without
+        );
     }
 
     /// A mismatched situation forfeits the lift; it never subtracts.
@@ -1394,12 +1717,38 @@ mod tests {
         let weights = ActivationWeights::default();
         let record = used(now, &[600], 1);
 
-        let without = activation(7.0, Some(&record), NO_SITUATION, NO_SALIENCE, now, &weights);
+        let without = activation(
+            7.0,
+            Some(&record),
+            NO_SITUATION,
+            NO_SALIENCE,
+            LexicalMatch::NONE,
+            now,
+            &weights,
+        );
         assert_eq!(
-            activation(7.0, Some(&record), 0.0, NO_SALIENCE, now, &weights),
+            activation(
+                7.0,
+                Some(&record),
+                0.0,
+                NO_SALIENCE,
+                LexicalMatch::NONE,
+                now,
+                &weights
+            ),
             without
         );
-        assert!(activation(7.0, Some(&record), 0.3, NO_SALIENCE, now, &weights) > without);
+        assert!(
+            activation(
+                7.0,
+                Some(&record),
+                0.3,
+                NO_SALIENCE,
+                LexicalMatch::NONE,
+                now,
+                &weights
+            ) > without
+        );
     }
 
     /// The situation cannot overturn a semantic lead, which is the other half of
@@ -1413,7 +1762,15 @@ mod tests {
         let now = now();
         let weights = ActivationWeights::default();
         let lift = weights.situation_lift();
-        let at_the_bar = activation(BAR, None, 1.0, NO_SALIENCE, now, &weights);
+        let at_the_bar = activation(
+            BAR,
+            None,
+            1.0,
+            NO_SALIENCE,
+            LexicalMatch::NONE,
+            now,
+            &weights,
+        );
 
         let wide: Vec<f64> = MEASURED_HITS
             .iter()
@@ -1427,11 +1784,195 @@ mod tests {
         );
         for best in wide {
             assert!(
-                at_the_bar < activation(best, None, NO_SITUATION, NO_SALIENCE, now, &weights),
+                at_the_bar
+                    < activation(
+                        best,
+                        None,
+                        NO_SITUATION,
+                        NO_SALIENCE,
+                        LexicalMatch::NONE,
+                        now,
+                        &weights
+                    ),
                 "a fully-situated candidate at the bar scored {at_the_bar} against a cold best \
                  match at {best} deviations"
             );
         }
+    }
+
+    // --- The query's own words (#1239) ---------------------------------------
+
+    /// A store whose nearest row for this query stands `spread` deviations
+    /// above its furthest, which is what a full lexical match is worth.
+    fn a_spread_of(spread: f64) -> LexicalMatch {
+        LexicalMatch { share: 1.0, spread }
+    }
+
+    /// Acceptance (#1239): a row that carries the query's own words better than
+    /// anything else in the store leads a row that is merely nearer.
+    ///
+    /// The case the term exists for, in the arithmetic that decides it. A store
+    /// whose nearest row stands four deviations above its furthest puts a
+    /// middling row - the one an exact-token query finds and an embedding does
+    /// not - above the nearest row, because carrying the words is worth that
+    /// whole spread.
+    #[test]
+    fn a_full_lexical_match_leads_a_row_that_is_merely_nearest() {
+        let now = now();
+        let weights = ActivationWeights::default();
+        let spread = 4.0;
+
+        let nearest = activation(
+            2.5,
+            None,
+            NO_SITUATION,
+            NO_SALIENCE,
+            LexicalMatch::NONE,
+            now,
+            &weights,
+        );
+        let middling_but_named = activation(
+            0.0,
+            None,
+            NO_SITUATION,
+            NO_SALIENCE,
+            a_spread_of(spread),
+            now,
+            &weights,
+        );
+
+        assert!(
+            middling_but_named > nearest,
+            "a row the query names exactly scored {middling_but_named} against the nearest row \
+             at {nearest}, and the words are supposed to be worth the store's whole spread"
+        );
+    }
+
+    /// Acceptance (#1239): a row the query's words did not reach is not lifted,
+    /// however far this source's rows are spread.
+    ///
+    /// The negative of the test above, and the property that makes the term
+    /// safe to add: a search over a store with no full-text hit ranks exactly
+    /// as it ranked before the term existed.
+    #[test]
+    fn a_row_the_querys_words_did_not_reach_is_not_lifted() {
+        let now = now();
+        let weights = ActivationWeights::default();
+        let record = used(now, &[600], 1);
+
+        for semantic in [0.0, 6.8, 7.3, 11.4, -3.0] {
+            let without = activation(
+                semantic,
+                Some(&record),
+                NO_SITUATION,
+                NO_SALIENCE,
+                LexicalMatch::NONE,
+                now,
+                &weights,
+            );
+            assert_eq!(
+                without,
+                semantic + weights.reinforcement(record.use_sum(now, &weights.use_score)),
+                "a candidate no full-text arm returned must score what it scored before the \
+                 term existed"
+            );
+            // A spread as wide as any store could state, and a share of nothing:
+            // the lift is the product, so it is still nothing.
+            assert_eq!(
+                activation(
+                    semantic,
+                    Some(&record),
+                    NO_SITUATION,
+                    NO_SALIENCE,
+                    LexicalMatch {
+                        share: NO_LEXICAL,
+                        spread: 20.0
+                    },
+                    now,
+                    &weights,
+                ),
+                without
+            );
+        }
+    }
+
+    /// Acceptance (#1239): the term is bounded by this query's own spread, and
+    /// it is that spread rather than a number of its own.
+    ///
+    /// The ceiling holds over every share a caller could hand in, including the
+    /// ones the type does not rule out - a value past one, a negative value,
+    /// and a value that is not a number.
+    #[test]
+    fn the_lexical_term_is_bounded_by_the_sources_own_spread() {
+        let weights = ActivationWeights::default();
+
+        for spread in [0.0, 0.5, 4.0, 13.0] {
+            for share in [0.0, 0.25, 0.5, 1.0, 1.5, 1e9, -1.0, f64::NAN, f64::INFINITY] {
+                let lift = weights.lexical(LexicalMatch { share, spread });
+                assert!(
+                    (0.0..=spread).contains(&lift),
+                    "a share of {share} against a spread of {spread} lifted {lift}, outside \
+                     the 0 to {spread} the term is bounded to"
+                );
+            }
+        }
+    }
+
+    /// Acceptance (#1239): the bound is a stated scale rather than a value
+    /// fitted to one store.
+    ///
+    /// What separates the two, testably, is that a scale carries no coefficient
+    /// of its own. The lexical lift is the source's own spread multiplied by a
+    /// ratio, so it is unmoved by every weight a deployment may fit - which is
+    /// what the two cheap signals cannot say, since both follow `use_lift`.
+    #[test]
+    fn the_lexical_bound_is_a_scale_and_introduces_no_coefficient() {
+        for decay in [0.1, 0.5, 0.9] {
+            for use_lift in [0.2, DEFAULT_USE_LIFT, 1.3] {
+                let weights = ActivationWeights {
+                    use_lift,
+                    use_score: UseScoreWeights {
+                        decay,
+                        ..UseScoreWeights::default()
+                    },
+                };
+                assert!(
+                    (weights.lexical(a_spread_of(4.0)) - 4.0).abs() < 1e-9,
+                    "at decay {decay} and lift {use_lift} a full lexical match was worth {}, \
+                     and a bound that moves with a weight somebody fitted is a fit rather than \
+                     a scale",
+                    weights.lexical(a_spread_of(4.0))
+                );
+            }
+        }
+    }
+
+    /// A partial match is worth its share of the spread, so a row that carries
+    /// some of the query's words does not rank as though it carried all of
+    /// them.
+    #[test]
+    fn a_partial_lexical_match_is_worth_its_share_of_the_spread() {
+        let weights = ActivationWeights::default();
+        let spread = 4.0;
+
+        let full = weights.lexical(LexicalMatch { share: 1.0, spread });
+        let half = weights.lexical(LexicalMatch { share: 0.5, spread });
+
+        assert!((full - spread).abs() < 1e-9);
+        assert!((half - spread / 2.0).abs() < 1e-9);
+    }
+
+    /// A source with no spread to state - one whose rows all sit at one
+    /// distance - lifts nothing, rather than dividing by nothing or lifting
+    /// everything.
+    #[test]
+    fn a_source_with_no_spread_lifts_no_lexical_match() {
+        let weights = ActivationWeights::default();
+
+        assert_eq!(weights.lexical(a_spread_of(0.0)), 0.0);
+        assert_eq!(weights.lexical(a_spread_of(-1.0)), 0.0);
+        assert_eq!(weights.lexical(a_spread_of(f64::NAN)), 0.0);
+        assert_eq!(weights.lexical(a_spread_of(f64::INFINITY)), 0.0);
     }
 
     /// Acceptance (#1123): scoring a corpus far larger than any one lookup reads
@@ -1461,6 +2002,7 @@ mod tests {
                     Some(record),
                     NO_SITUATION,
                     NO_SALIENCE,
+                    LexicalMatch::NONE,
                     now,
                     &weights,
                 )
