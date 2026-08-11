@@ -892,7 +892,8 @@ impl PgScratchpadStore {
                  FROM unnest(to_tsvector('english', $1))
              )
              SELECT id, conversation_id, owner_todo, note_key, content, note_type,
-                    seq, done, pinned, knowledge_entry_id, created_at, updated_at
+                    seq, done, pinned, after_outside_read, knowledge_entry_id,
+                    created_at, updated_at
              FROM scratchpads, q
              WHERE user_id = $2 AND conversation_id = $3
                AND q.query IS NOT NULL
@@ -1018,7 +1019,8 @@ impl PgScratchpadStore {
         let rows: Vec<SpRow> = sqlx::query_as(
             "WITH chunk_distances AS (
                 SELECT id, conversation_id, owner_todo, note_key, content, note_type,
-                       seq, done, pinned, knowledge_entry_id, created_at, updated_at,
+                       seq, done, pinned, after_outside_read, knowledge_entry_id,
+                       created_at, updated_at,
                        MIN(chunk <=> $1) AS min_distance
                 FROM scratchpads, unnest(embedding) AS chunk
                 WHERE user_id = $2 AND conversation_id = $3
@@ -1032,11 +1034,13 @@ impl PgScratchpadStore {
                            AND split_part(embedding_model, '@', 2)
                                = split_part($9, '@', 2)))
                 GROUP BY id, conversation_id, owner_todo, note_key, content, note_type,
-                         seq, done, pinned, knowledge_entry_id, created_at, updated_at
+                         seq, done, pinned, after_outside_read, knowledge_entry_id,
+                         created_at, updated_at
             ),
             vector_ranked AS (
                 SELECT id, conversation_id, owner_todo, note_key, content, note_type,
-                       seq, done, pinned, knowledge_entry_id, created_at, updated_at,
+                       seq, done, pinned, after_outside_read, knowledge_entry_id,
+                       created_at, updated_at,
                        ROW_NUMBER() OVER (ORDER BY min_distance) AS rank_v
                 FROM chunk_distances
                 ORDER BY min_distance
@@ -1044,7 +1048,8 @@ impl PgScratchpadStore {
             ),
             text_ranked AS (
                 SELECT id, conversation_id, owner_todo, note_key, content, note_type,
-                       seq, done, pinned, knowledge_entry_id, created_at, updated_at,
+                       seq, done, pinned, after_outside_read, knowledge_entry_id,
+                       created_at, updated_at,
                        ROW_NUMBER() OVER (ORDER BY ts_rank_cd(tsv, q.query) DESC) AS rank_t
                 FROM scratchpads, plainto_tsquery('english', $5) AS q(query)
                 WHERE user_id = $2 AND conversation_id = $3
@@ -1065,6 +1070,8 @@ impl PgScratchpadStore {
                        COALESCE(v.seq, t.seq) AS seq,
                        COALESCE(v.done, t.done) AS done,
                        COALESCE(v.pinned, t.pinned) AS pinned,
+                       COALESCE(v.after_outside_read, t.after_outside_read)
+                           AS after_outside_read,
                        COALESCE(v.knowledge_entry_id, t.knowledge_entry_id) AS knowledge_entry_id,
                        COALESCE(v.created_at, t.created_at) AS created_at,
                        COALESCE(v.updated_at, t.updated_at) AS updated_at,
@@ -1074,7 +1081,8 @@ impl PgScratchpadStore {
                 FULL OUTER JOIN text_ranked t ON v.id = t.id
             )
             SELECT id, conversation_id, owner_todo, note_key, content, note_type,
-                   seq, done, pinned, knowledge_entry_id, created_at, updated_at
+                   seq, done, pinned, after_outside_read, knowledge_entry_id,
+                   created_at, updated_at
             FROM fused ORDER BY rrf_score DESC, updated_at DESC, id DESC LIMIT $11",
         )
         .bind(embedding_vec)
