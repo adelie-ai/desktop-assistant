@@ -37,6 +37,7 @@ use desktop_assistant_core::ports::transport::{
     current_client_context, current_client_label, current_co_location, current_transport_kind,
 };
 use desktop_assistant_core::tag_normalize::normalize_tag;
+use desktop_assistant_core::tool_routing::{ToolLocation, compose_name};
 
 use crate::executor::McpControlHandle;
 
@@ -182,11 +183,6 @@ const TAG_CHECK_UNKNOWN: &str = "UNKNOWN";
 /// result is coherent in tests and in a build that never called
 /// `BuiltinToolService::with_topology`.
 const DEFAULT_DAEMON_HOST: &str = "this machine";
-
-/// What a device hit names as its host when the client reported no label
-/// (#1216). A hit must always name a machine, and an empty string reads as a
-/// name the model could quote back.
-const UNLABELLED_DEVICE_HOST: &str = "your device";
 
 /// How many daemon-side hits the tool registry is asked for.
 const REGISTRY_SEARCH_LIMIT: usize = 10;
@@ -2695,6 +2691,18 @@ impl BuiltinToolService {
     }
 
     async fn tool_search(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
+        /// The name the model must call for this hit (#1216).
+        ///
+        /// A search result is a discovery surface: the model calls what it
+        /// reads, so a hit carries the composed name the turn's tool table
+        /// advertises, not the provider's own. One composing function serves
+        /// both, so the two can never disagree. A name that cannot compose is
+        /// left as it is - the hit is then unreachable, which the turn's table
+        /// reports as a refused offer rather than this payload guessing.
+        fn composed(location: ToolLocation, provider_name: &str) -> String {
+            compose_name(location, provider_name).unwrap_or_else(|| provider_name.to_string())
+        }
+
         let search_fn = self
             .tool_search_fn
             .as_ref()
@@ -2744,15 +2752,6 @@ impl BuiltinToolService {
             .filter(|t| !(same_machine && daemon_name_set.contains(t.name.as_str())))
             .collect();
 
-        // The machine each hit runs on, by name (#1216). `runs_on` says what a
-        // hit reaches; `host` says which machine issues it, which is what a
-        // request about a particular machine - "read that file on the laptop" -
-        // has to match against. A hit that named no machine left the model
-        // nothing to match.
-        let device_host = current_client_label()
-            .filter(|label| !label.trim().is_empty())
-            .unwrap_or_else(|| UNLABELLED_DEVICE_HOST.to_string());
-
         let mut tools: Vec<serde_json::Value> =
             Vec::with_capacity(results.len() + device_hits.len());
         let mut runners_present: HashSet<ToolRunner> = HashSet::new();
@@ -2763,19 +2762,17 @@ impl BuiltinToolService {
                 .unwrap_or(ToolRunner::Daemon);
             runners_present.insert(runner);
             tools.push(serde_json::json!({
-                "name": tool.name,
+                "name": composed(ToolLocation::Daemon, &tool.name),
                 "description": tool.description,
                 "runs_on": runner.as_str(),
-                "host": self.daemon_host,
             }));
         }
         for tool in &device_hits {
             runners_present.insert(ToolRunner::Device);
             tools.push(serde_json::json!({
-                "name": tool.name,
+                "name": composed(ToolLocation::Client, &tool.name),
                 "description": tool.description,
                 "runs_on": ToolRunner::Device.as_str(),
-                "host": device_host,
             }));
         }
 
@@ -8724,14 +8721,12 @@ mod tests {
         );
     }
 
-    /// #1216 AC3: a hit carries the host it runs on, by name. A model asked to
-    /// read a file "on the laptop" cannot pick from a result that names no
-    /// machine, and `runs_on` alone does not name one.
+    /// #1216: a hit carries the name the model must call. The advertised set
+    /// composes a location root onto every provider name, so a hit reporting
+    /// the provider's own name would offer the model a name that does not
+    /// resolve.
     #[tokio::test]
-    async fn tool_search_result_names_the_host_of_each_hit() {
-        use desktop_assistant_core::ports::transport::with_client_label;
-        use std::collections::HashMap;
-
+    async fn tool_search_reports_the_composed_name_of_each_hit() {
         let service = BuiltinToolService::new()
             .with_tool_registry(
                 fixed_search(vec![ToolDefinition::new(
@@ -8742,46 +8737,6 @@ mod tests {
                 noop_definition_fn(),
             )
             .with_topology("daemon-host", false);
-        let json = with_client_label(
-            Some("laptop".to_string()),
-            search_with_client_tools(
-                &service,
-                "read a file",
-                vec![ToolDefinition::new(
-                    "device__read_file",
-                    "Read a file on the user's own computer",
-                    serde_json::json!({}),
-                )],
-            ),
-        )
-        .await;
-        let hosts: HashMap<&str, &str> = json["tools"]
-            .as_array()
-            .expect("hits")
-            .iter()
-            .map(|t| {
-                (
-                    t["name"].as_str().expect("a name"),
-                    t["host"].as_str().unwrap_or("<no host>"),
-                )
-            })
-            .collect();
-        assert_eq!(
-            hosts["fileio__read_file"], "daemon-host",
-            "a daemon hit names the daemon's machine: {json}"
-        );
-        assert_eq!(
-            hosts["device__read_file"], "laptop",
-            "a device hit names the client's machine: {json}"
-        );
-    }
-
-    /// A client that reported no host label still leaves every hit with a host
-    /// a person can read, rather than an empty string.
-    #[tokio::test]
-    async fn a_device_hit_from_an_unlabelled_client_still_names_a_host() {
-        let service = BuiltinToolService::new()
-            .with_tool_registry(fixed_search(Vec::new()), noop_definition_fn());
         let json = search_with_client_tools(
             &service,
             "read a file",
@@ -8792,7 +8747,17 @@ mod tests {
             )],
         )
         .await;
-        assert_eq!(json["tools"][0]["host"], "your device");
+        let names: Vec<&str> = json["tools"]
+            .as_array()
+            .expect("hits")
+            .iter()
+            .map(|t| t["name"].as_str().expect("a name"))
+            .collect();
+        assert_eq!(
+            names,
+            vec!["daemon_fileio__read_file", "client_device__read_file"],
+            "a hit names the tool as the model must call it: {json}"
+        );
     }
 
     #[tokio::test]

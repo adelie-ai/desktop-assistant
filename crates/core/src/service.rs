@@ -63,9 +63,7 @@ use crate::tool_provenance::{
     GATE_CLOSED_STATUS, GATE_OPEN_STATUS, GateChange, ToolGate, ToolPolicy, TurnProvenance,
     WITHHELD_STEP_TEXT, gated_tiers, is_withheld_step_text,
 };
-use crate::tool_routing::{
-    HOST_ARGUMENT, Route, RoutedTool, RoutingPolicy, ToolRouter, take_host_argument,
-};
+use crate::tool_routing::{Route, RoutedTool, ToolConnection, ToolRouter, strip_location};
 use crate::tools::{
     NoopToolExecutor, categorize_tool_namespaces, summarize_tool_name, summarize_tool_text,
     summarize_tool_value, tool_set_hash,
@@ -2714,7 +2712,11 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
         let device_label = current_client_label()
             .filter(|l| !l.trim().is_empty())
             .unwrap_or_default();
-        let tool_locality = ToolLocalityContext {
+        // Mutable because the two name sets are rewritten each round to the
+        // composed names the round's table produced: the note names tools to
+        // the model, and a name the model cannot call is worse than no name.
+        // The bare sets above serve the one report that needs them, just made.
+        let mut tool_locality = ToolLocalityContext {
             co_located: current_co_location(),
             transport: current_transport_kind(),
             host: self.host.clone(),
@@ -2724,41 +2726,19 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
             client_tool_names: client_tool_defs.iter().map(|d| d.name.clone()).collect(),
         };
 
-        // Report the client tools that share a name with a daemon-side one
-        // (#1083). The round's tool table advertises one definition per name,
-        // chosen by the routing policy, and routes the call to the host that
-        // definition came from - so the daemon-side tool is the one the model
-        // is shown and the one an unqualified call reaches. The client's twin
-        // is still reachable: the advertised schema carries the host argument,
-        // and a call that names the device runs there (#1216). Reported once
-        // here, where the collision is resolved, rather than on every note
-        // build.
-        //
-        // On one machine the two are the same machine anyway. On two machines
-        // the choice matters, which is why it is a warning: a tool registered
-        // to act on the user's own machine only acts there when the model says
-        // so, and a client that meant it to be the default should give it a
-        // name of its own.
+        // A client tool whose bare name a daemon-side tool also holds is no
+        // longer shadowed (#1083): the two compose under different roots, so
+        // both are offered and both are callable. It is still worth a line at
+        // DEBUG, because an operator reading logs will see two similar tools
+        // and should know why. The fault that does matter now - two connections
+        // claiming one composed name - is reported by the round's table below.
         let shadowed = tool_locality.shadowed_client_tools();
         if !shadowed.is_empty() {
-            if tool_locality.is_co_located() {
-                tracing::info!(
-                    tools = ?shadowed,
-                    policy = RoutingPolicy::PreferCoLocated.as_str(),
-                    "client tools share a name with a daemon-side tool; the daemon-side \
-                     one answers by default, and both run on this one machine"
-                );
-            } else {
-                tracing::warn!(
-                    tools = ?shadowed,
-                    policy = RoutingPolicy::PreferCoLocated.as_str(),
-                    host_argument = HOST_ARGUMENT,
-                    "client tools share a name with a daemon-side tool; the daemon-side one \
-                     answers by default and acts on the daemon's machine. The client's tool \
-                     runs only when the call names the device. Rename them (for example with \
-                     a namespace) to make them the default"
-                );
-            }
+            tracing::debug!(
+                tools = ?shadowed,
+                "client tools share a bare name with a daemon-side tool; both are offered, \
+                 each under its own name"
+            );
         }
 
         // Per-turn step stack for the planning + compaction tools (#240).
@@ -2914,51 +2894,59 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
             }
             round_starts.push(conv.messages.len());
 
-            // Build the round's tool table (#1216). Every name this round can
-            // reach goes in it once per host, and the table answers both
-            // questions the loop asks about a name: which definition the model
-            // is shown, and which host runs the call. They were two lookups
-            // over two tables with opposite precedence, so a name both sides
-            // offered was advertised from one host and executed on the other.
+            // Build the round's tool table (#1216). Every tool the round can
+            // reach goes in it once, under the name the model reads, and the
+            // table answers both questions the loop asks: which definition the
+            // model is shown, and which connection runs the call. They were two
+            // lookups over two tables with opposite precedence, so a name both
+            // sides offered was advertised from one and executed on the other.
             //
-            // Offer order still decides where a name sits in the advertised
-            // block - core, then activated, then the client's - which is what
-            // the provider's prompt cache reads, and it is unchanged by this
-            // table. It no longer decides which host answers for a name; that
-            // is the router's policy.
-            let mut router = ToolRouter::new(
-                RoutingPolicy::PreferCoLocated,
-                &self.host,
-                device_label.as_str(),
-            );
+            // Each offer names the connection it came from. That is the unit of
+            // locality - a client device, an MCP server, or the daemon's own
+            // built-ins - and it is where the location is read from later.
+            // Nothing reads a name to decide where a tool runs.
+            let mut router = ToolRouter::new();
             // When hosted search has been demoted, offer the full core set
-            // (which includes builtin_tool_search) instead of the filtered one.
-            router.offer_daemon_tools(if hosted_search_demoted {
-                &core_tools
-            } else {
-                &core_tools_for_llm
-            });
-            router.offer_daemon_tools(&activated_tools);
+            // (which includes the discovery tool) instead of the filtered one.
+            router.offer(
+                &ToolConnection::daemon_builtins(),
+                if hosted_search_demoted {
+                    &core_tools
+                } else {
+                    &core_tools_for_llm
+                },
+            );
+            // Anything a tool search activated, attributed to the server that
+            // offers it where this turn can name one. A tool the turn cannot
+            // attribute belongs to the registry as a whole, which is a distinct
+            // connection so that a collision with a built-in is still reported.
+            for def in &activated_tools {
+                let connection = namespaces
+                    .iter()
+                    .find(|ns| ns.tools.iter().any(|t| t.name == def.name))
+                    .map_or_else(ToolConnection::daemon_registry, |ns| {
+                        ToolConnection::daemon_server(&ns.name)
+                    });
+                router.offer(&connection, std::slice::from_ref(def));
+            }
             // The daemon's deferred fleet, when the provider's own tool search
             // is carrying it. The model can call these by name, so the table
-            // has to route them - and a name one of them shares with a client
-            // tool has to be resolved once rather than once per surface. They
-            // are not advertised in the block; `offered_namespaces` below takes
-            // the ones the table still answers with their own entry.
+            // has to route them, and they count for uniqueness like everything
+            // else. Their schemas travel in the namespaces rather than the
+            // block; `offered_namespaces` below takes the ones still reached
+            // that way.
             if use_hosted_search && !hosted_search_demoted {
                 for ns in &namespaces {
-                    router.offer_deferred_daemon_tools(&ns.tools);
+                    router.offer_deferred(&ToolConnection::daemon_server(&ns.name), &ns.tools);
                 }
             }
-            // The connection's registered client-local tools (#234), hosted on
-            // the user's own machine.
-            router.offer_device_tools(&client_tool_defs);
+            // The connection's registered client-local tools (#234), which run
+            // on the user's own machine.
+            router.offer(&ToolConnection::client_device(), &client_tool_defs);
             // The step-planning + compaction tools (#240) when a scratchpad
-            // writer is wired. They are the loop's own control surface -
-            // intercepted by name in the dispatch loop below rather than routed
-            // to an executor - so the table ranks them above any hosted tool of
-            // the same name, and dispatch reads that ranking rather than
-            // re-deciding it. Without a writer wired they stay off entirely.
+            // writer is wired. They are the loop's own control surface - it runs
+            // them itself, before any executor - so they have no connection and
+            // take no location root. Without a writer wired they stay off.
             if self.scratchpad_write.is_some() {
                 router.offer_core_loop_tool(planning::begin_step_tool());
                 router.offer_core_loop_tool(planning::complete_step_tool());
@@ -2971,18 +2959,32 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 }
             }
 
+            // Two connections claiming one name is a configuration fault, not a
+            // case with semantics: the table refused the second, and this names
+            // both so a person can see what to rename. Once per turn - the
+            // table is rebuilt every round and would otherwise repeat it.
+            if round == 0 {
+                for duplicate in router.duplicates() {
+                    tracing::warn!(
+                        name = %Safe::name(&duplicate.name),
+                        held_by = %Safe::name(&duplicate.held_by),
+                        refused = %Safe::name(&duplicate.refused),
+                        "two connections claim one tool name; the second is not offered. \
+                         Give one of them a namespace of its own"
+                    );
+                }
+            }
+
             // Restrict the round's table to the caller's allowlist (issues
             // #291 / #133) so a restricted subagent's LLM only ever sees the
             // tools it may use - and, because dispatch resolves through the
             // same table, can only reach what it saw. `None` ⇒ no restriction;
-            // an empty allowlist ⇒ no tools. The step-planning pair is exempt:
-            // they're the loop's own control surface, not delegable
-            // capabilities. Every other core-loop name an allowlist leaves out
-            // is dropped here and therefore refused at dispatch, rather than
-            // intercepted ahead of the check - the table is what dispatch
-            // reads, so what the caller may not see, it may not reach either.
-            // Dispatch still re-checks the allowlist below for a name the
-            // table never held.
+            // an empty allowlist ⇒ no tools. An allowlist names tools as their
+            // providers name them, without a location: where a tool ran is this
+            // turn's fact, not part of what the caller was permitted. The
+            // step-planning pair is exempt - the loop's own control surface is
+            // not a delegable capability - and dispatch re-checks the allowlist
+            // below for a name the table never held.
             if let Some(allowed) = current_tool_allowlist() {
                 router.retain(|name| {
                     name == planning::BEGIN_STEP_TOOL
@@ -2990,6 +2992,13 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                         || allowed.iter().any(|a| a == name)
                 });
             }
+
+            // The note names tools to the model, so it names them as the model
+            // must write them. Read from the table rather than from the names.
+            tool_locality.server_tool_names =
+                router.advertised_names_at(crate::tool_routing::ToolLocation::Daemon);
+            tool_locality.client_tool_names =
+                router.advertised_names_at(crate::tool_routing::ToolLocation::Client);
 
             let tool_defs: Vec<ToolDefinition> = router.advertised_definitions();
 
@@ -3589,7 +3598,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 // silently defaulted to `null` — the tool would run with
                 // garbage arguments and the model would get a confusing
                 // tool-specific error instead of the real cause (DA-13).
-                let mut arguments: serde_json::Value = if tool_call.arguments.trim().is_empty() {
+                let arguments: serde_json::Value = if tool_call.arguments.trim().is_empty() {
                     serde_json::json!({})
                 } else {
                     match serde_json::from_str(&tool_call.arguments) {
@@ -3611,75 +3620,27 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                         }
                     }
                 };
-                // The host the model stated, taken off the arguments before
-                // anything else reads them (#1216). It is the harness's field,
-                // not the tool's: no tool receives it, and the negative-memory
-                // digest below is taken without it, so a lesson learned about
-                // a call on one machine still matches the same call on another.
-                let requested_host = take_host_argument(&mut arguments);
-
-                // Where this call goes. The round's tool table answers it, and
-                // the same table chose the definition the model was shown, so
-                // the schema it read and the host that runs the call are one
-                // answer rather than two that may differ (#1216).
-                let route = router.resolve(&tool_call.name, requested_host.as_deref());
-                // A stated host the loop cannot honour is refused, never
-                // quietly reinterpreted as another one. Two shapes reach here:
-                // a host that does not run this tool, and a host stated for a
-                // name this turn's table does not hold at all - that one falls
-                // through to the daemon executor below, whose routing table
-                // outlives the turn, so a stated daemon host is honoured and
-                // anything else cannot be.
-                let unhonoured_host = match &route {
-                    Route::UnknownHost { asked, available } => Some((
-                        asked.clone(),
-                        format!(
-                            "Error: '{}' does not run on '{asked}'. It runs on: {}. Set \
-                             `{HOST_ARGUMENT}` to one of those, or leave it out and the host \
-                             is chosen for you.",
-                            tool_call.name,
-                            available.join(", ")
-                        ),
-                    )),
-                    Route::Unrouted => requested_host
-                        .as_deref()
-                        .filter(|asked| !crate::tool_routing::is_daemon_token(asked))
-                        .map(|asked| {
-                            (
-                                asked.to_string(),
-                                format!(
-                                    "Error: '{}' is not offered on '{asked}' this turn, so the \
-                                     call was not made. Search for the tool you need, or leave \
-                                     `{HOST_ARGUMENT}` out.",
-                                    tool_call.name
-                                ),
-                            )
-                        }),
-                    Route::Found(_) => None,
-                };
-                if let Some((asked, refusal)) = unhonoured_host {
-                    tracing::info!(
-                        tool = %Safe::name(&tool_call.name),
-                        host = %Safe::name(&asked),
-                        "tool call named a host that does not run this tool"
-                    );
-                    notify_tool_event(ToolEvent::Started {
-                        name: summarize_tool_name(&tool_call.name),
-                        args: summarize_tool_value(&arguments),
-                    });
-                    notify_tool_event(ToolEvent::Finished {
-                        name: summarize_tool_name(&tool_call.name),
-                        ok: false,
-                        output: format!("no such host: {asked}"),
-                    });
-                    conv.messages
-                        .push(Message::tool_result(&tool_call.id, &refusal));
-                    continue;
-                }
+                // The tool this name names. One lookup, and the same table the
+                // advertised set was built from, so the schema the model read
+                // and the tool that runs cannot be two answers (#1216).
+                let route = router.resolve(&tool_call.name);
                 let routed: Option<&RoutedTool> = match &route {
                     Route::Found(entry) => Some(entry),
-                    Route::UnknownHost { .. } | Route::Unrouted => None,
+                    Route::Unrouted => None,
                 };
+                // The provider's own name, which is what everything except the
+                // model uses: the executor that runs it, the provenance gate
+                // that classifies it, the caller's allowlist, and the lesson a
+                // failure writes. The location root is the daemon's own
+                // bookkeeping and must never reach a learning key - a burn
+                // keyed on a prefixed name would teach nothing about the same
+                // tool on another machine, and nobody would see it happen
+                // (#1126). A name the table does not hold is stripped the same
+                // way: the model may be calling a tool it learned last turn.
+                let call_name: &str = routed.map_or_else(
+                    || strip_location(&tool_call.name),
+                    RoutedTool::provider_name,
+                );
 
                 // A tool call's arguments are content: the model puts the
                 // user's document, file path or credential in them. INFO
@@ -3710,7 +3671,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 // finished plan as a skill (#1155) reads the same plan the step
                 // tools write, so it is intercepted here too.
                 if routed.is_some_and(RoutedTool::is_core_loop)
-                    && tool_call.name == skill_promotion::PROMOTE_PLAN_TOOL
+                    && call_name == skill_promotion::PROMOTE_PLAN_TOOL
                 {
                     let ack = self
                         .handle_promote_plan(
@@ -3727,8 +3688,8 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 }
 
                 if routed.is_some_and(RoutedTool::is_core_loop)
-                    && (tool_call.name == planning::BEGIN_STEP_TOOL
-                        || tool_call.name == planning::COMPLETE_STEP_TOOL)
+                    && (call_name == planning::BEGIN_STEP_TOOL
+                        || call_name == planning::COMPLETE_STEP_TOOL)
                 {
                     // Step-level narration: announce the logical step the model
                     // just declared, once, as its goal. A step spans multiple
@@ -3737,7 +3698,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                     // silent, and neither control tool gets a completion status
                     // of its own - the `continue` at the end of this branch
                     // keeps them out of the dispatch path that emits one.
-                    if tool_call.name == planning::BEGIN_STEP_TOOL
+                    if call_name == planning::BEGIN_STEP_TOOL
                         && let Some(goal) = arguments.get("goal").and_then(|v| v.as_str())
                     {
                         let goal = goal.trim();
@@ -3783,7 +3744,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 // execution below, and `spawn_subagent` runs normally. Gated on
                 // the same condition that advertises the planning tools.
                 let mut pending_child_scope: Option<SubagentScope> = None;
-                if self.scratchpad_write.is_some() && tool_call.name == SPAWN_SUBAGENT_TOOL {
+                if self.scratchpad_write.is_some() && call_name == SPAWN_SUBAGENT_TOOL {
                     let base = current_owner_todo().unwrap_or_default();
                     let (fanned_key, _seq) = step_stack
                         .fan_out(1)
@@ -3823,7 +3784,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 // handled above are intentionally exempt (they aren't real tool
                 // work and were never advertised through the allowlist).
                 if let Some(allowed) = current_tool_allowlist()
-                    && !allowed.iter().any(|t| t == &tool_call.name)
+                    && !allowed.iter().any(|t| t == call_name)
                 {
                     tracing::warn!(
                         tool = %Safe::name(&tool_call.name),
@@ -3861,7 +3822,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 // this one says WHAT a tool may do given what the turn has
                 // already read.
                 if let ToolGate::Refuse(refusal) =
-                    turn_provenance.check(&tool_call.name, current_turn_interactivity())
+                    turn_provenance.check(call_name, current_turn_interactivity())
                 {
                     tracing::warn!(
                         tool = %Safe::name(&tool_call.name),
@@ -3902,7 +3863,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 // therefore no warning. Nothing is learned from such a call
                 // either, so the two halves stay symmetric.
                 let pending_action = turn_situation.as_ref().map(|situation| {
-                    PendingAction::observe(tool_call.name.clone(), &arguments, situation)
+                    PendingAction::observe(call_name.to_string(), &arguments, situation)
                 });
                 // The digest costs a hash, so it is taken once and shared by
                 // the places that need it.
@@ -3978,7 +3939,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 // server-side, because the executor's routing table outlives
                 // the turn and the client's registrations do not.
                 let client_exec = match (&client_tool_port, routed) {
-                    (Some(port), Some(entry)) if entry.host().is_client() => Some(port),
+                    (Some(port), Some(entry)) if entry.is_client() => Some(port),
                     _ => None,
                 };
 
@@ -4009,19 +3970,19 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 // fallthrough is rare, and it is the daemon's own tool list,
                 // which is what bounds the label. A name the model invented is
                 // in neither set.
-                let known = tool_defs.iter().any(|t| t.name == tool_call.name)
+                let known = routed.is_some()
                     || namespaces
                         .iter()
-                        .any(|ns| ns.tools.iter().any(|t| t.name == tool_call.name))
+                        .any(|ns| ns.tools.iter().any(|t| t.name == call_name))
                     || self
                         .tools
-                        .tool_definition(&tool_call.name)
+                        .tool_definition(call_name)
                         .await
                         .ok()
                         .flatten()
                         .is_some();
                 let tool_span =
-                    crate::telemetry::tool_span(round_report.span(), &tool_call.name, tool_runner);
+                    crate::telemetry::tool_span(round_report.span(), call_name, tool_runner);
                 let tool_started = std::time::Instant::now();
 
                 // `tool_ok` is tracked alongside the result so the observer can
@@ -4029,7 +3990,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 // into the tool result (and keeps looping on).
                 let (result, tool_ok) = if let Some(port) = client_exec {
                     match port
-                        .execute(&tool_call.id, &tool_call.name, arguments)
+                        .execute(&tool_call.id, call_name, arguments)
                         .instrument(tool_span.clone())
                         .await
                     {
@@ -4078,7 +4039,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                     // of tool execution so conversation-scoped builtins (the
                     // scratchpad) can resolve which pad they operate on without
                     // the `ToolExecutor` port growing a conversation parameter.
-                    let exec = self.tools.execute_tool(&tool_call.name, arguments);
+                    let exec = self.tools.execute_tool(call_name, arguments);
                     let scoped = with_conversation_id(conversation_id.clone(), exec);
                     // Take in whatever the turn has appended since the last
                     // dispatch, then install the transcript this tool may read
@@ -4174,7 +4135,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 tool_span.record("outcome", tool_outcome.as_label());
                 crate::telemetry::record_tool_call(
                     tool_started.elapsed(),
-                    &tool_call.name,
+                    call_name,
                     known,
                     tool_outcome,
                 );
@@ -4222,7 +4183,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 // activate the discovered tools for subsequent rounds.
                 // Skip when hosted search is active (unless demoted to local fallback).
                 if (!use_hosted_search || hosted_search_demoted)
-                    && tool_call.name == "builtin_tool_search"
+                    && call_name == "builtin_tool_search"
                     && let Ok(found) = serde_json::from_str::<serde_json::Value>(&result)
                     && let Some(tools_arr) = found.get("tools").and_then(|v| v.as_array())
                 {
@@ -4240,7 +4201,10 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                         {
                             continue;
                         }
-                        if let Some(name) = tool_entry.get("name").and_then(|v| v.as_str())
+                        if let Some(name) = tool_entry
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .map(strip_location)
                             && !activated_tools.iter().any(|t| t.name == name)
                             && !core_tools.iter().any(|t| t.name == name)
                             && let Ok(Some(def)) = self.tools.tool_definition(name).await
@@ -4267,12 +4231,12 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 // there.
                 if use_hosted_search
                     && !hosted_search_demoted
-                    && routed.is_none_or(|entry| entry.host().is_server())
-                    && !activated_tools.iter().any(|t| t.name == tool_call.name)
-                    && !core_tools.iter().any(|t| t.name == tool_call.name)
+                    && routed.is_none_or(|entry| !entry.is_client())
+                    && !activated_tools.iter().any(|t| t.name == call_name)
+                    && !core_tools.iter().any(|t| t.name == call_name)
                 {
                     for ns in &namespaces {
-                        if ns.tools.iter().any(|t| t.name == tool_call.name) {
+                        if ns.tools.iter().any(|t| t.name == call_name) {
                             for t in &ns.tools {
                                 if !activated_tools.iter().any(|a| a.name == t.name)
                                     && !core_tools.iter().any(|ct| ct.name == t.name)
@@ -10979,13 +10943,12 @@ mod tests {
         (out, captured)
     }
 
-    // --- #1216: a tool's identity is the pair (capability name, host) ---
+    // --- #1216: unique names, and one table that resolves them ---
 
     /// A server-side executor that records what it ran and with what arguments.
     ///
     /// `core` is advertised every round. `registry` is reachable only through a
-    /// tool search, which is where a device hit and a daemon hit of one name
-    /// meet.
+    /// tool search.
     struct RecordingToolExecutor {
         core: Vec<ToolDefinition>,
         registry: Vec<ToolDefinition>,
@@ -11042,7 +11005,7 @@ mod tests {
     /// A handler whose daemon side and client side both offer `read_file`.
     /// Returns the handler and a handle on every tool set the model was shown.
     #[allow(clippy::type_complexity)]
-    fn collided_handler(
+    fn two_sided_handler(
         responses: Vec<LlmResponse>,
         core: Vec<ToolDefinition>,
         registry: Vec<ToolDefinition>,
@@ -11074,81 +11037,23 @@ mod tests {
         (handler, advertised)
     }
 
-    /// #1216 AC2: the schema the model is shown and the host that executes
-    /// always agree. Pinned for the collision case: one capability name, one
-    /// definition on each side, one call.
-    #[tokio::test]
-    async fn advertised_schema_and_executing_host_agree_on_a_collided_name() {
-        use crate::ports::client_tools::with_client_tools;
-
-        let responses = vec![
-            LlmResponse::with_tool_calls(
-                "",
-                vec![ToolCall::new("c1", "read_file", r#"{"path":"/etc/hosts"}"#)],
-            ),
-            LlmResponse::text("done"),
-        ];
-        let daemon_ran = Arc::new(Mutex::new(Vec::new()));
-        let (handler, advertised) = collided_handler(
-            responses,
-            vec![daemon_read_file()],
-            vec![],
-            HashMap::from([("read_file".to_string(), "daemon result".to_string())]),
-            Arc::clone(&daemon_ran),
-        );
-        let conv = handler
-            .create_conversation("t".into(), vec![])
-            .await
-            .unwrap();
-        let device_ran = Arc::new(Mutex::new(Vec::new()));
-        let port: Arc<dyn crate::ports::client_tools::ClientToolPort> =
-            Arc::new(FakeClientToolPort::ok(
-                vec![device_read_file()],
-                Arc::clone(&device_ran),
-                "device result",
-            ));
-        with_client_tools(
-            port,
-            handler.send_prompt(&conv.id, "read it".into(), noop_callback(), noop_status()),
-        )
-        .await
-        .expect("turn completes");
-
-        let rounds = advertised.lock().unwrap().clone();
-        let shown: Vec<&ToolDefinition> = rounds
-            .first()
-            .expect("the model was called")
-            .iter()
-            .filter(|t| t.name == "read_file")
-            .collect();
-        assert_eq!(shown.len(), 1, "one capability name, one advertised entry");
-
-        let on_daemon = daemon_ran
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|(name, _)| name == "read_file");
-        let on_device = !device_ran.lock().unwrap().is_empty();
-        assert!(
-            on_daemon ^ on_device,
-            "exactly one host runs the call: daemon={on_daemon} device={on_device}"
-        );
-        let expected = if on_device {
-            "DEVICE read_file"
-        } else {
-            "DAEMON read_file"
-        };
-        assert_eq!(
-            shown[0].description, expected,
-            "the model was shown one host's schema and the call ran on the other"
-        );
+    fn client_port(
+        defs: Vec<ToolDefinition>,
+        ran: &Arc<Mutex<Vec<(String, String)>>>,
+    ) -> Arc<dyn crate::ports::client_tools::ClientToolPort> {
+        Arc::new(FakeClientToolPort::ok(
+            defs,
+            Arc::clone(ran),
+            "device result",
+        ))
     }
 
-    /// #1216 AC1: the same capability on two hosts is two addressable things.
-    /// The model reaches each one deliberately by naming the host, and the
-    /// name it calls is the same in both cases.
+    /// #1216: one capability offered by two connections is two names, and each
+    /// name runs on the connection it came from. This is the defect #1215
+    /// demonstrated - the model shown the daemon's schema while the client
+    /// executed - and unique names remove the contest entirely.
     #[tokio::test]
-    async fn both_hosts_of_a_collided_capability_are_reachable_by_naming_the_host() {
+    async fn a_capability_on_two_connections_is_two_names_and_two_routes() {
         use crate::ports::client_tools::with_client_tools;
 
         let responses = vec![
@@ -11156,22 +11061,22 @@ mod tests {
                 "",
                 vec![ToolCall::new(
                     "c1",
-                    "read_file",
-                    r#"{"path":"/etc/hosts","__host":"device"}"#,
+                    "daemon_read_file",
+                    r#"{"path":"/etc/hosts"}"#,
                 )],
             ),
             LlmResponse::with_tool_calls(
                 "",
                 vec![ToolCall::new(
                     "c2",
-                    "read_file",
-                    r#"{"path":"/etc/hosts","__host":"daemon"}"#,
+                    "client_read_file",
+                    r#"{"path":"/etc/hosts"}"#,
                 )],
             ),
             LlmResponse::text("done"),
         ];
         let daemon_ran = Arc::new(Mutex::new(Vec::new()));
-        let (handler, _advertised) = collided_handler(
+        let (handler, advertised) = two_sided_handler(
             responses,
             vec![daemon_read_file()],
             vec![],
@@ -11183,62 +11088,64 @@ mod tests {
             .await
             .unwrap();
         let device_ran = Arc::new(Mutex::new(Vec::new()));
-        let port: Arc<dyn crate::ports::client_tools::ClientToolPort> =
-            Arc::new(FakeClientToolPort::ok(
-                vec![device_read_file()],
-                Arc::clone(&device_ran),
-                "device result",
-            ));
         with_client_tools(
-            port,
-            handler.send_prompt(&conv.id, "read both".into(), noop_callback(), noop_status()),
+            client_port(vec![device_read_file()], &device_ran),
+            handler.send_prompt(&conv.id, "read it".into(), noop_callback(), noop_status()),
         )
         .await
         .expect("turn completes");
 
-        let on_device: Vec<String> = device_ran
-            .lock()
-            .unwrap()
+        let rounds = advertised.lock().unwrap().clone();
+        let shown: Vec<(&str, &str)> = rounds
+            .first()
+            .expect("the model was called")
             .iter()
-            .map(|(_, name)| name.clone())
+            .filter(|t| t.name.ends_with("read_file"))
+            .map(|t| (t.name.as_str(), t.description.as_str()))
             .collect();
+        assert_eq!(
+            shown,
+            vec![
+                ("daemon_read_file", "DAEMON read_file"),
+                ("client_read_file", "DEVICE read_file"),
+            ],
+            "both connections' tools are offered, each under its own name"
+        );
+
         let on_daemon: Vec<String> = daemon_ran
             .lock()
             .unwrap()
             .iter()
             .map(|(name, _)| name.clone())
             .collect();
-        assert_eq!(
-            on_device,
-            vec!["read_file".to_string()],
-            "the call that named the device must run there"
-        );
-        assert_eq!(
-            on_daemon,
-            vec!["read_file".to_string()],
-            "the call that named the daemon must run there"
-        );
+        let on_device: Vec<String> = device_ran
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, name)| name.clone())
+            .collect();
+        assert_eq!(on_daemon, vec!["read_file".to_string()]);
+        assert_eq!(on_device, vec!["read_file".to_string()]);
     }
 
-    /// The host is routing metadata, not a tool parameter: the tool runs with
-    /// the arguments the model wrote for it and nothing else.
+    /// #1216: the location root is the daemon's own bookkeeping. What runs is
+    /// the provider's own name, so a tool never sees a name its provider does
+    /// not know.
     #[tokio::test]
-    async fn the_host_argument_is_removed_before_the_tool_runs() {
-        use crate::ports::client_tools::with_client_tools;
-
+    async fn the_provider_name_not_the_composed_name_reaches_the_executor() {
         let responses = vec![
             LlmResponse::with_tool_calls(
                 "",
                 vec![ToolCall::new(
                     "c1",
-                    "read_file",
-                    r#"{"path":"/etc/hosts","__host":"daemon"}"#,
+                    "daemon_read_file",
+                    r#"{"path":"/etc/hosts"}"#,
                 )],
             ),
             LlmResponse::text("done"),
         ];
         let daemon_ran = Arc::new(Mutex::new(Vec::new()));
-        let (handler, _advertised) = collided_handler(
+        let (handler, _advertised) = two_sided_handler(
             responses,
             vec![daemon_read_file()],
             vec![],
@@ -11249,33 +11156,82 @@ mod tests {
             .create_conversation("t".into(), vec![])
             .await
             .unwrap();
-        let device_ran = Arc::new(Mutex::new(Vec::new()));
-        let port: Arc<dyn crate::ports::client_tools::ClientToolPort> =
-            Arc::new(FakeClientToolPort::ok(
-                vec![device_read_file()],
-                Arc::clone(&device_ran),
-                "device result",
-            ));
-        with_client_tools(
-            port,
-            handler.send_prompt(&conv.id, "read it".into(), noop_callback(), noop_status()),
-        )
-        .await
-        .expect("turn completes");
+        handler
+            .send_prompt(&conv.id, "read it".into(), noop_callback(), noop_status())
+            .await
+            .expect("turn completes");
 
         let ran = daemon_ran.lock().unwrap().clone();
-        let (_, arguments) = ran.first().expect("the daemon ran the call");
+        let (name, arguments) = ran.first().expect("the daemon ran the call");
+        assert_eq!(name, "read_file", "the executor is asked for its own name");
+        assert_eq!(arguments, &serde_json::json!({"path": "/etc/hosts"}));
+    }
+
+    /// #1216, the rule most likely to be missed: the location prefix must never
+    /// reach a learning key. #1126 keys a burn on the tool name plus an
+    /// argument digest, so a prefixed name would fragment what the assistant
+    /// learns per machine - a tool that burned the user on the daemon would
+    /// teach nothing about the same tool on their laptop, and nobody would see
+    /// it happen.
+    #[tokio::test]
+    async fn the_location_prefix_never_reaches_the_negative_memory_digest() {
+        let responses = vec![
+            LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new(
+                    "c1",
+                    "daemon_read_file",
+                    r#"{"path":"/etc/hosts"}"#,
+                )],
+            ),
+            LlmResponse::text("done"),
+        ];
+        let daemon_ran = Arc::new(Mutex::new(Vec::new()));
+        // No result for `read_file`, so the executor fails and the turn writes
+        // the lesson this test reads.
+        let (handler, _advertised) = two_sided_handler(
+            responses,
+            vec![daemon_read_file()],
+            vec![],
+            HashMap::new(),
+            Arc::clone(&daemon_ran),
+        );
+        let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&recorded);
+        let handler = handler.with_negative_memory(
+            Arc::new(|| Box::pin(async { Ok(Vec::new()) })),
+            Arc::new(
+                move |observation: crate::ports::negative_memory::BurnObservation| {
+                    sink.lock().unwrap().push(observation.action.clone());
+                    Box::pin(async {
+                        Err(CoreError::Storage("not stored by this test".into()))
+                            as Result<crate::ports::negative_memory::BurnWrite, CoreError>
+                    })
+                },
+            ),
+            Arc::new(|_, _| Box::pin(async { Ok(Vec::new()) })),
+        );
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "read it".into(), noop_callback(), noop_status())
+            .await
+            .expect("turn completes");
+        settle().await;
+
+        let actions = recorded.lock().unwrap().clone();
         assert_eq!(
-            arguments,
-            &serde_json::json!({"path": "/etc/hosts"}),
-            "the routing field must not reach the tool"
+            actions,
+            vec!["read_file".to_string()],
+            "a lesson is keyed on the tool, not on the machine it ran on"
         );
     }
 
-    /// A tool-search hit carries the host it runs on, and activation keeps it:
-    /// a hit that runs on the device must not activate the daemon's tool of
-    /// the same name, which would swap the schema under the model mid-turn
-    /// while the route stayed where it was.
+    /// A tool-search hit that runs on the user's own machine must not activate
+    /// the daemon's tool of the same provider name: the hit says where it runs,
+    /// and the daemon's copy is a different tool.
     #[tokio::test]
     async fn a_device_search_hit_does_not_activate_the_daemon_tool_of_the_same_name() {
         use crate::ports::client_tools::with_client_tools;
@@ -11290,24 +11246,20 @@ mod tests {
                 "",
                 vec![ToolCall::new(
                     "c1",
-                    "builtin_tool_search",
+                    "daemon_builtin_tool_search",
                     r#"{"query":"read a file"}"#,
                 )],
-            ),
-            LlmResponse::with_tool_calls(
-                "",
-                vec![ToolCall::new("c2", "read_file", r#"{"path":"/etc/hosts"}"#)],
             ),
             LlmResponse::text("done"),
         ];
         let daemon_ran = Arc::new(Mutex::new(Vec::new()));
-        let (handler, advertised) = collided_handler(
+        let (handler, advertised) = two_sided_handler(
             responses,
             vec![search_tool],
             vec![daemon_read_file()],
             HashMap::from([(
                 "builtin_tool_search".to_string(),
-                r#"{"ok":true,"tools":[{"name":"read_file","description":"DEVICE read_file","runs_on":"device"}]}"#
+                r#"{"ok":true,"tools":[{"name":"client_read_file","description":"DEVICE read_file","runs_on":"device"}]}"#
                     .to_string(),
             )]),
             Arc::clone(&daemon_ran),
@@ -11317,111 +11269,32 @@ mod tests {
             .await
             .unwrap();
         let device_ran = Arc::new(Mutex::new(Vec::new()));
-        let port: Arc<dyn crate::ports::client_tools::ClientToolPort> =
-            Arc::new(FakeClientToolPort::ok(
-                vec![device_read_file()],
-                Arc::clone(&device_ran),
-                "device result",
-            ));
         with_client_tools(
-            port,
+            client_port(vec![device_read_file()], &device_ran),
             handler.send_prompt(&conv.id, "read it".into(), noop_callback(), noop_status()),
         )
         .await
         .expect("turn completes");
 
         let rounds = advertised.lock().unwrap().clone();
-        let after_search = rounds
-            .get(1)
-            .expect("the model was called again after the search");
-        let shown: Vec<&ToolDefinition> = after_search
-            .iter()
-            .filter(|t| t.name == "read_file")
-            .collect();
-        assert_eq!(shown.len(), 1, "one capability name, one advertised entry");
-        assert_eq!(
-            shown[0].description, "DEVICE read_file",
-            "a device hit must not activate the daemon's tool of the same name"
+        let after_search = rounds.get(1).expect("the model was called again");
+        let names: Vec<&str> = after_search.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            !names.contains(&"daemon_read_file"),
+            "a device hit must not activate the daemon's tool: {names:?}"
         );
         assert!(
-            !device_ran.lock().unwrap().is_empty(),
-            "the call must run on the host whose schema was shown"
-        );
-    }
-
-    /// A host the loop cannot honour is refused, never quietly turned into
-    /// another host. A name this turn's table does not hold falls through to
-    /// the daemon executor, so a call that asked for the user's own machine
-    /// must not run on the daemon's instead.
-    #[tokio::test]
-    async fn a_device_host_stated_for_a_name_the_turn_does_not_offer_is_refused() {
-        use crate::ports::client_tools::with_client_tools;
-
-        let responses = vec![
-            LlmResponse::with_tool_calls(
-                "",
-                vec![ToolCall::new(
-                    "c1",
-                    "ghost_tool",
-                    r#"{"path":"/etc/hosts","__host":"device"}"#,
-                )],
-            ),
-            LlmResponse::text("done"),
-        ];
-        let daemon_ran = Arc::new(Mutex::new(Vec::new()));
-        let (handler, _advertised) = collided_handler(
-            responses,
-            vec![daemon_read_file()],
-            vec![],
-            HashMap::from([("ghost_tool".to_string(), "daemon result".to_string())]),
-            Arc::clone(&daemon_ran),
-        );
-        let conv = handler
-            .create_conversation("t".into(), vec![])
-            .await
-            .unwrap();
-        let device_ran = Arc::new(Mutex::new(Vec::new()));
-        let port: Arc<dyn crate::ports::client_tools::ClientToolPort> =
-            Arc::new(FakeClientToolPort::ok(
-                vec![device_read_file()],
-                Arc::clone(&device_ran),
-                "device result",
-            ));
-        with_client_tools(
-            port,
-            handler.send_prompt(&conv.id, "go".into(), noop_callback(), noop_status()),
-        )
-        .await
-        .expect("turn completes");
-
-        assert!(
-            daemon_ran.lock().unwrap().is_empty(),
-            "a call that asked for the device must not run on the daemon"
-        );
-        assert!(device_ran.lock().unwrap().is_empty());
-        let stored = handler.get_conversation(&conv.id).await.unwrap();
-        let result = stored
-            .messages
-            .iter()
-            .find(|m| m.tool_call_id.as_deref() == Some("c1"))
-            .expect("the refusal is fed back as this call's result");
-        assert!(
-            result.content.contains("is not offered on 'device'"),
-            "the refusal must say what could not be honoured: {}",
-            result.content
+            names.contains(&"client_read_file"),
+            "the client's tool is offered under its own name: {names:?}"
         );
     }
 
     /// #1216 on the deferred surface: when the provider's own tool search
-    /// carries the daemon's fleet, a name the client also registers is offered
-    /// once - in the advertised block, from the client - and the daemon's twin
-    /// is withheld from the namespaces. Otherwise the model reads one schema
-    /// through the provider and another in the block, and only one of them can
-    /// be what runs.
+    /// carries the daemon's fleet, those tools are in the same table and are
+    /// offered under the same composed names, so the name the model reads
+    /// through the provider is the name the table resolves.
     #[tokio::test]
-    async fn a_deferred_daemon_tool_is_withheld_when_the_client_holds_its_name() {
-        use crate::ports::client_tools::with_client_tools;
-
+    async fn a_deferred_daemon_tool_is_offered_under_its_composed_name() {
         type Offered = Arc<Mutex<Vec<(Vec<ToolDefinition>, Vec<ToolNamespace>)>>>;
 
         struct RecordingHostedLlm {
@@ -11488,23 +11361,13 @@ mod tests {
             "files",
             "file tools",
             vec![
-                ToolDefinition::new("fileio_read_file", "DAEMON read_file", read_file_schema()),
-                ToolDefinition::new("fileio_write_file", "DAEMON write_file", read_file_schema()),
+                ToolDefinition::new("fileio__read_file", "read a file", read_file_schema()),
+                ToolDefinition::new("fileio__write_file", "write a file", read_file_schema()),
             ],
         )];
         let offered: Offered = Arc::new(Mutex::new(Vec::new()));
         let llm = RecordingHostedLlm {
-            responses: Mutex::new(vec![
-                LlmResponse::with_tool_calls(
-                    "",
-                    vec![ToolCall::new(
-                        "c1",
-                        "fileio_read_file",
-                        r#"{"path":"/etc/hosts"}"#,
-                    )],
-                ),
-                LlmResponse::text("done"),
-            ]),
+            responses: Mutex::new(vec![LlmResponse::text("done")]),
             offered: Arc::clone(&offered),
         };
         let handler = ConversationHandler::with_tools(
@@ -11518,66 +11381,21 @@ mod tests {
             .create_conversation("Test".into(), vec![])
             .await
             .unwrap();
-
-        let device_ran = Arc::new(Mutex::new(Vec::new()));
-        let port: Arc<dyn crate::ports::client_tools::ClientToolPort> =
-            Arc::new(FakeClientToolPort::ok(
-                vec![ToolDefinition::new(
-                    "fileio_read_file",
-                    "DEVICE read_file",
-                    read_file_schema(),
-                )],
-                Arc::clone(&device_ran),
-                "device result",
-            ));
-        with_client_tools(
-            port,
-            handler.send_prompt(&conv.id, "read it".into(), noop_callback(), noop_status()),
-        )
-        .await
-        .expect("turn completes");
+        handler
+            .send_prompt(&conv.id, "read it".into(), noop_callback(), noop_status())
+            .await
+            .expect("turn completes");
 
         let calls = offered.lock().unwrap().clone();
-        let (block, deferred) = calls.first().expect("the model was called");
+        let (_, deferred) = calls.first().expect("the model was called");
         let deferred_names: Vec<&str> = deferred
             .iter()
             .flat_map(|ns| ns.tools.iter().map(|t| t.name.as_str()))
             .collect();
         assert_eq!(
             deferred_names,
-            vec!["fileio_write_file"],
-            "the daemon's twin of a name the client holds must not be deferred to the model"
-        );
-        let shown: Vec<&ToolDefinition> = block
-            .iter()
-            .filter(|t| t.name == "fileio_read_file")
-            .collect();
-        assert_eq!(shown.len(), 1, "one capability name, one advertised entry");
-        assert_eq!(shown[0].description, "DEVICE read_file");
-        assert!(
-            !device_ran.lock().unwrap().is_empty(),
-            "the call must run on the host whose schema the model was shown"
-        );
-
-        // And the round after it: a call the client's tool answered is not a
-        // deferred namespace call, so the daemon's namespace is not activated
-        // behind it. Activating it would put the daemon's copy of the same name
-        // into the block, where the policy would make it the default - the name
-        // would change machines part-way through the turn.
-        let (after, _) = calls.get(1).expect("the model was called again");
-        let names: Vec<&str> = after.iter().map(|t| t.name.as_str()).collect();
-        assert!(
-            !names.contains(&"fileio_write_file"),
-            "a client-answered call must not activate the daemon's namespace: {names:?}"
-        );
-        let still_shown: Vec<&ToolDefinition> = after
-            .iter()
-            .filter(|t| t.name == "fileio_read_file")
-            .collect();
-        assert_eq!(still_shown.len(), 1);
-        assert_eq!(
-            still_shown[0].description, "DEVICE read_file",
-            "the name must not change machines mid-turn"
+            vec!["daemon_fileio__read_file", "daemon_fileio__write_file"],
+            "the model calls what it reads, so a deferred schema carries the composed name"
         );
     }
 
