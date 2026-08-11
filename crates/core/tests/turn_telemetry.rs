@@ -2422,3 +2422,420 @@ fn a_conversation_id_cannot_forge_a_log_line() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// What filled the input (#1203).
+//
+// `llm.tokens.input` says a round cost 40k and cannot say whether that was the
+// transcript, the pinned notes or eighty tool schemas, and each of those has a
+// different fix. These tests are the promise that the breakdown is separable
+// in the way an operator would act on it.
+//
+// Every name below is spelled out rather than imported from the crate under
+// test, so a rename at the recording site fails these tests instead of
+// travelling with them.
+// ---------------------------------------------------------------------------
+
+/// The turn-span field each part of an assembled prompt is reported under.
+const PROMPT_PART_FIELDS: [&str; 10] = [
+    "prompt.system_tokens",
+    "prompt.summary_tokens",
+    "prompt.current_task_tokens",
+    "prompt.working_state_tokens",
+    "prompt.plan_tokens",
+    "prompt.pinned_tokens",
+    "prompt.scratchpad_tokens",
+    "prompt.recall_tokens",
+    "prompt.transcript_tokens",
+    "prompt.tool_schema_tokens",
+];
+
+/// What the parts add up to.
+const PROMPT_TOTAL_FIELD: &str = "prompt.total_tokens";
+
+/// How many tool schemas the round advertised. A count, not a token figure,
+/// and named so (#1212).
+const PROMPT_TOOL_COUNT_FIELD: &str = "prompt.tool_count";
+
+/// Every field the breakdown puts on the turn span.
+fn prompt_fields() -> Vec<&'static str> {
+    let mut all = PROMPT_PART_FIELDS.to_vec();
+    all.push(PROMPT_TOTAL_FIELD);
+    all.push(PROMPT_TOOL_COUNT_FIELD);
+    all
+}
+
+const PROMPT_PART_TOKENS_METRIC: &str = "llm.prompt.part.tokens";
+const PROMPT_TOOLS_METRIC: &str = "llm.prompt.tools";
+const PROMPT_MEASURED_METRIC: &str = "llm.prompt.measured";
+
+/// The `part` label values [`PROMPT_PART_TOKENS_METRIC`] may carry - the whole
+/// bounded set.
+const PROMPT_PART_LABELS: [&str; 10] = [
+    "system",
+    "summary",
+    "current_task",
+    "working_state",
+    "plan",
+    "pinned",
+    "scratchpad",
+    "recall",
+    "transcript",
+    "tool_schemas",
+];
+
+/// Read one token figure off the turn span, failing by name when it is absent.
+fn prompt_field(span: &SpanRecord, field: &str) -> u64 {
+    let raw = span.field(field).unwrap_or_else(|| {
+        panic!(
+            "the turn span carries no `{field}`; it recorded {:?}",
+            span.fields
+        )
+    });
+    raw.parse::<u64>()
+        .unwrap_or_else(|e| panic!("`{field}` must be a number; got {raw:?} ({e})"))
+}
+
+/// A pinned note long enough that its block costs real tokens.
+const PINNED_NOTE: &str = "the registry caps a metric at sixty-four label sets, \
+     first come, with no eviction, so an unbounded label is an unbounded leak \
+     in a process that runs for weeks and the dimension stays dead until the \
+     process restarts";
+
+/// A handler whose scratchpad holds one pinned note, so the turn assembles a
+/// `[Pinned]` block. Nothing else is wired, so `[Scratchpad]` stays gated
+/// silent and `[Recall]` never renders.
+fn handler_with_pinned_note(
+    responses: Vec<Reply>,
+    tools: ScriptedTools,
+) -> ConversationHandler<MemStore, ScriptedLlm, ScriptedTools> {
+    use desktop_assistant_core::domain::ScratchpadNote;
+    use desktop_assistant_core::ports::scratchpad::ScratchpadListFn;
+    let list: ScratchpadListFn = Arc::new(move |conversation_id: String, _note_type, _limit| {
+        let mut note = ScratchpadNote::new("sp-1", conversation_id, "cap", PINNED_NOTE);
+        note.pinned = true;
+        Box::pin(async move { Ok(vec![note]) })
+    });
+    handler(responses, tools).with_scratchpad_list(list)
+}
+
+#[test]
+fn turn_span_carries_a_token_figure_for_every_prompt_part() {
+    let _serialised = serialised();
+    let captured = run(Level::INFO, two_round_script(), ScriptedTools::ok());
+    let turn = captured.span("turn");
+
+    for field in prompt_fields() {
+        assert!(
+            turn.field(field).is_some(),
+            "the turn span must carry `{field}`; it recorded {:?}",
+            turn.fields
+        );
+    }
+    assert!(
+        prompt_field(turn, PROMPT_TOTAL_FIELD) > 0,
+        "a turn that assembled a prompt must report a non-zero total; it \
+         recorded {:?}",
+        turn.fields
+    );
+}
+
+#[test]
+fn every_prompt_figure_on_the_turn_span_names_its_unit() {
+    let _serialised = serialised();
+    let captured = run(Level::INFO, two_round_script(), ScriptedTools::ok());
+    let turn = captured.span("turn");
+
+    let mut checked = 0;
+    for key in turn.fields.keys() {
+        let Some(rest) = key.strip_prefix("prompt.") else {
+            continue;
+        };
+        checked += 1;
+        assert!(
+            rest.ends_with("_tokens") || key == PROMPT_TOOL_COUNT_FIELD,
+            "`{key}` states no unit. A character count and a token count for \
+             the same block look equally plausible side by side, so every \
+             figure here says which it is"
+        );
+    }
+    assert_eq!(
+        checked,
+        prompt_fields().len(),
+        "the turn span carried {checked} `prompt.` fields, so this test did \
+         not see the set it names; it recorded {:?}",
+        turn.fields
+    );
+}
+
+#[test]
+fn prompt_parts_are_recorded_when_the_provider_reports_no_token_counts() {
+    let _serialised = serialised();
+    // A connector that reports no usage at all: what the breakdown must not
+    // depend on, because the parts are measured here and not by the provider.
+    let captured = run(
+        Level::INFO,
+        vec![LlmResponse::text(REPLY_SENTINEL).into()],
+        ScriptedTools::ok(),
+    );
+    assert!(
+        captured.console.contains("input_tokens=-"),
+        "precondition: the provider must have reported nothing\n\
+         --- console ---\n{}",
+        captured.console
+    );
+
+    let turn = captured.span("turn");
+    for field in prompt_fields() {
+        assert!(
+            turn.field(field).is_some(),
+            "`{field}` must be recorded whatever the provider reported; the \
+             turn recorded {:?}",
+            turn.fields
+        );
+    }
+    assert!(prompt_field(turn, PROMPT_TOTAL_FIELD) > 0);
+}
+
+#[test]
+fn a_turn_with_no_pinned_notes_recall_or_scratchpad_records_zero_for_those_parts() {
+    let _serialised = serialised();
+    let captured = run(Level::INFO, two_round_script(), ScriptedTools::ok());
+    let turn = captured.span("turn");
+
+    for field in [
+        "prompt.pinned_tokens",
+        "prompt.recall_tokens",
+        "prompt.scratchpad_tokens",
+    ] {
+        assert_eq!(
+            turn.field(field),
+            Some("0"),
+            "a block that did not render is a measured zero, not an omission - \
+             an absent field cannot be told from a part nobody measured; the \
+             turn recorded {:?}",
+            turn.fields
+        );
+    }
+}
+
+#[test]
+fn a_pinned_note_is_counted_against_the_pinned_part_and_no_other() {
+    let _serialised = serialised();
+    let with_pin = capture(Level::INFO, async {
+        let handler = handler_with_pinned_note(two_round_script(), ScriptedTools::ok());
+        one_turn(&handler).await;
+    });
+    let without_pin = run(Level::INFO, two_round_script(), ScriptedTools::ok());
+
+    let pinned = with_pin.span("turn");
+    let bare = without_pin.span("turn");
+
+    assert!(
+        prompt_field(pinned, "prompt.pinned_tokens") > 0,
+        "the pinned note must show up in the pinned part; the turn recorded \
+         {:?}",
+        pinned.fields
+    );
+    assert_eq!(
+        prompt_field(bare, "prompt.pinned_tokens"),
+        0,
+        "precondition: the same turn without a pin must report no pinned cost"
+    );
+    for field in ["prompt.scratchpad_tokens", "prompt.recall_tokens"] {
+        assert_eq!(
+            prompt_field(pinned, field),
+            0,
+            "a pin is not a scratchpad index and not a recall offer, so it \
+             must not be counted as `{field}`; the turn recorded {:?}",
+            pinned.fields
+        );
+    }
+    assert_eq!(
+        prompt_field(pinned, "prompt.transcript_tokens"),
+        prompt_field(bare, "prompt.transcript_tokens"),
+        "the two turns sent the same messages, so a pin that changed the \
+         transcript figure is being counted in the wrong part"
+    );
+    assert_eq!(
+        prompt_field(pinned, "prompt.system_tokens"),
+        prompt_field(bare, "prompt.system_tokens"),
+        "the same reason: a pin is not part of the system instruction"
+    );
+}
+
+#[test]
+fn the_turn_span_carries_the_tool_count_and_the_tool_schema_cost() {
+    let _serialised = serialised();
+    // #1212 measured a turn that had spent 23.7k tokens on 99 tool schemas
+    // before it did anything, and nobody could see it without reading a log by
+    // hand. This is the pair that makes the tool set visible.
+    let captured = run(Level::INFO, two_round_script(), ScriptedTools::ok());
+    let turn = captured.span("turn");
+
+    assert_eq!(
+        turn.field(PROMPT_TOOL_COUNT_FIELD),
+        Some("1"),
+        "the turn advertised exactly one tool; it recorded {:?}",
+        turn.fields
+    );
+    assert!(
+        prompt_field(turn, "prompt.tool_schema_tokens") > 0,
+        "an advertised schema costs prompt tokens the message bodies never \
+         show; the turn recorded {:?}",
+        turn.fields
+    );
+}
+
+#[test]
+fn the_turn_span_reports_the_prompt_the_turn_opened_with_not_the_one_it_ended_with() {
+    let _serialised = serialised();
+    // A turn's rounds grow the transcript with their own tool traffic. The
+    // figure here is the standing cost the turn entered with, so a later
+    // round's multi-megabyte tool result must not become the transcript
+    // number an operator reads for this turn.
+    let captured = run(Level::INFO, two_round_script(), ScriptedTools::oversized());
+    let turn = captured.span("turn");
+
+    let transcript = prompt_field(turn, "prompt.transcript_tokens");
+    assert!(transcript > 0, "the user prompt is in the transcript");
+    assert!(
+        transcript < 1_000,
+        "the turn opened with one short user prompt, so its transcript figure \
+         must be small; a later round's capped tool result is tens of \
+         thousands of tokens, and reading {transcript} here means the last \
+         round overwrote the turn's own number"
+    );
+}
+
+#[test]
+fn prompt_part_metrics_are_labelled_by_part_alone() {
+    let _serialised = serialised();
+    let captured = run(Level::INFO, two_round_script(), ScriptedTools::ok());
+
+    let mut seen_parts: Vec<String> = Vec::new();
+    for counter in captured
+        .after
+        .counters
+        .iter()
+        .filter(|c| c.window_delta > 0)
+    {
+        match counter.name {
+            PROMPT_PART_TOKENS_METRIC => {
+                let keys: Vec<&str> = counter.labels.iter().map(|l| l.key()).collect();
+                assert_eq!(
+                    keys,
+                    vec!["part"],
+                    "`{PROMPT_PART_TOKENS_METRIC}` carries the part name and \
+                     nothing else - a conversation or model axis here would \
+                     burn the registry's 64-label-set cap, which has no \
+                     eviction"
+                );
+                let value = counter.labels[0].value().to_string();
+                assert!(
+                    PROMPT_PART_LABELS.contains(&value.as_str()),
+                    "`{value}` is not one of the bounded part names \
+                     {PROMPT_PART_LABELS:?}"
+                );
+                seen_parts.push(value);
+            }
+            PROMPT_TOOLS_METRIC | PROMPT_MEASURED_METRIC => {
+                assert!(
+                    counter.labels.is_empty(),
+                    "`{}` takes no label at all; it carried {:?}",
+                    counter.name,
+                    counter.labels
+                );
+            }
+            _ => {}
+        }
+    }
+
+    seen_parts.sort();
+    let mut expected: Vec<String> = PROMPT_PART_LABELS.iter().map(|p| p.to_string()).collect();
+    expected.sort();
+    assert_eq!(
+        seen_parts, expected,
+        "every part reports every turn, so a missing block is distinguishable \
+         from an unmeasured one on the metrics side too"
+    );
+    assert_eq!(
+        captured.counter_delta(PROMPT_MEASURED_METRIC, &[]),
+        1,
+        "one turn measures one prompt, which is the denominator the per-part \
+         totals are read against"
+    );
+    assert_eq!(
+        captured.counter_delta(PROMPT_TOOLS_METRIC, &[]),
+        1,
+        "the turn advertised one tool"
+    );
+}
+
+#[test]
+fn no_prompt_metric_carries_a_conversation_scoped_label() {
+    let _serialised = serialised();
+    let captured = run(Level::INFO, two_round_script(), ScriptedTools::ok());
+
+    let mut checked = 0;
+    for counter in captured.after.counters.iter().filter(|c| {
+        matches!(
+            c.name,
+            PROMPT_PART_TOKENS_METRIC | PROMPT_TOOLS_METRIC | PROMPT_MEASURED_METRIC
+        )
+    }) {
+        checked += 1;
+        for label in &counter.labels {
+            for forbidden in [CONVERSATION_ID, USER_ID, REQUEST_ID, MODEL, PROVIDER] {
+                assert_ne!(
+                    label.value(),
+                    forbidden,
+                    "`{}` must not be labelled by conversation, user, request \
+                     or model; it carried {:?}",
+                    counter.name,
+                    counter.labels
+                );
+            }
+        }
+    }
+    assert!(
+        checked > 0,
+        "no prompt metric was recorded, so this test asserted nothing"
+    );
+}
+
+#[test]
+fn the_docs_state_the_parts_are_estimates_that_do_not_sum_to_the_provider_count() {
+    // The parts come from this daemon's own estimator and the provider counts
+    // its own way, so the two disagree by construction. Said once, in the
+    // operator-facing document, rather than per field.
+    const LOGGING_DOC: &str = include_str!("../../../docs/logging.md");
+
+    for name in prompt_fields() {
+        assert!(
+            LOGGING_DOC.contains(name),
+            "`{name}` is recorded and undocumented, so nobody reading \
+             docs/logging.md knows it exists"
+        );
+    }
+    for metric in [
+        PROMPT_PART_TOKENS_METRIC,
+        PROMPT_TOOLS_METRIC,
+        PROMPT_MEASURED_METRIC,
+    ] {
+        assert!(
+            LOGGING_DOC.contains(metric),
+            "`{metric}` is missing from the metrics table in docs/logging.md"
+        );
+    }
+    for claim in [
+        "will not sum exactly to the provider's own input count",
+        "estimate",
+    ] {
+        assert!(
+            LOGGING_DOC.contains(claim),
+            "docs/logging.md must say {claim:?}: a figure presented without \
+             its accuracy claim reads as a measurement"
+        );
+    }
+}
