@@ -220,14 +220,24 @@ const NOTE_COLUMNS: &[&str] = &[
     "updated_at",
 ];
 
-/// Every query in this adapter that answers [`SpRow`], for the tests that hold
-/// them all to [`NOTE_COLUMNS`].
+/// Every query in this adapter that answers [`SpRow`], directly or behind a
+/// `#[sqlx(flatten)]`, for the tests that hold them all to [`NOTE_COLUMNS`].
 ///
 /// A new one has to be added here as well as written. That is this guard's weak
-/// point, and it is still far stronger than six hand-checked lists, which is
-/// what it replaces.
+/// point, and it is still far stronger than seven hand-checked lists, which is
+/// what it replaces. "Answers `SpRow`" is the test, not "is read into `SpRow`":
+/// a row type that merely CONTAINS one needs every column just the same.
 #[cfg(test)]
 const SP_ROW_QUERIES: &[(&str, &str)] = &[
+    // Answers `SpNearestRow`, which carries `SpRow` behind `#[sqlx(flatten)]`.
+    // Missed by the first version of this list, which read the `query_as` type
+    // rather than what that type holds - and it is the query the `[Recall]`
+    // scratchpad arm reads through, so a column missing here takes recall
+    // quietly off rather than failing loudly.
+    (
+        "NEAREST_NOTES_BY_EMBEDDING_SQL",
+        NEAREST_NOTES_BY_EMBEDDING_SQL,
+    ),
     ("WRITE_UPSERT_SQL", WRITE_UPSERT_SQL),
     ("GET_MANY_SQL", GET_MANY_SQL),
     ("LIST_SQL", LIST_SQL),
@@ -1170,12 +1180,35 @@ mod projection_tests {
     /// `just check`, rather than behind `just test-db` where the failure
     /// already had somewhere to hide. `knowledge_search.rs` guards its own scan
     /// this way; this is the same idiom on the adapter that lacked it.
+    /// The identifiers `sql` names, as SQL reads them.
+    ///
+    /// Split on everything that is not an identifier character, so a column is
+    /// matched as a whole word. A substring test cannot do this job: `id` is a
+    /// substring of `user_id`, so `sql.contains("id")` is true of every query in
+    /// this file whether or not it selects `id` - the check for the one column
+    /// every row is keyed by could never have failed.
+    fn identifiers(sql: &str) -> Vec<&str> {
+        sql.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|t| !t.is_empty())
+            .collect()
+    }
+
     #[test]
     fn every_query_that_answers_a_note_selects_every_column_a_note_reads() {
         for (name, sql) in SP_ROW_QUERIES {
+            let named = identifiers(sql);
             for column in NOTE_COLUMNS {
+                // `id` is NOT covered, here or in the sibling test, and saying
+                // so is the point. It appears in join predicates, ordering and
+                // the subagent-snapshot clause as well as in projections, so no
+                // textual check can tell a query that selects it from one that
+                // merely mentions it. Dropping it would fail the same way every
+                // other column does, and this guard would not see it.
+                if *column == "id" {
+                    continue;
+                }
                 assert!(
-                    sql.contains(column),
+                    named.contains(column),
                     "{name} does not select `{column}`, so reading a note through it \
                      fails at run time against a real database:\n{sql}"
                 );
@@ -1202,7 +1235,9 @@ mod projection_tests {
     fn the_hybrid_query_carries_every_column_through_all_of_its_arms() {
         // `id` also appears in the join predicate and the ordering, so it sets
         // no useful floor; every other column appears only in the stages.
-        let floor = SEARCH_HYBRID_SQL.matches("note_key").count();
+        let named = identifiers(SEARCH_HYBRID_SQL);
+        let count = |c: &str| named.iter().filter(|t| **t == c).count();
+        let floor = count("note_key");
         assert!(
             floor >= 5,
             "this test's own yardstick is wrong: `note_key` should thread every stage"
@@ -1211,7 +1246,7 @@ mod projection_tests {
             if *column == "id" {
                 continue;
             }
-            let seen = SEARCH_HYBRID_SQL.matches(column).count();
+            let seen = count(column);
             assert!(
                 seen >= floor,
                 "the hybrid query names `{column}` {seen} times against `note_key`'s \

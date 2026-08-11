@@ -989,20 +989,7 @@ async fn main() -> Result<()> {
             .as_ref()
             .map(|c| c.security.clone())
             .unwrap_or_default();
-        match security.tool_policy() {
-            Ok(policy) => tracing::info!(
-                "tool policy: {} (conversations may still ask for a different level)",
-                policy.as_str()
-            ),
-            Err(error) => tracing::error!(
-                "{error}. Running at {} until the file is corrected",
-                desktop_assistant_core::tool_provenance::ToolPolicy::default().as_str()
-            ),
-        }
-        // Said on every boot, set or not (#1249). The default stops a daemon
-        // destroying text it wrote, which is a behaviour change an operator
-        // must not have to infer from an absent key.
-        tracing::info!("{}", security.withhold_mode_line());
+        config::report_security_posture(&security);
         security.hard_withhold
     };
 
