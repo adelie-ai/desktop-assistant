@@ -639,7 +639,7 @@ pub fn is_own_draft(skill: &IndexedSkill) -> bool {
         && !skill.present_on_disk
         && matches!(
             skill.source.as_deref(),
-            Some(SELF_AUTHORED_SOURCE) | Some(EXTRACTED_SOURCE)
+            Some(SELF_AUTHORED_SOURCE) | Some(EXTRACTED_SOURCE) | Some(MISFILED_SOURCE)
         )
 }
 
@@ -649,6 +649,43 @@ pub fn is_own_draft(skill: &IndexedSkill) -> bool {
 /// to recognise both, and a rule that names one marker and forgets the other is
 /// the kind of gap that lets an unattended write reach a person's skill.
 pub const EXTRACTED_SOURCE: &str = "extraction";
+
+/// `source` recorded on a skill proposed from a knowledge entry that was really
+/// a procedure (#1175).
+///
+/// Its own marker rather than [`EXTRACTED_SOURCE`], because the two answer a
+/// different question for the person deciding whether to approve it: one was
+/// found in a conversation, and this one says "you already have this written
+/// down as a fact, and it does not work as one". The entry it came from is
+/// named in the skill's `metadata.from_entry`, so a person can act on both
+/// halves of the split.
+///
+/// [`is_own_draft`] recognises it for the reason it recognises the other two:
+/// a later sweep must be able to revise its own unadopted proposal, and must
+/// never touch anything else.
+pub const MISFILED_SOURCE: &str = "misfiled-knowledge";
+
+/// The one rule that decides which store a piece of learning belongs in
+/// (#1155, #1175).
+///
+/// Stated once, in the domain, and spent by every path that can write a
+/// knowledge entry: the dream cycle's extraction prompt, its consolidation
+/// prompt, and the write tool the model calls inside a turn. A rule stated in
+/// one prompt is a rule the other paths do not have, which is how the knowledge
+/// store filled with routines written as facts in the first place.
+///
+/// It is a sentence rather than a paragraph because two of its three readers
+/// pay for it on every call. The paragraph that says what a skill's fields are
+/// belongs with the path that asks for those fields.
+///
+/// **A prompt is not an enforcer.** This makes the rule reach every writer; it
+/// does not make any of them obey. What catches what still slips through is the
+/// sweep that proposes a mis-filed entry as a skill after the fact.
+pub const METHOD_IS_NOT_A_FACT: &str = "Knowledge records what is TRUE. A skill records HOW TO DO something. A method - ordered \
+     steps, a repeatable how-to - belongs in the skill library and not here: filed as a fact it \
+     reads as neither, competes with real facts for attention, and cannot be followed by \
+     anything. A method's PREFERENCES do stay knowledge: which sources to use, in what order, \
+     what to skip, and what \"done\" looks like for this person.";
 
 /// Decide what a promotion request may do.
 ///

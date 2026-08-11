@@ -551,6 +551,20 @@ fn build_extraction_user_prompt(context_summary: &str, transcript: &str) -> Stri
 
 #[cfg(test)]
 mod tests {
+
+    /// The rule that decides which store a piece of learning belongs in reaches
+    /// the extraction prompt.
+    ///
+    /// Stated once in the domain and spent here, rather than written out again:
+    /// a second wording is a second rule, and the two drift.
+    #[test]
+    fn the_extraction_prompt_states_the_method_is_not_a_fact_rule() {
+        let prompt = build_extraction_system_prompt(&[]);
+        assert!(
+            prompt.contains(desktop_assistant_core::skill_promotion::METHOD_IS_NOT_A_FACT),
+            "extraction writes knowledge entries, so it has to be told what is not one: {prompt}"
+        );
+    }
     use super::*;
 
     #[test]

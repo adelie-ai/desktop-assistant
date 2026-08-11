@@ -1340,6 +1340,23 @@ struct SliceAnswer {
 
 #[cfg(test)]
 mod tests {
+
+    /// The same rule reaches the consolidation prompt.
+    ///
+    /// Consolidation rewrites and merges entries that already exist, so without
+    /// it the pass tightens a mis-filed procedure into a better-written fact
+    /// and cements it - the one pass in the cycle whose whole job is to decide
+    /// what an entry should look like, deciding it without the rule that says
+    /// this one should not be an entry at all.
+    #[test]
+    fn the_consolidation_prompt_states_the_method_is_not_a_fact_rule() {
+        let prompt = build_system_prompt();
+        assert!(
+            prompt.contains(desktop_assistant_core::skill_promotion::METHOD_IS_NOT_A_FACT),
+            "consolidation decides what an entry should be, so it has to be told what is not \
+             one: {prompt}"
+        );
+    }
     use std::io::{self, Write};
     use std::sync::{Arc, Mutex, Once};
 

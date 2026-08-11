@@ -9337,6 +9337,28 @@ mod tests {
     /// keeps passing it and silently gets different behavior than any
     /// lingering documentation would promise. This guard and the schema stay
     /// in the same file, so the two cannot drift apart again.
+    /// The rule that decides which store a piece of learning belongs in reaches
+    /// the write tool the model calls inside a turn.
+    ///
+    /// The dream cycle's own paths are told it; this is the one a person's turn
+    /// goes through, and it is the path that files a routine as a fact while
+    /// somebody is watching.
+    #[test]
+    fn the_knowledge_write_tool_states_the_method_is_not_a_fact_rule() {
+        let service = fully_wired_service();
+        let def = service
+            .tool_definitions()
+            .into_iter()
+            .find(|d| d.name == TOOL_KB_WRITE)
+            .expect("builtin_knowledge_base_write is advertised");
+        assert!(
+            def.description
+                .contains(desktop_assistant_core::skill_promotion::METHOD_IS_NOT_A_FACT),
+            "the write tool has to say what is not a knowledge entry: {}",
+            def.description
+        );
+    }
+
     #[test]
     fn skill_get_schema_does_not_advertise_an_owner_argument() {
         let service = fully_wired_service();
