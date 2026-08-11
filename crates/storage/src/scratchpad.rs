@@ -192,6 +192,185 @@ const NEAREST_NOTES_BY_EMBEDDING_SQL: &str = "\
      ORDER BY d.distance, sp.id DESC
      LIMIT $8";
 
+/// Every column [`SpRow`] reads.
+///
+/// The list exists so a test can hold every query to it. A column added to the
+/// row and missed by ONE query is invisible to any test that builds its
+/// fixtures in memory: the row type and the reading code agree with each other,
+/// and only the SQL disagrees, so nothing fails until a statement reaches
+/// Postgres. That is how `after_outside_read` reached `main` (#1277) missing
+/// from four of these six, with `just check` green.
+///
+/// Test-only: the integration suites link the lib without `cfg(test)`, so a
+/// const only the guard reads is dead code in that build.
+#[cfg(test)]
+const NOTE_COLUMNS: &[&str] = &[
+    "id",
+    "conversation_id",
+    "owner_todo",
+    "note_key",
+    "content",
+    "note_type",
+    "seq",
+    "done",
+    "pinned",
+    "after_outside_read",
+    "knowledge_entry_id",
+    "created_at",
+    "updated_at",
+];
+
+/// Every query in this adapter that answers [`SpRow`], for the tests that hold
+/// them all to [`NOTE_COLUMNS`].
+///
+/// A new one has to be added here as well as written. That is this guard's weak
+/// point, and it is still far stronger than six hand-checked lists, which is
+/// what it replaces.
+#[cfg(test)]
+const SP_ROW_QUERIES: &[(&str, &str)] = &[
+    ("WRITE_UPSERT_SQL", WRITE_UPSERT_SQL),
+    ("GET_MANY_SQL", GET_MANY_SQL),
+    ("LIST_SQL", LIST_SQL),
+    ("SEARCH_TEXT_ANY_TERM_SQL", SEARCH_TEXT_ANY_TERM_SQL),
+    ("SEARCH_TEXT_SQL", SEARCH_TEXT_SQL),
+    ("SEARCH_HYBRID_SQL", SEARCH_HYBRID_SQL),
+];
+
+/// Answers [`SpRow`], so it selects every column the row reads.
+const WRITE_UPSERT_SQL: &str = "INSERT INTO scratchpads \
+             (id, user_id, conversation_id, owner_todo, note_key, content, note_type, seq, done, \
+              knowledge_entry_id, after_outside_read) \
+         SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], \
+                              $5::text[], $6::text[], $7::text[], $8::int4[], $9::bool[], \
+                              $10::text[], $11::bool[]) \
+         ON CONFLICT (conversation_id, owner_todo, note_key) \
+         DO UPDATE SET content = EXCLUDED.content, note_type = EXCLUDED.note_type, \
+                       seq = EXCLUDED.seq, done = EXCLUDED.done, updated_at = NOW(), \
+                       embedding = NULL, embedding_model = NULL, \
+                       after_outside_read = EXCLUDED.after_outside_read, \
+                       knowledge_entry_id = COALESCE(EXCLUDED.knowledge_entry_id, \
+                                                     scratchpads.knowledge_entry_id) \
+         WHERE scratchpads.user_id = EXCLUDED.user_id \
+         RETURNING id, conversation_id, owner_todo, note_key, content, note_type, seq, done, pinned, \
+                   after_outside_read, knowledge_entry_id, created_at, updated_at";
+
+/// Answers [`SpRow`], so it selects every column the row reads.
+const GET_MANY_SQL: &str = "SELECT id, conversation_id, owner_todo, note_key, content, note_type, seq, done, pinned, \
+                after_outside_read, knowledge_entry_id, created_at, updated_at \
+         FROM scratchpads \
+         WHERE user_id = $1 AND conversation_id = $2 AND note_key = ANY($3) \
+           AND ($5::text IS NULL OR (owner_todo = $6 OR owner_todo LIKE $6 || '.%' \
+                OR (id COLLATE \"C\" < $5 AND owner_todo = ANY($7::text[])))) \
+         ORDER BY updated_at DESC LIMIT $4";
+
+/// Answers [`SpRow`], so it selects every column the row reads.
+const LIST_SQL: &str = "SELECT id, conversation_id, owner_todo, note_key, content, note_type, seq, done, pinned, \
+                after_outside_read, knowledge_entry_id, created_at, updated_at \
+         FROM scratchpads \
+         WHERE user_id = $1 AND conversation_id = $2 \
+           AND ($3::text IS NULL OR note_type = $3) \
+           AND ($5::text IS NULL OR (owner_todo = $6 OR owner_todo LIKE $6 || '.%' \
+                OR (id COLLATE \"C\" < $5 AND owner_todo = ANY($7::text[])))) \
+         ORDER BY pinned DESC, note_type ASC, seq ASC NULLS LAST, updated_at DESC LIMIT $4";
+
+/// Answers [`SpRow`], so it selects every column the row reads.
+const SEARCH_TEXT_ANY_TERM_SQL: &str = "WITH q AS (
+             SELECT to_tsquery('english', string_agg(quote_literal(lexeme), ' | ')) AS query
+             FROM unnest(to_tsvector('english', $1))
+         )
+         SELECT id, conversation_id, owner_todo, note_key, content, note_type,
+                seq, done, pinned, after_outside_read, knowledge_entry_id,
+                created_at, updated_at
+         FROM scratchpads, q
+         WHERE user_id = $2 AND conversation_id = $3
+           AND q.query IS NOT NULL
+           AND tsv @@ q.query
+           AND ($4::text IS NULL OR (owner_todo = $5 OR owner_todo LIKE $5 || '.%'
+                OR (id COLLATE \"C\" < $4 AND owner_todo = ANY($6::text[]))))
+           AND note_key <> $8
+         ORDER BY ts_rank_cd(tsv, q.query) DESC, updated_at DESC, id DESC
+         LIMIT $7";
+
+/// Answers [`SpRow`], so it selects every column the row reads.
+const SEARCH_TEXT_SQL: &str = "WITH q AS (SELECT plainto_tsquery('english', $3) AS query) \
+         SELECT id, conversation_id, owner_todo, note_key, content, note_type, seq, done, pinned, \
+                after_outside_read, knowledge_entry_id, created_at, updated_at \
+         FROM scratchpads, q \
+         WHERE user_id = $1 AND conversation_id = $2 AND tsv @@ q.query \
+           AND ($4::text IS NULL OR note_type = $4) \
+           AND ($6::text IS NULL OR (owner_todo = $7 OR owner_todo LIKE $7 || '.%' \
+                OR (id COLLATE \"C\" < $6 AND owner_todo = ANY($8::text[])))) \
+         ORDER BY ts_rank_cd(tsv, q.query) DESC, updated_at DESC LIMIT $5";
+
+/// Answers [`SpRow`], so it selects every column the row reads.
+const SEARCH_HYBRID_SQL: &str = "WITH chunk_distances AS (
+            SELECT id, conversation_id, owner_todo, note_key, content, note_type,
+                   seq, done, pinned, after_outside_read, knowledge_entry_id,
+                   created_at, updated_at,
+                   MIN(chunk <=> $1) AS min_distance
+            FROM scratchpads, unnest(embedding) AS chunk
+            WHERE user_id = $2 AND conversation_id = $3
+              AND ($4::text IS NULL OR note_type = $4)
+              AND ($6::text IS NULL OR (owner_todo = $7 OR owner_todo LIKE $7 || '.%'
+                   OR (id COLLATE \"C\" < $6 AND owner_todo = ANY($8::text[]))))
+              AND embedding IS NOT NULL
+              AND embedding_model IS NOT NULL
+              AND (embedding_model = $9
+                   OR (split_part($9, '@', 2) <> ''
+                       AND split_part(embedding_model, '@', 2)
+                           = split_part($9, '@', 2)))
+            GROUP BY id, conversation_id, owner_todo, note_key, content, note_type,
+                     seq, done, pinned, after_outside_read, knowledge_entry_id,
+                     created_at, updated_at
+        ),
+        vector_ranked AS (
+            SELECT id, conversation_id, owner_todo, note_key, content, note_type,
+                   seq, done, pinned, after_outside_read, knowledge_entry_id,
+                   created_at, updated_at,
+                   ROW_NUMBER() OVER (ORDER BY min_distance) AS rank_v
+            FROM chunk_distances
+            ORDER BY min_distance
+            LIMIT $10
+        ),
+        text_ranked AS (
+            SELECT id, conversation_id, owner_todo, note_key, content, note_type,
+                   seq, done, pinned, after_outside_read, knowledge_entry_id,
+                   created_at, updated_at,
+                   ROW_NUMBER() OVER (ORDER BY ts_rank_cd(tsv, q.query) DESC) AS rank_t
+            FROM scratchpads, plainto_tsquery('english', $5) AS q(query)
+            WHERE user_id = $2 AND conversation_id = $3
+              AND tsv @@ q.query
+              AND ($4::text IS NULL OR note_type = $4)
+              AND ($6::text IS NULL OR (owner_todo = $7 OR owner_todo LIKE $7 || '.%'
+                   OR (id COLLATE \"C\" < $6 AND owner_todo = ANY($8::text[]))))
+            ORDER BY ts_rank_cd(tsv, q.query) DESC
+            LIMIT $10
+        ),
+        fused AS (
+            SELECT COALESCE(v.id, t.id) AS id,
+                   COALESCE(v.conversation_id, t.conversation_id) AS conversation_id,
+                   COALESCE(v.owner_todo, t.owner_todo) AS owner_todo,
+                   COALESCE(v.note_key, t.note_key) AS note_key,
+                   COALESCE(v.content, t.content) AS content,
+                   COALESCE(v.note_type, t.note_type) AS note_type,
+                   COALESCE(v.seq, t.seq) AS seq,
+                   COALESCE(v.done, t.done) AS done,
+                   COALESCE(v.pinned, t.pinned) AS pinned,
+                   COALESCE(v.after_outside_read, t.after_outside_read)
+                       AS after_outside_read,
+                   COALESCE(v.knowledge_entry_id, t.knowledge_entry_id) AS knowledge_entry_id,
+                   COALESCE(v.created_at, t.created_at) AS created_at,
+                   COALESCE(v.updated_at, t.updated_at) AS updated_at,
+                   (COALESCE(1.0 / (60 + v.rank_v), 0) +
+                    COALESCE(1.0 / (60 + t.rank_t), 0))::FLOAT8 AS rrf_score
+            FROM vector_ranked v
+            FULL OUTER JOIN text_ranked t ON v.id = t.id
+        )
+        SELECT id, conversation_id, owner_todo, note_key, content, note_type,
+               seq, done, pinned, after_outside_read, knowledge_entry_id,
+               created_at, updated_at
+        FROM fused ORDER BY rrf_score DESC, updated_at DESC, id DESC LIMIT $11";
+
 #[derive(sqlx::FromRow)]
 struct SpRow {
     id: String,
@@ -300,38 +479,21 @@ impl ScratchpadStore for PgScratchpadStore {
             .await
             .map_err(|e| CoreError::Storage(e.to_string()))?;
 
-        let rows: Vec<SpRow> = sqlx::query_as(
-            "INSERT INTO scratchpads \
-                 (id, user_id, conversation_id, owner_todo, note_key, content, note_type, seq, done, \
-                  knowledge_entry_id, after_outside_read) \
-             SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], \
-                                  $5::text[], $6::text[], $7::text[], $8::int4[], $9::bool[], \
-                                  $10::text[], $11::bool[]) \
-             ON CONFLICT (conversation_id, owner_todo, note_key) \
-             DO UPDATE SET content = EXCLUDED.content, note_type = EXCLUDED.note_type, \
-                           seq = EXCLUDED.seq, done = EXCLUDED.done, updated_at = NOW(), \
-                           embedding = NULL, embedding_model = NULL, \
-                           after_outside_read = EXCLUDED.after_outside_read, \
-                           knowledge_entry_id = COALESCE(EXCLUDED.knowledge_entry_id, \
-                                                         scratchpads.knowledge_entry_id) \
-             WHERE scratchpads.user_id = EXCLUDED.user_id \
-             RETURNING id, conversation_id, owner_todo, note_key, content, note_type, seq, done, pinned, \
-                       after_outside_read, knowledge_entry_id, created_at, updated_at",
-        )
-        .bind(&ids)
-        .bind(&user_ids)
-        .bind(&conv_ids)
-        .bind(&owner_todos)
-        .bind(&keys)
-        .bind(&contents)
-        .bind(&types)
-        .bind(&seqs)
-        .bind(&dones)
-        .bind(&entry_ids)
-        .bind(&after_outside_reads)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|e| CoreError::Storage(e.to_string()))?;
+        let rows: Vec<SpRow> = sqlx::query_as(WRITE_UPSERT_SQL)
+            .bind(&ids)
+            .bind(&user_ids)
+            .bind(&conv_ids)
+            .bind(&owner_todos)
+            .bind(&keys)
+            .bind(&contents)
+            .bind(&types)
+            .bind(&seqs)
+            .bind(&dones)
+            .bind(&entry_ids)
+            .bind(&after_outside_reads)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
 
         // One statement per embedded note. A single statement cannot carry them
         // all: every note's `vector[]` has its own chunk count, and a Postgres
@@ -385,25 +547,17 @@ impl ScratchpadStore for PgScratchpadStore {
         }
         let user_id = current_user_id();
         let (vb, me, ancestors) = read_snapshot();
-        let rows: Vec<SpRow> = sqlx::query_as(
-            "SELECT id, conversation_id, owner_todo, note_key, content, note_type, seq, done, pinned, \
-                    after_outside_read, knowledge_entry_id, created_at, updated_at \
-             FROM scratchpads \
-             WHERE user_id = $1 AND conversation_id = $2 AND note_key = ANY($3) \
-               AND ($5::text IS NULL OR (owner_todo = $6 OR owner_todo LIKE $6 || '.%' \
-                    OR (id COLLATE \"C\" < $5 AND owner_todo = ANY($7::text[])))) \
-             ORDER BY updated_at DESC LIMIT $4",
-        )
-        .bind(user_id.as_str())
-        .bind(conversation_id)
-        .bind(keys)
-        .bind(limit as i64)
-        .bind(vb)
-        .bind(me)
-        .bind(ancestors)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CoreError::Storage(e.to_string()))?;
+        let rows: Vec<SpRow> = sqlx::query_as(GET_MANY_SQL)
+            .bind(user_id.as_str())
+            .bind(conversation_id)
+            .bind(keys)
+            .bind(limit as i64)
+            .bind(vb)
+            .bind(me)
+            .bind(ancestors)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
         Ok(rows.into_iter().map(SpRow::into_note).collect())
     }
 
@@ -418,26 +572,17 @@ impl ScratchpadStore for PgScratchpadStore {
         // so a sequenced plan of `todo`s reads in order. The optional
         // `note_type` filter rides a single static query via `IS NULL OR`.
         let (vb, me, ancestors) = read_snapshot();
-        let rows: Vec<SpRow> = sqlx::query_as(
-            "SELECT id, conversation_id, owner_todo, note_key, content, note_type, seq, done, pinned, \
-                    after_outside_read, knowledge_entry_id, created_at, updated_at \
-             FROM scratchpads \
-             WHERE user_id = $1 AND conversation_id = $2 \
-               AND ($3::text IS NULL OR note_type = $3) \
-               AND ($5::text IS NULL OR (owner_todo = $6 OR owner_todo LIKE $6 || '.%' \
-                    OR (id COLLATE \"C\" < $5 AND owner_todo = ANY($7::text[])))) \
-             ORDER BY pinned DESC, note_type ASC, seq ASC NULLS LAST, updated_at DESC LIMIT $4",
-        )
-        .bind(user_id.as_str())
-        .bind(conversation_id)
-        .bind(note_type)
-        .bind(limit as i64)
-        .bind(vb)
-        .bind(me)
-        .bind(ancestors)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CoreError::Storage(e.to_string()))?;
+        let rows: Vec<SpRow> = sqlx::query_as(LIST_SQL)
+            .bind(user_id.as_str())
+            .bind(conversation_id)
+            .bind(note_type)
+            .bind(limit as i64)
+            .bind(vb)
+            .bind(me)
+            .bind(ancestors)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
         Ok(rows.into_iter().map(SpRow::into_note).collect())
     }
 
@@ -886,35 +1031,18 @@ impl PgScratchpadStore {
         let user_id = current_user_id();
         let (vb, me, ancestors) = read_snapshot();
         let mut scan = crate::scan_bound::begin_bounded(&self.pool, self.scan_ceiling).await?;
-        let rows: Vec<SpRow> = sqlx::query_as(
-            "WITH q AS (
-                 SELECT to_tsquery('english', string_agg(quote_literal(lexeme), ' | ')) AS query
-                 FROM unnest(to_tsvector('english', $1))
-             )
-             SELECT id, conversation_id, owner_todo, note_key, content, note_type,
-                    seq, done, pinned, after_outside_read, knowledge_entry_id,
-                    created_at, updated_at
-             FROM scratchpads, q
-             WHERE user_id = $2 AND conversation_id = $3
-               AND q.query IS NOT NULL
-               AND tsv @@ q.query
-               AND ($4::text IS NULL OR (owner_todo = $5 OR owner_todo LIKE $5 || '.%'
-                    OR (id COLLATE \"C\" < $4 AND owner_todo = ANY($6::text[]))))
-               AND note_key <> $8
-             ORDER BY ts_rank_cd(tsv, q.query) DESC, updated_at DESC, id DESC
-             LIMIT $7",
-        )
-        .bind(query)
-        .bind(user_id.as_str())
-        .bind(conversation_id)
-        .bind(vb)
-        .bind(me)
-        .bind(ancestors)
-        .bind(limit as i64)
-        .bind(SCRATCHPAD_GOAL_KEY)
-        .fetch_all(&mut *scan)
-        .await
-        .map_err(|e| CoreError::Storage(e.to_string()))?;
+        let rows: Vec<SpRow> = sqlx::query_as(SEARCH_TEXT_ANY_TERM_SQL)
+            .bind(query)
+            .bind(user_id.as_str())
+            .bind(conversation_id)
+            .bind(vb)
+            .bind(me)
+            .bind(ancestors)
+            .bind(limit as i64)
+            .bind(SCRATCHPAD_GOAL_KEY)
+            .fetch_all(&mut *scan)
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
         scan.commit()
             .await
             .map_err(|e| CoreError::Storage(e.to_string()))?;
@@ -939,28 +1067,18 @@ impl PgScratchpadStore {
         // Search stays relevance-ranked; the optional `note_type` filter rides
         // a single static query via `IS NULL OR`.
         let (vb, me, ancestors) = read_snapshot();
-        let rows: Vec<SpRow> = sqlx::query_as(
-            "WITH q AS (SELECT plainto_tsquery('english', $3) AS query) \
-             SELECT id, conversation_id, owner_todo, note_key, content, note_type, seq, done, pinned, \
-                    after_outside_read, knowledge_entry_id, created_at, updated_at \
-             FROM scratchpads, q \
-             WHERE user_id = $1 AND conversation_id = $2 AND tsv @@ q.query \
-               AND ($4::text IS NULL OR note_type = $4) \
-               AND ($6::text IS NULL OR (owner_todo = $7 OR owner_todo LIKE $7 || '.%' \
-                    OR (id COLLATE \"C\" < $6 AND owner_todo = ANY($8::text[])))) \
-             ORDER BY ts_rank_cd(tsv, q.query) DESC, updated_at DESC LIMIT $5",
-        )
-        .bind(user_id.as_str())
-        .bind(conversation_id)
-        .bind(query)
-        .bind(note_type)
-        .bind(limit as i64)
-        .bind(vb)
-        .bind(me)
-        .bind(ancestors)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CoreError::Storage(e.to_string()))?;
+        let rows: Vec<SpRow> = sqlx::query_as(SEARCH_TEXT_SQL)
+            .bind(user_id.as_str())
+            .bind(conversation_id)
+            .bind(query)
+            .bind(note_type)
+            .bind(limit as i64)
+            .bind(vb)
+            .bind(me)
+            .bind(ancestors)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
         Ok(rows.into_iter().map(SpRow::into_note).collect())
     }
 
@@ -1016,90 +1134,90 @@ impl PgScratchpadStore {
         // either one costs nothing at the time and breaks recall later.
         let fetch_limit = (limit.saturating_mul(2)) as i64;
 
-        let rows: Vec<SpRow> = sqlx::query_as(
-            "WITH chunk_distances AS (
-                SELECT id, conversation_id, owner_todo, note_key, content, note_type,
-                       seq, done, pinned, after_outside_read, knowledge_entry_id,
-                       created_at, updated_at,
-                       MIN(chunk <=> $1) AS min_distance
-                FROM scratchpads, unnest(embedding) AS chunk
-                WHERE user_id = $2 AND conversation_id = $3
-                  AND ($4::text IS NULL OR note_type = $4)
-                  AND ($6::text IS NULL OR (owner_todo = $7 OR owner_todo LIKE $7 || '.%'
-                       OR (id COLLATE \"C\" < $6 AND owner_todo = ANY($8::text[]))))
-                  AND embedding IS NOT NULL
-                  AND embedding_model IS NOT NULL
-                  AND (embedding_model = $9
-                       OR (split_part($9, '@', 2) <> ''
-                           AND split_part(embedding_model, '@', 2)
-                               = split_part($9, '@', 2)))
-                GROUP BY id, conversation_id, owner_todo, note_key, content, note_type,
-                         seq, done, pinned, after_outside_read, knowledge_entry_id,
-                         created_at, updated_at
-            ),
-            vector_ranked AS (
-                SELECT id, conversation_id, owner_todo, note_key, content, note_type,
-                       seq, done, pinned, after_outside_read, knowledge_entry_id,
-                       created_at, updated_at,
-                       ROW_NUMBER() OVER (ORDER BY min_distance) AS rank_v
-                FROM chunk_distances
-                ORDER BY min_distance
-                LIMIT $10
-            ),
-            text_ranked AS (
-                SELECT id, conversation_id, owner_todo, note_key, content, note_type,
-                       seq, done, pinned, after_outside_read, knowledge_entry_id,
-                       created_at, updated_at,
-                       ROW_NUMBER() OVER (ORDER BY ts_rank_cd(tsv, q.query) DESC) AS rank_t
-                FROM scratchpads, plainto_tsquery('english', $5) AS q(query)
-                WHERE user_id = $2 AND conversation_id = $3
-                  AND tsv @@ q.query
-                  AND ($4::text IS NULL OR note_type = $4)
-                  AND ($6::text IS NULL OR (owner_todo = $7 OR owner_todo LIKE $7 || '.%'
-                       OR (id COLLATE \"C\" < $6 AND owner_todo = ANY($8::text[]))))
-                ORDER BY ts_rank_cd(tsv, q.query) DESC
-                LIMIT $10
-            ),
-            fused AS (
-                SELECT COALESCE(v.id, t.id) AS id,
-                       COALESCE(v.conversation_id, t.conversation_id) AS conversation_id,
-                       COALESCE(v.owner_todo, t.owner_todo) AS owner_todo,
-                       COALESCE(v.note_key, t.note_key) AS note_key,
-                       COALESCE(v.content, t.content) AS content,
-                       COALESCE(v.note_type, t.note_type) AS note_type,
-                       COALESCE(v.seq, t.seq) AS seq,
-                       COALESCE(v.done, t.done) AS done,
-                       COALESCE(v.pinned, t.pinned) AS pinned,
-                       COALESCE(v.after_outside_read, t.after_outside_read)
-                           AS after_outside_read,
-                       COALESCE(v.knowledge_entry_id, t.knowledge_entry_id) AS knowledge_entry_id,
-                       COALESCE(v.created_at, t.created_at) AS created_at,
-                       COALESCE(v.updated_at, t.updated_at) AS updated_at,
-                       (COALESCE(1.0 / (60 + v.rank_v), 0) +
-                        COALESCE(1.0 / (60 + t.rank_t), 0))::FLOAT8 AS rrf_score
-                FROM vector_ranked v
-                FULL OUTER JOIN text_ranked t ON v.id = t.id
-            )
-            SELECT id, conversation_id, owner_todo, note_key, content, note_type,
-                   seq, done, pinned, after_outside_read, knowledge_entry_id,
-                   created_at, updated_at
-            FROM fused ORDER BY rrf_score DESC, updated_at DESC, id DESC LIMIT $11",
-        )
-        .bind(embedding_vec)
-        .bind(user_id.as_str())
-        .bind(conversation_id)
-        .bind(note_type)
-        .bind(query)
-        .bind(vb)
-        .bind(me)
-        .bind(ancestors)
-        .bind(embedding_model)
-        .bind(fetch_limit)
-        .bind(limit as i64)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CoreError::Storage(e.to_string()))?;
+        let rows: Vec<SpRow> = sqlx::query_as(SEARCH_HYBRID_SQL)
+            .bind(embedding_vec)
+            .bind(user_id.as_str())
+            .bind(conversation_id)
+            .bind(note_type)
+            .bind(query)
+            .bind(vb)
+            .bind(me)
+            .bind(ancestors)
+            .bind(embedding_model)
+            .bind(fetch_limit)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
         Ok(rows.into_iter().map(SpRow::into_note).collect())
+    }
+}
+
+#[cfg(test)]
+mod projection_tests {
+    use super::{NOTE_COLUMNS, SEARCH_HYBRID_SQL, SP_ROW_QUERIES};
+
+    /// Every query that answers `SpRow` selects every column `SpRow` reads.
+    ///
+    /// The guard the #1277 outage needed and did not have. A column added to
+    /// the row and missed by one query is invisible to every test that builds
+    /// its fixtures in memory - the row type and the reading code agree with
+    /// each other, and only the SQL disagrees - so nothing failed until a live
+    /// database ran the statement. Four of these six were missing it and
+    /// `just check` was green.
+    ///
+    /// Asserted against the SQL text so it runs in the lib suite on every
+    /// `just check`, rather than behind `just test-db` where the failure
+    /// already had somewhere to hide. `knowledge_search.rs` guards its own scan
+    /// this way; this is the same idiom on the adapter that lacked it.
+    #[test]
+    fn every_query_that_answers_a_note_selects_every_column_a_note_reads() {
+        for (name, sql) in SP_ROW_QUERIES {
+            for column in NOTE_COLUMNS {
+                assert!(
+                    sql.contains(column),
+                    "{name} does not select `{column}`, so reading a note through it \
+                     fails at run time against a real database:\n{sql}"
+                );
+            }
+        }
+    }
+
+    /// The hybrid query folds two arms through a chain of CTEs, so naming a
+    /// column once is not enough: it has to survive the group, both ranked
+    /// arms, the fold, and the final read.
+    ///
+    /// Why counting rather than a rule about the `FROM` clause. The obvious
+    /// rule - every stage reading `FROM scratchpads` carries every column -
+    /// is wrong twice over. It misses the final projections, which read
+    /// `FROM fused`; and it wrongly implicates the `GROUP BY` of
+    /// `chunk_distances`, which is not a projection at all and yet breaks the
+    /// query just as hard when the column is absent from it. Counting
+    /// occurrences against a column known to thread every stage needs to know
+    /// none of that.
+    ///
+    /// This is the case the test above cannot see, and it is what a
+    /// half-threaded chain looks like: the column is present, in some arms.
+    #[test]
+    fn the_hybrid_query_carries_every_column_through_all_of_its_arms() {
+        // `id` also appears in the join predicate and the ordering, so it sets
+        // no useful floor; every other column appears only in the stages.
+        let floor = SEARCH_HYBRID_SQL.matches("note_key").count();
+        assert!(
+            floor >= 5,
+            "this test's own yardstick is wrong: `note_key` should thread every stage"
+        );
+        for column in NOTE_COLUMNS {
+            if *column == "id" {
+                continue;
+            }
+            let seen = SEARCH_HYBRID_SQL.matches(column).count();
+            assert!(
+                seen >= floor,
+                "the hybrid query names `{column}` {seen} times against `note_key`'s \
+                 {floor}, so a stage drops it:\n{SEARCH_HYBRID_SQL}"
+            );
+        }
     }
 }
 
