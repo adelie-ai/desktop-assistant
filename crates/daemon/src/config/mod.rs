@@ -5816,7 +5816,10 @@ admin_subjects = ["operator", "ops-oncall"]
         };
         super::save_daemon_config(&path, &config).expect("save");
 
-        let reloaded = super::load_daemon_config(&path)
+        // `parse_daemon_config` rather than the migrating loader: this asks what
+        // the written file says, and a read that could rewrite it would be
+        // measuring its own side effect.
+        let reloaded = super::parse_daemon_config(&path)
             .expect("reload")
             .expect("a written file is a present file");
         assert!(
