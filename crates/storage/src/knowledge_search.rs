@@ -13,7 +13,7 @@
 //!
 //! The order is `desktop_assistant_core::ports::recall::rank_by_activation`'s -
 //! the same function the `[Recall]` block's arms rank by - and every term it
-//! reads comes off [`SearchCandidate`]'s own `Activatable` implementation.
+//! reads comes off `SearchCandidate`'s own `Activatable` implementation.
 //! #1167 stated that the tool and the block could not drift because they read
 //! one score, and that was already false when written: the two built the
 //! score's *arguments* separately, so the page's projection dropping the

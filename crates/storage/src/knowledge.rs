@@ -575,11 +575,11 @@ impl PgKnowledgeBaseStore {
     /// [`current_situation_cue`]. What this read fetches is the per-entry half,
     /// which is a primary-key lookup over at most one page of ids.
     ///
-    /// Run after [`Self::use_records`] rather than beside it. The two are
-    /// separate statements on separate connections, and the default pool holds
-    /// five: a search that held two of them at once would let one turn's
-    /// several searches queue the next turn behind pool acquisition, which no
-    /// statement timeout bounds.
+    /// The one caller runs this after [`Self::use_records`] rather than beside
+    /// it. The two are separate statements on separate connections, and the
+    /// default pool holds five: a search that held two of them at once would
+    /// let one turn's several searches queue the next turn behind pool
+    /// acquisition, which no statement timeout bounds.
     async fn situation_records(
         &self,
         ids: Vec<String>,

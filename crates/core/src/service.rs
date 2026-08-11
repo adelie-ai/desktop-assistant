@@ -2701,10 +2701,6 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
             .instrument(crate::telemetry::recall_span(&conversation_id.0))
             .await;
 
-        // Negative memory (#1126), read once for the whole turn. A burn is
-        // matched at a decision point and a decision point is every tool call,
-        // so a read per call would put a database round trip in front of each
-        // one. The set is small and the matching is pure.
         // The cue this turn measured against the knowledge store, kept for the
         // turn's own tools (#1244). The knowledge-base search tool ranks by the
         // same situation the block does, and a cue is a statistic of the whole
@@ -2716,6 +2712,10 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
             .as_ref()
             .and_then(|found| found.candidates.situation_cue.clone());
 
+        // Negative memory (#1126), read once for the whole turn. A burn is
+        // matched at a decision point and a decision point is every tool call,
+        // so a read per call would put a database round trip in front of each
+        // one. The set is small and the matching is pure.
         let live_burns = self.live_burns_or_none().await;
         // Whether anything is wired at all. With nothing behind it the loop
         // must cost exactly what it cost before this feature existed, which
