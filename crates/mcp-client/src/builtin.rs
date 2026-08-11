@@ -992,12 +992,9 @@ impl BuiltinToolService {
             ToolDefinition::new(
                 TOOL_SYS_PROPS,
                 "Return a compact property sheet with basic runtime/system context. \
-                 The daemon host's personal fields (username, home directory, \
-                 hostname, shell, locale, XDG paths, local time) are reported only \
-                 when the connecting client shared its device context; the fields \
-                 that say where server-side tools act (cwd, os, arch, os_version, \
-                 session_type) are always reported, and anything held back is named \
-                 in `daemon_host.withheld`",
+                 Some of the daemon host's fields are reported only when the \
+                 connecting client shared its device context; the reply names any \
+                 it held back in `daemon_host.withheld` and says why",
                 serde_json::json!({
                     "type": "object",
                     "properties": {},
@@ -1543,6 +1540,22 @@ impl BuiltinToolService {
     /// A withheld field is **named** in `daemon_host.withheld` rather than
     /// dropped silently, so the model can tell "withheld" from "could not be
     /// detected" - the latter is a key that is present and null.
+    ///
+    /// # What this gate does NOT cover
+    ///
+    /// Only the `daemon_host` block. When the client shares no context the
+    /// identity fields above fall back to the daemon host and report its
+    /// `username`, `home_dir`, `hostname` and `timezone` - the same four values
+    /// `daemon_host` withholds, in the same reply, under
+    /// `identity_source: "daemon_host_fallback"`. That fallback is #558's and it
+    /// answers a different question (never present a daemon value AS the
+    /// client's) than a privacy preference does (do not disclose it at all).
+    ///
+    /// So on a desktop install, where the daemon host is the user's own machine,
+    /// what this gate newly withholds is `shell`, `locale` and the XDG paths.
+    /// `username`, `home_dir`, `hostname` and `timezone` still leave by the
+    /// identity route. `the_identity_fallback_still_reports_the_daemon_hosts_user`
+    /// pins that, so the gap is enforced and visible rather than latent.
     fn sys_props(&self) -> String {
         let now = NowSnapshot::now();
 
@@ -3801,10 +3814,25 @@ struct IdentityFields {
 
 /// Why a personal `daemon_host` field is absent, in the reply itself, so the
 /// model reads a decision rather than a gap.
-const DAEMON_HOST_WITHHELD_REASON: &str = "the connecting client shared no device context, so the daemon host's personal \
-     fields are withheld; on a desktop install the daemon host is the user's own \
-     machine, and reporting them would return the very facts the client withheld. \
-     Withheld is not unknown: these values exist, they are simply not being shared.";
+///
+/// It says "not reported", not "does not exist". Naming a field here is a
+/// statement about this reply, not about the host: `shell` and `locale` are
+/// named even on a host that never set them, so which environment variables
+/// happen to be set is not itself readable from the list.
+///
+/// It also points at the identity fields rather than letting the model infer
+/// they went quiet. They did not: when the client shares no context those fall
+/// back to the daemon host and report its username, home directory, hostname and
+/// timezone. A note that implied otherwise would be false in the very reply that
+/// carries it.
+const DAEMON_HOST_WITHHELD_REASON: &str = "not reported, because the connecting client shared no device context: on a \
+     desktop install the daemon host is the user's own machine, so these repeat \
+     what the client withheld. \"Withheld\" describes this reply, not the host - a \
+     field named here may or may not have a value, whereas a field present and \
+     null was looked for and not found. This does NOT cover the top-level \
+     identity fields: when `identity_source` is \"daemon_host_fallback\" those \
+     carry the daemon host's own username, home directory, hostname and \
+     timezone.";
 
 /// The `daemon_host` block of one `builtin_sys_props` reply.
 ///
@@ -3821,7 +3849,14 @@ fn daemon_host_props(now: &NowSnapshot, share_personal: bool) -> serde_json::Val
 
     // Kept whatever the client shared: these are how the model knows where a
     // server-side file or terminal tool acts, and withholding them would break
-    // real behaviour rather than protect anything. None of them names a person.
+    // real behaviour rather than protect anything.
+    //
+    // Four of the five name nobody. `cwd` is the exception and is kept anyway:
+    // it is the daemon's working directory, which on a desktop install usually
+    // sits under the user's home and so carries their login name - but it is
+    // also the one field the reply's own note tells the model to resolve
+    // relative paths against, so withholding it breaks server-side file and
+    // terminal tools outright. Kept knowingly, not because it is impersonal.
     let mut host = serde_json::Map::new();
     // Where a relative path resolves for a server-side tool.
     host.insert("cwd".to_string(), serde_json::json!(detect_daemon_cwd()));
@@ -3855,7 +3890,12 @@ fn daemon_host_props(now: &NowSnapshot, share_personal: bool) -> serde_json::Val
     serde_json::Value::Object(host)
 }
 
-/// The personal `daemon_host` fields, as (name, value) pairs in reply order.
+/// The personal `daemon_host` fields, as (name, value) pairs.
+///
+/// This order is the one `withheld` reports. It is NOT the order the fields
+/// appear in the reply: `serde_json::Map` is a `BTreeMap` unless the
+/// `preserve_order` feature is on, and it is not on in this workspace, so the
+/// object itself comes out alphabetical.
 ///
 /// One list, so what is emitted and what is reported as withheld cannot drift
 /// apart: a field added here is both emitted when the client shared a context
@@ -5673,6 +5713,97 @@ mod tests {
         }
     }
 
+    /// Every key `daemon_host` may carry, in one place. A key that appears in the
+    /// reply and in neither list fails `sys_props_daemon_host_carries_no_unclassified_field`,
+    /// so a field added later cannot be emitted without someone deciding which
+    /// side of the gate it belongs on.
+    fn all_daemon_host_keys() -> Vec<&'static str> {
+        let mut all: Vec<&'static str> = PERSONAL_DAEMON_HOST_FIELDS
+            .iter()
+            .chain(TOOL_LOCALITY_DAEMON_HOST_FIELDS.iter())
+            .copied()
+            .collect();
+        all.extend(["withheld", "withheld_reason"]);
+        all.sort_unstable();
+        all
+    }
+
+    #[tokio::test]
+    async fn sys_props_daemon_host_carries_no_unclassified_field() {
+        // The gate is only as good as its coverage. A new field added straight to
+        // the unconditional block would be emitted on every reply, named in no
+        // `withheld` list, and caught by nothing - so pin the whole key set in
+        // both states and force the decision to be made deliberately.
+        let shared: Vec<&str> = all_daemon_host_keys();
+        let daemon = daemon_host_under(Some(sharing_client_context())).await;
+        let mut keys: Vec<&str> = daemon.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, shared, "unclassified key in the shared reply");
+
+        let daemon = daemon_host_under(None).await;
+        let mut keys: Vec<&str> = daemon.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        let mut withheld_case: Vec<&str> = TOOL_LOCALITY_DAEMON_HOST_FIELDS.to_vec();
+        withheld_case.extend(["withheld", "withheld_reason"]);
+        withheld_case.sort_unstable();
+        assert_eq!(
+            keys, withheld_case,
+            "unclassified key in the withholding reply"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_identity_fallback_still_reports_the_daemon_hosts_user() {
+        // NOT the behaviour anyone wants - it is pinned so the gap is visible.
+        //
+        // Gating `daemon_host` does not make `sys_props` private. When the client
+        // shares no context the identity half falls back to the daemon host and
+        // reports its username, home directory and hostname at the TOP level of
+        // the same reply that names those very fields as withheld below. On a
+        // desktop install, where the daemon host is the user's own machine, that
+        // is the same disclosure by another key.
+        //
+        // #558 put that fallback there to answer a different question - never
+        // present a daemon value AS the client's - and it is out of scope here.
+        // This test exists so the next person reads the limit from a failing
+        // assertion rather than from a comment, and so that closing the gap is a
+        // deliberate edit to a named test rather than a silent behaviour change.
+        let service = BuiltinToolService::new();
+        let response = service
+            .execute_tool("builtin_sys_props", serde_json::json!({}))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let props = json
+            .get("props")
+            .and_then(serde_json::Value::as_object)
+            .unwrap();
+
+        assert_eq!(
+            props
+                .get("identity_source")
+                .and_then(serde_json::Value::as_str),
+            Some("daemon_host_fallback"),
+        );
+        for field in ["username", "home_dir"] {
+            assert!(
+                props.get(field).is_some_and(|v| !v.is_null()),
+                "the identity fallback still discloses {field}; if this now fails, the \
+                 gap closed and `sys_props`'s scope note must be updated to match"
+            );
+        }
+        // The contradiction in one assertion: named as withheld below, reported above.
+        let withheld: Vec<&str> = props
+            .get("daemon_host")
+            .and_then(|d| d.get("withheld"))
+            .and_then(serde_json::Value::as_array)
+            .expect("withheld array")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        assert!(withheld.contains(&"username"));
+    }
+
     #[tokio::test]
     async fn sys_props_keeps_the_tool_locality_daemon_host_fields_when_the_client_shared_none() {
         // The guard against over-withholding: these are how the model knows
@@ -5700,6 +5831,16 @@ mod tests {
                 .and_then(serde_json::Value::as_str)
                 .is_some_and(|s| !s.is_empty())
         );
+        // `cwd` is an Option and CAN be null, and it is the one field the reply's
+        // note tells the model to resolve relative paths against - so a
+        // present-but-null `cwd` is the failure this assertion exists for.
+        assert!(
+            daemon
+                .get("cwd")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|s| !s.is_empty()),
+            "cwd must carry a real path, not just a key; saw {daemon:?}"
+        );
     }
 
     #[tokio::test]
@@ -5720,6 +5861,31 @@ mod tests {
             daemon.get("withheld"),
             Some(&serde_json::json!([])),
             "nothing is withheld from a client that shared its context"
+        );
+        assert!(
+            daemon
+                .get("withheld_reason")
+                .is_some_and(serde_json::Value::is_null),
+            "a reply that withheld nothing must not carry a reason for withholding"
+        );
+        // The tool-locality fields are not conditional in EITHER direction: a gate
+        // that dropped them for a sharing client would be caught only here.
+        for field in TOOL_LOCALITY_DAEMON_HOST_FIELDS {
+            assert!(
+                daemon.contains_key(*field),
+                "daemon_host.{field} must be reported whatever the client shared; \
+                 saw {daemon:?}"
+            );
+        }
+        // Values, not just keys: a personal field emitted as null, or wired to the
+        // wrong detector, would satisfy a presence check.
+        assert_eq!(
+            daemon.get("username").and_then(serde_json::Value::as_str),
+            detect_username().as_deref(),
+        );
+        assert_eq!(
+            daemon.get("home_dir").and_then(serde_json::Value::as_str),
+            detect_home_dir().as_deref(),
         );
     }
 
