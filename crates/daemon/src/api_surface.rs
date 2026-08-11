@@ -6875,4 +6875,130 @@ url = postgres://adele:hunter2@db.example/adele
             );
         }
     }
+
+    // ----- A read of the config file must not write it (#915) -------------
+    //
+    // The legacy migration rewrites `daemon.toml` and takes a `.bak` when the
+    // file holds `[llm]` and no `[connections]` table. Deleting the last
+    // connection makes the daemon write exactly that shape, so any caller
+    // that migrates on the way in resurrects the connection the user removed
+    // and drops another backup beside the file.
+    //
+    // These tests watch the file, not the value the call returned: the defect
+    // is a side effect on disk, so a test that only read the return value
+    // would pass while the bug is present.
+    mod config_reads_do_not_write {
+        use super::*;
+
+        /// A running daemon with one connection and a legacy `[llm]` block
+        /// that an earlier migration left in place. The file is the
+        /// serialization of the config the handle runs, which is what every
+        /// daemon-authored write produces.
+        ///
+        /// `[llm]` carries a model, so it is not the default block and
+        /// serializes whatever else changes. Deleting the one connection
+        /// therefore leaves `[llm]` with no `[connections]` - the shape the
+        /// legacy migration triggers on.
+        fn handle_with_one_connection_and_a_legacy_llm_block(
+            dir: &std::path::Path,
+        ) -> (Arc<RegistryHandle>, std::path::PathBuf) {
+            let mut cfg = config_with_connections(&[("local", ollama_local())]);
+            cfg.llm.model = Some("llama3".to_string());
+            let path = dir.join("daemon.toml");
+            crate::config::save_daemon_config(&path, &cfg).expect("write the running config");
+            let registry = build_registry(&cfg);
+            let handle =
+                Arc::new(RegistryHandle::new(cfg, registry).with_config_path(path.clone()));
+            (handle, path)
+        }
+
+        /// Every file name in `dir`, sorted, so a new `.bak` shows up as an
+        /// added entry.
+        fn file_names(dir: &std::path::Path) -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(dir)
+                .expect("read the config directory")
+                .map(|entry| {
+                    entry
+                        .expect("read a directory entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect();
+            names.sort();
+            names
+        }
+
+        /// Byte-exact comparison, reported as text so a failure shows which
+        /// tables were added rather than two arrays of numbers.
+        fn assert_file_is_byte_identical(path: &std::path::Path, before: &[u8], what: &str) {
+            let after = std::fs::read(path).expect("read the config file");
+            assert!(
+                after == before,
+                "{what} must leave daemon.toml byte-identical\n--- before ---\n{}\n--- after ---\n{}",
+                String::from_utf8_lossy(before),
+                String::from_utf8_lossy(&after),
+            );
+        }
+
+        async fn delete_the_only_connection(handle: &Arc<RegistryHandle>) {
+            DaemonConnectionsService::new(handle.clone())
+                .delete_connection("local".to_string(), false)
+                .await
+                .expect("the last connection can be deleted");
+        }
+
+        #[tokio::test]
+        async fn a_settings_read_leaves_the_config_file_byte_identical_after_the_last_connection_is_deleted()
+         {
+            let dir = tempfile::TempDir::new().expect("temp dir");
+            let (handle, path) = handle_with_one_connection_and_a_legacy_llm_block(dir.path());
+            delete_the_only_connection(&handle).await;
+
+            let after_delete = std::fs::read(&path).expect("read the config file");
+            let files_after_delete = file_names(dir.path());
+
+            // `get_config` asks for this on every settings read, so it runs as
+            // often as a client refreshes its settings panel.
+            for _ in 0..3 {
+                let _ = handle.restart_required();
+            }
+
+            assert_file_is_byte_identical(&path, &after_delete, "a settings read");
+            assert_eq!(
+                file_names(dir.path()),
+                files_after_delete,
+                "a settings read must not leave a backup beside daemon.toml"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_deleted_connection_does_not_come_back_when_the_config_file_is_reloaded() {
+            let dir = tempfile::TempDir::new().expect("temp dir");
+            let (handle, path) = handle_with_one_connection_and_a_legacy_llm_block(dir.path());
+            delete_the_only_connection(&handle).await;
+
+            let after_delete = std::fs::read(&path).expect("read the config file");
+            let files_after_delete = file_names(dir.path());
+
+            // What the config-file watcher runs after a daemon-authored write.
+            let _ = handle.apply_reload();
+
+            assert!(
+                handle.snapshot_config().connections.is_empty(),
+                "a deleted connection must not be restored by a reload: {:?}",
+                handle
+                    .snapshot_config()
+                    .connections
+                    .keys()
+                    .collect::<Vec<_>>()
+            );
+            assert_file_is_byte_identical(&path, &after_delete, "a reload");
+            assert_eq!(
+                file_names(dir.path()),
+                files_after_delete,
+                "a reload must not leave a backup beside daemon.toml"
+            );
+        }
+    }
 }

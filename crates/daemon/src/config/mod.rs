@@ -2021,6 +2021,23 @@ model = "llama3"
     }
 
     #[test]
+    fn a_config_with_default_llm_settings_serializes_without_an_llm_table() {
+        // `[llm]` with no `[connections]` is the shape the legacy migration
+        // triggers on. A daemon-authored file must not carry that marker just
+        // because the struct has an `llm` field, or removing the last
+        // connection turns the file back into a legacy config.
+        let written = toml::to_string_pretty(&DaemonConfig::default()).expect("serialize");
+        assert!(
+            !migration::file_has_top_level_table(&written, "llm"),
+            "a config with no legacy [llm] settings must not serialize one: {written}"
+        );
+        assert!(
+            !written.trim().is_empty(),
+            "the serialized config must still hold the sections a fresh install needs"
+        );
+    }
+
+    #[test]
     fn transports_config_absent_table_is_default() {
         // A config with no `[transports]` section deserializes to all defaults.
         let cfg: DaemonConfig = toml::from_str("").unwrap();
