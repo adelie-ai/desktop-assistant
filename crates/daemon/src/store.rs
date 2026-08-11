@@ -588,3 +588,174 @@ mod tests {
         assert!(path_str.ends_with("conversations.json"));
     }
 }
+
+/// Which conversation store the daemon runs on, and whether that store keeps
+/// one user's conversations apart from another's.
+///
+/// The daemon picks the store from its configuration, and the two choices do
+/// not carry the same guarantee. The distinction matters at exactly one place:
+/// deciding whether the remote door may serve this store at all
+/// (`check_remote_door_store_tenancy`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConversationStoreKind {
+    /// PostgreSQL. Every conversation row carries its owner, and every read is
+    /// scoped by that owner.
+    Postgres,
+    /// One JSON file under the data home. It holds no owner and has no
+    /// partition, so every reader of the file reads every conversation in it.
+    JsonFile,
+}
+
+impl ConversationStoreKind {
+    /// The store a daemon selects: PostgreSQL when a database URL is
+    /// configured, else the JSON file. This mirrors the selection the daemon
+    /// makes when it builds the store, and it is the only input the tenancy
+    /// guard needs.
+    pub fn for_database_configured(database_configured: bool) -> Self {
+        if database_configured {
+            Self::Postgres
+        } else {
+            Self::JsonFile
+        }
+    }
+
+    /// Whether this store keeps one user's conversations apart from another's.
+    pub fn is_user_scoped(self) -> bool {
+        matches!(self, Self::Postgres)
+    }
+
+    /// A short name for the startup log, so an operator can read which store
+    /// the daemon chose without inspecting the configuration again.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Postgres => "postgres",
+            Self::JsonFile => "json-file",
+        }
+    }
+}
+
+/// Refuse a remote door served from a conversation store that has no per-user
+/// partition.
+///
+/// The remote WebSocket door admits every principal its authentication accepts,
+/// so it can serve more than one person. A store with no partition holds one
+/// set of conversations for all of them. Together those two facts mean each
+/// authenticated user reads and writes every other user's conversations, and
+/// nothing further down the stack can prevent it.
+///
+/// The check is on the configuration and runs at startup, so an operator learns
+/// about it before two people connect rather than after one reads the other's
+/// data. It refuses the whole daemon rather than only the door, because a
+/// remote deployment whose door silently never binds reads as a network fault
+/// and takes far longer to diagnose than a refusal that names its own cause.
+///
+/// A local install keeps its behaviour exactly. The remote door is off by
+/// default, so the common single-user desktop case never reaches the refusal
+/// whatever store it runs on.
+///
+/// This guard does not make the JSON store safe for several users. It refuses a
+/// configuration that cannot be made safe by anything the daemon does at
+/// runtime.
+pub fn check_remote_door_store_tenancy(
+    ws_enabled: bool,
+    store: ConversationStoreKind,
+) -> anyhow::Result<()> {
+    if !ws_enabled || store.is_user_scoped() {
+        return Ok(());
+    }
+    Err(anyhow::anyhow!(
+        "the remote WebSocket door is enabled and the conversation store is a single JSON file \
+         with no per-user partition, so every authenticated user would read and write every \
+         other user's conversations. Configure a database (`[database] url` in daemon.toml, or \
+         DESKTOP_ASSISTANT_DATABASE_URL), or turn the remote door off (`[transports] ws_enabled \
+         = false`, or DESKTOP_ASSISTANT_WS_ENABLED=false)"
+    ))
+}
+
+/// Acceptance suite for the remote-door tenancy guard (#773).
+///
+/// The daemon runs on one of two conversation stores. One of them keeps a
+/// user's conversations apart from every other user's, and one of them does
+/// not. The remote WebSocket door admits more than one authenticated person, so
+/// the two facts have to be checked together, at startup, before anybody
+/// connects.
+#[cfg(test)]
+mod remote_door_store_tenancy {
+    use super::{ConversationStoreKind, check_remote_door_store_tenancy};
+
+    /// A daemon selects PostgreSQL when a database URL is configured, and the
+    /// JSON file when none is. This is the fact the guard reasons about, so it
+    /// is pinned on its own.
+    #[test]
+    fn a_configured_database_selects_postgres_and_no_database_selects_the_json_file() {
+        assert_eq!(
+            ConversationStoreKind::for_database_configured(true),
+            ConversationStoreKind::Postgres
+        );
+        assert_eq!(
+            ConversationStoreKind::for_database_configured(false),
+            ConversationStoreKind::JsonFile
+        );
+    }
+
+    /// The JSON file holds no owner column and has no partition, so it cannot
+    /// keep one user's conversations from another's. PostgreSQL can.
+    #[test]
+    fn only_the_database_store_is_user_scoped() {
+        assert!(ConversationStoreKind::Postgres.is_user_scoped());
+        assert!(!ConversationStoreKind::JsonFile.is_user_scoped());
+    }
+
+    /// #773 acceptance: a daemon configured for remote access on a store with
+    /// no per-user partition refuses to start. Two authenticated people would
+    /// otherwise share one unpartitioned file, and each would read the other's
+    /// conversations.
+    #[test]
+    fn a_remote_door_on_a_store_with_no_user_partition_is_refused() {
+        let result = check_remote_door_store_tenancy(true, ConversationStoreKind::JsonFile);
+        assert!(
+            result.is_err(),
+            "the remote door on an unpartitioned store must be refused, not served"
+        );
+    }
+
+    /// #773 acceptance: the single-user local install is the common case, it is
+    /// safe, and it must not gain a new error. The remote door is off, so
+    /// nothing about the store's tenancy can leak between users.
+    #[test]
+    fn a_local_only_daemon_on_the_json_file_store_still_starts() {
+        assert!(
+            check_remote_door_store_tenancy(false, ConversationStoreKind::JsonFile).is_ok(),
+            "a local-only daemon on the JSON store is the common desktop case and must start"
+        );
+    }
+
+    /// The remote door on a store that does partition by user is exactly what
+    /// the deployed configuration does, and it must still start.
+    #[test]
+    fn a_remote_door_on_a_user_scoped_store_starts() {
+        assert!(check_remote_door_store_tenancy(true, ConversationStoreKind::Postgres).is_ok());
+        assert!(check_remote_door_store_tenancy(false, ConversationStoreKind::Postgres).is_ok());
+    }
+
+    /// The refusal has to be actionable: an operator reading it must learn what
+    /// is wrong and both ways to fix it, without reading the source.
+    #[test]
+    fn the_refusal_names_the_cause_and_both_ways_to_fix_it() {
+        let message = check_remote_door_store_tenancy(true, ConversationStoreKind::JsonFile)
+            .expect_err("the configuration is refused")
+            .to_string();
+        assert!(
+            message.contains("DESKTOP_ASSISTANT_DATABASE_URL"),
+            "the refusal must name the database setting: {message}"
+        );
+        assert!(
+            message.contains("ws_enabled"),
+            "the refusal must name the transport switch: {message}"
+        );
+        assert!(
+            message.contains("conversation"),
+            "the refusal must say what is shared: {message}"
+        );
+    }
+}

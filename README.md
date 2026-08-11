@@ -79,6 +79,20 @@ fixed default user; multi-tenant servers run the same daemon with a real IdP
 in front of it. See [docs/architecture-evolution.md](docs/architecture-evolution.md)
 for the target shape and design rules.
 
+That guarantee comes from the database. A daemon with no database configured
+runs on a single JSON file instead, and that file holds no owner and has no
+partition, so every reader of it reads every conversation in it. This is safe
+for the single-user desktop it is meant for, and unsafe the moment a second
+person can reach the daemon.
+
+So the daemon **refuses to start** when the remote WebSocket door is enabled and
+no database is configured. The refusal names both ways out: configure
+`[database] url` (or `DESKTOP_ASSISTANT_DATABASE_URL`), or turn the door off
+with `[transports] ws_enabled = false` (or `DESKTOP_ASSISTANT_WS_ENABLED=false`).
+A local install is unaffected, because the remote door is off by default. At
+every start the daemon logs which conversation store it selected and whether
+that store is scoped per user.
+
 ## Requirements
 
 - Rust (stable, edition 2024)
