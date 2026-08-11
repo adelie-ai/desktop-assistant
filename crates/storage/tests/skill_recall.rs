@@ -1370,3 +1370,117 @@ async fn a_cross_tenant_read_of_a_skill_situation_returns_nothing() {
 
     fx.cleanup().await;
 }
+
+// --- Approval, and what it changes (#1175) ----------------------------------
+
+/// Acceptance (#1175): approving a skill is what makes it reachable at all.
+///
+/// #1155 wrote the unapproved row and #1154 excluded it from every read the
+/// model has. Until something could set approval, a promoted skill was a row
+/// nothing would ever return - so this is the property the approve command
+/// exists to produce, checked where it actually happens.
+#[tokio::test]
+async fn approving_a_skill_is_what_makes_it_reachable() {
+    let Some(fx) = fixture().await else { return };
+    let store = PgSkillIndexStore::new(fx.pool.clone());
+
+    with_user_id(UserId::new(USER), async {
+        let draft = a_skill("my-draft", "A procedure the assistant wrote.", Some(USER));
+        seed(&store, &fx.pool, &draft, axis(0), false).await;
+
+        let before = store
+            .nearest_by_embedding(axis(0), MODEL, 10)
+            .await
+            .expect("the scan answers");
+        assert!(
+            before.skills.is_empty(),
+            "an unapproved skill reaches nothing: {:?}",
+            before.skills
+        );
+
+        store
+            .set_approval(
+                &SkillScope::Owner(USER.to_string()),
+                &["my-draft".to_string()],
+                Some(SkillApproval {
+                    at: now(),
+                    by: Some(USER.to_string()),
+                }),
+            )
+            .await
+            .expect("the approval is recorded");
+
+        let after = store
+            .nearest_by_embedding(axis(0), MODEL, 10)
+            .await
+            .expect("the scan answers");
+        let names: Vec<&str> = after.skills.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["my-draft"], "and an approved one is offerable");
+
+        let listed = store.list(None).await.expect("the catalog lists");
+        let row = listed
+            .iter()
+            .find(|s| s.name == "my-draft")
+            .expect("the row is listed");
+        assert_eq!(
+            row.approved_by.as_deref(),
+            Some(USER),
+            "the catalog records who consented"
+        );
+    })
+    .await;
+
+    fx.cleanup().await;
+}
+
+/// Approval is scoped: one person's approval of their own row is not another
+/// person's, and it does not reach the host-global row of the same name.
+#[tokio::test]
+async fn approving_ones_own_skill_leaves_the_global_row_of_that_name_alone() {
+    let Some(fx) = fixture().await else { return };
+    let store = PgSkillIndexStore::new(fx.pool.clone());
+
+    with_user_id(UserId::new(USER), async {
+        seed(
+            &store,
+            &fx.pool,
+            &a_skill("deploy", "The host-global copy.", None),
+            axis(0),
+            false,
+        )
+        .await;
+        seed(
+            &store,
+            &fx.pool,
+            &a_skill("deploy", "My own draft.", Some(USER)),
+            axis(0),
+            false,
+        )
+        .await;
+
+        store
+            .set_approval(
+                &SkillScope::Owner(USER.to_string()),
+                &["deploy".to_string()],
+                Some(SkillApproval {
+                    at: now(),
+                    by: Some(USER.to_string()),
+                }),
+            )
+            .await
+            .expect("the approval is recorded");
+
+        let global = store
+            .get("deploy", None)
+            .await
+            .expect("the global row reads")
+            .expect("the global row is there");
+        assert!(
+            !global.is_approved(),
+            "one person's consent is not consent for the whole host"
+        );
+    })
+    .await;
+
+    fx.cleanup().await;
+}

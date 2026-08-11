@@ -176,6 +176,15 @@ busctl --user call org.desktopAssistant \
 - WebSocket auth uses bearer JWTs, minted off the D-Bus surface entirely; see
   [WEBSOCKET_API.md](WEBSOCKET_API.md). Multiple tokens can be valid at once
   until expiry.
+- The skill catalog is **not on this surface**. `list_skills` and
+  `set_skill_approval` are what let a person see the skills the assistant wrote
+  for itself and approve one for use (see
+  [WEBSOCKET_API.md](WEBSOCKET_API.md)). This bridge carries a curated subset
+  of the command surface and has no typed method for them, so a D-Bus client
+  reaches them through the generic `org.desktopAssistant.Commands.SendCommand`
+  channel or not at all. Nothing an existing D-Bus caller does changes; what
+  such a client cannot do without that channel is show a person a skill waiting
+  for approval.
 - Negative memory is **not on this surface**. The daemon holds a tool call back
   when the same act went badly before, and `list_negative_memories`,
   `get_negative_memory` and `clear_negative_memory` are what let a person see

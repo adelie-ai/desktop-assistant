@@ -163,6 +163,15 @@ still a person's judgement rather than the model's: it is a command, which
 arrives from an authenticated client connection and never from a turn, and no
 tool the model is offered reaches it.
 
+`ListSkills` and `SetSkillApproval` are tenant work. The listing is the
+caller's own view of the catalog - the host-global skills plus their own - and
+the write reaches only rows this person owns, so neither decides anything for
+another tenant or for the host. Approving is a person's act rather than the
+model's, on the same footing as clearing a negative memory: it is a command,
+which arrives from an authenticated client connection and never from a turn,
+and no tool the model is offered reaches it. An assistant able to approve its
+own procedures would be recording the user's consent on the user's behalf.
+
 Every other command is tenant work, including `ClearAllHistory`, which clears
 only the calling user's conversations.
 

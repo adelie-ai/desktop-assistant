@@ -310,8 +310,69 @@ Current command variants:
 - `list_negative_memories`
 - `get_negative_memory { id }`
 - `clear_negative_memory { id, note? }`
+- `list_skills { limit? }`
+- `set_skill_approval { name, approved }`
 
 Result payloads are typed variants (`pong`, `status`, `conversation_id`, `conversations`, `conversation`, `config`, `ack`, etc.).
+
+### Skills: what the library holds, and what may be followed
+
+A skill is a named procedure. The assistant can write one for itself - from a
+plan it finished, or from a method it found while consolidating - and every
+such skill is recorded **unapproved**. An unapproved skill is offered by
+nothing and its body is refused by the skill-read tool, so until a person
+approves it, it exists and does nothing. These two commands are the whole of
+what a person does about that.
+
+**`list_skills { limit? }`** returns `skills`, one row per skill this person
+can see: the host-global ones plus their own.
+
+```json
+{"skills": [
+  {"name": "deploy-the-lab",
+   "description": "Roll a new image out to the cluster and watch it settle.",
+   "kind": "workflow",
+   "trust_tier": "local",
+   "source": "self-authored",
+   "own": true,
+   "present_on_disk": false,
+   "approved": false,
+   "tags": ["ops"]}
+]}
+```
+
+An unapproved skill is **listed**, with `approved: false`. That is the point of
+the command: silence would be indistinguishable from a library with nothing in
+it, and a skill nobody can see is a skill nobody will ever approve. `approved_at`
+and `approved_by` are present only once consent has been recorded.
+
+`trust_tier` is `local`, `github`, `well_known` or `unknown` - a string rather
+than an enum, so a tier added later reaches an older client as an unfamiliar
+word instead of a parse failure. On anything but `local`, `description` is text
+somebody outside this machine wrote: render it as a quotation, not as the
+assistant's own words. The body is not carried; read it with the skill tools.
+
+**`set_skill_approval { name, approved }`** returns
+`{"skill_approval_set": {"approved": true, "changed": true}}`. `approved` is
+the state after the call, so a client can render the result without a second
+read; `changed` says whether this call is the one that moved it. Asking for the
+state a skill is already in answers `changed: false` and writes nothing - not
+an error, and the skill is in the state you asked for either way.
+
+Two things it deliberately does not do.
+
+**It carries no approver.** The approver is the connection's authenticated
+subject. A payload field naming somebody else would let a record of consent be
+written in another person's name.
+
+**It reaches only your own skills.** A host-global skill was approved by
+somebody putting a file in a skill root, and withdrawing that from one person's
+session would decide it for every other tenant on the host. A name you own no
+row for is refused with `not_found` rather than silently ignored, because you
+asked for a state change that did not happen.
+
+A deployment with no skill catalog - no database, or no skill roots - answers
+both commands with `unsupported` rather than with an empty list.
 
 ### Negative memory: what is holding a call back
 

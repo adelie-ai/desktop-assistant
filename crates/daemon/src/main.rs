@@ -3123,6 +3123,37 @@ async fn main() -> Result<()> {
             }),
         );
     }
+    // #1175: the person-facing half of the skill catalog - list it, and approve
+    // or withdraw approval on one of this person's own skills. Gated on a
+    // catalog, so a deployment with none reports that it cannot answer rather
+    // than answering with an empty library.
+    //
+    // This is the only path that can set approval, and it is a command rather
+    // than a tool on purpose: an assistant able to approve its own procedures
+    // would be recording the user's consent on the user's behalf.
+    if let Some(si) = &skill_index_store {
+        use desktop_assistant_core::domain::{SkillApproval, SkillScope};
+        use desktop_assistant_core::ports::skill_index::SkillIndexStore;
+        let si_list = Arc::clone(si);
+        let si_get = Arc::clone(si);
+        let si_approve = Arc::clone(si);
+        api_handler_impl = api_handler_impl.with_skill_catalog(
+            Arc::new(move |limit: Option<u32>| {
+                let store = Arc::clone(&si_list);
+                Box::pin(async move { store.list(limit).await })
+            }),
+            Arc::new(move |name: String, owner: Option<String>| {
+                let store = Arc::clone(&si_get);
+                Box::pin(async move { store.get(&name, owner.as_deref()).await })
+            }),
+            Arc::new(
+                move |scope: SkillScope, names: Vec<String>, approval: Option<SkillApproval>| {
+                    let store = Arc::clone(&si_approve);
+                    Box::pin(async move { store.set_approval(&scope, &names, approval).await })
+                },
+            ),
+        );
+    }
     // Dream-cycle controls (#knowledge maintenance): when a pool + embeddings
     // are configured, serve `StartKnowledgeMaintenance` by spawning the requested
     // pass through the shared service. The same `Arc` the timer loops drive, so

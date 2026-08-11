@@ -16,7 +16,8 @@ use std::sync::Arc;
 use desktop_assistant_api_model as api;
 pub use desktop_assistant_auth_jwt::UserId;
 use desktop_assistant_core::domain::{DEFAULT_NOTE_TYPE, KnowledgeEntry, ScratchpadNote};
-use desktop_assistant_core::ports::auth::with_user_id;
+use desktop_assistant_core::domain::{SkillApproval, SkillScope};
+use desktop_assistant_core::ports::auth::{current_user_id, with_user_id};
 use desktop_assistant_core::ports::client_tools::with_client_tools;
 use desktop_assistant_core::ports::inbound::{
     AssistantService, ConnectionAvailability, ConnectionConfigPayload, ConnectionsService,
@@ -600,7 +601,6 @@ where
 /// list is a control with nothing to point at, and listing a catalog nobody can
 /// approve from is what left promoted skills inert.
 #[derive(Clone)]
-#[allow(dead_code)] // WITHHELD: the arms that read these are the implementation.
 struct SkillCatalogWiring {
     list: SkillListFn,
     /// Resolves a name inside one scope. The approval write is scoped to the
@@ -1596,6 +1596,29 @@ fn knowledge_entry_to_view(e: KnowledgeEntry) -> api::KnowledgeEntryView {
     }
 }
 
+/// One catalog row as a person reads it (#1175).
+///
+/// The body is deliberately not carried: a listing is a listing, and a skill
+/// body is a whole playbook. `own` is derived from the row's owner rather than
+/// compared against the caller, because the store already answered within the
+/// caller's own view - the global skills plus theirs - so an owned row is this
+/// person's by construction.
+fn skill_to_view(skill: &desktop_assistant_core::domain::IndexedSkill) -> api::SkillView {
+    api::SkillView {
+        name: skill.name.clone(),
+        description: skill.description.clone(),
+        kind: skill.kind.as_str().to_string(),
+        trust_tier: skill.trust_tier.as_str().to_string(),
+        source: skill.source.clone(),
+        own: skill.owner_user_id.is_some(),
+        present_on_disk: skill.present_on_disk,
+        approved: skill.is_approved(),
+        approved_at: skill.approved_at.map(|at| at.to_rfc3339()),
+        approved_by: skill.approved_by.clone(),
+        tags: skill.tags.clone(),
+    }
+}
+
 /// One negative memory as a person reads it (#1186).
 ///
 /// `now` is read once by the caller and passed in, so every row in one list
@@ -2390,16 +2413,56 @@ where
                     cleared: !cleared.is_empty(),
                 })
             }
-            api::Command::ListSkills { limit: _ } => {
-                let _ = self.skills.as_ref().ok_or(ApiError::Unsupported)?;
-                Err(ApiError::Unsupported)
+            api::Command::ListSkills { limit } => {
+                let wiring = self.skills.as_ref().ok_or(ApiError::Unsupported)?;
+                let rows = (wiring.list)(limit).await.map_err(Self::map_core_err)?;
+                Ok(api::CommandResult::Skills(
+                    rows.iter().map(skill_to_view).collect(),
+                ))
             }
-            api::Command::SetSkillApproval {
-                name: _,
-                approved: _,
-            } => {
-                let _ = self.skills.as_ref().ok_or(ApiError::Unsupported)?;
-                Err(ApiError::Unsupported)
+            api::Command::SetSkillApproval { name, approved } => {
+                let wiring = self.skills.as_ref().ok_or(ApiError::Unsupported)?;
+                // The caller's own scope, resolved from the identity the
+                // request authenticated as and never from the payload - the
+                // command carries no field that could name anybody else.
+                let owner = current_user_id();
+                let scope = SkillScope::Owner(owner.as_str().to_string());
+                // `Some(_)` addresses the caller's own row; the adapters ignore
+                // the string it carries and resolve the scope from the request
+                // (#911), so this is a scope selector and not a claim.
+                let existing = (wiring.get)(name.clone(), Some(owner.as_str().to_string()))
+                    .await
+                    .map_err(Self::map_core_err)?;
+                // A host-global skill was approved by somebody putting a file
+                // in a skill root, and withdrawing that from one person's
+                // session would decide it for every other tenant on the host.
+                // So a name this person owns no row for is refused by name
+                // rather than silently ignored: the caller asked for a state
+                // change that did not happen, and has to be able to tell.
+                let Some(existing) = existing else {
+                    return Err(ApiError::NotFound);
+                };
+                // Already in the state the caller asked for: nothing to write,
+                // and not a failure (base rule 8.2). Answering `changed: false`
+                // is what makes a retried request safe by design rather than by
+                // luck (base rule 8.4).
+                if existing.is_approved() == approved {
+                    return Ok(api::CommandResult::SkillApprovalSet {
+                        approved,
+                        changed: false,
+                    });
+                }
+                let approval = approved.then(|| SkillApproval {
+                    at: chrono::Utc::now(),
+                    by: Some(owner.as_str().to_string()),
+                });
+                (wiring.set_approval)(scope, vec![name], approval)
+                    .await
+                    .map_err(Self::map_core_err)?;
+                Ok(api::CommandResult::SkillApprovalSet {
+                    approved,
+                    changed: true,
+                })
             }
             api::Command::ListMcpServers => {
                 let servers = self

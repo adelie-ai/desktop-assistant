@@ -125,8 +125,32 @@ Who may write the columns is deliberately narrow:
   on both branches, so an amend of an approved skill drops the approval the old
   body earned. Forcing it in the store rather than in the caller is what makes
   that atomic: there is no window in which new content wears an old approval.
-- **`set_approval` is the explicit flip**, in either direction. Nothing calls it
-  yet, so a self-authored skill stays unapproved until an approve surface exists.
+- **`set_approval` is the explicit flip**, in either direction, and one command
+  calls it: `set_skill_approval { name, approved }` (#1175). That command is
+  what makes a self-authored skill usable at all, and three rules bound it.
+
+  It is a **command and never a tool**: it arrives from an authenticated client
+  connection, never from a turn, and nothing the model is offered reaches it.
+  An assistant able to approve its own procedures would be recording the user's
+  consent on the user's behalf.
+
+  It carries **no approver field**. The approver is the connection's
+  authenticated subject, so a record of consent cannot be written in somebody
+  else's name.
+
+  It reaches **only the caller's own rows**. A host-global skill was approved
+  by somebody putting a file in a skill root, and withdrawing that from one
+  person's session would decide it for every other tenant on the host, so a
+  name this person owns no row for is refused rather than silently ignored.
+
+  Asking for the state a skill is already in writes nothing and is not an
+  error; the reply says `changed: false`.
+
+- **`list_skills { limit? }` is what makes an unapproved skill visible.** It
+  returns the host-global skills plus the caller's own, each with `approved`,
+  and it lists the unapproved ones rather than omitting them - silence there is
+  indistinguishable from a library with nothing in it, and a skill nobody can
+  see is a skill nobody will ever approve.
 
 ### What "not approved" actually withholds
 
