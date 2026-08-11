@@ -133,7 +133,7 @@ async fn no_system_id_yields_legacy_handshake_shape() {
     wait_for_socket(&path).await;
 
     let (_client, _signals, _drop) =
-        UdsClient::connect(&path, Some("legacy-token"), None, None, None)
+        UdsClient::connect(&path, Some("legacy-token"), None, None, None, true)
             .await
             .expect("raw uds connect");
 
@@ -160,7 +160,7 @@ async fn peer_cred_handshake_omits_jwt() {
     spawn_handshake_capture_server(path.clone(), tx);
     wait_for_socket(&path).await;
 
-    let (_client, _signals, _drop) = UdsClient::connect(&path, None, None, None, None)
+    let (_client, _signals, _drop) = UdsClient::connect(&path, None, None, None, None, true)
         .await
         .expect("raw uds connect");
 
@@ -254,5 +254,77 @@ async fn client_context_is_omitted_when_sharing_disabled() {
     assert_eq!(
         first.client_context, None,
         "sharing disabled must attach no client context"
+    );
+}
+
+/// #783: the `share_client_context` setting being off is a refusal, and the
+/// daemon cannot infer it from an absent context - a client that resolved
+/// nothing sends an absent context too, and keeps its peer-identity grounding.
+/// So the client states the refusal on the handshake, and re-states it on
+/// reconnect. A sharing client states nothing, which keeps its handshake bytes
+/// identical to the pre-#783 shape.
+#[tokio::test]
+async fn the_client_context_refusal_is_stated_on_connect_and_restated_on_reconnect() {
+    let dir = TempDir::new().unwrap();
+
+    let declining_path = dir.path().join("declining.sock");
+    let (declining_tx, mut declining_rx) = mpsc::unbounded_channel();
+    spawn_handshake_capture_server(declining_path.clone(), declining_tx);
+    wait_for_socket(&declining_path).await;
+
+    let sharing_path = dir.path().join("sharing.sock");
+    let (sharing_tx, mut sharing_rx) = mpsc::unbounded_channel();
+    spawn_handshake_capture_server(sharing_path.clone(), sharing_tx);
+    wait_for_socket(&sharing_path).await;
+
+    let base = ConnectionConfig {
+        transport_mode: TransportMode::Uds,
+        ws_jwt: Some("test-token".to_string()),
+        ..ConnectionConfig::default()
+    };
+
+    let _declining = Connector::connect(&ConnectionConfig {
+        socket_path: Some(declining_path.clone()),
+        share_client_context: false,
+        ..base.clone()
+    })
+    .await
+    .expect("connector connects");
+
+    let first = timeout(Duration::from_secs(5), declining_rx.recv())
+        .await
+        .expect("first handshake captured")
+        .expect("handshake present");
+    assert_eq!(
+        first.share_client_context,
+        Some(false),
+        "sharing disabled must state the refusal, not merely omit the context"
+    );
+
+    let second = timeout(Duration::from_secs(10), declining_rx.recv())
+        .await
+        .expect("reconnect handshake captured")
+        .expect("handshake present");
+    assert_eq!(
+        second.share_client_context,
+        Some(false),
+        "the refusal must survive a reconnect, like every other handshake field"
+    );
+
+    let _sharing = Connector::connect(&ConnectionConfig {
+        socket_path: Some(sharing_path.clone()),
+        share_client_context: true,
+        ..base
+    })
+    .await
+    .expect("connector connects");
+
+    let sharing_handshake = timeout(Duration::from_secs(5), sharing_rx.recv())
+        .await
+        .expect("sharing handshake captured")
+        .expect("handshake present");
+    assert_eq!(
+        sharing_handshake.share_client_context, None,
+        "a sharing client must send no declaration at all"
     );
 }

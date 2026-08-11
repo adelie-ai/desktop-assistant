@@ -2880,6 +2880,10 @@ impl WsFrame {
 ///
 /// The system id is a **co-location/routing hint, not a trust boundary** (#248):
 /// it is self-reported and no privilege is gated on it (auth remains the JWT).
+///
+/// `share_client_context` (#783) is the client's declaration about the *other*
+/// fields' subject matter, and is likewise not a trust boundary: it withholds
+/// grounding, it never grants anything.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct UdsHandshake {
     /// Bearer JWT the server validates. Optional in the *type* (so a handshake
@@ -2904,6 +2908,20 @@ pub struct UdsHandshake {
     /// trust boundary**: it is self-reported and no privilege is gated on it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_context: Option<ClientContext>,
+    /// The client's declaration about sharing its local environment (#783).
+    ///
+    /// `Some(false)` means the client refuses to describe the user's device at
+    /// all, and the server must attach no client context to the connection —
+    /// including the peer-identity grounding it would otherwise apply to a
+    /// local client that reported none (#558). A client that connects on behalf
+    /// of somebody else sets this: its own process environment belongs to the
+    /// server it runs on, not to the person it is serving.
+    ///
+    /// `Some(true)` and absent both mean "no refusal", and behave identically —
+    /// absent is what every client that predates this field sends, so the
+    /// #558 grounding is unchanged for all of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share_client_context: Option<bool>,
 }
 
 /// HTTP header carrying the client's per-machine **system id** on the WebSocket
@@ -3282,6 +3300,7 @@ mod tests {
             system_id: None,
             host_label: None,
             client_context: None,
+            share_client_context: None,
         };
         let json = serde_json::to_string(&h).unwrap();
         assert_eq!(json, r#"{"jwt":"tok"}"#, "absent fields must not appear");
@@ -3291,6 +3310,7 @@ mod tests {
         assert_eq!(legacy.system_id, None);
         assert_eq!(legacy.host_label, None);
         assert_eq!(legacy.client_context, None);
+        assert_eq!(legacy.share_client_context, None);
     }
 
     #[test]
@@ -3354,6 +3374,32 @@ mod tests {
     }
 
     #[test]
+    fn uds_handshake_declining_client_context_round_trips_and_is_absent_by_default() {
+        // #783: the refusal must survive the wire, and a handshake that makes no
+        // declaration must stay byte-identical to the pre-#783 shape so every
+        // older client keeps its #558 grounding.
+        let declined = UdsHandshake {
+            jwt: Some("tok".into()),
+            share_client_context: Some(false),
+            ..UdsHandshake::default()
+        };
+        let json = serde_json::to_string(&declined).unwrap();
+        assert_eq!(json, r#"{"jwt":"tok","share_client_context":false}"#);
+        let back: UdsHandshake = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.share_client_context, Some(false));
+
+        let undeclared = UdsHandshake {
+            jwt: Some("tok".into()),
+            ..UdsHandshake::default()
+        };
+        assert_eq!(
+            serde_json::to_string(&undeclared).unwrap(),
+            r#"{"jwt":"tok"}"#,
+            "a client making no declaration must send no such field"
+        );
+    }
+
+    #[test]
     fn uds_handshake_missing_jwt_still_parses() {
         // A frame with no `jwt` must still deserialize (so the server can return
         // its explicit "missing jwt" auth error rather than a generic parse
@@ -3369,6 +3415,7 @@ mod tests {
             system_id: Some("machine-abc".into()),
             host_label: Some("laptop".into()),
             client_context: None,
+            share_client_context: None,
         };
         let json = serde_json::to_string(&h).unwrap();
         let back: UdsHandshake = serde_json::from_str(&json).unwrap();
