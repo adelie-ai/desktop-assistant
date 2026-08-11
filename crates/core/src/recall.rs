@@ -2792,6 +2792,61 @@ mod tests {
         );
     }
 
+    /// The block refuses to rank a set where some candidates carry a distance
+    /// and some do not, and leaves the order it arrived in (#1244).
+    ///
+    /// One lookup uses one mode, so a mixed set means an adapter fused two -
+    /// and a block half ordered by activation and half by `ts_rank_cd` is
+    /// ordered by neither. The search page's policy on the same shape of set is
+    /// the opposite one, because its full-text arm produces such a set on every
+    /// call; `MixedSet` states both and each caller states which it takes.
+    ///
+    /// The first assertion is the control: the same two measured candidates,
+    /// with no lexical one beside them, are reordered by the use log. Without
+    /// it this test would pass over a set nothing would have reordered anyway.
+    #[test]
+    fn a_mixed_candidate_set_leaves_the_blocks_order_untouched() {
+        let source = seeded_source();
+        let nearest = hit(
+            "kb-nearest",
+            "a fact nobody reads",
+            &["topic"],
+            source.distance_at(9.0),
+        );
+        let worked = opened(
+            hit(
+                "kb-worked",
+                "a fact the work keeps needing",
+                &["topic"],
+                source.distance_at(8.6),
+            ),
+            20,
+            60,
+        );
+        let shown = |entries: Vec<RecallEntry>| {
+            shown_ids(&RecallCandidates {
+                entries,
+                entry_dispersion: Some(source),
+                ..RecallCandidates::default()
+            })
+        };
+
+        assert_eq!(
+            shown(vec![nearest.clone(), worked.clone()]),
+            owned(&["kb-worked", "kb-nearest"]),
+            "one mode in the list: the use log reorders it"
+        );
+        assert_eq!(
+            shown(vec![
+                nearest,
+                worked,
+                lexical("kb-fts", "a fact found by its words"),
+            ]),
+            owned(&["kb-nearest", "kb-worked", "kb-fts"]),
+            "a mixed set carries no one order, so the block keeps the order it arrived in"
+        );
+    }
+
     /// Acceptance (#1123): a store with no use history renders exactly the block
     /// it rendered before activation existed - the distances decide, in the
     /// order they arrived.
