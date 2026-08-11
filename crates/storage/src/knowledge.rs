@@ -1,6 +1,8 @@
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::KnowledgeEntry;
+use desktop_assistant_core::domain::activation::LexicalMatch;
 use desktop_assistant_core::domain::knowledge_use::KnowledgeUseRecord;
+use desktop_assistant_core::domain::situation::SituationRecord;
 use desktop_assistant_core::ports::auth::current_user_id;
 use desktop_assistant_core::ports::knowledge::{
     AVAILABLE_TAGS_LIMIT, KNOWLEDGE_TAG_CENSUS_SAMPLE, KnowledgeBaseStore, KnowledgeListPage,
@@ -465,27 +467,33 @@ impl PgKnowledgeBaseStore {
         let spread = rows.first().map_or(0.0, |r| r.spread(measured));
         let dispersion =
             measured.unwrap_or(desktop_assistant_core::recall::RECALL_ASSUMED_DISPERSION);
-        let candidates: Vec<SearchCandidate> = rows
+        let mut candidates: Vec<SearchCandidate> = rows
             .into_iter()
             .map(|r| {
                 let distance = r.distance;
-                let lexical_share = r.lexical_share;
+                let lexical = LexicalMatch {
+                    share: r.lexical_share,
+                    spread,
+                };
                 SearchCandidate {
                     entry: r.into_entry(),
                     distance,
-                    lexical_share,
+                    lexical,
+                    use_record: None,
+                    situation: SituationRecord::new(),
                 }
             })
             .collect();
-        let records = self
-            .use_records(candidates.iter().map(|c| c.entry.id.clone()).collect())
-            .await;
+        let ids: Vec<String> = candidates.iter().map(|c| c.entry.id.clone()).collect();
+        let mut records = self.use_records(ids).await;
+        for candidate in &mut candidates {
+            candidate.use_record = records.remove(&candidate.entry.id);
+        }
 
         Ok(crate::knowledge_search::rank_page(
             candidates,
             dispersion,
-            spread,
-            &records,
+            None,
             chrono::Utc::now(),
             limit,
         ))

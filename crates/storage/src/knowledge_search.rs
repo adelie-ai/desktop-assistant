@@ -56,19 +56,26 @@
 //! scan carries decide only the order candidates travel in. A rank-shaped
 //! tiebreak would reintroduce exactly what this module removed.
 
-use std::collections::HashMap;
-
 use chrono::{DateTime, Utc};
 use desktop_assistant_core::domain::KnowledgeEntry;
-use desktop_assistant_core::domain::activation::{
-    ActivationWeights, LexicalMatch, NO_SITUATION, activation,
-};
+use desktop_assistant_core::domain::activation::{LexicalMatch, NO_SITUATION};
 use desktop_assistant_core::domain::knowledge_use::KnowledgeUseRecord;
 use desktop_assistant_core::domain::salience::{SalienceReading, SalienceSource};
-use desktop_assistant_core::ports::recall::RecallDispersion;
+use desktop_assistant_core::domain::situation::{SituationCue, SituationRecord};
+use desktop_assistant_core::ports::recall::{
+    Activatable, MixedSet, RecallDispersion, RecallRelevance, rank_by_activation,
+};
 
 /// One row the hybrid search admitted, and what the store could measure about
 /// it.
+///
+/// **Every term the activation score reads is a field here, and the
+/// [`Activatable`] implementation below is the only place they are read from**
+/// (#1244). The `[Recall]` block's candidate ([`RecallEntry`]) carries the same
+/// set for the same reason: a term added to the score is a method added to the
+/// trait, which is a compile error in both until both answer.
+///
+/// [`RecallEntry`]: desktop_assistant_core::ports::recall::RecallEntry
 #[derive(Debug, Clone)]
 pub(crate) struct SearchCandidate {
     pub entry: KnowledgeEntry,
@@ -76,112 +83,121 @@ pub(crate) struct SearchCandidate {
     /// arm admitted and the vector arm cannot compare - no stored vector, or
     /// one from another model.
     pub distance: Option<f64>,
-    /// Where this row stands among the rows the query's own words reached, in
-    /// `[0, 1]`, and [`NO_LEXICAL`] for a row those words did not reach.
-    pub lexical_share: f64,
+    /// What this query's own words found here, and how far this source lets
+    /// anything stand out for them (#1239).
+    ///
+    /// [`LexicalMatch::NONE`] for a row those words did not reach. The spread
+    /// is the source's and is the same for every candidate of one page; it
+    /// travels per candidate because the term is read through the trait, and a
+    /// term read from anywhere but the candidate is a term one caller can
+    /// supply and the other forget.
+    pub lexical: LexicalMatch,
+    /// What the use log knows about this row (#698), or `None` where it knows
+    /// nothing or could not be read - both mean the row ranks on its other
+    /// terms, which is how every row ranked before the log existed.
+    pub use_record: Option<KnowledgeUseRecord>,
+    /// The situations this row has been seen in (#1125).
+    ///
+    /// Empty is an ordinary answer - a row written before any of this was
+    /// recorded, a turn with nothing connected, or a read that failed - and
+    /// [`SituationCue::coverage`] then answers zero.
+    pub situation: SituationRecord,
+}
+
+impl Activatable for SearchCandidate {
+    /// A row the vector arm measured carries its distance; a row only the
+    /// full-text arm reached carries none, which is the same statement
+    /// [`RecallRelevance::LexicalMatch`] makes on the recall path.
+    fn relevance(&self) -> RecallRelevance {
+        self.distance
+            .map_or(RecallRelevance::LexicalMatch, RecallRelevance::Distance)
+    }
+
+    fn use_record(&self) -> Option<&KnowledgeUseRecord> {
+        self.use_record.as_ref()
+    }
+
+    fn situation_coverage(&self, cue: Option<&SituationCue>) -> f64 {
+        cue.map_or(NO_SITUATION, |cue| cue.coverage(&self.situation))
+    }
+
+    /// Read from the row's own stored text and provenance, which the scan
+    /// already selects - the same reading the recall path takes of the same
+    /// entry, from the same fields.
+    fn salience_share(&self) -> f64 {
+        SalienceReading::read(&SalienceSource::of(&self.entry)).share()
+    }
+
+    /// The one term the two paths legitimately differ on. This caller has a
+    /// full-text arm and reads it; a recall lookup has none and answers
+    /// [`LexicalMatch::NONE`].
+    fn lexical(&self) -> LexicalMatch {
+        self.lexical
+    }
 }
 
 /// Order one search page, best first, and cut it to `limit`.
 ///
-/// **Measured rows first, ranked by activation.** Each is scored by
-/// [`activation`] over the semantic term its own source states - how many of
-/// that store's median absolute deviations below the store's median this
-/// query put it - plus what the use log knows about it and what its own text
-/// says about how salient it is. Nothing here is a rank: the distance survives
-/// into the score, which is the whole point of the change.
+/// **One ranking rule, held by the type system** (#1244). The order is
+/// [`rank_by_activation`]'s, the same function the `[Recall]` block's arms rank
+/// by, and every term it reads comes off [`SearchCandidate`]'s own
+/// [`Activatable`] implementation. #1167 stated in three places that the tool
+/// and the block could not drift because they read one score; that claim had no
+/// enforcer and was already false when written - the page's projection dropped
+/// the `source` column, so the salience term's `Deliberate` signal could never
+/// fire here, and the situation term was passed as a literal zero. Both were
+/// *inputs*. A term added to the score is now a method added to the trait, and
+/// a method with no default body is a compile error in both implementors until
+/// both answer.
 ///
-/// **The query's own words count too** (#1239). A candidate the full-text arm
-/// returned carries a share of this query's own best lexical match, and that
-/// share buys it a share of the spread the source's own distances have -
-/// [`ActivationWeights::lexical`] states the equivalence and why the spread is
-/// the right scale. It is what lets a row an exact-token query finds lead a row
-/// that is merely nearer, which is the whole reason the term exists.
+/// **The mixed-set policy is this caller's, and it is the opposite of the
+/// block's.** A search page is mixed by construction - the full-text arm
+/// deliberately admits rows the vector arm cannot compare at all - so
+/// [`MixedSet::MeasuredFirst`] ranks what was measured and keeps the rest in
+/// the order the database gave them. Refusing to rank a mixed set, which is
+/// what a recall lookup does because a mixed set there means an adapter fused
+/// two modes, would turn the ranking off on every call here.
 ///
-/// **Then the rows the store could not measure, in the order it gave them.**
-/// Such a row carries no distance, so there is no dimensionless term for the
-/// score to add and no honest place for it among the measured ones. Standing in
-/// a fixed value would say it is as good as a row at the store's median, which
-/// is a claim nobody measured; dropping it would hide an entry written since
-/// the last embedding backfill. So it keeps the database's own `ts_rank_cd`
-/// order and follows - which is the same rule
-/// [`RecallRelevance::LexicalMatch`](desktop_assistant_core::ports::recall::RecallRelevance::LexicalMatch)
-/// states for a lexical candidate, applied to the one caller that sees both
-/// kinds at once.
+/// Such a row carries no distance, so there is no dimensionless term for a
+/// score to add to and no honest place for it among the measured ones. Standing
+/// in a fixed value would say it is as good as a row at the store's median,
+/// which is a claim nobody measured; dropping it would hide an entry written
+/// since the last embedding backfill. So it keeps the database's own
+/// `ts_rank_cd` order and follows - the same rule
+/// [`RecallRelevance::LexicalMatch`] states for a lexical candidate, applied to
+/// the one caller that sees both kinds at once.
 ///
-/// `situation` is not read here, and the term is
-/// [`NO_SITUATION`] for every candidate. The cue is a
-/// property of the whole store measured per turn, and the block already pays
-/// for it once a turn; a search runs inside a turn that is already going, and
-/// may run several times, so paying for it again per call is a cost this change
-/// does not take on. #1240 tracks it.
-///
-/// `spread` is how many of the source's own deviations separate its nearest row
-/// from its furthest for this query, which is what a full lexical match is
-/// worth. The scan states it; zero where the source stated none, which leaves
-/// every lexical term at nothing.
+/// `situation` is the cue the running turn measured against this store, handed
+/// down rather than re-read - see
+/// [`current_situation_cue`](desktop_assistant_core::ports::knowledge_use::current_situation_cue),
+/// which holds why. `None` weights the term at zero, which ranks exactly as
+/// this page ranked before the term reached it.
 ///
 /// The scan answers one row per entry, so nothing here deduplicates: a row both
 /// arms admitted arrives once, carrying the distance one measured and the share
 /// the other read.
-///
-/// `records` may be empty: a use log that could not be read costs the order and
-/// never the page, exactly as it does on the recall path.
-///
-/// **This is the second implementation of the ranking policy**, beside
-/// `core::recall`'s own, and the two already differ on the mixed set: that one
-/// refuses to rank at all where some candidates carry a distance and some do
-/// not, because for its caller a mixed set means an adapter fused two modes.
-/// Here a mixed set is what the two arms produce by construction, so refusing
-/// would turn the ranking off on every call. Both read one `activation`, so the
-/// score has one definition; nothing holds the policy or the inputs together,
-/// and #1244 is where that is fixed.
 pub(crate) fn rank_page(
     candidates: Vec<SearchCandidate>,
     dispersion: RecallDispersion,
-    spread: f64,
-    records: &HashMap<String, KnowledgeUseRecord>,
+    situation: Option<&SituationCue>,
     now: DateTime<Utc>,
     limit: usize,
 ) -> Vec<KnowledgeEntry> {
-    let weights = ActivationWeights::default();
-    let mut measured: Vec<(f64, KnowledgeEntry)> = Vec::new();
-    let mut unmeasured: Vec<KnowledgeEntry> = Vec::new();
-
-    for candidate in candidates {
-        let lexical = LexicalMatch {
-            share: candidate.lexical_share,
-            spread,
-        };
-        let Some(distance) = candidate.distance else {
-            // A row nothing measured still carries the words that found it, but
-            // there is no semantic term for the lift to be added to - a lift on
-            // its own would place it by a number nobody measured. It keeps the
-            // order the database ranked it in, which is that lexical order.
-            unmeasured.push(candidate.entry);
-            continue;
-        };
-        let score = activation(
-            dispersion.deviations_below_median(distance),
-            records.get(&candidate.entry.id),
-            NO_SITUATION,
-            SalienceReading::read(&SalienceSource::of(&candidate.entry)).share(),
-            lexical,
-            now,
-            &weights,
-        );
-        measured.push((score, candidate.entry));
-    }
-
-    // `total_cmp` rather than `partial_cmp`, so the comparator is a total order
-    // and the sort cannot depend on which pair it happened to visit first. The
-    // sort is stable, so two candidates that score identically keep the order
-    // the scan gave them, which is nearest first.
-    measured.sort_by(|left, right| right.0.total_cmp(&left.0));
-
-    let mut page: Vec<KnowledgeEntry> = measured.into_iter().map(|(_, entry)| entry).collect();
-    page.append(&mut unmeasured);
-    page.truncate(limit);
-    page
+    // TODO(#1244): the cue is accepted but not read yet - this commit is the
+    // failing spec, and the next one supplies it.
+    let _unread = situation;
+    rank_by_activation(
+        candidates,
+        |candidate| candidate,
+        dispersion,
+        None,
+        now,
+        MixedSet::MeasuredFirst,
+    )
+    .into_iter()
+    .map(|candidate| candidate.entry)
+    .take(limit)
+    .collect()
 }
 
 /// What [`PgKnowledgeBaseStore`](crate::PgKnowledgeBaseStore)'s hybrid search
@@ -360,7 +376,11 @@ pub const HYBRID_SEARCH_SQL: &str = "\
 #[cfg(test)]
 mod tests {
     use super::*;
+    use desktop_assistant_core::domain::activation::{ActivationWeights, NO_LEXICAL};
     use desktop_assistant_core::domain::knowledge_use::RECENT_USE_WINDOW;
+    use desktop_assistant_core::domain::salience::SOURCE_EXPLICIT;
+    use desktop_assistant_core::domain::situation::{FieldFan, Situation, SituationField};
+    use desktop_assistant_core::ports::recall::RecallEntry;
 
     fn now() -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2026-08-10T12:00:00Z")
@@ -376,24 +396,35 @@ mod tests {
         SearchCandidate {
             entry: an_entry(id),
             distance: Some(distance),
-            lexical_share: 0.0,
+            lexical: LexicalMatch::NONE,
+            use_record: None,
+            situation: SituationRecord::new(),
         }
     }
 
-    /// A row the query's own words reached as well as the vector arm did.
-    fn named(id: &str, distance: f64, share: f64) -> SearchCandidate {
+    /// A row the query's own words reached as well as the vector arm did, in a
+    /// source whose nearest and furthest rows stand `spread` deviations apart.
+    fn named(id: &str, distance: f64, share: f64, spread: f64) -> SearchCandidate {
         SearchCandidate {
-            entry: an_entry(id),
-            distance: Some(distance),
-            lexical_share: share,
+            lexical: LexicalMatch { share, spread },
+            ..measured(id, distance)
         }
+    }
+
+    /// A row the query's words did not reach, in a source spread that wide.
+    /// The pair to [`named`]: the spread is stated and the share is nothing.
+    fn unnamed(id: &str, distance: f64, spread: f64) -> SearchCandidate {
+        named(id, distance, NO_LEXICAL, spread)
     }
 
     fn lexical(id: &str) -> SearchCandidate {
         SearchCandidate {
-            entry: an_entry(id),
             distance: None,
-            lexical_share: 1.0,
+            lexical: LexicalMatch {
+                share: 1.0,
+                spread: NO_SPREAD,
+            },
+            ..measured(id, 0.0)
         }
     }
 
@@ -418,11 +449,26 @@ mod tests {
         }
     }
 
-    fn log(records: Vec<KnowledgeUseRecord>) -> HashMap<String, KnowledgeUseRecord> {
-        records
-            .into_iter()
-            .map(|r| (r.entry_id.clone(), r))
-            .collect()
+    /// The same candidate, carrying `opens` opens the newest of which is
+    /// `seconds_ago` old.
+    fn opened(candidate: SearchCandidate, opens: u64, seconds_ago: i64) -> SearchCandidate {
+        SearchCandidate {
+            use_record: Some(used(&candidate.entry.id, opens, seconds_ago)),
+            ..candidate
+        }
+    }
+
+    /// The same candidate, having been seen in `situation`.
+    fn seen_in(candidate: SearchCandidate, situation: &Situation) -> SearchCandidate {
+        let record = situation
+            .iter()
+            .fold(SituationRecord::new(), |record, (field, value)| {
+                record.with(field, value)
+            });
+        SearchCandidate {
+            situation: record,
+            ..candidate
+        }
     }
 
     fn ids(page: &[KnowledgeEntry]) -> Vec<&str> {
@@ -434,9 +480,14 @@ mod tests {
         RecallDispersion::assumed(0.80, 0.05)
     }
 
-    /// What a test passes where no candidate carries the query's words, so the
-    /// lexical term is worth nothing whatever the spread would have been.
+    /// What a test states where the source measured no spread, so a full
+    /// lexical match is worth nothing.
     const NO_SPREAD: f64 = 0.0;
+
+    /// What a test passes where the turn measured no situation cue, which is
+    /// every turn with nothing connected and every turn that ran no recall
+    /// lookup.
+    const NO_CUE: Option<&SituationCue> = None;
 
     /// Acceptance (#1167): the page is ordered by the activation score, so what
     /// the use log knows about a candidate can take the top line from a
@@ -450,13 +501,13 @@ mod tests {
     /// rules disagree.
     #[test]
     fn a_used_entry_leads_a_marginally_nearer_one_nothing_has_opened() {
-        let records = log(vec![used("used", 12, 600)]);
-
         let page = rank_page(
-            vec![measured("nearest", 0.50), measured("used", 0.52)],
+            vec![
+                measured("nearest", 0.50),
+                opened(measured("used", 0.52), 12, 600),
+            ],
             a_store(),
-            NO_SPREAD,
-            &records,
+            NO_CUE,
             now(),
             10,
         );
@@ -480,22 +531,22 @@ mod tests {
     /// the two stores apart.
     #[test]
     fn the_semantic_term_is_read_against_the_stores_own_spread() {
-        let records = log(vec![used("used", 12, 600)]);
-        let candidates = vec![measured("nearest", 0.50), measured("used", 0.70)];
+        let candidates = vec![
+            measured("nearest", 0.50),
+            opened(measured("used", 0.70), 12, 600),
+        ];
 
         let tight = rank_page(
             candidates.clone(),
             RecallDispersion::assumed(0.80, 0.05),
-            NO_SPREAD,
-            &records,
+            NO_CUE,
             now(),
             10,
         );
         let loose = rank_page(
             candidates,
             RecallDispersion::assumed(0.80, 3.0),
-            NO_SPREAD,
-            &records,
+            NO_CUE,
             now(),
             10,
         );
@@ -529,8 +580,7 @@ mod tests {
                 measured("near", 0.50),
             ],
             a_store(),
-            NO_SPREAD,
-            &HashMap::new(),
+            NO_CUE,
             now(),
             10,
         );
@@ -546,8 +596,7 @@ mod tests {
         let page = rank_page(
             vec![lexical("first"), lexical("second"), lexical("third")],
             a_store(),
-            NO_SPREAD,
-            &HashMap::new(),
+            NO_CUE,
             now(),
             10,
         );
@@ -559,17 +608,14 @@ mod tests {
     /// candidate activation lifts into the page is on it.
     #[test]
     fn the_page_is_cut_to_the_limit_after_ranking_rather_than_before() {
-        let records = log(vec![used("used", 12, 600)]);
-
         let page = rank_page(
             vec![
                 measured("nearest", 0.50),
                 measured("second", 0.51),
-                measured("used", 0.53),
+                opened(measured("used", 0.53), 12, 600),
             ],
             a_store(),
-            NO_SPREAD,
-            &records,
+            NO_CUE,
             now(),
             1,
         );
@@ -585,8 +631,7 @@ mod tests {
         let page = rank_page(
             vec![measured("far", 0.60), measured("near", 0.50)],
             a_store(),
-            NO_SPREAD,
-            &HashMap::new(),
+            NO_CUE,
             now(),
             10,
         );
@@ -607,10 +652,12 @@ mod tests {
         let spread = 4.0;
 
         let page = rank_page(
-            vec![measured("nearest", 0.70), named("named", 0.80, 1.0)],
+            vec![
+                unnamed("nearest", 0.70, spread),
+                named("named", 0.80, 1.0, spread),
+            ],
             a_store(),
-            spread,
-            &HashMap::new(),
+            NO_CUE,
             now(),
             10,
         );
@@ -631,10 +678,9 @@ mod tests {
     #[test]
     fn a_row_with_no_text_hit_is_not_lifted_however_wide_the_source_is_spread() {
         let far_and_unnamed = rank_page(
-            vec![measured("nearest", 0.70), measured("far", 0.90)],
+            vec![unnamed("nearest", 0.70, 20.0), unnamed("far", 0.90, 20.0)],
             a_store(),
-            20.0,
-            &HashMap::new(),
+            NO_CUE,
             now(),
             10,
         );
@@ -651,10 +697,12 @@ mod tests {
     #[test]
     fn a_source_with_no_measured_spread_ranks_as_it_did_before_the_term_existed() {
         let page = rank_page(
-            vec![measured("nearest", 0.70), named("named", 0.80, 1.0)],
+            vec![
+                unnamed("nearest", 0.70, NO_SPREAD),
+                named("named", 0.80, 1.0, NO_SPREAD),
+            ],
             a_store(),
-            NO_SPREAD,
-            &HashMap::new(),
+            NO_CUE,
             now(),
             10,
         );
@@ -667,30 +715,251 @@ mod tests {
     #[test]
     fn a_partial_text_hit_does_not_lift_as_far_as_a_full_one() {
         let spread = 4.0;
-        let candidates = |share| vec![measured("nearest", 0.70), named("named", 0.80, share)];
+        let candidates = |share| {
+            vec![
+                unnamed("nearest", 0.70, spread),
+                named("named", 0.80, share, spread),
+            ]
+        };
 
         assert_eq!(
-            ids(&rank_page(
-                candidates(1.0),
-                a_store(),
-                spread,
-                &HashMap::new(),
-                now(),
-                10
-            )),
+            ids(&rank_page(candidates(1.0), a_store(), NO_CUE, now(), 10)),
             vec!["named", "nearest"]
         );
         assert_eq!(
-            ids(&rank_page(
-                candidates(0.1),
-                a_store(),
-                spread,
-                &HashMap::new(),
-                now(),
-                10
-            )),
+            ids(&rank_page(candidates(0.1), a_store(), NO_CUE, now(), 10)),
             vec!["nearest", "named"],
             "a tenth of the words must not buy the whole spread"
+        );
+    }
+
+    // --- One ranking rule for the tool and the block (#1244) ----------------
+
+    /// The present situation the tests below rank in.
+    fn here_and_now() -> Situation {
+        Situation::new()
+            .with(SituationField::Host, "workshop")
+            .with(SituationField::Weekday, "thursday")
+    }
+
+    /// A store of two hundred entries in which each of the cue's values is
+    /// carried by a quarter of them, so every field is informative and none
+    /// dominates.
+    fn a_gradeable_cue(situation: Situation) -> SituationCue {
+        let fans = situation
+            .iter()
+            .map(|(field, _)| {
+                (
+                    field,
+                    FieldFan {
+                        population: 200,
+                        holding: 50,
+                    },
+                )
+            })
+            .collect();
+        SituationCue::measured(situation, &fans).expect("two hundred entries is a gradeable store")
+    }
+
+    /// An entry a person wrote in a live turn, so the salience term has a
+    /// signal to read rather than nothing.
+    fn a_deliberate_entry(id: &str) -> KnowledgeEntry {
+        KnowledgeEntry {
+            source: Some(SOURCE_EXPLICIT.to_string()),
+            ..an_entry(id)
+        }
+    }
+
+    /// The same knowledge entry as the search tool's candidate and as the
+    /// block's, carrying the same history and the same situation record.
+    fn both_ways(
+        entry: KnowledgeEntry,
+        distance: f64,
+        record: KnowledgeUseRecord,
+        situation: &Situation,
+    ) -> (RecallEntry, SearchCandidate) {
+        let seen = situation
+            .iter()
+            .fold(SituationRecord::new(), |record, (field, value)| {
+                record.with(field, value)
+            });
+        let block = RecallEntry::new(entry.clone(), RecallRelevance::Distance(distance))
+            .with_use_record(Some(record.clone()))
+            .with_situation(seen.clone());
+        let tool = SearchCandidate {
+            entry,
+            distance: Some(distance),
+            lexical: LexicalMatch::NONE,
+            use_record: Some(record),
+            situation: seen,
+        };
+        (block, tool)
+    }
+
+    /// Acceptance (#1244): the search tool and the `[Recall]` block read one
+    /// entry through the same terms, and rank one pair of entries the same way.
+    ///
+    /// Named for exactly that and no wider. It checks the **four terms the two
+    /// paths must agree on** - the semantic signal, the reinforcement the use
+    /// log supplies, the situation coverage and the salience share - and one
+    /// pair ordered by each path. It does not check the fifth term: the two
+    /// legitimately differ there, because a search has a full-text arm and a
+    /// recall lookup uses one mode at a time and has none. Nor is it what holds
+    /// the two paths together - [`Activatable`] is, by refusing to compile an
+    /// implementor that does not answer every term. This is the second line,
+    /// and the reason it cannot be the first is that it only ever checks the
+    /// terms somebody thought to list here.
+    ///
+    /// The fixture exercises every term it compares, asserted rather than
+    /// assumed: a fixture where the situation and salience terms were both zero
+    /// would pass this test with either path ignoring them.
+    #[test]
+    fn the_tool_and_the_block_supply_the_same_four_shared_terms_and_rank_the_same_pair_alike() {
+        let here = here_and_now();
+        let cue = a_gradeable_cue(here.clone());
+        let store = a_store();
+        let weights = ActivationWeights::default();
+
+        let (block, tool) = both_ways(
+            a_deliberate_entry("kb-1"),
+            store.distance_at(4.0),
+            used("kb-1", 12, 600),
+            &here,
+        );
+
+        assert_eq!(
+            block.relevance().semantic_signal(store),
+            tool.relevance().semantic_signal(store),
+            "the two paths must read one distance against one source the same way"
+        );
+        assert_eq!(
+            block
+                .use_record()
+                .map(|record| record.use_sum(now(), &weights.use_score)),
+            tool.use_record()
+                .map(|record| record.use_sum(now(), &weights.use_score)),
+            "the two paths must read one use log the same way"
+        );
+        assert_eq!(
+            block.situation_coverage(Some(&cue)),
+            tool.situation_coverage(Some(&cue)),
+            "the two paths must read one situation record against one cue the same way"
+        );
+        assert_eq!(
+            block.salience_share(),
+            tool.salience_share(),
+            "the two paths must read one entry's own text and provenance the same way"
+        );
+        assert!(
+            block.situation_coverage(Some(&cue)) > 0.0 && block.salience_share() > 0.0,
+            "the fixture must exercise the two terms a path could ignore for free"
+        );
+
+        // And the terms reach the ordering, not merely the trait. The two
+        // entries sit at one distance, so only the situation can separate them,
+        // and the one that was never seen here arrives first.
+        let elsewhere = Situation::new()
+            .with(SituationField::Host, "the-road")
+            .with(SituationField::Weekday, "sunday");
+        let (block_far, tool_far) = both_ways(
+            a_deliberate_entry("elsewhere"),
+            store.distance_at(4.0),
+            used("elsewhere", 12, 600),
+            &elsewhere,
+        );
+        let (block_near, tool_near) = both_ways(
+            a_deliberate_entry("here"),
+            store.distance_at(4.0),
+            used("here", 12, 600),
+            &here,
+        );
+
+        let block_order = rank_by_activation(
+            vec![block_far, block_near],
+            |hit| hit,
+            store,
+            Some(&cue),
+            now(),
+            MixedSet::Refuse,
+        );
+        let block_ids: Vec<&str> = block_order
+            .iter()
+            .map(|hit| hit.entry.id.as_str())
+            .collect();
+        let page = rank_page(vec![tool_far, tool_near], store, Some(&cue), now(), 10);
+
+        assert_eq!(
+            block_ids,
+            vec!["here", "elsewhere"],
+            "the block ranks the entry seen here first"
+        );
+        assert_eq!(
+            ids(&page),
+            block_ids,
+            "the tool must order the same pair the same way as the block"
+        );
+    }
+
+    /// Acceptance (#1244): a search ranks an entry seen in the present
+    /// situation above an equally similar one that was not.
+    ///
+    /// Both sit at one distance, carry no use history and carry the same text,
+    /// so the situation is the only term that can separate them - and the one
+    /// that was never seen here arrives first, so a stable sort left alone
+    /// would keep it there.
+    #[test]
+    fn a_search_ranks_an_entry_seen_in_the_present_situation_above_an_equally_similar_one_that_was_not()
+     {
+        let here = here_and_now();
+        let cue = a_gradeable_cue(here.clone());
+
+        let page = rank_page(
+            vec![
+                measured("elsewhere", 0.60),
+                seen_in(measured("here", 0.60), &here),
+            ],
+            a_store(),
+            Some(&cue),
+            now(),
+            10,
+        );
+
+        assert_eq!(
+            ids(&page),
+            vec!["here", "elsewhere"],
+            "an entry this situation recurs with must lead an equally similar one it does not"
+        );
+    }
+
+    /// Acceptance (#1244): a turn that measured no cue ranks the page exactly
+    /// as it ranked before the term existed.
+    ///
+    /// Nothing connected, recall not wired, and a store too small to grade a
+    /// cue all arrive here as `None`, and the check is stronger than "the order
+    /// did not change": the page of entries that carry situation records is the
+    /// same page as one whose entries carry none, so the term cannot be reading
+    /// a record through some other route.
+    #[test]
+    fn a_search_with_no_situation_cue_ranks_the_page_as_it_ranked_before_the_cue() {
+        let here = here_and_now();
+        let situated = vec![
+            measured("elsewhere", 0.60),
+            seen_in(measured("here", 0.60), &here),
+        ];
+        let unrecorded = vec![measured("elsewhere", 0.60), measured("here", 0.60)];
+
+        let with_records = rank_page(situated, a_store(), NO_CUE, now(), 10);
+        let without_records = rank_page(unrecorded, a_store(), NO_CUE, now(), 10);
+
+        assert_eq!(
+            ids(&with_records),
+            ids(&without_records),
+            "with no cue, a situation record must not move anything"
+        );
+        assert_eq!(
+            ids(&with_records),
+            vec!["elsewhere", "here"],
+            "and the page keeps the order the scan gave it"
         );
     }
 

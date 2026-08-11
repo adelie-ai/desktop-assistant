@@ -62,7 +62,9 @@ use std::sync::Arc;
 
 use crate::CoreError;
 use crate::domain::KnowledgeEntry;
-use crate::domain::activation::{NO_SALIENCE, NO_SITUATION};
+use crate::domain::activation::{
+    ActivationWeights, LexicalMatch, NO_SALIENCE, NO_SITUATION, activation,
+};
 use crate::domain::knowledge_use::KnowledgeUseRecord;
 use crate::domain::salience::{SalienceReading, SalienceSource};
 use crate::domain::situation::{SituationCue, SituationRecord};
@@ -338,6 +340,18 @@ impl Activatable for RecallEntry {
     fn salience_share(&self) -> f64 {
         SalienceReading::read(&SalienceSource::of(&self.entry)).share()
     }
+
+    /// A recall candidate carries no lexical rank, and that is the honest
+    /// answer rather than an omission.
+    ///
+    /// One lookup uses one mode, so a candidate arrives with a distance or with
+    /// a full-text match and never both - see [`RecallRelevance`]. A candidate
+    /// that arrived the second way carries no semantic signal either, so the
+    /// block declines to rank the set at all and the term would have nothing to
+    /// be added to.
+    fn lexical(&self) -> LexicalMatch {
+        LexicalMatch::NONE
+    }
 }
 
 /// One skill offered as a recall candidate (#1154): procedural memory, cued by
@@ -483,15 +497,33 @@ impl Activatable for RecallSkill {
     fn salience_share(&self) -> f64 {
         NO_SALIENCE
     }
+
+    /// A skill candidate carries no lexical rank, on exactly the terms
+    /// [`RecallEntry::lexical`] states: the catalog is read in one mode at a
+    /// time, and a full-text hit carries no semantic signal to add a lexical
+    /// term to.
+    fn lexical(&self) -> LexicalMatch {
+        LexicalMatch::NONE
+    }
 }
 
 /// What a candidate contributes to its activation score
 /// ([`crate::domain::activation`]).
 ///
-/// One ranking rule, read through one trait, so the knowledge arm and the skill
-/// arm cannot drift apart. Both hold the same two signals - how far the
-/// candidate stands out of its own source, and what the use log knows about it -
-/// and the block orders each arm by the same function of them.
+/// **One method per term of [`activation`], and no defaults.** Every path that
+/// ranks by activation supplies its terms through this trait, so a term added
+/// to the score is a method added here, and a method added here is a compile
+/// error in every implementor until it answers. That is the whole mechanism:
+/// the two implementations of the ranking policy - the `[Recall]` block's arms
+/// and the knowledge-base search tool's page - cannot drift on their *inputs*,
+/// which is where both of the differences found by eye so far lived (a dropped
+/// `source` column, and a missing situation term). A cross-check test holds
+/// only what it thought to compare; this holds every term by construction.
+///
+/// A term a source genuinely has nothing to say about is answered by a named
+/// constant - [`NO_SALIENCE`], [`NO_SITUATION`],
+/// [`LexicalMatch::NONE`] - which is a statement, not an omission. What is made
+/// impossible is a caller *silently* supplying nothing.
 pub trait Activatable {
     /// How near this candidate is to the prompt, and in which sense.
     fn relevance(&self) -> RecallRelevance;
@@ -514,6 +546,171 @@ pub trait Activatable {
     /// [`NO_SALIENCE`] where the source
     /// holds no text a detector can read - see [`crate::domain::salience`].
     fn salience_share(&self) -> f64;
+    /// How much of the query's own words this candidate carries, and how far
+    /// its source lets anything stand out for that query (#1239), or
+    /// [`LexicalMatch::NONE`] where the caller has no full-text arm to read.
+    ///
+    /// `NONE` is a real answer and must stay expressible: a recall lookup uses
+    /// one mode at a time, so its candidates carry a distance or a full-text
+    /// match and never both.
+    fn lexical(&self) -> LexicalMatch;
+}
+
+/// What a ranker does with a set where some candidates carry a semantic signal
+/// and some do not.
+///
+/// **Both callers are right, and they answer differently, so the policy is an
+/// argument rather than a rule** (#1244). A mixed set means something different
+/// to each of them:
+///
+/// - A recall lookup uses one mode at a time, so its candidates all carry a
+///   distance or all carry a full-text match. A *mixed* set there means an
+///   adapter fused two modes into one list, and a block half ordered by one
+///   rule and half by another is ordered by neither. [`Self::Refuse`] is a
+///   guard on a case no adapter produces.
+/// - A search page is mixed by construction: the full-text arm deliberately
+///   admits rows the vector arm cannot compare at all, so refusing there would
+///   turn the ranking off on every call. [`Self::MeasuredFirst`] ranks what was
+///   measured and keeps the rest in the order the database gave them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MixedSet {
+    /// Leave the whole list in the order it arrived, and log that the ranking
+    /// was turned off. The `[Recall]` block's policy.
+    Refuse,
+    /// Rank the candidates that carry a semantic signal, then append the rest
+    /// in the order they arrived. The knowledge-base search page's policy.
+    MeasuredFirst,
+}
+
+/// Order candidates by their activation score, best first (#1123, #1244).
+///
+/// **The one ranking rule, for every caller that has one.** The `[Recall]`
+/// block's knowledge arm, its skill arm (#1154), and the knowledge-base search
+/// tool's page (#1167) all rank here. Two implementations would agree until one
+/// of the rules below changed, and the rule most likely to change is the one
+/// the second copy could not see.
+///
+/// ## The shape, and why it beat the others
+///
+/// Three candidates were compared before this one was built, against the same
+/// requirement: that a term added to [`activation`] cannot reach one caller and
+/// miss the other.
+///
+/// - **A cross-check test** - rank the same entry both ways and assert the
+///   scores match. Rejected as the *only* enforcer: a test holds what it thought
+///   to compare, and both defects found in this code so far were inputs to the
+///   score rather than the score itself, so a test comparing scores over a
+///   fixture that does not exercise the missing term passes. There is such a
+///   test, and it is a second line rather than the first.
+/// - **One wide function taking every term as a parameter.** Rejected because
+///   adding a parameter is a compile error at the call sites, which is the right
+///   signal, but nothing stops a caller answering the new parameter with a
+///   literal zero - which is exactly how the situation term came to be
+///   `NO_SITUATION` on the search path.
+/// - **This one: a trait with one method per term, and the mixed-set policy as
+///   an argument.** A term added to the score is a method added to
+///   [`Activatable`], and a method with no default body is a compile error in
+///   every implementor until it answers. The answer may still be "nothing", but
+///   it has to be written down as one.
+///
+/// `activatable` projects the caller's own item onto the terms - the block ranks
+/// `(candidate, rendered line)` pairs and the search page ranks its own
+/// candidate rows, and neither shape has to be flattened to rank. A projection
+/// rather than a per-caller wrapper type implementing [`Activatable`] by
+/// delegation, because such a wrapper is a second place a term can be dropped,
+/// which is the defect this function exists to close.
+///
+/// **Stable, so the arrival order breaks a tie.** Candidates arrive nearest
+/// first, and a stable sort leaves two of equal activation in that order - which
+/// is the right tie-break and is also what keeps a store with no use history
+/// ranking exactly as it ranked before any of this existed.
+///
+/// **It never decides admission.** Whatever bar the caller applies, it applied
+/// before this. The situation term (#1125) is inside this function for that
+/// reason and no other: a signal that could admit a candidate the bar refused
+/// would break the block's "and N more entries also matched" hedge, which counts
+/// what cleared a distance test over a nearest-first list.
+///
+/// `dispersion` and `situation` are the caller's own source's, never another's.
+/// A candidate with no situation record of its own answers [`NO_SITUATION`]
+/// through [`Activatable::situation_coverage`] and the term contributes zero,
+/// which is how it ranked before the cue existed.
+///
+/// The weights are [`ActivationWeights::default`] and are not a parameter: two
+/// callers ranking one store by two weightings is the drift this function
+/// exists to stop.
+pub fn rank_by_activation<T, A>(
+    candidates: Vec<T>,
+    activatable: impl Fn(&T) -> &A,
+    dispersion: RecallDispersion,
+    situation: Option<&SituationCue>,
+    now: chrono::DateTime<chrono::Utc>,
+    mixed: MixedSet,
+) -> Vec<T>
+where
+    A: Activatable + ?Sized,
+{
+    let weights = ActivationWeights::default();
+    let scored: Vec<Option<f64>> = candidates
+        .iter()
+        .map(|candidate| {
+            let hit = activatable(candidate);
+            // The semantic signal is read first and the rest inside the `map`,
+            // so a candidate with no signal - which no score will be built for -
+            // pays for none of the other terms. A salience reading lowercases
+            // the whole body.
+            hit.relevance().semantic_signal(dispersion).map(|semantic| {
+                activation(
+                    semantic,
+                    hit.use_record(),
+                    hit.situation_coverage(situation),
+                    hit.salience_share(),
+                    hit.lexical(),
+                    now,
+                    &weights,
+                )
+            })
+        })
+        .collect();
+
+    let with_signal = scored.iter().filter(|score| score.is_some()).count();
+    if mixed == MixedSet::Refuse && with_signal < scored.len() {
+        // A set of all lexical candidates is the ordinary degraded lookup and
+        // says nothing new. A *mixed* set means an adapter fused two modes into
+        // one list, which no adapter does today and which silently turns this
+        // ranking off - so it is worth a line rather than a shrug.
+        if with_signal > 0 {
+            tracing::debug!(
+                candidates = scored.len(),
+                with_semantic_signal = with_signal,
+                "recall: a mixed candidate set carries no one order, so activation ranking is \
+                 off for this block"
+            );
+        }
+        return candidates;
+    }
+
+    let mut measured: Vec<(f64, T)> = Vec::with_capacity(with_signal);
+    let mut unmeasured: Vec<T> = Vec::with_capacity(scored.len() - with_signal);
+    for (score, candidate) in scored.into_iter().zip(candidates) {
+        match score {
+            Some(score) => measured.push((score, candidate)),
+            None => unmeasured.push(candidate),
+        }
+    }
+    // `total_cmp` rather than `partial_cmp`, so the comparator is a total order
+    // and the sort cannot depend on which pair it happened to visit first. A
+    // score that is not a number cannot reach here on the block's path: the bar
+    // compares the same distance and a comparison against NaN is false, so such
+    // a candidate was never admitted.
+    measured.sort_by(|left, right| right.0.total_cmp(&left.0));
+
+    let mut ranked: Vec<T> = measured
+        .into_iter()
+        .map(|(_, candidate)| candidate)
+        .collect();
+    ranked.append(&mut unmeasured);
+    ranked
 }
 
 /// One scratchpad note offered as a recall candidate (#1101).
