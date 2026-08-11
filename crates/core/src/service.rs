@@ -59,7 +59,7 @@ use crate::sanitize::sanitize_assistant_text;
 use crate::skill_promotion::{self, PromotionMode};
 use crate::tool_provenance::{
     GATE_CLOSED_STATUS, GATE_OPEN_STATUS, GateChange, ToolGate, ToolPolicy, TurnProvenance,
-    WITHHELD_STEP_TEXT, gated_tiers,
+    WITHHELD_STEP_TEXT, gated_tiers, is_withheld_step_text,
 };
 use crate::tools::{
     NoopToolExecutor, categorize_tool_namespaces, summarize_tool_name, summarize_tool_text,
@@ -1235,7 +1235,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
                 o.to_string()
             };
             let body = step_text_to_record(&body, provenance);
-            outcome_is_a_trace = body != WITHHELD_STEP_TEXT;
+            outcome_is_a_trace = !is_withheld_step_text(&body);
             notes.push(NewScratchpadNote {
                 key: okey.clone(),
                 content: planning::truncate_on_char_boundary(&body, MAX_NOTE_BYTES),
