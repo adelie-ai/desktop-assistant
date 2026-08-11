@@ -203,7 +203,13 @@ test_db_down_spares_a_container_whose_run_is_still_live() {
     assert_contains "$RUN_ERR" "$LIVE_PID" 'naming the run that holds it'
 }
 
-two_concurrent_test_db_runs_both_pass() {
+# The property is that two runs at once get their own database, rather than
+# racing for one. Named for that and not for "both pass", because "both pass"
+# is also what a busy or wedged machine breaks - and a red here that means the
+# runtime could not start a container is not evidence about this property at
+# all. That ambiguity has already been misread twice in one afternoon, once as
+# CPU saturation and once nearly as a confirmed mutation.
+two_concurrent_runs_get_their_own_database_rather_than_sharing_one() {
     local payload="$SCRIPT_TESTS_FIXTURES/assert-own-database.sh"
     local a_status=0 b_status=0
     ("$TEST_DB_SH" run -- "$payload" >"$TEST_TMP/a.log" 2>&1; echo $? >"$TEST_TMP/a.status") &
@@ -212,8 +218,20 @@ two_concurrent_test_db_runs_both_pass() {
     local b_pid=$!
     wait "$a_pid" || true
     wait "$b_pid" || true
-    a_status="$(cat "$TEST_TMP/a.status")"
-    b_status="$(cat "$TEST_TMP/b.status")"
+    # A subshell killed before it wrote its status leaves no file, and reading
+    # one that is not there reported `cat: ...: No such file or directory` and
+    # a bare failure that said nothing about which run died.
+    a_status="$(cat "$TEST_TMP/a.status" 2>/dev/null || echo no-status)"
+    b_status="$(cat "$TEST_TMP/b.status" 2>/dev/null || echo no-status)"
+    # E_NO_DATABASE from test-db.sh: the harness could not provide a database,
+    # so neither run reached the thing under test.
+    if [ "$a_status" = 3 ] || [ "$b_status" = 3 ]; then
+        printf -- '--- run A (status %s) ---\n' "$a_status" >&2
+        cat "$TEST_TMP/a.log" >&2
+        printf -- '--- run B (status %s) ---\n' "$b_status" >&2
+        cat "$TEST_TMP/b.log" >&2
+        fail 'the container runtime could not provide a database, so this says NOTHING about concurrency - read the runtime error above, not this test'
+    fi
     if [ "$a_status" != 0 ] || [ "$b_status" != 0 ]; then
         printf -- '--- run A (status %s) ---\n' "$a_status" >&2
         cat "$TEST_TMP/a.log" >&2
@@ -245,9 +263,9 @@ run_test test_db_reports_a_clear_error_when_the_published_port_cannot_be_read
 run_test test_db_down_removes_a_leftover_whose_run_has_exited
 run_test test_db_down_spares_a_container_whose_run_is_still_live
 if container_runtime_available; then
-    run_test two_concurrent_test_db_runs_both_pass
+    run_test two_concurrent_runs_get_their_own_database_rather_than_sharing_one
 else
-    skip_test two_concurrent_test_db_runs_both_pass \
+    skip_test two_concurrent_runs_get_their_own_database_rather_than_sharing_one \
         'no reachable podman/docker; the parallel-safety fix is UNVERIFIED here. Start a runtime (or set CONTAINER_CLI) and re-run: just test-scripts'
 fi
 finish_tests 'test-db-harness'

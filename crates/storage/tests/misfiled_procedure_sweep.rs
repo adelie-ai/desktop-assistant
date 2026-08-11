@@ -324,7 +324,14 @@ async fn a_proposal_never_overwrites_a_skill_the_person_approved() {
         approved_by: None,
     };
     with_user_id(UserId::new(ALICE), async {
-        store.upsert(&mine, chrono::Utc::now()).await.expect("seed");
+        // Seeded through `write_authored`, not `upsert`: `upsert` is the
+        // disk-scan writer and forces `present_on_disk = TRUE`, which makes
+        // `is_own_draft` false for a reason that is not approval - so the
+        // approval clause could be deleted and this test stayed green.
+        store
+            .write_authored(&mine, chrono::Utc::now())
+            .await
+            .expect("seed");
         store
             .set_approval(
                 &SkillScope::Owner(ALICE.to_string()),
@@ -356,9 +363,20 @@ async fn a_proposal_never_overwrites_a_skill_the_person_approved() {
         .iter()
         .find(|s| s.name == "publish-a-crate-0")
         .expect("the person's own skill is still there");
+    // What `write_authored` would have done had the guard not held: replace the
+    // body and the description, relabel the source, and null the approval. Each
+    // is checked, because the seed is an off-disk draft and `present_on_disk`
+    // can no longer witness anything - it is already false either way.
     assert_eq!(kept.description, "The one I already wrote.");
-    assert!(kept.is_approved(), "and still approved");
-    assert!(kept.present_on_disk, "and still on disk");
+    assert_eq!(
+        kept.body, "# mine\n\nMy own steps.\n",
+        "the person's own body survives"
+    );
+    assert!(
+        kept.is_approved(),
+        "and their approval survives - `write_authored` nulls it, so this is \
+         what fails if the proposal overwrote the row"
+    );
 
     fx.cleanup().await;
 }
