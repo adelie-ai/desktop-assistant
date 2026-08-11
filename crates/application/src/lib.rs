@@ -16,7 +16,8 @@ use std::sync::Arc;
 use desktop_assistant_api_model as api;
 pub use desktop_assistant_auth_jwt::UserId;
 use desktop_assistant_core::domain::{DEFAULT_NOTE_TYPE, KnowledgeEntry, ScratchpadNote};
-use desktop_assistant_core::ports::auth::with_user_id;
+use desktop_assistant_core::domain::{SkillApproval, SkillScope};
+use desktop_assistant_core::ports::auth::{current_user_id, with_user_id};
 use desktop_assistant_core::ports::client_tools::with_client_tools;
 use desktop_assistant_core::ports::inbound::{
     AssistantService, ConnectionAvailability, ConnectionConfigPayload, ConnectionsService,
@@ -33,6 +34,7 @@ use desktop_assistant_core::ports::scratchpad::{
     MAX_KEYS_PER_CALL, MAX_NOTE_BYTES, MAX_RESULTS_CEILING, NewScratchpadNote, ScratchpadClearFn,
     ScratchpadDeleteManyFn, ScratchpadGetManyFn, ScratchpadListFn, ScratchpadWriteFn,
 };
+use desktop_assistant_core::ports::skill_index::{SkillGetFn, SkillListFn, SkillSetApprovalFn};
 use desktop_assistant_core::ports::store::{IdempotencyKeyStore, TurnStateStore};
 use desktop_assistant_core::ports::tool_observer::{ToolEvent, ToolObserver, with_tool_observer};
 use desktop_assistant_core::ports::turn_capability::Delivery;
@@ -578,6 +580,11 @@ where
     /// assistant will not do something would read an empty list as "nothing is
     /// holding it", which is the wrong answer twice over.
     negative_memory: Option<NegativeMemoryWiring>,
+    /// Optional person-facing view of the skill catalog (#1175): list it, and
+    /// approve or unapprove one of this person's own skills. `None` - no
+    /// Postgres, or no skill roots - makes both commands report that this
+    /// deployment cannot answer, rather than answering with an empty catalog.
+    skills: Option<SkillCatalogWiring>,
     /// Optional on-demand knowledge-maintenance service (dream-cycle controls).
     /// When attached, `StartKnowledgeMaintenance` spawns the requested pass
     /// (extraction / consolidation / embedding recompute) as a tracked,
@@ -585,6 +592,22 @@ where
     /// return a clear "not configured" error. Held as a trait object (the port
     /// is `async_trait`) so no extra generic threads through the handler.
     maintenance: Option<Arc<dyn KnowledgeMaintenanceService>>,
+}
+
+/// The one read and the one write a person's view of the skill catalog needs
+/// (#1175), plus the by-name read the write checks itself against.
+///
+/// Held together because the surface is one thing: approving a skill nobody can
+/// list is a control with nothing to point at, and listing a catalog nobody can
+/// approve from is what left promoted skills inert.
+#[derive(Clone)]
+struct SkillCatalogWiring {
+    list: SkillListFn,
+    /// Resolves a name inside one scope. The approval write is scoped to the
+    /// caller's own rows, so this is what turns "no such skill of yours" into
+    /// a refusal that names the state rather than a silent no-op.
+    get: SkillGetFn,
+    set_approval: SkillSetApprovalFn,
 }
 
 /// The three reads and the one write a person's view of negative memory needs
@@ -643,6 +666,7 @@ where
             client_tools: None,
             conversation_subs: None,
             negative_memory: None,
+            skills: None,
             maintenance: None,
         }
     }
@@ -663,6 +687,26 @@ where
             list,
             inspect,
             clear,
+        });
+        self
+    }
+
+    /// Attach the person-facing half of the skill catalog (#1175): list it,
+    /// and approve or withdraw approval on one of this person's own skills.
+    ///
+    /// A caller that skips this leaves both commands reporting that the
+    /// deployment cannot answer, which is the honest reply from a deployment
+    /// with no catalog - an empty list would read as "you have no skills".
+    pub fn with_skill_catalog(
+        mut self,
+        list: SkillListFn,
+        get: SkillGetFn,
+        set_approval: SkillSetApprovalFn,
+    ) -> Self {
+        self.skills = Some(SkillCatalogWiring {
+            list,
+            get,
+            set_approval,
         });
         self
     }
@@ -1552,6 +1596,37 @@ fn knowledge_entry_to_view(e: KnowledgeEntry) -> api::KnowledgeEntryView {
     }
 }
 
+/// One catalog row as a person reads it (#1175).
+///
+/// The body is deliberately not carried: a listing is a listing, and a skill
+/// body is a whole playbook. `own` is derived from the row's owner rather than
+/// compared against the caller, because the store already answered within the
+/// caller's own view - the global skills plus theirs - so an owned row is this
+/// person's by construction.
+fn skill_to_view(skill: &desktop_assistant_core::domain::IndexedSkill) -> api::SkillView {
+    api::SkillView {
+        name: skill.name.clone(),
+        description: skill.description.clone(),
+        kind: skill.kind.as_str().to_string(),
+        trust_tier: skill.trust_tier.as_str().to_string(),
+        source: skill.source.clone(),
+        own: skill.owner_user_id.is_some(),
+        present_on_disk: skill.present_on_disk,
+        approved: skill.is_approved(),
+        approved_at: skill.approved_at.map(|at| at.to_rfc3339()),
+        approved_by: skill.approved_by.clone(),
+        // Read off the row the mis-filed sweep wrote (#1175). A metadata key
+        // rather than a column, because it describes how one proposal came to
+        // exist rather than anything the catalog is keyed or searched on.
+        proposed_from_entry_id: skill
+            .metadata
+            .get("from_entry")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        tags: skill.tags.clone(),
+    }
+}
+
 /// One negative memory as a person reads it (#1186).
 ///
 /// `now` is read once by the caller and passed in, so every row in one list
@@ -2344,6 +2419,57 @@ where
                 // in the state the caller asked for either way (base rule 8.2).
                 Ok(api::CommandResult::NegativeMemoryCleared {
                     cleared: !cleared.is_empty(),
+                })
+            }
+            api::Command::ListSkills { limit } => {
+                let wiring = self.skills.as_ref().ok_or(ApiError::Unsupported)?;
+                let rows = (wiring.list)(limit).await.map_err(Self::map_core_err)?;
+                Ok(api::CommandResult::Skills(
+                    rows.iter().map(skill_to_view).collect(),
+                ))
+            }
+            api::Command::SetSkillApproval { name, approved } => {
+                let wiring = self.skills.as_ref().ok_or(ApiError::Unsupported)?;
+                // The caller's own scope, resolved from the identity the
+                // request authenticated as and never from the payload - the
+                // command carries no field that could name anybody else.
+                let owner = current_user_id();
+                let scope = SkillScope::Owner(owner.as_str().to_string());
+                // `Some(_)` addresses the caller's own row; the adapters ignore
+                // the string it carries and resolve the scope from the request
+                // (#911), so this is a scope selector and not a claim.
+                let existing = (wiring.get)(name.clone(), Some(owner.as_str().to_string()))
+                    .await
+                    .map_err(Self::map_core_err)?;
+                // A host-global skill was approved by somebody putting a file
+                // in a skill root, and withdrawing that from one person's
+                // session would decide it for every other tenant on the host.
+                // So a name this person owns no row for is refused by name
+                // rather than silently ignored: the caller asked for a state
+                // change that did not happen, and has to be able to tell.
+                let Some(existing) = existing else {
+                    return Err(ApiError::NotFound);
+                };
+                // Already in the state the caller asked for: nothing to write,
+                // and not a failure (base rule 8.2). Answering `changed: false`
+                // is what makes a retried request safe by design rather than by
+                // luck (base rule 8.4).
+                if existing.is_approved() == approved {
+                    return Ok(api::CommandResult::SkillApprovalSet {
+                        approved,
+                        changed: false,
+                    });
+                }
+                let approval = approved.then(|| SkillApproval {
+                    at: chrono::Utc::now(),
+                    by: Some(owner.as_str().to_string()),
+                });
+                (wiring.set_approval)(scope, vec![name], approval)
+                    .await
+                    .map_err(Self::map_core_err)?;
+                Ok(api::CommandResult::SkillApprovalSet {
+                    approved,
+                    changed: true,
                 })
             }
             api::Command::ListMcpServers => {
@@ -7922,6 +8048,7 @@ mod tests {
         CLEARED_BY_PERSON, Facet as BurnFacet, NegativeMemory as Burn,
         NegativeMemoryKind as BurnKind, Scope as BurnScope,
     };
+    use desktop_assistant_core::domain::{SkillApproval, SkillScope};
     use desktop_assistant_core::ports::negative_memory::{
         BurnRecord, DroppedFacet, ExtinguishBurnsFn, InspectBurnFn, LiveBurnsFn,
     };
@@ -8021,6 +8148,357 @@ mod tests {
         });
 
         (list, inspect, clear, notes)
+    }
+
+    // --- The skill catalog, as a person sees it (#1175) ---------------------
+
+    /// One catalog: a global skill a scan approved, and this person's own
+    /// draft that nothing has approved.
+    fn a_catalog() -> Vec<desktop_assistant_core::domain::IndexedSkill> {
+        use desktop_assistant_core::domain::{IndexedSkill, Locality, SkillKind, TrustTier};
+        let row = |name: &str, owner: Option<&str>, approved: bool| IndexedSkill {
+            name: name.to_string(),
+            description: format!("What {name} is for."),
+            kind: SkillKind::Workflow,
+            disk_path: String::new(),
+            owner_user_id: owner.map(str::to_string),
+            locality: Locality::Daemon,
+            content_hash: format!("hash-{name}"),
+            trust_tier: TrustTier::Local,
+            source: Some("self-authored".to_string()),
+            tags: vec!["ops".to_string()],
+            attachments: Vec::new(),
+            body: "# body\n".to_string(),
+            metadata: serde_json::json!({}),
+            present_on_disk: false,
+            last_seen_at: None,
+            approved_at: approved.then(chrono::Utc::now),
+            approved_by: approved.then(|| "a-person".to_string()),
+        };
+        vec![
+            row("scanned-global", None, true),
+            row("my-draft", Some("alice"), false),
+        ]
+    }
+
+    /// The catalog closures over one shared set of rows, plus the approval
+    /// calls they received so a test can read who was recorded as approver.
+    #[allow(clippy::type_complexity)]
+    fn in_memory_skill_catalog() -> (
+        SkillListFn,
+        SkillGetFn,
+        SkillSetApprovalFn,
+        Arc<Mutex<Vec<(SkillScope, Vec<String>, Option<SkillApproval>)>>>,
+    ) {
+        let rows = Arc::new(Mutex::new(a_catalog()));
+        let calls: Arc<Mutex<Vec<(SkillScope, Vec<String>, Option<SkillApproval>)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+
+        let l = Arc::clone(&rows);
+        let list: SkillListFn = Arc::new(move |limit: Option<u32>| {
+            let rows = Arc::clone(&l);
+            Box::pin(async move {
+                let held = rows.lock().unwrap().clone();
+                let take = limit.map_or(held.len(), |l| l as usize);
+                Ok(held.into_iter().take(take).collect())
+            })
+        });
+
+        let g = Arc::clone(&rows);
+        let get: SkillGetFn = Arc::new(move |name: String, owner: Option<String>| {
+            let rows = Arc::clone(&g);
+            Box::pin(async move {
+                // The real adapters resolve `Some(_)` from the caller's own
+                // identity and never from the argument's string (#911); this
+                // stands in for "the caller's own scope" the same way.
+                let held = rows.lock().unwrap();
+                Ok(held
+                    .iter()
+                    .find(|r| r.name == name && r.owner_user_id.is_some() == owner.is_some())
+                    .cloned())
+            })
+        });
+
+        let a = Arc::clone(&rows);
+        let seen = Arc::clone(&calls);
+        let set_approval: SkillSetApprovalFn = Arc::new(
+            move |scope: SkillScope, names: Vec<String>, approval: Option<SkillApproval>| {
+                let rows = Arc::clone(&a);
+                let seen = Arc::clone(&seen);
+                Box::pin(async move {
+                    seen.lock()
+                        .unwrap()
+                        .push((scope.clone(), names.clone(), approval.clone()));
+                    for row in rows.lock().unwrap().iter_mut() {
+                        if row.owner_user_id.as_deref() == scope.owner()
+                            && names.contains(&row.name)
+                        {
+                            row.approved_at = approval.as_ref().map(|a| a.at);
+                            row.approved_by = approval.as_ref().and_then(|a| a.by.clone());
+                        }
+                    }
+                    Ok(())
+                })
+            },
+        );
+
+        (list, get, set_approval, calls)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn skill_handler() -> (
+        DefaultAssistantApiHandler<
+            FakeAssistant,
+            FakeConversations,
+            FakeSettings,
+            FakeConnections,
+            FakeKnowledge,
+        >,
+        Arc<Mutex<Vec<(SkillScope, Vec<String>, Option<SkillApproval>)>>>,
+    ) {
+        let (list, get, set_approval, calls) = in_memory_skill_catalog();
+        let handler = DefaultAssistantApiHandler::new(
+            Arc::new(FakeAssistant),
+            Arc::new(FakeConversations),
+            Arc::new(FakeSettings),
+            Arc::new(FakeConnections),
+            Arc::new(FakeKnowledge),
+        )
+        .with_skill_catalog(list, get, set_approval);
+        (handler, calls)
+    }
+
+    async fn list_skills(
+        h: &DefaultAssistantApiHandler<
+            FakeAssistant,
+            FakeConversations,
+            FakeSettings,
+            FakeConnections,
+            FakeKnowledge,
+        >,
+    ) -> Vec<api::SkillView> {
+        let api::CommandResult::Skills(rows) = h
+            .handle_command_for(
+                RequestContext::from(UserId::new("alice")),
+                api::Command::ListSkills { limit: None },
+            )
+            .await
+            .expect("listing succeeds")
+        else {
+            panic!("expected Skills");
+        };
+        rows
+    }
+
+    /// Acceptance (#1175): a skill nobody has approved is listed and says so,
+    /// rather than being silently absent.
+    ///
+    /// Silence is indistinguishable from a library with nothing in it, and a
+    /// promoted skill that nobody can see is a promoted skill nobody will ever
+    /// approve.
+    #[tokio::test]
+    async fn an_unapproved_skill_is_listed_and_says_it_is_unapproved() {
+        let (h, _) = skill_handler();
+        let rows = list_skills(&h).await;
+
+        let draft = rows
+            .iter()
+            .find(|r| r.name == "my-draft")
+            .expect("the unapproved skill is listed, not omitted");
+        assert!(!draft.approved, "and it says it is unapproved: {draft:?}");
+        assert!(draft.approved_at.is_none());
+        assert!(draft.own, "it is this person's own row");
+
+        let scanned = rows
+            .iter()
+            .find(|r| r.name == "scanned-global")
+            .expect("the approved global skill is listed too");
+        assert!(scanned.approved);
+        assert!(!scanned.own, "a host-global row is not this person's own");
+    }
+
+    /// Acceptance (#1175): a person can approve their own skill, and the
+    /// catalog then says it is approved.
+    #[tokio::test]
+    async fn a_person_can_approve_their_own_skill() {
+        let (h, _) = skill_handler();
+
+        let result = h
+            .handle_command_for(
+                RequestContext::from(UserId::new("alice")),
+                api::Command::SetSkillApproval {
+                    name: "my-draft".to_string(),
+                    approved: true,
+                },
+            )
+            .await
+            .expect("approving succeeds");
+
+        assert_eq!(
+            result,
+            api::CommandResult::SkillApprovalSet {
+                approved: true,
+                changed: true,
+            }
+        );
+        let rows = list_skills(&h).await;
+        let draft = rows.iter().find(|r| r.name == "my-draft").expect("listed");
+        assert!(draft.approved, "the catalog now records consent: {draft:?}");
+    }
+
+    /// The approver is the authenticated caller, and the wire carries no field
+    /// that could name anybody else.
+    ///
+    /// A record of consent written in another person's name is worse than no
+    /// record: it is evidence of a decision nobody made.
+    #[tokio::test]
+    async fn the_approver_is_the_authenticated_caller_and_never_a_payload_field() {
+        let wire = serde_json::to_value(api::Command::SetSkillApproval {
+            name: "my-draft".to_string(),
+            approved: true,
+        })
+        .expect("the command serializes");
+        let fields = wire
+            .get("set_skill_approval")
+            .and_then(serde_json::Value::as_object)
+            .expect("an object payload");
+        let mut names: Vec<&str> = fields.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec!["approved", "name"],
+            "the payload names the skill and the state, and nothing about who is consenting"
+        );
+
+        let (h, calls) = skill_handler();
+        h.handle_command_for(
+            RequestContext::from(UserId::new("alice")),
+            api::Command::SetSkillApproval {
+                name: "my-draft".to_string(),
+                approved: true,
+            },
+        )
+        .await
+        .expect("approving succeeds");
+
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 1);
+        let (scope, names, approval) = &recorded[0];
+        assert_eq!(*scope, SkillScope::Owner("alice".to_string()));
+        assert_eq!(names, &vec!["my-draft".to_string()]);
+        assert_eq!(
+            approval.as_ref().and_then(|a| a.by.as_deref()),
+            Some("alice"),
+            "the approver recorded is the caller the request authenticated as"
+        );
+    }
+
+    /// A person can withdraw approval, which returns the skill to the state a
+    /// promoted one starts in.
+    #[tokio::test]
+    async fn withdrawing_approval_returns_the_skill_to_unapproved() {
+        let (h, _) = skill_handler();
+        h.handle_command_for(
+            RequestContext::from(UserId::new("alice")),
+            api::Command::SetSkillApproval {
+                name: "my-draft".to_string(),
+                approved: true,
+            },
+        )
+        .await
+        .expect("approving succeeds");
+
+        let result = h
+            .handle_command_for(
+                RequestContext::from(UserId::new("alice")),
+                api::Command::SetSkillApproval {
+                    name: "my-draft".to_string(),
+                    approved: false,
+                },
+            )
+            .await
+            .expect("withdrawing succeeds");
+
+        assert_eq!(
+            result,
+            api::CommandResult::SkillApprovalSet {
+                approved: false,
+                changed: true,
+            }
+        );
+        let rows = list_skills(&h).await;
+        assert!(!rows.iter().find(|r| r.name == "my-draft").unwrap().approved);
+    }
+
+    /// Asking for the state a skill is already in is not an error, and writes
+    /// nothing (base rule 8.4: the same request twice has the same result and
+    /// no second effect).
+    #[tokio::test]
+    async fn approving_a_skill_that_is_already_approved_changes_nothing_and_is_not_an_error() {
+        let (h, calls) = skill_handler();
+        for _ in 0..2 {
+            h.handle_command_for(
+                RequestContext::from(UserId::new("alice")),
+                api::Command::SetSkillApproval {
+                    name: "my-draft".to_string(),
+                    approved: true,
+                },
+            )
+            .await
+            .expect("approving succeeds");
+        }
+
+        let result = h
+            .handle_command_for(
+                RequestContext::from(UserId::new("alice")),
+                api::Command::SetSkillApproval {
+                    name: "my-draft".to_string(),
+                    approved: true,
+                },
+            )
+            .await
+            .expect("approving again succeeds");
+        assert_eq!(
+            result,
+            api::CommandResult::SkillApprovalSet {
+                approved: true,
+                changed: false,
+            },
+            "the skill is in the state the caller asked for, and this call did not move it"
+        );
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "a request for the state a skill is already in writes nothing"
+        );
+    }
+
+    /// A host-global skill cannot be approved or unapproved from one person's
+    /// session: that decision belongs to whoever put the file in a skill root,
+    /// and it would reach every other tenant on the host.
+    #[tokio::test]
+    async fn a_skill_this_person_does_not_own_is_refused_rather_than_silently_ignored() {
+        let (h, calls) = skill_handler();
+
+        let refusal = h
+            .handle_command_for(
+                RequestContext::from(UserId::new("alice")),
+                api::Command::SetSkillApproval {
+                    name: "scanned-global".to_string(),
+                    approved: false,
+                },
+            )
+            .await
+            .expect_err("a name this person owns no row for is refused");
+
+        assert!(
+            matches!(refusal, ApiError::NotFound),
+            "refused by name rather than reported as a technical failure: {refusal:?}"
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "and nothing was written on the way to the refusal"
+        );
     }
 
     fn negative_memory_handler() -> DefaultAssistantApiHandler<

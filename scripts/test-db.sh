@@ -50,6 +50,23 @@ die() {
     exit 1
 }
 
+# The harness could not provide a database at all, so no test ran.
+#
+# A separate status from `die` because the two mean opposite things to whoever
+# reads the exit code. `cargo test` exits 1 when a test fails, so a harness that
+# also exits 1 when it cannot start Postgres is indistinguishable from a real
+# failure - and the failure it imitates is "your change broke something", which
+# is exactly what someone running a mutation or a bisect is looking for. That
+# has already produced one false verification.
+E_NO_DATABASE=3
+die_env() {
+    printf 'test-db: %s\n' "$1" >&2
+    shift
+    [ "$#" -eq 0 ] || printf '  %s\n' "$@" >&2
+    printf '\ntest-db: NO TEST RAN. This is the harness failing, not your code.\n' >&2
+    exit "$E_NO_DATABASE"
+}
+
 remove_created() {
     [ -n "$CREATED_NAME" ] || return 0
     local name="$CREATED_NAME"
@@ -115,10 +132,26 @@ start_container() {
         if [ -n "${TEST_DB_PORT:-}" ]; then
             port_note="Host port ${TEST_DB_PORT} (from TEST_DB_PORT) could not be published; it is probably in use."
         fi
-        die 'could not start the throwaway Postgres container' \
+        # The runtime's own lock pool is finite and every volume takes one, so
+        # a machine that has accumulated throwaway volumes stops being able to
+        # start containers at all. The message names it because the runtime's
+        # own wording ("allocating lock ... exceeded num_locks") does not say
+        # what to do about it.
+        local remedy='Unset TEST_DB_PORT to let the runtime pick a free port, or free the port and re-run.'
+        case "$detail" in
+            *num_locks*|*'allocating lock'*)
+                port_note='The container runtime has run out of locks, so it cannot create the volume.'
+                remedy="Count leftovers with: podman volume ls -q | wc -l
+  Remove only the throwaway ones, which are 64-hex-named:
+    podman volume ls -q | grep -E '^[0-9a-f]{64}$' | xargs -r -n 200 podman volume rm
+  Do NOT use 'podman volume prune' - named volumes such as a compose Postgres
+  data volume report as dangling and would be destroyed with them."
+                ;;
+        esac
+        die_env 'could not start the throwaway Postgres container' \
             "$port_note" \
             "$detail" \
-            'Unset TEST_DB_PORT to let the runtime pick a free port, or free the port and re-run.'
+            "$remedy"
     fi
     rm -f "$run_err"
 

@@ -162,6 +162,31 @@ pub fn build_recall_search(
     })
 }
 
+/// What the skill arm answers with: the candidates, the catalog's own spread,
+/// and the catalog's own situation cue.
+///
+/// A named type rather than a bare tuple because it appears four times - the
+/// measured read, the degraded read, [`gather`]'s parameter and
+/// [`skills_or_none`]'s - and the three parts travel together by design: a
+/// spread and a cue with no candidates to grade are both nothing, so nothing
+/// may keep one without the others.
+type SkillArm = (
+    Vec<RecallSkill>,
+    Option<RecallDispersion>,
+    Option<SituationCue>,
+);
+
+/// The same, for the knowledge arm.
+type KnowledgeArm = (
+    Vec<RecallEntry>,
+    Option<RecallDispersion>,
+    Option<SituationCue>,
+);
+
+/// The same, for the scratchpad arm, which keeps no situation record of its
+/// own.
+type NoteArm = (Vec<RecallNote>, Option<RecallDispersion>);
+
 /// Hold one lookup to [`RECALL_CALL_CEILING`].
 ///
 /// Separate from [`lookup`] so the ceiling can be proven without a database:
@@ -234,17 +259,20 @@ async fn lookup(
             },
             async {
                 let Some(skills) = skill_store else {
-                    return Ok((Vec::new(), None));
+                    return Ok((Vec::new(), None, None));
                 };
                 Ok((
                     skills
                         .search_text_any_term(&request.prompt, request.skill_limit)
                         .await?
                         .into_iter()
-                        // No use records here either, for the reason the
-                        // knowledge arm above states.
+                        // No use records and no situation here either, for the
+                        // reason the knowledge arm above states: a lexical
+                        // candidate carries no semantic term, so nothing ranks
+                        // it and every signal read for it would be discarded.
                         .map(to_recall_skill)
                         .collect(),
+                    None,
                     None,
                 ))
             },
@@ -255,6 +283,15 @@ async fn lookup(
     // Every arm shares the one vector, and none depends on another.
     let vector_for_notes = vector.clone();
     let vector_for_skills = vector.clone();
+    // The situation this turn arrived in, read once for the whole lookup. It is
+    // derived from the clock and what the client reported, so it costs no model
+    // call and no extra work on the write path - see
+    // `desktop_assistant_core::domain::situation`. Read once rather than once
+    // per arm so both arms grade the same instant: the two run together, and a
+    // turn that straddled a boundary would otherwise read one part of the day
+    // for facts and another for procedures.
+    let here = current_situation();
+    let here_for_skills = here.clone();
     gather(
         async {
             let found = kb_store
@@ -275,11 +312,6 @@ async fn lookup(
             // turn including the many where the bar admits nothing and every
             // record read is discarded.
             let ids: Vec<String> = found.entries.iter().map(|(e, _)| e.id.clone()).collect();
-            // The situation this turn arrived in, read once and against the
-            // whole store. It is derived from the clock and what the client
-            // reported, so it costs no model call and no extra work on the
-            // write path - see `desktop_assistant_core::domain::situation`.
-            let here = current_situation();
             let (mut records, mut situations, cue) = if ids.is_empty() {
                 (
                     std::collections::HashMap::new(),
@@ -357,7 +389,7 @@ async fn lookup(
         },
         async {
             let Some(skills) = skill_store else {
-                return Ok((Vec::new(), None));
+                return Ok((Vec::new(), None, None));
             };
             let found = skills
                 .nearest_by_embedding(vector_for_skills, embedding_model, request.skill_limit)
@@ -366,15 +398,38 @@ async fn lookup(
             // same reasons as the knowledge arm's above: a slow or broken log
             // costs the order of the skill lines and never the lines.
             let names: Vec<String> = found.skills.iter().map(|s| s.name.clone()).collect();
-            let mut records = if names.is_empty() {
-                std::collections::HashMap::new()
+            let here = here_for_skills;
+            let (mut records, mut situations, cue) = if names.is_empty() {
+                (
+                    std::collections::HashMap::new(),
+                    std::collections::HashMap::new(),
+                    None,
+                )
+            } else if here.is_empty() {
+                // Nothing connected, so no cue can be graded and no record can
+                // score against one. The read is skipped rather than run and
+                // discarded, on the same terms as the knowledge arm's.
+                (
+                    use_records(skill_uses.records(names)).await,
+                    std::collections::HashMap::new(),
+                    None,
+                )
             } else {
-                use_records(skill_uses.records(names)).await
+                let (records, (situations, cue)) = tokio::join!(
+                    use_records(skill_uses.records(names.clone())),
+                    situation_signal(skill_uses.situation_signal(names, here)),
+                );
+                (records, situations, cue)
             };
             tracing::debug!(
                 candidates = found.skills.len(),
                 with_use_record = records.len(),
-                "recall: how many skill candidates the use log had something to say about"
+                with_situation_record = situations.len(),
+                situation_cue = cue
+                    .as_ref()
+                    .map_or(0, |cue: &SituationCue| { cue.situation().iter().count() }),
+                "recall: how many skill candidates the use log and the situation had something \
+                 to say about"
             );
             Ok((
                 found
@@ -382,10 +437,14 @@ async fn lookup(
                     .into_iter()
                     .map(|skill| {
                         let record = records.remove(&skill.name);
-                        to_recall_skill(skill).with_use_record(record)
+                        let seen_in = situations.remove(&skill.name).unwrap_or_default();
+                        to_recall_skill(skill)
+                            .with_use_record(record)
+                            .with_situation(seen_in)
                     })
                     .collect(),
                 found.dispersion,
+                cue,
             ))
         },
     )
@@ -394,10 +453,10 @@ async fn lookup(
 
 /// One scanned skill as a recall candidate.
 ///
-/// The name, the description and the presence flag travel; nothing is rendered
-/// here, and the body was never read. How much of a description a line may
-/// spend, and how a skill whose files are gone is marked, are the core's
-/// decisions.
+/// The name, the description, the provenance and the presence flag travel;
+/// nothing is rendered here, and the body was never read. How much of a
+/// description a line may spend, and how a skill whose files are gone or whose
+/// text came from outside this machine is marked, are the core's decisions.
 fn to_recall_skill(skill: NearestSkill) -> RecallSkill {
     // The row states which kind of relevance it carries, rather than the call
     // site stating it: the measured read and the degraded one answer with the
@@ -411,6 +470,7 @@ fn to_recall_skill(skill: NearestSkill) -> RecallSkill {
     RecallSkill::new(
         skill.name,
         skill.description,
+        skill.trust_tier,
         skill.present_on_disk,
         relevance,
     )
@@ -525,22 +585,13 @@ async fn situation_signal(
 /// because one scan states both (#1167). A source that cannot measure one
 /// answers `None` and the core reads it by its stated estimate.
 async fn gather(
-    entries: impl Future<
-        Output = Result<
-            (
-                Vec<RecallEntry>,
-                Option<RecallDispersion>,
-                Option<SituationCue>,
-            ),
-            CoreError,
-        >,
-    >,
-    notes: impl Future<Output = Result<(Vec<RecallNote>, Option<RecallDispersion>), CoreError>>,
-    skills: impl Future<Output = Result<(Vec<RecallSkill>, Option<RecallDispersion>), CoreError>>,
+    entries: impl Future<Output = Result<KnowledgeArm, CoreError>>,
+    notes: impl Future<Output = Result<NoteArm, CoreError>>,
+    skills: impl Future<Output = Result<SkillArm, CoreError>>,
 ) -> Result<RecallCandidates, CoreError> {
     let (entries, notes, skills) = tokio::join!(entries, notes, skills);
     let (notes, note_dispersion) = notes_or_none(notes);
-    let (skills, skill_dispersion) = skills_or_none(skills);
+    let (skills, skill_dispersion, skill_situation_cue) = skills_or_none(skills);
     let (entries, entry_dispersion, situation_cue) = entries?;
     // Which sources stated their own geometry, and which the block will read by
     // a stated estimate. Without this an operator meeting a block that is
@@ -561,6 +612,7 @@ async fn gather(
         note_dispersion,
         situation_cue,
         skill_dispersion,
+        skill_situation_cue,
     })
 }
 
@@ -605,9 +657,7 @@ fn to_recall_note(note: ScratchpadNote, relevance: RecallRelevance) -> RecallNot
 /// The spread goes with the rows, for the reason [`skills_or_none`] gives: a
 /// spread with no candidates to grade is nothing, and it must not be left
 /// standing as though the pad had been measured.
-fn notes_or_none(
-    found: Result<(Vec<RecallNote>, Option<RecallDispersion>), CoreError>,
-) -> (Vec<RecallNote>, Option<RecallDispersion>) {
+fn notes_or_none(found: Result<NoteArm, CoreError>) -> NoteArm {
     match found {
         Ok(answer) => answer,
         Err(e) => {
@@ -620,16 +670,14 @@ fn notes_or_none(
     }
 }
 
-/// The skill arm's rows and its spread, or neither.
+/// The skill arm's rows, its spread and its cue, or none of the three.
 ///
 /// The same treatment [`notes_or_none`] gives the pad, and for the same reason:
 /// the arm reads its own table, so it fails on its own, and losing the skill
-/// lines is a smaller loss than losing the block. The spread goes with them -
-/// a spread with no candidates to grade is nothing, and it must not be left
-/// standing as though the catalog had been measured.
-fn skills_or_none(
-    found: Result<(Vec<RecallSkill>, Option<RecallDispersion>), CoreError>,
-) -> (Vec<RecallSkill>, Option<RecallDispersion>) {
+/// lines is a smaller loss than losing the block. All three go together - a
+/// spread with no candidates to grade is nothing, and so is a cue, and neither
+/// must be left standing as though the catalog had been measured.
+fn skills_or_none(found: Result<SkillArm, CoreError>) -> SkillArm {
     match found {
         Ok(answer) => answer,
         Err(e) => {
@@ -637,7 +685,7 @@ fn skills_or_none(
                 error = %e,
                 "recall: the skill arm failed; the other arms still render"
             );
-            (Vec::new(), None)
+            (Vec::new(), None, None)
         }
     }
 }
@@ -666,6 +714,44 @@ async fn embed_prompt(embed: &EmbedFn, prompt: &str) -> Option<Vec<f32>> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The seam the provenance mark has to cross, and the one place nothing
+    /// watched (#1175).
+    ///
+    /// The whole case for letting an installed skill into a system prompt is
+    /// that its line carries `[installed: ...]`. Storage proves the tier leaves
+    /// the row and the core proves every tier marks its line, but the adapter
+    /// between them is a plain field copy - and a copy that names one tier
+    /// instead of the row's compiles, passes both of those suites, and renders
+    /// third-party text as the assistant's own memory.
+    ///
+    /// Written over every variant rather than one, because a mistake here is a
+    /// constant, and a constant matches whichever variant the fixture happened
+    /// to use.
+    #[test]
+    fn every_trust_tier_survives_the_walk_from_a_row_to_a_recall_candidate() {
+        use desktop_assistant_core::domain::TrustTier;
+
+        for tier in [
+            TrustTier::Local,
+            TrustTier::Github,
+            TrustTier::WellKnown,
+            TrustTier::Unknown,
+        ] {
+            let candidate = to_recall_skill(NearestSkill {
+                name: "publish-a-crate".to_string(),
+                description: "Cut a release and push it to the registry.".to_string(),
+                trust_tier: tier,
+                present_on_disk: true,
+                distance: Some(0.20),
+            });
+            assert_eq!(
+                candidate.provenance, tier,
+                "the row's own tier must reach the candidate that renders it, or a \
+                 skill written outside this machine renders unmarked"
+            );
+        }
+    }
     use super::*;
     use desktop_assistant_storage::{
         RECALL_SCAN_STATEMENT_TIMEOUT, USE_LOG_READ_STATEMENT_TIMEOUT,
@@ -784,6 +870,7 @@ mod tests {
         RecallSkill::new(
             "publish-a-crate",
             "Cut a release and push it to the registry.",
+            desktop_assistant_core::domain::TrustTier::Local,
             true,
             RecallRelevance::Distance(0.12),
         )
@@ -791,8 +878,8 @@ mod tests {
 
     /// The skill arm answering with nothing, for a test whose subject is one of
     /// the other two.
-    async fn no_skills() -> Result<(Vec<RecallSkill>, Option<RecallDispersion>), CoreError> {
-        Ok((Vec::new(), None))
+    async fn no_skills() -> Result<SkillArm, CoreError> {
+        Ok((Vec::new(), None, None))
     }
 
     fn a_note() -> RecallNote {
@@ -967,7 +1054,7 @@ mod tests {
             },
             async move {
                 tokio::time::sleep(hold).await;
-                Ok((vec![a_skill()], Some(a_dispersion())))
+                Ok((vec![a_skill()], Some(a_dispersion()), None))
             },
         )
         .await

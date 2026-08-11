@@ -230,6 +230,13 @@ const MIGRATIONS: &[Migration] = &[
     // readable beside the correction written over it.
     migration!("049_negative_memory.sql"),
     migration!("050_negative_memory_widening.sql"),
+    // #1175: the situations a skill has been followed in, so the cue #1125
+    // built can reach the procedural arm #1154 shipped without it. The same
+    // shape as 047's, keyed on the catalog name rather than an entry id.
+    migration!("051_skill_situation.sql"),
+    // #1175: what the mis-filed-procedure sweep has already judged, so a store
+    // is read once per entry per edit rather than once per entry per night.
+    migration!("052_knowledge_procedure_sweep.sql"),
 ];
 
 /// Second half of the advisory-lock key: the schema the migrations write to.

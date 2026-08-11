@@ -695,7 +695,17 @@ fn slice_entries(entries: Vec<KbEntry>) -> Vec<Vec<KbEntry>> {
 }
 
 fn build_system_prompt() -> String {
-    String::from(
+    // The rule that says what is not a knowledge entry, stated once in the
+    // domain and spent here as well as in extraction's prompt (#1175). This
+    // pass rewrites and merges entries that already exist, so without it a
+    // mis-filed procedure gets tightened into a better-written fact and
+    // cemented - the one pass whose job is to decide what an entry should look
+    // like, deciding it without the rule that says this one should not be an
+    // entry at all. It cannot write a skill, so it is told to leave a method
+    // alone rather than to move it: the sweep proposes those, and a merge or a
+    // rewrite in the meantime would only make the proposal describe something
+    // the entry no longer says.
+    let mut prompt = String::from(
         "You are curating a personal long-term knowledge base. You are shown the COMPLETE set \
          of entries (or a self-contained slice of it). Recompute what this set SHOULD look like \
          and return the operations that get it there.\n\
@@ -727,8 +737,20 @@ fn build_system_prompt() -> String {
          \n\
          Only emit operations for entries that should change; omit anything you would keep \
          as-is. `scope` is an object of string dimensions (e.g. {\"project\":\"adelie-ai\"}) or \
-         null for universal facts. Output ONLY the JSON object.",
-    )
+         null for universal facts. Output ONLY the JSON object.\n\
+         \n\
+         ## What is not an entry\n\
+         \n",
+    );
+    prompt.push_str(desktop_assistant_core::skill_promotion::METHOD_IS_NOT_A_FACT);
+    prompt.push_str(
+        "\n\
+         \n\
+         KEEP such an entry as it stands - do not merge it, do not rewrite it, \
+         and do not delete it. A separate pass proposes it as a skill, and it \
+         has to still say what it says when that happens.",
+    );
+    prompt
 }
 
 fn build_user_prompt(entries: &[KbEntry]) -> String {
@@ -1340,6 +1362,23 @@ struct SliceAnswer {
 
 #[cfg(test)]
 mod tests {
+
+    /// The same rule reaches the consolidation prompt.
+    ///
+    /// Consolidation rewrites and merges entries that already exist, so without
+    /// it the pass tightens a mis-filed procedure into a better-written fact
+    /// and cements it - the one pass in the cycle whose whole job is to decide
+    /// what an entry should look like, deciding it without the rule that says
+    /// this one should not be an entry at all.
+    #[test]
+    fn the_consolidation_prompt_states_the_method_is_not_a_fact_rule() {
+        let prompt = build_system_prompt();
+        assert!(
+            prompt.contains(desktop_assistant_core::skill_promotion::METHOD_IS_NOT_A_FACT),
+            "consolidation decides what an entry should be, so it has to be told what is not \
+             one: {prompt}"
+        );
+    }
     use std::io::{self, Write};
     use std::sync::{Arc, Mutex, Once};
 

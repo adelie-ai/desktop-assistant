@@ -60,6 +60,30 @@ pub type SkillGetFn = Arc<
         + Sync,
 >;
 
+/// Boxed-closure boundary for listing the catalog a person can see - the
+/// host-global skills plus their own - wired by the daemon over
+/// [`SkillIndexStore::list`]. Args: `(limit)`.
+pub type SkillListFn = Arc<
+    dyn Fn(
+            Option<u32>,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<IndexedSkill>, CoreError>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Boxed-closure boundary for recording or withdrawing a person's approval
+/// (#1175), wired by the daemon over [`SkillIndexStore::set_approval`].
+/// Args: `(scope, names, approval)`, where `None` withdraws.
+pub type SkillSetApprovalFn = Arc<
+    dyn Fn(
+            SkillScope,
+            Vec<String>,
+            Option<SkillApproval>,
+        ) -> Pin<Box<dyn Future<Output = Result<(), CoreError>> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Outbound port for persisting and searching the skill catalog.
 ///
 /// Implementations exist for Postgres (hybrid vector + full-text) and SQLite

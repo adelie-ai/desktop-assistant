@@ -33,12 +33,14 @@
 //!   from - see [`RecallDispersion`]. The adapter measures that over the whole
 //!   source, not over the rows it returned, and answers `None` when it cannot.
 //! - **The present situation, read against the source.** A candidate carries
-//!   the situations it has been seen in ([`RecallEntry::situation`]), and the
-//!   answer carries one [`SituationCue`] for the whole lookup: the present
-//!   situation, plus how much each of its values separates one entry of this
-//!   store from another. That second half is a property of the source in the
-//!   same way a dispersion is, so it is measured over the source and answered
-//!   as `None` when it cannot be - see [`crate::domain::situation`].
+//!   the situations it has been seen in ([`RecallEntry::situation`],
+//!   [`RecallSkill::situation`]), and the answer carries one [`SituationCue`]
+//!   **per source**: the present situation, plus how much each of its values
+//!   separates one row of that source from another. That second half is a
+//!   property of the source in the same way a dispersion is, so it is measured
+//!   over the source and answered as `None` when it cannot be - and the skill
+//!   catalog's is never the knowledge store's, because the two hold different
+//!   populations with different coverage. See [`crate::domain::situation`].
 //! - **One user, and one conversation's pad.** Row-level security is a backstop
 //!   the table owner bypasses, so every query behind this port carries its own
 //!   `WHERE user_id` predicate. The scratchpad arm carries a `conversation_id`
@@ -64,6 +66,7 @@ use crate::domain::activation::{NO_SALIENCE, NO_SITUATION};
 use crate::domain::knowledge_use::KnowledgeUseRecord;
 use crate::domain::salience::{SalienceReading, SalienceSource};
 use crate::domain::situation::{SituationCue, SituationRecord};
+use crate::domain::skill::TrustTier;
 
 /// How near a candidate is to the prompt, and in which sense.
 ///
@@ -341,6 +344,17 @@ impl Activatable for RecallEntry {
 /// carries the name it can be fetched by and the one line that says what it is
 /// for, and nothing else of what it holds.
 ///
+/// **An installed skill is marked, never laundered** (#1175). The catalog's
+/// larger half is usually installed rather than written here, and an arm that
+/// could offer only self-authored skills offered the smaller half. What kept it
+/// out was real: `builtin_skill_search` returns this same description field and
+/// is classified `Declared(SkillTrustTier)`, so a non-local hit taints the turn
+/// and closes the tool gate, where this block has no tool call in it and
+/// nothing would taint. So the line carries the mark instead, and the mark
+/// survives into the prompt the model reads - it is part of the rendered line,
+/// not metadata beside it. Acting on the line still means a fetch, and the
+/// fetch taints exactly as it always did.
+///
 /// **An unapproved skill is never a candidate.** Approval (#1155) records that
 /// a person agreed the procedure may be followed, and nothing in the system
 /// will hand its body over until they have: `builtin_skill_get` refuses one by
@@ -354,7 +368,26 @@ pub struct RecallSkill {
     /// The catalog name, which is also the handle the skill is fetched by.
     pub name: String,
     /// The skill's own "when to use" line, as its frontmatter states it.
+    ///
+    /// **Whose words these are depends on [`Self::provenance`].** On an
+    /// installed skill this is text somebody outside this machine wrote, and it
+    /// renders into a system message ahead of the user's prompt. It may only be
+    /// shown marked - see [`Self::provenance`].
     pub description: String,
+    /// Where the skill's text came from (#1175).
+    ///
+    /// A constructor argument rather than a defaulted field, because a default
+    /// is what laundering looks like: a construction site that forgets would
+    /// present third-party text as the assistant's own memory, silently, and no
+    /// test of any *particular* site would catch the next one. Making it
+    /// unforgettable is the mechanism; the marker on the line is what the
+    /// model reads.
+    ///
+    /// This is provenance and not consent, and the two are separate axes. An
+    /// installed skill can be approved, and a skill Adele wrote for herself is
+    /// [`TrustTier::Local`] and may still not be followed until somebody says
+    /// so - which the adapter enforces by excluding it from the scan.
+    pub provenance: TrustTier,
     /// Whether the skill's files were on disk at the last scan of its scope.
     ///
     /// `false` does **not** make the skill unusable, which is why it is marked
@@ -367,6 +400,15 @@ pub struct RecallSkill {
     /// What the use log knows about this skill (#1154), on the same terms as
     /// [`RecallEntry::use_record`]: the reinforcement half of its activation.
     pub use_record: Option<KnowledgeUseRecord>,
+    /// The situations this skill has been seen in (#1175), and the third term
+    /// of its activation score.
+    ///
+    /// Empty is an ordinary answer, on exactly the terms
+    /// [`RecallEntry::situation`] states: a skill nobody has opened yet, or an
+    /// adapter that could not read the table. Either way
+    /// [`SituationCue::coverage`] answers zero and the skill ranks the way it
+    /// ranked before the cue reached this arm.
+    pub situation: SituationRecord,
 }
 
 impl RecallSkill {
@@ -374,21 +416,32 @@ impl RecallSkill {
     pub fn new(
         name: impl Into<String>,
         description: impl Into<String>,
+        provenance: TrustTier,
         present_on_disk: bool,
         relevance: RecallRelevance,
     ) -> Self {
         Self {
             name: name.into(),
             description: description.into(),
+            provenance,
             present_on_disk,
             relevance,
             use_record: None,
+            situation: SituationRecord::new(),
         }
     }
 
     /// The same candidate, carrying what the log knows about it.
+    #[must_use]
     pub fn with_use_record(mut self, record: Option<KnowledgeUseRecord>) -> Self {
         self.use_record = record;
+        self
+    }
+
+    /// The same candidate, carrying the situations it has been seen in.
+    #[must_use]
+    pub fn with_situation(mut self, situation: SituationRecord) -> Self {
+        self.situation = situation;
         self
     }
 }
@@ -402,18 +455,15 @@ impl Activatable for RecallSkill {
         self.use_record.as_ref()
     }
 
-    /// A skill records no situation yet (#1154). `knowledge_situation` is keyed
-    /// on a knowledge entry, and nothing writes a row for a skill, so the term
-    /// has nothing to read and contributes exactly zero - which is how every
-    /// candidate scored before #1125 existed.
+    /// Read against the situations this skill has been followed in (#1175),
+    /// exactly as a knowledge entry is read against its own.
     ///
-    /// This is the arm's largest known gap rather than a settled answer. A
-    /// procedure is more situational than a fact, not less: "deploy this" is a
-    /// weak query and a strong situation, which is the whole reason this arm
-    /// exists. Giving a skill a situation record is what would let the cue
-    /// reach it.
-    fn situation_coverage(&self, _cue: Option<&SituationCue>) -> f64 {
-        NO_SITUATION
+    /// The cue this is handed is the **catalog's**, never the knowledge
+    /// store's - see [`RecallCandidates::skill_situation_cue`]. A skill nothing
+    /// has opened yet carries an empty record, which scores zero, which is how
+    /// every skill scored before this arm had a record at all.
+    fn situation_coverage(&self, cue: Option<&SituationCue>) -> f64 {
+        cue.map_or(NO_SITUATION, |cue| cue.coverage(&self.situation))
     }
 
     /// A skill carries no salience reading (#1127). Every signal is read from a
@@ -540,6 +590,18 @@ pub struct RecallCandidates {
     /// failed - and every entry then ranks the way it ranked before the cue
     /// existed.
     pub situation_cue: Option<SituationCue>,
+    /// The present situation, read against the skill catalog (#1175).
+    ///
+    /// Its own, and never the knowledge arm's, for the reason
+    /// [`Self::skill_dispersion`] is its own: how much a situation value
+    /// separates one skill from another is a property of the catalog, and the
+    /// two sources have neither the same population nor the same fan. A cue
+    /// graded over the knowledge store would weight a value by how much it
+    /// separates facts and spend that weight on procedures.
+    ///
+    /// `None` where the adapter measured none, and every skill then ranks the
+    /// way it ranked before the cue reached this arm.
+    pub skill_situation_cue: Option<SituationCue>,
     /// The skill catalog's own dispersion, on the same terms.
     ///
     /// Its own, and never the knowledge arm's. A skill row embeds a name, a

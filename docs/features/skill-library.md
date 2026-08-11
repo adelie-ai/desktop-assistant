@@ -125,8 +125,32 @@ Who may write the columns is deliberately narrow:
   on both branches, so an amend of an approved skill drops the approval the old
   body earned. Forcing it in the store rather than in the caller is what makes
   that atomic: there is no window in which new content wears an old approval.
-- **`set_approval` is the explicit flip**, in either direction. Nothing calls it
-  yet, so a self-authored skill stays unapproved until an approve surface exists.
+- **`set_approval` is the explicit flip**, in either direction, and one command
+  calls it: `set_skill_approval { name, approved }` (#1175). That command is
+  what makes a self-authored skill usable at all, and three rules bound it.
+
+  It is a **command and never a tool**: it arrives from an authenticated client
+  connection, never from a turn, and nothing the model is offered reaches it.
+  An assistant able to approve its own procedures would be recording the user's
+  consent on the user's behalf.
+
+  It carries **no approver field**. The approver is the connection's
+  authenticated subject, so a record of consent cannot be written in somebody
+  else's name.
+
+  It reaches **only the caller's own rows**. A host-global skill was approved
+  by somebody putting a file in a skill root, and withdrawing that from one
+  person's session would decide it for every other tenant on the host, so a
+  name this person owns no row for is refused rather than silently ignored.
+
+  Asking for the state a skill is already in writes nothing and is not an
+  error; the reply says `changed: false`.
+
+- **`list_skills { limit? }` is what makes an unapproved skill visible.** It
+  returns the host-global skills plus the caller's own, each with `approved`,
+  and it lists the unapproved ones rather than omitting them - silence there is
+  indistinguishable from a library with nothing in it, and a skill nobody can
+  see is a skill nobody will ever approve.
 
 ### What "not approved" actually withholds
 
@@ -212,22 +236,28 @@ user prompt lands, the daemon embeds it once and asks the catalog what is near
 it, then offers the approved matches as one line each - a name and what the skill
 is for, never the body - before the model's first move.
 
-Three things follow for the catalog, and the whole design is in
+Five things follow for the catalog, and the whole design is in
 `docs/features/pre-prompt-recall.md`:
 
 - **Only an approved skill is offered**, and the exclusion happens inside the
   scan, so an unapproved row is absent from the catalog's measured spread as
   well as from the candidates.
-- **Only a locally authored one, too.** A skill installed from a repository or
-  a web source carries a description its author wrote, and
-  `builtin_skill_search` is classified `Declared(SkillTrustTier)` precisely
-  because that text is third-party content. The block has no tool call in it,
-  so nothing would taint; the arm drops such a skill rather than putting its
-  author's prose in a system message with every tool tier open. It stays
-  reachable through the search tool, which taints correctly.
+- **An installed skill is offered and marked** `[installed: github]`,
+  `[installed: web]` or `[installed: source unrecorded]` (#1175). Its
+  description is text its author wrote, and `builtin_skill_search` is classified
+  `Declared(SkillTrustTier)` precisely because such text is third-party content.
+  The block has no tool call in it, so nothing would taint - which is why the
+  arm first dropped these rows outright. The mark replaces the drop: it is part
+  of the rendered line, the label says what it means, and following the
+  procedure still costs a `builtin_skill_get` that taints exactly as before.
 - **A skill whose files are gone is offered and marked** `[files missing]`. The
   body still reads, so the procedure is still followable; only its bundled
-  scripts are unreachable.
+  scripts are unreachable. One line can carry both markers.
+- **A skill records the situations it has been followed in** (migration
+  `051_skill_situation.sql`), so a procedure this room keeps calling for ranks
+  above an equally near one that belongs somewhere else. Written by a taken-up
+  offer and by nothing else, because that is the only moment a procedure is
+  followed in anybody's situation.
 - **Offers and opens are recorded** in `skill_use_stats` and `skill_offers`
   (migration `048_skill_use_log.sql`), so a skill surfaced often and opened never
   is visible as such, and one opened repeatedly ranks above a nearer skill

@@ -11,13 +11,20 @@
 //!    `summary` for entries that have none, and rewrites one whose body changed
 //!    after it was written. Never touches `content`. Also part of
 //!    [`run_dreaming_scan`]; see `summarize`.
-//! 3. **Archival** — marks long-quiet conversations as archived. Also part of
+//! 3. **Mis-filed procedure sweep** (frequent, bounded, one model call per
+//!    batch) — reads knowledge entries that were never read for this and
+//!    proposes each one that is really a method as an UNAPPROVED skill, naming
+//!    the entry it came from. It never rewrites the entry. A ledger records
+//!    every entry it has read, so a store is read once per entry per edit
+//!    rather than once per entry per cycle. Also part of [`run_dreaming_scan`];
+//!    see `misfiled`.
+//! 4. **Archival** — marks long-quiet conversations as archived. Also part of
 //!    [`run_dreaming_scan`].
-//! 4. **Consolidation** (infrequent, strong model) — loads a user's entire
+//! 5. **Consolidation** (infrequent, strong model) — loads a user's entire
 //!    active KB and recomputes it holistically (prune / merge / tighten),
 //!    applying explicit operations in one transaction with soft-delete. Run on
 //!    its own slower cadence by [`run_consolidation_scan`].
-//! 5. **Trash sweep** (frequent, cheap, no LLM) — frees soft-deleted entries
+//! 6. **Trash sweep** (frequent, cheap, no LLM) — frees soft-deleted entries
 //!    past their retention window. Deliberately independent of the passes
 //!    above: see `trash` and [`sweep_expired_trash`].
 
@@ -25,6 +32,7 @@ mod archival;
 mod common;
 mod consolidation;
 mod extraction;
+mod misfiled;
 mod reconcile;
 mod skills;
 mod summarize;
@@ -37,6 +45,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::knowledge_delete::KnowledgeDeletePolicy;
 
+pub use misfiled::{MAX_SWEPT_ENTRIES_PER_CYCLE, MisfiledStats, run_misfiled_sweep_phase};
 pub use summarize::{SummaryStats, run_summary_phase};
 pub use trash::{empty_trash, reap_expired_trash, sweep_expired_trash, trash_count};
 pub use types::{
@@ -101,6 +110,26 @@ pub async fn run_dreaming_scan(
         ),
         Ok(_) => tracing::debug!("dreaming: every knowledge entry has a current summary"),
         Err(e) => tracing::warn!("dreaming: summary phase failed: {e}"),
+    }
+
+    // After the summary phase, so a cycle spends its cheap per-entry work before
+    // its per-entry model calls, and after extraction, so an entry written this
+    // cycle is judged in the same one. Its failure is logged and dropped, like
+    // every phase after extraction: the entries it did not judge stay in its
+    // worklist and the next cycle reads them.
+    tracing::info!("dreaming: mis-filed procedure sweep");
+    match misfiled::run_misfiled_sweep_phase(pool, llm_fn, cancellation).await {
+        Ok(stats) if stats.judged > 0 => tracing::info!(
+            "dreaming: read {} knowledge entr{} for mis-filed procedures and proposed {} \
+             unapproved skill(s); {} entr{} still unread",
+            stats.judged,
+            if stats.judged == 1 { "y" } else { "ies" },
+            stats.proposed,
+            stats.remaining,
+            if stats.remaining == 1 { "y" } else { "ies" }
+        ),
+        Ok(_) => tracing::debug!("dreaming: every knowledge entry has been read for procedures"),
+        Err(e) => tracing::warn!("dreaming: mis-filed procedure sweep failed: {e}"),
     }
 
     if archive_after_days > 0 {

@@ -120,6 +120,39 @@ test_db_reports_a_clear_error_when_no_free_port_is_available() {
     assert_eq 0 "$(cli_log | grep -c '^rm ' || true)" 'nothing was created, so nothing is removed'
 }
 
+test_db_exits_a_distinct_status_when_no_database_could_be_provided() {
+    # `cargo test` exits 1 when a test fails. A harness that also exits 1 when
+    # it could not start Postgres is indistinguishable from a real failure, and
+    # the failure it imitates - "your change broke something" - is exactly what
+    # someone running a mutation or a bisect is looking for. That has already
+    # produced one false verification, so the status is the property under test.
+    with_fake_cli
+    export FAKE_RUN_STATUS=126
+    export FAKE_RUN_STDERR='Error: pasta failed with exit code 1: Address already in use'
+    run_cmd "$TEST_DB_SH" run -- touch "$TEST_TMP/payload-ran"
+    assert_eq 3 "$RUN_STATUS" 'a harness failure has its own status, not the one a failing test uses'
+    assert_contains "$RUN_ERR" 'NO TEST RAN' 'and says so in words, for whoever reads the log rather than the status'
+    [ ! -e "$TEST_TMP/payload-ran" ] || fail 'the payload must not run without a database'
+}
+
+test_db_names_the_runtime_lock_pool_when_that_is_what_failed() {
+    # Every volume takes one of the runtime's finite locks, so a machine that
+    # has accumulated throwaway volumes stops being able to start containers at
+    # all. The runtime says "exceeded num_locks", which does not tell anybody
+    # what to do; this must.
+    with_fake_cli
+    export FAKE_RUN_STATUS=125
+    export FAKE_RUN_STDERR='Error: creating named volume "abc": allocating lock for new volume: allocation failed; exceeded num_locks (2048)'
+    run_cmd "$TEST_DB_SH" run -- true
+    assert_eq 3 "$RUN_STATUS" 'still a harness failure'
+    assert_contains "$RUN_ERR" 'out of locks' 'names the cause rather than repeating the runtime wording'
+    assert_contains "$RUN_ERR" 'volume ls' 'tells the reader how to count the leftovers'
+    # The safe removal only, because the obvious command is the destructive one:
+    # a compose Postgres data volume reports as dangling and prune takes it.
+    assert_contains "$RUN_ERR" '0-9a-f' 'gives the pattern that matches only throwaway volumes'
+    assert_contains "$RUN_ERR" 'Do NOT' 'warns against the prune that would destroy named volumes'
+}
+
 test_db_reports_a_clear_error_when_the_published_port_cannot_be_read() {
     with_fake_cli
     # The container died between `run` and `port`, so `--rm` already took it
@@ -170,7 +203,13 @@ test_db_down_spares_a_container_whose_run_is_still_live() {
     assert_contains "$RUN_ERR" "$LIVE_PID" 'naming the run that holds it'
 }
 
-two_concurrent_test_db_runs_both_pass() {
+# The property is that two runs at once get their own database, rather than
+# racing for one. Named for that and not for "both pass", because "both pass"
+# is also what a busy or wedged machine breaks - and a red here that means the
+# runtime could not start a container is not evidence about this property at
+# all. That ambiguity has already been misread twice in one afternoon, once as
+# CPU saturation and once nearly as a confirmed mutation.
+two_concurrent_runs_get_their_own_database_rather_than_sharing_one() {
     local payload="$SCRIPT_TESTS_FIXTURES/assert-own-database.sh"
     local a_status=0 b_status=0
     ("$TEST_DB_SH" run -- "$payload" >"$TEST_TMP/a.log" 2>&1; echo $? >"$TEST_TMP/a.status") &
@@ -179,8 +218,20 @@ two_concurrent_test_db_runs_both_pass() {
     local b_pid=$!
     wait "$a_pid" || true
     wait "$b_pid" || true
-    a_status="$(cat "$TEST_TMP/a.status")"
-    b_status="$(cat "$TEST_TMP/b.status")"
+    # A subshell killed before it wrote its status leaves no file, and reading
+    # one that is not there reported `cat: ...: No such file or directory` and
+    # a bare failure that said nothing about which run died.
+    a_status="$(cat "$TEST_TMP/a.status" 2>/dev/null || echo no-status)"
+    b_status="$(cat "$TEST_TMP/b.status" 2>/dev/null || echo no-status)"
+    # E_NO_DATABASE from test-db.sh: the harness could not provide a database,
+    # so neither run reached the thing under test.
+    if [ "$a_status" = 3 ] || [ "$b_status" = 3 ]; then
+        printf -- '--- run A (status %s) ---\n' "$a_status" >&2
+        cat "$TEST_TMP/a.log" >&2
+        printf -- '--- run B (status %s) ---\n' "$b_status" >&2
+        cat "$TEST_TMP/b.log" >&2
+        fail 'the container runtime could not provide a database, so this says NOTHING about concurrency - read the runtime error above, not this test'
+    fi
     if [ "$a_status" != 0 ] || [ "$b_status" != 0 ]; then
         printf -- '--- run A (status %s) ---\n' "$a_status" >&2
         cat "$TEST_TMP/a.log" >&2
@@ -206,13 +257,15 @@ run_test test_db_exports_the_url_of_the_container_it_created
 run_test test_db_cleans_up_its_own_container_on_success_and_on_failure
 run_test test_db_does_not_remove_a_container_it_did_not_create
 run_test test_db_reports_a_clear_error_when_no_free_port_is_available
+run_test test_db_exits_a_distinct_status_when_no_database_could_be_provided
+run_test test_db_names_the_runtime_lock_pool_when_that_is_what_failed
 run_test test_db_reports_a_clear_error_when_the_published_port_cannot_be_read
 run_test test_db_down_removes_a_leftover_whose_run_has_exited
 run_test test_db_down_spares_a_container_whose_run_is_still_live
 if container_runtime_available; then
-    run_test two_concurrent_test_db_runs_both_pass
+    run_test two_concurrent_runs_get_their_own_database_rather_than_sharing_one
 else
-    skip_test two_concurrent_test_db_runs_both_pass \
+    skip_test two_concurrent_runs_get_their_own_database_rather_than_sharing_one \
         'no reachable podman/docker; the parallel-safety fix is UNVERIFIED here. Start a runtime (or set CONTAINER_CLI) and re-run: just test-scripts'
 fi
 finish_tests 'test-db-harness'

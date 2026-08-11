@@ -8,7 +8,7 @@ on-demand trigger path, the event-broadcast chain that drives live refresh, the
 concurrency model, and the cancellation story — so none of it has to be
 re-derived from the code.
 
-## The five passes
+## The six passes
 
 All live in `crates/storage/src/dreaming/` + `crates/storage/src/embedding_backfill.rs`:
 
@@ -16,6 +16,7 @@ All live in `crates/storage/src/dreaming/` + `crates/storage/src/embedding_backf
 | ---- | ----------- | ------------ | ------- |
 | **Extraction** | `run_dreaming_scan` | Scans conversations past their watermark, asks an LLM to extract durable facts, writes them (+ archival of long-quiet conversations). A finding that is a **method** goes to the skill catalog as an unapproved candidate instead - see "A method is not a fact". | frequent (hourly) |
 | **Summary backfill** | `run_dreaming_scan` | Writes the one-line `summary` for entries that have none, and rewrites one whose body changed after it was written. Batched, capped per cycle, and never touches `content`. | frequent (hourly) |
+| **Mis-filed procedure sweep** | `run_dreaming_scan` | Reads knowledge entries for routines written as facts and **proposes** each as an unapproved skill naming the entry it came from. Never rewrites the entry. Bounded per cycle, and a ledger stops it re-reading an entry until its text changes - see "A method is not a fact". | frequent (hourly) |
 | **Consolidation** | `run_consolidation_scan` | Loads a user's whole active KB and recomputes it holistically (prune / merge / tighten) with a stronger model, applied transactionally with soft-delete and bounded by the rules below. | slow (daily) |
 | **Embedding recompute** | `backfill_knowledge_embeddings` | Re-embeds rows. The periodic backfill only touches NULL/stale/model-mismatched rows; the **force** path (`invalidate_all_knowledge_embeddings` → backfill) re-embeds everything. | periodic + on-demand |
 | **Trash sweep** | `sweep_expired_trash` | Frees soft-deleted entries past their retention window. No LLM, no embeddings — a single indexed DELETE per user. | frequent (hourly) |
@@ -48,10 +49,28 @@ and `crates/storage/tests/search_embedding_model_scope.rs`).
 
 ## A method is not a fact
 
-Extraction has two destinations, not one (#1155). The rule that decides which:
+Extraction has two destinations, not one (#1155). The rule that decides which is
+stated once, in `core::skill_promotion::METHOD_IS_NOT_A_FACT`:
 
-> **Knowledge records what is true. A skill records how to do something. And a
-> skill's preferences stay knowledge.**
+> **Knowledge records what is TRUE. A skill records HOW TO DO something. A
+> method - ordered steps, a repeatable how-to - belongs in the skill library and
+> not here [...] A method's PREFERENCES do stay knowledge.**
+
+**Every path that writes a knowledge entry spends that one sentence** (#1175):
+the extraction prompt, the consolidation prompt, and the write tool the model
+calls inside a turn. It used to be in extraction's prompt alone, which is a rule
+the other two paths did not have - and consolidation is the pass whose whole job
+is to decide what an entry should look like, so it would tighten a mis-filed
+procedure into a better-written fact and cement it. It cannot write a skill, so
+it is told to leave a method exactly as it stands rather than to move it: the
+sweep below proposes those, and a merge or a rewrite in the meantime would only
+make the proposal describe something the entry no longer says.
+
+Three named tests hold the rule to reaching all three
+(`the_extraction_prompt_states_the_method_is_not_a_fact_rule` and its two
+siblings). A prompt is not an enforcer, though: it makes the rule reach a
+writer and does not make the writer obey. What catches what still slips through
+is the sweep.
 
 An entry that answers "what are the steps" is a skill in the wrong table.
 Procedural content in declarative memory is wrong three ways at once. It reads
@@ -87,9 +106,38 @@ be followed more than once. The **knowledge entry** holds what configures a run
 person. Those are facts, they change independently of the method, and they are
 exactly what a knowledge entry is for.
 
-Entries already stored the wrong way are not migrated by this pass. Moving them
-is a judgement, and getting it wrong destroys something useful, so a proposing
-sweep is tracked separately.
+### The sweep for what is already mis-filed
+
+Entries already stored the wrong way are not migrated. Moving them is a
+judgement, and getting it wrong destroys something useful - so the sweep
+(`crates/storage/src/dreaming/misfiled.rs`, #1175) **proposes and never
+rewrites**. It reads a batch of entries, and for each one that is really a
+method it writes a new **unapproved skill** whose `source` is
+`misfiled-knowledge` and whose `metadata.from_entry` names the entry it came
+from. The entry itself is not touched at all - not its content, not its tags,
+not its `updated_at`.
+
+That is the proposal mechanism this system already has, rather than a review
+queue beside it: an unapproved skill is exactly how `promote_plan_to_skill` and
+the extraction pass propose a procedure nobody has agreed to. `list_skills`
+shows it, carrying `proposed_from_entry_id`, and `set_skill_approval` is the
+person's decision. Retiring the entry afterwards is theirs too.
+
+Four things bound what an unattended pass may do here:
+
+- **The entry is never written.** The only write is a new catalog row.
+- **The link is validated, not trusted.** One call shows several entries, so a
+  proposal has to say which one it came from; a `from_entry` the call did not
+  show is dropped. A mis-linked proposal would tell a person that one of their
+  entries is a procedure when the sentence the model read was a different one.
+- **A proposal never overwrites a skill the person owns.** The same
+  `is_own_draft` guard the promotion path applies: an approved skill, one from
+  a skill root, or one installed from elsewhere is left alone.
+- **An entry is read once per edit.** `knowledge_procedure_sweep` (migration
+  `052`) records every entry read and the entry's `updated_at` at that moment,
+  including the ones that read as ordinary facts - "we looked and it was a fact"
+  is exactly the answer the ledger exists to avoid paying for twice. Without it
+  the pass would spend a model call per entry per cycle forever.
 
 ## What the summary backfill may and may not do
 
@@ -521,6 +569,8 @@ is a broader, cross-cutting change tracked separately.
 | Port | `crates/core/src/ports/inbound.rs` (`KnowledgeMaintenanceService`) |
 | Scans + force-recalc | `crates/storage/src/dreaming/`, `crates/storage/src/embedding_backfill.rs` |
 | Extraction's skill arm (the routing prompt, the parse, the write) | `crates/storage/src/dreaming/skills.rs` |
+| The one statement of the method-is-not-a-fact rule | `crates/core/src/skill_promotion.rs` (`METHOD_IS_NOT_A_FACT`) |
+| The mis-filed-procedure sweep, its prompt and its ledger | `crates/storage/src/dreaming/misfiled.rs`, table `knowledge_procedure_sweep` (`052`) |
 | Trash lifecycle (count / empty / reap / sweep) | `crates/storage/src/dreaming/trash.rs`, sweep loop in `crates/daemon/src/main.rs` |
 | The one hard-delete statement + the policy | `crates/storage/src/knowledge_delete.rs`, audited by `crates/storage/tests/knowledge_hard_delete_audit.rs` |
 | Who asked for a delete | `crates/core/src/ports/knowledge_delete.rs` (`DeleteInitiator`, `with_delete_initiator`), installed in `crates/application/src/lib.rs` |

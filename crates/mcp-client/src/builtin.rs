@@ -679,7 +679,15 @@ impl BuiltinToolService {
         let mut defs = vec![
             ToolDefinition::new(
                 TOOL_KB_WRITE,
-                "Write or update knowledge base entries. Use for storing preferences, facts, \
+                // The rule that says what is NOT a knowledge entry, stated once
+                // in the domain and spent by every path that writes one
+                // (#1175). This is the path a person's own turn goes through,
+                // so it is the one that files a routine as a fact while
+                // somebody is watching.
+                format!(
+                    "{}\n\n{}",
+                    desktop_assistant_core::skill_promotion::METHOD_IS_NOT_A_FACT,
+                    "Write or update knowledge base entries. Use for storing preferences, facts, \
                  instructions, project context, or any durable information the user wants remembered. \
                  Content should be self-contained prose that describes both the context (when/why \
                  this information is useful) and the information itself. Provide either a single \
@@ -701,7 +709,8 @@ impl BuiltinToolService {
                  description is what the check compares. When the response carries \
                  `tag_check: \"UNKNOWN\"`, at least one tag on that write was stored without \
                  being checked, so treat those tags as your own wording and not as established \
-                 vocabulary.",
+                 vocabulary."
+                ),
                 serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -2432,8 +2441,13 @@ impl BuiltinToolService {
         };
         let record = Arc::clone(record);
         let conversation_id = conversation.0;
+        // Where the procedure was followed (#1175). Read on the tool's own path
+        // so it describes the turn's client, and recorded against exactly the
+        // name that became an open - the same rule, and the same shape, as the
+        // knowledge log's `record_open` above.
+        let situation = current_situation();
         record_in_background("skill_get_opened", async move {
-            record(conversation_id, vec![name]).await
+            record(conversation_id, vec![name], situation).await
         });
     }
 
@@ -9332,6 +9346,28 @@ mod tests {
     /// keeps passing it and silently gets different behavior than any
     /// lingering documentation would promise. This guard and the schema stay
     /// in the same file, so the two cannot drift apart again.
+    /// The rule that decides which store a piece of learning belongs in reaches
+    /// the write tool the model calls inside a turn.
+    ///
+    /// The dream cycle's own paths are told it; this is the one a person's turn
+    /// goes through, and it is the path that files a routine as a fact while
+    /// somebody is watching.
+    #[test]
+    fn the_knowledge_write_tool_states_the_method_is_not_a_fact_rule() {
+        let service = fully_wired_service();
+        let def = service
+            .tool_definitions()
+            .into_iter()
+            .find(|d| d.name == TOOL_KB_WRITE)
+            .expect("builtin_knowledge_base_write is advertised");
+        assert!(
+            def.description
+                .contains(desktop_assistant_core::skill_promotion::METHOD_IS_NOT_A_FACT),
+            "the write tool has to say what is not a knowledge entry: {}",
+            def.description
+        );
+    }
+
     #[test]
     fn skill_get_schema_does_not_advertise_an_owner_argument() {
         let service = fully_wired_service();

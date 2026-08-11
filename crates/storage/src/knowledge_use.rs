@@ -142,11 +142,29 @@ struct SituationRow {
 /// counts are per field - see
 /// [`FieldFan`](desktop_assistant_core::domain::situation::FieldFan).
 #[derive(sqlx::FromRow)]
-struct FanRow {
+pub(crate) struct FanRow {
     field: String,
     entries: i64,
     fan: i64,
 }
+
+/// The knowledge store's own fan measurement, in the shape
+/// [`measure_cue`] requires.
+const KNOWLEDGE_FAN_SQL: &str = "\
+    WITH cue AS (SELECT * FROM UNNEST($2::text[], $3::text[]) AS c(field, value)),
+     per_field AS (
+         SELECT field, count(DISTINCT entry_id) AS entries
+         FROM knowledge_situation
+         WHERE user_id = $1 AND field = ANY($2::text[])
+         GROUP BY field
+     )
+     SELECT cue.field,
+            COALESCE(per_field.entries, 0) AS entries,
+            (SELECT count(*) FROM knowledge_situation ks
+             WHERE ks.user_id = $1
+               AND ks.field = cue.field
+               AND ks.value = cue.value) AS fan
+     FROM cue LEFT JOIN per_field ON per_field.field = cue.field";
 
 /// Read `situation` against the whole store: for each field the cue states, how
 /// many entries record that field and how many of those carry the cue's own
@@ -164,8 +182,20 @@ struct FanRow {
 ///
 /// Runs inside the caller's transaction, so it shares that transaction's
 /// connection and its statement timeout.
-async fn measure_cue(
+///
+/// **One function, one statement per source.** `fan_sql` is the source's own
+/// measurement, held as a static string beside the table it reads
+/// ([`KNOWLEDGE_FAN_SQL`], and the skill catalog's own in
+/// [`crate::skill_use`]). The arithmetic that turns two counts into a cue is
+/// one rule and belongs in one place, and the two sources count over different
+/// tables with different keys - so what is shared is the function and what
+/// differs is a bound-parameter statement, never a table name built into a
+/// string. Every such statement must answer the columns [`FanRow`] names, take
+/// `$1` as the user, `$2` as the fields and `$3` as their values, and count
+/// **per field** on both sides.
+pub(crate) async fn measure_cue(
     read: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    fan_sql: &'static str,
     user_id: &str,
     situation: Situation,
 ) -> Result<Option<SituationCue>, CoreError> {
@@ -180,28 +210,13 @@ async fn measure_cue(
         .map(|(_, value)| value.to_string())
         .collect();
 
-    let rows: Vec<FanRow> = sqlx::query_as(
-        "WITH cue AS (SELECT * FROM UNNEST($2::text[], $3::text[]) AS c(field, value)), \
-         per_field AS ( \
-             SELECT field, count(DISTINCT entry_id) AS entries \
-             FROM knowledge_situation \
-             WHERE user_id = $1 AND field = ANY($2::text[]) \
-             GROUP BY field \
-         ) \
-         SELECT cue.field, \
-                COALESCE(per_field.entries, 0) AS entries, \
-                (SELECT count(*) FROM knowledge_situation ks \
-                 WHERE ks.user_id = $1 \
-                   AND ks.field = cue.field \
-                   AND ks.value = cue.value) AS fan \
-         FROM cue LEFT JOIN per_field ON per_field.field = cue.field",
-    )
-    .bind(user_id)
-    .bind(&fields)
-    .bind(&values)
-    .fetch_all(&mut **read)
-    .await
-    .map_err(|e| CoreError::Storage(e.to_string()))?;
+    let rows: Vec<FanRow> = sqlx::query_as(fan_sql)
+        .bind(user_id)
+        .bind(&fields)
+        .bind(&values)
+        .fetch_all(&mut **read)
+        .await
+        .map_err(|e| CoreError::Storage(e.to_string()))?;
 
     let fans: std::collections::BTreeMap<SituationField, FieldFan> = rows
         .into_iter()
@@ -539,7 +554,7 @@ impl KnowledgeUseLog for PgKnowledgeUseLog {
         let cue = if situation.is_empty() {
             None
         } else {
-            measure_cue(&mut read, user_id.as_str(), situation).await?
+            measure_cue(&mut read, KNOWLEDGE_FAN_SQL, user_id.as_str(), situation).await?
         };
 
         read.commit()

@@ -24,6 +24,10 @@
 //! 5. **An open counts only against a standing offer**, and counting it takes
 //!    the offer down - so a retried read is one open, and a read the block
 //!    never offered is not an open at all.
+//! 6. **A skill records the situations it has been opened in** (#1175), and the
+//!    catalog grades the present situation against its own fan - never the
+//!    knowledge store's. Both halves live in SQL, so neither is reachable
+//!    without a database.
 //!
 //! ## Running locally
 //!
@@ -35,6 +39,9 @@
 
 mod support;
 
+use desktop_assistant_core::domain::situation::{
+    MAX_SITUATION_VALUES_PER_FIELD, SITUATION_MIN_POPULATION, Situation, SituationField,
+};
 use desktop_assistant_core::domain::{
     IndexedSkill, Locality, SkillApproval, SkillKind, SkillScope, TrustTier,
 };
@@ -439,18 +446,18 @@ async fn the_degraded_full_text_read_also_withholds_an_unapproved_skill() {
     fx.cleanup().await;
 }
 
-/// Acceptance (#1154): a skill that came from outside this machine is not
-/// offered.
+/// Acceptance (#1175): a skill that came from outside this machine is offered,
+/// and every row carries the tier its line is marked with.
 ///
 /// The block is a system message with no tool call in it, so nothing taints
-/// and the tool gate stays open. `builtin_skill_search` returns the same
-/// `description` field and is classified `Declared(SkillTrustTier)`, which
-/// means the platform already rules that a non-local skill's text is
-/// third-party content that must close the gate. Delivering the same bytes
-/// through a more trusted channel with less checking is the defect this
-/// excludes.
+/// and the tool gate stays open - which is why #1154 dropped these rows
+/// outright. What replaces the drop is the mark: the tier travels with the
+/// candidate and the core renders it on the line, so the model is told whose
+/// words the description is rather than reading it as the assistant's own
+/// memory. Both reads carry it, because a backend outage must not quietly
+/// launder what the measured read discloses.
 #[tokio::test]
-async fn a_skill_from_outside_this_machine_is_absent_from_the_recall_scan() {
+async fn an_installed_skill_reaches_the_recall_scan_carrying_the_tier_that_marks_it() {
     let Some(fx) = fixture().await else { return };
     let store = PgSkillIndexStore::new(fx.pool.clone());
 
@@ -475,18 +482,37 @@ async fn a_skill_from_outside_this_machine_is_absent_from_the_recall_scan() {
             .nearest_by_embedding(axis(0), MODEL, 10)
             .await
             .expect("the scan answers");
-        let names: Vec<&str> = found.skills.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, vec!["written-here"]);
+        let mut tiers: Vec<(&str, TrustTier)> = found
+            .skills
+            .iter()
+            .map(|s| (s.name.as_str(), s.trust_tier))
+            .collect();
+        tiers.sort_by_key(|(name, _)| *name);
+        assert_eq!(
+            tiers,
+            vec![
+                ("from-github", TrustTier::Github),
+                ("written-here", TrustTier::Local),
+            ],
+            "both are offered, and each says where its text came from"
+        );
 
         let lexical = store
             .search_text_any_term("a procedure", 10)
             .await
             .expect("the degraded read answers");
-        let names: Vec<&str> = lexical.iter().map(|s| s.name.as_str()).collect();
+        let mut tiers: Vec<(&str, TrustTier)> = lexical
+            .iter()
+            .map(|s| (s.name.as_str(), s.trust_tier))
+            .collect();
+        tiers.sort_by_key(|(name, _)| *name);
         assert_eq!(
-            names,
-            vec!["written-here"],
-            "a backend outage must not turn into an offer of third-party text"
+            tiers,
+            vec![
+                ("from-github", TrustTier::Github),
+                ("written-here", TrustTier::Local),
+            ],
+            "a backend outage must not turn a marked offer into an unmarked one"
         );
     })
     .await;
@@ -494,14 +520,15 @@ async fn a_skill_from_outside_this_machine_is_absent_from_the_recall_scan() {
     fx.cleanup().await;
 }
 
-/// A non-local skill shadowing a local one by name must not leave the block
-/// offering the local line while a fetch hands back the non-local body.
+/// A non-local skill shadowing a local one by name is offered as the row a
+/// fetch would return, marked, rather than as the row underneath it.
 ///
-/// The trust rule therefore applies to the row a name resolved to, not to the
-/// set it resolves from: the name is dropped outright rather than falling
-/// through to the row underneath it.
+/// The line has to describe the procedure `builtin_skill_get` hands back, or
+/// the model is briefed on one method and given another's steps. So the tier
+/// that marks the line is the resolved row's, and the description is the
+/// resolved row's too.
 #[tokio::test]
-async fn a_name_whose_resolved_row_came_from_outside_is_dropped_rather_than_falling_through() {
+async fn a_shadowed_name_is_offered_as_the_row_a_fetch_returns_and_marked_as_that_row() {
     let Some(fx) = fixture().await else { return };
     let store = PgSkillIndexStore::new(fx.pool.clone());
 
@@ -527,11 +554,20 @@ async fn a_name_whose_resolved_row_came_from_outside_is_dropped_rather_than_fall
             .await
             .expect("the scan answers");
 
-        assert!(
-            found.skills.is_empty(),
-            "the fetch would return the installed personal row, so offering the global \
-             line would describe a procedure the model will not be given: {:?}",
+        assert_eq!(
+            found.skills.len(),
+            1,
+            "one row per name: {:?}",
             found.skills
+        );
+        assert_eq!(
+            found.skills[0].description, "My own copy, installed from elsewhere.",
+            "the line describes the row a fetch returns"
+        );
+        assert_eq!(
+            found.skills[0].trust_tier,
+            TrustTier::Github,
+            "and it is marked as that row, not as the one it shadows"
         );
     })
     .await;
@@ -687,11 +723,11 @@ async fn a_name_resolves_over_the_catalog_rather_than_over_the_rows_that_matched
 
 /// The spread describes the set the arm draws from.
 ///
-/// A catalog of mostly installed skills would otherwise report a measurement
+/// A catalog mostly awaiting approval would otherwise report a measurement
 /// taken over rows the arm can never show: `RECALL_DISPERSION_MIN_ROWS` would
-/// count them, so a handful of local skills among a large installed library
-/// would be graded against the installed library's geometry rather than left
-/// on the caller's stated estimate.
+/// count them, so a handful of followable skills among a large pending library
+/// would be graded against the pending library's geometry rather than left on
+/// the caller's stated estimate.
 #[tokio::test]
 async fn the_spread_is_measured_over_the_skills_the_arm_can_offer() {
     let Some(fx) = fixture().await else { return };
@@ -701,15 +737,12 @@ async fn the_spread_is_measured_over_the_skills_the_arm_can_offer() {
         // Well past the minimum sample, but only three of them are offerable.
         for i in 0..(RECALL_DISPERSION_MIN_ROWS + 5) {
             let radians = 0.05 + (i as f32) * 0.03;
-            let mut row = a_skill(
+            let row = a_skill(
                 &format!("procedure-{i:02}"),
                 "A procedure in a catalog of procedures.",
                 None,
             );
-            if i >= 3 {
-                row.trust_tier = TrustTier::Github;
-            }
-            seed(&store, &fx.pool, &row, at_angle(radians), true).await;
+            seed(&store, &fx.pool, &row, at_angle(radians), i < 3).await;
         }
 
         let found = store
@@ -717,11 +750,15 @@ async fn the_spread_is_measured_over_the_skills_the_arm_can_offer() {
             .await
             .expect("the scan answers");
 
-        assert_eq!(found.skills.len(), 3, "only the local skills are offerable");
+        assert_eq!(
+            found.skills.len(),
+            3,
+            "only the approved skills are offerable"
+        );
         assert_eq!(
             found.dispersion, None,
             "three rows is no sample at all, so the caller falls back to its stated estimate \
-             rather than being handed the installed library's geometry"
+             rather than being handed the pending library's geometry"
         );
     })
     .await;
@@ -756,7 +793,11 @@ async fn a_skill_offered_by_the_block_and_then_opened_records_an_open() {
         assert_eq!(offered, 1);
 
         let opened = log
-            .record_opened(CONVERSATION.to_string(), vec!["deploy".to_string()])
+            .record_opened(
+                CONVERSATION.to_string(),
+                vec!["deploy".to_string()],
+                Situation::new(),
+            )
             .await
             .expect("the open is recorded");
         assert_eq!(opened, 1);
@@ -843,7 +884,11 @@ async fn a_skill_read_with_no_standing_offer_records_no_open() {
         .await;
 
         let opened = log
-            .record_opened(CONVERSATION.to_string(), vec!["deploy".to_string()])
+            .record_opened(
+                CONVERSATION.to_string(),
+                vec!["deploy".to_string()],
+                Situation::new(),
+            )
             .await
             .expect("the write succeeds");
 
@@ -883,9 +928,13 @@ async fn a_second_read_of_one_offered_skill_records_one_open() {
             .expect("the offer is recorded");
 
         for _ in 0..2 {
-            log.record_opened(CONVERSATION.to_string(), vec!["deploy".to_string()])
-                .await
-                .expect("the write succeeds");
+            log.record_opened(
+                CONVERSATION.to_string(),
+                vec!["deploy".to_string()],
+                Situation::new(),
+            )
+            .await
+            .expect("the write succeeds");
         }
 
         let records = log
@@ -933,13 +982,21 @@ async fn a_recall_offer_replaces_the_conversations_standing_skill_offers() {
         .expect("the second turn's offer");
 
         let stale = log
-            .record_opened(CONVERSATION.to_string(), vec!["first-turn".to_string()])
+            .record_opened(
+                CONVERSATION.to_string(),
+                vec!["first-turn".to_string()],
+                Situation::new(),
+            )
             .await
             .expect("the write succeeds");
         assert_eq!(stale, 0, "the previous turn's offer no longer stands");
 
         let live = log
-            .record_opened(CONVERSATION.to_string(), vec!["second-turn".to_string()])
+            .record_opened(
+                CONVERSATION.to_string(),
+                vec!["second-turn".to_string()],
+                Situation::new(),
+            )
             .await
             .expect("the write succeeds");
         assert_eq!(live, 1, "this turn's offer is the one that can be taken up");
@@ -1021,6 +1078,406 @@ async fn the_skill_use_log_reads_only_the_calling_users_own_record() {
                 .expect("the log answers")
                 .is_empty(),
             "another person's offer is not this person's history"
+        );
+    })
+    .await;
+
+    fx.cleanup().await;
+}
+
+// --- The situation a skill has been opened in (#1175) -----------------------
+
+/// The present situation these tests use: a Thursday at the workshop.
+fn here_and_now() -> Situation {
+    Situation::new()
+        .with(SituationField::Host, "workshop")
+        .with(SituationField::Weekday, "thursday")
+}
+
+/// Offer `name` in this conversation and then open it in `situation`, which is
+/// the one path that accumulates a skill's situation record.
+async fn offer_and_open(log: &PgSkillUseLog, name: &str, situation: Situation) {
+    log.record_offered(OfferScope::recall(CONVERSATION), vec![name.to_string()])
+        .await
+        .unwrap_or_else(|e| panic!("offer {name}: {e}"));
+    log.record_opened(CONVERSATION.to_string(), vec![name.to_string()], situation)
+        .await
+        .unwrap_or_else(|e| panic!("open {name}: {e}"));
+}
+
+/// The situation record the log holds for `name`.
+async fn situation_of(
+    log: &PgSkillUseLog,
+    name: &str,
+) -> Option<desktop_assistant_core::domain::situation::SituationRecord> {
+    log.situation_signal(vec![name.to_string()], Situation::new())
+        .await
+        .expect("the situation read succeeds")
+        .records
+        .into_iter()
+        .next()
+        .map(|(_, record)| record)
+}
+
+/// Acceptance (#1175): a skill carries a situation record, written where the
+/// procedure proved useful.
+///
+/// This is what lets phase 4's cue reach phase 7's arm at all. Without it the
+/// skill arm answers `NO_SITUATION` for every candidate and the strongest cue a
+/// desktop assistant holds is spent only on facts.
+#[tokio::test]
+async fn a_skill_opened_after_an_offer_records_the_situation_it_was_opened_in() {
+    let Some(fx) = fixture().await else { return };
+    let store = PgSkillIndexStore::new(fx.pool.clone());
+    let log = PgSkillUseLog::new(fx.pool.clone());
+
+    with_user_id(UserId::new(USER), async {
+        seed(
+            &store,
+            &fx.pool,
+            &a_skill("deploy-the-lab", "How to deploy.", None),
+            axis(0),
+            true,
+        )
+        .await;
+
+        offer_and_open(&log, "deploy-the-lab", here_and_now()).await;
+
+        let record = situation_of(&log, "deploy-the-lab")
+            .await
+            .expect("the skill carries a situation record");
+        assert!(
+            record.holds(SituationField::Host, "workshop"),
+            "the host the procedure was followed on is recorded: {record:?}"
+        );
+        assert!(
+            record.holds(SituationField::Weekday, "thursday"),
+            "the weekday it was followed on is recorded: {record:?}"
+        );
+    })
+    .await;
+
+    fx.cleanup().await;
+}
+
+/// A read nothing offered accumulates nothing - the same rule the open counter
+/// keeps, applied to the situation that travels with it.
+#[tokio::test]
+async fn a_skill_read_that_nothing_offered_records_no_situation() {
+    let Some(fx) = fixture().await else { return };
+    let store = PgSkillIndexStore::new(fx.pool.clone());
+    let log = PgSkillUseLog::new(fx.pool.clone());
+
+    with_user_id(UserId::new(USER), async {
+        seed(
+            &store,
+            &fx.pool,
+            &a_skill("unoffered", "A procedure nothing offered.", None),
+            axis(0),
+            true,
+        )
+        .await;
+
+        let opened = log
+            .record_opened(
+                CONVERSATION.to_string(),
+                vec!["unoffered".to_string()],
+                here_and_now(),
+            )
+            .await
+            .expect("the write succeeds");
+
+        assert_eq!(opened, 0, "no offer stood, so nothing counts as an open");
+        assert!(
+            situation_of(&log, "unoffered").await.is_none(),
+            "a read the block never offered is not evidence of where the procedure is useful"
+        );
+    })
+    .await;
+
+    fx.cleanup().await;
+}
+
+/// The retrieve-record-retrieve loop closes after one step: recording a value
+/// the record already holds moves counters nothing ranks and adds no value.
+#[tokio::test]
+async fn a_situation_a_skill_already_holds_records_no_second_value() {
+    let Some(fx) = fixture().await else { return };
+    let store = PgSkillIndexStore::new(fx.pool.clone());
+    let log = PgSkillUseLog::new(fx.pool.clone());
+
+    with_user_id(UserId::new(USER), async {
+        seed(
+            &store,
+            &fx.pool,
+            &a_skill("repeated", "A procedure followed twice here.", None),
+            axis(0),
+            true,
+        )
+        .await;
+
+        offer_and_open(&log, "repeated", here_and_now()).await;
+        offer_and_open(&log, "repeated", here_and_now()).await;
+
+        let record = situation_of(&log, "repeated")
+            .await
+            .expect("the skill carries a record");
+        let hosts: Vec<&str> = record
+            .iter()
+            .filter(|(field, _)| *field == SituationField::Host)
+            .map(|(_, value)| value)
+            .collect();
+        assert_eq!(
+            hosts,
+            vec!["workshop"],
+            "a second open in the same situation adds nothing the ranking reads"
+        );
+    })
+    .await;
+
+    fx.cleanup().await;
+}
+
+/// A skill cannot accumulate situation values without limit: the open field is
+/// capped per skill and the least recently seen goes first.
+#[tokio::test]
+async fn a_skill_cannot_accumulate_situation_values_without_limit() {
+    let Some(fx) = fixture().await else { return };
+    let store = PgSkillIndexStore::new(fx.pool.clone());
+    let log = PgSkillUseLog::new(fx.pool.clone());
+
+    with_user_id(UserId::new(USER), async {
+        seed(
+            &store,
+            &fx.pool,
+            &a_skill("travelled", "A procedure followed everywhere.", None),
+            axis(0),
+            true,
+        )
+        .await;
+
+        for i in 0..(MAX_SITUATION_VALUES_PER_FIELD + 3) {
+            offer_and_open(
+                &log,
+                "travelled",
+                Situation::new().with(SituationField::Host, format!("host-{i}")),
+            )
+            .await;
+        }
+
+        let record = situation_of(&log, "travelled")
+            .await
+            .expect("the skill carries a record");
+        let hosts = record
+            .iter()
+            .filter(|(field, _)| *field == SituationField::Host)
+            .count();
+        assert_eq!(
+            hosts, MAX_SITUATION_VALUES_PER_FIELD,
+            "a skill followed from more machines than this has stopped saying where it applies"
+        );
+    })
+    .await;
+
+    fx.cleanup().await;
+}
+
+/// Acceptance (#1175): the cue the skill arm reads is measured over the whole
+/// catalog, and a value every skill carries is worth nothing.
+///
+/// Measured over one lookup's candidates it would describe the near tail
+/// instead, and a deployment with one host would find that host informative
+/// merely because it is the only one.
+#[tokio::test]
+async fn the_skill_cue_counts_the_whole_catalog_and_a_shared_value_separates_nobody() {
+    let Some(fx) = fixture().await else { return };
+    let store = PgSkillIndexStore::new(fx.pool.clone());
+    let log = PgSkillUseLog::new(fx.pool.clone());
+
+    let population = SITUATION_MIN_POPULATION as usize;
+    with_user_id(UserId::new(USER), async {
+        // Every skill in the catalog has been followed on the one host, and a
+        // quarter of them on a Thursday.
+        for i in 0..population {
+            let name = format!("procedure-{i}");
+            seed(
+                &store,
+                &fx.pool,
+                &a_skill(&name, "A procedure.", None),
+                axis(0),
+                true,
+            )
+            .await;
+            let mut situation = Situation::new().with(SituationField::Host, "workshop");
+            if i % 4 == 0 {
+                situation = situation.with(SituationField::Weekday, "thursday");
+            } else {
+                situation = situation.with(SituationField::Weekday, "monday");
+            }
+            offer_and_open(&log, &name, situation).await;
+        }
+
+        let cue = log
+            .situation_signal(Vec::new(), here_and_now())
+            .await
+            .expect("the signal reads")
+            .cue
+            .expect("a catalog this size can grade a cue");
+
+        assert_eq!(
+            cue.information(SituationField::Host),
+            0.0,
+            "the only host every skill carries separates nobody"
+        );
+        assert!(
+            cue.information(SituationField::Weekday) > 0.0,
+            "a weekday a quarter of the catalog carries does separate them"
+        );
+    })
+    .await;
+
+    fx.cleanup().await;
+}
+
+/// Row-level scoping: one tenant's skill situations are not another's, on a
+/// host-global catalog where a name is not evidence of access.
+#[tokio::test]
+async fn a_cross_tenant_read_of_a_skill_situation_returns_nothing() {
+    let Some(fx) = fixture().await else { return };
+    let store = PgSkillIndexStore::new(fx.pool.clone());
+    let log = PgSkillUseLog::new(fx.pool.clone());
+
+    with_user_id(UserId::new(USER), async {
+        seed(
+            &store,
+            &fx.pool,
+            &a_skill("shared-name", "A host-global procedure.", None),
+            axis(0),
+            true,
+        )
+        .await;
+        offer_and_open(&log, "shared-name", here_and_now()).await;
+    })
+    .await;
+
+    with_user_id(UserId::new(OTHER_USER), async {
+        assert!(
+            situation_of(&log, "shared-name").await.is_none(),
+            "one person's situations say nothing about another's"
+        );
+    })
+    .await;
+
+    fx.cleanup().await;
+}
+
+// --- Approval, and what it changes (#1175) ----------------------------------
+
+/// Acceptance (#1175): approving a skill is what makes it reachable at all.
+///
+/// #1155 wrote the unapproved row and #1154 excluded it from every read the
+/// model has. Until something could set approval, a promoted skill was a row
+/// nothing would ever return - so this is the property the approve command
+/// exists to produce, checked where it actually happens.
+#[tokio::test]
+async fn approving_a_skill_is_what_makes_it_reachable() {
+    let Some(fx) = fixture().await else { return };
+    let store = PgSkillIndexStore::new(fx.pool.clone());
+
+    with_user_id(UserId::new(USER), async {
+        let draft = a_skill("my-draft", "A procedure the assistant wrote.", Some(USER));
+        seed(&store, &fx.pool, &draft, axis(0), false).await;
+
+        let before = store
+            .nearest_by_embedding(axis(0), MODEL, 10)
+            .await
+            .expect("the scan answers");
+        assert!(
+            before.skills.is_empty(),
+            "an unapproved skill reaches nothing: {:?}",
+            before.skills
+        );
+
+        store
+            .set_approval(
+                &SkillScope::Owner(USER.to_string()),
+                &["my-draft".to_string()],
+                Some(SkillApproval {
+                    at: now(),
+                    by: Some(USER.to_string()),
+                }),
+            )
+            .await
+            .expect("the approval is recorded");
+
+        let after = store
+            .nearest_by_embedding(axis(0), MODEL, 10)
+            .await
+            .expect("the scan answers");
+        let names: Vec<&str> = after.skills.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["my-draft"], "and an approved one is offerable");
+
+        let listed = store.list(None).await.expect("the catalog lists");
+        let row = listed
+            .iter()
+            .find(|s| s.name == "my-draft")
+            .expect("the row is listed");
+        assert_eq!(
+            row.approved_by.as_deref(),
+            Some(USER),
+            "the catalog records who consented"
+        );
+    })
+    .await;
+
+    fx.cleanup().await;
+}
+
+/// Approval is scoped: one person's approval of their own row is not another
+/// person's, and it does not reach the host-global row of the same name.
+#[tokio::test]
+async fn approving_ones_own_skill_leaves_the_global_row_of_that_name_alone() {
+    let Some(fx) = fixture().await else { return };
+    let store = PgSkillIndexStore::new(fx.pool.clone());
+
+    with_user_id(UserId::new(USER), async {
+        seed(
+            &store,
+            &fx.pool,
+            &a_skill("deploy", "The host-global copy.", None),
+            axis(0),
+            false,
+        )
+        .await;
+        seed(
+            &store,
+            &fx.pool,
+            &a_skill("deploy", "My own draft.", Some(USER)),
+            axis(0),
+            false,
+        )
+        .await;
+
+        store
+            .set_approval(
+                &SkillScope::Owner(USER.to_string()),
+                &["deploy".to_string()],
+                Some(SkillApproval {
+                    at: now(),
+                    by: Some(USER.to_string()),
+                }),
+            )
+            .await
+            .expect("the approval is recorded");
+
+        let global = store
+            .get("deploy", None)
+            .await
+            .expect("the global row reads")
+            .expect("the global row is there");
+        assert!(
+            !global.is_approved(),
+            "one person's consent is not consent for the whole host"
         );
     })
     .await;
