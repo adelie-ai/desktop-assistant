@@ -48,7 +48,7 @@ use desktop_assistant_core::ports::store::LearnedWindowStore;
 use desktop_assistant_core::prompts::{Personality, PersonalityOverride};
 
 use crate::config::{
-    DaemonConfig, default_daemon_config_path, load_daemon_config, save_daemon_config,
+    DaemonConfig, default_daemon_config_path, parse_daemon_config, save_daemon_config,
 };
 use crate::connections::{
     AnthropicConnection, AzureConnection, BedrockConnection, ConnectionConfig, ConnectionId,
@@ -415,7 +415,7 @@ impl RegistryHandle {
     /// Never fails: this path only describes state. [`Self::apply_reload`] is
     /// the one that refuses a bad config.
     pub fn restart_required(&self) -> Vec<crate::config::RestartArea> {
-        let candidate = match load_daemon_config(&self.config_path) {
+        let candidate = match parse_daemon_config(&self.config_path) {
             Ok(Some(config)) => Some(config),
             // No file (or an empty one) means nothing on disk contradicts the
             // running process.
@@ -502,10 +502,15 @@ impl RegistryHandle {
     /// Returns the [`crate::config::ReloadPlan`] describing what was applied (and what still
     /// needs a restart) on success.
     pub fn apply_reload(&self) -> anyhow::Result<crate::config::ReloadPlan> {
-        // 1. Parse + validate the candidate from disk. `load_daemon_config`
+        // 1. Parse + validate the candidate from disk. `parse_daemon_config`
         //    surfaces TOML and [connections]/[purposes] validation errors. A
         //    failure here returns Err and leaves the running state untouched.
-        let new_config = match load_daemon_config(&self.config_path) {
+        //
+        //    The non-migrating reader: this path runs from the config-file
+        //    watcher, so rewriting the file here would answer a file change
+        //    with another file change. Legacy shapes are migrated once at
+        //    startup instead (#915).
+        let new_config = match parse_daemon_config(&self.config_path) {
             Ok(Some(cfg)) => cfg,
             Ok(None) => {
                 tracing::warn!(
@@ -4172,7 +4177,7 @@ mod tests {
         // Run from the config as it round-trips through TOML, so "unchanged on
         // disk" really is unchanged — serialization materializes defaults that
         // the in-memory value does not carry.
-        let loaded = crate::config::load_daemon_config(&path)
+        let loaded = crate::config::load_and_migrate_daemon_config(&path)
             .expect("load succeeds")
             .expect("config is present");
         let handle = make_handle_at(loaded, path.clone());
@@ -4527,8 +4532,8 @@ mod tests {
     fn existing_contradictory_config_loads_with_a_warning() {
         // Enforcement lives on the write path only. An already-stored
         // contradictory binding (embedding purpose -> a generative model, the
-        // exact prod shape) must still BOOT: `load_daemon_config` does not check
-        // kinds, so it returns Ok rather than crashing the daemon on startup.
+        // exact prod shape) must still BOOT: the loader does not check kinds,
+        // so it returns Ok rather than crashing the daemon on startup.
         let mut cfg = config_with_connections(&[("local", ollama_local())]);
         cfg.purposes.set(
             PurposeKind::Interactive,
@@ -4552,7 +4557,7 @@ mod tests {
 
         let path = tmp_config_path();
         crate::config::save_daemon_config(&path, &cfg).expect("seed contradictory config on disk");
-        let loaded = crate::config::load_daemon_config(&path)
+        let loaded = crate::config::load_and_migrate_daemon_config(&path)
             .expect("a stored contradictory binding must still load, not crash the daemon")
             .expect("config is present");
         let embedding = loaded
@@ -4725,7 +4730,7 @@ mod tests {
         fn handle_for_toml(toml: &str) -> (Arc<RegistryHandle>, std::path::PathBuf) {
             let path = tmp_config_path();
             std::fs::write(&path, toml).expect("write initial config");
-            let cfg = crate::config::load_daemon_config(&path)
+            let cfg = crate::config::load_and_migrate_daemon_config(&path)
                 .expect("initial config parses")
                 .expect("initial config present");
             let registry = build_registry(&cfg);
@@ -5155,14 +5160,14 @@ url = postgres://adele:hunter2@db.example/adele
         /// The synthetic password inside `UNQUOTED_URL_WITH_PASSWORD`.
         const PASSWORD_IN_BROKEN_LINE: &str = "hunter2";
 
-        /// Boot a handle the way `main` does when `load_daemon_config`
+        /// Boot a handle the way `main` does when `load_and_migrate_daemon_config`
         /// returned `Err`: built-in defaults in memory, the user's real file
         /// still on disk.
         fn booted_from_a_failed_load(toml: &str) -> (Arc<RegistryHandle>, std::path::PathBuf) {
             let path = tmp_config_path();
             std::fs::write(&path, toml).expect("write the user's config");
             assert!(
-                crate::config::load_daemon_config(&path).is_err(),
+                crate::config::load_and_migrate_daemon_config(&path).is_err(),
                 "fixture must be a config the daemon cannot load"
             );
             let cfg = DaemonConfig::default();
@@ -5213,7 +5218,8 @@ url = postgres://adele:hunter2@db.example/adele
             // The premise: the parse error itself quotes the offending line.
             let parse_error = format!(
                 "{:#}",
-                crate::config::load_daemon_config(&path).expect_err("fixture must not load")
+                crate::config::load_and_migrate_daemon_config(&path)
+                    .expect_err("fixture must not load")
             );
             assert!(
                 parse_error.contains(PASSWORD_IN_BROKEN_LINE),
@@ -5237,7 +5243,7 @@ url = postgres://adele:hunter2@db.example/adele
             // the edit the daemon could not read.
             let path = tmp_config_path();
             std::fs::write(&path, REPAIRED).expect("write the boot config");
-            let cfg = crate::config::load_daemon_config(&path)
+            let cfg = crate::config::load_and_migrate_daemon_config(&path)
                 .expect("boot config parses")
                 .expect("boot config present");
             let registry = build_registry(&cfg);
@@ -5270,7 +5276,7 @@ url = postgres://adele:hunter2@db.example/adele
                 .set_personality(Personality::default())
                 .expect("writes resume once the daemon is running the file's own contents");
 
-            let reloaded = crate::config::load_daemon_config(&path)
+            let reloaded = crate::config::load_and_migrate_daemon_config(&path)
                 .expect("the written config still parses")
                 .expect("the written config is present");
             assert!(
@@ -6872,6 +6878,132 @@ url = postgres://adele:hunter2@db.example/adele
             assert_eq!(
                 map_effort_to_reasoning_config("anthropic", "m", None),
                 ReasoningConfig::default()
+            );
+        }
+    }
+
+    // ----- A read of the config file must not write it (#915) -------------
+    //
+    // The legacy migration rewrites `daemon.toml` and takes a `.bak` when the
+    // file holds `[llm]` and no `[connections]` table. Deleting the last
+    // connection makes the daemon write exactly that shape, so any caller
+    // that migrates on the way in resurrects the connection the user removed
+    // and drops another backup beside the file.
+    //
+    // These tests watch the file, not the value the call returned: the defect
+    // is a side effect on disk, so a test that only read the return value
+    // would pass while the bug is present.
+    mod config_reads_do_not_write {
+        use super::*;
+
+        /// A running daemon with one connection and a legacy `[llm]` block
+        /// that an earlier migration left in place. The file is the
+        /// serialization of the config the handle runs, which is what every
+        /// daemon-authored write produces.
+        ///
+        /// `[llm]` carries a model, so it is not the default block and
+        /// serializes whatever else changes. Deleting the one connection
+        /// therefore leaves `[llm]` with no `[connections]` - the shape the
+        /// legacy migration triggers on.
+        fn handle_with_one_connection_and_a_legacy_llm_block(
+            dir: &std::path::Path,
+        ) -> (Arc<RegistryHandle>, std::path::PathBuf) {
+            let mut cfg = config_with_connections(&[("local", ollama_local())]);
+            cfg.llm.model = Some("llama3".to_string());
+            let path = dir.join("daemon.toml");
+            crate::config::save_daemon_config(&path, &cfg).expect("write the running config");
+            let registry = build_registry(&cfg);
+            let handle =
+                Arc::new(RegistryHandle::new(cfg, registry).with_config_path(path.clone()));
+            (handle, path)
+        }
+
+        /// Every file name in `dir`, sorted, so a new `.bak` shows up as an
+        /// added entry.
+        fn file_names(dir: &std::path::Path) -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(dir)
+                .expect("read the config directory")
+                .map(|entry| {
+                    entry
+                        .expect("read a directory entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect();
+            names.sort();
+            names
+        }
+
+        /// Byte-exact comparison, reported as text so a failure shows which
+        /// tables were added rather than two arrays of numbers.
+        fn assert_file_is_byte_identical(path: &std::path::Path, before: &[u8], what: &str) {
+            let after = std::fs::read(path).expect("read the config file");
+            assert!(
+                after == before,
+                "{what} must leave daemon.toml byte-identical\n--- before ---\n{}\n--- after ---\n{}",
+                String::from_utf8_lossy(before),
+                String::from_utf8_lossy(&after),
+            );
+        }
+
+        async fn delete_the_only_connection(handle: &Arc<RegistryHandle>) {
+            DaemonConnectionsService::new(handle.clone())
+                .delete_connection("local".to_string(), false)
+                .await
+                .expect("the last connection can be deleted");
+        }
+
+        #[tokio::test]
+        async fn a_settings_read_leaves_the_config_file_byte_identical_after_the_last_connection_is_deleted()
+         {
+            let dir = tempfile::TempDir::new().expect("temp dir");
+            let (handle, path) = handle_with_one_connection_and_a_legacy_llm_block(dir.path());
+            delete_the_only_connection(&handle).await;
+
+            let after_delete = std::fs::read(&path).expect("read the config file");
+            let files_after_delete = file_names(dir.path());
+
+            // `get_config` asks for this on every settings read, so it runs as
+            // often as a client refreshes its settings panel.
+            for _ in 0..3 {
+                let _ = handle.restart_required();
+            }
+
+            assert_file_is_byte_identical(&path, &after_delete, "a settings read");
+            assert_eq!(
+                file_names(dir.path()),
+                files_after_delete,
+                "a settings read must not leave a backup beside daemon.toml"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_deleted_connection_does_not_come_back_when_the_config_file_is_reloaded() {
+            let dir = tempfile::TempDir::new().expect("temp dir");
+            let (handle, path) = handle_with_one_connection_and_a_legacy_llm_block(dir.path());
+            delete_the_only_connection(&handle).await;
+
+            let after_delete = std::fs::read(&path).expect("read the config file");
+            let files_after_delete = file_names(dir.path());
+
+            // What the config-file watcher runs after a daemon-authored write.
+            let _ = handle.apply_reload();
+
+            assert!(
+                handle.snapshot_config().connections.is_empty(),
+                "a deleted connection must not be restored by a reload: {:?}",
+                handle
+                    .snapshot_config()
+                    .connections
+                    .keys()
+                    .collect::<Vec<_>>()
+            );
+            assert_file_is_byte_identical(&path, &after_delete, "a reload");
+            assert_eq!(
+                file_names(dir.path()),
+                files_after_delete,
+                "a reload must not leave a backup beside daemon.toml"
             );
         }
     }

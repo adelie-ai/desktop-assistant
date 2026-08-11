@@ -135,9 +135,9 @@ impl PurposeConfig {
 /// The `interactive` purpose is required when the `[purposes]` table is
 /// present; without it there is nothing for `"primary"` to inherit from.
 /// Empty / absent `[purposes]` is represented by `Purposes::default()` and is
-/// a valid state (first-run, no migration) — [`crate::config::load_daemon_config`]
-/// decides
-/// whether to synthesize a set.
+/// a valid state (first-run, no migration) —
+/// [`crate::config::load_and_migrate_daemon_config`] decides whether to
+/// synthesize a set.
 ///
 /// Internally a `BTreeMap<PurposeKind, PurposeConfig>` so adding a new
 /// variant doesn't require editing four named-field arms. Custom
