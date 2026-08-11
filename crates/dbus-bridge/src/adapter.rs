@@ -39,11 +39,10 @@ pub use knowledge::DbusKnowledgeAdapter;
 pub use reload::DbusReloadAdapter;
 pub use settings::DbusSettingsAdapter;
 
-/// Well-known D-Bus bus name. Same as the in-process daemon's name —
+/// Well-known D-Bus bus name. Same as the in-process daemon's name -
 /// we are the **replacement** for that registration, not a parallel
-/// one. The daemon must NOT also own the name in Option-A deployments
-/// where the bridge is enabled (operators pick one or the other via
-/// the daemon's `DESKTOP_ASSISTANT_DBUS_REQUIRED` env knob).
+/// one. Since the cutover (#318/#319) the daemon serves no D-Bus
+/// surface, so this process is the only owner of the name.
 pub const DBUS_SERVICE_NAME: &str = "org.desktopAssistant";
 
 /// Object paths the bridge exposes. Order matters for introspection
