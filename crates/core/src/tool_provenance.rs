@@ -880,7 +880,42 @@ fn collect_trust_tiers(value: &serde_json::Value, out: &mut Vec<String>) {
 /// anything it explains about the gate is explained again on every turn from
 /// here on. The refusal already carries the reasoning; this only has to say
 /// that a step ran and its wording is missing.
-pub const WITHHELD_STEP_TEXT: &str = "[step text not recorded]";
+///
+/// It says a policy withheld the wording rather than that recording failed,
+/// because a person meets this in the client's own plan view and "not
+/// recorded" reads as a fault in the assistant.
+///
+/// **Never compare against this constant directly.** Use
+/// [`is_withheld_step_text`], which also recognises the wordings this build has
+/// retired, listed in the private `RETIRED_WITHHELD_STEP_TEXTS`.
+pub const WITHHELD_STEP_TEXT: &str = "[withheld by security policy]";
+
+/// Every placeholder wording this build has used and stopped using.
+///
+/// The placeholder lands in a durable note, so changing
+/// [`WITHHELD_STEP_TEXT`] does not change the rows already written. A row
+/// carrying a retired wording must still read as a placeholder, or a plan whose
+/// steps were withheld months ago starts looking like a plan with real wording
+/// in it - and is offered for promotion into a skill on that basis.
+///
+/// Nothing catches that mistake on its own. Every test in the workspace builds
+/// its rows from [`WITHHELD_STEP_TEXT`], so all of them pass whether or not the
+/// older rows are still recognised. `the_retired_placeholder_is_still_recognised`
+/// is the one that does not.
+///
+/// Add to this list when the wording changes. Never remove from it.
+const RETIRED_WITHHELD_STEP_TEXTS: &[&str] = &["[step text not recorded]"];
+
+/// Whether `text` is a withheld-step placeholder rather than the model's own
+/// wording.
+///
+/// Matches the whole value, after trimming, so a step whose real wording quotes
+/// the placeholder is not mistaken for one.
+#[must_use]
+pub fn is_withheld_step_text(text: &str) -> bool {
+    let text = text.trim();
+    text == WITHHELD_STEP_TEXT || RETIRED_WITHHELD_STEP_TEXTS.contains(&text)
+}
 
 /// Whether a subagent-tool payload carries a child agent's answer.
 ///
@@ -2145,5 +2180,37 @@ mod tests {
         assert!(ToolPolicy::Aggressive.stamps_durable_writes());
         assert!(ToolPolicy::Standard.stamps_durable_writes());
         assert!(!ToolPolicy::Lax.stamps_durable_writes());
+    }
+
+    // --- the placeholder wording, and the rows carrying an older one (#1250) -
+
+    #[test]
+    fn the_current_placeholder_is_recognised() {
+        assert!(super::is_withheld_step_text(super::WITHHELD_STEP_TEXT));
+    }
+
+    #[test]
+    fn the_retired_placeholder_is_still_recognised() {
+        // The reason this module keeps a list rather than one constant. Notes
+        // written by an older daemon are durable and carry the old wording, and
+        // every test that builds its rows from the constant passes whether or
+        // not those rows are still recognised.
+        assert!(super::is_withheld_step_text("[step text not recorded]"));
+    }
+
+    #[test]
+    fn a_note_that_merely_contains_the_phrase_is_not_a_placeholder() {
+        // The recogniser matches the whole value, so a step whose real wording
+        // quotes the placeholder is still the model's own wording.
+        assert!(!super::is_withheld_step_text(
+            "the note said [withheld by security policy] and I moved on"
+        ));
+    }
+
+    #[test]
+    fn surrounding_space_does_not_hide_a_placeholder() {
+        assert!(super::is_withheld_step_text(
+            "  [withheld by security policy]  "
+        ));
     }
 }

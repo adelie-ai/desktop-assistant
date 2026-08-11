@@ -26,7 +26,9 @@ use crate::domain::skill::{IndexedSkill, SkillError, validate_skill_name};
 use crate::domain::tool::ToolDefinition;
 use crate::domain::{Message, Role};
 use crate::planning::{OUTCOME_KEY_PREFIX, STEP_NOTE_TYPE};
+#[cfg(test)]
 use crate::tool_provenance::WITHHELD_STEP_TEXT;
+use crate::tool_provenance::is_withheld_step_text;
 
 /// Tool the model calls to accept a promotion offer. A core-loop tool, like the
 /// step-control pair it follows: only the loop holds the turn's plan.
@@ -233,7 +235,7 @@ fn read_outcome(raw: Option<&str>) -> (bool, Option<String>) {
     let Some(text) = raw.map(str::trim).filter(|t| !t.is_empty()) else {
         return (false, None);
     };
-    if text == WITHHELD_STEP_TEXT {
+    if is_withheld_step_text(text) {
         return (false, None);
     }
     match text.strip_prefix(ABANDONED_PREFIX) {
@@ -333,7 +335,7 @@ pub fn assess(
     // (#741), so there is a plan-shaped set of notes with no procedure in it.
     // Reported on its own rather than as "too few steps", because the fix is
     // different: nothing about the plan was wrong.
-    if !steps.is_empty() && steps.iter().all(|s| s.goal == WITHHELD_STEP_TEXT) {
+    if !steps.is_empty() && steps.iter().all(|s| is_withheld_step_text(&s.goal)) {
         return Err(NotPromotable::NothingRecorded);
     }
 
