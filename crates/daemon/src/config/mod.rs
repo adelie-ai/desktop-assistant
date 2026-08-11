@@ -435,6 +435,35 @@ impl SecurityConfig {
     }
 }
 
+/// Say what this daemon's security settings resolved to, before it serves
+/// anything.
+///
+/// Two lines, both on every boot. A security setting only visible by reading
+/// the file is a setting nobody checks, and an unreadable value has to be named
+/// rather than quietly replaced.
+///
+/// It lives here rather than inline in `main` so a test can install a
+/// subscriber and assert on what is actually emitted. A test that only calls
+/// [`SecurityConfig::withhold_mode_line`] proves the sentence exists, not that
+/// anything says it - deleting the emission would leave such a test green and
+/// the operator uninformed.
+pub fn report_security_posture(security: &SecurityConfig) {
+    match security.tool_policy() {
+        Ok(policy) => tracing::info!(
+            "tool policy: {} (conversations may still ask for a different level)",
+            policy.as_str()
+        ),
+        Err(error) => tracing::error!(
+            "{error}. Running at {} until the file is corrected",
+            ToolPolicy::default().as_str()
+        ),
+    }
+    // Said whether or not the key is set (#1249). The default stops a daemon
+    // destroying text it wrote, which is a behaviour change an operator must
+    // not have to infer from an absent key.
+    tracing::info!("{}", security.withhold_mode_line());
+}
+
 fn default_tool_policy() -> String {
     ToolPolicy::default().as_str().to_string()
 }
@@ -5835,8 +5864,97 @@ admin_subjects = ["operator", "ops-oncall"]
         std::fs::remove_file(&path).ok();
     }
 
+    /// What `report_security_posture` actually writes, for `security`.
+    ///
+    /// A capturing subscriber rather than an assertion on the returned string,
+    /// because the property #1249 states is that the daemon SAYS it. A test
+    /// that only calls `withhold_mode_line` proves the sentence exists and
+    /// nothing more: delete the emission and such a test stays green while the
+    /// operator learns nothing.
+    fn captured_startup_log(security: &super::SecurityConfig) -> String {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Captured(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let sink = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            super::report_security_posture(security);
+        });
+
+        let bytes = sink.0.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        String::from_utf8(bytes).expect("captured log output is UTF-8")
+    }
+
+    /// Acceptance (#1249): the daemon states the resolved withhold mode, and
+    /// the tool policy beside it, on every boot.
     #[test]
-    fn the_startup_log_states_the_withhold_mode() {
+    fn the_startup_log_says_both_security_settings() {
+        let said = captured_startup_log(&super::SecurityConfig::default());
+        assert!(
+            said.contains("hard_withhold = false"),
+            "the boot log must state the resolved withhold mode, got: {said}"
+        );
+        assert!(
+            said.contains("tool policy: standard"),
+            "and the tool policy beside it, got: {said}"
+        );
+
+        let destroying = super::SecurityConfig {
+            hard_withhold: true,
+            ..Default::default()
+        };
+        let said = captured_startup_log(&destroying);
+        assert!(
+            said.contains("hard_withhold = true") && said.contains("destroy"),
+            "an operator who chose destruction must read that back, got: {said}"
+        );
+    }
+
+    /// Acceptance (#1249): said when the key is ABSENT, which is the case that
+    /// matters - the upgrade turns destruction off for an operator who never
+    /// wrote the key, so silence is exactly the wrong answer.
+    #[test]
+    fn the_startup_log_speaks_when_the_key_is_absent() {
+        let config: DaemonConfig = toml::from_str("").unwrap();
+        let said = captured_startup_log(&config.security);
+        assert!(
+            said.contains("hard_withhold = false"),
+            "a config that says nothing must still produce the line, got: {said}"
+        );
+        assert!(
+            said.contains("stored"),
+            "and it must say the words are kept, got: {said}"
+        );
+    }
+
+    #[test]
+    fn the_withhold_mode_line_names_the_setting_and_its_effect() {
         // An operator has to be able to read what this daemon does with the
         // words it wrote, without opening the file and reasoning about a
         // default.
@@ -5856,7 +5974,7 @@ admin_subjects = ["operator", "ops-oncall"]
     }
 
     #[test]
-    fn the_startup_log_states_the_mode_when_the_key_is_absent() {
+    fn the_withhold_mode_line_resolves_an_absent_key_to_false() {
         // Said on every boot, not only when the key is set. The upgrade turns
         // destruction OFF for an operator who never wrote the key, so silence
         // is exactly the wrong answer here.
