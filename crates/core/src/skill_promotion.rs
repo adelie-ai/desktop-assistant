@@ -929,6 +929,42 @@ mod tests {
         assert!(!steps[0].succeeded());
     }
 
+    /// Acceptance (#1248): the guard on a plan with nothing in it holds.
+    ///
+    /// After #1247 a plan reaches this state by one route only - an operator
+    /// running with `hard_withhold` on - plus the rows written before that
+    /// change. Both wordings count, because the retired one is what the rows
+    /// already stored carry.
+    #[test]
+    fn an_all_placeholder_plan_is_still_skipped() {
+        for wording in [WITHHELD_STEP_TEXT, "[step text not recorded]"] {
+            let steps = vec![
+                PlanStep {
+                    key: "1".to_string(),
+                    goal: wording.to_string(),
+                    outcome: None,
+                    abandoned: false,
+                },
+                PlanStep {
+                    key: "2".to_string(),
+                    goal: wording.to_string(),
+                    outcome: None,
+                    abandoned: false,
+                },
+                PlanStep {
+                    key: "3".to_string(),
+                    goal: wording.to_string(),
+                    outcome: None,
+                    abandoned: false,
+                },
+            ];
+            assert!(
+                matches!(assess(steps, false), Err(NotPromotable::NothingRecorded)),
+                "a plan of placeholders is plan-shaped and holds no procedure: {wording:?}"
+            );
+        }
+    }
+
     // --- steps_this_turn -----------------------------------------------------
 
     /// Step notes outlive the turn that wrote them, so a plan must be judged on
