@@ -1021,6 +1021,12 @@ async fn main() -> Result<()> {
         .as_ref()
         .map(|c| c.transports.clone())
         .unwrap_or_default();
+    // The remote WebSocket door is OFF by default: the daemon is local-first
+    // (UDS), so the remote endpoint - and its TLS/login/origin machinery - is
+    // opt-in. Resolved here rather than beside the listener because the
+    // conversation-store tenancy check below needs the answer, and one binding
+    // keeps the two decisions from reading different values.
+    let ws_enabled = env_bool("DESKTOP_ASSISTANT_WS_ENABLED", transports_config.ws_enabled);
 
     // Build the per-connection client registry from the [connections] map
     // (#9). Purpose-based dispatch (#10 + #11) picks the right client per
@@ -1271,6 +1277,15 @@ async fn main() -> Result<()> {
 
     // --- Database (optional) ---
     let (db_url, db_max_conns) = config::resolve_database_config(daemon_config.as_ref());
+    // Which conversation store this daemon will run on, and whether it keeps
+    // one user's conversations apart from another's (#773). Decided here, from
+    // the configuration alone, so a remote door served from an unpartitioned
+    // store is refused before the daemon connects to anything - and before two
+    // people connect to the daemon.
+    let store_kind = store::ConversationStoreKind::for_database_configured(db_url.is_some());
+    store::check_remote_door_store_tenancy(ws_enabled, store_kind).inspect_err(|e| {
+        tracing::error!("{e:#}");
+    })?;
     let pg_pool = if let Some(url) = db_url {
         tracing::info!(
             "connecting to PostgreSQL (max_connections={})",
@@ -2628,21 +2643,34 @@ async fn main() -> Result<()> {
     // selection column, #11) so we wrap it in
     // `Arc<SharedConversationStore>` (a local newtype that lets us impl
     // `ConversationStore` for the Arc despite the orphan rule).
-    let inner_store: AnyConversationStore = if let Some(pool) = &pg_pool {
-        tracing::info!("using PostgreSQL conversation store");
-        AnyConversationStore::Postgres(desktop_assistant_storage::PgConversationStore::new(
-            pool.clone(),
-        ))
-    } else {
-        let store = PersistentConversationStore::from_default_path().map_err(|e| {
-            anyhow::anyhow!("failed to initialize persistent conversation store: {e}")
-        })?;
-        tracing::info!(
-            "using JSON conversation store at {}",
-            store::default_conversation_store_path().display()
-        );
-        AnyConversationStore::Json(store)
+    // Built from the store kind the tenancy check above already decided, so the
+    // store the daemon runs on is the store that decision was made about.
+    let inner_store: AnyConversationStore = match store_kind {
+        store::ConversationStoreKind::Postgres => {
+            let pool = pg_pool.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "a database URL is configured but no connection pool was built; refusing to \
+                     fall back to a conversation store with different tenancy"
+                )
+            })?;
+            AnyConversationStore::Postgres(desktop_assistant_storage::PgConversationStore::new(
+                pool.clone(),
+            ))
+        }
+        store::ConversationStoreKind::JsonFile => {
+            AnyConversationStore::Json(PersistentConversationStore::from_default_path().map_err(
+                |e| anyhow::anyhow!("failed to initialize persistent conversation store: {e}"),
+            )?)
+        }
     };
+    // Say which store was chosen and what it guarantees. Silence here is how an
+    // operator ends up unable to tell "it works" from "it is safe".
+    tracing::info!(
+        store = store_kind.label(),
+        user_scoped = store_kind.is_user_scoped(),
+        remote_door = ws_enabled,
+        "conversation store selected"
+    );
     let conversation_store = SharedConversationStore(Arc::new(inner_store));
 
     // Wrap the interactive-purpose client in a `RoutingLlmClient`. The
@@ -3288,12 +3316,6 @@ async fn main() -> Result<()> {
             Arc::clone(&admin_subjects),
         ))
     };
-
-    // WebSocket API (remote-friendly). OFF by default: the daemon is
-    // local-first (D-Bus minter + UDS), so the remote WebSocket endpoint —
-    // and its TLS/login/origin machinery — is opt-in via
-    // DESKTOP_ASSISTANT_WS_ENABLED=true.
-    let ws_enabled = env_bool("DESKTOP_ASSISTANT_WS_ENABLED", transports_config.ws_enabled);
 
     // TLS configuration. Read unconditionally — cheap, no I/O — so
     // `transports::resolve_ws_door_plan` below is the single place that
