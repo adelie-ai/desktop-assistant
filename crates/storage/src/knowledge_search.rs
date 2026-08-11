@@ -9,6 +9,24 @@
 //! the `[Recall]` block therefore ranked by different rules, and a person
 //! reading a result could not tell which they had got.
 //!
+//! ## One ranking rule, held by the type system (#1244)
+//!
+//! The order is `desktop_assistant_core::ports::recall::rank_by_activation`'s -
+//! the same function the `[Recall]` block's arms rank by - and every term it
+//! reads comes off [`SearchCandidate`]'s own `Activatable` implementation.
+//! #1167 stated that the tool and the block could not drift because they read
+//! one score, and that was already false when written: the two built the
+//! score's *arguments* separately, so the page's projection dropping the
+//! `source` column, and the situation term being passed as a literal zero, were
+//! both differences nothing would have caught. A term added to the score is now
+//! a method added to the trait, which does not compile until both callers
+//! answer it.
+//!
+//! The one term the two legitimately differ on is the lexical one, and the
+//! difference is stated rather than silent: this caller has a full-text arm and
+//! reads it, and a recall lookup uses one mode at a time and answers
+//! `LexicalMatch::NONE`.
+//!
 //! ## What the two arms do now
 //!
 //! **The arms admit; activation ranks.** That is the same division the block
@@ -183,14 +201,11 @@ pub(crate) fn rank_page(
     now: DateTime<Utc>,
     limit: usize,
 ) -> Vec<KnowledgeEntry> {
-    // TODO(#1244): the cue is accepted but not read yet - this commit is the
-    // failing spec, and the next one supplies it.
-    let _unread = situation;
     rank_by_activation(
         candidates,
         |candidate| candidate,
         dispersion,
-        None,
+        situation,
         now,
         MixedSet::MeasuredFirst,
     )

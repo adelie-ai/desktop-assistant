@@ -22,7 +22,9 @@ use crate::ports::conversation_ctx::with_conversation_id;
 use crate::ports::inbound::ConversationService;
 use crate::ports::knowledge::KnowledgeGetManyFn;
 use crate::ports::knowledge_use::current_situation;
-use crate::ports::knowledge_use::{KnowledgeOfferedFn, OfferScope, record_in_background};
+use crate::ports::knowledge_use::{
+    KnowledgeOfferedFn, OfferScope, record_in_background, with_situation_cue,
+};
 use crate::ports::llm::{
     ChunkCallback, LlmClient, ReasoningConfig, StatusCallback, current_cancellation_token,
     current_context_budget, current_tool_allowlist, current_tool_policy,
@@ -2703,6 +2705,17 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
         // matched at a decision point and a decision point is every tool call,
         // so a read per call would put a database round trip in front of each
         // one. The set is small and the matching is pure.
+        // The cue this turn measured against the knowledge store, kept for the
+        // turn's own tools (#1244). The knowledge-base search tool ranks by the
+        // same situation the block does, and a cue is a statistic of the whole
+        // store, so the turn measures it once and hands it down rather than
+        // paying a full-store count on every search the model runs. A turn that
+        // ran no lookup, or whose store could not grade one, hands down `None`,
+        // which weights the term at zero.
+        let turn_situation_cue = recall
+            .as_ref()
+            .and_then(|found| found.candidates.situation_cue.clone());
+
         let live_burns = self.live_burns_or_none().await;
         // Whether anything is wired at all. With nothing behind it the loop
         // must cost exactly what it cost before this feature existed, which
@@ -3852,6 +3865,10 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                     // conversation, so a read can reach nothing else.
                     transcript.absorb(&conv.messages);
                     let scoped = with_transcript(transcript.clone(), scoped);
+                    // And the turn's own situation cue, so a tool that ranks by
+                    // activation ranks by the same situation the `[Recall]`
+                    // block did (#1244).
+                    let scoped = with_situation_cue(turn_situation_cue.clone(), scoped);
                     // For `spawn_subagent`, install the child scope minted above so
                     // the spawn-tool body adopts it for the child (#287); every other
                     // tool runs with no pending child scope. Fold both arms into one
