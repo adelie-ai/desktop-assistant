@@ -3,10 +3,16 @@
 //! embeddings, persistence, database, backend tasks, WS auth).
 //!
 //! Extracted from `config.rs` (#41). Each pair is a thin wrapper over
-//! `load_daemon_config` → resolve / mutate → `save_daemon_config`. The
+//! `parse_daemon_config` → resolve / mutate → `save_daemon_config`. The
 //! resolved view types (`LlmSettingsView`, `EmbeddingsSettingsView`,
 //! etc.) and the resolution helpers stay in `mod.rs` since they're
 //! shared with non-view code paths.
+//!
+//! The reader here is the non-migrating one. Reading settings, and
+//! reading them to apply an edit, must not rewrite the file: the legacy
+//! migration takes a backup and synthesizes a `[connections.default]`,
+//! which on a config with no connections left puts back the connection
+//! the user deleted (#915). Legacy shapes are migrated at startup.
 
 use std::path::Path;
 
@@ -19,14 +25,14 @@ use super::{
     ResolvedPersistenceConfig, SecretConfig, WsAuthConfig, WsAuthDiscoveryInfo, bucket_secret_len,
     default_archive_after_days, default_backend_llm_model, default_base_url, default_connector,
     default_dreaming_interval_secs, default_git_remote_name, default_llm_model,
-    default_oidc_scopes, is_placeholder_secret_value, load_daemon_config, normalize_optional_value,
-    parse_connector_or_openai, redacted_secret_audit, resolve_backend_tasks_llm_config,
-    resolve_database_config, resolve_embeddings_config, resolve_llm_config,
-    resolve_persistence_config, save_daemon_config, write_secret_to_backend,
+    default_oidc_scopes, is_placeholder_secret_value, normalize_optional_value,
+    parse_connector_or_openai, parse_daemon_config, redacted_secret_audit,
+    resolve_backend_tasks_llm_config, resolve_database_config, resolve_embeddings_config,
+    resolve_llm_config, resolve_persistence_config, save_daemon_config, write_secret_to_backend,
 };
 
 pub fn get_llm_settings_view(path: &Path) -> anyhow::Result<LlmSettingsView> {
-    let config = load_daemon_config(path)?;
+    let config = parse_daemon_config(path)?;
     let resolved = resolve_llm_config(config.as_ref());
 
     Ok(LlmSettingsView {
@@ -55,7 +61,7 @@ pub fn set_llm_settings(
     max_tokens: Option<u32>,
     hosted_tool_search: Option<bool>,
 ) -> anyhow::Result<()> {
-    let mut config = load_daemon_config(path)?.unwrap_or_default();
+    let mut config = parse_daemon_config(path)?.unwrap_or_default();
 
     let connector = connector.trim().to_lowercase();
     if connector.is_empty() {
@@ -120,7 +126,7 @@ pub fn set_api_key(path: &Path, api_key: &str) -> anyhow::Result<()> {
         ));
     }
 
-    let mut config = load_daemon_config(path)?.unwrap_or_default();
+    let mut config = parse_daemon_config(path)?.unwrap_or_default();
     if config.llm.secret.is_none() {
         config.llm.secret = Some(SecretConfig::default());
     }
@@ -143,7 +149,7 @@ pub fn set_api_key(path: &Path, api_key: &str) -> anyhow::Result<()> {
 }
 
 pub fn get_embeddings_settings_view(path: &Path) -> anyhow::Result<EmbeddingsSettingsView> {
-    let config = load_daemon_config(path)?;
+    let config = parse_daemon_config(path)?;
     let resolved = resolve_embeddings_config(config.as_ref());
     Ok(resolved)
 }
@@ -180,7 +186,7 @@ pub fn set_embeddings_settings(
     model: Option<&str>,
     base_url: Option<&str>,
 ) -> anyhow::Result<()> {
-    let mut config = load_daemon_config(path)?.unwrap_or_default();
+    let mut config = parse_daemon_config(path)?.unwrap_or_default();
 
     config.embeddings.connector = connector
         .map(str::trim)
@@ -196,7 +202,7 @@ pub fn set_embeddings_settings(
 }
 
 pub fn get_persistence_settings_view(path: &Path) -> anyhow::Result<ResolvedPersistenceConfig> {
-    let config = load_daemon_config(path)?;
+    let config = parse_daemon_config(path)?;
     Ok(resolve_persistence_config(config.as_ref()))
 }
 
@@ -207,7 +213,7 @@ pub fn set_persistence_settings(
     remote_name: Option<&str>,
     push_on_update: bool,
 ) -> anyhow::Result<()> {
-    let mut config = load_daemon_config(path)?.unwrap_or_default();
+    let mut config = parse_daemon_config(path)?.unwrap_or_default();
 
     config.persistence.git.enabled = enabled;
     // #804/#895 review (deliberately not validated here, recorded rather than
@@ -230,7 +236,7 @@ pub fn set_persistence_settings(
 }
 
 pub fn get_database_settings_view(path: &Path) -> anyhow::Result<(String, u32)> {
-    let config = load_daemon_config(path)?;
+    let config = parse_daemon_config(path)?;
     let (url, max_connections) = resolve_database_config(config.as_ref());
     Ok((url.unwrap_or_default(), max_connections))
 }
@@ -240,7 +246,7 @@ pub fn set_database_settings(
     url: Option<&str>,
     max_connections: u32,
 ) -> anyhow::Result<()> {
-    let mut config = load_daemon_config(path)?.unwrap_or_default();
+    let mut config = parse_daemon_config(path)?.unwrap_or_default();
 
     config.database.url = normalize_optional_value(url);
     config.database.max_connections = max_connections;
@@ -261,7 +267,7 @@ pub struct BackendTasksSettingsViewConfig {
 pub fn get_backend_tasks_settings_view(
     path: &Path,
 ) -> anyhow::Result<BackendTasksSettingsViewConfig> {
-    let config = load_daemon_config(path)?;
+    let config = parse_daemon_config(path)?;
     let bt = config.as_ref().map(|c| &c.backend_tasks);
     let has_separate_llm = bt.is_some_and(|b| b.llm.is_some());
     let dreaming_enabled = bt.map(|b| b.dreaming_enabled).unwrap_or(false);
@@ -294,7 +300,7 @@ pub fn set_backend_tasks_settings(
     dreaming_interval_secs: u64,
     archive_after_days: u32,
 ) -> anyhow::Result<()> {
-    let mut config = load_daemon_config(path)?.unwrap_or_default();
+    let mut config = parse_daemon_config(path)?.unwrap_or_default();
 
     config.backend_tasks.dreaming_enabled = dreaming_enabled;
     config.backend_tasks.dreaming_interval_secs = dreaming_interval_secs;
@@ -354,7 +360,7 @@ pub fn get_connector_defaults(connector: &str) -> ConnectorDefaultsView {
 }
 
 pub fn get_ws_auth_discovery(config_path: &Path) -> anyhow::Result<WsAuthDiscoveryInfo> {
-    let config = load_daemon_config(config_path)?.unwrap_or_default();
+    let config = parse_daemon_config(config_path)?.unwrap_or_default();
     let ws_auth = config.ws_auth;
 
     let oidc_info = if ws_auth.methods.contains(&"oidc".to_string()) {
@@ -375,7 +381,7 @@ pub fn get_ws_auth_discovery(config_path: &Path) -> anyhow::Result<WsAuthDiscove
 }
 
 pub fn get_ws_auth_settings(config_path: &Path) -> anyhow::Result<WsAuthConfig> {
-    let config = load_daemon_config(config_path)?.unwrap_or_default();
+    let config = parse_daemon_config(config_path)?.unwrap_or_default();
     Ok(config.ws_auth)
 }
 
@@ -388,7 +394,7 @@ pub fn set_ws_auth_settings(
     oidc_client_id: &str,
     oidc_scopes: &str,
 ) -> anyhow::Result<()> {
-    let mut config = load_daemon_config(config_path)?.unwrap_or_default();
+    let mut config = parse_daemon_config(config_path)?.unwrap_or_default();
 
     config.ws_auth.methods = methods.to_vec();
 

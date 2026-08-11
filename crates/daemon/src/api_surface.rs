@@ -48,7 +48,7 @@ use desktop_assistant_core::ports::store::LearnedWindowStore;
 use desktop_assistant_core::prompts::{Personality, PersonalityOverride};
 
 use crate::config::{
-    DaemonConfig, default_daemon_config_path, load_daemon_config, save_daemon_config,
+    DaemonConfig, default_daemon_config_path, parse_daemon_config, save_daemon_config,
 };
 use crate::connections::{
     AnthropicConnection, AzureConnection, BedrockConnection, ConnectionConfig, ConnectionId,
@@ -415,7 +415,7 @@ impl RegistryHandle {
     /// Never fails: this path only describes state. [`Self::apply_reload`] is
     /// the one that refuses a bad config.
     pub fn restart_required(&self) -> Vec<crate::config::RestartArea> {
-        let candidate = match load_daemon_config(&self.config_path) {
+        let candidate = match parse_daemon_config(&self.config_path) {
             Ok(Some(config)) => Some(config),
             // No file (or an empty one) means nothing on disk contradicts the
             // running process.
@@ -502,10 +502,15 @@ impl RegistryHandle {
     /// Returns the [`crate::config::ReloadPlan`] describing what was applied (and what still
     /// needs a restart) on success.
     pub fn apply_reload(&self) -> anyhow::Result<crate::config::ReloadPlan> {
-        // 1. Parse + validate the candidate from disk. `load_daemon_config`
+        // 1. Parse + validate the candidate from disk. `parse_daemon_config`
         //    surfaces TOML and [connections]/[purposes] validation errors. A
         //    failure here returns Err and leaves the running state untouched.
-        let new_config = match load_daemon_config(&self.config_path) {
+        //
+        //    The non-migrating reader: this path runs from the config-file
+        //    watcher, so rewriting the file here would answer a file change
+        //    with another file change. Legacy shapes are migrated once at
+        //    startup instead (#915).
+        let new_config = match parse_daemon_config(&self.config_path) {
             Ok(Some(cfg)) => cfg,
             Ok(None) => {
                 tracing::warn!(
@@ -4172,7 +4177,7 @@ mod tests {
         // Run from the config as it round-trips through TOML, so "unchanged on
         // disk" really is unchanged — serialization materializes defaults that
         // the in-memory value does not carry.
-        let loaded = crate::config::load_daemon_config(&path)
+        let loaded = crate::config::load_and_migrate_daemon_config(&path)
             .expect("load succeeds")
             .expect("config is present");
         let handle = make_handle_at(loaded, path.clone());
@@ -4527,8 +4532,8 @@ mod tests {
     fn existing_contradictory_config_loads_with_a_warning() {
         // Enforcement lives on the write path only. An already-stored
         // contradictory binding (embedding purpose -> a generative model, the
-        // exact prod shape) must still BOOT: `load_daemon_config` does not check
-        // kinds, so it returns Ok rather than crashing the daemon on startup.
+        // exact prod shape) must still BOOT: the loader does not check kinds,
+        // so it returns Ok rather than crashing the daemon on startup.
         let mut cfg = config_with_connections(&[("local", ollama_local())]);
         cfg.purposes.set(
             PurposeKind::Interactive,
@@ -4552,7 +4557,7 @@ mod tests {
 
         let path = tmp_config_path();
         crate::config::save_daemon_config(&path, &cfg).expect("seed contradictory config on disk");
-        let loaded = crate::config::load_daemon_config(&path)
+        let loaded = crate::config::load_and_migrate_daemon_config(&path)
             .expect("a stored contradictory binding must still load, not crash the daemon")
             .expect("config is present");
         let embedding = loaded
@@ -4725,7 +4730,7 @@ mod tests {
         fn handle_for_toml(toml: &str) -> (Arc<RegistryHandle>, std::path::PathBuf) {
             let path = tmp_config_path();
             std::fs::write(&path, toml).expect("write initial config");
-            let cfg = crate::config::load_daemon_config(&path)
+            let cfg = crate::config::load_and_migrate_daemon_config(&path)
                 .expect("initial config parses")
                 .expect("initial config present");
             let registry = build_registry(&cfg);
@@ -5155,14 +5160,14 @@ url = postgres://adele:hunter2@db.example/adele
         /// The synthetic password inside `UNQUOTED_URL_WITH_PASSWORD`.
         const PASSWORD_IN_BROKEN_LINE: &str = "hunter2";
 
-        /// Boot a handle the way `main` does when `load_daemon_config`
+        /// Boot a handle the way `main` does when `load_and_migrate_daemon_config`
         /// returned `Err`: built-in defaults in memory, the user's real file
         /// still on disk.
         fn booted_from_a_failed_load(toml: &str) -> (Arc<RegistryHandle>, std::path::PathBuf) {
             let path = tmp_config_path();
             std::fs::write(&path, toml).expect("write the user's config");
             assert!(
-                crate::config::load_daemon_config(&path).is_err(),
+                crate::config::load_and_migrate_daemon_config(&path).is_err(),
                 "fixture must be a config the daemon cannot load"
             );
             let cfg = DaemonConfig::default();
@@ -5213,7 +5218,8 @@ url = postgres://adele:hunter2@db.example/adele
             // The premise: the parse error itself quotes the offending line.
             let parse_error = format!(
                 "{:#}",
-                crate::config::load_daemon_config(&path).expect_err("fixture must not load")
+                crate::config::load_and_migrate_daemon_config(&path)
+                    .expect_err("fixture must not load")
             );
             assert!(
                 parse_error.contains(PASSWORD_IN_BROKEN_LINE),
@@ -5237,7 +5243,7 @@ url = postgres://adele:hunter2@db.example/adele
             // the edit the daemon could not read.
             let path = tmp_config_path();
             std::fs::write(&path, REPAIRED).expect("write the boot config");
-            let cfg = crate::config::load_daemon_config(&path)
+            let cfg = crate::config::load_and_migrate_daemon_config(&path)
                 .expect("boot config parses")
                 .expect("boot config present");
             let registry = build_registry(&cfg);
@@ -5270,7 +5276,7 @@ url = postgres://adele:hunter2@db.example/adele
                 .set_personality(Personality::default())
                 .expect("writes resume once the daemon is running the file's own contents");
 
-            let reloaded = crate::config::load_daemon_config(&path)
+            let reloaded = crate::config::load_and_migrate_daemon_config(&path)
                 .expect("the written config still parses")
                 .expect("the written config is present");
             assert!(

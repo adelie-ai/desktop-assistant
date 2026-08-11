@@ -966,7 +966,8 @@ async fn main() -> Result<()> {
     // all is worse than one running built-in defaults. It does, however, mean
     // the process never held the user's settings, so the origin travels with
     // the config into the registry handle (#723).
-    let (daemon_config, config_origin) = match config::load_daemon_config(&config_path) {
+    let (daemon_config, config_origin) = match config::load_and_migrate_daemon_config(&config_path)
+    {
         Ok(config) => (config, config::ConfigOrigin::File),
         Err(error) => {
             tracing::error!(

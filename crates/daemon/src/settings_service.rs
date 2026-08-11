@@ -1114,7 +1114,7 @@ mod tests {
             uuid::Uuid::new_v4().simple()
         ));
         std::fs::write(&path, toml).expect("write boot config");
-        let cfg = crate::config::load_daemon_config(&path)
+        let cfg = crate::config::load_and_migrate_daemon_config(&path)
             .expect("boot config parses")
             .expect("boot config present");
         let registry = crate::registry::build_registry(&cfg);

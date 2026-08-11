@@ -1,7 +1,7 @@
 //! Legacy → new-format config migration.
 //!
 //! Extracted from `config.rs` (#41). Two migration passes run during
-//! [`super::load_daemon_config`]:
+//! [`super::load_and_migrate_daemon_config`]:
 //!
 //! 1. **Legacy `[llm]` → `[connections.default]`**: when the file
 //!    contains a top-level `[llm]` block but no `[connections]` table,

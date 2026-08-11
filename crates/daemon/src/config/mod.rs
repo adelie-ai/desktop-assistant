@@ -97,13 +97,21 @@ use desktop_assistant_storage::knowledge_delete::KnowledgeDeletePolicy;
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct DaemonConfig {
-    #[serde(default)]
+    /// Pre-`[connections]` LLM settings, kept so a config authored by an
+    /// older release still loads.
+    ///
+    /// Skipped when it holds nothing but defaults, because `[llm]` with no
+    /// `[connections]` table is exactly what the legacy migration triggers
+    /// on - and that is the file the daemon writes as soon as the last
+    /// connection is deleted. Serializing an empty block turns a
+    /// current-format config into a legacy-looking one (#915).
+    #[serde(default, skip_serializing_if = "LlmConfig::is_default")]
     pub llm: LlmConfig,
     /// Named connector instances. Each entry owns its own credentials and
     /// endpoint; the `type` tag selects which connector implementation is used.
     ///
     /// Populated by deserialize as `IndexMap<String, ConnectionConfig>` so TOML
-    /// parse errors surface before id-slug validation. [`load_daemon_config`]
+    /// parse errors surface before id-slug validation. [`load_and_migrate_daemon_config`]
     /// re-wraps the map as a validated [`ConnectionsMap`], rejecting invalid
     /// or duplicate ids.
     ///
@@ -892,7 +900,7 @@ impl Default for GitPersistenceConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct LlmConfig {
     #[serde(default = "default_connector")]
     pub connector: String,
@@ -934,6 +942,14 @@ impl Default for LlmConfig {
             hosted_tool_search: None,
             aws_profile: None,
         }
+    }
+}
+
+impl LlmConfig {
+    /// True when no legacy LLM setting was authored, so writing the block
+    /// would only repeat what the defaults already say.
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
     }
 }
 
@@ -1329,7 +1345,7 @@ pub enum ConfigOrigin {
     /// The running config is what the file held when the daemon read it - or
     /// there was no file (or an empty one), which is a legitimate first run.
     File,
-    /// [`load_daemon_config`] failed, so the process is running
+    /// [`load_and_migrate_daemon_config`] failed, so the process is running
     /// [`DaemonConfig::default`] and the file's real contents were never in
     /// memory. Serializing that snapshot back over the file would replace the
     /// user's configuration with defaults.
@@ -1337,13 +1353,21 @@ pub enum ConfigOrigin {
 }
 
 /// Read the config file into a [`DaemonConfig`], migrating legacy shapes on
-/// the way - which **rewrites the file** (see
+/// the way - which **rewrites the file** and leaves a `.bak` beside it (see
 /// [`migration::maybe_migrate_legacy_connections`]).
 ///
-/// `Ok(None)` means there is nothing to load: no file, or an empty one. Use
-/// [`parse_daemon_config`] where the question is only whether the file is
-/// valid; this one is for the paths that actually take the config on.
-pub fn load_daemon_config(path: &Path) -> anyhow::Result<Option<DaemonConfig>> {
+/// `Ok(None)` means there is nothing to load: no file, or an empty one.
+///
+/// **Startup only.** Every other path uses [`parse_daemon_config`], which
+/// reads the same file and applies the same validation without touching it.
+/// The split is what keeps a read from changing what it reads: the legacy
+/// trigger is `[llm]` with no `[connections]` table, and that is also what
+/// the daemon itself writes once the last connection is deleted, so a
+/// migrating reader answers a settings read by putting the deleted
+/// connection back (#915). Migration is a one-time repair of a file authored
+/// by an older release, so it belongs to the one moment the daemon takes the
+/// file on for the first time.
+pub fn load_and_migrate_daemon_config(path: &Path) -> anyhow::Result<Option<DaemonConfig>> {
     let Some((content, parsed)) = read_daemon_config_file(path)? else {
         return Ok(None);
     };
@@ -1381,16 +1405,18 @@ pub fn load_daemon_config(path: &Path) -> anyhow::Result<Option<DaemonConfig>> {
 
 /// Read and validate the config file **without touching it**: the same parse
 /// and the same `[connections]` / `[purposes]` validation as
-/// [`load_daemon_config`], minus the legacy migrations that rewrite the file
-/// and take a `.bak`.
+/// [`load_and_migrate_daemon_config`], minus the legacy migrations that
+/// rewrite the file and take a `.bak`.
 ///
 /// `Ok(None)` means there is nothing to read (no file, or an empty one).
 ///
-/// Why: paths that only need to *ask* whether the file is sound must not have
-/// a rewrite as a side effect - most of all the guard that decides whether a
-/// config write would destroy the file (#723). Deliberately no stricter than
-/// `load_daemon_config`: a legacy-shaped file that only validates once
-/// migrated is accepted here, because loading it would succeed.
+/// This is the reader for everything the running daemon does: settings reads,
+/// the read half of a settings write, the reload the config-file watcher
+/// drives, and the guard that decides whether a config write would destroy
+/// the file (#723). None of them may have a rewrite as a side effect (#915).
+/// Deliberately no stricter than `load_and_migrate_daemon_config`: a
+/// legacy-shaped file that only validates once migrated is accepted here,
+/// because loading it would succeed.
 pub fn parse_daemon_config(path: &Path) -> anyhow::Result<Option<DaemonConfig>> {
     let Some((content, parsed)) = read_daemon_config_file(path)? else {
         return Ok(None);
@@ -1950,7 +1976,7 @@ mod tests {
         path
     }
 
-    /// The legacy shape `load_daemon_config` migrates: `[llm]` and no
+    /// The legacy shape `load_and_migrate_daemon_config` migrates: `[llm]` and no
     /// `[connections]`.
     const LEGACY_CONFIG: &str = r#"
 # hand-authored
@@ -2520,14 +2546,14 @@ uds_socket = "/tmp/adelie.sock"
         // Set embeddings override
         set_embeddings_settings(&path, Some("ollama"), Some("nomic-embed-text"), None).unwrap();
 
-        let loaded = load_daemon_config(&path).unwrap().unwrap();
+        let loaded = load_and_migrate_daemon_config(&path).unwrap().unwrap();
         assert_eq!(loaded.embeddings.connector.as_deref(), Some("ollama"));
         assert_eq!(loaded.embeddings.model.as_deref(), Some("nomic-embed-text"));
         assert!(loaded.embeddings.base_url.is_none());
 
         // Clear override
         set_embeddings_settings(&path, None, None, None).unwrap();
-        let loaded = load_daemon_config(&path).unwrap().unwrap();
+        let loaded = load_and_migrate_daemon_config(&path).unwrap().unwrap();
         assert!(loaded.embeddings.connector.is_none());
 
         std::fs::remove_dir_all(&dir).ok();
@@ -2565,7 +2591,7 @@ uds_socket = "/tmp/adelie.sock"
             "refusal should point at the fix: {err}"
         );
         assert!(
-            load_daemon_config(&path).unwrap().is_none(),
+            load_and_migrate_daemon_config(&path).unwrap().is_none(),
             "a rejected write must not persist anything"
         );
     }
@@ -2581,7 +2607,7 @@ uds_socket = "/tmp/adelie.sock"
 
         set_embeddings_settings(&path, Some("bedrock"), None, Some("us-east-1"))
             .expect("a bedrock region string must not be parsed as an invalid URL");
-        let loaded = load_daemon_config(&path).unwrap().unwrap();
+        let loaded = load_and_migrate_daemon_config(&path).unwrap().unwrap();
         assert_eq!(loaded.embeddings.base_url.as_deref(), Some("us-east-1"));
     }
 
@@ -2614,7 +2640,7 @@ uds_socket = "/tmp/adelie.sock"
             "refusal should point at the fix: {err}"
         );
         assert!(
-            load_daemon_config(&path).unwrap().is_none(),
+            load_and_migrate_daemon_config(&path).unwrap().is_none(),
             "a rejected write must not persist anything"
         );
     }
@@ -2745,7 +2771,7 @@ uds_socket = "/tmp/adelie.sock"
 
         // The written file parses back cleanly as a valid config (the daemon can
         // load what it just bootstrapped, and settings writes will round-trip).
-        let loaded = load_daemon_config(&path).unwrap();
+        let loaded = load_and_migrate_daemon_config(&path).unwrap();
         assert!(
             loaded.is_some(),
             "the written default must load back as valid config"
@@ -2874,7 +2900,7 @@ base_url = "https://api.openai.com/v1"
 "#;
         std::fs::write(&path, content).unwrap();
 
-        let loaded = load_daemon_config(&path).unwrap().unwrap();
+        let loaded = load_and_migrate_daemon_config(&path).unwrap().unwrap();
         assert!(loaded.has_connections());
         assert_eq!(loaded.connections.len(), 1);
 
@@ -2897,7 +2923,7 @@ type = "openai"
 "#;
         std::fs::write(&path, content).unwrap();
 
-        let err = load_daemon_config(&path).unwrap_err();
+        let err = load_and_migrate_daemon_config(&path).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("Bad Id"), "error should cite bad id: {msg}");
         assert!(
@@ -2920,7 +2946,7 @@ type = "openai"
 "#;
         std::fs::write(&path, content).unwrap();
 
-        let err = load_daemon_config(&path).unwrap_err();
+        let err = load_and_migrate_daemon_config(&path).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("at least one"),
@@ -2983,7 +3009,7 @@ type = "openai"
         )
         .unwrap();
 
-        let loaded = load_daemon_config(&path).unwrap().unwrap();
+        let loaded = load_and_migrate_daemon_config(&path).unwrap().unwrap();
 
         assert_eq!(loaded.backend_tasks.knowledge_trash_retention_days, 3);
         assert_eq!(
@@ -3010,7 +3036,7 @@ type = "openai"
         )
         .unwrap();
 
-        let loaded = load_daemon_config(&path).unwrap().unwrap();
+        let loaded = load_and_migrate_daemon_config(&path).unwrap().unwrap();
         let policy = loaded.backend_tasks.knowledge_delete_policy();
 
         assert_eq!(policy.trash_retention_days, 7);
@@ -3071,7 +3097,7 @@ dreaming_enabled = true
         );
         std::fs::write(&path, &legacy).unwrap();
 
-        let loaded = load_daemon_config(&path).unwrap().unwrap();
+        let loaded = load_and_migrate_daemon_config(&path).unwrap().unwrap();
 
         // Exactly one synthesized connection called `default`.
         assert_eq!(loaded.connections.len(), 1);
@@ -3105,7 +3131,7 @@ dreaming_enabled = true
         );
 
         // Reload is idempotent — no new .bak, no new rewrite, connections still parse.
-        let reloaded = load_daemon_config(&path).unwrap().unwrap();
+        let reloaded = load_and_migrate_daemon_config(&path).unwrap().unwrap();
         assert_eq!(reloaded.connections.len(), 1);
         assert!(
             !dir.join("daemon.toml.bak.2").exists(),
@@ -3170,7 +3196,7 @@ api_key_env = "OPENAI_API_KEY"
 "#;
         std::fs::write(&path, legacy).unwrap();
 
-        let _loaded = load_daemon_config(&path).unwrap().unwrap();
+        let _loaded = load_and_migrate_daemon_config(&path).unwrap().unwrap();
 
         // Original .bak preserved as-is.
         let preserved = std::fs::read_to_string(dir.join("daemon.toml.bak")).unwrap();
@@ -3197,7 +3223,7 @@ connector = "openai"
 "#;
         std::fs::write(&path, legacy).unwrap();
 
-        let _loaded = load_daemon_config(&path).unwrap().unwrap();
+        let _loaded = load_and_migrate_daemon_config(&path).unwrap().unwrap();
 
         assert_eq!(
             std::fs::read_to_string(dir.join("daemon.toml.bak")).unwrap(),
@@ -3233,7 +3259,7 @@ model = "gpt-4o-mini"
 "#;
         std::fs::write(&path, legacy).unwrap();
 
-        let loaded = load_daemon_config(&path).unwrap().unwrap();
+        let loaded = load_and_migrate_daemon_config(&path).unwrap().unwrap();
 
         // `backend_tasks.llm` has been absorbed into `[purposes]` and removed.
         assert!(loaded.backend_tasks.llm.is_none());
@@ -3304,7 +3330,7 @@ model = "claude-haiku-4-5-20251001"
 "#;
         std::fs::write(&path, legacy).unwrap();
 
-        let loaded = load_daemon_config(&path).unwrap().unwrap();
+        let loaded = load_and_migrate_daemon_config(&path).unwrap().unwrap();
 
         assert!(loaded.backend_tasks.llm.is_none());
         assert_eq!(loaded.connections.len(), 2);
@@ -3350,7 +3376,7 @@ api_key_env = "OPENAI_API_KEY"
 "#;
         std::fs::write(&path, legacy).unwrap();
 
-        let loaded = load_daemon_config(&path).unwrap().unwrap();
+        let loaded = load_and_migrate_daemon_config(&path).unwrap().unwrap();
         assert_eq!(loaded.connections.len(), 1);
 
         let interactive = loaded.purposes.get(PurposeKind::Interactive).unwrap();
@@ -3389,7 +3415,7 @@ api_key_env = "OPENAI_WORK_KEY"
 "#;
         std::fs::write(&path, content).unwrap();
 
-        let loaded = load_daemon_config(&path).unwrap().unwrap();
+        let loaded = load_and_migrate_daemon_config(&path).unwrap().unwrap();
 
         // Connections untouched.
         assert_eq!(loaded.connections.len(), 1);
@@ -3421,7 +3447,7 @@ effort = "high"
 "#;
         std::fs::write(&path, content).unwrap();
 
-        let loaded = load_daemon_config(&path).unwrap().unwrap();
+        let loaded = load_and_migrate_daemon_config(&path).unwrap().unwrap();
         let interactive = loaded.purposes.get(PurposeKind::Interactive).unwrap();
         assert_eq!(interactive.effort, Some(crate::purposes::Effort::High));
         // No other purposes synthesized.
@@ -3449,7 +3475,7 @@ effort = "high"
         let path = dir.join("daemon.toml");
         std::fs::write(&path, legacy).unwrap();
 
-        let _loaded = load_daemon_config(&path).unwrap().unwrap();
+        let _loaded = load_and_migrate_daemon_config(&path).unwrap().unwrap();
         let actual = std::fs::read_to_string(&path).unwrap();
 
         assert_eq!(
@@ -3473,7 +3499,7 @@ effort = "high"
         let path = dir.join("daemon.toml");
         std::fs::write(&path, legacy).unwrap();
 
-        let _loaded = load_daemon_config(&path).unwrap().unwrap();
+        let _loaded = load_and_migrate_daemon_config(&path).unwrap().unwrap();
         let actual = std::fs::read_to_string(&path).unwrap();
 
         assert_eq!(
@@ -5031,7 +5057,7 @@ max_context_tokens = 1000000
             "refusal should point at the fix: {err}"
         );
         assert!(
-            load_daemon_config(&path).unwrap().is_none(),
+            load_and_migrate_daemon_config(&path).unwrap().is_none(),
             "a rejected write must not persist anything"
         );
     }
@@ -5207,7 +5233,7 @@ connector = "anthropic"
 "#;
         std::fs::write(&path, legacy).unwrap();
 
-        let loaded = load_daemon_config(&path).unwrap().unwrap();
+        let loaded = load_and_migrate_daemon_config(&path).unwrap().unwrap();
 
         // A second connection was synthesized for the different connector.
         let backend = loaded
@@ -5253,7 +5279,7 @@ model = "claude-haiku-4-5-20251001"
 "#;
         std::fs::write(&path, legacy).unwrap();
 
-        let loaded = load_daemon_config(&path).unwrap().unwrap();
+        let loaded = load_and_migrate_daemon_config(&path).unwrap().unwrap();
 
         // Exactly two connections: the user's `backend` + the synthesized one.
         assert_eq!(loaded.connections.len(), 2);
@@ -5286,7 +5312,9 @@ model = "claude-haiku-4-5-20251001"
     // --- `[authz]`: the remote administrator allowlist (#728) --------------
 
     mod authz {
-        use super::super::{AuthzConfig, DaemonConfig, load_daemon_config, save_daemon_config};
+        use super::super::{
+            AuthzConfig, DaemonConfig, load_and_migrate_daemon_config, save_daemon_config,
+        };
 
         /// A daemon with no `[authz]` section grants nobody the administrator
         /// capability over a remote transport. Fail closed.
@@ -5342,14 +5370,14 @@ admin_subjects = ["operator", "ops-oncall"]
             };
             save_daemon_config(&path, &cfg).expect("write config");
 
-            let loaded = load_daemon_config(&path)
+            let loaded = load_and_migrate_daemon_config(&path)
                 .expect("load config")
                 .expect("config present");
             assert_eq!(loaded.authz.admin_subjects, vec!["operator".to_string()]);
 
             // A later rewrite (what every settings command does) keeps it.
             save_daemon_config(&path, &loaded).expect("rewrite config");
-            let reloaded = load_daemon_config(&path)
+            let reloaded = load_and_migrate_daemon_config(&path)
                 .expect("reload config")
                 .expect("config present");
             assert_eq!(reloaded.authz.admin_subjects, vec!["operator".to_string()]);
@@ -5468,7 +5496,7 @@ admin_subjects = ["operator", "ops-oncall"]
             let dir = tempfile::TempDir::new().expect("tempdir");
             let path = dir.path().join("daemon.toml");
             std::fs::write(&path, &toml_src).expect("write the documented config");
-            load_daemon_config(&path)
+            load_and_migrate_daemon_config(&path)
                 .unwrap_or_else(|e| panic!("the example in {source} does not load: {e}"))
                 .unwrap_or_else(|| panic!("the example in {source} loaded as nothing"));
         }
@@ -5502,7 +5530,7 @@ admin_subjects = ["operator", "ops-oncall"]
         let dir = tempfile::TempDir::new().expect("tempdir");
         let path = dir.path().join("daemon.toml");
         std::fs::write(&path, &toml_src).expect("write the documented config");
-        let loaded = load_daemon_config(&path)
+        let loaded = load_and_migrate_daemon_config(&path)
             .unwrap_or_else(|e| panic!("{source} does not load: {e}"))
             .expect("config present");
 
@@ -5574,7 +5602,7 @@ admin_subjects = ["operator", "ops-oncall"]
         )
         .expect("write config");
 
-        let loaded = load_daemon_config(&path)
+        let loaded = load_and_migrate_daemon_config(&path)
             .expect("an unknown key must not fail the load")
             .expect("config present");
         assert!(
