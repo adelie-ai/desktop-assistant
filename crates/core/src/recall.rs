@@ -4836,6 +4836,85 @@ mod tests {
         );
     }
 
+    /// A catalog the size real ones actually are answers with no cue at all,
+    /// and the arm then ranks exactly as it did before the cue existed (#1175).
+    ///
+    /// `SITUATION_MIN_POPULATION` is 20 and was calibrated on the knowledge
+    /// store, which holds thousands of rows. A skill catalog holds tens - see
+    /// `RECALL_SKILL_SCAN_LIMIT`'s own comment - and the population measured
+    /// here is narrower still, being the skills *this person has opened*,
+    /// counted per field. So on a young catalog every field sits under the
+    /// floor, the cue is `None`, its term weights zero, and the situation half
+    /// of this arm is inert.
+    ///
+    /// That is the floor working rather than failing: a fan measured over a
+    /// handful of observations is noise, and weighting by noise is worse than
+    /// not weighting at all. It is recorded as a test rather than a comment
+    /// because every other test of this arm seeds a population at or above the
+    /// floor, so the case a real deployment is in went unexercised - and a
+    /// behaviour nothing exercises is a behaviour nobody notices changing.
+    #[test]
+    fn a_young_catalog_answers_with_no_cue_and_ranks_as_it_did_before() {
+        let here = here_and_now();
+
+        // A catalog of eight situated skills, which is a generous real one.
+        let fans = here
+            .iter()
+            .map(|(field, _)| {
+                (
+                    field,
+                    crate::domain::situation::FieldFan {
+                        population: 8,
+                        holding: 2,
+                    },
+                )
+            })
+            .collect();
+        assert_eq!(
+            crate::domain::SituationCue::measured(here.clone(), &fans),
+            None,
+            "a catalog this size cannot grade a cue, so it must not offer one"
+        );
+
+        let source = seeded_source();
+        let elsewhere = crate::domain::Situation::new()
+            .with(crate::domain::SituationField::Host, "the-road")
+            .with(crate::domain::SituationField::Weekday, "sunday");
+        let candidates = RecallCandidates {
+            skills: vec![
+                skill_seen_in(
+                    skill(
+                        "elsewhere",
+                        "A procedure first followed on the road.",
+                        true,
+                        source.distance_at(9.0),
+                    ),
+                    &elsewhere,
+                ),
+                skill_seen_in(
+                    skill(
+                        "here",
+                        "A procedure this room keeps calling for.",
+                        true,
+                        source.distance_at(8.9),
+                    ),
+                    &here,
+                ),
+            ],
+            skill_dispersion: Some(source),
+            skill_situation_cue: None,
+            ..RecallCandidates::default()
+        };
+
+        assert_eq!(
+            shown_skills(&candidates),
+            vec!["elsewhere".to_string(), "here".to_string()],
+            "with no cue the nearer skill leads, exactly as it did before the \
+             situation term existed - the same pair the cue reorders when the \
+             catalog is large enough to grade one"
+        );
+    }
+
     /// Acceptance (#1175): the skill arm is ranked by the catalog's own cue and
     /// never by the knowledge store's.
     ///

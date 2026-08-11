@@ -152,6 +152,31 @@ use chrono::{DateTime, Datelike, Timelike, Utc};
 /// store as evidence that the host is informative, when among the entries that
 /// have one it may separate nobody.
 ///
+/// **One floor, two sources of very different size** (#1175). This number was
+/// calibrated on the knowledge store, which holds thousands of rows. The skill
+/// catalog now measures its own cue against the same floor, and a catalog holds
+/// tens of rows rather than thousands - see `RECALL_SKILL_SCAN_LIMIT`. The
+/// population counted here is narrower still: the skills this person has
+/// opened, per field. So on a young catalog every field sits under the floor,
+/// the cue is `None`, and the situation half of the skill arm is inert.
+///
+/// That is deliberate, and it is the floor working rather than failing. A fan
+/// measured over a handful of observations is noise, and weighting by noise is
+/// worse than not weighting at all; the arm then ranks exactly as it did before
+/// the term existed, which is the quiet answer rather than the loud one.
+///
+/// It is stated here because the alternative is worse in a specific way. A
+/// floor calibrated on one source's population and applied to another's has
+/// already cost this design once: the recall bar met the same shape from the
+/// other direction, where a measurement did run and produced a threshold no
+/// candidate could reach. That failed destructively; this fails safe. But the
+/// shared premise is worth naming rather than rediscovering, and what would
+/// justify scaling this per source is a population of real catalogs - not one.
+///
+/// `a_young_catalog_answers_with_no_cue_and_ranks_as_it_did_before` exercises
+/// the inert case, because every other test of that arm seeds a population at
+/// or above this floor.
+///
 /// [`RECALL_DISPERSION_MIN_ROWS`]: crate::ports::recall::RECALL_DISPERSION_MIN_ROWS
 pub const SITUATION_MIN_POPULATION: u64 = 20;
 
