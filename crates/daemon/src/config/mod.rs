@@ -5807,8 +5807,13 @@ admin_subjects = ["operator", "ops-oncall"]
         let mut path = std::env::temp_dir();
         path.push(format!("da-1249-{}.toml", uuid::Uuid::new_v4().simple()));
 
-        let mut config = super::DaemonConfig::default();
-        config.security.hard_withhold = true;
+        let config = super::DaemonConfig {
+            security: super::SecurityConfig {
+                hard_withhold: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         super::save_daemon_config(&path, &config).expect("save");
 
         let reloaded = super::load_daemon_config(&path)
@@ -5832,8 +5837,10 @@ admin_subjects = ["operator", "ops-oncall"]
         // An operator has to be able to read what this daemon does with the
         // words it wrote, without opening the file and reasoning about a
         // default.
-        let mut destroying = super::SecurityConfig::default();
-        destroying.hard_withhold = true;
+        let destroying = super::SecurityConfig {
+            hard_withhold: true,
+            ..Default::default()
+        };
         let line = destroying.withhold_mode_line();
         assert!(
             line.contains("hard_withhold = true"),
