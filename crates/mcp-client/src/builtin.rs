@@ -991,7 +991,13 @@ impl BuiltinToolService {
             ),
             ToolDefinition::new(
                 TOOL_SYS_PROPS,
-                "Return a compact property sheet with basic runtime/system context",
+                "Return a compact property sheet with basic runtime/system context. \
+                 The daemon host's personal fields (username, home directory, \
+                 hostname, shell, locale, XDG paths, local time) are reported only \
+                 when the connecting client shared its device context; the fields \
+                 that say where server-side tools act (cwd, os, arch, os_version, \
+                 session_type) are always reported, and anything held back is named \
+                 in `daemon_host.withheld`",
                 serde_json::json!({
                     "type": "object",
                     "properties": {},
@@ -1512,6 +1518,31 @@ impl BuiltinToolService {
         }
     }
 
+    /// A property sheet for the model: who the user is, and where server-side
+    /// tools act.
+    ///
+    /// Two halves, and both are conditional on the connecting client's
+    /// self-reported context (#549/#558/#779).
+    ///
+    /// The **identity** fields (`real_name`, `username`, `home_dir`, `hostname`,
+    /// `os`, `timezone`) come from the client when it sent a context, and from
+    /// the daemon host when it did not; `identity_source` says which, and a field
+    /// the client omitted stays null rather than borrowing the daemon's.
+    ///
+    /// The **`daemon_host`** block splits on one test: does the model need this
+    /// to know where a server-side file or terminal tool acts?
+    ///
+    /// - Always reported, because withholding them breaks real behaviour:
+    ///   `cwd`, `os`, `arch`, `os_version`, `session_type`.
+    /// - Reported only when the client shared a context: `generated_at_local`,
+    ///   `timezone`, `hostname`, `username`, `home_dir`, `xdg_dirs`, `shell`,
+    ///   `locale`. On a desktop install the daemon host is the user's own
+    ///   machine, so these repeat the facts the client-context preference
+    ///   governs; they follow the same preference the identity fields do.
+    ///
+    /// A withheld field is **named** in `daemon_host.withheld` rather than
+    /// dropped silently, so the model can tell "withheld" from "could not be
+    /// detected" - the latter is a key that is present and null.
     fn sys_props(&self) -> String {
         let now = NowSnapshot::now();
 
@@ -1558,7 +1589,10 @@ impl BuiltinToolService {
                          are the daemon host's own values and may not be the \
                          user's. Server-side tools (file, terminal) run on the \
                          daemon host: relative paths resolve from `daemon_host.cwd`, \
-                         not the client's home.",
+                         not the client's home. `daemon_host.withheld` names the \
+                         personal fields held back because the client shared no \
+                         device context; a field named there was withheld, whereas \
+                         a field present and null simply could not be detected.",
                 "generated_at_epoch": now.epoch_secs(),
                 "generated_at_utc": now.utc_rfc3339(),
                 "identity_source": identity.source,
@@ -1568,21 +1602,7 @@ impl BuiltinToolService {
                 "hostname": identity.hostname,
                 "os": identity.os,
                 "timezone": identity.timezone,
-                "daemon_host": {
-                    "cwd": detect_daemon_cwd(),
-                    "generated_at_local": now.local_rfc3339(),
-                    "timezone": now.timezone(),
-                    "hostname": detect_hostname(),
-                    "os": std::env::consts::OS,
-                    "arch": std::env::consts::ARCH,
-                    "os_version": detect_os_version(),
-                    "username": detect_username(),
-                    "home_dir": detect_home_dir(),
-                    "xdg_dirs": detect_xdg_dirs(),
-                    "shell": detect_shell(),
-                    "locale": detect_locale(),
-                    "session_type": detect_session_type(),
-                },
+                "daemon_host": daemon_host_props(&now, client.is_some()),
             },
         })
         .to_string()
@@ -3779,6 +3799,93 @@ struct IdentityFields {
     timezone: Option<String>,
 }
 
+/// Why a personal `daemon_host` field is absent, in the reply itself, so the
+/// model reads a decision rather than a gap.
+const DAEMON_HOST_WITHHELD_REASON: &str = "the connecting client shared no device context, so the daemon host's personal \
+     fields are withheld; on a desktop install the daemon host is the user's own \
+     machine, and reporting them would return the very facts the client withheld. \
+     Withheld is not unknown: these values exist, they are simply not being shared.";
+
+/// The `daemon_host` block of one `builtin_sys_props` reply.
+///
+/// `share_personal` is the same predicate the identity fields use - the
+/// connecting client sent a non-empty context - so the two halves of the reply
+/// cannot disagree about whether the client shared anything (#779).
+fn daemon_host_props(now: &NowSnapshot, share_personal: bool) -> serde_json::Value {
+    let personal = personal_daemon_host_fields(now);
+    let withheld: Vec<&'static str> = if share_personal {
+        Vec::new()
+    } else {
+        personal.iter().map(|(name, _)| *name).collect()
+    };
+
+    // Kept whatever the client shared: these are how the model knows where a
+    // server-side file or terminal tool acts, and withholding them would break
+    // real behaviour rather than protect anything. None of them names a person.
+    let mut host = serde_json::Map::new();
+    // Where a relative path resolves for a server-side tool.
+    host.insert("cwd".to_string(), serde_json::json!(detect_daemon_cwd()));
+    // Which commands, path conventions and binaries are valid there.
+    host.insert("os".to_string(), serde_json::json!(std::env::consts::OS));
+    host.insert(
+        "arch".to_string(),
+        serde_json::json!(std::env::consts::ARCH),
+    );
+    host.insert(
+        "os_version".to_string(),
+        serde_json::json!(detect_os_version()),
+    );
+    // Whether a server-side command can reach a graphical session.
+    host.insert(
+        "session_type".to_string(),
+        serde_json::json!(detect_session_type()),
+    );
+
+    if share_personal {
+        for (name, value) in personal {
+            host.insert(name.to_string(), value);
+        }
+    }
+
+    host.insert("withheld".to_string(), serde_json::json!(withheld));
+    host.insert(
+        "withheld_reason".to_string(),
+        serde_json::json!((!share_personal).then_some(DAEMON_HOST_WITHHELD_REASON)),
+    );
+    serde_json::Value::Object(host)
+}
+
+/// The personal `daemon_host` fields, as (name, value) pairs in reply order.
+///
+/// One list, so what is emitted and what is reported as withheld cannot drift
+/// apart: a field added here is both emitted when the client shared a context
+/// and named when it did not. The values are resolved even when they will be
+/// withheld - a handful of environment reads and one small file read - because a
+/// separate list of names is exactly the kind of thing that goes stale in
+/// silence, and a personal field missing from `withheld` would read to the model
+/// as merely undetectable.
+///
+/// Each entry fails the tool-locality test in [`daemon_host_props`]: none of them
+/// is needed for a server-side file or terminal tool to act, and each repeats a
+/// fact the client-context preference governs. `hostname` names the user's
+/// machine. `timezone` and `generated_at_local` are the user's own local time on
+/// a desktop install; `generated_at_epoch` and `generated_at_utc` stay
+/// unconditional, so the model can still order and compute times, just not
+/// localize them. `username`, `home_dir`, `xdg_dirs`, `shell` and `locale` name
+/// the person directly.
+fn personal_daemon_host_fields(now: &NowSnapshot) -> Vec<(&'static str, serde_json::Value)> {
+    vec![
+        ("generated_at_local", serde_json::json!(now.local_rfc3339())),
+        ("timezone", serde_json::json!(now.timezone())),
+        ("hostname", serde_json::json!(detect_hostname())),
+        ("username", serde_json::json!(detect_username())),
+        ("home_dir", serde_json::json!(detect_home_dir())),
+        ("xdg_dirs", detect_xdg_dirs()),
+        ("shell", serde_json::json!(detect_shell())),
+        ("locale", serde_json::json!(detect_locale())),
+    ]
+}
+
 fn detect_username() -> Option<String> {
     ["USER", "LOGNAME", "USERNAME"]
         .iter()
@@ -5644,9 +5751,10 @@ mod tests {
         // The gate is the same predicate the identity fields already use: an
         // all-absent context counts as absent, so the two halves of the reply
         // cannot disagree about whether the client shared anything.
-        let daemon =
-            daemon_host_under(Some(desktop_assistant_core::ports::transport::ClientContext::default()))
-                .await;
+        let daemon = daemon_host_under(Some(
+            desktop_assistant_core::ports::transport::ClientContext::default(),
+        ))
+        .await;
         for field in PERSONAL_DAEMON_HOST_FIELDS {
             assert!(
                 !daemon.contains_key(*field),
