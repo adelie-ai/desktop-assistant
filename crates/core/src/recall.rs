@@ -76,11 +76,10 @@
 
 use std::sync::OnceLock;
 
-use crate::domain::activation::{ActivationWeights, LexicalMatch, activation};
-use crate::domain::situation::SituationCue;
 use crate::domain::skill::TrustTier;
 use crate::ports::recall::{
-    Activatable, RecallCandidates, RecallDispersion, RecallEntry, RecallNote, RecallSkill,
+    MixedSet, RecallCandidates, RecallDispersion, RecallEntry, RecallNote, RecallSkill,
+    rank_by_activation,
 };
 use crate::ports::scratchpad::NOTE_KEY_MAX_CHARS;
 
@@ -748,11 +747,16 @@ fn render_recall_with_width(
             (!line.is_empty()).then_some((*hit, line))
         })
         .collect();
+    // A recall lookup uses one mode at a time, so a mixed set here means an
+    // adapter fused two - `MixedSet::Refuse` is the guard, and
+    // `rank_by_activation` states why each caller's policy is what it is.
     let showable = rank_by_activation(
         showable,
+        |(hit, _)| *hit,
         entry_dispersion,
         candidates.situation_cue.as_ref(),
         surface.now,
+        MixedSet::Refuse,
     );
 
     // The pad is its own source and carries its own spread. A note embeds
@@ -860,9 +864,11 @@ fn render_recall_with_width(
     // measured over facts says nothing about procedures.
     let showable_skills = rank_by_activation(
         showable_skills,
+        |(skill, _)| *skill,
         skill_dispersion,
         candidates.skill_situation_cue.as_ref(),
         surface.now,
+        MixedSet::Refuse,
     );
 
     if showable.is_empty() && showable_notes.is_empty() && showable_skills.is_empty() {
@@ -945,44 +951,6 @@ fn render_recall_with_width(
     })
 }
 
-/// Order the admitted candidates of one arm by activation, best first (#1123).
-///
-/// One score, over the two signals retrieval actually holds: how far the
-/// candidate stands out of its own source, and what the use log knows about it.
-/// [`crate::domain::activation`] states the score and why it has that shape;
-/// what belongs here is what it means for a block.
-///
-/// **One function for every arm that has a use log.** The knowledge arm and the
-/// skill arm (#1154) rank on the same two signals, so they rank through the
-/// same code: two implementations would agree until one of the rules below
-/// changed, and the rule most likely to change is the one the second copy could
-/// not see. `dispersion` is the arm's own, never another's.
-///
-/// **Stable, so distance breaks a tie.** Candidates arrive nearest-first, and a
-/// stable sort leaves two of equal activation in that order - which is the right
-/// tie-break and is also what keeps a store with no use history rendering
-/// exactly the block it rendered before this existed.
-///
-/// **A set with no semantic term is left alone.** A
-/// [`RecallRelevance`](crate::ports::recall::RecallRelevance) that
-/// carries no distance carries no term to score, and its own documentation says
-/// what follows: the database ranked those rows and the block keeps that order.
-/// The test is over the whole set rather than per candidate, because a block
-/// half ordered by one rule and half by another is ordered by neither. One
-/// lookup uses one mode, so in practice the set is all of one kind.
-///
-/// **It never decides admission.** The bar did that, above, on distance alone.
-/// The situation term (#1125) is inside this function for that reason and no
-/// other: a signal that could admit an entry the bar refused would break the
-/// block's "and N more entries also matched" hedge, which counts what cleared a
-/// distance test over a nearest-first list. Nothing in this function is
-/// reachable from that test.
-///
-/// A candidate with no situation record of its own answers
-/// [`NO_SITUATION`](crate::domain::activation::NO_SITUATION) through
-/// [`Activatable::situation_coverage`] and the term contributes zero, which is
-/// how it ranked before the cue existed. `situation` is the arm's own cue,
-/// never another's, on the same terms as `dispersion`.
 /// The dispersion to read [`RECALL_BAR`] against: a source's own measurement
 /// wherever it can admit anything, and the stated estimate where it cannot.
 ///
@@ -1015,61 +983,6 @@ fn admission_dispersion(measured: RecallDispersion) -> RecallDispersion {
     } else {
         RECALL_ASSUMED_DISPERSION
     }
-}
-
-fn rank_by_activation<'a, T: Activatable>(
-    showable: Vec<(&'a T, String)>,
-    dispersion: RecallDispersion,
-    situation: Option<&SituationCue>,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Vec<(&'a T, String)> {
-    let weights = ActivationWeights::default();
-    let scored: Vec<Option<f64>> = showable
-        .iter()
-        .map(|(hit, _)| {
-            // Both cheap signals are read inside the `map`, so a degraded
-            // lookup - where every candidate carries a lexical rank and no
-            // distance, and this function returns the list untouched - pays for
-            // neither. A salience reading lowercases the whole body.
-            hit.relevance().semantic_signal(dispersion).map(|semantic| {
-                activation(
-                    semantic,
-                    hit.use_record(),
-                    hit.situation_coverage(situation),
-                    hit.salience_share(),
-                    LexicalMatch::NONE,
-                    now,
-                    &weights,
-                )
-            })
-        })
-        .collect();
-    let with_signal = scored.iter().filter(|score| score.is_some()).count();
-    if with_signal < scored.len() {
-        // A set of all lexical candidates is the ordinary degraded lookup and
-        // says nothing new. A *mixed* set means an adapter fused two modes into
-        // one list, which no adapter does today and which silently turns this
-        // ranking off - so it is worth a line rather than a shrug.
-        if with_signal > 0 {
-            tracing::debug!(
-                candidates = scored.len(),
-                with_semantic_signal = with_signal,
-                "recall: a mixed candidate set carries no one order, so activation ranking is \
-                 off for this block"
-            );
-        }
-        return showable;
-    }
-    let scores: Vec<f64> = scored.into_iter().flatten().collect();
-
-    let mut ranked: Vec<(f64, (&'a T, String))> = scores.into_iter().zip(showable).collect();
-    // `total_cmp` rather than `partial_cmp`, so the comparator is a total order
-    // and the sort cannot depend on which pair it happened to visit first. A
-    // score that is not a number cannot reach here: the bar compares the same
-    // distance and a comparison against NaN is false, so such a candidate was
-    // never admitted.
-    ranked.sort_by(|left, right| right.0.total_cmp(&left.0));
-    ranked.into_iter().map(|(_, hit)| hit).collect()
 }
 
 /// The tag names the entries this block showed carry, most-carried first, and
@@ -2917,6 +2830,61 @@ mod tests {
             shown_ids(&candidates),
             vec!["kb-worked".to_string(), "kb-nearest".to_string()],
             "twenty opens inside the hour must outrank four tenths of a deviation of distance"
+        );
+    }
+
+    /// The block refuses to rank a set where some candidates carry a distance
+    /// and some do not, and leaves the order it arrived in (#1244).
+    ///
+    /// One lookup uses one mode, so a mixed set means an adapter fused two -
+    /// and a block half ordered by activation and half by `ts_rank_cd` is
+    /// ordered by neither. The search page's policy on the same shape of set is
+    /// the opposite one, because its full-text arm produces such a set on every
+    /// call; `MixedSet` states both and each caller states which it takes.
+    ///
+    /// The first assertion is the control: the same two measured candidates,
+    /// with no lexical one beside them, are reordered by the use log. Without
+    /// it this test would pass over a set nothing would have reordered anyway.
+    #[test]
+    fn a_mixed_candidate_set_leaves_the_blocks_order_untouched() {
+        let source = seeded_source();
+        let nearest = hit(
+            "kb-nearest",
+            "a fact nobody reads",
+            &["topic"],
+            source.distance_at(9.0),
+        );
+        let worked = opened(
+            hit(
+                "kb-worked",
+                "a fact the work keeps needing",
+                &["topic"],
+                source.distance_at(8.6),
+            ),
+            20,
+            60,
+        );
+        let shown = |entries: Vec<RecallEntry>| {
+            shown_ids(&RecallCandidates {
+                entries,
+                entry_dispersion: Some(source),
+                ..RecallCandidates::default()
+            })
+        };
+
+        assert_eq!(
+            shown(vec![nearest.clone(), worked.clone()]),
+            owned(&["kb-worked", "kb-nearest"]),
+            "one mode in the list: the use log reorders it"
+        );
+        assert_eq!(
+            shown(vec![
+                nearest,
+                worked,
+                lexical("kb-fts", "a fact found by its words"),
+            ]),
+            owned(&["kb-nearest", "kb-worked", "kb-fts"]),
+            "a mixed set carries no one order, so the block keeps the order it arrived in"
         );
     }
 

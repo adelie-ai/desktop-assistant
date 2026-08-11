@@ -29,11 +29,15 @@ use std::sync::Arc;
 
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::KnowledgeEntry;
-use desktop_assistant_core::domain::situation::Situation;
+use desktop_assistant_core::domain::situation::{
+    FieldFan, Situation, SituationCue, SituationField,
+};
 use desktop_assistant_core::ports::knowledge::{
     KnowledgeBaseStore, KnowledgeListQuery, ListOrder, ListOrderOpt,
 };
-use desktop_assistant_core::ports::knowledge_use::{KnowledgeUseLog, OfferScope};
+use desktop_assistant_core::ports::knowledge_use::{
+    KnowledgeUseLog, OfferScope, with_situation_cue,
+};
 use desktop_assistant_storage::{
     PgKnowledgeBaseStore, PgKnowledgeUseLog, UserId, run_migrations, with_user_id,
 };
@@ -514,6 +518,150 @@ async fn knowledge_hybrid_search_ranks_an_opened_entry_above_a_nearer_unopened_o
                 vec!["used".to_string(), "unread".to_string()],
                 "an entry the work keeps needing must lead a marginally nearer one nothing \
                  has opened; got {ids:?}"
+            );
+            fx
+        },
+    )
+    .await;
+}
+
+// -- the situation as a cue on the tool's own page (#1244) --------------------
+
+/// The present situation the two tests below run in.
+fn here_and_now() -> Situation {
+    Situation::new().with(SituationField::Host, "workshop")
+}
+
+/// The cue a turn would have measured for the `[Recall]` block over a store
+/// large enough to grade one: two hundred entries record the host, and a
+/// quarter of them record this one.
+///
+/// Hand-built rather than measured over the fixture, because what these tests
+/// are about is what the tool does with the cue the turn hands it - a
+/// two-row fixture is below the population floor and would grade nothing.
+fn a_turns_cue() -> SituationCue {
+    let here = here_and_now();
+    let fans = here
+        .iter()
+        .map(|(field, _)| {
+            (
+                field,
+                FieldFan {
+                    population: 200,
+                    holding: 50,
+                },
+            )
+        })
+        .collect();
+    SituationCue::measured(here, &fans).expect("two hundred entries is a gradeable store")
+}
+
+/// Seed two entries the query reaches identically, one of which has been seen
+/// in the present situation.
+///
+/// Identical embeddings, identical text: the two tie on every term the score
+/// reads except the situation, and the scan's own tie-break
+/// (`ORDER BY distance, id DESC`) hands them over with the unsituated one
+/// first. So an assertion that the situated one leads cannot pass by accident.
+async fn seed_a_situated_pair(pool: &PgPool, store: &PgKnowledgeBaseStore) {
+    let log = PgKnowledgeUseLog::new(pool.clone());
+    with_user_id(UserId::new("alice"), async {
+        store
+            .write(KnowledgeEntry::new(
+                "zz-elsewhere",
+                "the deploy window",
+                vec![],
+            ))
+            .await
+            .expect("write zz-elsewhere");
+        store
+            .write(KnowledgeEntry::new("aa-here", "the deploy window", vec![]))
+            .await
+            .expect("write aa-here");
+        log.record_situation(vec!["aa-here".to_string()], here_and_now())
+            .await
+            .expect("record the situation");
+    })
+    .await;
+    set_embedding(pool, "zz-elsewhere", vec![vec![1.0, 0.0, 0.0]]).await;
+    set_embedding(pool, "aa-here", vec![vec![1.0, 0.0, 0.0]]).await;
+}
+
+/// The ids one search answers with, run inside `cue`'s turn.
+async fn search_ids(store: &PgKnowledgeBaseStore, cue: Option<SituationCue>) -> Vec<String> {
+    with_user_id(UserId::new("alice"), async {
+        with_situation_cue(cue, async {
+            store
+                .search(
+                    "the deploy window",
+                    vec![1.0, 0.0, 0.0],
+                    MODEL,
+                    None,
+                    None,
+                    10,
+                )
+                .await
+                .expect("search")
+                .entries
+                .into_iter()
+                .map(|e| e.id)
+                .collect::<Vec<_>>()
+        })
+        .await
+    })
+    .await
+}
+
+#[tokio::test]
+async fn a_search_inside_a_turn_ranks_an_entry_seen_in_the_present_situation_first() {
+    // Acceptance (#1244): the situation term reaches the search tool's page.
+    // The tool reads the cue the turn measured for the [Recall] block, and
+    // reads each candidate's own situation record out of the log, so the two
+    // paths rank one store by one rule.
+    //
+    // MUTATION: passing `None` for the cue in `search_hybrid`, or dropping the
+    // situation read, turns this RED - the pair then comes back in the scan's
+    // own order.
+    with_fixture(
+        "a_search_inside_a_turn_ranks_an_entry_seen_in_the_present_situation_first",
+        |fx| async move {
+            let store =
+                PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
+            seed_a_situated_pair(&fx.pool, &store).await;
+
+            let ids = search_ids(&store, Some(a_turns_cue())).await;
+
+            assert_eq!(
+                ids,
+                vec!["aa-here".to_string(), "zz-elsewhere".to_string()],
+                "an entry this situation recurs with must lead an equally similar one it does \
+                 not; got {ids:?}"
+            );
+            fx
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_search_outside_any_turn_ranks_the_page_as_it_ranked_before_the_cue() {
+    // Acceptance (#1244): a turn with nothing connected, and any caller outside
+    // a turn at all, installs no cue - and the page is then the page this tool
+    // answered before the term reached it, over the very same stored situation
+    // records.
+    with_fixture(
+        "a_search_outside_any_turn_ranks_the_page_as_it_ranked_before_the_cue",
+        |fx| async move {
+            let store =
+                PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
+            seed_a_situated_pair(&fx.pool, &store).await;
+
+            let ids = search_ids(&store, None).await;
+
+            assert_eq!(
+                ids,
+                vec!["zz-elsewhere".to_string(), "aa-here".to_string()],
+                "with no cue the page must keep the order the scan gave it; got {ids:?}"
             );
             fx
         },

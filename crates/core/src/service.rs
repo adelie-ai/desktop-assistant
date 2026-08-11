@@ -22,7 +22,9 @@ use crate::ports::conversation_ctx::with_conversation_id;
 use crate::ports::inbound::ConversationService;
 use crate::ports::knowledge::KnowledgeGetManyFn;
 use crate::ports::knowledge_use::current_situation;
-use crate::ports::knowledge_use::{KnowledgeOfferedFn, OfferScope, record_in_background};
+use crate::ports::knowledge_use::{
+    KnowledgeOfferedFn, OfferScope, record_in_background, with_situation_cue,
+};
 use crate::ports::llm::{
     ChunkCallback, LlmClient, ReasoningConfig, StatusCallback, current_cancellation_token,
     current_context_budget, current_tool_allowlist, current_tool_policy,
@@ -2774,6 +2776,17 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
             .instrument(crate::telemetry::recall_span(&conversation_id.0))
             .await;
 
+        // The cue this turn measured against the knowledge store, kept for the
+        // turn's own tools (#1244). The knowledge-base search tool ranks by the
+        // same situation the block does, and a cue is a statistic of the whole
+        // store, so the turn measures it once and hands it down rather than
+        // paying a full-store count on every search the model runs. A turn that
+        // ran no lookup, or whose store could not grade one, hands down `None`,
+        // which weights the term at zero.
+        let turn_situation_cue = recall
+            .as_ref()
+            .and_then(|found| found.candidates.situation_cue.clone());
+
         // Negative memory (#1126), read once for the whole turn. A burn is
         // matched at a decision point and a decision point is every tool call,
         // so a read per call would put a database round trip in front of each
@@ -3940,6 +3953,10 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                     // conversation, so a read can reach nothing else.
                     transcript.absorb(&conv.messages);
                     let scoped = with_transcript(transcript.clone(), scoped);
+                    // And the turn's own situation cue, so a tool that ranks by
+                    // activation ranks by the same situation the `[Recall]`
+                    // block did (#1244).
+                    let scoped = with_situation_cue(turn_situation_cue.clone(), scoped);
                     // For `spawn_subagent`, install the child scope minted above so
                     // the spawn-tool body adopts it for the child (#287); every other
                     // tool runs with no pending child scope. Fold both arms into one
@@ -13934,6 +13951,139 @@ mod tests {
             observed.lock().unwrap().clone(),
             Some(conv.id.clone()),
             "execute_tool must observe the conversation as a task-local"
+        );
+    }
+
+    // --- #1244: the turn hands its situation cue down to its tools ----------
+
+    /// Tool executor that records the task-local situation cue observed during
+    /// `execute_tool`, proving the dispatch loop installs it.
+    struct CueCapturingExecutor {
+        tools: Vec<ToolDefinition>,
+        observed: Arc<Mutex<Option<crate::domain::situation::SituationCue>>>,
+    }
+
+    impl ToolExecutor for CueCapturingExecutor {
+        async fn core_tools(&self) -> Vec<ToolDefinition> {
+            self.tools.clone()
+        }
+        async fn search_tools(&self, _query: &str) -> Result<Vec<ToolDefinition>, CoreError> {
+            Ok(vec![])
+        }
+        async fn tool_definition(&self, name: &str) -> Result<Option<ToolDefinition>, CoreError> {
+            Ok(self.tools.iter().find(|t| t.name == name).cloned())
+        }
+        async fn execute_tool(
+            &self,
+            _name: &str,
+            _arguments: serde_json::Value,
+        ) -> Result<String, CoreError> {
+            *self.observed.lock().unwrap() = crate::ports::knowledge_use::current_situation_cue();
+            Ok("ok".to_string())
+        }
+    }
+
+    /// The cue a recall lookup answers with in the two tests below.
+    fn a_measured_cue() -> crate::domain::situation::SituationCue {
+        use crate::domain::situation::{FieldFan, Situation, SituationCue, SituationField};
+
+        let here = Situation::new().with(SituationField::Host, "workshop");
+        let fans = here
+            .iter()
+            .map(|(field, _)| {
+                (
+                    field,
+                    FieldFan {
+                        population: 200,
+                        holding: 50,
+                    },
+                )
+            })
+            .collect();
+        SituationCue::measured(here, &fans).expect("two hundred entries is a gradeable store")
+    }
+
+    /// A recall lookup that answers with a measured cue and no candidates.
+    fn recall_with_a_cue(cue: crate::domain::situation::SituationCue) -> RecallSearchFn {
+        use crate::ports::recall::RecallCandidates;
+
+        Arc::new(move |_req| {
+            let cue = cue.clone();
+            Box::pin(async move {
+                Ok(RecallCandidates {
+                    situation_cue: Some(cue),
+                    ..RecallCandidates::default()
+                })
+            })
+        })
+    }
+
+    /// Run one turn whose single tool call records whatever situation cue the
+    /// dispatch loop installed around it.
+    async fn cue_seen_by_a_tool(
+        recall: Option<RecallSearchFn>,
+    ) -> Option<crate::domain::situation::SituationCue> {
+        let observed: Arc<Mutex<Option<crate::domain::situation::SituationCue>>> =
+            Arc::new(Mutex::new(None));
+        let tool = ToolDefinition::new("noop", "noop", serde_json::json!({"type": "object"}));
+        let responses = vec![
+            LlmResponse::with_tool_calls("", vec![ToolCall::new("c1", "noop", "{}")]),
+            LlmResponse::text("done"),
+        ];
+        let executor = CueCapturingExecutor {
+            tools: vec![tool],
+            observed: Arc::clone(&observed),
+        };
+        let mut handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            ToolCallingLlm::new(responses),
+            executor,
+            Box::new(|| "conv-cue-1".to_string()),
+        );
+        if let Some(recall) = recall {
+            handler = handler.with_recall_search(recall);
+        }
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "go".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+        let observed = observed.lock().unwrap();
+        observed.clone()
+    }
+
+    /// Acceptance (#1244): the cue the turn measured for the `[Recall]` block
+    /// reaches the turn's tools, so the knowledge-base search ranks by the same
+    /// situation the block does without measuring it again.
+    #[tokio::test]
+    async fn the_turn_hands_the_cue_it_measured_for_the_block_down_to_its_tools() {
+        let cue = a_measured_cue();
+
+        let seen = cue_seen_by_a_tool(Some(recall_with_a_cue(cue.clone()))).await;
+
+        assert_eq!(
+            seen,
+            Some(cue),
+            "execute_tool must observe the turn's own situation cue as a task-local"
+        );
+    }
+
+    /// Acceptance (#1244): a turn that ran no recall lookup installs no cue, so
+    /// its tools rank exactly as they ranked before the cue existed.
+    ///
+    /// The nothing-connected and recall-off cases both arrive here: with no
+    /// lookup wired there is nothing to measure a cue from, and `None` is a
+    /// defined answer rather than a silent one.
+    #[tokio::test]
+    async fn a_turn_with_no_recall_lookup_hands_its_tools_no_cue() {
+        let seen = cue_seen_by_a_tool(None).await;
+
+        assert_eq!(
+            seen, None,
+            "a turn with no recall lookup must install no cue"
         );
     }
 

@@ -301,6 +301,48 @@ pub fn current_situation() -> Situation {
     Situation::observe(chrono::Utc::now(), &sources)
 }
 
+tokio::task_local! {
+    /// The cue this turn measured for the `[Recall]` block, installed around
+    /// every server-side tool execution of that turn (#1244).
+    ///
+    /// See [`current_situation_cue`] for the contract.
+    static SITUATION_CUE: Option<SituationCue>;
+}
+
+/// Run `fut` with `cue` installed as the situation cue of the running turn.
+///
+/// The dispatch loop installs it around each tool execution, exactly as it
+/// installs the conversation id, so a tool can rank by the situation without
+/// [`crate::ports::knowledge::KnowledgeBaseStore`] growing a cue parameter.
+pub async fn with_situation_cue<F, T>(cue: Option<SituationCue>, fut: F) -> T
+where
+    F: Future<Output = T>,
+{
+    SITUATION_CUE.scope(cue, fut).await
+}
+
+/// The cue the running turn measured against the knowledge store, or `None`.
+///
+/// **Measured once per turn and handed down, never re-read here** (#1244).
+/// A [`SituationCue`] is the present situation plus how much each of its values
+/// separates one entry of this store from another, and that second half is
+/// counted over the whole store - which is why
+/// [`KnowledgeUseLog::situation_signal`] measures it and the pre-prompt recall
+/// lookup pays for it once. A search runs inside a turn that is already going
+/// and the model may run several, so measuring it again per call would pay a
+/// full-store count for an answer the turn already holds.
+///
+/// `None` is an ordinary answer with three causes a reader does not have to tell
+/// apart - the turn ran no recall lookup, recall is not wired at all, or the
+/// store could not grade a cue - and all three weight the situation term at zero,
+/// which ranks exactly as this path ranked before the term reached it.
+///
+/// A `tokio::task_local` does not cross a `tokio::spawn`, so a tool executed on
+/// a task of its own reads `None` rather than another turn's cue.
+pub fn current_situation_cue() -> Option<SituationCue> {
+    SITUATION_CUE.try_with(Clone::clone).ok().flatten()
+}
+
 /// Boxed async closure that sets a standing mark and reports the ids marked.
 pub type KnowledgeMarkFn = Arc<
     dyn Fn(MarkRequest) -> Pin<Box<dyn Future<Output = Result<Vec<String>, CoreError>> + Send>>

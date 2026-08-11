@@ -1,11 +1,14 @@
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::KnowledgeEntry;
+use desktop_assistant_core::domain::activation::LexicalMatch;
 use desktop_assistant_core::domain::knowledge_use::KnowledgeUseRecord;
+use desktop_assistant_core::domain::situation::{Situation, SituationRecord};
 use desktop_assistant_core::ports::auth::current_user_id;
 use desktop_assistant_core::ports::knowledge::{
     AVAILABLE_TAGS_LIMIT, KNOWLEDGE_TAG_CENSUS_SAMPLE, KnowledgeBaseStore, KnowledgeListPage,
     KnowledgeListQuery, KnowledgeSearchPage, ListOrder, ScopeSize,
 };
+use desktop_assistant_core::ports::knowledge_use::current_situation_cue;
 use desktop_assistant_core::ports::recall::RecallDispersion;
 use pgvector::Vector;
 use sqlx::PgPool;
@@ -412,10 +415,20 @@ impl PgKnowledgeBaseStore {
     /// too small to state one leaves the page on
     /// [`RECALL_ASSUMED_DISPERSION`](desktop_assistant_core::recall::RECALL_ASSUMED_DISPERSION),
     /// which is the same estimate the `[Recall]` block falls back to: one
-    /// estimate rather than two, read through one `activation`. What is *not*
-    /// held mechanically is that the two paths hand that function the same
-    /// inputs - #1244 - so a column this projection drops is a difference
-    /// nothing here would catch.
+    /// estimate rather than two, read through one `activation`.
+    ///
+    /// **What #1244 holds, and what it does not.** Every term now comes off one
+    /// [`Activatable`] implementation per path, so a term *added to the score*
+    /// is a compile error in both until both answer. That is mechanical. What
+    /// is not mechanical is how each path *populates* the values those methods
+    /// read: this projection decides what the tool's candidates carry, and a
+    /// column dropped here is still a difference the trait cannot see. Both
+    /// defects found so far lived exactly there - a dropped `kb.source`, and a
+    /// situation term nobody supplied - so
+    /// `the_hybrid_scan_selects_every_column_the_shared_terms_read` guards the
+    /// projection specifically, and is the test to widen when a term is added.
+    ///
+    /// [`Activatable`]: desktop_assistant_core::ports::recall::Activatable
     ///
     /// The scan carries [`RECALL_SCAN_STATEMENT_TIMEOUT`]: it reads every
     /// comparable row in scope to state the spread, so it is a full scan and it
@@ -465,27 +478,52 @@ impl PgKnowledgeBaseStore {
         let spread = rows.first().map_or(0.0, |r| r.spread(measured));
         let dispersion =
             measured.unwrap_or(desktop_assistant_core::recall::RECALL_ASSUMED_DISPERSION);
-        let candidates: Vec<SearchCandidate> = rows
+        let mut candidates: Vec<SearchCandidate> = rows
             .into_iter()
             .map(|r| {
                 let distance = r.distance;
-                let lexical_share = r.lexical_share;
+                let lexical = LexicalMatch {
+                    share: r.lexical_share,
+                    spread,
+                };
                 SearchCandidate {
                     entry: r.into_entry(),
                     distance,
-                    lexical_share,
+                    lexical,
+                    use_record: None,
+                    situation: SituationRecord::new(),
                 }
             })
             .collect();
-        let records = self
-            .use_records(candidates.iter().map(|c| c.entry.id.clone()).collect())
-            .await;
+        let ids: Vec<String> = candidates.iter().map(|c| c.entry.id.clone()).collect();
+        // Cloned only where the second read will actually use it: with no cue
+        // the situation read is skipped, and a clone made for it would be built
+        // and dropped on every search a turn makes.
+        let cue = current_situation_cue();
+        let situation_ids = cue.as_ref().map(|_| ids.clone());
+        let mut records = self.use_records(ids).await;
+        // The cue the running turn measured for the `[Recall]` block, handed
+        // down rather than measured again - `current_situation_cue` holds why.
+        // With no cue there is nothing to grade a record against, so the second
+        // read is skipped rather than run and discarded: a turn with nothing
+        // connected, and a deployment with recall off, pay nothing per search
+        // for a term that would score every candidate zero. That is the same
+        // bargain the pre-prompt recall path makes.
+        let mut situations = match situation_ids {
+            Some(ids) => self.situation_records(ids).await,
+            None => std::collections::HashMap::new(),
+        };
+        for candidate in &mut candidates {
+            candidate.use_record = records.remove(&candidate.entry.id);
+            candidate.situation = situations
+                .remove(&candidate.entry.id)
+                .unwrap_or_else(SituationRecord::new);
+        }
 
         Ok(crate::knowledge_search::rank_page(
             candidates,
             dispersion,
-            spread,
-            &records,
+            cue.as_ref(),
             chrono::Utc::now(),
             limit,
         ))
@@ -529,6 +567,49 @@ impl PgKnowledgeBaseStore {
                     error = %e,
                     "knowledge search: the use log could not be read; ranking on the semantic \
                      signal alone"
+                );
+                std::collections::HashMap::new()
+            }
+        }
+    }
+
+    /// The situations each of `ids` has been seen in (#1125, #1244), and an
+    /// empty map where the log could not be read.
+    ///
+    /// **A read that fails costs the order and never the page**, on exactly the
+    /// terms [`Self::use_records`] states: an entry with no record scores zero
+    /// on the situation term, which is how every entry on this path scored
+    /// before the term reached it.
+    ///
+    /// The cue is not read here. It is a statistic of the whole store, so
+    /// measuring one costs a full-store count per call, and the running turn
+    /// has already measured one for the `[Recall]` block - see
+    /// [`current_situation_cue`]. What this read fetches is the per-entry half,
+    /// which is a primary-key lookup over at most one page of ids.
+    ///
+    /// The one caller runs this after [`Self::use_records`] rather than beside
+    /// it. The two are separate statements on separate connections, and the
+    /// default pool holds five: a search that held two of them at once would
+    /// let one turn's several searches queue the next turn behind pool
+    /// acquisition, which no statement timeout bounds.
+    async fn situation_records(
+        &self,
+        ids: Vec<String>,
+    ) -> std::collections::HashMap<String, SituationRecord> {
+        use desktop_assistant_core::ports::knowledge_use::KnowledgeUseLog;
+
+        if ids.is_empty() {
+            return std::collections::HashMap::new();
+        }
+        match crate::knowledge_use::PgKnowledgeUseLog::new(self.pool.clone())
+            .situation_signal(ids, Situation::new())
+            .await
+        {
+            Ok(signal) => signal.records.into_iter().collect(),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "knowledge search: the situation could not be read; ranking without it"
                 );
                 std::collections::HashMap::new()
             }
