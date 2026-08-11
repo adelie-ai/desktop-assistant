@@ -270,8 +270,7 @@ impl ScratchpadStore for PgScratchpadStore {
         // Rewritten with the content, never merged with what the row already
         // held (#1247): an upsert replaces the words, so the flag has to
         // describe the words now stored rather than the ones they replaced.
-        let after_outside_reads: Vec<bool> =
-            notes.iter().map(|n| n.after_outside_read).collect();
+        let after_outside_reads: Vec<bool> = notes.iter().map(|n| n.after_outside_read).collect();
 
         // The conflict target `(conversation_id, owner_todo, note_key)`
         // (migration 031) has no `user_id` component, so without a `WHERE`

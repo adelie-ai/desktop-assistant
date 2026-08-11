@@ -771,8 +771,7 @@ pub fn burns_that_fire<'a>(
 /// The words are the risk, not the lesson. The lesson survives whatever this
 /// hides: the act is the fingerprint, and the circumstance is read off the
 /// clock and the client rather than written by the model.
-pub const WITHHELD_BURN_OUTCOME: &str =
-    "the call failed; what it said is not shown here, because the turn that recorded it had \
+pub const WITHHELD_BURN_OUTCOME: &str = "the call failed; what it said is not shown here, because the turn that recorded it had \
      read content from outside the trust boundary";
 
 /// What the model reads in place of the tool result, when a burn fires.

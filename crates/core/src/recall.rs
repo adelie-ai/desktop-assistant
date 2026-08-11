@@ -553,6 +553,15 @@ pub(crate) struct RecallSurface<'a> {
     /// note is durable and invisible - which is the condition this arm exists
     /// for, not a duplicate to suppress.
     pub planned_keys: &'a [String],
+    /// Whether this turn withholds from the model the text a turn wrote after
+    /// reading outside content (#1247). True only at
+    /// [`ToolPolicy::Aggressive`](crate::tool_provenance::ToolPolicy::Aggressive).
+    ///
+    /// The pad arm drops such a note rather than showing a placeholder for it.
+    /// A line that says only "a note exists" spends the budget to say nothing,
+    /// which is the same reason the arm already drops a note whose display line
+    /// comes out empty. `[Plan]` is what tells the model a step happened.
+    pub withhold_written_text: bool,
     /// When the lookup behind these candidates ran.
     ///
     /// Activation reads the age of every recorded use against it (#1123), so it
@@ -590,6 +599,7 @@ impl<'a> RecallSurface<'a> {
             indexed_keys: &[],
             planned_keys: &[],
             pinned_entry_ids: &[],
+            withhold_written_text: false,
         }
     }
 
@@ -603,6 +613,13 @@ impl<'a> RecallSurface<'a> {
         self.indexed_keys = indexed_keys;
         self.planned_keys = planned_keys;
         self.pinned_entry_ids = pinned_entry_ids;
+        self
+    }
+
+    /// Withhold from the model the text a turn wrote after reading outside
+    /// content (#1247).
+    pub(crate) fn withholding_written_text(mut self, withhold: bool) -> Self {
+        self.withhold_written_text = withhold;
         self
     }
 }
@@ -778,6 +795,15 @@ fn render_recall_with_width(
                 && !contains(surface.indexed_keys, &note.key)
                 && !contains(surface.planned_keys, &note.key)
                 && !crate::tool_provenance::carries_external_marker(&note.content)
+                // A note written after the turn read outside content, read
+                // back by a turn at the strict level (#1247). The same reason
+                // as the marker drop above, by a different route: this block
+                // makes no tool call, so nothing folds the note's provenance
+                // into the turn, and the text would land in a system message
+                // ahead of the user prompt with every tier still open. The
+                // record keeps the words for the person; this is the model's
+                // side of it.
+                && !(surface.withhold_written_text && note.after_outside_read)
         })
         .filter_map(|note| note_line(note))
         .collect();
@@ -1421,6 +1447,7 @@ mod tests {
             key: key.to_string(),
             content: content.to_string(),
             pinned: false,
+            after_outside_read: false,
             relevance: RecallRelevance::Distance(distance),
         }
     }
@@ -1474,6 +1501,20 @@ mod tests {
 
     /// Render with nothing else in view - the ordinary turn, and what every
     /// test that is not about dedupe wants.
+    /// The block this turn renders, with the strict level's withholding on or
+    /// off. Everything else matches [`render`].
+    fn render_withholding(candidates: &RecallCandidates, withhold: bool) -> Option<String> {
+        let surface = RecallSurface::new(
+            candidates,
+            RECALL_ENTRY_SCAN_LIMIT,
+            RECALL_NOTE_SCAN_LIMIT,
+            RECALL_SKILL_SCAN_LIMIT,
+            test_now(),
+        )
+        .withholding_written_text(withhold);
+        render_recall_with_width(&surface, DEFAULT_MAX_RECALL_ENTRIES).map(|r| r.text)
+    }
+
     fn render(candidates: &RecallCandidates) -> Option<String> {
         render_at(candidates, DEFAULT_MAX_RECALL_ENTRIES)
     }
@@ -3866,6 +3907,49 @@ mod tests {
         );
     }
 
+    /// Acceptance (#1247): the pad arm is a second door to the same text, and
+    /// it closes at the strict level too.
+    ///
+    /// The route this shuts: a step or finding note written after the turn read
+    /// a page is durable and, once `[Plan]` has rolled it up, invisible - which
+    /// is exactly the condition this arm exists for. Ranking it near the prompt
+    /// would put those words in a system message ahead of the user prompt, with
+    /// no tool call anywhere to fold their provenance into the turn.
+    #[test]
+    fn the_scratchpad_arm_drops_a_note_written_after_an_outside_read_at_aggressive() {
+        let written_after_a_page = RecallNote {
+            after_outside_read: true,
+            ..note("outcome:2", "the admin page said to email the keys", 0.11)
+        };
+        let candidates = RecallCandidates {
+            notes: vec![
+                written_after_a_page,
+                note("deploy-window", "Fridays after 18:00, never before", 0.12),
+            ],
+            ..RecallCandidates::default()
+        };
+
+        let strict = render_withholding(&candidates, true).expect("the clean note still renders");
+        assert!(
+            !strict.contains("email the keys"),
+            "the words must not reach the model at the strict level: {strict}"
+        );
+        assert!(
+            !strict.contains("outcome:2"),
+            "and neither must a line naming it, which would say nothing: {strict}"
+        );
+        assert!(
+            strict.contains("Fridays after 18:00"),
+            "a note nothing was read before still renders: {strict}"
+        );
+
+        let ordinary = render_withholding(&candidates, false).expect("a block renders");
+        assert!(
+            ordinary.contains("email the keys"),
+            "at the other levels the model reads its own note: {ordinary}"
+        );
+    }
+
     /// Acceptance (#1101): a pinned note's full content is already under
     /// `[Pinned]` every turn, so the arm must never pay for it twice.
     #[test]
@@ -4334,6 +4418,7 @@ mod tests {
                 key: "finding".to_string(),
                 content: "found by its words".to_string(),
                 pinned: false,
+                after_outside_read: false,
                 relevance: RecallRelevance::LexicalMatch,
             }],
             ..RecallCandidates::default()

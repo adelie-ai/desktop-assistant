@@ -719,15 +719,6 @@ struct RecallLookup {
     looked_up_at: chrono::DateTime<chrono::Utc>,
 }
 
-/// The text a step note records: the model's own wording in a clean turn, a
-/// fixed placeholder once the turn has read outside content (#741).
-///
-/// The step-planning tools sit in front of the provenance gate by design -
-/// the stack has to close or the turn's compaction breaks - so their durable
-/// write is guarded here instead. The placeholder keeps the note, and the
-/// `[Plan]` block a later turn renders from it, honest about the fact that a
-/// step happened, without carrying the model's wording forward into a turn
-/// that starts clean.
 /// The messages THIS turn added, from the watermark `send_prompt` captured.
 ///
 /// Promotion asks "did this plan follow a skill", and the answer has to be
@@ -3009,6 +3000,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                     &surfaces.planned_keys,
                     &surfaces.pinned_entry_ids,
                 )
+                .withholding_written_text(withhold_written_text)
             });
 
             // The estimator borrows `&self.llm` so the closure is built
@@ -8772,8 +8764,7 @@ mod tests {
     /// switch the feature off.
     #[tokio::test]
     async fn promotion_is_offered_at_standard_after_reading_a_page() {
-        let (prompts, _written) =
-            plan_turn_after_reading_a_page(ToolPolicy::Standard, None).await;
+        let (prompts, _written) = plan_turn_after_reading_a_page(ToolPolicy::Standard, None).await;
         assert!(
             any_skill_offer(&prompts),
             "a three-step method is worth keeping, whatever the turn read"
@@ -9631,6 +9622,7 @@ mod tests {
                         key: "deploy-window".to_string(),
                         content: "Fridays after 18:00, never before".to_string(),
                         pinned: false,
+                        after_outside_read: false,
                         relevance: RecallRelevance::Distance(0.12),
                     }],
                     ..RecallCandidates::default()
@@ -16116,7 +16108,7 @@ mod tests {
     /// strict level.
     #[tokio::test]
     async fn a_failure_after_reading_outside_content_records_the_words_and_hides_them_at_aggressive()
-    {
+     {
         // Two really-classified tools: `osm_search` returns bytes an outside
         // party chose, and `builtin_knowledge_base_search` only reads, so it
         // stays open after that closes the gate.
@@ -16200,8 +16192,8 @@ mod tests {
             superseded_by: None,
             after_outside_read: written[0].after_outside_read,
         };
-        let held = render_warning(&[&stored], Utc::now(), true)
-            .expect("a fired burn renders a warning");
+        let held =
+            render_warning(&[&stored], Utc::now(), true).expect("a fired burn renders a warning");
         assert!(
             !held.contains("exfiltrate"),
             "no word the server chose may reach a decision point: {held}"
@@ -16215,8 +16207,8 @@ mod tests {
             "and it says why the words are missing: {held}"
         );
 
-        let shown = render_warning(&[&stored], Utc::now(), false)
-            .expect("a fired burn renders a warning");
+        let shown =
+            render_warning(&[&stored], Utc::now(), false).expect("a fired burn renders a warning");
         assert!(
             shown.contains("exfiltrate"),
             "at the other levels the model reads the lesson in full: {shown}"

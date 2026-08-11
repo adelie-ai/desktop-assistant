@@ -4345,6 +4345,7 @@ mod tests {
             key: key.to_string(),
             content: content.to_string(),
             pinned: false,
+            after_outside_read: false,
             relevance: crate::ports::recall::RecallRelevance::Distance(0.10),
         }
     }
