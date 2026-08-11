@@ -243,7 +243,7 @@ Field summary. Every span carries `conversation_id`.
 
 | span | fields |
 |---|---|
-| `turn` | `request_id`, `trace_id`, `conversation_id`, `user_id`, `connection_id`, `provider`, `model`, then `rounds`, `outcome` and `duration_ms` when it ends |
+| `turn` | `request_id`, `trace_id`, `conversation_id`, `user_id`, `connection_id`, `provider`, `model`, then `rounds`, `outcome`, `duration_ms` and the `prompt.*` breakdown below when it ends |
 | `turn.round` | `round` (one-based), `conversation_id`, `tools`, `outcome`, and the four token counts the provider reported |
 | `llm.call` | `purpose`, `provider`, `model`, `conversation_id`, `provider_request_id`, the four `gen_ai.usage.*` token counts below, plus `round` and `outcome` for a round's own call |
 | `tool.call` | `tool`, `runner` (`client` or `server`), `conversation_id`, `outcome` |
@@ -300,6 +300,57 @@ caching leaves the two cache attributes off. A recorded zero would sum into a
 total that reads as a real measurement, which is the distinction
 `llm.tokens.unreported` exists to keep. A failed call reports nothing and so
 carries none of the four.
+
+### What filled the input
+
+`gen_ai.usage.input_tokens` says a round cost 40k. It cannot say whether that
+was the transcript, the pinned notes or eighty tool schemas, and each of those
+has a different fix: compact the transcript, prune the notes, drop a server's
+tools, narrow the recall. So the turn span also carries a breakdown of the
+prompt the turn opened with, part by part.
+
+| field | what it counts |
+|---|---|
+| `prompt.system_tokens` | the cached system instruction - standing guidance, personality, client context, machine topology, the tool-listing note, any one-turn refinement - and the ambient `[Now]` line |
+| `prompt.summary_tokens` | the `[Summary of earlier conversation]` block |
+| `prompt.current_task_tokens` | the `[Current task]` anchor |
+| `prompt.working_state_tokens` | the `[Working state]` line |
+| `prompt.plan_tokens` | the `[Plan]` block |
+| `prompt.pinned_tokens` | the `[Pinned]` block, notes and attached knowledge together |
+| `prompt.scratchpad_tokens` | the `[Scratchpad]` key index |
+| `prompt.recall_tokens` | the `[Recall]` block |
+| `prompt.transcript_tokens` | the conversation history this prompt carries |
+| `prompt.tool_schema_tokens` | the tool schemas, sent out of band in the request's `tools` array |
+| `prompt.total_tokens` | every part above, summed |
+| `prompt.tool_count` | how many tools those schemas describe |
+
+Every part sums to `prompt.total_tokens` and nothing is left over, so a figure
+that looks wrong can be checked rather than guessed at. `prompt.tool_count` is
+the one figure that is not a token count, and it is named as the count it is:
+the tool bill is a pair, because a schema cost without a tool count says
+nothing about whether to drop a server.
+
+**These are estimates, and they will not sum exactly to the provider's own
+input count.** They come from this daemon's estimator - the same one the
+context budget's pre-flight check reads, so the number an operator sees is the
+number the shrink decision was taken on - while the provider tokenises its own
+way. The provider's reported count stays the authority; this says where that
+number went.
+
+**Zero is a measurement here, unlike a provider's count.** A turn with nothing
+pinned reports `prompt.pinned_tokens=0` rather than leaving the field off. That
+is the opposite of the rule above for `gen_ai.usage.*`, and deliberately: a
+provider can decline to say, so an absent count there is unknowable, while the
+assembler always knows whether it emitted a block. An absent field here could
+only mean the part went unmeasured, which is the one thing a reader must be
+able to tell from an empty block.
+
+**The figures are the prompt the turn opened with, not the one it ended with.**
+A turn assembles a prompt per round and each round adds its own tool traffic,
+so a last-round figure would report the tail of a tool loop under a name that
+reads as the turn's own. What this answers is the standing bill - what the turn
+cost before it did anything. A turn cancelled before its first round assembles
+no prompt and carries none of these fields.
 
 ### The two lines an operator greps
 
@@ -418,6 +469,9 @@ report a user files.
 | `llm.tokens.cache_write` | counter | `provider`, `model` |
 | `llm.tokens.cache_read` | counter | `provider`, `model` |
 | `llm.tokens.unreported` | counter | `provider`, `count` |
+| `llm.prompt.part.tokens` | counter | `part` |
+| `llm.prompt.tools` | counter | none |
+| `llm.prompt.measured` | counter | none |
 | `dreaming.scan.duration` | histogram | `outcome` |
 | `dreaming.facts.written` | counter | none |
 | `consolidation.scan.duration` | histogram | `outcome` |
@@ -437,6 +491,20 @@ identical to a cold one.
 `llm.tokens.unreported` is incremented instead with a `count` label naming
 which one. So a total that looks low can be checked against how many calls said
 nothing, which a silent `0` would make impossible.
+
+The three `llm.prompt.*` counters are the breakdown above, over time. `part` is
+one of ten names from a closed set, and no conversation, user, model or
+provider axis is added to any of them: the operator question they answer is
+what fraction of the input one part is spending, which needs no such axis, and
+one of them would burn the label budget. `llm.prompt.measured` counts the
+prompts measured and is the denominator that turns the other two back into a
+per-turn mean.
+
+They are counters rather than histograms because the facade's only histogram is
+a *duration* histogram - fixed millisecond buckets, a millisecond sum, and an
+export that names its values `ms`. Token counts put through it would be
+labelled as milliseconds everywhere they surfaced, so they accumulate the way
+`llm.tokens.input` already does instead.
 
 Every `outcome` and `purpose` label is an enum rendering to a `&'static str`,
 so an unbounded value cannot be passed: it has the wrong lifetime. `provider`

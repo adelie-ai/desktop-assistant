@@ -45,8 +45,10 @@
 //! ## What may be recorded
 //!
 //! Ids, counts, durations, names of tools, models and providers, and token
-//! counts. **Never content** - no prompt, no assembled context, no tool
-//! argument, no search query, no model reply. A span field is the easiest
+//! counts - what a provider said a call cost, which [`tokens`] owns, and the
+//! per-part breakdown of what filled the input, which [`prompt`] owns. **Never
+//! content** - no prompt, no assembled context, no tool argument, no search
+//! query, no model reply. A span field is the easiest
 //! place to break that rule and the hardest place to notice it, because
 //! nothing prints a span field unless an event fires inside the span. Every
 //! span here is built by hand for that reason; there is no `#[instrument]`,
@@ -73,7 +75,14 @@
 //! instead - a name the turn did not advertise is recorded as [`UNKNOWN_TOOL`].
 //! A conversation id, a user id or a request id is never a label.
 
-use std::fmt;
+mod prompt;
+mod tokens;
+
+pub(crate) use prompt::{PromptBreakdown, PromptPart};
+pub(crate) use tokens::{
+    Count, TokenTotals, record_genai_tokens_on_span, record_token_usage, record_tokens_on_span,
+};
+
 use std::time::Duration;
 
 use adelie_telemetry::Safe;
@@ -119,108 +128,6 @@ pub(crate) const TOOL_CALL_DURATION: &str = "tool.call.duration";
 /// what the executor knows - the daemon's own tool list, which is the set that
 /// bounds this label.
 pub(crate) const UNKNOWN_TOOL: &str = "unknown";
-
-/// Prompt tokens the provider reported, by provider and model.
-pub(crate) const TOKENS_INPUT: &str = "llm.tokens.input";
-
-/// Completion tokens the provider reported.
-pub(crate) const TOKENS_OUTPUT: &str = "llm.tokens.output";
-
-/// Tokens written into the provider's prompt cache.
-pub(crate) const TOKENS_CACHE_WRITE: &str = "llm.tokens.cache_write";
-
-/// Tokens served from the provider's prompt cache. On a caching provider this
-/// is most of the cost story: a cache read costs a fraction of a fresh input
-/// token, so input alone makes a well-cached turn look like a cold one.
-pub(crate) const TOKENS_CACHE_READ: &str = "llm.tokens.cache_read";
-
-/// Calls whose token count the provider did not report, by provider and by
-/// which count was missing.
-///
-/// A count that is absent contributes nothing to the totals above, because
-/// recording `0` would understate them with no way afterwards to tell a real
-/// zero from a missing number. This counter is how a total that looks low gets
-/// checked against how many calls did not report.
-pub(crate) const TOKENS_UNREPORTED: &str = "llm.tokens.unreported";
-
-// ---------------------------------------------------------------------------
-// Token counts on the provider-call span.
-//
-// The metrics above answer "how many tokens did this model burn today". They
-// cannot answer "what did this turn cost", because that needs a conversation
-// id, which is unbounded and would burn the 64-value cap described at the top
-// of this module on first contact. A span attribute has no cardinality budget,
-// and the provider-call span already carries the conversation id and the round,
-// so the counts go there as well.
-//
-// The four names below are the **OpenTelemetry GenAI semantic convention's**
-// own, not this project's, so a backend that special-cases GenAI attributes
-// renders a provider call natively instead of showing four fields it has no
-// meaning for.
-//
-// The convention is followed as a written specification rather than through a
-// crate: `opentelemetry-semantic-conventions` is not a dependency of this
-// workspace, and the GenAI registry has moved out of it into a repository of
-// its own. Followed here: the `gen_ai.usage.*` group of the OpenTelemetry
-// GenAI semantic conventions, read on 2026-08-08, which the main registry at
-// semconv 1.41.0 defers to for every GenAI attribute. That group is at
-// Development stability, so the names can still move; each is written once,
-// here, so a move is one edit.
-//
-// The metric names above are deliberately left alone. They are a separate
-// signal with separate consumers, and renaming a metric breaks the queries
-// already reading it - so the convention is adopted where it is new and free.
-// ---------------------------------------------------------------------------
-
-/// Prompt tokens the provider reported for one call.
-const GEN_AI_INPUT_TOKENS: &str = "gen_ai.usage.input_tokens";
-
-/// Completion tokens the provider reported for one call.
-const GEN_AI_OUTPUT_TOKENS: &str = "gen_ai.usage.output_tokens";
-
-/// Input tokens written into the provider's prompt cache.
-const GEN_AI_CACHE_CREATION_INPUT_TOKENS: &str = "gen_ai.usage.cache_creation.input_tokens";
-
-/// Input tokens served from the provider's prompt cache.
-const GEN_AI_CACHE_READ_INPUT_TOKENS: &str = "gen_ai.usage.cache_read.input_tokens";
-
-/// One token count on a span: the attribute it is recorded under, and how to
-/// read it off a provider's report.
-type GenAiCount = (&'static str, fn(&TokenUsage) -> Option<u64>);
-
-/// Each count a provider reports, and the attribute it is recorded under.
-///
-/// One list, read by the recording below, so a count cannot be read off the
-/// provider's report and written under another count's name.
-const GEN_AI_COUNTS: [GenAiCount; 4] = [
-    (GEN_AI_INPUT_TOKENS, |u| u.input_tokens),
-    (GEN_AI_OUTPUT_TOKENS, |u| u.output_tokens),
-    (GEN_AI_CACHE_CREATION_INPUT_TOKENS, |u| {
-        u.cache_creation_input_tokens
-    }),
-    (GEN_AI_CACHE_READ_INPUT_TOKENS, |u| {
-        u.cache_read_input_tokens
-    }),
-];
-
-/// Put one provider call's token counts on its `llm.call` span.
-///
-/// Only the counts the provider actually reported. An absent count leaves its
-/// attribute unrecorded rather than recording a zero, because a zero sums into
-/// a total that reads as a real measurement and there is no way afterwards to
-/// tell it from one. `llm.tokens.unreported` draws the same distinction on the
-/// metrics side.
-///
-/// The caller passes the span rather than this reading the current one: the
-/// counts are known only after the call returns, and by then the span is no
-/// longer the one the connector ran inside.
-pub(crate) fn record_genai_tokens_on_span(span: &tracing::Span, usage: &TokenUsage) {
-    for (attribute, read) in GEN_AI_COUNTS {
-        if let Some(value) = read(usage) {
-            span.record(attribute, value);
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Outcomes. Each renders to a `&'static str`, so an unbounded value cannot
@@ -349,6 +256,23 @@ pub(crate) fn turn_span(
         rounds = tracing::field::Empty,
         outcome = tracing::field::Empty,
         duration_ms = tracing::field::Empty,
+        // What filled the input (#1203). A span fixes its field set when it
+        // opens, and a `record` against a field it never declared is dropped
+        // silently, so every name `PromptPart::as_span_field` can return is
+        // spelled out here. `tests/turn_telemetry.rs` is what holds the two
+        // lists together.
+        prompt.system_tokens = tracing::field::Empty,
+        prompt.summary_tokens = tracing::field::Empty,
+        prompt.current_task_tokens = tracing::field::Empty,
+        prompt.working_state_tokens = tracing::field::Empty,
+        prompt.plan_tokens = tracing::field::Empty,
+        prompt.pinned_tokens = tracing::field::Empty,
+        prompt.scratchpad_tokens = tracing::field::Empty,
+        prompt.recall_tokens = tracing::field::Empty,
+        prompt.transcript_tokens = tracing::field::Empty,
+        prompt.tool_schema_tokens = tracing::field::Empty,
+        prompt.total_tokens = tracing::field::Empty,
+        prompt.tool_count = tracing::field::Empty,
     );
     // The turn is the root of its trace, so this is where the trace id the
     // client already knows becomes the one a backend indexes by. Everything
@@ -605,91 +529,8 @@ pub(crate) fn record_tool_call(elapsed: Duration, tool: &str, known: bool, outco
     );
 }
 
-/// One of the four token counts: what to call it in a label, what metric it
-/// accumulates into, and how to read it off a provider's report.
-type TokenCount = (&'static str, &'static str, fn(&TokenUsage) -> Option<u64>);
-
-/// The four counts, and the name each is recorded under.
-///
-/// One list, read by both the recording below and the span fields, so a count
-/// cannot be recorded to the facade and left off the span.
-const COUNTS: [TokenCount; 4] = [
-    ("input", TOKENS_INPUT, |u| u.input_tokens),
-    ("output", TOKENS_OUTPUT, |u| u.output_tokens),
-    ("cache_write", TOKENS_CACHE_WRITE, |u| {
-        u.cache_creation_input_tokens
-    }),
-    ("cache_read", TOKENS_CACHE_READ, |u| {
-        u.cache_read_input_tokens
-    }),
-];
-
-/// Record one round's token usage, and count what the provider left out.
-///
-/// `None` is not zero. A count the provider did not report is skipped and
-/// counted as unreported instead, so no total is silently understated. A
-/// response with no usage at all counts every one of the four as unreported,
-/// because that is what a connector that reports nothing looks like from here.
-pub(crate) fn record_token_usage(usage: Option<&TokenUsage>, route: &TurnRoute) {
-    let [provider, model] = route_labels(route);
-    for (which, name, read) in COUNTS {
-        match usage.and_then(read) {
-            Some(value) => metrics::add(name, value, &[provider.clone(), model.clone()]),
-            None => metrics::increment(
-                TOKENS_UNREPORTED,
-                &[provider.clone(), Label::new("count", which)],
-            ),
-        }
-    }
-}
-
 /// The most tool names one round's span attribute lists by name.
 const MAX_TOOLS_ON_SPAN: usize = 16;
-
-/// A token count the provider may not have reported.
-///
-/// Renders as the number, or as `-` when the provider said nothing. A log line
-/// that printed `0` for an absence would be indistinguishable from a real
-/// zero, and there would be no way afterwards to tell which it was.
-pub(crate) struct Count(pub(crate) Option<u64>);
-
-impl fmt::Display for Count {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.0 {
-            Some(value) => write!(f, "{value}"),
-            None => f.write_str("-"),
-        }
-    }
-}
-
-/// A turn's token totals, summed from its rounds.
-///
-/// Each total stays `None` until some round reported that count, so a turn
-/// whose provider reports nothing is visibly different from one that really
-/// used no tokens. A round that did not report contributes nothing rather than
-/// a zero.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct TokenTotals {
-    pub(crate) input: Option<u64>,
-    pub(crate) output: Option<u64>,
-    pub(crate) cache_write: Option<u64>,
-    pub(crate) cache_read: Option<u64>,
-}
-
-impl TokenTotals {
-    /// Add one round's counts.
-    pub(crate) fn add(&mut self, usage: &TokenUsage) {
-        fn accumulate(total: &mut Option<u64>, reported: Option<u64>) {
-            if let Some(value) = reported {
-                *total = Some(total.unwrap_or(0).saturating_add(value));
-            }
-        }
-        accumulate(&mut self.input, usage.input_tokens);
-        accumulate(&mut self.output, usage.output_tokens);
-        accumulate(&mut self.cache_write, usage.cache_creation_input_tokens);
-        accumulate(&mut self.cache_read, usage.cache_read_input_tokens);
-    }
-}
 
 /// One turn, reported when it ends by any path.
 ///
@@ -712,6 +553,10 @@ pub(crate) struct TurnGuard {
     /// The turn's tokens, summed from its rounds rather than counted
     /// separately, so the two can never disagree.
     pub(crate) tokens: TokenTotals,
+    /// What filled the input the turn opened with (#1203). `None` until the
+    /// turn assembles a prompt, which a turn cancelled before its first round
+    /// never does - and an unrecorded part is exactly what that is.
+    prompt: Option<PromptBreakdown>,
 }
 
 impl TurnGuard {
@@ -723,7 +568,22 @@ impl TurnGuard {
             rounds: 0,
             outcome: TurnOutcome::Failed,
             tokens: TokenTotals::default(),
+            prompt: None,
         }
+    }
+
+    /// Note what filled the input, the first time the turn assembles a prompt.
+    ///
+    /// Later calls are ignored, and that is the measurement's definition
+    /// rather than defensiveness: a turn assembles a prompt per round, each
+    /// one carrying the tool traffic the rounds before it produced, so a
+    /// last-writer-wins field would report the tail of a tool loop under a
+    /// name that reads as the turn's own. What this answers is what the turn
+    /// cost before it did anything - the standing bill for the system prompt,
+    /// the pinned notes, the recall offer and the tool fleet. What the rounds
+    /// then add to it is a separate measurement.
+    pub(crate) fn set_prompt_breakdown(&mut self, breakdown: PromptBreakdown) {
+        self.prompt.get_or_insert(breakdown);
     }
 }
 
@@ -731,6 +591,10 @@ impl Drop for TurnGuard {
     fn drop(&mut self) {
         let elapsed = self.started.elapsed();
         record_turn(elapsed, self.rounds, self.outcome);
+        if let Some(breakdown) = &self.prompt {
+            prompt::record_on_span(&self.span, breakdown);
+            prompt::record_metrics(breakdown);
+        }
         self.span.record("rounds", self.rounds);
         self.span.record("outcome", self.outcome.as_label());
         self.span.record("duration_ms", elapsed.as_millis() as u64);
@@ -864,62 +728,9 @@ impl Drop for RoundGuard {
     }
 }
 
-/// Put a round's token counts on its span, present ones only.
-///
-/// An absent count leaves its field empty rather than recording a zero, so a
-/// trace shows the same distinction the metrics do.
-pub(crate) fn record_tokens_on_span(span: &tracing::Span, usage: &TokenUsage) {
-    if let Some(value) = usage.input_tokens {
-        span.record("input_tokens", value);
-    }
-    if let Some(value) = usage.output_tokens {
-        span.record("output_tokens", value);
-    }
-    if let Some(value) = usage.cache_creation_input_tokens {
-        span.record("cache_write_tokens", value);
-    }
-    if let Some(value) = usage.cache_read_input_tokens {
-        span.record("cache_read_tokens", value);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_missing_count_renders_as_absent_not_as_zero() {
-        assert_eq!(Count(Some(0)).to_string(), "0");
-        assert_eq!(Count(None).to_string(), "-");
-    }
-
-    #[test]
-    fn totals_skip_what_a_provider_did_not_report() {
-        let mut totals = TokenTotals::default();
-        totals.add(&TokenUsage {
-            input_tokens: Some(100),
-            output_tokens: None,
-            cache_creation_input_tokens: None,
-            cache_read_input_tokens: None,
-        });
-        totals.add(&TokenUsage {
-            input_tokens: Some(200),
-            output_tokens: Some(20),
-            cache_creation_input_tokens: None,
-            cache_read_input_tokens: None,
-        });
-
-        assert_eq!(totals.input, Some(300));
-        assert_eq!(
-            totals.output,
-            Some(20),
-            "the round that reported an output count still contributes it"
-        );
-        assert_eq!(
-            totals.cache_read, None,
-            "a count no round reported stays absent rather than becoming zero"
-        );
-    }
 
     #[test]
     fn every_outcome_renders_to_a_bounded_label() {
@@ -973,19 +784,5 @@ mod tests {
         let [provider, model] = route_labels(&TurnRoute::default());
         assert_eq!(provider.value(), crate::ports::turn_telemetry::UNSET);
         assert_eq!(model.value(), crate::ports::turn_telemetry::UNSET);
-    }
-
-    #[test]
-    fn the_four_counts_are_read_from_one_list() {
-        // The span fields and the facade recording both walk `COUNTS`, so a
-        // fifth count cannot be added to one and forgotten in the other.
-        let usage = TokenUsage {
-            input_tokens: Some(1),
-            output_tokens: Some(2),
-            cache_creation_input_tokens: Some(3),
-            cache_read_input_tokens: Some(4),
-        };
-        let read: Vec<Option<u64>> = COUNTS.iter().map(|(_, _, read)| read(&usage)).collect();
-        assert_eq!(read, vec![Some(1), Some(2), Some(3), Some(4)]);
     }
 }

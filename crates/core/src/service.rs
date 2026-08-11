@@ -3095,6 +3095,11 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
             // because the pre-flight budget check inside assembly can narrow
             // the window past `target_window` and nothing else here would know.
             let window_from = assembled.window_from;
+            // What filled the input (#1203). Taken here, from the prompt that
+            // ships, and only the first round's - the guard keeps the first
+            // and ignores the rest, so the turn span reports the standing bill
+            // the turn opened with rather than the tail of its own tool loop.
+            report.set_prompt_breakdown(assembled.breakdown);
             // What the `[Recall]` block put in front of the model, recorded as
             // an offer (#698). Only on a turn's first round, because that is
             // the only round the block renders on - recording an empty list on
