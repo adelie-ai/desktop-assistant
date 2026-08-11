@@ -856,8 +856,14 @@ mod tests {
 
     /// A pad that measured its own, and put its distances somewhere else: a
     /// note embeds `"<key> <content>"`, which is terser than an entry's body.
+    ///
+    /// Inside the band a measurement may claim. The first value written here
+    /// spread a ninth of its median, which a real pad turns out to exceed and
+    /// which `RECALL_DISPERSION_MAX_RELATIVE_SPREAD` now refuses outright - so
+    /// the fixture described a pad the bar cannot read, and this test is about
+    /// a measurement travelling rather than about one being refused.
     fn a_pad_dispersion() -> RecallDispersion {
-        RecallDispersion::measured(0.55, 0.09, 40).expect("a pad's own statistics")
+        RecallDispersion::measured(0.55, 0.07, 40).expect("a pad's own statistics")
     }
 
     fn a_skill() -> RecallSkill {

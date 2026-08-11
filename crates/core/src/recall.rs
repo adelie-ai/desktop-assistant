@@ -1610,7 +1610,12 @@ mod tests {
     fn no_raw_cosine_constant_decides_whether_the_block_renders() {
         let distance = 0.45;
         let tight = RecallDispersion::measured(0.80, 0.05, 400).expect("a store's statistics");
-        let loose = RecallDispersion::measured(0.80, 0.30, 400).expect("a store's statistics");
+        // Loose, but still inside the band a measurement may claim: a deviation
+        // past `RECALL_DISPERSION_MAX_RELATIVE_SPREAD` of the median is refused
+        // outright and falls back to the estimate, which would test the
+        // estimate rather than the bar. The property here is about two sources
+        // the bar can actually read, so both fixtures are measurable ones.
+        let loose = RecallDispersion::measured(0.80, 0.11, 400).expect("a store's statistics");
 
         let against = |source| RecallCandidates {
             entries: vec![hit("kb-1", "a stored fact", &["topic"], distance)],
@@ -4041,6 +4046,45 @@ mod tests {
         assert!(
             render(&with(loose)).is_none(),
             "the same distance out of a loose pad is ordinary"
+        );
+    }
+
+    /// The pad arm's *widening* direction, which nothing reached before (#1243).
+    ///
+    /// The estimate is a bar in a fixed place, so it refuses everything beyond
+    /// about 0.31 of cosine distance however clearly a note stands out. Reading
+    /// the pad against its own spread is what lets a far note render when the
+    /// rest of the pad is further still - the case a real pad measured on a
+    /// prompt about something else.
+    ///
+    /// Named for the arm rather than the arithmetic on purpose. Every other
+    /// test here uses a distance of 0.45 or nearer, so a fixed cosine cap added
+    /// anywhere above that passed the entire suite while deleting exactly this
+    /// behaviour.
+    #[test]
+    fn a_far_note_renders_when_the_pads_own_spread_makes_it_exceptional() {
+        // Beyond anything the stated estimate admits.
+        let distance = 0.70;
+        assert!(
+            !RecallRelevance::Distance(distance).clears_bar(RECALL_ASSUMED_DISPERSION, RECALL_BAR),
+            "the fixture must be a distance the estimate refuses, or this test \
+             passes for the wrong reason"
+        );
+
+        let candidates = RecallCandidates {
+            notes: vec![note("finding", "the pool leaks connections", distance)],
+            note_dispersion: RecallDispersion::measured(
+                0.901,
+                0.028,
+                crate::ports::recall::RECALL_DISPERSION_MIN_ROWS,
+            ),
+            ..RecallCandidates::default()
+        };
+
+        let block = render(&candidates).expect("a far note that stands out still renders");
+        assert!(
+            block.contains("the pool leaks connections"),
+            "the note the pad was read for is the one that must appear: {block}"
         );
     }
 

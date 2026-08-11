@@ -5,6 +5,9 @@
 .claude/settings.local.json
 .claude/worktrees/
 
+# Agent worktrees live here; never commit them.
+.worktrees/
+
 # Python bytecode/cache
 __pycache__/
 *.pyc

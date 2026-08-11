@@ -31,10 +31,11 @@ ExecStart=%h/.cargo/bin/adelie-dbus-bridge
 Restart=on-failure
 RestartSec=2
 # The bridge IS the live D-Bus surface (#318 name flip): it claims
-# `org.desktopAssistant`, and the daemon no longer serves the in-process surface
-# (DESKTOP_ASSISTANT_DBUS_INPROCESS=false by default — set it true + stop the
-# bridge to revert). For a side-by-side QA instance, run a second bridge with
-# ADELIE_BRIDGE_NAME=org.desktopAssistant.Bridge or .Dev.
+# `org.desktopAssistant`. The daemon serves no D-Bus surface of its own, so
+# there is nothing to fall back to when the bridge is down - recover by fixing
+# the bridge, or by pinning the previous bridge version. For a side-by-side QA
+# instance, run a second bridge with ADELIE_BRIDGE_NAME=org.desktopAssistant.Bridge
+# or .Dev.
 Environment=ADELIE_BRIDGE_NAME=org.desktopAssistant
 Environment=RUST_LOG=info,desktop_assistant_dbus_bridge=debug
 

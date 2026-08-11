@@ -1,5 +1,5 @@
 //! Per-turn dispatch client used by [`crate::api_surface::RoutingConversationHandler`]
-//! to swap the underlying `AnyLlmClient` based on the resolved
+//! to swap the underlying `Arc<dyn LlmClient>` based on the resolved
 //! `(connection_id, model_id, effort)` triple for each `send_prompt`.
 //!
 //! Rationale: the core `ConversationHandler` owns a single `llm: L` field
@@ -9,7 +9,7 @@
 //! would be a very invasive change.
 //!
 //! Instead we install this wrapper as the handler's `L`. It looks up the
-//! target `AnyLlmClient` on each call via a [`tokio::task_local!`] slot
+//! target `Arc<dyn LlmClient>` on each call via a [`tokio::task_local!`] slot
 //! populated by the daemon-side routing wrapper. When the slot is unset
 //! (e.g. background jobs), dispatch falls through to a
 //! statically-configured fallback — the interactive-purpose client at
@@ -566,7 +566,7 @@ mod tests {
         );
     }
 
-    /// A mock `AnyLlmClient` variant is overkill for this test; we simply
+    /// A mock `LlmClient` implementation is overkill for this test; we simply
     /// verify the dispatch does not panic and returns the fallback's
     /// error (there's no real server), which proves the delegation
     /// compiles and reaches the inner client.

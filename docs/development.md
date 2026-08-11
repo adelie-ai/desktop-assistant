@@ -83,7 +83,6 @@ docker run --rm -p 11339:11339 \
 
 Container defaults from `Dockerfile`:
 - `DESKTOP_ASSISTANT_WS_BIND=0.0.0.0:11339`
-- `DESKTOP_ASSISTANT_DBUS_REQUIRED=false` (daemon will continue if session D-Bus is unavailable)
 
 For systemd user service + D-Bus activation setup:
 

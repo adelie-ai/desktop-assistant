@@ -1,19 +1,17 @@
 //! adelie-dbus-bridge: standalone per-user D-Bus bridge.
 //!
-//! The bridge exposes the same session-bus surface the in-process
-//! `dbus-interface` adapters expose today (well-known name
-//! `org.desktopAssistant`, the four object paths under
-//! `/org/desktopAssistant/...`) but does NOT link the daemon's
+//! The bridge is the session-bus surface (well-known name
+//! `org.desktopAssistant`, the object paths under
+//! `/org/desktopAssistant/...`), and it does NOT link the daemon's
 //! `application` crate. Instead, every D-Bus method call is translated
-//! into a `WsRequest` and shipped over a JWT-authenticated UDS
-//! connection to the daemon (issue #103). `WsFrame::Event`s coming
-//! back over the same UDS connection are translated into the
+//! into a `WsRequest` and shipped over a local UDS connection to the
+//! daemon, authenticated by kernel peer-cred (#407). `WsFrame::Event`s
+//! coming back over the same UDS connection are translated into the
 //! corresponding D-Bus signals.
 //!
-//! See `docs/architecture-evolution.md` Phase 1 for context. This crate
-//! is the binary half of the "D-Bus bridge" story; the daemon itself
-//! still ships the in-process surface for Option A
-//! (independently-shippable transition — see PR #106).
+//! See `docs/architecture-evolution.md` Phase 1 for context. The cutover
+//! (#318/#319) deleted the daemon's own in-process `dbus-interface`
+//! adapters, so this crate is the only thing that serves the surface.
 //!
 //! The split between `lib.rs` and `main.rs` is deliberate: the binary wires a
 //! client-common [`Connector`](desktop_assistant_client_common::Connector) to a

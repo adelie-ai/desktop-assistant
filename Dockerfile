@@ -48,7 +48,6 @@ COPY --from=builder /workspace/target/release/desktop-assistant-daemon /usr/loca
 
 ENV RUST_LOG=info
 ENV DESKTOP_ASSISTANT_WS_BIND=0.0.0.0:11339
-ENV DESKTOP_ASSISTANT_DBUS_REQUIRED=false
 ENV XDG_CONFIG_HOME=/home/assistant/.config
 ENV XDG_DATA_HOME=/home/assistant/.local/share
 ENV XDG_STATE_HOME=/home/assistant/.local/state
