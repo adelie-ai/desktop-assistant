@@ -262,7 +262,7 @@ impl DeploymentConfig {
     /// Whether this equals the default section, so an unconfigured daemon never
     /// writes a `[deployment]` table into `daemon.toml`.
     fn is_default(&self) -> bool {
-        self.on_workstation.is_none()
+        self == &Self::default()
     }
 }
 
@@ -290,7 +290,7 @@ impl AuthzConfig {
     /// Whether this equals the default section, so an unconfigured daemon never
     /// writes an `[authz]` table into `daemon.toml`.
     fn is_default(&self) -> bool {
-        self.admin_subjects.is_empty()
+        self == &Self::default()
     }
 }
 
@@ -303,7 +303,7 @@ impl From<&AuthzConfig> for desktop_assistant_transport_dispatch::AdminSubjects 
 }
 
 /// `[subagents]` configuration: multi-agent behaviour knobs.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct SubagentsConfig {
     /// Whether a subagent finishing wakes its parent conversation with an
     /// autonomous turn (issue #668). On by default: a `spawn_subagent`
@@ -327,7 +327,7 @@ impl SubagentsConfig {
     /// Whether this equals the default section, so a default `[subagents]` is
     /// not serialized (keeping migrated `daemon.toml` output stable).
     fn is_default(&self) -> bool {
-        self.wake_parent == default_wake_parent()
+        self == &Self::default()
     }
 }
 
@@ -341,7 +341,7 @@ fn default_wake_parent() -> bool {
 /// value every other layer falls back to, so it is also what an unreadable or
 /// absent setting resolves to, and it is what a client mirrors when it has no
 /// stored preference of its own.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct SecurityConfig {
     /// `aggressive`, `standard` or `lax`. See
     /// [`desktop_assistant_core::tool_provenance::ToolPolicy`] for what each
@@ -369,7 +369,7 @@ impl SecurityConfig {
     /// Whether this equals the default section, so a default `[security]` is
     /// not serialized (keeping migrated `daemon.toml` output stable).
     fn is_default(&self) -> bool {
-        self.tool_policy == default_tool_policy()
+        self == &Self::default()
     }
 
     /// The configured level, or an error naming the bad value and the accepted
@@ -396,7 +396,7 @@ fn default_tool_policy() -> String {
 /// `[skills]` configuration: whether to index on-disk skills, and which global
 /// roots to scan. Global skills are host-global (owner-less); user-scoped skills
 /// arrive via client registration in a later slice.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct SkillsConfig {
     /// Whether the daemon scans + indexes on-disk skills at startup. When no
     /// configured root resolves, the feature degrades off regardless.
@@ -430,9 +430,7 @@ impl SkillsConfig {
     /// Whether this equals the default section, so a default `[skills]` is not
     /// serialized (keeping migrated `daemon.toml` output stable).
     fn is_default(&self) -> bool {
-        self.enabled == default_skills_enabled()
-            && self.roots == default_skill_roots()
-            && self.user_roots == default_user_roots()
+        self == &Self::default()
     }
 }
 
@@ -548,7 +546,7 @@ impl Default for WsAuthConfig {
 /// drift. Unset (`None`) ⇒ a per-host default resolved at startup:
 /// `issuer` = the local hostname, `audience` = `"<user>.adelie-ai"` (a per-user
 /// daemon is a distinct service instance, so the user-scoped audience is honest).
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Hs256Config {
     /// JWT `iss`. `None`/empty ⇒ the local hostname.
     #[serde(default)]
@@ -559,10 +557,10 @@ pub struct Hs256Config {
 }
 
 impl Hs256Config {
-    /// `true` when both fields are unset — the all-default form, omitted from
-    /// serialized config so an empty `[ws_auth.hs256]` table isn't emitted.
+    /// Whether this equals the default section, so an empty `[ws_auth.hs256]`
+    /// table isn't emitted.
     fn is_default(&self) -> bool {
-        self.issuer.is_none() && self.audience.is_none()
+        self == &Self::default()
     }
 }
 
@@ -5566,5 +5564,107 @@ admin_subjects = ["operator", "ops-oncall"]
             loaded.connections.contains_key("default"),
             "the keys the daemon does understand must still arrive"
         );
+    }
+
+    // --- a section that differs in any field is not the default (#1254) -----
+
+    // These are regression guards, not a red-then-green pair: no section was
+    // losing data when they were written. Each `is_default` was a hand-written
+    // conjunction that happened to cover the fields its section had, and would
+    // have gone silently wrong on the next field added. The enforcement is the
+    // derived comparison in the implementations, not these tests; the tests are
+    // here so a future author who un-derives one finds out immediately.
+    //
+    // The failure they stand against: a section reports itself default while
+    // holding a value the operator set, `skip_serializing_if` omits the whole
+    // table on the next save from any client, and the setting is gone with no
+    // error and no log line.
+
+    #[test]
+    fn a_deployment_section_that_differs_is_not_the_default() {
+        let mut section = super::DeploymentConfig::default();
+        assert!(section.is_default());
+        section.on_workstation = Some(!section.on_workstation.unwrap_or(false));
+        assert!(!section.is_default());
+    }
+
+    #[test]
+    fn an_authz_section_that_differs_is_not_the_default() {
+        let mut section = super::AuthzConfig::default();
+        assert!(section.is_default());
+        section.admin_subjects.push("admin@example.com".to_string());
+        assert!(!section.is_default());
+    }
+
+    #[test]
+    fn a_subagents_section_that_differs_is_not_the_default() {
+        let mut section = super::SubagentsConfig::default();
+        assert!(section.is_default());
+        section.wake_parent = !section.wake_parent;
+        assert!(!section.is_default());
+    }
+
+    #[test]
+    fn a_security_section_that_differs_is_not_the_default() {
+        let mut section = super::SecurityConfig::default();
+        assert!(section.is_default());
+        section.tool_policy = "aggressive".to_string();
+        assert!(!section.is_default());
+    }
+
+    #[test]
+    fn a_skills_section_that_differs_in_any_field_is_not_the_default() {
+        // Three fields, so three ways to be non-default. The middle one is the
+        // case a one-field check would have missed.
+        let base = super::SkillsConfig::default();
+        assert!(base.is_default());
+
+        let mut by_enabled = base.clone();
+        by_enabled.enabled = !by_enabled.enabled;
+        assert!(!by_enabled.is_default(), "enabled");
+
+        let mut by_roots = base.clone();
+        by_roots.roots.push(std::path::PathBuf::from("/opt/skills"));
+        assert!(!by_roots.is_default(), "roots");
+
+        let mut by_user_roots = base.clone();
+        by_user_roots
+            .user_roots
+            .push(std::path::PathBuf::from("/opt/user-skills"));
+        assert!(!by_user_roots.is_default(), "user_roots");
+    }
+
+    #[test]
+    fn an_hs256_section_that_differs_in_any_field_is_not_the_default() {
+        let base = super::Hs256Config::default();
+        assert!(base.is_default());
+
+        let mut by_issuer = base.clone();
+        by_issuer.issuer = Some("https://issuer.example.com".to_string());
+        assert!(!by_issuer.is_default(), "issuer");
+
+        let mut by_audience = base.clone();
+        by_audience.audience = Some("adele".to_string());
+        assert!(!by_audience.is_default(), "audience");
+    }
+
+    #[test]
+    fn a_non_default_section_survives_a_save_round_trip() {
+        // The actual failure, end to end: a value the operator set must still
+        // be there after a save that was triggered by something unrelated.
+        let mut path = std::env::temp_dir();
+        path.push(format!("da-1254-{}.toml", uuid::Uuid::new_v4().simple()));
+
+        let mut config = super::DaemonConfig::default();
+        config.security.tool_policy = "aggressive".to_string();
+        super::save_daemon_config(&path, &config).expect("save");
+
+        let written = std::fs::read_to_string(&path).expect("read back");
+        assert!(
+            written.contains("aggressive"),
+            "a non-default section must be written, got: {written}"
+        );
+
+        std::fs::remove_file(&path).ok();
     }
 }
