@@ -104,8 +104,6 @@ spec:
               value: "false" # LAN/tailnet provides transport encryption; skip CA distribution
             - name: DESKTOP_ASSISTANT_UDS_ENABLED
               value: "false"
-            - name: DESKTOP_ASSISTANT_DBUS_REQUIRED
-              value: "false"
             - name: DESKTOP_ASSISTANT_WS_LOGIN_USERNAME
               value: "adele"
             # Pure static-password; no PAM/local users in-pod. The daemon would

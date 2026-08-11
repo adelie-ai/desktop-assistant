@@ -12,10 +12,10 @@
 //! 4. Wait for SIGTERM / SIGINT; tear down cleanly.
 //!
 //! The well-known bus name is configurable (`--name`); it defaults to
-//! `org.desktopAssistant` — the bridge is the live D-Bus surface as of the
-//! cutover name flip (#318), and the daemon no longer claims the name (its
-//! in-process surface is off by default). Pass `--name org.desktopAssistant.Bridge`
-//! or `.Dev` to run a side-by-side instance for QA without colliding.
+//! `org.desktopAssistant` - the bridge is the live D-Bus surface as of the
+//! cutover name flip (#318), and the daemon no longer claims the name. Pass
+//! `--name org.desktopAssistant.Bridge` or `.Dev` to run a side-by-side
+//! instance for QA without colliding.
 
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
@@ -38,10 +38,10 @@ use desktop_assistant_dbus_bridge::transport::ConnectorBridgeTransport;
 use tokio::signal::unix::{SignalKind, signal};
 
 // The bridge is the live D-Bus surface as of the cutover's name flip (#318):
-// it claims `org.desktopAssistant` and the daemon steps off the name (its
-// in-process surface is off by default; `DESKTOP_ASSISTANT_DBUS_INPROCESS=true`
-// re-enables it as a revert). Use `--name org.desktopAssistant.Bridge`/`.Dev`
-// to run a side-by-side instance for QA without colliding.
+// it claims `org.desktopAssistant` and the daemon steps off the name. The
+// daemon serves no D-Bus surface of its own, so this process is the only
+// owner. Use `--name org.desktopAssistant.Bridge`/`.Dev` to run a side-by-side
+// instance for QA without colliding.
 const DEFAULT_BRIDGE_NAME: &str = "org.desktopAssistant";
 
 #[derive(Debug, Parser)]
