@@ -21,8 +21,11 @@
 use chrono::{DateTime, Utc};
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::knowledge_use::{KnowledgeUseRecord, RECENT_USE_WINDOW};
+use desktop_assistant_core::domain::situation::Situation;
 use desktop_assistant_core::ports::auth::current_user_id;
-use desktop_assistant_core::ports::knowledge_use::{MAX_STANDING_OFFERS, OfferScope, OfferSource};
+use desktop_assistant_core::ports::knowledge_use::{
+    MAX_STANDING_OFFERS, OfferScope, OfferSource, SituationSignal,
+};
 use desktop_assistant_core::ports::skill_use::SkillUseLog;
 use sqlx::PgPool;
 
@@ -161,10 +164,19 @@ impl SkillUseLog for PgSkillUseLog {
         Ok(written)
     }
 
+    async fn situation_signal(
+        &self,
+        _names: Vec<String>,
+        _situation: Situation,
+    ) -> Result<SituationSignal, CoreError> {
+        Ok(SituationSignal::default())
+    }
+
     async fn record_opened(
         &self,
         conversation_id: String,
         names: Vec<String>,
+        _situation: Situation,
     ) -> Result<usize, CoreError> {
         let names = storable(names);
         if names.is_empty() {

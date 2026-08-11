@@ -1702,11 +1702,12 @@ async fn main() -> Result<()> {
     if let Some(log) = &skill_use_log {
         use desktop_assistant_core::ports::skill_use::SkillUseLog;
         let opened = Arc::clone(log);
-        builtin_tools =
-            builtin_tools.with_skill_open_log(Arc::new(move |conversation_id, names| {
+        builtin_tools = builtin_tools.with_skill_open_log(Arc::new(
+            move |conversation_id, names, situation| {
                 let log = Arc::clone(&opened);
-                Box::pin(async move { log.record_opened(conversation_id, names).await })
-            }));
+                Box::pin(async move { log.record_opened(conversation_id, names, situation).await })
+            },
+        ));
     }
 
     // Desktop notifications (builtin_notify). Capability-gated: only wired when

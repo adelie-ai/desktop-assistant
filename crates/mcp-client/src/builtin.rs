@@ -2432,8 +2432,13 @@ impl BuiltinToolService {
         };
         let record = Arc::clone(record);
         let conversation_id = conversation.0;
+        // Where the procedure was followed (#1175). Read on the tool's own path
+        // so it describes the turn's client, and recorded against exactly the
+        // name that became an open - the same rule, and the same shape, as the
+        // knowledge log's `record_open` above.
+        let situation = current_situation();
         record_in_background("skill_get_opened", async move {
-            record(conversation_id, vec![name]).await
+            record(conversation_id, vec![name], situation).await
         });
     }
 

@@ -4666,4 +4666,173 @@ mod tests {
         assert!(note_lines(&block).is_empty(), "{block}");
         assert_eq!(skill_lines(&block).len(), 1, "{block}");
     }
+
+    // --- The situation as a cue on the skill arm (#1175) --------------------
+
+    /// The same skill candidate, having been opened in `situation`.
+    fn skill_seen_in(skill: RecallSkill, situation: &crate::domain::Situation) -> RecallSkill {
+        let record = situation.iter().fold(
+            crate::domain::SituationRecord::new(),
+            |record, (field, value)| record.with(field, value),
+        );
+        skill.with_situation(record)
+    }
+
+    /// The skill names the block rendered, in the order it rendered them.
+    fn shown_skills(candidates: &RecallCandidates) -> Vec<String> {
+        render_at_full(candidates, DEFAULT_MAX_RECALL_ENTRIES)
+            .map(|rendered| rendered.skill_names)
+            .unwrap_or_default()
+    }
+
+    /// Acceptance (#1175): a procedure this situation keeps producing is ranked
+    /// above an equally near one that belongs somewhere else.
+    ///
+    /// The whole point of the arm. Nobody retrieves how to ride a bicycle by
+    /// searching for it, and "deploy this" is a weak query and a strong
+    /// situation.
+    #[test]
+    fn a_skill_opened_in_the_recurring_situation_is_ranked_above_one_opened_elsewhere() {
+        let source = seeded_source();
+        let here = here_and_now();
+        let elsewhere = crate::domain::Situation::new()
+            .with(crate::domain::SituationField::Host, "the-road")
+            .with(crate::domain::SituationField::Weekday, "sunday");
+
+        let candidates = RecallCandidates {
+            skills: vec![
+                skill_seen_in(
+                    skill(
+                        "elsewhere",
+                        "A procedure first followed on the road.",
+                        true,
+                        source.distance_at(9.0),
+                    ),
+                    &elsewhere,
+                ),
+                skill_seen_in(
+                    skill(
+                        "here",
+                        "A procedure this room keeps calling for.",
+                        true,
+                        source.distance_at(8.9),
+                    ),
+                    &here,
+                ),
+            ],
+            skill_dispersion: Some(source),
+            skill_situation_cue: Some(a_gradeable_cue(here)),
+            ..RecallCandidates::default()
+        };
+
+        assert_eq!(
+            shown_skills(&candidates),
+            vec!["here".to_string(), "elsewhere".to_string()],
+            "the procedure this situation keeps producing must lead one a tenth of a \
+             deviation nearer that belongs somewhere else"
+        );
+    }
+
+    /// Acceptance (#1175): the skill arm is ranked by the catalog's own cue and
+    /// never by the knowledge store's.
+    ///
+    /// How much a situation value separates one row from another is a property
+    /// of the source that holds the rows, exactly as a dispersion is. A cue
+    /// graded over the knowledge store weights a value by how much it separates
+    /// facts, and spending that weight on procedures would say the catalog
+    /// measured something it never measured.
+    #[test]
+    fn the_skill_arm_is_ranked_by_the_catalogs_own_cue_and_not_the_knowledge_stores() {
+        let source = seeded_source();
+        let here = here_and_now();
+
+        let skills = vec![
+            skill_seen_in(
+                skill(
+                    "nearer",
+                    "A procedure nothing here calls for.",
+                    true,
+                    source.distance_at(9.0),
+                ),
+                &crate::domain::Situation::new()
+                    .with(crate::domain::SituationField::Host, "the-road"),
+            ),
+            skill_seen_in(
+                skill(
+                    "situated",
+                    "A procedure this room keeps calling for.",
+                    true,
+                    source.distance_at(8.9),
+                ),
+                &here,
+            ),
+        ];
+
+        // The knowledge store measured a cue; the catalog measured none. The
+        // skill arm must be ordered by distance alone.
+        let knowledge_cue_only = RecallCandidates {
+            skills: skills.clone(),
+            skill_dispersion: Some(source),
+            situation_cue: Some(a_gradeable_cue(here.clone())),
+            ..RecallCandidates::default()
+        };
+        assert_eq!(
+            shown_skills(&knowledge_cue_only),
+            vec!["nearer".to_string(), "situated".to_string()],
+            "a cue the knowledge store measured says nothing about the catalog"
+        );
+
+        // The catalog measured its own. Now the situation may reorder.
+        let catalogs_own_cue = RecallCandidates {
+            skills,
+            skill_dispersion: Some(source),
+            skill_situation_cue: Some(a_gradeable_cue(here)),
+            ..RecallCandidates::default()
+        };
+        assert_eq!(
+            shown_skills(&catalogs_own_cue),
+            vec!["situated".to_string(), "nearer".to_string()],
+            "the catalog's own cue is what reorders the skill arm"
+        );
+    }
+
+    /// Acceptance (#1175): a situation match cannot admit a skill the bar
+    /// refused - the same rule the knowledge arm keeps, on the arm that gained
+    /// the term second.
+    #[test]
+    fn a_situation_match_cannot_admit_a_skill_the_bar_refused() {
+        let source = seeded_source();
+        let here = here_and_now();
+
+        let mut skills = cued_skills(MAX_RECALL_SKILLS + 2, RECALL_BAR + 4.0);
+        // Well below the bar, and a perfect match for the present situation. A
+        // term that could admit would put it in the block and make the count
+        // below wrong by one.
+        skills.push(skill_seen_in(
+            skill(
+                "below-the-bar",
+                "An unrelated procedure this room keeps calling for.",
+                true,
+                source.distance_at(RECALL_BAR - 2.0),
+            ),
+            &here,
+        ));
+
+        let candidates = RecallCandidates {
+            skills,
+            skill_dispersion: Some(source),
+            skill_situation_cue: Some(a_gradeable_cue(here)),
+            ..RecallCandidates::default()
+        };
+        let block = render(&candidates).expect("a block");
+
+        assert!(
+            !block.contains("below-the-bar"),
+            "the bar admits on distance; the situation only orders what it admitted: {block}"
+        );
+        assert!(
+            block.contains("...and 2 more skills also matched."),
+            "the hedge counts what cleared the bar, which the situation cannot move: {block}"
+        );
+    }
 }

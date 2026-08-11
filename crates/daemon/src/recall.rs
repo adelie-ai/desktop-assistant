@@ -561,6 +561,7 @@ async fn gather(
         note_dispersion,
         situation_cue,
         skill_dispersion,
+        skill_situation_cue: None,
     })
 }
 

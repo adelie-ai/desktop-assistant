@@ -53,7 +53,8 @@ use std::sync::Arc;
 
 use crate::CoreError;
 use crate::domain::knowledge_use::KnowledgeUseRecord;
-use crate::ports::knowledge_use::OfferScope;
+use crate::domain::situation::Situation;
+use crate::ports::knowledge_use::{OfferScope, SituationSignal};
 
 /// The skill use log: what was offered, and what was opened.
 ///
@@ -82,11 +83,50 @@ pub trait SkillUseLog: Send + Sync {
     /// reasons, and only a taken-up offer is evidence that the block worked.
     /// Taking the offer down is also what makes the count idempotent, so a
     /// retried tool call adds nothing.
+    ///
+    /// `situation` is where the open happened, recorded against exactly the
+    /// names that became opens (#1175). It is #238's accumulation rule applied
+    /// to a procedure, and it is carried by the write that already decides
+    /// which names count, for the reason
+    /// [`KnowledgeUseLog::record_opened`](crate::ports::knowledge_use::KnowledgeUseLog::record_opened)
+    /// gives. Passing [`Situation::new`] records no situation, which is what a
+    /// caller with nothing connected passes.
+    ///
+    /// A skill has no write path that carries a situation, which is why there
+    /// is no counterpart to the knowledge log's `record_situation`. A scan
+    /// reads a file at daemon start and the dream cycle authors a skill in a
+    /// background pass; neither happens in anybody's situation, so a method
+    /// that recorded one would record the daemon's own.
     fn record_opened(
         &self,
         conversation_id: String,
         names: Vec<String>,
+        situation: Situation,
     ) -> impl Future<Output = Result<usize, CoreError>> + Send;
+
+    /// Everything one lookup needs of the situation: what each named skill has
+    /// been opened in, and what the present situation is worth over this
+    /// catalog (#1175).
+    ///
+    /// One call rather than two, and measured over the source rather than over
+    /// one lookup's candidates, for the reasons
+    /// [`KnowledgeUseLog::situation_signal`](crate::ports::knowledge_use::KnowledgeUseLog::situation_signal)
+    /// states.
+    ///
+    /// **The cue is the catalog's own.** How much a situation value separates
+    /// one skill from another is a property of the catalog, so a cue the
+    /// knowledge store measured says nothing here - the same split
+    /// [`RecallDispersion`](crate::ports::recall::RecallDispersion) already
+    /// makes for distance.
+    ///
+    /// Names with no record are absent from
+    /// [`SituationSignal::records`] rather than returned empty, and the cue is
+    /// `None` where the catalog cannot grade one.
+    fn situation_signal(
+        &self,
+        names: Vec<String>,
+        situation: Situation,
+    ) -> impl Future<Output = Result<SituationSignal, CoreError>> + Send;
 
     /// What the log knows about each of `names`.
     ///
@@ -112,9 +152,13 @@ pub type SkillOfferedFn = Arc<
 >;
 
 /// Boxed async closure that records skill opens against a conversation's
-/// standing offers. Args: `(conversation_id, skill_names)`.
+/// standing offers. Args: `(conversation_id, skill_names, situation)`.
 pub type SkillOpenedFn = Arc<
-    dyn Fn(String, Vec<String>) -> Pin<Box<dyn Future<Output = Result<usize, CoreError>> + Send>>
+    dyn Fn(
+            String,
+            Vec<String>,
+            Situation,
+        ) -> Pin<Box<dyn Future<Output = Result<usize, CoreError>> + Send>>
         + Send
         + Sync,
 >;

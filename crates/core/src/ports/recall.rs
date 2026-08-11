@@ -338,6 +338,15 @@ pub struct RecallSkill {
     /// What the use log knows about this skill (#1154), on the same terms as
     /// [`RecallEntry::use_record`]: the reinforcement half of its activation.
     pub use_record: Option<KnowledgeUseRecord>,
+    /// The situations this skill has been seen in (#1175), and the third term
+    /// of its activation score.
+    ///
+    /// Empty is an ordinary answer, on exactly the terms
+    /// [`RecallEntry::situation`] states: a skill nobody has opened yet, or an
+    /// adapter that could not read the table. Either way
+    /// [`SituationCue::coverage`] answers zero and the skill ranks the way it
+    /// ranked before the cue reached this arm.
+    pub situation: SituationRecord,
 }
 
 impl RecallSkill {
@@ -354,12 +363,21 @@ impl RecallSkill {
             present_on_disk,
             relevance,
             use_record: None,
+            situation: SituationRecord::new(),
         }
     }
 
     /// The same candidate, carrying what the log knows about it.
+    #[must_use]
     pub fn with_use_record(mut self, record: Option<KnowledgeUseRecord>) -> Self {
         self.use_record = record;
+        self
+    }
+
+    /// The same candidate, carrying the situations it has been seen in.
+    #[must_use]
+    pub fn with_situation(mut self, situation: SituationRecord) -> Self {
+        self.situation = situation;
         self
     }
 }
@@ -511,6 +529,18 @@ pub struct RecallCandidates {
     /// failed - and every entry then ranks the way it ranked before the cue
     /// existed.
     pub situation_cue: Option<SituationCue>,
+    /// The present situation, read against the skill catalog (#1175).
+    ///
+    /// Its own, and never the knowledge arm's, for the reason
+    /// [`Self::skill_dispersion`] is its own: how much a situation value
+    /// separates one skill from another is a property of the catalog, and the
+    /// two sources have neither the same population nor the same fan. A cue
+    /// graded over the knowledge store would weight a value by how much it
+    /// separates facts and spend that weight on procedures.
+    ///
+    /// `None` where the adapter measured none, and every skill then ranks the
+    /// way it ranked before the cue reached this arm.
+    pub skill_situation_cue: Option<SituationCue>,
     /// The skill catalog's own dispersion, on the same terms.
     ///
     /// Its own, and never the knowledge arm's. A skill row embeds a name, a
