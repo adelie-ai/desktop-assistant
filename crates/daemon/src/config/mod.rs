@@ -363,12 +363,30 @@ pub struct SecurityConfig {
     /// which this daemon deliberately does not do for any other setting.
     #[serde(default = "default_tool_policy")]
     pub tool_policy: String,
+
+    /// Whether this daemon destroys the words a turn writes after it has read
+    /// content from outside the trust boundary, instead of storing them and
+    /// withholding them at the model-facing render (#1249).
+    ///
+    /// `false`, the default, is right for the shipped case - a single-person
+    /// desktop install, where a record the assistant wrote is a record the
+    /// person may read. `true` restores the older behaviour for a deployment
+    /// that wants possibly-injected text to reach no durable store at all; the
+    /// person then reads the placeholder too, because nothing else was kept.
+    ///
+    /// A deployment decision, so there is deliberately no per-conversation or
+    /// per-user override. A person who could turn the operator's setting off
+    /// from a chat window would make it worth nothing. The per-turn control is
+    /// [`SecurityConfig::tool_policy`].
+    #[serde(default)]
+    pub hard_withhold: bool,
 }
 
 impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
             tool_policy: default_tool_policy(),
+            hard_withhold: false,
         }
     }
 }
@@ -378,6 +396,26 @@ impl SecurityConfig {
     /// not serialized (keeping migrated `daemon.toml` output stable).
     fn is_default(&self) -> bool {
         self == &Self::default()
+    }
+
+    /// What this daemon does with the words a turn wrote after reading outside
+    /// content, in one line for the startup log (#1249).
+    ///
+    /// Said on every boot, whether or not the key is set. The default is a
+    /// behaviour change in one direction - a daemon that says nothing stops
+    /// destroying text it wrote - so an operator has to be able to read the
+    /// resolved state rather than infer it from an absent key.
+    #[must_use]
+    pub fn withhold_mode_line(&self) -> String {
+        if self.hard_withhold {
+            "withheld text: destroyed at write, at every tool policy \
+             (hard_withhold = true)"
+                .to_string()
+        } else {
+            "withheld text: stored whole and hidden from the model at the aggressive tool \
+             policy (hard_withhold = false)"
+                .to_string()
+        }
     }
 
     /// The configured level, or an error naming the bad value and the accepted

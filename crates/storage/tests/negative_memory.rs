@@ -105,6 +105,7 @@ fn observation_of(act: &str, scope: Scope, outcome: &str) -> BurnObservation {
         fingerprint: fingerprint(&serde_json::json!({ "call": act })),
         scope,
         outcome: outcome.to_string(),
+        after_outside_read: false,
     }
 }
 

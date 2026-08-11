@@ -3727,6 +3727,11 @@ fn parse_new_note(obj: &serde_json::Value) -> Option<NewScratchpadNote> {
         // Filled in by the write closure, the one place every scratchpad write
         // passes through (#717).
         embedding: None,
+        // This write is refused outright once the turn has read outside
+        // content and runs at the aggressive tool policy, and is unremarkable
+        // at the other two, so there is nothing here to flag (#1247). The turn
+        // loop's own step control is the one writer that knows.
+        after_outside_read: false,
         knowledge_entry_id,
     })
 }

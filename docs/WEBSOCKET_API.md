@@ -556,6 +556,40 @@ previous behaviour back. The three levels:
 The daemon says which level it resolved in its startup log. A value it does
 not recognise is named in an error there, and the daemon runs at `standard`.
 
+#### Text a turn wrote after reading outside content
+
+`[security] hard_withhold` decides what happens to the words a turn writes to
+durable storage after it has read content from outside the trust boundary: a
+plan step's goal and outcome, and a negative memory's account of what went
+wrong.
+
+```toml
+[security]
+tool_policy = "standard"
+hard_withhold = false
+```
+
+| Value | What is stored | What the model reads |
+|---|---|---|
+| `false` (default) | the words, with the fact recorded | the placeholder at `aggressive`, the words at `standard` and `lax` |
+| `true` | a placeholder | the placeholder, at every level |
+
+The level that decides is the one in force when the block is **rendered**, not
+the one in force when the note was written. So moving `tool_policy` changes what
+the model sees of everything already stored.
+
+A person reads the words at every level and under either setting, except where
+`hard_withhold` destroyed them - then there is nothing to read.
+
+**Behaviour change.** Before this, the words were destroyed at write time at
+every level, which is `hard_withhold = true`. A daemon that upgrades without
+setting the key gets `false` and stops discarding text it wrote. The daemon
+states the resolved mode in its startup log on every boot, set or not, so an
+operator can read the current state rather than infer it from an absent key.
+
+There is deliberately no per-conversation or per-user override. The per-turn
+control is `tool_policy`.
+
 #### Per-conversation override
 
 A conversation can ask for the level that refuses nothing, whatever the

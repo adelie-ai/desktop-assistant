@@ -7,8 +7,8 @@ use crate::context::{
     window_start,
 };
 use crate::domain::negative_memory::{
-    NegativeMemory, PendingAction, burns_that_fire, clamp_outcome, render_hold_notice,
-    render_warning,
+    NegativeMemory, PendingAction, WITHHELD_BURN_OUTCOME, burns_that_fire, clamp_outcome,
+    render_hold_notice, render_warning,
 };
 use crate::domain::skill::{detect_kind, skill_content_hash};
 use crate::domain::{
@@ -595,6 +595,16 @@ pub struct ConversationHandler<S, L, T = NoopToolExecutor> {
     /// native desktop install and every test on the wording they had before the
     /// flag existed.
     on_workstation: bool,
+    /// Whether this daemon destroys the words a turn writes after it has read
+    /// content from outside the trust boundary, instead of storing them and
+    /// withholding them at the render (#1249).
+    ///
+    /// An operator's setting, resolved once at startup from `[security]
+    /// hard_withhold` and never per conversation: a person who could turn off
+    /// the operator's destruction from a chat window would make it worth
+    /// nothing. `false` is the shipped state and the default here, so a test
+    /// or a background job gets the behaviour a desktop install gets.
+    hard_withhold: bool,
     /// Per-conversation turn serialization (#282). Maps a conversation id to a
     /// `Weak`-referenced async mutex; a turn upgrades-or-inserts the entry, holds
     /// the `Arc<Mutex<()>>` guard across its whole body, then drops it. Entries
@@ -611,15 +621,6 @@ pub struct ConversationHandler<S, L, T = NoopToolExecutor> {
 /// set one via [`ConversationHandler::with_host`] (issue #243). The live daemon
 /// always sets its hostname; this keeps tests and background jobs coherent.
 pub const DEFAULT_HOST_LABEL: &str = "this machine";
-
-/// What a burn records in place of a tool's own error text, once the turn has
-/// read content from outside the trust boundary.
-///
-/// The words are the risk, not the lesson. A burn is replayed in another
-/// conversation, at the moment the model is deciding whether to act, which is
-/// the last place an outside party's sentence should be able to reach.
-const OUTCOME_WITHHELD_EXTERNAL: &str = "the call failed; what it said is not recorded, because this turn had read content \
-     from outside the trust boundary";
 
 /// The identity a turn remembers meeting: the act, and the digest of its own
 /// arguments.
@@ -660,6 +661,7 @@ impl<S, L> ConversationHandler<S, L, NoopToolExecutor> {
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             host: DEFAULT_HOST_LABEL.to_string(),
             on_workstation: true,
+            hard_withhold: false,
             turn_locks: std::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -737,11 +739,43 @@ fn turn_messages(messages: &[Message], turn_start: usize) -> &[Message] {
     messages.get(turn_start..).unwrap_or(&[])
 }
 
-fn step_text_to_record(text: &str, provenance: TurnProvenance) -> String {
-    if provenance.ingested_external() {
+/// What a step note stores, and whether the turn writing it had already read
+/// content from outside the trust boundary (#1247).
+///
+/// The words are kept. The flag travels with them, and the model-facing render
+/// is what decides, later, whether the model reads them - so the level a person
+/// sets still changes what the model sees, and the person reads the note
+/// whatever the level is.
+///
+/// `hard_withhold` is the operator's opt-out (#1249): with it on, the words are
+/// replaced before storage and nobody can read them back.
+fn step_text_to_record(
+    text: &str,
+    provenance: TurnProvenance,
+    hard_withhold: bool,
+) -> (String, bool) {
+    let after_outside_read = provenance.ingested_external();
+    if after_outside_read && hard_withhold {
+        (WITHHELD_STEP_TEXT.to_string(), true)
+    } else {
+        (text.to_string(), after_outside_read)
+    }
+}
+
+/// What the MODEL reads of a stored note (#1247).
+///
+/// Every model-facing render of a note's text goes through here, so there is
+/// one answer rather than one per surface. `withhold` is the reading turn's own
+/// decision - true only at [`ToolPolicy::Aggressive`] - and a note that was not
+/// written after an outside read is never touched.
+///
+/// The person-facing paths deliberately do NOT call this. They read the record
+/// as stored, which is the whole point of storing it.
+fn withheld_or_content(note: &crate::domain::ScratchpadNote, withhold: bool) -> String {
+    if withhold && note.after_outside_read {
         WITHHELD_STEP_TEXT.to_string()
     } else {
-        text.to_string()
+        note.content.clone()
     }
 }
 
@@ -779,6 +813,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             host: DEFAULT_HOST_LABEL.to_string(),
             on_workstation: true,
+            hard_withhold: false,
             turn_locks: std::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -788,6 +823,18 @@ impl<S, L, T> ConversationHandler<S, L, T> {
     /// hostname here; the follow-up phase replaces it with a stable machine-id.
     pub fn with_host(mut self, host: impl Into<String>) -> Self {
         self.host = host.into();
+        self
+    }
+
+    /// State whether this daemon destroys the words a turn writes after it has
+    /// read content from outside the trust boundary (#1249).
+    ///
+    /// `false`, the default, keeps the record and lets the model-facing render
+    /// withhold it per the reading turn's level. `true` is the older
+    /// behaviour: the words never reach durable storage, so nobody can read
+    /// them back - not the model, and not the person either.
+    pub fn with_hard_withhold(mut self, hard_withhold: bool) -> Self {
+        self.hard_withhold = hard_withhold;
         self
     }
 
@@ -1134,7 +1181,8 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             // complete_step evicts the work done *within* the step.
             let watermark = conv.messages.len();
             let (key, sequence) = stack.begin(goal, watermark);
-            let recorded_goal = step_text_to_record(goal, provenance);
+            let (recorded_goal, after_outside_read) =
+                step_text_to_record(goal, provenance, self.hard_withhold);
             // The vector is filled in by the write closure, which is the one
             // place every scratchpad write passes through (#717).
             let note = NewScratchpadNote {
@@ -1144,6 +1192,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
                 sequence: Some(sequence),
                 done: false,
                 embedding: None,
+                after_outside_read,
                 knowledge_entry_id: None,
             };
             if let Err(e) = write(conv_id, vec![note]).await {
@@ -1155,7 +1204,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
                 "step": key,
                 "depth": stack.depth(),
                 "goal": goal,
-                "text_recorded": !provenance.ingested_external(),
+                "text_recorded": !(after_outside_read && self.hard_withhold),
             })
             .to_string();
         }
@@ -1181,7 +1230,8 @@ impl<S, L, T> ConversationHandler<S, L, T> {
                 } else {
                     o.to_string()
                 };
-                let body = step_text_to_record(&body, provenance);
+                let (body, after_outside_read) =
+                    step_text_to_record(&body, provenance, self.hard_withhold);
                 let note = NewScratchpadNote {
                     key: key.clone(),
                     content: planning::truncate_on_char_boundary(&body, MAX_NOTE_BYTES),
@@ -1189,6 +1239,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
                     sequence: None,
                     done: false,
                     embedding: None,
+                    after_outside_read,
                     knowledge_entry_id: None,
                 };
                 if let Err(e) = write(conv_id, vec![note]).await {
@@ -1199,7 +1250,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
                     "action": "complete_step",
                     "note": "no active step; recorded a standalone note",
                     "outcome_note": key,
-                    "text_recorded": !provenance.ingested_external(),
+                    "text_recorded": !(after_outside_read && self.hard_withhold),
                 })
                 .to_string();
             }
@@ -1212,7 +1263,8 @@ impl<S, L, T> ConversationHandler<S, L, T> {
         // been before the turn was tainted. Withhold on the state NOW: taint
         // only ever moves one way within a turn, so this is the conservative
         // reading and it needs no second flag on the frame.
-        let recorded_goal = step_text_to_record(&frame.goal, provenance);
+        let (recorded_goal, goal_after_outside_read) =
+            step_text_to_record(&frame.goal, provenance, self.hard_withhold);
         let mut notes = vec![NewScratchpadNote {
             key: frame.key.clone(),
             content: planning::truncate_on_char_boundary(&recorded_goal, MAX_NOTE_BYTES),
@@ -1220,6 +1272,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             sequence: Some(frame.sequence),
             done: true,
             embedding: None,
+            after_outside_read: goal_after_outside_read,
             knowledge_entry_id: None,
         }];
         let mut note_keys: Vec<String> = Vec::new();
@@ -1234,7 +1287,8 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             } else {
                 o.to_string()
             };
-            let body = step_text_to_record(&body, provenance);
+            let (body, after_outside_read) =
+                step_text_to_record(&body, provenance, self.hard_withhold);
             outcome_is_a_trace = !is_withheld_step_text(&body);
             notes.push(NewScratchpadNote {
                 key: okey.clone(),
@@ -1243,6 +1297,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
                 sequence: None,
                 done: false,
                 embedding: None,
+                after_outside_read,
                 knowledge_entry_id: None,
             });
             note_keys.push(okey);
@@ -1416,20 +1471,26 @@ impl<S, L, T> ConversationHandler<S, L, T> {
         let Some(write) = self.record_burn.clone() else {
             return;
         };
-        // Both halves of one rule, in one place. Once the turn has read content
-        // from outside the trust boundary it can vouch for neither the tool's
-        // error text nor the arguments the model chose - a model that has just
-        // read a web page may be quoting it back, and an argument is the
-        // channel it writes directly. Both are shown to a later turn at a
-        // decision point, so where the turn cannot vouch for them, neither is
-        // recorded.
+        // One rule, in one place. Once the turn has read content from outside
+        // the trust boundary it can vouch for neither the tool's error text nor
+        // the arguments the model chose - a model that has just read a web page
+        // may be quoting it back, and an argument is the channel it writes
+        // directly. Both are shown to a later turn at a decision point.
         //
-        // The lesson survives either way. The act is the fingerprint, which
-        // this does not touch, and the circumstance is read off the clock and
-        // the client rather than written by the model.
-        let (outcome, scope) = if external {
+        // So the record keeps them and states the fact (#1247), and
+        // `render_warning` decides from that fact plus the READING turn's level
+        // whether the model sees them. The person reads them either way, which
+        // is the whole reason the burn is worth writing: a lesson whose account
+        // says only that a call failed cannot be judged, cleared, or acted on.
+        //
+        // `hard_withhold` is the operator's opt-out (#1249). Under it the words
+        // and the arguments never reach the store, exactly as before. The
+        // lesson survives that too: the act is the fingerprint, which this does
+        // not touch, and the circumstance is read off the clock and the client
+        // rather than written by the model.
+        let (outcome, scope) = if external && self.hard_withhold {
             (
-                OUTCOME_WITHHELD_EXTERNAL.to_string(),
+                WITHHELD_BURN_OUTCOME.to_string(),
                 pending.scope.without_arguments(),
             )
         } else {
@@ -1440,6 +1501,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             fingerprint: pending.fingerprint.clone(),
             scope,
             outcome,
+            after_outside_read: external,
         };
         let written = Arc::clone(written);
         let identity = identity.to_string();
@@ -1605,9 +1667,15 @@ impl<S, L, T> ConversationHandler<S, L, T> {
     ) -> Option<serde_json::Value> {
         self.skill_search.as_ref()?;
         self.skill_write_authored.as_ref()?;
-        // A turn that ingested external content does not durably record the
-        // model's own wording (#741), and a skill is nothing but wording.
-        if provenance.ingested_external() {
+        // The strict level keeps its old behaviour: no offer at all (#1248).
+        //
+        // The rule used to fire on taint alone, and its reason - "a turn that
+        // ingested external content does not durably record the model's own
+        // wording" - is what #1247 removed. What is left is the level, and the
+        // cost of refusing everywhere landed exactly where it hurt: a turn that
+        // reads several pages and works out a repeatable procedure is the turn
+        // most worth keeping a skill from.
+        if provenance.ingested_external() && provenance.policy() == ToolPolicy::Aggressive {
             return None;
         }
 
@@ -1648,11 +1716,14 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             return r#"{"ok":false,"error":"the skill library is not available in this turn"}"#
                 .to_string();
         };
-        if provenance.ingested_external() {
+        // Refused at the strict level only (#1248), matching the offer above.
+        // At the other two the backstop is the approval step: a skill written
+        // here is unapproved, so a person still decides before it is followed.
+        if provenance.ingested_external() && provenance.policy() == ToolPolicy::Aggressive {
             return serde_json::json!({
                 "ok": false,
-                "declined": "this turn read external content, so its own wording is not \
-                             recorded; a skill written from it could not be trusted",
+                "declined": "this turn read external content and runs at the aggressive tool \
+                             policy, which does not keep a plan as a skill",
             })
             .to_string();
         }
@@ -1784,6 +1855,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
         &self,
         conversation_id: &ConversationId,
         current_key: Option<&str>,
+        withhold: bool,
     ) -> ScratchpadSurfaces {
         let Some(list) = self.scratchpad_list.clone() else {
             return ScratchpadSurfaces::default();
@@ -1798,12 +1870,24 @@ impl<S, L, T> ConversationHandler<S, L, T> {
         let Ok(notes) = list(conversation_id.0.clone(), None, limit).await else {
             return ScratchpadSurfaces::default();
         };
+        // Where the model-facing surfaces part company with the person-facing
+        // ones (#1247). A note written after the turn read outside content
+        // keeps its words in the store; here, a reading turn at the strict
+        // level reads a placeholder instead.
+        //
+        // Only step and outcome notes carry the flag today - no other writer is
+        // told what its turn has taken in - so `[Scratchpad]` and `[Pinned]`
+        // are unaffected in practice, and stay correct if that ever changes.
         let raw: Vec<planning::RawNote> = notes
             .iter()
             .map(|n| planning::RawNote {
                 key: n.key.as_str(),
                 owner_todo: n.owner_todo.as_str(),
-                content: n.content.as_str(),
+                content: if withhold && n.after_outside_read {
+                    WITHHELD_STEP_TEXT
+                } else {
+                    n.content.as_str()
+                },
                 note_type: n.note_type.as_str(),
                 done: n.done,
                 pinned: n.pinned,
@@ -2872,6 +2956,10 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
             // a model-maintained goal then keeps showing up even after history
             // is windowed/compacted away. Reading per round means a goal the
             // model wrote mid-turn surfaces on the next round.
+            //
+            // What this round withholds from the model, decided once and used
+            // by every model-facing render below (#1247).
+            let withhold_written_text = turn_provenance.policy() == ToolPolicy::Aggressive;
             let goal = match &self.scratchpad_get_many {
                 Some(read) => read(
                     conversation_id.0.clone(),
@@ -2881,7 +2969,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 .await
                 .ok()
                 .and_then(|mut notes| notes.pop())
-                .map(|note| note.content)
+                .map(|note| withheld_or_content(&note, withhold_written_text))
                 .filter(|content| !content.trim().is_empty()),
                 None => None,
             };
@@ -2897,7 +2985,11 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
             // completed - and a note it just wrote - shows up on the next one.
             let current_step = step_stack.current_key().map(str::to_string);
             let surfaces = self
-                .render_scratchpad_surfaces(conversation_id, current_step.as_deref())
+                .render_scratchpad_surfaces(
+                    conversation_id,
+                    current_step.as_deref(),
+                    withhold_written_text,
+                )
                 .await;
 
             // The turn's candidates, plus what this round's other blocks already
@@ -3692,7 +3784,11 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                     _ => Vec::new(),
                 };
                 if let Some(identity) = burn_identity.as_deref()
-                    && let Some(warning) = render_warning(&fired_burns, Utc::now())
+                    && let Some(warning) = render_warning(
+                        &fired_burns,
+                        Utc::now(),
+                        turn_provenance.policy() == ToolPolicy::Aggressive,
+                    )
                 {
                     tracing::info!(
                         tool = %Safe::name(&tool_call.name),
@@ -4167,7 +4263,9 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
             .await
             .ok()
             .and_then(|mut notes| notes.pop())
-            .map(|note| note.content)
+            .map(|note| {
+                withheld_or_content(&note, turn_provenance.policy() == ToolPolicy::Aggressive)
+            })
             .filter(|content| !content.trim().is_empty()),
             None => None,
         };
@@ -4177,7 +4275,13 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
             .map(str::to_string);
         // No live step to mark: the wind-down is the turn closing out, not a
         // step continuing.
-        let wind_down_surfaces = self.render_scratchpad_surfaces(conversation_id, None).await;
+        let wind_down_surfaces = self
+            .render_scratchpad_surfaces(
+                conversation_id,
+                None,
+                turn_provenance.policy() == ToolPolicy::Aggressive,
+            )
+            .await;
 
         // Show the model a transient wrap-up instruction for THIS call only,
         // then drop it so only its closing reply is persisted.
@@ -15640,6 +15744,7 @@ mod tests {
             written_at: Utc::now(),
             last_confirmed_at: Utc::now(),
             superseded_by: None,
+            after_outside_read: false,
         }
     }
 
@@ -16000,13 +16105,18 @@ mod tests {
         );
     }
 
-    /// A tool error can be an outside party's own words. #741 keeps such bytes
-    /// out of the assistant's memory because a note written now is read back as
-    /// ordinary context later; a burn is worse, because it is read back in
-    /// another conversation at the moment the model is deciding whether to act.
-    /// The lesson is kept and the words are not.
+    /// A tool error can be an outside party's own words, and so can the
+    /// arguments a model wrote after reading a page. A burn is replayed in
+    /// another conversation at the moment the model is deciding whether to act,
+    /// which is the worst place in the system to park an instruction.
+    ///
+    /// #1247 moved where that is answered. The words and the arguments are
+    /// recorded, so a person can read what actually went wrong and judge the
+    /// lesson; the warning is what withholds them, from the model, at the
+    /// strict level.
     #[tokio::test]
-    async fn a_failure_after_reading_outside_content_records_no_outside_words() {
+    async fn a_failure_after_reading_outside_content_records_the_words_and_hides_them_at_aggressive()
+    {
         // Two really-classified tools: `osm_search` returns bytes an outside
         // party chose, and `builtin_knowledge_base_search` only reads, so it
         // stays open after that closes the gate.
@@ -16054,29 +16164,62 @@ mod tests {
         let written = log.written.lock().unwrap();
         assert_eq!(written.len(), 1, "the failure still teaches that it failed");
         assert!(
-            !written[0].outcome.contains("exfiltrate"),
-            "but not one word the server chose; got {}",
+            written[0].outcome.contains("exfiltrate"),
+            "the record keeps what went wrong, for the person; got {}",
             written[0].outcome
         );
-        assert!(
-            written[0].outcome.contains("outside the trust boundary"),
-            "and it says why the words are missing; got {}",
-            written[0].outcome
-        );
-        // The stronger channel, and the one an outcome-only guard misses: the
-        // model writes the arguments itself, and a model that has just read a
-        // page may be quoting it back. A recorded argument is printed verbatim
-        // in a later turn's warning, at a decision point.
         assert_eq!(
             written[0]
                 .scope
                 .get(&crate::domain::Facet::Argument("query".to_string())),
-            None,
-            "nothing the model wrote after reading outside content is recorded"
+            Some("a place"),
+            "and the arguments the act went badly with"
+        );
+        assert!(
+            written[0].after_outside_read,
+            "and it states that the turn had read outside content"
         );
         assert!(
             !written[0].fingerprint.is_empty(),
-            "and the act is still identified, so the lesson still fires on it"
+            "the act is still identified, so the lesson still fires on it"
+        );
+
+        // The half that protects the model: the warning a later turn reads at
+        // the strict level carries neither the server's sentence nor the
+        // arguments written after it.
+        let stored = NegativeMemory {
+            id: "nm-1".to_string(),
+            action: written[0].action.clone(),
+            fingerprint: written[0].fingerprint.clone(),
+            kind: crate::domain::NegativeMemoryKind::Burn,
+            scope: written[0].scope.clone(),
+            outcome: written[0].outcome.clone(),
+            occurrences: 1,
+            written_at: Utc::now(),
+            last_confirmed_at: Utc::now(),
+            superseded_by: None,
+            after_outside_read: written[0].after_outside_read,
+        };
+        let held = render_warning(&[&stored], Utc::now(), true)
+            .expect("a fired burn renders a warning");
+        assert!(
+            !held.contains("exfiltrate"),
+            "no word the server chose may reach a decision point: {held}"
+        );
+        assert!(
+            !held.contains("a place"),
+            "nor an argument written after the page was read: {held}"
+        );
+        assert!(
+            held.contains("outside the trust boundary"),
+            "and it says why the words are missing: {held}"
+        );
+
+        let shown = render_warning(&[&stored], Utc::now(), false)
+            .expect("a fired burn renders a warning");
+        assert!(
+            shown.contains("exfiltrate"),
+            "at the other levels the model reads the lesson in full: {shown}"
         );
     }
 

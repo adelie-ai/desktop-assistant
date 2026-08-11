@@ -97,6 +97,7 @@ struct MemoryRow {
     written_at: DateTime<Utc>,
     last_confirmed_at: DateTime<Utc>,
     superseded_by: Option<String>,
+    after_outside_read: bool,
 }
 
 /// One `negative_memory_facet` row as it comes back.
@@ -162,6 +163,7 @@ fn assemble(rows: Vec<MemoryRow>, facets: Vec<FacetRow>) -> Vec<NegativeMemory> 
                 written_at: row.written_at,
                 last_confirmed_at: row.last_confirmed_at,
                 superseded_by: row.superseded_by,
+                after_outside_read: row.after_outside_read,
             })
         })
         .collect()
@@ -221,7 +223,8 @@ where
 /// The columns every memory read selects, in the order [`MemoryRow`] names
 /// them.
 const MEMORY_COLUMNS: &str = "id, action, fingerprint, kind, outcome, occurrences, \
-                              written_at, last_confirmed_at, superseded_by";
+                              written_at, last_confirmed_at, superseded_by, \
+                              after_outside_read";
 
 impl NegativeMemoryStore for PgNegativeMemoryStore {
     async fn live_burns(&self) -> Result<Vec<NegativeMemory>, CoreError> {
@@ -320,8 +323,8 @@ impl NegativeMemoryStore for PgNegativeMemoryStore {
                 let id = uuid::Uuid::now_v7().to_string();
                 let claimed = sqlx::query_scalar::<_, String>(
                     "INSERT INTO negative_memory \
-                         (id, user_id, action, fingerprint, kind, outcome) \
-                     VALUES ($1, $2, $3, $4, 'burn', $5) \
+                         (id, user_id, action, fingerprint, kind, outcome, after_outside_read) \
+                     VALUES ($1, $2, $3, $4, 'burn', $5, $6) \
                      ON CONFLICT (user_id, action, fingerprint) \
                          WHERE kind = 'burn' AND superseded_by IS NULL \
                      DO NOTHING \
@@ -332,6 +335,7 @@ impl NegativeMemoryStore for PgNegativeMemoryStore {
                 .bind(&observation.action)
                 .bind(&fingerprint)
                 .bind(&observation.outcome)
+                .bind(observation.after_outside_read)
                 .fetch_optional(&mut *tx)
                 .await
                 .map_err(storage_error)?;
@@ -447,13 +451,15 @@ impl NegativeMemoryStore for PgNegativeMemoryStore {
 
                 let occurrences = sqlx::query_scalar::<_, i64>(
                     "UPDATE negative_memory \
-                     SET last_confirmed_at = NOW(), occurrences = occurrences + 1, outcome = $3 \
+                     SET last_confirmed_at = NOW(), occurrences = occurrences + 1, \
+                         outcome = $3, after_outside_read = $4 \
                      WHERE user_id = $1 AND id = $2 \
                      RETURNING occurrences",
                 )
                 .bind(user_id)
                 .bind(&row.id)
                 .bind(&observation.outcome)
+                .bind(observation.after_outside_read)
                 .fetch_one(&mut *tx)
                 .await
                 .map_err(storage_error)?;

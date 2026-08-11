@@ -2934,6 +2934,11 @@ where
                         // Filled in by the write closure, the one place every
                         // scratchpad write passes through (#717).
                         embedding: None,
+                        // A person editing their own note in a client is not a
+                        // turn that read a page, so there is nothing to flag
+                        // (#1247). Only the turn loop's own step control can
+                        // know the answer, and only it sets this.
+                        after_outside_read: false,
                         // A client edits a note's text; attaching a knowledge
                         // entry is the model's move, through the scratchpad
                         // write tool. `None` preserves whatever the stored note
@@ -8120,6 +8125,7 @@ mod tests {
             written_at: chrono::Utc::now() - chrono::Duration::days(6),
             last_confirmed_at: chrono::Utc::now(),
             superseded_by: None,
+            after_outside_read: false,
         }
     }
 
