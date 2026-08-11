@@ -118,8 +118,8 @@ The daemon grants the administrator capability two ways:
 Reads stay open to a tenant, including the connector, model and purpose reads
 the ordinary model picker uses. Writes to service configuration do not:
 
-`SetApiKey`, `SetEmbeddingsSettings`, `SetPersistenceSettings`,
-`SetDatabaseSettings`, `SetBackendTasksSettings`, `SetWsAuthSettings`,
+`SetApiKey`, `SetEmbeddingsSettings`, `SetDatabaseSettings`,
+`SetBackendTasksSettings`, `SetWsAuthSettings`,
 `CreateConnection`, `UpdateConnection`, `DeleteConnection`,
 `SetConnectionSecret`, `SetPurpose`, `AddMcpServer`, `RemoveMcpServer`,
 `SetMcpServerEnabled`, `UpsertMcpServer`, `SetMcpSecret`,

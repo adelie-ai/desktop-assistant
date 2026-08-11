@@ -1,14 +1,12 @@
 //! Password redaction for the connection URLs that settings surfaces return.
 //!
-//! Settings reads (`get_database_settings`, `get_persistence_settings`,
-//! `get_config`) hand connection strings to whatever client is on the other
-//! end of the socket. Both kinds of URL the daemon stores can carry a
-//! credential inline — a PostgreSQL DSN (`postgres://user:pass@host/db`, or
-//! the libpq `?password=` parameter form) and an HTTPS git remote
-//! (`https://user:token@host/repo.git`). The database credential is the sharper
-//! of the two: it belongs to the role that owns every table, and the row-level
-//! security backstop is deliberately not `FORCE`d for that role, so a client
-//! holding it can read and write every user's rows directly.
+//! Settings reads (`get_database_settings`, `get_config`) hand connection
+//! strings to whatever client is on the other end of the socket. A PostgreSQL
+//! DSN carries its credential inline (`postgres://user:pass@host/db`, or the
+//! libpq `?password=` parameter form), and that credential is a sharp one: it
+//! belongs to the role that owns every table, and the row-level security
+//! backstop is deliberately not `FORCE`d for that role, so a client holding it
+//! can read and write every user's rows directly.
 //!
 //! Rule: a URL leaving the daemon never carries a password. The password
 //! component is replaced by [`REDACTED_PASSWORD`]; scheme, user, host, port,

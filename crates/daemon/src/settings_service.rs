@@ -4,8 +4,8 @@ use std::sync::Arc;
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::ports::inbound::{
     BackendTasksSettingsView, ConnectorDefaultsView, DatabaseSettingsView, EmbeddingHealth,
-    EmbeddingsSettingsView, LlmSettingsView, McpServerView, PersistenceSettingsView,
-    PersonalitySettingsView, ServiceAccountView, SettingsService, WsAuthSettingsView,
+    EmbeddingsSettingsView, LlmSettingsView, McpServerView, PersonalitySettingsView,
+    ServiceAccountView, SettingsService, WsAuthSettingsView,
 };
 use desktop_assistant_mcp_client::executor::McpControlHandle;
 
@@ -323,34 +323,6 @@ impl SettingsService for DaemonSettingsService {
             embeddings_available: defaults.embeddings_available,
             hosted_tool_search_available: defaults.hosted_tool_search_available,
         })
-    }
-
-    async fn get_persistence_settings(&self) -> Result<PersistenceSettingsView, CoreError> {
-        let resolved = config::get_persistence_settings_view(&self.config_path)
-            .map_err(|e| CoreError::SystemService(e.to_string()))?;
-        Ok(PersistenceSettingsView {
-            enabled: resolved.enabled,
-            remote_url: resolved.remote_url.unwrap_or_default(),
-            remote_name: resolved.remote_name,
-            push_on_update: resolved.push_on_update,
-        })
-    }
-
-    async fn set_persistence_settings(
-        &self,
-        enabled: bool,
-        remote_url: Option<String>,
-        remote_name: Option<String>,
-        push_on_update: bool,
-    ) -> Result<(), CoreError> {
-        config::set_persistence_settings(
-            &self.config_path,
-            enabled,
-            remote_url.as_deref(),
-            remote_name.as_deref(),
-            push_on_update,
-        )
-        .map_err(|e| CoreError::SystemService(e.to_string()))
     }
 
     async fn get_database_settings(&self) -> Result<DatabaseSettingsView, CoreError> {

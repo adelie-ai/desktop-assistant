@@ -30,9 +30,9 @@ use desktop_assistant_core::ports::inbound::{
     AssistantService, BackendTasksSettingsView, ConnectionConfigPayload,
     ConnectionView as CoreConnectionView, ConnectionsService, ConnectorDefaultsView,
     ConversationService, DatabaseSettingsView, EmbeddingsSettingsView, KnowledgeService,
-    LlmSettingsView, ModelListing as CoreModelListing, PersistenceSettingsView,
-    PurposeConfigPayload, PurposeKind as CorePurposeKind, PurposesView as CorePurposesView,
-    SettingsService, WsAuthSettingsView,
+    LlmSettingsView, ModelListing as CoreModelListing, PurposeConfigPayload,
+    PurposeKind as CorePurposeKind, PurposesView as CorePurposesView, SettingsService,
+    WsAuthSettingsView,
 };
 use desktop_assistant_core::ports::llm::{ChunkCallback, StatusCallback};
 use desktop_assistant_ws::{WsAuthValidator, WsFrame, WsRequest, router};
@@ -295,23 +295,6 @@ impl SettingsService for FakeSettings {
             embeddings_available: false,
             hosted_tool_search_available: false,
         })
-    }
-    async fn get_persistence_settings(&self) -> Result<PersistenceSettingsView, CoreError> {
-        Ok(PersistenceSettingsView {
-            enabled: false,
-            remote_url: "".into(),
-            remote_name: "origin".into(),
-            push_on_update: false,
-        })
-    }
-    async fn set_persistence_settings(
-        &self,
-        _enabled: bool,
-        _remote_url: Option<String>,
-        _remote_name: Option<String>,
-        _push_on_update: bool,
-    ) -> Result<(), CoreError> {
-        Ok(())
     }
     async fn get_database_settings(&self) -> Result<DatabaseSettingsView, CoreError> {
         Ok(DatabaseSettingsView {

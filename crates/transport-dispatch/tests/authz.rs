@@ -53,12 +53,6 @@ fn unstamped_config() -> api::Config {
             is_default: false,
             health: api::EmbeddingHealth::Ok,
         },
-        persistence: api::PersistenceSettingsView {
-            enabled: false,
-            remote_url: String::new(),
-            remote_name: "origin".to_string(),
-            push_on_update: false,
-        },
         personality: api::PersonalitySettingsView::default(),
         restart_required: Vec::new(),
         caller_capability: None,
@@ -376,14 +370,6 @@ command_table! {
                 connector: "ollama".to_string(),
             },
             Tenant),
-    GetPersistenceSettings => (api::Command::GetPersistenceSettings, Tenant),
-    SetPersistenceSettings => (api::Command::SetPersistenceSettings {
-                enabled: true,
-                remote_url: None,
-                remote_name: None,
-                push_on_update: false,
-            },
-            Admin),
     GetDatabaseSettings => (api::Command::GetDatabaseSettings, Tenant),
     SetDatabaseSettings => (api::Command::SetDatabaseSettings {
                 url: api::Secret(String::new()),
@@ -976,22 +962,6 @@ async fn daemon_global_config_changes_require_admin() {
         },
         api::ConfigChanges {
             embeddings_base_url: Some("http://example.com".to_string()),
-            ..api::ConfigChanges::default()
-        },
-        api::ConfigChanges {
-            persistence_enabled: Some(true),
-            ..api::ConfigChanges::default()
-        },
-        api::ConfigChanges {
-            persistence_remote_url: Some("https://example.com/repo.git".into()),
-            ..api::ConfigChanges::default()
-        },
-        api::ConfigChanges {
-            persistence_remote_name: Some("origin".to_string()),
-            ..api::ConfigChanges::default()
-        },
-        api::ConfigChanges {
-            persistence_push_on_update: Some(true),
             ..api::ConfigChanges::default()
         },
     ];

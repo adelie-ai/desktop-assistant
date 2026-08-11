@@ -26,8 +26,7 @@
 //!
 //! ## Connection URLs arrive redacted
 //!
-//! `get_database_settings` and the persistence remote in `get_config` /
-//! `get_persistence_settings` return a URL whose password reads
+//! `get_database_settings` returns a URL whose password reads
 //! `api::secret_url::REDACTED_PASSWORD`. The bridge forwards what the daemon
 //! sends: redaction happens once, at the daemon's api mapping, so every
 //! transport inherits it. A settings UI can post the redacted URL back
@@ -71,10 +70,6 @@ pub struct ConfigData {
     pub embeddings_has_api_key: bool,
     pub embeddings_available: bool,
     pub embeddings_is_default: bool,
-    pub persistence_enabled: bool,
-    pub persistence_remote_url: String,
-    pub persistence_remote_name: String,
-    pub persistence_push_on_update: bool,
     pub llm_temperature: f64,
     pub llm_top_p: f64,
     pub llm_max_tokens: u32,
@@ -107,14 +102,6 @@ pub struct ConfigPatchArgs {
     pub embeddings_model: String,
     pub set_embeddings_base_url: bool,
     pub embeddings_base_url: String,
-    pub set_persistence_enabled: bool,
-    pub persistence_enabled: bool,
-    pub set_persistence_remote_url: bool,
-    pub persistence_remote_url: String,
-    pub set_persistence_remote_name: bool,
-    pub persistence_remote_name: String,
-    pub set_persistence_push_on_update: bool,
-    pub persistence_push_on_update: bool,
     pub set_llm_temperature: bool,
     pub llm_temperature: f64,
     pub set_llm_top_p: bool,
@@ -159,10 +146,6 @@ fn config_from_wire(c: &api::Config) -> ConfigData {
         embeddings_has_api_key: c.embeddings.has_api_key,
         embeddings_available: c.embeddings.available,
         embeddings_is_default: c.embeddings.is_default,
-        persistence_enabled: c.persistence.enabled,
-        persistence_remote_url: c.persistence.remote_url.clone(),
-        persistence_remote_name: c.persistence.remote_name.clone(),
-        persistence_push_on_update: c.persistence.push_on_update,
         llm_temperature: -1.0,
         llm_top_p: -1.0,
         llm_max_tokens: 0,
@@ -278,43 +261,6 @@ impl<T: BridgeTransport + 'static> DbusSettingsAdapter<T> {
         }
     }
 
-    /// Return persistence settings:
-    /// `(enabled, remote_url, remote_name, push_on_update)`.
-    async fn get_persistence_settings(&self) -> fdo::Result<(bool, String, String, bool)> {
-        let result = self.dispatch(api::Command::GetPersistenceSettings).await?;
-        match result {
-            api::CommandResult::PersistenceSettings(p) => {
-                Ok((p.enabled, p.remote_url, p.remote_name, p.push_on_update))
-            }
-            other => Err(fdo::Error::Failed(format!(
-                "unexpected GetPersistenceSettings result: {other:?}"
-            ))),
-        }
-    }
-
-    async fn set_persistence_settings(
-        &self,
-        enabled: bool,
-        remote_url: &str,
-        remote_name: &str,
-        push_on_update: bool,
-    ) -> fdo::Result<()> {
-        let result = self
-            .dispatch(api::Command::SetPersistenceSettings {
-                enabled,
-                remote_url: normalize(remote_url).map(api::Secret::from),
-                remote_name: normalize(remote_name),
-                push_on_update,
-            })
-            .await?;
-        match result {
-            api::CommandResult::Ack => Ok(()),
-            other => Err(fdo::Error::Failed(format!(
-                "unexpected SetPersistenceSettings result: {other:?}"
-            ))),
-        }
-    }
-
     /// Return aggregate config. LLM-section fields are populated from
     /// the named-connections surface in a follow-up; today they are
     /// empty / sentinel values so the D-Bus signature is stable.
@@ -328,10 +274,10 @@ impl<T: BridgeTransport + 'static> DbusSettingsAdapter<T> {
         }
     }
 
-    /// Apply a partial aggregate config update. Only the embeddings +
-    /// persistence sections round-trip through the wire today; the
-    /// LLM section is a no-op pending the follow-up that widens the
-    /// api-model. Returns the updated config snapshot.
+    /// Apply a partial aggregate config update. Only the embeddings section
+    /// round-trips through the wire today; the LLM section is a no-op pending
+    /// the follow-up that widens the api-model. Returns the updated config
+    /// snapshot.
     async fn set_config(
         &self,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
@@ -353,19 +299,6 @@ impl<T: BridgeTransport + 'static> DbusSettingsAdapter<T> {
         }
         if changes.set_embeddings_base_url {
             wire_changes.embeddings_base_url = Some(changes.embeddings_base_url.clone());
-        }
-        if changes.set_persistence_enabled {
-            wire_changes.persistence_enabled = Some(changes.persistence_enabled);
-        }
-        if changes.set_persistence_remote_url {
-            wire_changes.persistence_remote_url =
-                Some(changes.persistence_remote_url.clone().into());
-        }
-        if changes.set_persistence_remote_name {
-            wire_changes.persistence_remote_name = Some(changes.persistence_remote_name.clone());
-        }
-        if changes.set_persistence_push_on_update {
-            wire_changes.persistence_push_on_update = Some(changes.persistence_push_on_update);
         }
 
         // Personality (#226): translate each set ordinal into the wire level.
@@ -1048,7 +981,7 @@ mod tests {
     }
 
     #[test]
-    fn config_from_wire_carries_embeddings_persistence_and_sentinels_llm() {
+    fn config_from_wire_carries_embeddings_and_sentinels_llm() {
         let wire = api::Config {
             embeddings: api::EmbeddingsSettingsView {
                 connector: "openai".into(),
@@ -1059,12 +992,6 @@ mod tests {
                 is_default: false,
                 health: Default::default(),
             },
-            persistence: api::PersistenceSettingsView {
-                enabled: true,
-                remote_url: "git@h:r.git".into(),
-                remote_name: "origin".into(),
-                push_on_update: false,
-            },
             personality: api::PersonalitySettingsView::default(),
             restart_required: Vec::new(),
             caller_capability: None,
@@ -1072,8 +999,6 @@ mod tests {
         let data = config_from_wire(&wire);
         assert_eq!(data.embeddings_connector, "openai");
         assert!(data.embeddings_has_api_key);
-        assert!(data.persistence_enabled);
-        assert_eq!(data.persistence_remote_name, "origin");
         // The legacy LLM block is no longer on `Config`; the bridge surfaces
         // stable sentinels so the D-Bus signature doesn't drift.
         assert_eq!(data.llm_connector, "");
@@ -1162,29 +1087,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_persistence_settings_normalizes_blank_remote_fields() {
-        let t = FakeTransport::replying(api::CommandResult::Ack);
-        settings(Arc::clone(&t))
-            .set_persistence_settings(true, "", "  ", false)
-            .await
-            .unwrap();
-        match t.last() {
-            api::Command::SetPersistenceSettings {
-                enabled,
-                remote_url,
-                remote_name,
-                push_on_update,
-            } => {
-                assert!(enabled);
-                assert_eq!(remote_url, None);
-                assert_eq!(remote_name, None);
-                assert!(!push_on_update);
-            }
-            other => panic!("expected SetPersistenceSettings, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
     async fn get_config_maps_wire_config_via_config_from_wire() {
         let t = FakeTransport::replying(api::CommandResult::Config(api::Config {
             embeddings: api::EmbeddingsSettingsView {
@@ -1195,12 +1097,6 @@ mod tests {
                 available: true,
                 is_default: true,
                 health: Default::default(),
-            },
-            persistence: api::PersistenceSettingsView {
-                enabled: false,
-                remote_url: String::new(),
-                remote_name: "origin".into(),
-                push_on_update: true,
             },
             personality: api::PersonalitySettingsView::default(),
             restart_required: Vec::new(),

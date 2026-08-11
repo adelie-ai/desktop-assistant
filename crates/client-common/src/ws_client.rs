@@ -781,12 +781,6 @@ mod tests {
                     is_default: true,
                     health: Default::default(),
                 },
-                persistence: api::PersistenceSettingsView {
-                    enabled: false,
-                    remote_url: String::new(),
-                    remote_name: "origin".to_string(),
-                    push_on_update: true,
-                },
                 personality: api::PersonalitySettingsView::default(),
                 restart_required: Vec::new(),
                 caller_capability: None,

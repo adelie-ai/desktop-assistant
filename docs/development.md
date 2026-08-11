@@ -249,23 +249,6 @@ INFO and what belongs at DEBUG - the metrics facade, and OTLP export behind the
 
 If `OPENAI_MODEL` is not set, the daemon defaults OpenAI to `gpt-5.4`.
 
-To enable local git versioning for built-in memory/preferences:
-
-```toml
-[persistence.git]
-enabled = true
-```
-
-To push updates to a remote:
-
-```toml
-[persistence.git]
-enabled = true
-remote_url = "git@github.com:you/assistant-memory.git"
-remote_name = "origin"
-push_on_update = true
-```
-
 ## Testing MCP Integration
 
 - E2E tests may require external binaries (`fileio-mcp`, `python3`)

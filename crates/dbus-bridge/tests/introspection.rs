@@ -18,8 +18,20 @@
 //! to re-capture, and re-freezing from the bridge itself would let a dropped
 //! member (a KDE regression) silently re-baseline. Two documented intentional
 //! drops are removed from the captured Settings surface (`Q2_DROPS`): the legacy
-//! `Get/SetLlmSettings` (superseded by named connections) and `GenerateWsJwt`
-//! (JWT minting is off D-Bus entirely — #281).
+//! `Get/SetLlmSettings` (superseded by named connections), `GenerateWsJwt`
+//! (JWT minting is off D-Bus entirely — #281), and the persistence pair (#765).
+//!
+//! ## The one place the floor itself moved
+//!
+//! `GetConfig`, `SetConfig` and `ConfigChanged` carry a positional struct, and
+//! #765 removed the four `persistence_*` fields from the middle of it. A
+//! signature change is not a drop, so `Q2_DROPS` cannot express it and the
+//! golden's three struct signatures were edited in place. This is the only
+//! sanctioned edit to the floor: the feature behind those fields was removed
+//! on purpose, and adele-kde - the client the floor exists to protect - moves
+//! to the narrowed signature in the same release. Do not treat this as licence
+//! to re-baseline; a member that disappears without an entry here or in
+//! `Q2_DROPS` is still a regression.
 //!
 //! The gate checks two things, NOT byte-equality:
 //!   1. **No floor regression** — every golden member is still present on the
@@ -79,6 +91,10 @@ const Q2_DROPS: &[(&str, &str)] = &[
     ("org.desktopAssistant.Settings", "GetLlmSettings"),
     ("org.desktopAssistant.Settings", "SetLlmSettings"),
     ("org.desktopAssistant.Settings", "GenerateWsJwt"),
+    // #765 - the git-backed history mirror is gone, so the pair that read and
+    // wrote its settings has nothing behind it.
+    ("org.desktopAssistant.Settings", "GetPersistenceSettings"),
+    ("org.desktopAssistant.Settings", "SetPersistenceSettings"),
 ];
 
 /// Post-cutover **superset** members the bridge adds beyond the frozen floor.

@@ -561,12 +561,6 @@ fn config_with_restart_required(areas: &[&str]) -> api::Config {
             is_default: false,
             health: api::EmbeddingHealth::Ok,
         },
-        persistence: api::PersistenceSettingsView {
-            enabled: false,
-            remote_url: String::new(),
-            remote_name: "origin".into(),
-            push_on_update: false,
-        },
         personality: api::PersonalitySettingsView::default(),
         restart_required: areas.iter().map(|a| (*a).to_string()).collect(),
         caller_capability: None,

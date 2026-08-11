@@ -77,21 +77,6 @@ pub struct ConnectorDefaultsView {
     pub hosted_tool_search_available: bool,
 }
 
-/// The configured git-persistence settings, as stored.
-///
-/// SECURITY: `remote_url` is the value the operator configured, credential
-/// included — an HTTPS remote can embed a token inline. It is an in-process
-/// value: the application layer redacts it before it reaches a client. Any new
-/// adapter that surfaces this view owes the same redaction.
-#[derive(Debug, Clone)]
-pub struct PersistenceSettingsView {
-    pub enabled: bool,
-    /// Empty string means no remote is configured.
-    pub remote_url: String,
-    pub remote_name: String,
-    pub push_on_update: bool,
-}
-
 /// The configured database settings, as stored.
 ///
 /// SECURITY: `url` is the raw connection string, password included, and that
@@ -737,18 +722,6 @@ pub trait SettingsService: Send + Sync {
         &self,
         connector: String,
     ) -> impl std::future::Future<Output = Result<ConnectorDefaultsView, CoreError>> + Send;
-
-    fn get_persistence_settings(
-        &self,
-    ) -> impl std::future::Future<Output = Result<PersistenceSettingsView, CoreError>> + Send;
-
-    fn set_persistence_settings(
-        &self,
-        enabled: bool,
-        remote_url: Option<String>,
-        remote_name: Option<String>,
-        push_on_update: bool,
-    ) -> impl std::future::Future<Output = Result<(), CoreError>> + Send;
 
     fn get_database_settings(
         &self,

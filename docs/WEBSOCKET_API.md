@@ -303,8 +303,6 @@ Current command variants:
     recognize also deserializes as `unknown` rather than failing the payload.
 - `set_embeddings_settings { connector?, model?, base_url? }`
 - `get_connector_defaults { connector }`
-- `get_persistence_settings`
-- `set_persistence_settings { enabled, remote_url?, remote_name?, push_on_update }`
 - `get_database_settings`
 - `set_database_settings { url, max_connections }`
 - `list_negative_memories`
@@ -462,9 +460,8 @@ as "nothing is holding it".
 
 ### Credentials in connection URLs
 
-Every connection URL a reply carries — the database `url`, the git
-`remote_url` in `get_persistence_settings` and `get_config` — has its password
-replaced by `***`:
+Every connection URL a reply carries — the database `url` in
+`get_database_settings` and `get_config` — has its password replaced by `***`:
 
 ```json
 {"result": {"database_settings": {"url": "postgres://adele:***@postgres:5432/adele", "max_connections": 5}}}
@@ -718,8 +715,8 @@ which the model picker needs.
 
 An administrator is additionally required for the service-configuration writes:
 
-`set_api_key`, `set_embeddings_settings`, `set_persistence_settings`,
-`set_database_settings`, `set_backend_tasks_settings`, `set_ws_auth_settings`,
+`set_api_key`, `set_embeddings_settings`, `set_database_settings`,
+`set_backend_tasks_settings`, `set_ws_auth_settings`,
 `create_connection`, `update_connection`, `delete_connection`,
 `set_connection_secret`, `set_purpose`, `add_mcp_server`, `remove_mcp_server`,
 `set_mcp_server_enabled`, `upsert_mcp_server`, `set_mcp_secret`,

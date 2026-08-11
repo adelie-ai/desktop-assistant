@@ -4,8 +4,7 @@
 //! `[embeddings]` and backend-tasks `base_url` settings. Four call sites,
 //! one defect — a URL is used to attach a bearer token or an API key
 //! without ever being validated — so this module gives all four one rule
-//! instead of separate ad hoc checks. A fifth, `set_persistence_settings`'s
-//! git `remote_url`, is deliberately not one of them; see #991.
+//! instead of separate ad hoc checks.
 //!
 //! ## The rule
 //!
