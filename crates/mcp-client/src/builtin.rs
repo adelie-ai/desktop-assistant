@@ -183,6 +183,11 @@ const TAG_CHECK_UNKNOWN: &str = "UNKNOWN";
 /// `BuiltinToolService::with_topology`.
 const DEFAULT_DAEMON_HOST: &str = "this machine";
 
+/// What a device hit names as its host when the client reported no label
+/// (#1216). A hit must always name a machine, and an empty string reads as a
+/// name the model could quote back.
+const UNLABELLED_DEVICE_HOST: &str = "your device";
+
 /// How many daemon-side hits the tool registry is asked for.
 const REGISTRY_SEARCH_LIMIT: usize = 10;
 
@@ -2739,6 +2744,15 @@ impl BuiltinToolService {
             .filter(|t| !(same_machine && daemon_name_set.contains(t.name.as_str())))
             .collect();
 
+        // The machine each hit runs on, by name (#1216). `runs_on` says what a
+        // hit reaches; `host` says which machine issues it, which is what a
+        // request about a particular machine - "read that file on the laptop" -
+        // has to match against. A hit that named no machine left the model
+        // nothing to match.
+        let device_host = current_client_label()
+            .filter(|label| !label.trim().is_empty())
+            .unwrap_or_else(|| UNLABELLED_DEVICE_HOST.to_string());
+
         let mut tools: Vec<serde_json::Value> =
             Vec::with_capacity(results.len() + device_hits.len());
         let mut runners_present: HashSet<ToolRunner> = HashSet::new();
@@ -2752,6 +2766,7 @@ impl BuiltinToolService {
                 "name": tool.name,
                 "description": tool.description,
                 "runs_on": runner.as_str(),
+                "host": self.daemon_host,
             }));
         }
         for tool in &device_hits {
@@ -2760,6 +2775,7 @@ impl BuiltinToolService {
                 "name": tool.name,
                 "description": tool.description,
                 "runs_on": ToolRunner::Device.as_str(),
+                "host": device_host,
             }));
         }
 
@@ -8552,9 +8568,6 @@ mod tests {
     impl desktop_assistant_core::ports::client_tools::ClientToolPort for FakeClientTools {
         async fn tool_definitions(&self) -> Vec<ToolDefinition> {
             self.0.clone()
-        }
-        async fn is_registered(&self, name: &str) -> bool {
-            self.0.iter().any(|t| t.name == name)
         }
         async fn execute(
             &self,

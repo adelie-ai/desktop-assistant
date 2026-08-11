@@ -63,6 +63,9 @@ use crate::tool_provenance::{
     GATE_CLOSED_STATUS, GATE_OPEN_STATUS, GateChange, ToolGate, ToolPolicy, TurnProvenance,
     WITHHELD_STEP_TEXT, gated_tiers, is_withheld_step_text,
 };
+use crate::tool_routing::{
+    HOST_ARGUMENT, Route, RoutedTool, RoutingPolicy, ToolRouter, take_host_argument,
+};
 use crate::tools::{
     NoopToolExecutor, categorize_tool_namespaces, summarize_tool_name, summarize_tool_text,
     summarize_tool_value, tool_set_hash,
@@ -2704,7 +2707,11 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
         // phrase, rather than substituted here: the tool note and the topology
         // section address the reader differently, so one shared placeholder
         // reads wrong in at least one of them.
-        let client_label = current_client_label()
+        // The label of the machine the connected client runs on, empty when it
+        // reported none. A label, not a key: the round's tool table addresses a
+        // host by its token (#1216), so renaming a machine renames nothing a
+        // model or a stored lesson refers to.
+        let device_label = current_client_label()
             .filter(|l| !l.trim().is_empty())
             .unwrap_or_default();
         let tool_locality = ToolLocalityContext {
@@ -2712,35 +2719,44 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
             transport: current_transport_kind(),
             host: self.host.clone(),
             daemon_on_workstation: self.on_workstation,
-            client_label,
+            client_label: device_label.clone(),
             server_tool_names,
             client_tool_names: client_tool_defs.iter().map(|d| d.name.clone()).collect(),
         };
 
-        // Report the client tools this turn cannot reach (#1083). The tool-set
-        // merge below drops a client definition whose name a server-side tool
-        // already holds, so the model is never offered it and dispatch routes
-        // the name to the server executor. Reported once here, where the
-        // collision is resolved, rather than on every note build.
+        // Report the client tools that share a name with a daemon-side one
+        // (#1083). The round's tool table advertises one definition per name,
+        // chosen by the routing policy, and routes the call to the host that
+        // definition came from - so the daemon-side tool is the one the model
+        // is shown and the one an unqualified call reaches. The client's twin
+        // is still reachable: the advertised schema carries the host argument,
+        // and a call that names the device runs there (#1216). Reported once
+        // here, where the collision is resolved, rather than on every note
+        // build.
         //
-        // On one machine that is the intended collapse of one capability that
-        // happens to be registered twice, so it is an ordinary outcome. On two
-        // machines it is a real loss: the operator registered a tool meant to
-        // act on the user's own machine, and nothing can call it.
+        // On one machine the two are the same machine anyway. On two machines
+        // the choice matters, which is why it is a warning: a tool registered
+        // to act on the user's own machine only acts there when the model says
+        // so, and a client that meant it to be the default should give it a
+        // name of its own.
         let shadowed = tool_locality.shadowed_client_tools();
         if !shadowed.is_empty() {
             if tool_locality.is_co_located() {
                 tracing::info!(
                     tools = ?shadowed,
+                    policy = RoutingPolicy::PreferCoLocated.as_str(),
                     "client tools share a name with a daemon-side tool; the daemon-side \
-                     one is used, and both run on this one machine"
+                     one answers by default, and both run on this one machine"
                 );
             } else {
                 tracing::warn!(
                     tools = ?shadowed,
-                    "client tools share a name with a daemon-side tool, so they cannot be \
-                     called; the daemon-side tool wins and acts on the daemon's machine. \
-                     Rename them (for example with a namespace) to make them reachable"
+                    policy = RoutingPolicy::PreferCoLocated.as_str(),
+                    host_argument = HOST_ARGUMENT,
+                    "client tools share a name with a daemon-side tool; the daemon-side one \
+                     answers by default and acts on the daemon's machine. The client's tool \
+                     runs only when the call names the device. Rename them (for example with \
+                     a namespace) to make them the default"
                 );
             }
         }
@@ -2898,54 +2914,68 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
             }
             round_starts.push(conv.messages.len());
 
-            // Build the tool set: core + dynamically activated.
-            // When hosted search has been demoted, use the full core set
+            // Build the round's tool table (#1216). Every name this round can
+            // reach goes in it once per host, and the table answers both
+            // questions the loop asks about a name: which definition the model
+            // is shown, and which host runs the call. They were two lookups
+            // over two tables with opposite precedence, so a name both sides
+            // offered was advertised from one host and executed on the other.
+            //
+            // Offer order still decides where a name sits in the advertised
+            // block - core, then activated, then the client's - so a round's
+            // block stays a prefix of the next one's for the provider's prompt
+            // cache. It no longer decides which host answers for the name;
+            // that is the router's policy.
+            let mut router = ToolRouter::new(
+                RoutingPolicy::PreferCoLocated,
+                &self.host,
+                device_label.as_str(),
+            );
+            // When hosted search has been demoted, offer the full core set
             // (which includes builtin_tool_search) instead of the filtered one.
-            let mut tool_defs: Vec<ToolDefinition> = if hosted_search_demoted {
-                core_tools.clone()
+            router.offer_daemon_tools(if hosted_search_demoted {
+                &core_tools
             } else {
-                core_tools_for_llm.clone()
-            };
-            tool_defs.extend(activated_tools.iter().cloned());
-            // Offer the connection's registered client-local tools alongside
-            // the server-side set so the LLM can invoke them (#234). Skip any
-            // whose name already collides with a server-side tool — the
-            // server-side definition wins to keep dispatch unambiguous.
-            for def in &client_tool_defs {
-                if !tool_defs.iter().any(|t| t.name == def.name) {
-                    tool_defs.push(def.clone());
-                }
-            }
-            // Advertise the step-planning + compaction tools (#240) when a
-            // scratchpad writer is wired. They are core-loop tools — intercepted
-            // by name in the dispatch loop below rather than routed to the tool
-            // executor — so they're appended here, after the server/client sets,
-            // every round. Without a writer wired they stay off entirely.
+                &core_tools_for_llm
+            });
+            router.offer_daemon_tools(&activated_tools);
+            // The connection's registered client-local tools (#234), hosted on
+            // the user's own machine.
+            router.offer_device_tools(&client_tool_defs);
+            // The step-planning + compaction tools (#240) when a scratchpad
+            // writer is wired. They are the loop's own control surface -
+            // intercepted by name in the dispatch loop below rather than routed
+            // to an executor - so the table ranks them above any hosted tool of
+            // the same name, and dispatch reads that ranking rather than
+            // re-deciding it. Without a writer wired they stay off entirely.
             if self.scratchpad_write.is_some() {
-                tool_defs.push(planning::begin_step_tool());
-                tool_defs.push(planning::complete_step_tool());
+                router.offer_core_loop_tool(planning::begin_step_tool());
+                router.offer_core_loop_tool(planning::complete_step_tool());
                 // Keeping a finished plan is a core-loop tool for the same
                 // reason the pair above is: the plan and the turn's messages
                 // are the loop's, and the offer arrives in a step's own
                 // acknowledgement (#1155). Off unless the catalog is wired.
                 if self.skill_write_authored.is_some() {
-                    tool_defs.push(skill_promotion::promote_plan_tool());
+                    router.offer_core_loop_tool(skill_promotion::promote_plan_tool());
                 }
             }
 
-            // Restrict the advertised tool set to the caller's allowlist
-            // (issues #291 / #133) so a restricted subagent's LLM only ever
-            // sees the tools it may use. `None` ⇒ no restriction; an empty
-            // allowlist ⇒ no tools. The core-loop step-planning tools are
-            // exempt — they're the loop's own control surface, not delegable
+            // Restrict the round's table to the caller's allowlist (issues
+            // #291 / #133) so a restricted subagent's LLM only ever sees the
+            // tools it may use - and, because dispatch resolves through the
+            // same table, can only reach what it saw. `None` ⇒ no restriction;
+            // an empty allowlist ⇒ no tools. The step-planning pair is exempt:
+            // they're the loop's own control surface, not delegable
             // capabilities, and dispatch also re-checks the allowlist below.
             if let Some(allowed) = current_tool_allowlist() {
-                tool_defs.retain(|t| {
-                    t.name == planning::BEGIN_STEP_TOOL
-                        || t.name == planning::COMPLETE_STEP_TOOL
-                        || allowed.iter().any(|a| a == &t.name)
+                router.retain(|name| {
+                    name == planning::BEGIN_STEP_TOOL
+                        || name == planning::COMPLETE_STEP_TOOL
+                        || allowed.iter().any(|a| a == name)
                 });
             }
+
+            let tool_defs: Vec<ToolDefinition> = router.advertised_definitions();
 
             let deferred_ns: &[ToolNamespace] = if !hosted_search_demoted {
                 &namespaces
@@ -3538,7 +3568,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 // silently defaulted to `null` — the tool would run with
                 // garbage arguments and the model would get a confusing
                 // tool-specific error instead of the real cause (DA-13).
-                let arguments: serde_json::Value = if tool_call.arguments.trim().is_empty() {
+                let mut arguments: serde_json::Value = if tool_call.arguments.trim().is_empty() {
                     serde_json::json!({})
                 } else {
                     match serde_json::from_str(&tool_call.arguments) {
@@ -3560,6 +3590,50 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                         }
                     }
                 };
+                // The host the model stated, taken off the arguments before
+                // anything else reads them (#1216). It is the harness's field,
+                // not the tool's: no tool receives it, and the negative-memory
+                // digest below is taken without it, so a lesson learned about
+                // a call on one machine still matches the same call on another.
+                let requested_host = take_host_argument(&mut arguments);
+
+                // Where this call goes. The round's tool table answers it, and
+                // the same table chose the definition the model was shown, so
+                // the schema it read and the host that runs the call are one
+                // answer rather than two that may differ (#1216).
+                let route = router.resolve(&tool_call.name, requested_host.as_deref());
+                if let Route::UnknownHost { asked, available } = &route {
+                    tracing::info!(
+                        tool = %Safe::name(&tool_call.name),
+                        host = %Safe::name(asked),
+                        "tool call named a host that does not run this tool"
+                    );
+                    notify_tool_event(ToolEvent::Started {
+                        name: summarize_tool_name(&tool_call.name),
+                        args: summarize_tool_value(&arguments),
+                    });
+                    notify_tool_event(ToolEvent::Finished {
+                        name: summarize_tool_name(&tool_call.name),
+                        ok: false,
+                        output: format!("no such host: {asked}"),
+                    });
+                    let hosts = available.join(", ");
+                    conv.messages.push(Message::tool_result(
+                        &tool_call.id,
+                        format!(
+                            "Error: '{}' does not run on '{asked}'. It runs on: {hosts}. Set \
+                             `{HOST_ARGUMENT}` to one of those, or leave it out and the host \
+                             is chosen for you.",
+                            tool_call.name
+                        ),
+                    ));
+                    continue;
+                }
+                let routed: Option<&RoutedTool> = match &route {
+                    Route::Found(entry) => Some(entry),
+                    Route::UnknownHost { .. } | Route::Unrouted => None,
+                };
+
                 // A tool call's arguments are content: the model puts the
                 // user's document, file path or credential in them. INFO
                 // carries the tool name and the size; the arguments go to
@@ -3580,15 +3654,15 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 // `conv.messages` (for eviction) and the per-turn step stack.
                 // Every tool call still needs a tool_result for provider
                 // pairing, so we push the (small) ack and move to the next call.
-                // Gate on the same condition that advertises these tools, so when
-                // planning is off the names aren't shadowed (an MCP tool could
-                // otherwise share one) and dispatch falls through as normal.
-                // Keeping a finished plan as a skill (#1155) reads the same
-                // plan the step tools write, so it is intercepted here too.
-                // Gated on the condition that advertises it, so the name is not
-                // shadowed when the catalog is unwired.
-                if self.scratchpad_write.is_some()
-                    && self.skill_write_authored.is_some()
+                // Gated on the round's tool table rather than on the wiring
+                // that fills it (#1216): the table ranks the loop's control
+                // surface above any hosted tool of the same name, so this
+                // branch fires exactly when the model was shown the loop's
+                // schema, and dispatch falls through as normal when planning is
+                // off and an MCP tool holds the name instead. Keeping a
+                // finished plan as a skill (#1155) reads the same plan the step
+                // tools write, so it is intercepted here too.
+                if routed.is_some_and(RoutedTool::is_core_loop)
                     && tool_call.name == skill_promotion::PROMOTE_PLAN_TOOL
                 {
                     let ack = self
@@ -3605,7 +3679,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                     continue;
                 }
 
-                if self.scratchpad_write.is_some()
+                if routed.is_some_and(RoutedTool::is_core_loop)
                     && (tool_call.name == planning::BEGIN_STEP_TOOL
                         || tool_call.name == planning::COMPLETE_STEP_TOOL)
                 {
@@ -3844,16 +3918,20 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                     args: summarize_tool_value(&arguments),
                 });
 
-                // Route client-local tools to the client (#107 / #234): if a
-                // per-turn client-tool port is installed and the called name is
-                // registered for this user, suspend the turn and await the
-                // client's result instead of running a server-side executor.
-                // A registered client tool whose name collides with a
-                // server-side one never reaches here — the tool-set merge above
-                // gives the server-side definition precedence, so the LLM was
-                // offered (and called) the server-side tool.
-                let client_exec = match &client_tool_port {
-                    Some(port) if port.is_registered(&tool_call.name).await => Some(port),
+                // Route client-local tools to the client (#107 / #234): when
+                // the round's table put this call on the connected client's
+                // machine, suspend the turn and await the client's result
+                // instead of running a server-side executor.
+                //
+                // The table is the only thing consulted here (#1216). It is the
+                // one that chose the definition the model was shown, so a name
+                // both hosts offer cannot be advertised from one and executed
+                // on the other. A name the table does not hold - one the model
+                // learned in an earlier turn and called directly - runs
+                // server-side, because the executor's routing table outlives
+                // the turn and the client's registrations do not.
+                let client_exec = match (&client_tool_port, routed) {
+                    (Some(port), Some(entry)) if entry.host().is_client() => Some(port),
                     _ => None,
                 };
 
@@ -3861,11 +3939,10 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 // where it ran: a client tool crosses a socket to the user's
                 // own machine and a server tool does not, so folding the two
                 // into one series would hide the difference that matters.
-                let tool_runner = if client_exec.is_some() {
-                    crate::telemetry::ToolRunner::Client
-                } else {
-                    crate::telemetry::ToolRunner::Server
-                };
+                let tool_runner = routed.map_or(
+                    crate::telemetry::ToolRunner::Server,
+                    RoutedTool::telemetry_runner,
+                );
                 // Resolved before the clock starts, so the lookup is not
                 // counted as tool time. Whether the name belongs to a set the daemon controls
                 // rather than to the model. That is the only property the
@@ -4103,6 +4180,17 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                     && let Some(tools_arr) = found.get("tools").and_then(|v| v.as_array())
                 {
                     for tool_entry in tools_arr {
+                        // A hit that runs on the user's own machine is already
+                        // in the round's table, offered by the client (#1216).
+                        // Activating the daemon's tool of the same name would
+                        // put the daemon's schema in front of the model for a
+                        // capability the search just told it runs elsewhere,
+                        // and the route would not move with it.
+                        if tool_entry.get("runs_on").and_then(|v| v.as_str())
+                            == Some(crate::domain::ToolRunner::Device.as_str())
+                        {
+                            continue;
+                        }
                         if let Some(name) = tool_entry.get("name").and_then(|v| v.as_str())
                             && !activated_tools.iter().any(|t| t.name == name)
                             && !core_tools.iter().any(|t| t.name == name)
@@ -10797,9 +10885,6 @@ mod tests {
     impl crate::ports::client_tools::ClientToolPort for FakeClientToolPort {
         async fn tool_definitions(&self) -> Vec<ToolDefinition> {
             self.defs.clone()
-        }
-        async fn is_registered(&self, name: &str) -> bool {
-            self.defs.iter().any(|d| d.name == name)
         }
         async fn execute(
             &self,

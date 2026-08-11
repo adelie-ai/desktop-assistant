@@ -46,7 +46,7 @@
 //! the harness picks by policy. The argument is routing metadata, so the loop
 //! removes it before the tool runs: it is not part of any tool's own schema.
 
-use crate::domain::{ToolDefinition, ToolLocality};
+use crate::domain::{ToolDefinition, ToolLocality, ToolRunner};
 
 /// The argument that carries the host of a call, on a capability that more
 /// than one host offers.
@@ -131,6 +131,17 @@ impl RoutedTool {
     /// an executor.
     pub fn is_core_loop(&self) -> bool {
         self.source == ToolSource::CoreLoop
+    }
+
+    /// The telemetry label for the side that ran this call, derived from the
+    /// route rather than computed a second time from the client registration
+    /// map. A span that disagreed with the route would describe a turn that
+    /// did not happen.
+    pub(crate) fn telemetry_runner(&self) -> crate::telemetry::ToolRunner {
+        match self.host {
+            ToolLocality::Server { .. } => crate::telemetry::ToolRunner::Server,
+            ToolLocality::Client { .. } => crate::telemetry::ToolRunner::Client,
+        }
     }
 }
 
@@ -224,33 +235,185 @@ impl ToolRouter {
     /// The definitions the model is shown: one per capability name, in the
     /// order the names were first offered, each from the host this table would
     /// route the name to.
+    ///
+    /// A capability more than one host offers carries [`HOST_ARGUMENT`], so
+    /// the model can state which machine it means. Everything else is
+    /// advertised exactly as its host defined it, which keeps the advertised
+    /// block byte-stable for the tools that have nothing to choose.
     pub fn advertised_definitions(&self) -> Vec<ToolDefinition> {
-        unimplemented!("#1216: the advertised set is chosen by policy")
+        let mut advertised: Vec<ToolDefinition> = Vec::with_capacity(self.entries.len());
+        let mut seen: Vec<&str> = Vec::new();
+        for entry in &self.entries {
+            if seen.contains(&entry.name()) {
+                continue;
+            }
+            seen.push(entry.name());
+            let chosen = self
+                .preferred(entry.name())
+                .expect("a name read out of the table resolves within it");
+            let hosts = self.host_tokens(entry.name());
+            if chosen.is_core_loop() || hosts.len() < 2 {
+                advertised.push(chosen.definition().clone());
+            } else {
+                advertised.push(self.with_host_argument(chosen.definition(), &hosts));
+            }
+        }
+        advertised
     }
 
     /// The entry that answers for `name`, with the host the model stated (as
     /// it wrote it) or `None` when it stated none.
+    ///
+    /// With no host stated this is the same call the advertised set made, so
+    /// the schema the model read and the host that runs the call are one
+    /// answer rather than two that agree by inspection.
     pub fn resolve(&self, name: &str, host: Option<&str>) -> Route<'_> {
-        // Placeholder: today's dispatch, which prefers the device entry
-        // whatever the model was shown. Replaced by a resolution that shares
-        // `preferred` with the advertised set.
-        let _ = host;
-        let mut found: Option<&RoutedTool> = None;
-        for entry in self.entries.iter().filter(|e| e.name() == name) {
-            if found.is_none() || entry.host().is_client() {
-                found = Some(entry);
-            }
+        let Some(chosen) = self.preferred(name) else {
+            return Route::Unrouted;
+        };
+        let Some(asked) = host.map(str::trim).filter(|h| !h.is_empty()) else {
+            return Route::Found(chosen);
+        };
+        // The loop's control surface runs in the loop, on the daemon, and no
+        // host argument was advertised for it. A stated host is then noise
+        // rather than a route, so it changes nothing.
+        if chosen.is_core_loop() {
+            return Route::Found(chosen);
         }
-        found.map_or(Route::Unrouted, Route::Found)
+        self.entries
+            .iter()
+            .find(|e| e.name() == name && token_names_host(asked, e.host()))
+            .map_or_else(
+                || Route::UnknownHost {
+                    asked: asked.to_string(),
+                    available: self.host_tokens(name),
+                },
+                Route::Found,
+            )
     }
 
-    /// Add an entry, keeping the first definition offered for a
-    /// (name, host) pair.
-    fn insert(&mut self, definition: ToolDefinition, host: ToolLocality, source: ToolSource) {
-        let duplicate = self
+    /// The one place a name is ranked into a host. Both the advertised set and
+    /// [`ToolRouter::resolve`] go through here, so an answer that differed
+    /// between them cannot be built.
+    fn preferred(&self, name: &str) -> Option<&RoutedTool> {
+        let mut best: Option<&RoutedTool> = None;
+        for entry in self.entries.iter().filter(|e| e.name() == name) {
+            let wins = best.is_none_or(|incumbent| self.outranks(entry, incumbent));
+            if wins {
+                best = Some(entry);
+            }
+        }
+        best
+    }
+
+    /// The ranking, in full: the turn loop's own control surface first,
+    /// because the loop intercepts those names before any executor and a
+    /// hosted tool of the same name could never have run; then the hosts, by
+    /// [`RoutingPolicy`].
+    fn outranks(&self, candidate: &RoutedTool, incumbent: &RoutedTool) -> bool {
+        if candidate.is_core_loop() != incumbent.is_core_loop() {
+            return candidate.is_core_loop();
+        }
+        match self.policy {
+            RoutingPolicy::PreferCoLocated => {
+                candidate.host().is_server() && incumbent.host().is_client()
+            }
+        }
+    }
+
+    /// The host tokens that offer `name`, in table order. Empty for a name
+    /// only the turn loop claims.
+    fn host_tokens(&self, name: &str) -> Vec<&'static str> {
+        let mut tokens: Vec<&'static str> = Vec::new();
+        for entry in self
             .entries
             .iter()
-            .any(|e| e.name() == definition.name && e.host.host_token() == host.host_token());
+            .filter(|e| e.name() == name && !e.is_core_loop())
+        {
+            let token = entry.host().host_token();
+            if !tokens.contains(&token) {
+                tokens.push(token);
+            }
+        }
+        tokens
+    }
+
+    /// The definition with [`HOST_ARGUMENT`] added, listing the hosts that
+    /// offer it and naming each one.
+    ///
+    /// A definition whose parameters are not a JSON object cannot carry the
+    /// field. That capability is still routed by policy; it just cannot be
+    /// addressed by host, and the loop says so rather than advertising a
+    /// choice that is not there.
+    fn with_host_argument(
+        &self,
+        definition: &ToolDefinition,
+        hosts: &[&'static str],
+    ) -> ToolDefinition {
+        let mut advertised = definition.clone();
+        let properties = advertised.parameters.as_object_mut().and_then(|schema| {
+            schema
+                .entry("properties")
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+                .as_object_mut()
+        });
+        let Some(properties) = properties else {
+            tracing::warn!(
+                tool = %definition.name,
+                "a tool whose parameters are not an object cannot say which host to run on"
+            );
+            return advertised;
+        };
+        properties.insert(
+            HOST_ARGUMENT.to_string(),
+            serde_json::json!({
+                "type": "string",
+                "enum": hosts,
+                "description": self.describe_hosts(hosts),
+            }),
+        );
+        advertised
+    }
+
+    /// One line naming each host the model may choose, and what happens when
+    /// it chooses none.
+    fn describe_hosts(&self, hosts: &[&'static str]) -> String {
+        let named: Vec<String> = hosts
+            .iter()
+            .map(|token| {
+                if *token == ToolRunner::Device.as_str() {
+                    match self.device_label.trim() {
+                        "" => format!("`{token}` runs it on your own machine"),
+                        label => format!("`{token}` runs it on your own machine, '{label}'"),
+                    }
+                } else {
+                    format!(
+                        "`{token}` runs it on the assistant's machine, '{}'",
+                        self.daemon_host
+                    )
+                }
+            })
+            .collect();
+        format!(
+            "Which machine runs this call: {}. Leave it out when the task is not about a \
+             particular machine: the assistant then picks the host it runs on.",
+            named.join("; ")
+        )
+    }
+
+    /// Add an entry, keeping the first definition offered for a name on a
+    /// host from a source.
+    ///
+    /// The daemon offers its core set and then its activated set, and a tool
+    /// in both is one tool; the loop's claim on a name is a different entry,
+    /// because the loop and a daemon tool can both hold one and the ranking
+    /// between them is the point.
+    fn insert(&mut self, definition: ToolDefinition, host: ToolLocality, source: ToolSource) {
+        let duplicate = self.entries.iter().any(|e| {
+            e.name() == definition.name
+                && e.host.host_token() == host.host_token()
+                && e.source == source
+        });
         if !duplicate {
             self.entries.push(RoutedTool {
                 definition,
@@ -259,6 +422,36 @@ impl ToolRouter {
             });
         }
     }
+}
+
+/// Take the host off a tool call's arguments, leaving the arguments the tool
+/// itself declared.
+///
+/// The host is routing metadata: it belongs to the harness, not to the tool,
+/// so a tool never receives it and no fingerprint taken over the arguments
+/// includes it. A lesson learned about a call on one machine then still
+/// matches the same call on another (#1126, #1216).
+///
+/// Returns `None` when the model stated no host, or stated one that is not a
+/// string - a non-string is not a host anybody offers, and the caller's
+/// unstated-host policy is the right answer for it.
+pub fn take_host_argument(arguments: &mut serde_json::Value) -> Option<String> {
+    arguments
+        .as_object_mut()?
+        .remove(HOST_ARGUMENT)?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Whether `token`, as the model wrote it, names `host`.
+///
+/// The vocabulary is the one a tool-search hit reports in `runs_on`, so the
+/// model can state the host it just read. `remote-service` names the daemon:
+/// it says what the tool reaches, not where the call is made, and the call is
+/// made from the daemon either way.
+fn token_names_host(token: &str, host: &ToolLocality) -> bool {
+    token.eq_ignore_ascii_case(host.host_token())
+        || (host.is_server() && token.eq_ignore_ascii_case(ToolRunner::RemoteService.as_str()))
 }
 
 #[cfg(test)]
@@ -482,6 +675,27 @@ mod tests {
             tokens(&after),
             "the token that addresses a host must not change when its label does"
         );
+    }
+
+    /// The host is routing metadata: the tool is called with the arguments
+    /// the model wrote for it, and nothing else.
+    #[test]
+    fn taking_the_host_leaves_the_tool_its_own_arguments() {
+        let mut arguments = serde_json::json!({"path": "/etc/hosts", "__host": "device"});
+        assert_eq!(
+            take_host_argument(&mut arguments).as_deref(),
+            Some("device")
+        );
+        assert_eq!(arguments, serde_json::json!({"path": "/etc/hosts"}));
+    }
+
+    /// Arguments that state no host are handed on untouched, so the policy
+    /// answers for them.
+    #[test]
+    fn taking_the_host_from_arguments_that_state_none_changes_nothing() {
+        let mut arguments = serde_json::json!({"path": "/etc/hosts"});
+        assert_eq!(take_host_argument(&mut arguments), None);
+        assert_eq!(arguments, serde_json::json!({"path": "/etc/hosts"}));
     }
 
     /// A name the turn never offered is not routed here. The turn loop hands

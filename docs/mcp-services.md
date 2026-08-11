@@ -484,6 +484,14 @@ description do not say which machine it acts on. Each result carries a
 | `remote-service` | An MCP server the daemon reaches over HTTP. Acts on that service, and on no local files. |
 | `device` | A tool the connected client registered. Acts on the user's own machine. |
 
+Each hit also carries `host`, the name of the machine that issues the call: the
+daemon's own label for a `daemon` or `remote-service` hit, and the connected
+client's label for a `device` hit (`your device` when the client reported none).
+The two fields answer different questions. `runs_on` says what a tool reaches,
+which is what stops a model believing a remote calendar tool can read local
+files. `host` says which machine issues it, which is what a request about a
+particular machine - "read that file on the laptop" - is matched against.
+
 The daemon and remote-service split is read live from the routing table and the
 server configuration, so a server added since startup classifies correctly. A
 name the executor does not route is a built-in, which runs inside the daemon
@@ -504,6 +512,36 @@ collision.
 
 A search that matched more client tools than it returned reports the count it
 dropped in `more_device_tools_matched`.
+
+## One Name, Two Machines
+
+A tool is identified by the pair (capability name, host). The name says what the
+tool does and never says where it runs, so a machine that is renamed or replaced
+changes no tool name - and what the assistant learned about a tool on one
+machine still applies to the same tool on another.
+
+Each turn builds one table of every tool it can reach, keyed by that pair. The
+table decides both what the model is shown and where each call goes, so the
+schema the model reads and the machine that runs the call are one decision
+rather than two that can disagree.
+
+When the daemon and the connected client both offer a capability under one name:
+
+- The advertised schema gains an optional `__host` argument, whose values are
+  the `runs_on` tokens of the hosts that offer it (`daemon`, `device`). The
+  model sets it when the task is about a particular machine.
+- With no `__host` stated, the routing policy chooses. The policy is
+  `prefer-co-located`: the call stays on the daemon, which is the process
+  running the turn, rather than crossing a socket to a client that may
+  disconnect mid-turn.
+- `__host` is the harness's field, not the tool's. It is removed before the tool
+  runs, so no tool receives it.
+- A capability only one host offers carries no `__host` argument: there is
+  nothing to choose.
+
+An operator who wants a client-registered tool to be the default for a name the
+daemon also holds should give it a name of its own - a namespace on the client's
+MCP entry does that. The daemon logs the shared names once per turn.
 
 ## Startup Behaviour
 

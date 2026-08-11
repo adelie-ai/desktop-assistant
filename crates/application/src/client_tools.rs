@@ -540,7 +540,7 @@ pub async fn sweep_non_terminal_turns_on_startup(
 ///
 /// User scoping is implicit: every coordinator entry point reads
 /// `current_user_id()` from the task-local the dispatcher installed, so this
-/// adapter's `tool_definitions`/`is_registered`/`execute` are all scoped to
+/// adapter's `tool_definitions`/`execute` are both scoped to
 /// the connection's user.
 pub struct CoordinatorClientToolPort {
     coord: Arc<ClientToolCoordinator>,
@@ -679,10 +679,6 @@ impl TurnStateStore for InMemoryTurnStateStore {
 impl ClientToolPort for CoordinatorClientToolPort {
     async fn tool_definitions(&self) -> Vec<ToolDefinition> {
         self.coord.registered_definitions().await
-    }
-
-    async fn is_registered(&self, name: &str) -> bool {
-        self.coord.is_client_registered(name).await
     }
 
     async fn execute(

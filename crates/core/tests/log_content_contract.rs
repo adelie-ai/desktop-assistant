@@ -259,10 +259,6 @@ impl ClientToolPort for FailingClientToolPort {
         self.tools.clone()
     }
 
-    async fn is_registered(&self, name: &str) -> bool {
-        self.tools.iter().any(|t| t.name == name)
-    }
-
     async fn execute(
         &self,
         _tool_call_id: &str,
@@ -434,14 +430,30 @@ fn server_tool_failure_capturing(level: Level) -> String {
     logs
 }
 
+/// The name only the client holds. The client-tool arm calls this rather than
+/// the daemon's `write_note` so the turn reaches the client executor because
+/// that is the only host offering the capability - not because dispatch
+/// preferred one of two hosts that both offered it (#1216).
+const CLIENT_ONLY_TOOL: &str = "write_note_on_device";
+
+/// The model's script for the client-tool arm: one call to the name only the
+/// client holds, then an answer.
+fn client_tool_call_script() -> Vec<LlmResponse> {
+    let arguments = serde_json::json!({ "note": TOOL_ARGUMENT_SENTINEL }).to_string();
+    vec![
+        LlmResponse::with_tool_calls("", vec![ToolCall::new("c1", CLIENT_ONLY_TOOL, arguments)]),
+        LlmResponse::text("saved"),
+    ]
+}
+
 /// Run one turn whose tool call is routed to a client tool that fails.
 fn client_tool_failure_capturing(level: Level) -> String {
     let (_, logs) = capture_at(level, async {
-        let handler = handler(tool_call_script());
+        let handler = handler(client_tool_call_script());
         let port: std::sync::Arc<dyn ClientToolPort> = std::sync::Arc::new(FailingClientToolPort {
             tools: vec![ToolDefinition::new(
-                "write_note",
-                "write a note",
+                CLIENT_ONLY_TOOL,
+                "write a note on the user's own machine",
                 serde_json::json!({"type": "object"}),
             )],
             failure: TOOL_ERROR_SENTINEL.to_string(),
