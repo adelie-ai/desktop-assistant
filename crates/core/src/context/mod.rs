@@ -41,6 +41,7 @@ use crate::domain::{
 };
 use crate::planning;
 use crate::ports::llm::{ContextBudget, LlmClient, ReasoningConfig};
+use crate::telemetry::{PromptBreakdown, PromptPart};
 
 /// Default maximum number of conversation messages sent to the LLM per turn.
 /// When the conversation exceeds this limit, only the most recent messages
@@ -311,6 +312,14 @@ pub(crate) struct AssembledTurn {
     /// the order it rendered them (#1154). Reported for the same reason, and
     /// recorded against the skill use log rather than the knowledge one.
     pub recalled_skill_names: Vec<String>,
+    /// What each part of this prompt cost, in estimated tokens (#1203).
+    ///
+    /// Reported rather than re-derived, for the reason the ids above are: only
+    /// the assembler knows which block it emitted, and recovering that
+    /// afterwards would mean matching on the `[..]` tag a block happens to
+    /// open with. Denominated in the `estimate` closure the caller passed, so
+    /// the breakdown and the budget check below read one number.
+    pub breakdown: PromptBreakdown,
 }
 
 /// Build the message list for a single turn, optionally enforcing a
@@ -348,11 +357,21 @@ pub(crate) fn assemble_turn_within_budget(
     // deterministic.
     let ambient = AmbientContext::current();
 
+    // Tool schemas are sent to the model out-of-band (the `tools` array, not a
+    // message body), so summing message bodies alone undercounts: namespace
+    // activation can inject tens of KB of JSON Schema (issue #305 item 7).
+    // Computed once, outside the shrink loop, because shrinking drops
+    // *messages* and never changes the tool set - and unconditionally, budget
+    // or no budget, because the breakdown reports what the schemas cost on
+    // every turn (#1203).
+    let tool_schema_tokens =
+        tool_schema_estimate(tools.tool_defs, tools.deferred_namespaces, estimate);
+
     // One assembly pass at a given window size. The only thing that varies
     // across the shrink loop is `max_messages`, so everything else is captured
     // once here and the two call sites collapse to `assemble(current_max)`.
     let assemble = |max: usize| {
-        assemble_turn(
+        let mut pass = assemble_turn(
             conversation,
             tools,
             anchors,
@@ -361,13 +380,17 @@ pub(crate) fn assemble_turn_within_budget(
             max,
             budget,
             estimate,
-        )
+        );
+        pass.breakdown
+            .set_tools(tools.tool_defs.len(), tool_schema_tokens);
+        pass
     };
     let finish = |pass: TurnMessages, max: usize| AssembledTurn {
         messages: pass.messages,
         window_from: window_start(conversation.messages, max),
         recalled_entry_ids: pass.recalled_entry_ids,
         recalled_skill_names: pass.recalled_skill_names,
+        breakdown: pass.breakdown,
     };
 
     let mut current_max = max_messages;
@@ -377,29 +400,20 @@ pub(crate) fn assemble_turn_within_budget(
         return finish(assembled, current_max);
     };
 
-    // Pre-flight token estimate: sum the cost of every assembled message's
-    // body, plus the active tool schemas. The threshold mirrors
-    // `COMPACTION_TOKEN_RATIO` used by the post-call token-pressure path so
-    // the two checks agree on what counts as "near the limit".
+    // Pre-flight token estimate: what the breakdown says this pass costs -
+    // every assembled message body plus the active tool schemas. The threshold
+    // mirrors `COMPACTION_TOKEN_RATIO` used by the post-call token-pressure
+    // path so the two checks agree on what counts as "near the limit".
     //
-    // Tool schemas are sent to the model out-of-band (the `tools` array, not
-    // a message body), so summing message bodies alone undercounts: namespace
-    // activation can inject tens of KB of JSON Schema the budget never sees
-    // (issue #305 item 7). Account for it explicitly. The cost is constant
-    // across shrink iterations (shrinking only drops *messages*), so it is
-    // computed once here.
+    // The check reads the breakdown's own total rather than re-summing, so the
+    // number an operator reads on the turn span is the number this decision
+    // was taken on. Two sums over the same prompt could drift apart silently;
+    // one cannot.
     let max_input_tokens = active_budget.max_input_tokens;
     let threshold = (max_input_tokens as f64 * COMPACTION_TOKEN_RATIO) as u64;
-    let tool_schema_tokens =
-        tool_schema_estimate(tools.tool_defs, tools.deferred_namespaces, estimate);
 
     for _ in 0..MAX_PREFLIGHT_SHRINK_ITERATIONS {
-        let message_tokens: u64 = assembled
-            .messages
-            .iter()
-            .map(|m| estimate(&m.content))
-            .sum();
-        let assembled_tokens = message_tokens + tool_schema_tokens;
+        let assembled_tokens = assembled.breakdown.total_tokens();
         if assembled_tokens <= threshold {
             return finish(assembled, current_max);
         }
@@ -925,20 +939,36 @@ fn assemble_turn(
         windowed,
         &active_summary_ids,
     );
+    // What each part of this prompt costs, measured as the prompt is laid out
+    // (#1203). Attribution happens here because here is the only place that
+    // knows which block is which: reading it back off the finished prompt
+    // would mean matching on the `[..]` tag a block happens to open with.
+    // Costed with the caller's `estimate`, the same closure the budget check
+    // reads.
+    let mut breakdown = PromptBreakdown::default();
+    breakdown.add(PromptPart::System, estimate(&system_instruction));
+
     let mut messages = Vec::with_capacity(windowed.len() + 2);
     messages.push(Message::new(Role::System, system_instruction));
-    messages.extend(surfaced.blocks);
-    messages.extend(expand_history(
+    for block in surfaced.blocks {
+        breakdown.add(block.part, estimate(&block.message.content));
+        messages.push(block.message);
+    }
+    for message in expand_history(
         windowed,
         start,
         conversation.summaries,
         &active_summary_ids,
         projection,
-    ));
+    ) {
+        breakdown.add(PromptPart::Transcript, estimate(&message.content));
+        messages.push(message);
+    }
     TurnMessages {
         messages,
         recalled_entry_ids: surfaced.recalled_entry_ids,
         recalled_skill_names: surfaced.recalled_skill_names,
+        breakdown,
     }
 }
 
@@ -953,6 +983,10 @@ struct TurnMessages {
     recalled_entry_ids: Vec<String>,
     /// See [`AssembledTurn::recalled_skill_names`].
     recalled_skill_names: Vec<String>,
+    /// See [`AssembledTurn::breakdown`]. Carries every part but the tool
+    /// schemas, which are the same on every pass of the shrink loop and are
+    /// filled in by the wrapper.
+    breakdown: PromptBreakdown,
 }
 
 /// Build the turn's system-instruction string: the assembled prompt sections
@@ -1006,10 +1040,30 @@ fn system_block(
     demoted_system
 }
 
+/// One re-surfaced block, and which part of the prompt it counts as.
+///
+/// The two travel together so the cost is attributed where the block is built.
+/// A prompt read back afterwards is a list of messages that all open with a
+/// `[..]` tag, and nothing holds those tags stable.
+struct SurfacedBlock {
+    part: PromptPart,
+    message: Message,
+}
+
+impl SurfacedBlock {
+    /// A `[..]` system block of the given part.
+    fn new(part: PromptPart, content: String) -> Self {
+        Self {
+            part,
+            message: Message::new(Role::System, content),
+        }
+    }
+}
+
 /// The turn's re-surfaced context blocks, and what the `[Recall]` block among
 /// them offered.
 struct SurfacedBlocks {
-    blocks: Vec<Message>,
+    blocks: Vec<SurfacedBlock>,
     /// See [`AssembledTurn::recalled_entry_ids`].
     recalled_entry_ids: Vec<String>,
     /// See [`AssembledTurn::recalled_skill_names`].
@@ -1063,16 +1117,16 @@ fn surfaced_blocks(
     // cached system instruction — so the volatile timestamp never busts the
     // prompt-prefix cache.
     if !ambient.now_line.is_empty() {
-        blocks.push(Message::new(
-            Role::System,
+        blocks.push(SurfacedBlock::new(
+            PromptPart::System,
             format!("[Now] {}", ambient.now_line),
         ));
     }
 
     // Rolling context summary, once windowing has dropped earlier history.
     if is_windowed && !context_summary.is_empty() {
-        blocks.push(Message::new(
-            Role::System,
+        blocks.push(SurfacedBlock::new(
+            PromptPart::Summary,
             format!("[Summary of earlier conversation]\n{context_summary}"),
         ));
     }
@@ -1097,7 +1151,10 @@ fn surfaced_blocks(
                     .is_some_and(|sid| active_summary_ids.contains(sid))
         });
         if !anchor_visible || many_tool_rounds {
-            blocks.push(Message::new(Role::System, format!("[Current task] {task}")));
+            blocks.push(SurfacedBlock::new(
+                PromptPart::CurrentTask,
+                format!("[Current task] {task}"),
+            ));
         }
     }
 
@@ -1130,14 +1187,17 @@ fn surfaced_blocks(
         working_state.notes = 0;
     }
     if let Some(counts) = working_state.render() {
-        blocks.push(Message::new(
-            Role::System,
+        blocks.push(SurfacedBlock::new(
+            PromptPart::WorkingState,
             format!("[Working state] {counts}"),
         ));
     }
 
     if let Some(plan) = plan {
-        blocks.push(Message::new(Role::System, format!("[Plan]\n{plan}")));
+        blocks.push(SurfacedBlock::new(
+            PromptPart::Plan,
+            format!("[Plan]\n{plan}"),
+        ));
     }
 
     // Pinned note content (#597). No gate: `[Scratchpad]` is deliberately quiet
@@ -1145,11 +1205,17 @@ fn surfaced_blocks(
     // precisely so a load-bearing fact is never one forgotten search away. The
     // cap and byte budget - not a visibility gate - are what bound its cost.
     if let Some(pinned) = anchors.pinned.filter(|p| !p.is_empty()) {
-        blocks.push(Message::new(Role::System, format!("[Pinned]\n{pinned}")));
+        blocks.push(SurfacedBlock::new(
+            PromptPart::Pinned,
+            format!("[Pinned]\n{pinned}"),
+        ));
     }
 
     if let Some(index) = scratchpad_index {
-        blocks.push(Message::new(Role::System, format!("[Scratchpad] {index}")));
+        blocks.push(SurfacedBlock::new(
+            PromptPart::Scratchpad,
+            format!("[Scratchpad] {index}"),
+        ));
     }
 
     // Pre-prompt recall (#1100). Last, and closest to the user prompt that
@@ -1178,8 +1244,8 @@ fn surfaced_blocks(
             ..surface
         };
         if let Some(recall) = crate::recall::render_recall(&surface) {
-            blocks.push(Message::new(
-                Role::System,
+            blocks.push(SurfacedBlock::new(
+                PromptPart::Recall,
                 format!("[Recall] {}", recall.text),
             ));
             recalled_entry_ids = recall.entry_ids;
@@ -4366,7 +4432,9 @@ mod tests {
     fn advertised_tool_tokens(tools: &[ToolDefinition], estimate: &dyn Fn(&str) -> u64) -> u64 {
         tools
             .iter()
-            .map(|t| estimate(&t.name) + estimate(&t.description) + estimate(&t.parameters.to_string()))
+            .map(|t| {
+                estimate(&t.name) + estimate(&t.description) + estimate(&t.parameters.to_string())
+            })
             .sum()
     }
 
@@ -4537,13 +4605,20 @@ mod tests {
         // The criterion is that the breakdown uses the estimator the budget
         // check uses. The way to hold it is to make one number serve both: the
         // check shrinks the window exactly when this total is over threshold.
+        // Bodies heavy enough that the transcript, not the standing system
+        // block, is most of the prompt. The system block demotes its own tool
+        // listing once it passes a fraction of the budget, which would change
+        // the prompt between the two passes below and confound the comparison;
+        // the precondition after the assemblies is what holds that off.
+        let body = "some words to give this message real weight ".repeat(120);
         let msgs: Vec<Message> = (0..30)
             .map(|i| {
-                if i % 2 == 0 {
-                    Message::new(Role::User, format!("u-{i} some words to give this body weight"))
+                let role = if i % 2 == 0 {
+                    Role::User
                 } else {
-                    Message::new(Role::Assistant, format!("a-{i} and a reply of similar weight"))
-                }
+                    Role::Assistant
+                };
+                Message::new(role, format!("m-{i} {body}"))
             })
             .collect();
         let assemble = |budget: Option<ContextBudget>| {
@@ -4579,6 +4654,12 @@ mod tests {
             source: BudgetSource::UniversalFallback,
         }));
 
+        assert_eq!(
+            roomy.breakdown.tokens(PromptPart::System),
+            unbudgeted.breakdown.tokens(PromptPart::System),
+            "precondition: the system block must not have demoted its tool \
+             listing, or the two passes are not assembling the same prompt"
+        );
         assert_eq!(
             roomy.window_from, 0,
             "a budget the reported total fits under leaves the window alone"

@@ -1,0 +1,366 @@
+//! What filled a turn's input, part by part.
+//!
+//! ## The question this answers
+//!
+//! `llm.tokens.input` says a round cost 40k. It cannot say whether that was
+//! the transcript, the pinned notes or eighty tool schemas, and each of those
+//! has a different fix: compact the transcript, prune the notes, drop a
+//! server's tools, narrow the recall. So the breakdown is the number an
+//! operator acts on, and the parts have to be separable in the way the fix is,
+//! not merely add up.
+//!
+//! One real turn measured while this was being built had already spent 34,324
+//! tokens on a 254-character prompt, about 23.7k of it tool schemas for 99
+//! tools, before the turn did anything at all. Nothing showed that without
+//! reading a log by hand.
+//!
+//! ## The unit is a claim, so it is in every name
+//!
+//! Every figure here is **estimated tokens**, counted with the same estimator
+//! the context budget uses - the turn passes one closure to assembly and it
+//! serves both the budget check and this breakdown, so the two can never
+//! disagree about what a block costs. Each field name ends in `_tokens`, and
+//! the one figure that is not a token count is [`TOOL_COUNT_FIELD`], named as
+//! the count it is. A character count and a token count for the same block
+//! look equally plausible side by side, which is why neither is left to the
+//! reader to infer.
+//!
+//! **They are estimates, and they do not sum to what the provider bills.** The
+//! provider tokenises its own way and its reported input count stays the
+//! authority; these are a breakdown of where that number went, accurate to the
+//! estimator's own precision.
+//!
+//! ## Zero is a measurement here, unlike a provider's count
+//!
+//! A turn with nothing pinned records `0` for the pinned part rather than
+//! leaving the field off. That is the opposite of the convention the
+//! provider-reported counts follow, and deliberately: a provider can decline to
+//! say, so an absent count there is unknowable and a `0` would invent a
+//! measurement. The assembler always knows whether it emitted a block, so an
+//! absent field here could only mean the part went unmeasured - which is the
+//! one thing a reader must be able to tell apart from an empty block.
+//!
+//! ## Counters, not histograms
+//!
+//! The metrics facade offers one histogram and it is a *duration*
+//! histogram: fixed millisecond buckets, a millisecond sum, and an OTLP export
+//! that names its values `ms`. Token counts put through it would be labelled
+//! as milliseconds everywhere they surfaced, which is exactly the units claim
+//! this module exists to keep. So the per-part figures accumulate as counters,
+//! the way `llm.tokens.input` already does, and [`PROMPT_MEASURED`] is the
+//! denominator that turns them back into a per-turn mean.
+//!
+//! ## Label bounding
+//!
+//! One metric name carries one label, `part`, whose value comes from
+//! [`PromptPart::as_label`] and is therefore a `&'static str` from a closed
+//! set of ten. No conversation id, user id, model or provider reaches any
+//! metric here: the registry caps a metric at 64 label sets with no eviction,
+//! so an unbounded label is an unbounded leak in a process that runs for
+//! weeks. Per-conversation stays a trace question, answered by the span fields
+//! below.
+
+use adelie_telemetry::metrics::{self, Label};
+
+// ---------------------------------------------------------------------------
+// Metric names.
+// ---------------------------------------------------------------------------
+
+/// Estimated prompt tokens contributed by one part of an assembled prompt, by
+/// part name.
+///
+/// A counter rather than a histogram for the reason the module header gives.
+/// Read against [`PROMPT_MEASURED`] for a per-turn mean, or against each other
+/// for the fraction of the input one part is spending.
+pub(crate) const PROMPT_PART_TOKENS: &str = "llm.prompt.part.tokens";
+
+/// Tool schemas advertised to the model, summed over measured prompts.
+pub(crate) const PROMPT_TOOLS: &str = "llm.prompt.tools";
+
+/// Prompts whose breakdown was recorded: the denominator for the two counters
+/// above.
+pub(crate) const PROMPT_MEASURED: &str = "llm.prompt.measured";
+
+// ---------------------------------------------------------------------------
+// Span field names. Each is a literal in the `turn` span's declaration too,
+// because a span fixes its field set when it opens and a `record` against a
+// field the span never declared is dropped silently. `PromptPart::ALL` and
+// that declaration have to agree; `tests/turn_telemetry.rs` is what holds
+// them together, because nothing else would report the drift.
+// ---------------------------------------------------------------------------
+
+/// What every part adds up to.
+pub(crate) const TOTAL_FIELD: &str = "prompt.total_tokens";
+
+/// How many tools this prompt advertised. A count, not a token figure.
+pub(crate) const TOOL_COUNT_FIELD: &str = "prompt.tool_count";
+
+// ---------------------------------------------------------------------------
+// The parts.
+// ---------------------------------------------------------------------------
+
+/// One part of an assembled prompt, as an operator would act on it.
+///
+/// The set is closed and each variant renders to a `&'static str`, which is
+/// what makes an unbounded value impossible to pass into the `part` label: it
+/// has the wrong lifetime.
+///
+/// Every block the assembler emits belongs to exactly one of these, so the
+/// parts sum to the whole prompt and nothing hides in an unmeasured
+/// remainder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PromptPart {
+    /// The cached system instruction - standing guidance, the personality
+    /// blurb, the client-context block, the machine topology, the tool-listing
+    /// note and any one-turn refinement - plus the ambient `[Now]` line.
+    ///
+    /// `[Now]` is a separate per-turn message so that a volatile timestamp
+    /// never busts the prompt-prefix cache, but it is one line and it is part
+    /// of the standing frame an operator reads, so it is reported here rather
+    /// than as a part of its own.
+    System,
+    /// The `[Summary of earlier conversation]` block: what compaction left
+    /// behind of the history the window dropped.
+    Summary,
+    /// The `[Current task]` anchor, re-surfaced when the goal has drifted out
+    /// of view.
+    CurrentTask,
+    /// The `[Working state]` line: a count of notes and open to-dos.
+    WorkingState,
+    /// The `[Plan]` block: the open todo tree.
+    Plan,
+    /// The `[Pinned]` block: notes the model pinned, and the live content of
+    /// any knowledge entry they attach.
+    Pinned,
+    /// The `[Scratchpad]` index: the free-form note keys.
+    Scratchpad,
+    /// The `[Recall]` block: candidate memory for the user's prompt.
+    Recall,
+    /// The conversation transcript, as this prompt carries it - the window,
+    /// with the round's projected content and any collapsed-run markers.
+    Transcript,
+    /// The tool schemas advertised alongside the messages. Sent out of band,
+    /// in the request's `tools` array, so no message body shows what they
+    /// cost.
+    ToolSchemas,
+}
+
+impl PromptPart {
+    /// Every part, in the order a prompt renders them.
+    pub(crate) const ALL: [PromptPart; 10] = [
+        Self::System,
+        Self::Summary,
+        Self::CurrentTask,
+        Self::WorkingState,
+        Self::Plan,
+        Self::Pinned,
+        Self::Scratchpad,
+        Self::Recall,
+        Self::Transcript,
+        Self::ToolSchemas,
+    ];
+
+    /// The `part` label value. Bounded by its type.
+    pub(crate) fn as_label(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Summary => "summary",
+            Self::CurrentTask => "current_task",
+            Self::WorkingState => "working_state",
+            Self::Plan => "plan",
+            Self::Pinned => "pinned",
+            Self::Scratchpad => "scratchpad",
+            Self::Recall => "recall",
+            Self::Transcript => "transcript",
+            Self::ToolSchemas => "tool_schemas",
+        }
+    }
+
+    /// The turn-span field this part is recorded under. Always ends in
+    /// `_tokens`, because the unit is a claim and a reader must not have to
+    /// infer it.
+    pub(crate) fn as_span_field(self) -> &'static str {
+        match self {
+            Self::System => "prompt.system_tokens",
+            Self::Summary => "prompt.summary_tokens",
+            Self::CurrentTask => "prompt.current_task_tokens",
+            Self::WorkingState => "prompt.working_state_tokens",
+            Self::Plan => "prompt.plan_tokens",
+            Self::Pinned => "prompt.pinned_tokens",
+            Self::Scratchpad => "prompt.scratchpad_tokens",
+            Self::Recall => "prompt.recall_tokens",
+            Self::Transcript => "prompt.transcript_tokens",
+            Self::ToolSchemas => "prompt.tool_schema_tokens",
+        }
+    }
+
+    /// Where this part sits in [`PromptBreakdown`]'s array.
+    const fn index(self) -> usize {
+        match self {
+            Self::System => 0,
+            Self::Summary => 1,
+            Self::CurrentTask => 2,
+            Self::WorkingState => 3,
+            Self::Plan => 4,
+            Self::Pinned => 5,
+            Self::Scratchpad => 6,
+            Self::Recall => 7,
+            Self::Transcript => 8,
+            Self::ToolSchemas => 9,
+        }
+    }
+}
+
+/// What each part of one assembled prompt cost, in estimated tokens.
+///
+/// Built by the assembler as it lays the prompt out, so a block's cost is
+/// attributed where it is produced rather than recovered afterwards by reading
+/// the prompt back. Recovering it would mean matching on the `[..]` tag the
+/// block happens to open with, which nothing holds stable.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PromptBreakdown {
+    tokens: [u64; PromptPart::ALL.len()],
+    tool_count: usize,
+}
+
+impl PromptBreakdown {
+    /// Add what one block of `part` cost.
+    pub(crate) fn add(&mut self, part: PromptPart, tokens: u64) {
+        let slot = &mut self.tokens[part.index()];
+        *slot = slot.saturating_add(tokens);
+    }
+
+    /// Record the tool schemas: how many tools were advertised, and what their
+    /// schemas cost.
+    ///
+    /// One call for both, because the pair is the whole point - a schema bill
+    /// without a tool count says nothing about whether to drop a server.
+    pub(crate) fn set_tools(&mut self, count: usize, schema_tokens: u64) {
+        self.tool_count = count;
+        self.tokens[PromptPart::ToolSchemas.index()] = schema_tokens;
+    }
+
+    /// What `part` cost. Zero for a block that did not render, which is a
+    /// measurement and not an absence.
+    pub(crate) fn tokens(&self, part: PromptPart) -> u64 {
+        self.tokens[part.index()]
+    }
+
+    /// How many tools this prompt advertised.
+    pub(crate) fn tool_count(&self) -> usize {
+        self.tool_count
+    }
+
+    /// Every part summed: the whole prompt, plus its out-of-band schemas.
+    pub(crate) fn total_tokens(&self) -> u64 {
+        self.tokens
+            .iter()
+            .fold(0u64, |sum, part| sum.saturating_add(*part))
+    }
+}
+
+/// Put one prompt's breakdown on the turn span.
+///
+/// Every part is recorded, including the zeros: see the module header for why
+/// this differs from how a provider's own counts are handled.
+pub(crate) fn record_on_span(span: &tracing::Span, breakdown: &PromptBreakdown) {
+    for part in PromptPart::ALL {
+        span.record(part.as_span_field(), breakdown.tokens(part));
+    }
+    span.record(TOTAL_FIELD, breakdown.total_tokens());
+    span.record(TOOL_COUNT_FIELD, breakdown.tool_count() as u64);
+}
+
+/// Accumulate one prompt's breakdown into the metrics facade.
+pub(crate) fn record_metrics(breakdown: &PromptBreakdown) {
+    for part in PromptPart::ALL {
+        metrics::add(
+            PROMPT_PART_TOKENS,
+            breakdown.tokens(part),
+            &[Label::new("part", part.as_label())],
+        );
+    }
+    metrics::add(PROMPT_TOOLS, breakdown.tool_count() as u64, &[]);
+    metrics::increment(PROMPT_MEASURED, &[]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_part_has_its_own_slot_label_and_field() {
+        // One mis-copied index would make two parts share a slot, and the
+        // breakdown would report one of them as the other with nothing else
+        // amiss - the total would still be right.
+        let indices: Vec<usize> = PromptPart::ALL.iter().map(|p| p.index()).collect();
+        let mut sorted = indices.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            PromptPart::ALL.len(),
+            "two parts share a slot, so one is recorded as the other: {indices:?}"
+        );
+        assert_eq!(
+            sorted.last(),
+            Some(&(PromptPart::ALL.len() - 1)),
+            "the slots must fill the array exactly: {sorted:?}"
+        );
+
+        let labels: std::collections::HashSet<&str> =
+            PromptPart::ALL.iter().map(|p| p.as_label()).collect();
+        assert_eq!(
+            labels.len(),
+            PromptPart::ALL.len(),
+            "two parts rendering to one label would merge two series"
+        );
+        let fields: std::collections::HashSet<&str> =
+            PromptPart::ALL.iter().map(|p| p.as_span_field()).collect();
+        assert_eq!(
+            fields.len(),
+            PromptPart::ALL.len(),
+            "two parts sharing a span field would overwrite each other"
+        );
+    }
+
+    #[test]
+    fn every_span_field_states_tokens_as_its_unit() {
+        for part in PromptPart::ALL {
+            let field = part.as_span_field();
+            assert!(
+                field.ends_with("_tokens"),
+                "`{field}` leaves its unit to be inferred, and a character \
+                 count reads exactly like a token count"
+            );
+        }
+        assert!(TOTAL_FIELD.ends_with("_tokens"));
+        assert!(
+            !TOOL_COUNT_FIELD.ends_with("_tokens"),
+            "the tool count is not a token figure and must not be named as one"
+        );
+    }
+
+    #[test]
+    fn a_part_that_did_not_render_reports_zero_rather_than_nothing() {
+        let mut breakdown = PromptBreakdown::default();
+        breakdown.add(PromptPart::System, 120);
+        assert_eq!(breakdown.tokens(PromptPart::Pinned), 0);
+        assert_eq!(breakdown.total_tokens(), 120);
+    }
+
+    #[test]
+    fn the_total_is_the_sum_of_the_parts() {
+        let mut breakdown = PromptBreakdown::default();
+        for (i, part) in PromptPart::ALL.iter().enumerate() {
+            breakdown.add(*part, i as u64 + 1);
+        }
+        // `set_tools` assigns rather than adds, so the tool part's `add` above
+        // is replaced and not doubled.
+        breakdown.set_tools(3, 40);
+        let expected: u64 = (1..=9).sum::<u64>() + 40;
+        assert_eq!(breakdown.total_tokens(), expected);
+        assert_eq!(breakdown.tool_count(), 3);
+        assert_eq!(breakdown.tokens(PromptPart::ToolSchemas), 40);
+    }
+}

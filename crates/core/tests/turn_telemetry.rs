@@ -2665,6 +2665,63 @@ fn a_pinned_note_is_counted_against_the_pinned_part_and_no_other() {
 }
 
 #[test]
+fn a_turn_cancelled_before_it_assembles_a_prompt_carries_no_prompt_field() {
+    let _serialised = serialised();
+    // The counterpart to the zero above, and what makes it mean anything: a
+    // zero says a block did not render, and an absent field says no prompt was
+    // ever built. A turn whose token is already tripped leaves at the loop's
+    // first checkpoint, before assembly.
+    let captured = capture(Level::INFO, async {
+        let handler = handler(two_round_script(), ScriptedTools::ok());
+        let conv = handler
+            .create_conversation("c".into(), vec![])
+            .await
+            .expect("create the conversation");
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        with_user_id(
+            UserId::new(USER_ID),
+            with_request_id(
+                REQUEST_ID.to_string(),
+                with_turn_route(route(), async {
+                    let _ = handler
+                        .send_prompt_with_override(
+                            &conv.id,
+                            PROMPT_SENTINEL.to_string(),
+                            None,
+                            String::new(),
+                            Box::new(|_| true),
+                            Box::new(|_| {}),
+                            cancelled,
+                        )
+                        .await;
+                }),
+            ),
+        )
+        .await;
+    });
+
+    let turn = captured.span("turn");
+    assert_eq!(
+        turn.field("outcome"),
+        Some("cancelled"),
+        "precondition: the turn must have left before it assembled anything; \
+         it recorded {:?}",
+        turn.fields
+    );
+    for field in prompt_fields() {
+        assert_eq!(
+            turn.field(field),
+            None,
+            "`{field}` must be absent when no prompt was assembled - a zero \
+             here would read as a block that rendered nothing; the turn \
+             recorded {:?}",
+            turn.fields
+        );
+    }
+}
+
+#[test]
 fn the_turn_span_carries_the_tool_count_and_the_tool_schema_cost() {
     let _serialised = serialised();
     // #1212 measured a turn that had spent 23.7k tokens on 99 tool schemas
@@ -2713,13 +2770,12 @@ fn prompt_part_metrics_are_labelled_by_part_alone() {
     let _serialised = serialised();
     let captured = run(Level::INFO, two_round_script(), ScriptedTools::ok());
 
+    // Every series this metric holds, not only the ones that moved: a part
+    // that rendered nothing records a zero, and a zero delta reads the same as
+    // no measurement at all. What the series set can still say is which
+    // label values exist, which is the bounded-cardinality claim.
     let mut seen_parts: Vec<String> = Vec::new();
-    for counter in captured
-        .after
-        .counters
-        .iter()
-        .filter(|c| c.window_delta > 0)
-    {
+    for counter in captured.after.counters.iter() {
         match counter.name {
             PROMPT_PART_TOKENS_METRIC => {
                 let keys: Vec<&str> = counter.labels.iter().map(|l| l.key()).collect();
@@ -2756,8 +2812,10 @@ fn prompt_part_metrics_are_labelled_by_part_alone() {
     expected.sort();
     assert_eq!(
         seen_parts, expected,
-        "every part reports every turn, so a missing block is distinguishable \
-         from an unmeasured one on the metrics side too"
+        "the metric holds one series per part and no others - the bound is \
+         the whole point, and no turn in this file renders a summary, a \
+         current-task anchor or a plan, so those three series exist only if \
+         every part reports on every turn"
     );
     assert_eq!(
         captured.counter_delta(PROMPT_MEASURED_METRIC, &[]),
@@ -2786,6 +2844,20 @@ fn no_prompt_metric_carries_a_conversation_scoped_label() {
     }) {
         checked += 1;
         for label in &counter.labels {
+            // The key, first. A conversation axis added here would not
+            // necessarily carry a recognisable value - the id may be unset by
+            // the time the turn reports - and the axis is the leak whatever
+            // the value turns out to be.
+            assert_eq!(
+                label.key(),
+                "part",
+                "`{}` may carry no axis but the part name; a per-conversation, \
+                 per-user or per-model axis is an unbounded series key in a \
+                 registry that caps a metric at 64 label sets and evicts \
+                 none. It carried {:?}",
+                counter.name,
+                counter.labels
+            );
             for forbidden in [CONVERSATION_ID, USER_ID, REQUEST_ID, MODEL, PROVIDER] {
                 assert_ne!(
                     label.value(),
@@ -2810,10 +2882,13 @@ fn the_docs_state_the_parts_are_estimates_that_do_not_sum_to_the_provider_count(
     // its own way, so the two disagree by construction. Said once, in the
     // operator-facing document, rather than per field.
     const LOGGING_DOC: &str = include_str!("../../../docs/logging.md");
+    // Read with runs of whitespace collapsed, so a claim the document happens
+    // to wrap across two lines still counts as made.
+    let doc: String = LOGGING_DOC.split_whitespace().collect::<Vec<_>>().join(" ");
 
     for name in prompt_fields() {
         assert!(
-            LOGGING_DOC.contains(name),
+            doc.contains(name),
             "`{name}` is recorded and undocumented, so nobody reading \
              docs/logging.md knows it exists"
         );
@@ -2824,7 +2899,7 @@ fn the_docs_state_the_parts_are_estimates_that_do_not_sum_to_the_provider_count(
         PROMPT_MEASURED_METRIC,
     ] {
         assert!(
-            LOGGING_DOC.contains(metric),
+            doc.contains(metric),
             "`{metric}` is missing from the metrics table in docs/logging.md"
         );
     }
@@ -2833,7 +2908,7 @@ fn the_docs_state_the_parts_are_estimates_that_do_not_sum_to_the_provider_count(
         "estimate",
     ] {
         assert!(
-            LOGGING_DOC.contains(claim),
+            doc.contains(claim),
             "docs/logging.md must say {claim:?}: a figure presented without \
              its accuracy claim reads as a measurement"
         );
