@@ -105,9 +105,20 @@ Reporting that as a match count would state a falsehood.
 ## What decides the order (#1167)
 
 `results` is ordered by the **activation score**, the same score the `[Recall]`
-block ranks by, so the tool and the block read one rule rather than two. The
-rule is shared; what is not yet held mechanically is that both paths feed it the
-same inputs, which issue #1244 covers.
+block ranks by, so the tool and the block read one rule rather than two.
+
+Since #1244 the *terms* are shared mechanically as well as the score: both paths
+supply them through one `Activatable` implementation each, with one required
+method per term and no default bodies, so a term added to the score is a compile
+error on both paths until both answer it - across crates, since the tool's
+implementation lives in the storage adapter.
+
+What that does **not** hold is how each path populates the values those methods
+read. The tool's population is the hybrid scan's projection, and a column
+dropped there is still a difference the trait cannot see; both defects found so
+far lived exactly there. `the_hybrid_scan_selects_every_column_the_shared_terms_read`
+guards the projection for that reason, and is the test to widen when a term is
+added.
 
 The two arms admit and the score ranks:
 

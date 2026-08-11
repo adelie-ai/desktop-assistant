@@ -510,7 +510,7 @@ impl Activatable for RecallSkill {
 /// What a candidate contributes to its activation score
 /// ([`crate::domain::activation`]).
 ///
-/// **One method per term of [`activation`], and no defaults.** Every path that
+/// **One method per term of `activation`, and no defaults.** Every path that
 /// ranks by activation supplies its terms through this trait, so a term added
 /// to the score is a method added here, and a method added here is a compile
 /// error in every implementor until it answers. That is the whole mechanism:
@@ -593,7 +593,7 @@ pub enum MixedSet {
 /// ## The shape, and why it beat the others
 ///
 /// Three candidates were compared before this one was built, against the same
-/// requirement: that a term added to [`activation`] cannot reach one caller and
+/// requirement: that a term added to `activation` cannot reach one caller and
 /// miss the other.
 ///
 /// - **A cross-check test** - rank the same entry both ways and assert the

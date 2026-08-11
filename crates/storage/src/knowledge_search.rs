@@ -986,17 +986,36 @@ mod tests {
     /// it. `the_hybrid_scan_selects_what_the_lexical_term_reads` is the same
     /// check on the query.
     #[test]
-    fn the_hybrid_scan_selects_what_the_lexical_term_reads() {
+    fn the_hybrid_scan_selects_every_column_the_shared_terms_read() {
+        // The trait holds that both paths *read* the same terms. It cannot hold
+        // that both paths *populate* them, and this projection is where the
+        // tool's population happens - so a column dropped here is a difference
+        // between the two rankings that compiles, passes the cross-check test,
+        // and changes the order silently.
+        //
+        // Both defects found so far were exactly that. `kb.source` was dropped
+        // once, which made the salience term's `Deliberate` signal unreachable
+        // on this path and scored every deliberately-written entry about 0.07
+        // deviations lower from the tool than from the block; it was caught by
+        // a reviewer noticing a missing column, not by anything that failed.
+        //
+        // Widen this list when a term is added to `Activatable`.
         let projection = HYBRID_SEARCH_SQL
             .rsplit("     SELECT kb.id")
             .next()
             .expect("the scan reads its rows after it measures");
 
-        for column in ["a.lexical_share", "s.nearest", "s.furthest"] {
+        for (column, term) in [
+            ("a.lexical_share", "the lexical term"),
+            ("s.nearest", "the lexical term's own scale"),
+            ("s.furthest", "the lexical term's own scale"),
+            ("kb.source", "the salience term's Deliberate signal"),
+            ("kb.summary", "the salience reading"),
+        ] {
             assert!(
                 projection.contains(column),
-                "the scan does not select {column}, so the lexical term reads nothing: \
-                 \n{HYBRID_SEARCH_SQL}"
+                "the scan does not select {column}, so {term} reads nothing on the \
+                 tool path while the block still reads it: \n{HYBRID_SEARCH_SQL}"
             );
         }
     }

@@ -163,7 +163,7 @@ pub const DEFAULT_USE_LIFT: f64 = 0.5;
 /// set a minute ago, which is the single largest term the log can carry.
 pub const MAX_REINFORCEMENT_DEVIATIONS: f64 = 3.0;
 
-/// The coefficients [`activation`] applies.
+/// The coefficients `activation` applies.
 ///
 /// A struct rather than constants for the same reason
 /// [`UseScoreWeights`] is one: a deployment that has kept a use log can fit its
@@ -501,7 +501,18 @@ pub const NO_SALIENCE: f64 = 0.0;
 /// Every extra signal is handed in already dimensionless, exactly as the
 /// semantic one is. That is what lets a fourth source, or a fifth term, join
 /// later without refitting anything already here.
-pub fn activation(
+/// **Crate-private on purpose** (#1244). Every path that ranks by activation
+/// supplies its terms through
+/// [`Activatable`](crate::ports::recall::Activatable), and that is only a
+/// mechanism while this function cannot be reached around it. Exported, a
+/// ranking site in an adapter crate could call it directly and answer a term
+/// with a literal - which is precisely how the search path came to pass
+/// `NO_SITUATION` and rank on three terms while the block ranked on four.
+///
+/// Widening this back to `pub` reopens that door, so if a caller outside this
+/// crate needs to rank, give it an `Activatable` implementation rather than
+/// this function.
+pub(crate) fn activation(
     semantic: f64,
     record: Option<&KnowledgeUseRecord>,
     situation_coverage: f64,

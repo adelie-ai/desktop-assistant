@@ -415,10 +415,18 @@ impl PgKnowledgeBaseStore {
     /// too small to state one leaves the page on
     /// [`RECALL_ASSUMED_DISPERSION`](desktop_assistant_core::recall::RECALL_ASSUMED_DISPERSION),
     /// which is the same estimate the `[Recall]` block falls back to: one
-    /// estimate rather than two, read through one `activation`. That the two
-    /// paths hand that function the same inputs is held mechanically (#1244):
-    /// every term comes off one [`Activatable`] implementation each, so a term
-    /// added to the score is a compile error in both until both answer.
+    /// estimate rather than two, read through one `activation`.
+    ///
+    /// **What #1244 holds, and what it does not.** Every term now comes off one
+    /// [`Activatable`] implementation per path, so a term *added to the score*
+    /// is a compile error in both until both answer. That is mechanical. What
+    /// is not mechanical is how each path *populates* the values those methods
+    /// read: this projection decides what the tool's candidates carry, and a
+    /// column dropped here is still a difference the trait cannot see. Both
+    /// defects found so far lived exactly there - a dropped `kb.source`, and a
+    /// situation term nobody supplied - so
+    /// `the_hybrid_scan_selects_every_column_the_shared_terms_read` guards the
+    /// projection specifically, and is the test to widen when a term is added.
     ///
     /// [`Activatable`]: desktop_assistant_core::ports::recall::Activatable
     ///
@@ -488,7 +496,12 @@ impl PgKnowledgeBaseStore {
             })
             .collect();
         let ids: Vec<String> = candidates.iter().map(|c| c.entry.id.clone()).collect();
-        let mut records = self.use_records(ids.clone()).await;
+        // Cloned only where the second read will actually use it: with no cue
+        // the situation read is skipped, and a clone made for it would be built
+        // and dropped on every search a turn makes.
+        let cue = current_situation_cue();
+        let situation_ids = cue.as_ref().map(|_| ids.clone());
+        let mut records = self.use_records(ids).await;
         // The cue the running turn measured for the `[Recall]` block, handed
         // down rather than measured again - `current_situation_cue` holds why.
         // With no cue there is nothing to grade a record against, so the second
@@ -496,9 +509,8 @@ impl PgKnowledgeBaseStore {
         // connected, and a deployment with recall off, pay nothing per search
         // for a term that would score every candidate zero. That is the same
         // bargain the pre-prompt recall path makes.
-        let cue = current_situation_cue();
-        let mut situations = match cue {
-            Some(_) => self.situation_records(ids).await,
+        let mut situations = match situation_ids {
+            Some(ids) => self.situation_records(ids).await,
             None => std::collections::HashMap::new(),
         };
         for candidate in &mut candidates {
