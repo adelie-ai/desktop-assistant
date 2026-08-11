@@ -363,12 +363,30 @@ pub struct SecurityConfig {
     /// which this daemon deliberately does not do for any other setting.
     #[serde(default = "default_tool_policy")]
     pub tool_policy: String,
+
+    /// Whether this daemon destroys the words a turn writes after it has read
+    /// content from outside the trust boundary, instead of storing them and
+    /// withholding them at the model-facing render (#1249).
+    ///
+    /// `false`, the default, is right for the shipped case - a single-person
+    /// desktop install, where a record the assistant wrote is a record the
+    /// person may read. `true` restores the older behaviour for a deployment
+    /// that wants possibly-injected text to reach no durable store at all; the
+    /// person then reads the placeholder too, because nothing else was kept.
+    ///
+    /// A deployment decision, so there is deliberately no per-conversation or
+    /// per-user override. A person who could turn the operator's setting off
+    /// from a chat window would make it worth nothing. The per-turn control is
+    /// [`SecurityConfig::tool_policy`].
+    #[serde(default)]
+    pub hard_withhold: bool,
 }
 
 impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
             tool_policy: default_tool_policy(),
+            hard_withhold: false,
         }
     }
 }
@@ -378,6 +396,26 @@ impl SecurityConfig {
     /// not serialized (keeping migrated `daemon.toml` output stable).
     fn is_default(&self) -> bool {
         self == &Self::default()
+    }
+
+    /// What this daemon does with the words a turn wrote after reading outside
+    /// content, in one line for the startup log (#1249).
+    ///
+    /// Said on every boot, whether or not the key is set. The default is a
+    /// behaviour change in one direction - a daemon that says nothing stops
+    /// destroying text it wrote - so an operator has to be able to read the
+    /// resolved state rather than infer it from an absent key.
+    #[must_use]
+    pub fn withhold_mode_line(&self) -> String {
+        if self.hard_withhold {
+            "withheld text: destroyed at write, at every tool policy \
+             (hard_withhold = true)"
+                .to_string()
+        } else {
+            "withheld text: stored whole and hidden from the model at the aggressive tool \
+             policy (hard_withhold = false)"
+                .to_string()
+        }
     }
 
     /// The configured level, or an error naming the bad value and the accepted
@@ -5691,6 +5729,147 @@ admin_subjects = ["operator", "ops-oncall"]
         let mut by_audience = base.clone();
         by_audience.audience = Some("adele".to_string());
         assert!(!by_audience.is_default(), "audience");
+    }
+
+    // #1249: `[security] hard_withhold`. Its own block because the setting is
+    // an operator's, not a person's: no client and no conversation can reach
+    // it, so the config file and the startup log are the whole of its surface
+    // and both are tested here.
+
+    #[test]
+    fn hard_withhold_defaults_to_false() {
+        // The shipped case is a single-person desktop install, where a record
+        // the assistant wrote is a record the person may read. Destroying it at
+        // write time is the deployment's choice to make, not the build's.
+        assert!(!super::SecurityConfig::default().hard_withhold);
+    }
+
+    #[test]
+    fn a_config_with_no_hard_withhold_key_resolves_to_false() {
+        // Not a migration: an existing `daemon.toml` says nothing about a key
+        // this build has only just added, and the absent state has to be the
+        // intended one or every upgraded instance is wrong.
+        let config: DaemonConfig = toml::from_str("").unwrap();
+        assert!(!config.security.hard_withhold);
+
+        let policy_only: DaemonConfig = toml::from_str(
+            r#"
+            [security]
+            tool_policy = "aggressive"
+            "#,
+        )
+        .unwrap();
+        assert!(!policy_only.security.hard_withhold);
+    }
+
+    #[test]
+    fn an_unreadable_hard_withhold_value_is_an_error() {
+        // A security setting must never degrade quietly. A value this build
+        // cannot read is reported by name, rather than resolving to the weaker
+        // of the two states behind the operator's back.
+        let error = toml::from_str::<DaemonConfig>(
+            r#"
+            [security]
+            hard_withhold = "yes"
+            "#,
+        )
+        .expect_err("a non-boolean must not parse");
+        assert!(
+            error.to_string().contains("hard_withhold"),
+            "the error must name the field, got: {error}"
+        );
+    }
+
+    #[test]
+    fn is_default_accounts_for_every_field_in_the_section() {
+        // The trap #1249 exists to avoid, pinned on the section it adds a field
+        // to: `is_default` decides whether `[security]` is written at all, so a
+        // check that misses a field drops that field on the next save from any
+        // client.
+        let base = super::SecurityConfig::default();
+        assert!(base.is_default());
+
+        let mut by_policy = base.clone();
+        by_policy.tool_policy = "aggressive".to_string();
+        assert!(!by_policy.is_default(), "tool_policy");
+
+        let mut by_withhold = base.clone();
+        by_withhold.hard_withhold = !by_withhold.hard_withhold;
+        assert!(!by_withhold.is_default(), "hard_withhold");
+    }
+
+    #[test]
+    fn a_non_default_hard_withhold_survives_a_save_round_trip() {
+        // The whole failure, end to end, with `tool_policy` left at its default
+        // so the section is non-default in the new field ALONE. A save
+        // triggered by something unrelated - a personality edit, a model change
+        // - must not drop the operator's choice.
+        let mut path = std::env::temp_dir();
+        path.push(format!("da-1249-{}.toml", uuid::Uuid::new_v4().simple()));
+
+        let config = super::DaemonConfig {
+            security: super::SecurityConfig {
+                hard_withhold: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        super::save_daemon_config(&path, &config).expect("save");
+
+        // `parse_daemon_config` rather than the migrating loader: this asks what
+        // the written file says, and a read that could rewrite it would be
+        // measuring its own side effect.
+        let reloaded = super::parse_daemon_config(&path)
+            .expect("reload")
+            .expect("a written file is a present file");
+        assert!(
+            reloaded.security.hard_withhold,
+            "the operator's setting must survive a save it did not ask for"
+        );
+        assert_eq!(
+            reloaded.security.tool_policy,
+            super::SecurityConfig::default().tool_policy,
+            "the field that was left alone must still be the default"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn the_startup_log_states_the_withhold_mode() {
+        // An operator has to be able to read what this daemon does with the
+        // words it wrote, without opening the file and reasoning about a
+        // default.
+        let destroying = super::SecurityConfig {
+            hard_withhold: true,
+            ..Default::default()
+        };
+        let line = destroying.withhold_mode_line();
+        assert!(
+            line.contains("hard_withhold = true"),
+            "the line must state the setting, got: {line}"
+        );
+        assert!(
+            line.contains("destroy"),
+            "the line must say what happens to the words, got: {line}"
+        );
+    }
+
+    #[test]
+    fn the_startup_log_states_the_mode_when_the_key_is_absent() {
+        // Said on every boot, not only when the key is set. The upgrade turns
+        // destruction OFF for an operator who never wrote the key, so silence
+        // is exactly the wrong answer here.
+        let config: DaemonConfig = toml::from_str("").unwrap();
+        let line = config.security.withhold_mode_line();
+        assert!(
+            line.contains("hard_withhold = false"),
+            "the resolved mode must be stated, got: {line}"
+        );
+        assert!(
+            line.contains("stored"),
+            "the line must say the words are kept, got: {line}"
+        );
     }
 
     #[test]

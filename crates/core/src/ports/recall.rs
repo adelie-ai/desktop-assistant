@@ -533,6 +533,11 @@ pub struct RecallNote {
     /// content this turn. The flag travels rather than the adapter filtering on
     /// it, because "already in view" is one rule and it is applied in one place.
     pub pinned: bool,
+    /// Whether the turn that wrote this note had already read content from
+    /// outside the trust boundary (#1247). The flag travels rather than the
+    /// adapter deciding, because what to do about it depends on the level the
+    /// READING turn runs at, which the adapter does not know.
+    pub after_outside_read: bool,
     pub relevance: RecallRelevance,
 }
 

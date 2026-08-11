@@ -237,6 +237,10 @@ const MIGRATIONS: &[Migration] = &[
     // #1175: what the mis-filed-procedure sweep has already judged, so a store
     // is read once per entry per edit rather than once per entry per night.
     migration!("052_knowledge_procedure_sweep.sql"),
+    // #1247: whether the turn that wrote a durable record had already read
+    // content from outside the trust boundary. The record keeps its words; the
+    // model-facing render is what withholds them.
+    migration!("053_record_after_outside_read.sql"),
 ];
 
 /// Second half of the advisory-lock key: the schema the migrations write to.

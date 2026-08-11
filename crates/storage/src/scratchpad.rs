@@ -182,7 +182,8 @@ const NEAREST_NOTES_BY_EMBEDDING_SQL: &str = "\
          GROUP BY m.median, m.rows_read
      )
      SELECT sp.id, sp.conversation_id, sp.owner_todo, sp.note_key, sp.content, sp.note_type,
-            sp.seq, sp.done, sp.pinned, sp.knowledge_entry_id, sp.created_at, sp.updated_at,
+            sp.seq, sp.done, sp.pinned, sp.after_outside_read, sp.knowledge_entry_id,
+            sp.created_at, sp.updated_at,
             d.distance, s.median, s.rows_read, s.deviation
      FROM d
      JOIN scratchpads sp
@@ -202,6 +203,7 @@ struct SpRow {
     seq: Option<i32>,
     done: bool,
     pinned: bool,
+    after_outside_read: bool,
     knowledge_entry_id: Option<String>,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
@@ -219,6 +221,7 @@ impl SpRow {
             sequence: self.seq,
             done: self.done,
             pinned: self.pinned,
+            after_outside_read: self.after_outside_read,
             knowledge_entry_id: self.knowledge_entry_id,
             created_at: self.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
             updated_at: self.updated_at.format("%Y-%m-%d %H:%M:%S").to_string(),
@@ -264,6 +267,10 @@ impl ScratchpadStore for PgScratchpadStore {
         // follow on a knowledge write. The COALESCE below is what applies it.
         let entry_ids: Vec<Option<String>> =
             notes.iter().map(|n| n.knowledge_entry_id.clone()).collect();
+        // Rewritten with the content, never merged with what the row already
+        // held (#1247): an upsert replaces the words, so the flag has to
+        // describe the words now stored rather than the ones they replaced.
+        let after_outside_reads: Vec<bool> = notes.iter().map(|n| n.after_outside_read).collect();
 
         // The conflict target `(conversation_id, owner_todo, note_key)`
         // (migration 031) has no `user_id` component, so without a `WHERE`
@@ -296,19 +303,20 @@ impl ScratchpadStore for PgScratchpadStore {
         let rows: Vec<SpRow> = sqlx::query_as(
             "INSERT INTO scratchpads \
                  (id, user_id, conversation_id, owner_todo, note_key, content, note_type, seq, done, \
-                  knowledge_entry_id) \
+                  knowledge_entry_id, after_outside_read) \
              SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], \
                                   $5::text[], $6::text[], $7::text[], $8::int4[], $9::bool[], \
-                                  $10::text[]) \
+                                  $10::text[], $11::bool[]) \
              ON CONFLICT (conversation_id, owner_todo, note_key) \
              DO UPDATE SET content = EXCLUDED.content, note_type = EXCLUDED.note_type, \
                            seq = EXCLUDED.seq, done = EXCLUDED.done, updated_at = NOW(), \
                            embedding = NULL, embedding_model = NULL, \
+                           after_outside_read = EXCLUDED.after_outside_read, \
                            knowledge_entry_id = COALESCE(EXCLUDED.knowledge_entry_id, \
                                                          scratchpads.knowledge_entry_id) \
              WHERE scratchpads.user_id = EXCLUDED.user_id \
              RETURNING id, conversation_id, owner_todo, note_key, content, note_type, seq, done, pinned, \
-                       knowledge_entry_id, created_at, updated_at",
+                       after_outside_read, knowledge_entry_id, created_at, updated_at",
         )
         .bind(&ids)
         .bind(&user_ids)
@@ -320,6 +328,7 @@ impl ScratchpadStore for PgScratchpadStore {
         .bind(&seqs)
         .bind(&dones)
         .bind(&entry_ids)
+        .bind(&after_outside_reads)
         .fetch_all(&mut *tx)
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;
@@ -378,7 +387,7 @@ impl ScratchpadStore for PgScratchpadStore {
         let (vb, me, ancestors) = read_snapshot();
         let rows: Vec<SpRow> = sqlx::query_as(
             "SELECT id, conversation_id, owner_todo, note_key, content, note_type, seq, done, pinned, \
-                    knowledge_entry_id, created_at, updated_at \
+                    after_outside_read, knowledge_entry_id, created_at, updated_at \
              FROM scratchpads \
              WHERE user_id = $1 AND conversation_id = $2 AND note_key = ANY($3) \
                AND ($5::text IS NULL OR (owner_todo = $6 OR owner_todo LIKE $6 || '.%' \
@@ -411,7 +420,7 @@ impl ScratchpadStore for PgScratchpadStore {
         let (vb, me, ancestors) = read_snapshot();
         let rows: Vec<SpRow> = sqlx::query_as(
             "SELECT id, conversation_id, owner_todo, note_key, content, note_type, seq, done, pinned, \
-                    knowledge_entry_id, created_at, updated_at \
+                    after_outside_read, knowledge_entry_id, created_at, updated_at \
              FROM scratchpads \
              WHERE user_id = $1 AND conversation_id = $2 \
                AND ($3::text IS NULL OR note_type = $3) \
@@ -932,7 +941,7 @@ impl PgScratchpadStore {
         let rows: Vec<SpRow> = sqlx::query_as(
             "WITH q AS (SELECT plainto_tsquery('english', $3) AS query) \
              SELECT id, conversation_id, owner_todo, note_key, content, note_type, seq, done, pinned, \
-                    knowledge_entry_id, created_at, updated_at \
+                    after_outside_read, knowledge_entry_id, created_at, updated_at \
              FROM scratchpads, q \
              WHERE user_id = $1 AND conversation_id = $2 AND tsv @@ q.query \
                AND ($4::text IS NULL OR note_type = $4) \

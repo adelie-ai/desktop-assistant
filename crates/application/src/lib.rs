@@ -2934,6 +2934,11 @@ where
                         // Filled in by the write closure, the one place every
                         // scratchpad write passes through (#717).
                         embedding: None,
+                        // A person editing their own note in a client is not a
+                        // turn that read a page, so there is nothing to flag
+                        // (#1247). Only the turn loop's own step control can
+                        // know the answer, and only it sets this.
+                        after_outside_read: false,
                         // A client edits a note's text; attaching a knowledge
                         // entry is the model's move, through the scratchpad
                         // write tool. `None` preserves whatever the stored note
@@ -4230,6 +4235,57 @@ mod tests {
     use desktop_assistant_core::ports::llm::{ChunkCallback, StatusCallback};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Acceptance (#1247): the person reads the words, whatever the writing
+    /// turn had read and whatever level it ran at.
+    ///
+    /// The two audiences are the whole point of the change. The model-facing
+    /// render is where withholding happens; these two mappings are the
+    /// person-facing side, and they carry the record as stored.
+    #[test]
+    fn the_person_always_reads_the_wording() {
+        use desktop_assistant_core::domain::ScratchpadNote;
+        use desktop_assistant_core::domain::negative_memory::{
+            NegativeMemory, NegativeMemoryKind, Scope,
+        };
+
+        let mut note = ScratchpadNote::new("id-1", "conv-1", "outcome:1", "the second one is live");
+        note.after_outside_read = true;
+        let view = scratchpad_note_to_view(note);
+        assert_eq!(
+            view.content, "the second one is live",
+            "a note written after an outside read still reads as itself"
+        );
+
+        let scope = Scope::from_stored([("argument", "path", "/srv/app".to_string())])
+            .expect("a scope this build can name");
+        let memory = NegativeMemory {
+            id: "nm-1".to_string(),
+            action: "risky".to_string(),
+            fingerprint: "fp".to_string(),
+            kind: NegativeMemoryKind::Burn,
+            scope,
+            outcome: "it is a mount point".to_string(),
+            occurrences: 1,
+            written_at: chrono::Utc::now(),
+            last_confirmed_at: chrono::Utc::now(),
+            superseded_by: None,
+            after_outside_read: true,
+        };
+        let view = negative_memory_to_view(&memory, chrono::Utc::now());
+        assert_eq!(
+            view.outcome, "it is a mount point",
+            "a person reads what actually went wrong"
+        );
+        assert_eq!(
+            view.arguments
+                .iter()
+                .map(|f| (f.name.as_str(), f.value.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("path", "/srv/app")],
+            "and the arguments it went wrong with"
+        );
+    }
 
     // --- Tool-provenance mapping to the wire (issue #741) ---------------
 
@@ -8069,6 +8125,7 @@ mod tests {
             written_at: chrono::Utc::now() - chrono::Duration::days(6),
             last_confirmed_at: chrono::Utc::now(),
             superseded_by: None,
+            after_outside_read: false,
         }
     }
 

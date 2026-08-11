@@ -66,6 +66,12 @@ pub struct BurnObservation {
     /// What went wrong, already clamped by
     /// [`clamp_outcome`](crate::domain::negative_memory::clamp_outcome).
     pub outcome: String,
+    /// Whether the turn that observed this had already read content from
+    /// outside the trust boundary (#1247).
+    ///
+    /// Stored beside `outcome` and rewritten with it on every confirmation, so
+    /// the flag and the words always describe the same occurrence.
+    pub after_outside_read: bool,
 }
 
 /// What recording a bad outcome did.

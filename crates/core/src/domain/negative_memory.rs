@@ -614,6 +614,15 @@ pub struct NegativeMemory {
     pub last_confirmed_at: DateTime<Utc>,
     /// The correction that extinguished this, when one has.
     pub superseded_by: Option<String>,
+    /// Whether the turn that last recorded this had already read content from
+    /// outside the trust boundary (#1247).
+    ///
+    /// Moves with [`Self::outcome`], because the two describe the same
+    /// occurrence: a later occurrence that rewrites the words rewrites this
+    /// too. It decides nothing on its own - [`render_warning`] reads it
+    /// together with the level the reading turn runs at, and a person reads
+    /// the words whatever it says.
+    pub after_outside_read: bool,
 }
 
 impl NegativeMemory {
@@ -756,13 +765,26 @@ pub fn burns_that_fire<'a>(
     fired
 }
 
+/// What a warning shows in place of a burn's own account, when the reading
+/// turn's level withholds it (#1247).
+///
+/// The words are the risk, not the lesson. The lesson survives whatever this
+/// hides: the act is the fingerprint, and the circumstance is read off the
+/// clock and the client rather than written by the model.
+pub const WITHHELD_BURN_OUTCOME: &str = "the call failed; what it said is not shown here, because the turn that recorded it had \
+     read content from outside the trust boundary";
+
 /// What the model reads in place of the tool result, when a burn fires.
 ///
 /// Deliberately the same shape of interruption as a surfaced procedure: a
 /// candidate to check, not an instruction to obey. The two arrive at the same
 /// moment and should read as one rule rather than as two unrelated warnings.
 /// Returns `None` when nothing fired.
-pub fn render_warning(fired: &[&NegativeMemory], now: DateTime<Utc>) -> Option<String> {
+pub fn render_warning(
+    fired: &[&NegativeMemory],
+    now: DateTime<Utc>,
+    withhold: bool,
+) -> Option<String> {
     if fired.is_empty() {
         return None;
     }
@@ -784,8 +806,27 @@ pub fn render_warning(fired: &[&NegativeMemory], now: DateTime<Utc>) -> Option<S
             0 | 1 => String::new(),
             n => format!(", {n} times"),
         };
-        out.push_str(&format!("\n- Last {when}{times}: {}\n", burn.outcome));
-        let arguments = describe(&burn.scope, false);
+        // The two halves the reading turn's level decides about, together in
+        // one place. Both are text an outside party could have chosen: the
+        // outcome is a remote server's own sentence, and an argument is what
+        // the model wrote after reading one. A warning is replayed in ANOTHER
+        // conversation at the moment the model is deciding whether to act,
+        // which is the worst place in the system to park an instruction.
+        //
+        // The situation facets below are not part of it. They are read off the
+        // clock and the client, so no outside party writes them.
+        let hidden = withhold && burn.after_outside_read;
+        let outcome = if hidden {
+            WITHHELD_BURN_OUTCOME
+        } else {
+            burn.outcome.as_str()
+        };
+        out.push_str(&format!("\n- Last {when}{times}: {outcome}\n"));
+        let arguments = if hidden {
+            String::new()
+        } else {
+            describe(&burn.scope, false)
+        };
         if !arguments.is_empty() {
             out.push_str(&format!("  Called with: {arguments}\n"));
         }
@@ -973,6 +1014,7 @@ mod tests {
             written_at: now() - age,
             last_confirmed_at: now() - age,
             superseded_by: None,
+            after_outside_read: false,
         }
     }
 
@@ -1762,7 +1804,7 @@ mod tests {
     fn the_warning_states_the_outcome_and_reads_as_a_candidate() {
         let held = [fresh_burn()];
         let fired = burns_that_fire(&held, &the_call(), now());
-        let warning = render_warning(&fired, now()).expect("a fired burn renders a warning");
+        let warning = render_warning(&fired, now(), false).expect("a fired burn renders a warning");
         assert!(warning.contains("mount point"), "it says what went wrong");
         assert!(
             warning.contains("not a refusal"),
@@ -1787,7 +1829,7 @@ mod tests {
     /// behind it costs the model no reading at all.
     #[test]
     fn no_fired_burn_renders_no_warning() {
-        assert!(render_warning(&[], now()).is_none());
+        assert!(render_warning(&[], now(), false).is_none());
     }
 
     /// A wall of past failures is not a warning, so the rendered block is
@@ -1814,7 +1856,7 @@ mod tests {
             fired[0].id, "nm-0",
             "the strongest - most recently confirmed - leads"
         );
-        let warning = render_warning(&fired, now()).expect("a fired burn renders a warning");
+        let warning = render_warning(&fired, now(), false).expect("a fired burn renders a warning");
         assert_eq!(
             warning.matches("\n- Last ").count(),
             MAX_WARNED_BURNS,
@@ -1915,12 +1957,12 @@ mod tests {
         let fired = burns_that_fire(&held, &the_call(), now());
         assert!(!fired.is_empty());
         assert_eq!(
-            render_warning(&fired, now()).is_some(),
+            render_warning(&fired, now(), false).is_some(),
             render_hold_notice(&fired).is_some(),
             "a fired set that warns the model also names the lesson for the person"
         );
         assert_eq!(
-            render_warning(&[], now()).is_some(),
+            render_warning(&[], now(), false).is_some(),
             render_hold_notice(&[]).is_some(),
             "and an empty set does neither"
         );

@@ -39,6 +39,14 @@ pub struct ScratchpadNote {
     /// Bounded by [`crate::ports::scratchpad::MAX_PINNED_NOTES`]; only the
     /// dedicated pin path changes it, so rewriting a note never clears its pin.
     pub pinned: bool,
+    /// Whether the turn that wrote this note had already read content from
+    /// outside the trust boundary (#1247).
+    ///
+    /// A statement about the WRITING turn, and nothing else. What the model is
+    /// shown is decided at the render, from this plus the level the READING
+    /// turn runs at, so moving the level still changes what the model sees of
+    /// everything already written. A person reads the note either way.
+    pub after_outside_read: bool,
     /// The knowledge entry this note attaches, when it carries one (#1104).
     ///
     /// The attachment is additive: the note keeps its own `content`, which says
@@ -80,6 +88,7 @@ impl ScratchpadNote {
             sequence: None,
             done: false,
             pinned: false,
+            after_outside_read: false,
             knowledge_entry_id: None,
             created_at: String::new(),
             updated_at: String::new(),

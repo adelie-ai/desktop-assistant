@@ -639,6 +639,7 @@ fn to_recall_note(note: ScratchpadNote, relevance: RecallRelevance) -> RecallNot
         key: note.key,
         content: note.content,
         pinned: note.pinned,
+        after_outside_read: note.after_outside_read,
         relevance,
     }
 }
@@ -887,6 +888,7 @@ mod tests {
             key: "deploy-window".into(),
             content: "Fridays after 18:00".into(),
             pinned: false,
+            after_outside_read: false,
             relevance: RecallRelevance::Distance(0.12),
         }
     }

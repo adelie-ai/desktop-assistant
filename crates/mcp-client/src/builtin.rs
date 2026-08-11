@@ -3142,9 +3142,24 @@ impl BuiltinToolService {
         let mut bytes = 0usize;
         let mut budget_truncated = false;
         for note in &results {
+            // A note written by a turn that had already read outside content
+            // is marked here, on the way to the model, and not in the store
+            // (#1247). `builtin_scratchpad_search` is classified
+            // `Declared(ExternalContentMarker)` exactly so a marked result
+            // folds into the reading turn's provenance and closes its gate.
+            //
+            // Marked rather than withheld, and marked on read rather than on
+            // write, for two reasons: the model is told where the words came
+            // from instead of losing them, and the stored record - which is
+            // what a person reads - stays the assistant's own text.
+            let content = if note.after_outside_read {
+                desktop_assistant_core::tool_provenance::mark_external_content(&note.content)
+            } else {
+                note.content.clone()
+            };
             let entry = serde_json::json!({
                 "key": note.key,
-                "content": note.content,
+                "content": content,
                 "type": note.note_type,
                 "sequence": note.sequence,
                 "done": note.done,
@@ -3727,6 +3742,11 @@ fn parse_new_note(obj: &serde_json::Value) -> Option<NewScratchpadNote> {
         // Filled in by the write closure, the one place every scratchpad write
         // passes through (#717).
         embedding: None,
+        // This write is refused outright once the turn has read outside
+        // content and runs at the aggressive tool policy, and is unremarkable
+        // at the other two, so there is nothing here to flag (#1247). The turn
+        // loop's own step control is the one writer that knows.
+        after_outside_read: false,
         knowledge_entry_id,
     })
 }
@@ -4103,6 +4123,7 @@ mod tests {
                             existing.note_type = note.note_type;
                             existing.sequence = note.sequence;
                             existing.done = note.done;
+                            existing.after_outside_read = note.after_outside_read;
                             // `None` preserves, matching the storage adapter's
                             // COALESCE: a rewrite must not drop an attachment.
                             if note.knowledge_entry_id.is_some() {
@@ -4120,6 +4141,7 @@ mod tests {
                             n.note_type = note.note_type;
                             n.sequence = note.sequence;
                             n.done = note.done;
+                            n.after_outside_read = note.after_outside_read;
                             n.knowledge_entry_id = note.knowledge_entry_id;
                             n.updated_at = "t0".into();
                             guard.push(n.clone());
@@ -4649,6 +4671,61 @@ mod tests {
                 MAX_NOTES_PER_WRITE
             );
             assert_eq!(json["skipped"].as_array().unwrap().len(), 5);
+        })
+        .await;
+    }
+
+    /// Acceptance (#1247): a note the assistant wrote after reading a page is
+    /// marked on its way back to the model, so the read folds into the reading
+    /// turn's provenance instead of arriving as the assistant's own words.
+    ///
+    /// `builtin_scratchpad_search` is classified
+    /// `Declared(ExternalContentMarker)` exactly for this. Without the mark the
+    /// read is `Trusted`, and #1247 - which keeps the words rather than
+    /// destroying them - would otherwise have made that read a way around the
+    /// gate.
+    #[tokio::test]
+    async fn a_note_written_after_an_outside_read_comes_back_marked() {
+        let (service, store) = scratchpad_service();
+        {
+            let mut guard = store.lock().unwrap();
+            let mut note = ScratchpadNote::new("id-1", "c1", "outcome:1", "the live setting");
+            note.after_outside_read = true;
+            note.updated_at = "t0".into();
+            guard.push(note);
+            let mut clean = ScratchpadNote::new("id-2", "c1", "plain", "nothing was read");
+            clean.updated_at = "t0".into();
+            guard.push(clean);
+        }
+
+        with_conversation_id(ConversationId::from("c1"), async {
+            let out = service
+                .execute_tool(
+                    TOOL_SCRATCHPAD_SEARCH,
+                    serde_json::json!({"keys": ["outcome:1", "plain"], "max_results": 10}),
+                )
+                .await
+                .expect("the read succeeds");
+            assert!(
+                desktop_assistant_core::tool_provenance::carries_external_marker(&out),
+                "the read must taint the turn that makes it: {out}"
+            );
+            assert!(
+                out.contains("the live setting"),
+                "and it must still carry the words: {out}"
+            );
+
+            let clean_only = service
+                .execute_tool(
+                    TOOL_SCRATCHPAD_SEARCH,
+                    serde_json::json!({"keys": ["plain"], "max_results": 10}),
+                )
+                .await
+                .expect("the read succeeds");
+            assert!(
+                !desktop_assistant_core::tool_provenance::carries_external_marker(&clean_only),
+                "a note nothing was read before must not taint anything: {clean_only}"
+            );
         })
         .await;
     }

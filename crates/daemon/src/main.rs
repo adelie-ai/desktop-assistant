@@ -984,7 +984,7 @@ async fn main() -> Result<()> {
     // security level that is only visible by reading the file is a level
     // nobody checks, and an unreadable value has to be named rather than
     // quietly replaced.
-    {
+    let hard_withhold = {
         let security = daemon_config
             .as_ref()
             .map(|c| c.security.clone())
@@ -999,7 +999,12 @@ async fn main() -> Result<()> {
                 desktop_assistant_core::tool_provenance::ToolPolicy::default().as_str()
             ),
         }
-    }
+        // Said on every boot, set or not (#1249). The default stops a daemon
+        // destroying text it wrote, which is a behaviour change an operator
+        // must not have to infer from an absent key.
+        tracing::info!("{}", security.withhold_mode_line());
+        security.hard_withhold
+    };
 
     // Seed the built-in HS256 issuer identity (iss/aud) once, before serving, so
     // the issue and validate paths share a single immutable identity (#407 step
@@ -2725,6 +2730,10 @@ async fn main() -> Result<()> {
     // note). Co-location itself is decided by the per-machine system-id
     // handshake (#248, wired into the WS/UDS frontends below), not this label.
     .with_host(daemon_host_label())
+    // What this daemon does with the words a turn wrote after reading outside
+    // content (#1249). An operator's setting, resolved once above and never
+    // per conversation.
+    .with_hard_withhold(hard_withhold)
     // Where this daemon runs (#534). The model is told whether its daemon-side
     // terminal and file tools reach the user's own files or a machine the user
     // is not sitting at. An operator statement wins over container detection.

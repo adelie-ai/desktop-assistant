@@ -41,6 +41,14 @@ pub struct NewScratchpadNote {
     /// the background backfill, which is the normal degraded state when no
     /// embedding backend is configured or the backend stalled.
     pub embedding: Option<NoteEmbedding>,
+    /// Whether the turn writing this note had already read content from
+    /// outside the trust boundary (#1247).
+    ///
+    /// Set by the one write path that can know it - the turn loop's own step
+    /// control - and false everywhere else, because no other writer is told
+    /// what the turn has taken in. The record keeps its words either way; this
+    /// is what lets the model-facing render decide, later, what to show.
+    pub after_outside_read: bool,
     /// The knowledge entry this note attaches, when it carries one (#1104).
     ///
     /// `None` on an upsert **preserves** whatever the stored note already
@@ -61,6 +69,7 @@ impl NewScratchpadNote {
             sequence: None,
             done: false,
             embedding: None,
+            after_outside_read: false,
             knowledge_entry_id: None,
         }
     }
