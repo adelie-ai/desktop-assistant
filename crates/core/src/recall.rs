@@ -882,9 +882,6 @@ fn render_recall_with_width(
         // Over the lines that will actually render, not over the admitted set:
         // a note explaining a marker no line carries teaches the model to look
         // for something that is not there.
-        // Over the lines that will actually render, not over the admitted set:
-        // a note explaining a marker no line carries teaches the model to look
-        // for something that is not there.
         if showable_skills
             .iter()
             .take(MAX_RECALL_SKILLS)
@@ -4836,6 +4833,33 @@ mod tests {
         );
     }
 
+    /// The widest-marker constant is derived from one variant and describes all
+    /// of them, and nothing held it to that (#1175).
+    ///
+    /// `RECALL_SKILL_PROVENANCE_MARKER_MAX_BYTES` is
+    /// `RECALL_SKILL_INSTALLED_UNKNOWN_MARKER.len()`, so it is only "the widest"
+    /// while that marker happens to be. The compiler will demand an arm for a
+    /// tier added later - `provenance_marker` has no wildcard - but it has
+    /// nothing to say about how many bytes that arm returns, and a marker wider
+    /// than the budget truncates the line inside the mark it exists to make.
+    #[test]
+    fn no_provenance_marker_is_wider_than_the_budget_reserved_for_it() {
+        for tier in [
+            TrustTier::Local,
+            TrustTier::Github,
+            TrustTier::WellKnown,
+            TrustTier::Unknown,
+        ] {
+            assert!(
+                provenance_marker(tier).len() <= RECALL_SKILL_PROVENANCE_MARKER_MAX_BYTES,
+                "{tier:?} marks with {} bytes against a reserved {}, so a line \
+                 renders truncated inside its own provenance mark",
+                provenance_marker(tier).len(),
+                RECALL_SKILL_PROVENANCE_MARKER_MAX_BYTES
+            );
+        }
+    }
+
     /// A catalog the size real ones actually are answers with no cue at all,
     /// and the arm then ranks exactly as it did before the cue existed (#1175).
     ///
@@ -5166,7 +5190,7 @@ mod tests {
     /// the lines the block shows, and a marked candidate that did not fit
     /// leaves nothing to explain.
     #[test]
-    fn a_marked_skill_the_width_dropped_does_not_leave_its_note_behind() {
+    fn a_marked_skill_the_skill_cap_dropped_does_not_leave_its_note_behind() {
         let mut skills: Vec<RecallSkill> = (0..MAX_RECALL_SKILLS)
             .map(|i| {
                 skill(

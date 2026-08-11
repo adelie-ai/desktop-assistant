@@ -120,6 +120,39 @@ test_db_reports_a_clear_error_when_no_free_port_is_available() {
     assert_eq 0 "$(cli_log | grep -c '^rm ' || true)" 'nothing was created, so nothing is removed'
 }
 
+test_db_exits_a_distinct_status_when_no_database_could_be_provided() {
+    # `cargo test` exits 1 when a test fails. A harness that also exits 1 when
+    # it could not start Postgres is indistinguishable from a real failure, and
+    # the failure it imitates - "your change broke something" - is exactly what
+    # someone running a mutation or a bisect is looking for. That has already
+    # produced one false verification, so the status is the property under test.
+    with_fake_cli
+    export FAKE_RUN_STATUS=126
+    export FAKE_RUN_STDERR='Error: pasta failed with exit code 1: Address already in use'
+    run_cmd "$TEST_DB_SH" run -- touch "$TEST_TMP/payload-ran"
+    assert_eq 3 "$RUN_STATUS" 'a harness failure has its own status, not the one a failing test uses'
+    assert_contains "$RUN_ERR" 'NO TEST RAN' 'and says so in words, for whoever reads the log rather than the status'
+    [ ! -e "$TEST_TMP/payload-ran" ] || fail 'the payload must not run without a database'
+}
+
+test_db_names_the_runtime_lock_pool_when_that_is_what_failed() {
+    # Every volume takes one of the runtime's finite locks, so a machine that
+    # has accumulated throwaway volumes stops being able to start containers at
+    # all. The runtime says "exceeded num_locks", which does not tell anybody
+    # what to do; this must.
+    with_fake_cli
+    export FAKE_RUN_STATUS=125
+    export FAKE_RUN_STDERR='Error: creating named volume "abc": allocating lock for new volume: allocation failed; exceeded num_locks (2048)'
+    run_cmd "$TEST_DB_SH" run -- true
+    assert_eq 3 "$RUN_STATUS" 'still a harness failure'
+    assert_contains "$RUN_ERR" 'out of locks' 'names the cause rather than repeating the runtime wording'
+    assert_contains "$RUN_ERR" 'volume ls' 'tells the reader how to count the leftovers'
+    # The safe removal only, because the obvious command is the destructive one:
+    # a compose Postgres data volume reports as dangling and prune takes it.
+    assert_contains "$RUN_ERR" '0-9a-f' 'gives the pattern that matches only throwaway volumes'
+    assert_contains "$RUN_ERR" 'Do NOT' 'warns against the prune that would destroy named volumes'
+}
+
 test_db_reports_a_clear_error_when_the_published_port_cannot_be_read() {
     with_fake_cli
     # The container died between `run` and `port`, so `--rm` already took it
@@ -206,6 +239,8 @@ run_test test_db_exports_the_url_of_the_container_it_created
 run_test test_db_cleans_up_its_own_container_on_success_and_on_failure
 run_test test_db_does_not_remove_a_container_it_did_not_create
 run_test test_db_reports_a_clear_error_when_no_free_port_is_available
+run_test test_db_exits_a_distinct_status_when_no_database_could_be_provided
+run_test test_db_names_the_runtime_lock_pool_when_that_is_what_failed
 run_test test_db_reports_a_clear_error_when_the_published_port_cannot_be_read
 run_test test_db_down_removes_a_leftover_whose_run_has_exited
 run_test test_db_down_spares_a_container_whose_run_is_still_live

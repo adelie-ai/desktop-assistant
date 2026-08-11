@@ -288,6 +288,14 @@ async fn the_sweep_does_not_mix_two_tenants_entries_or_their_proposals() {
 /// row absent from disk, so a proposal that landed on an approved skill would
 /// destroy work a person did. The guard is the same one the promotion tool
 /// applies.
+///
+/// **The seed is an approved own-draft on purpose.** `is_own_draft` refuses on
+/// three independent clauses - not approved, absent from disk, and a source in
+/// the drafting set - so a fixture that fails more than one of them passes with
+/// the approval clause deleted, and this test's name would then be describing
+/// something it does not check. It is also the shape this ticket creates: a
+/// draft the sweep itself wrote, still off disk, that a person has since
+/// approved through `SetSkillApproval`.
 #[tokio::test]
 async fn a_proposal_never_overwrites_a_skill_the_person_approved() {
     let Some(fx) = fixture().await else { return };
@@ -305,12 +313,12 @@ async fn a_proposal_never_overwrites_a_skill_the_person_approved() {
         locality: Locality::Daemon,
         content_hash: "hash-mine".to_string(),
         trust_tier: TrustTier::Local,
-        source: Some("system".to_string()),
+        source: Some("self-authored".to_string()),
         tags: vec![],
         attachments: vec![],
         body: "# mine\n\nMy own steps.\n".to_string(),
         metadata: serde_json::json!({}),
-        present_on_disk: true,
+        present_on_disk: false,
         last_seen_at: None,
         approved_at: None,
         approved_by: None,

@@ -339,6 +339,23 @@ impl SkillScope {
         }
     }
 
+    /// True where this scope names an owner that cannot be told apart from the
+    /// host-global partition.
+    ///
+    /// The store mirrors a NULL `owner_user_id` to an empty `owner_key`, so one
+    /// bound parameter addresses either scope - which means `Owner("")` and
+    /// [`SkillScope::Global`] resolve to the same rows. A principal whose id is
+    /// empty would therefore read, approve, or withdraw approval on every
+    /// host-global skill, for every tenant on the host.
+    ///
+    /// Nothing on the authentication path rejects an empty subject: an id is
+    /// taken from the token verbatim. So this is checked where the scope is
+    /// spent rather than assumed where it is built, and a caller that meets it
+    /// gets a refusal instead of the global partition.
+    pub fn is_degenerate_owner(&self) -> bool {
+        matches!(self, SkillScope::Owner(owner) if owner.is_empty())
+    }
+
     /// The scope a skill belongs to, derived from its `owner_user_id`.
     pub fn of(skill: &IndexedSkill) -> Self {
         match &skill.owner_user_id {

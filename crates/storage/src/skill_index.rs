@@ -34,6 +34,32 @@ use pgvector::Vector;
 use sqlx::PgPool;
 
 /// Postgres-backed [`SkillIndexStore`].
+/// How many skills one unbounded listing returns.
+///
+/// `ListSkills` documents its `limit` as "omit for the store's own default", and
+/// the store had none - an omitted limit bound `i64::MAX`, so a caller repeating
+/// the call pulled every row of the catalog each time. A catalog holds tens of
+/// rows today, which is exactly why an unbounded read looked harmless; it is the
+/// growth case that is not.
+const SKILL_LIST_DEFAULT_LIMIT: i64 = 200;
+
+/// The `owner_key` a scope binds to, refusing one that cannot be told apart from
+/// the host-global partition.
+///
+/// A NULL `owner_user_id` is mirrored to an empty `owner_key`, so binding an
+/// empty owner silently addresses every host-global row rather than nobody. See
+/// [`SkillScope::is_degenerate_owner`].
+fn owner_key(scope: &SkillScope) -> Result<&str, CoreError> {
+    if scope.is_degenerate_owner() {
+        return Err(CoreError::Storage(
+            "a skill scope names an empty owner, which addresses the host-global \
+             partition rather than one person"
+                .to_string(),
+        ));
+    }
+    Ok(scope.owner().unwrap_or(""))
+}
+
 pub struct PgSkillIndexStore {
     pool: PgPool,
     scan_ceiling: std::time::Duration,
@@ -523,7 +549,7 @@ impl SkillIndexStore for PgSkillIndexStore {
             "UPDATE skill_index SET approved_at = $3, approved_by = $4 \
              WHERE owner_key = $1 AND name = ANY($2)",
         )
-        .bind(scope.owner().unwrap_or(""))
+        .bind(owner_key(scope)?)
         .bind(names)
         .bind(approved_at)
         .bind(approved_by)
@@ -544,7 +570,7 @@ impl SkillIndexStore for PgSkillIndexStore {
                     last_seen_at, approved_at, approved_by \
              FROM skill_index WHERE owner_key = $1 ORDER BY name",
         )
-        .bind(scope.owner().unwrap_or(""))
+        .bind(owner_key(scope)?)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;
@@ -567,7 +593,7 @@ impl SkillIndexStore for PgSkillIndexStore {
             "UPDATE skill_index SET present_on_disk = $3 \
              WHERE owner_key = $1 AND name = ANY($2)",
         )
-        .bind(scope.owner().unwrap_or(""))
+        .bind(owner_key(scope)?)
         .bind(names)
         .bind(present)
         .execute(&self.pool)
@@ -635,7 +661,7 @@ impl SkillIndexStore for PgSkillIndexStore {
              ORDER BY indexed_at DESC LIMIT $2",
         )
         .bind(user.as_str())
-        .bind(limit.map(i64::from).unwrap_or(i64::MAX))
+        .bind(limit.map(i64::from).unwrap_or(SKILL_LIST_DEFAULT_LIMIT))
         .fetch_all(&self.pool)
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;

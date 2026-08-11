@@ -714,6 +714,44 @@ async fn embed_prompt(embed: &EmbedFn, prompt: &str) -> Option<Vec<f32>> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The seam the provenance mark has to cross, and the one place nothing
+    /// watched (#1175).
+    ///
+    /// The whole case for letting an installed skill into a system prompt is
+    /// that its line carries `[installed: ...]`. Storage proves the tier leaves
+    /// the row and the core proves every tier marks its line, but the adapter
+    /// between them is a plain field copy - and a copy that names one tier
+    /// instead of the row's compiles, passes both of those suites, and renders
+    /// third-party text as the assistant's own memory.
+    ///
+    /// Written over every variant rather than one, because a mistake here is a
+    /// constant, and a constant matches whichever variant the fixture happened
+    /// to use.
+    #[test]
+    fn every_trust_tier_survives_the_walk_from_a_row_to_a_recall_candidate() {
+        use desktop_assistant_core::domain::TrustTier;
+
+        for tier in [
+            TrustTier::Local,
+            TrustTier::Github,
+            TrustTier::WellKnown,
+            TrustTier::Unknown,
+        ] {
+            let candidate = to_recall_skill(NearestSkill {
+                name: "publish-a-crate".to_string(),
+                description: "Cut a release and push it to the registry.".to_string(),
+                trust_tier: tier,
+                present_on_disk: true,
+                distance: Some(0.20),
+            });
+            assert_eq!(
+                candidate.provenance, tier,
+                "the row's own tier must reach the candidate that renders it, or a \
+                 skill written outside this machine renders unmarked"
+            );
+        }
+    }
     use super::*;
     use desktop_assistant_storage::{
         RECALL_SCAN_STATEMENT_TIMEOUT, USE_LOG_READ_STATEMENT_TIMEOUT,
