@@ -57,9 +57,10 @@ The application layer is transport-agnostic
   `SO_PEERCRED`; no token. The kernel-attested peer UID *is* the credential, so
   desktop apps reach their own daemon without managing any secret.
 - **D-Bus** (`crates/dbus-bridge`) — a standalone `adelie-dbus-bridge` binary
-  that fronts the daemon for legacy session-bus consumers. The daemon also
-  still hosts an in-process D-Bus interface for coexistence; the bridge is the
-  forward direction.
+  that fronts the daemon for legacy session-bus consumers. It owns
+  `org.desktopAssistant` and speaks to the daemon over UDS like any other
+  client. The daemon serves no D-Bus surface of its own, so a D-Bus consumer
+  needs this binary installed and running.
 
 Auth follows the **remote-door** rule (#407): the **WebSocket** door requires a
 JWT (HS256, shared via `crates/auth-jwt`, issued by the daemon's own WS `/login`
@@ -82,7 +83,7 @@ for the target shape and design rules.
 
 - Rust (stable, edition 2024)
 - PostgreSQL with the `pgvector` extension
-- Linux session D-Bus, if you want the D-Bus bridge or in-process D-Bus
+- Linux session D-Bus, if you want `adelie-dbus-bridge` or desktop notifications
 - Cloud provider credentials, if you're not running fully on Ollama
 - One or more MCP servers, if you want the assistant to do anything beyond chat
 
