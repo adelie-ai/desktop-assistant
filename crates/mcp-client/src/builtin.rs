@@ -5492,6 +5492,169 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // The `daemon_host` privacy gate (#779)
+    // -----------------------------------------------------------------------
+    //
+    // On a desktop install the daemon host IS the user's machine, so the
+    // personal half of `daemon_host` repeats the very facts the client-context
+    // control governs. It is gated on the same preference the identity fields
+    // respect. The other half is what tells the model where a SERVER-SIDE file
+    // or terminal tool acts, and withholding it breaks real behaviour, so it is
+    // kept whatever the preference says.
+
+    /// The personal `daemon_host` fields, which follow the client-context
+    /// preference.
+    const PERSONAL_DAEMON_HOST_FIELDS: &[&str] = &[
+        "generated_at_local",
+        "timezone",
+        "hostname",
+        "username",
+        "home_dir",
+        "xdg_dirs",
+        "shell",
+        "locale",
+    ];
+
+    /// The `daemon_host` fields kept whatever the preference says, because the
+    /// model needs them to know where server-side tools act.
+    const TOOL_LOCALITY_DAEMON_HOST_FIELDS: &[&str] =
+        &["cwd", "os", "arch", "os_version", "session_type"];
+
+    /// Run `builtin_sys_props` under `ctx` and return its `daemon_host` object.
+    async fn daemon_host_under(
+        ctx: Option<desktop_assistant_core::ports::transport::ClientContext>,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        use desktop_assistant_core::ports::transport::with_client_context;
+
+        let service = BuiltinToolService::new();
+        let response = with_client_context(ctx, async {
+            service
+                .execute_tool("builtin_sys_props", serde_json::json!({}))
+                .await
+        })
+        .await
+        .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&response).unwrap();
+        json.get("props")
+            .and_then(|p| p.get("daemon_host"))
+            .and_then(serde_json::Value::as_object)
+            .cloned()
+            .expect("daemon_host object")
+    }
+
+    fn sharing_client_context() -> desktop_assistant_core::ports::transport::ClientContext {
+        desktop_assistant_core::ports::transport::ClientContext {
+            real_name: Some("Ada Lovelace".into()),
+            username: Some("ada-client".into()),
+            home_dir: Some("/home/ada-client".into()),
+            hostname: Some("analytical-engine".into()),
+            timezone: Some("Europe/London".into()),
+            os: Some("TestOS 9000".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn sys_props_withholds_personal_daemon_host_fields_when_the_client_shared_none() {
+        let daemon = daemon_host_under(None).await;
+        for field in PERSONAL_DAEMON_HOST_FIELDS {
+            assert!(
+                !daemon.contains_key(*field),
+                "daemon_host.{field} must not be reported when the client shared no context; \
+                 saw {daemon:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sys_props_keeps_the_tool_locality_daemon_host_fields_when_the_client_shared_none() {
+        // The guard against over-withholding: these are how the model knows
+        // where a server-side file or terminal tool acts. A reply that withheld
+        // everything would pass the test above and break real behaviour.
+        let daemon = daemon_host_under(None).await;
+        for field in TOOL_LOCALITY_DAEMON_HOST_FIELDS {
+            assert!(
+                daemon.contains_key(*field),
+                "daemon_host.{field} is needed for tool locality and must survive the opt-out; \
+                 saw {daemon:?}"
+            );
+        }
+        // `os` and `arch` are compile-time constants, so they are never null -
+        // a present-but-null key would not tell the model where tools run.
+        assert!(
+            daemon
+                .get("os")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|s| !s.is_empty())
+        );
+        assert!(
+            daemon
+                .get("arch")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|s| !s.is_empty())
+        );
+    }
+
+    #[tokio::test]
+    async fn sys_props_reports_every_daemon_host_field_when_the_client_shared_a_context() {
+        // The guard against a dead control: if the preference never arrived, the
+        // reply would withhold by default and the two tests above would pass
+        // while the gate did nothing. This one only passes when the preference
+        // actually reaches the reply and turns the personal fields back on.
+        let daemon = daemon_host_under(Some(sharing_client_context())).await;
+        for field in PERSONAL_DAEMON_HOST_FIELDS {
+            assert!(
+                daemon.contains_key(*field),
+                "daemon_host.{field} must be reported when the client shared its context; \
+                 saw {daemon:?}"
+            );
+        }
+        assert_eq!(
+            daemon.get("withheld"),
+            Some(&serde_json::json!([])),
+            "nothing is withheld from a client that shared its context"
+        );
+    }
+
+    #[tokio::test]
+    async fn sys_props_names_every_withheld_daemon_host_field() {
+        // Withheld must be distinguishable from unknown. A field absent from the
+        // reply AND named here was withheld; a field present-but-null simply
+        // could not be detected. A model that cannot tell them apart will guess.
+        let daemon = daemon_host_under(None).await;
+        let withheld: Vec<&str> = daemon
+            .get("withheld")
+            .and_then(serde_json::Value::as_array)
+            .expect("withheld array")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        assert_eq!(withheld, PERSONAL_DAEMON_HOST_FIELDS.to_vec());
+        assert!(
+            daemon
+                .get("withheld_reason")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|r| !r.is_empty()),
+            "a withheld field needs a reason the model can read; saw {daemon:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sys_props_treats_an_empty_client_context_as_no_context_for_daemon_host() {
+        // The gate is the same predicate the identity fields already use: an
+        // all-absent context counts as absent, so the two halves of the reply
+        // cannot disagree about whether the client shared anything.
+        let daemon =
+            daemon_host_under(Some(desktop_assistant_core::ports::transport::ClientContext::default()))
+                .await;
+        for field in PERSONAL_DAEMON_HOST_FIELDS {
+            assert!(
+                !daemon.contains_key(*field),
+                "an empty client context must gate daemon_host.{field} exactly as an absent one does"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn kb_write_without_store_returns_error() {
         let service = BuiltinToolService::new();
