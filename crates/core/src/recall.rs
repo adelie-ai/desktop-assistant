@@ -752,16 +752,15 @@ fn render_recall_with_width(
             (!line.is_empty()).then_some((*skill, line))
         })
         .collect();
-    // The cue travels, and the skill arm answers `NO_SITUATION` for every
-    // candidate through `Activatable::situation_coverage`: no situation record
-    // names a skill yet (#1125 keys them on a knowledge entry). Passing the cue
-    // rather than `None` keeps that a property of the source instead of a
-    // decision this call site made, so the day a skill carries a record the
-    // term lights up here without a change.
+    // The catalog's own cue, never the knowledge store's (#1175). How much a
+    // situation value separates one row from another is a property of the
+    // source that holds the rows, the same way a dispersion is: the two stores
+    // have neither the same population nor the same coverage, so a weight
+    // measured over facts says nothing about procedures.
     let showable_skills = rank_by_activation(
         showable_skills,
         skill_dispersion,
-        candidates.situation_cue.as_ref(),
+        candidates.skill_situation_cue.as_ref(),
         surface.now,
     );
 
@@ -867,10 +866,11 @@ fn render_recall_with_width(
 /// distance test over a nearest-first list. Nothing in this function is
 /// reachable from that test.
 ///
-/// A source that keeps no situation record answers
+/// A candidate with no situation record of its own answers
 /// [`NO_SITUATION`](crate::domain::activation::NO_SITUATION) through
-/// [`Activatable::situation_coverage`] and the term contributes zero - see the
-/// skill arm's implementation, which says why it has nothing to read yet.
+/// [`Activatable::situation_coverage`] and the term contributes zero, which is
+/// how it ranked before the cue existed. `situation` is the arm's own cue,
+/// never another's, on the same terms as `dispersion`.
 fn rank_by_activation<'a, T: Activatable>(
     showable: Vec<(&'a T, String)>,
     dispersion: RecallDispersion,

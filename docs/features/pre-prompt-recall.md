@@ -204,9 +204,21 @@ recall - and skills got none of it.
 
 **Procedural memory is cued by the situation, not by the query.** Nobody
 retrieves how to ride a bicycle by searching their memory for it; the bicycle
-cues it. "Deploy this" is a weak query and a strong situation. So the
-prompt-cued arm here is the first half of the answer and not the whole of it -
-the situation signal widens the cue later, and the arm reads it when it exists.
+cues it. "Deploy this" is a weak query and a strong situation. So the arm reads
+the situation as well as the prompt: a skill accumulates a record of where it
+has been followed, and the present situation is read against that record exactly
+as it is read against a knowledge entry's - see "The situation as a cue" below,
+which states the whole rule once for both arms.
+
+Two halves of that are the catalog's own, and neither is the knowledge store's.
+The **record** is written by a taken-up offer and nothing else: a scan reads a
+file at daemon start and the dream cycle authors a skill in a background pass,
+and neither happens in anybody's situation, so a record written by either would
+record the daemon's. And the **cue** is graded over `skill_situation`, because
+how much "the workshop" separates one procedure from another is a fact about the
+catalog: the two stores have neither the same population nor the same coverage,
+so a weight measured over facts says nothing about procedures. That is the same
+split the dispersion already makes, for the same reason.
 
 **Only a skill somebody wrote on this machine and approved is offered**, and
 the two conditions answer different questions.
@@ -502,6 +514,15 @@ Neither write touches `knowledge_base`: an entry that had to be rewritten to
 learn where it is useful would restate its own content, move its `updated_at`,
 and put itself back in the embedding backfill queue.
 
+**Both arms keep their own record and their own cue.** A skill accumulates the
+same way an entry does, in `skill_situation` keyed on the catalog name, written
+by exactly one act: a taken-up offer, which is the only moment a procedure is
+followed in anybody's situation. The fan is counted over that table and never
+over `knowledge_situation`, so the weight a cue value carries on the skill arm
+is what it separates among procedures. Everything else below - what a situation
+is, presence over frequency, the bound, the write that cannot cost the read -
+holds identically for both.
+
 **Presence is the match, not how often.** The record holds how many times each
 value has been seen, and no ranking rule reads it. The use log already measures
 how much an entry has been used, so weighting the match by a count would put that
@@ -601,8 +622,9 @@ lasted, and saying so only in a log line. What is given up is atomicity between
 the two, which costs nothing: the record is idempotent by key, so the next reuse
 in the same situation records what this one missed.
 
-The rule is `crates/core/src/domain/situation.rs`; the table is
-`knowledge_situation`, created by `047_knowledge_situation.sql` and bounded per
+The rule is `crates/core/src/domain/situation.rs`; the tables are
+`knowledge_situation`, created by `047_knowledge_situation.sql`, and
+`skill_situation`, created by `051_skill_situation.sql`, both bounded per
 entry per field with the least recently seen value evicted first.
 
 ## Salience
@@ -1002,6 +1024,7 @@ measured.
 | The bounded use-log read | `recall::use_records`, same file |
 | The bounded situation read | `recall::situation_signal`, same file |
 | The situation writes and the fan count | `crates/storage/src/knowledge_use.rs` |
+| The same, for the skill catalog | `crates/storage/src/skill_use.rs`, table `skill_situation` |
 | The knowledge query, and the spread it states | `PgKnowledgeBaseStore::nearest_by_embedding`, `crates/storage/src/knowledge.rs` |
 | Its degraded form | `PgKnowledgeBaseStore::search_text_any_term`, same file |
 | The scratchpad query | `PgScratchpadStore::nearest_by_embedding`, `crates/storage/src/scratchpad.rs` |

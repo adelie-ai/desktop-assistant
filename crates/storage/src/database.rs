@@ -125,6 +125,10 @@ const PERSONAL_DATA_TABLES: &[&str] = &[
     // took up, which says as much about the person as the skills do.
     "skill_use_stats",
     "skill_offers",
+    // 051 - where one person's assistant has followed each procedure. A host
+    // name and the hours somebody works are personal data in their own right,
+    // on the same terms as `knowledge_situation`.
+    "skill_situation",
     // 049 - negative memory. What one person's assistant tried, how it failed,
     // and the host and hours it failed in. As personal as the work it was
     // doing, before any of the work itself is read.

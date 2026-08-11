@@ -33,12 +33,14 @@
 //!   from - see [`RecallDispersion`]. The adapter measures that over the whole
 //!   source, not over the rows it returned, and answers `None` when it cannot.
 //! - **The present situation, read against the source.** A candidate carries
-//!   the situations it has been seen in ([`RecallEntry::situation`]), and the
-//!   answer carries one [`SituationCue`] for the whole lookup: the present
-//!   situation, plus how much each of its values separates one entry of this
-//!   store from another. That second half is a property of the source in the
-//!   same way a dispersion is, so it is measured over the source and answered
-//!   as `None` when it cannot be - see [`crate::domain::situation`].
+//!   the situations it has been seen in ([`RecallEntry::situation`],
+//!   [`RecallSkill::situation`]), and the answer carries one [`SituationCue`]
+//!   **per source**: the present situation, plus how much each of its values
+//!   separates one row of that source from another. That second half is a
+//!   property of the source in the same way a dispersion is, so it is measured
+//!   over the source and answered as `None` when it cannot be - and the skill
+//!   catalog's is never the knowledge store's, because the two hold different
+//!   populations with different coverage. See [`crate::domain::situation`].
 //! - **One user, and one conversation's pad.** Row-level security is a backstop
 //!   the table owner bypasses, so every query behind this port carries its own
 //!   `WHERE user_id` predicate. The scratchpad arm carries a `conversation_id`
@@ -391,18 +393,15 @@ impl Activatable for RecallSkill {
         self.use_record.as_ref()
     }
 
-    /// A skill records no situation yet (#1154). `knowledge_situation` is keyed
-    /// on a knowledge entry, and nothing writes a row for a skill, so the term
-    /// has nothing to read and contributes exactly zero - which is how every
-    /// candidate scored before #1125 existed.
+    /// Read against the situations this skill has been followed in (#1175),
+    /// exactly as a knowledge entry is read against its own.
     ///
-    /// This is the arm's largest known gap rather than a settled answer. A
-    /// procedure is more situational than a fact, not less: "deploy this" is a
-    /// weak query and a strong situation, which is the whole reason this arm
-    /// exists. Giving a skill a situation record is what would let the cue
-    /// reach it.
-    fn situation_coverage(&self, _cue: Option<&SituationCue>) -> f64 {
-        NO_SITUATION
+    /// The cue this is handed is the **catalog's**, never the knowledge
+    /// store's - see [`RecallCandidates::skill_situation_cue`]. A skill nothing
+    /// has opened yet carries an empty record, which scores zero, which is how
+    /// every skill scored before this arm had a record at all.
+    fn situation_coverage(&self, cue: Option<&SituationCue>) -> f64 {
+        cue.map_or(NO_SITUATION, |cue| cue.coverage(&self.situation))
     }
 
     /// A skill carries no salience reading (#1127). Every signal is read from a
