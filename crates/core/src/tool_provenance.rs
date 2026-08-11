@@ -887,7 +887,7 @@ fn collect_trust_tiers(value: &serde_json::Value, out: &mut Vec<String>) {
 ///
 /// **Never compare against this constant directly.** Use
 /// [`is_withheld_step_text`], which also recognises the wordings this build has
-/// retired. See [`RETIRED_WITHHELD_STEP_TEXTS`].
+/// retired, listed in the private `RETIRED_WITHHELD_STEP_TEXTS`.
 pub const WITHHELD_STEP_TEXT: &str = "[withheld by security policy]";
 
 /// Every placeholder wording this build has used and stopped using.
