@@ -586,6 +586,11 @@ command_table! {
                 error: None,
             },
             Tenant),
+    ListSkills => (api::Command::ListSkills { limit: None }, Tenant),
+    SetSkillApproval => (api::Command::SetSkillApproval {
+        name: "deploy-the-lab".to_string(),
+        approved: true,
+    }, Tenant),
     ListNegativeMemories => (api::Command::ListNegativeMemories, Tenant),
     GetNegativeMemory => (api::Command::GetNegativeMemory { id: "nm-1".to_string() }, Tenant),
     ClearNegativeMemory => (api::Command::ClearNegativeMemory {

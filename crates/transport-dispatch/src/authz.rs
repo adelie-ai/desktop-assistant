@@ -304,6 +304,12 @@ fn classify(cmd: &api::Command) -> (&'static str, Capability) {
         api::Command::ListNegativeMemories => ("list_negative_memories", Tenant),
         api::Command::GetNegativeMemory { .. } => ("get_negative_memory", Tenant),
         api::Command::ClearNegativeMemory { .. } => ("clear_negative_memory", Tenant),
+        // #1175. Tenant work on both counts: the listing is the caller's own
+        // view of the catalog - the global skills plus theirs - and the write
+        // reaches only rows this person owns, so neither decides anything for
+        // another tenant or for the host.
+        api::Command::ListSkills { .. } => ("list_skills", Tenant),
+        api::Command::SetSkillApproval { .. } => ("set_skill_approval", Tenant),
     }
 }
 

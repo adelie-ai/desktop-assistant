@@ -828,6 +828,53 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         note: Option<String>,
     },
+
+    // --- The skill catalog, as a person sees it (#1175) --------------------
+    //
+    // A skill the assistant wrote for itself is recorded unapproved and stays
+    // unapproved until somebody says otherwise, and until these two commands
+    // existed nothing could say otherwise - so promoted skills accumulated
+    // inert and invisible. Approval is a person's act, which is why it arrives
+    // on the command surface and not as a tool: an assistant that could approve
+    // its own procedures would be consenting on the user's behalf.
+    /// List the skill catalog as this person sees it: the host-global skills
+    /// plus their own, each saying whether a person has approved it.
+    ///
+    /// Returns [`CommandResult::Skills`], newest first. An unapproved skill is
+    /// **listed**, marked `approved: false` - silence would be
+    /// indistinguishable from a library with nothing in it, which is the state
+    /// this command exists to tell apart.
+    ListSkills {
+        /// Most rows to return. Omit for the store's own default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+    },
+    /// Approve one of this person's own skills for use, or withdraw approval.
+    ///
+    /// Approval records **consent** - that a person agreed the procedure may be
+    /// followed - and it is a separate axis from where the skill came from. An
+    /// unapproved skill is never offered by `[Recall]` and its body is refused
+    /// by the skill-read tool, so this is what makes a promoted or extracted
+    /// skill usable at all.
+    ///
+    /// **There is no approver field, and that is deliberate.** The approver is
+    /// the authenticated caller. A payload that could name somebody else would
+    /// let a record of consent be written in another person's name.
+    ///
+    /// **This addresses the caller's own skills only.** A host-global skill got
+    /// its approval from a person putting a file in a skill root, and
+    /// withdrawing that from one tenant's session would decide for every other
+    /// tenant on the host. A name this person owns no row for is refused by
+    /// name rather than silently ignored.
+    ///
+    /// Returns [`CommandResult::SkillApprovalSet`]. Asking for the state a
+    /// skill is already in is not an error and changes nothing.
+    SetSkillApproval {
+        /// The catalog name, which is the handle the skill is fetched by.
+        name: String,
+        /// `true` approves, `false` withdraws.
+        approved: bool,
+    },
 }
 
 /// Single entry in a `RegisterClientTools` request. Mirrors the shape of
@@ -924,6 +971,21 @@ pub enum CommandResult {
     /// the caller asked for either way.
     NegativeMemoryCleared {
         cleared: bool,
+    },
+
+    /// Response to `ListSkills` (#1175): the catalog as this person sees it,
+    /// including the skills nobody has approved yet.
+    Skills(Vec<SkillView>),
+    /// Response to `SetSkillApproval` (#1175).
+    ///
+    /// `approved` is the state the skill is in after the call, so a caller can
+    /// render the result without a second read. `changed` says whether this
+    /// call is the one that moved it: `false` means it was already in that
+    /// state, which is not an error and leaves the skill exactly as the caller
+    /// asked for.
+    SkillApprovalSet {
+        approved: bool,
+        changed: bool,
     },
 
     /// Response to `GetConversationScratchpad` / `SetScratchpadNote` — the
@@ -1238,6 +1300,54 @@ pub enum MaintenanceOp {
     /// or corrupted vectors). Routine model changes are handled automatically
     /// by the periodic backfill.
     RecalculateEmbeddings,
+}
+
+/// One skill in the catalog, as a person reads it (#1175).
+///
+/// Carries what a person needs to decide whether to approve it: what it claims
+/// to be for, where its text came from, whether anything wrote it to disk, and
+/// whether consent has been recorded. The **body is not here** - a listing is a
+/// listing, and the body is read with the skill-read tool.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillView {
+    /// The catalog name, which is the handle the skill is fetched by.
+    pub name: String,
+    /// The skill's own "when to use" line.
+    ///
+    /// On a skill whose `trust_tier` is not `local` these are words somebody
+    /// outside this machine wrote. Render it as a quotation, not as the
+    /// assistant's own description.
+    pub description: String,
+    /// `skill` for a prose playbook, `workflow` for one with a step sequence.
+    pub kind: String,
+    /// Provenance: `local`, `github`, `well_known` or `unknown`. A string
+    /// rather than an enum on the wire, so a tier added later reaches an older
+    /// client as an unfamiliar word instead of a parse failure.
+    pub trust_tier: String,
+    /// Free-form source label the indexer recorded - a lockfile URL, a root
+    /// path, or how the assistant came to write it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Whether this row is this person's own. `false` is the host-global row,
+    /// which this person cannot approve or unapprove.
+    pub own: bool,
+    /// Whether the skill's files were on disk at the last scan of its scope.
+    /// `false` still reads and is still followable; only bundled scripts are
+    /// unreachable.
+    pub present_on_disk: bool,
+    /// Whether a person has recorded consent for this skill to be followed.
+    pub approved: bool,
+    /// When that consent was recorded, RFC 3339. Absent while `approved` is
+    /// `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_at: Option<String>,
+    /// Who recorded it. Absent on a deployment that recorded no approver, and
+    /// meaningless while `approved` is `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_by: Option<String>,
+    /// The skill's frontmatter tags.
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 /// One dimension a negative memory is scoped by, as a person reads it (#1186).
