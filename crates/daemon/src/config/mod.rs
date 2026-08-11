@@ -1535,43 +1535,81 @@ pub fn ensure_daemon_config_exists(path: &Path) -> anyhow::Result<bool> {
 /// Serialize `config` over the file at `path`, creating the parent directory
 /// if needed.
 ///
-/// This is a whole-file replacement: it truncates in place, so the caller is
-/// responsible for the config being the file's content plus its edit.
-/// `RegistryHandle::mutate_config` - the path that writes an in-memory
-/// snapshot - refuses to call this when the running config is not the file's
-/// content (#723). It is also not atomic: an interrupted write leaves a
-/// truncated file, which the daemon then refuses to overwrite on the next
-/// start rather than compounding the loss (#914).
+/// This is a whole-file replacement: the file becomes the serialization of
+/// `config`, so the caller is responsible for the config being the file's
+/// content plus its edit. `RegistryHandle::mutate_config` - the path that
+/// writes an in-memory snapshot - refuses to call this when the running config
+/// is not the file's content (#723).
+///
+/// The replacement is one step (#326). The content goes to a temporary file
+/// beside the config, which is then renamed over it, so a concurrent reader -
+/// a `Reload`, the config watcher, another process - reads the whole old
+/// config or the whole new one, and an interrupted save leaves the old config
+/// in place. The temporary file shares the config's own directory because a
+/// rename between filesystems fails, and the Kubernetes deployment writes this
+/// config onto a mounted volume. A failed save removes it.
+///
+/// The config carries credential references and OIDC client identifiers. The
+/// temporary file is created 0600 and keeps that mode through the rename, so
+/// the config is never readable by another user - not even for the length of
+/// the write.
 ///
 /// Comments and key order in a hand-authored file do not survive a rewrite;
 /// only the values do.
 pub fn save_daemon_config(path: &Path, config: &DaemonConfig) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create config directory {}", parent.display()))?;
+    let dir = path.parent().unwrap_or_else(|| Path::new(""));
+    if !dir.as_os_str().is_empty() {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("failed to create config directory {}", dir.display()))?;
     }
 
     let content = toml::to_string_pretty(config)?;
 
-    // The config can carry credential references and OIDC client identifiers;
-    // open with restrictive perms before writing so the file is never briefly
-    // world-readable. Mirrors `write_secret_file` below.
+    // A dotted, uniquely suffixed name: two saves at once cannot pick the same
+    // temporary file, and the config watcher matches by file name, so this one
+    // does not trip a reload before the rename does.
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "daemon.toml".to_string());
+    let temp_path = dir.join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4().simple()));
+
+    if let Err(error) = write_then_rename(&temp_path, path, content.as_bytes()) {
+        remove_temp_config_file(&temp_path);
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Fill `temp_path` with `content`, then rename it over `path`.
+///
+/// Split out of [`save_daemon_config`] so one caller removes the temporary
+/// file on every failure, whichever step failed.
+fn write_then_rename(temp_path: &Path, path: &Path, content: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+
     #[cfg(unix)]
     {
-        use std::io::Write;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)
-            .with_context(|| format!("failed to write daemon config at {}", path.display()))?;
+        use std::os::unix::fs::OpenOptionsExt;
+        // Restrictive from the first byte, rather than tightened after the
+        // open: a file created at the process umask is world-readable until
+        // the mode changes, and the content is already in it by then.
+        options.mode(0o600);
+    }
 
-        // `OpenOptions::mode` applies only when the file is *created*, so a
-        // config that already exists keeps whatever mode it had — which is how
-        // a 0644 seeded file stayed world-readable through every rewrite.
-        // Tighten explicitly, before any content is written.
+    let mut file = options
+        .open(temp_path)
+        .with_context(|| format!("failed to write daemon config at {}", path.display()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // The umask masks the mode above, and can clear the owner write bit
+        // with it. Set the mode exactly, while the file is still empty. This
+        // only ever adds back owner bits, so the file stays 0600 at most.
         file.set_permissions(std::fs::Permissions::from_mode(0o600))
             .with_context(|| {
                 format!(
@@ -1579,17 +1617,33 @@ pub fn save_daemon_config(path: &Path, config: &DaemonConfig) -> anyhow::Result<
                     path.display()
                 )
             })?;
-
-        let mut file = file;
-        file.write_all(content.as_bytes())
-            .with_context(|| format!("failed to write daemon config at {}", path.display()))?;
-        Ok(())
     }
 
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, content)
-            .with_context(|| format!("failed to write daemon config at {}", path.display()))
+    file.write_all(content)
+        .with_context(|| format!("failed to write daemon config at {}", path.display()))?;
+    // Flush before the rename publishes the file. A crash between the two
+    // would otherwise leave the config name on an empty file.
+    file.sync_all()
+        .with_context(|| format!("failed to flush daemon config at {}", path.display()))?;
+    drop(file);
+
+    std::fs::rename(temp_path, path)
+        .with_context(|| format!("failed to replace daemon config at {}", path.display()))
+}
+
+/// Remove the temporary file a failed save left behind, so nothing
+/// accumulates beside the config.
+fn remove_temp_config_file(temp_path: &Path) {
+    match std::fs::remove_file(temp_path) {
+        Ok(()) => {}
+        // The save can fail on the open itself, which leaves nothing to
+        // remove.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => tracing::warn!(
+            temp_file = %temp_path.display(),
+            %error,
+            "failed to remove the temporary daemon config file"
+        ),
     }
 }
 
@@ -1681,23 +1735,47 @@ mod tests {
     fn save_daemon_config_tightens_permissions_on_an_existing_file() {
         use std::os::unix::fs::PermissionsExt;
 
-        // The path that matters: a seeded config lands 0644 (the k8s init
-        // container writes it), and every daemon-authored rewrite kept those
-        // permissions, because OpenOptions::mode applies only on create.
-        let mut path = std::env::temp_dir();
-        path.push(format!("da-perm-{}.toml", uuid::Uuid::new_v4().simple()));
-        std::fs::write(&path, "# seeded\n").expect("seed the file");
+        // The property: the config is never readable above 0600, at any point
+        // during a save.
+        //
+        // The case that started this is a seeded config that lands 0644 (the
+        // Kubernetes init container writes it), which every daemon-authored
+        // rewrite then inherited, because OpenOptions::mode applies only on
+        // create. Tightening the mode after the open is not enough on its own:
+        // a save that writes through the existing file puts config content in
+        // a loose-mode file for as long as the write takes. A save that fills
+        // a fresh 0600 file and renames it into place never does.
+        //
+        // `seeded_link` is a second name for the seeded file's own inode, so
+        // it reports what that inode held across the whole save.
+        const SEEDED: &str = "# seeded\n";
+        let dir = std::env::temp_dir();
+        let tag = uuid::Uuid::new_v4().simple().to_string();
+        let path = dir.join(format!("da-perm-{tag}.toml"));
+        let seeded_link = dir.join(format!("da-perm-{tag}.seeded"));
+
+        std::fs::write(&path, SEEDED).expect("seed the file");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
             .expect("make it world-readable");
+        std::fs::hard_link(&path, &seeded_link).expect("give the seeded inode a second name");
 
         super::save_daemon_config(&path, &super::DaemonConfig::default()).expect("save");
 
         let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        let held_by_the_loose_file =
+            std::fs::read_to_string(&seeded_link).expect("read the seeded inode");
         std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&seeded_link).ok();
+
         assert_eq!(
             mode, 0o600,
             "the config carries credential coordinates; a rewrite must tighten \
              an existing loose file, not inherit its mode"
+        );
+        assert_eq!(
+            held_by_the_loose_file, SEEDED,
+            "the 0644 file never received config content, so no other user \
+             could read the config - not even for the length of the write"
         );
     }
 
@@ -1717,6 +1795,145 @@ mod tests {
         let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
         std::fs::remove_file(&path).ok();
         assert_eq!(mode, 0o600, "the create path must stay restrictive");
+    }
+
+    // --- save_daemon_config must replace the file in one step (#326) -------
+
+    #[cfg(unix)]
+    #[test]
+    fn save_daemon_config_writes_a_fresh_file_and_renames_it_over_the_config() {
+        use std::os::unix::fs::MetadataExt;
+
+        // The property: a reader that opens the config while a save runs gets
+        // the whole old config or the whole new config, never a partial one.
+        //
+        // A rename holds the property, because the content is complete before
+        // the name points at it. A truncate in place cannot: the file is
+        // empty, then partial, then whole, and every state is readable under
+        // the same name. `old_link` names the file such a reader already
+        // holds, so it must still carry the old config in full.
+        const OLD: &str = "[llm]\nconnector = \"ollama\"\nmodel = \"llama3\"\n";
+        let dir = std::env::temp_dir();
+        let tag = uuid::Uuid::new_v4().simple().to_string();
+        let path = dir.join(format!("da-atomic-{tag}.toml"));
+        let old_link = dir.join(format!("da-atomic-{tag}.old"));
+
+        std::fs::write(&path, OLD).expect("seed the file");
+        std::fs::hard_link(&path, &old_link).expect("give the old inode a second name");
+        let old_inode = std::fs::metadata(&old_link).expect("stat").ino();
+
+        super::save_daemon_config(&path, &super::DaemonConfig::default()).expect("save");
+
+        let new_inode = std::fs::metadata(&path).expect("stat").ino();
+        let held_by_the_old_file = std::fs::read_to_string(&old_link).expect("read the old inode");
+        let written = std::fs::read_to_string(&path).expect("read the config back");
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&old_link).ok();
+
+        assert_ne!(
+            new_inode, old_inode,
+            "the config path must name a new file, which is what makes the \
+             replacement one step"
+        );
+        assert_eq!(
+            held_by_the_old_file, OLD,
+            "the save must not write through the file a reader already holds, \
+             because that reader would then read a partial config"
+        );
+        assert_eq!(
+            written,
+            toml::to_string_pretty(&super::DaemonConfig::default()).expect("serialize"),
+            "the renamed file carries the new config in full"
+        );
+    }
+
+    #[test]
+    fn save_daemon_config_leaves_no_temp_file_after_a_successful_save() {
+        // The save builds its content in a temp file beside the config, so the
+        // rename stays on one filesystem. That temp file is gone by the time
+        // the save returns.
+        let dir =
+            std::env::temp_dir().join(format!("da-litter-ok-{}", uuid::Uuid::new_v4().simple()));
+        let path = dir.join("daemon.toml");
+
+        super::save_daemon_config(&path, &super::DaemonConfig::default()).expect("save");
+
+        let entries = directory_entry_names(&dir);
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            entries,
+            ["daemon.toml"],
+            "a save leaves only the config in the config directory"
+        );
+    }
+
+    #[test]
+    fn save_daemon_config_leaves_no_temp_file_after_a_failed_save() {
+        // A failure that is not cleaned up litters the operator's config
+        // directory. A directory where the config file belongs makes the
+        // rename fail, which is the failure that happens after the temp file
+        // exists.
+        let dir =
+            std::env::temp_dir().join(format!("da-litter-fail-{}", uuid::Uuid::new_v4().simple()));
+        let path = dir.join("daemon.toml");
+        std::fs::create_dir_all(&path).expect("put a directory where the config goes");
+
+        let result = super::save_daemon_config(&path, &super::DaemonConfig::default());
+
+        let entries = directory_entry_names(&dir);
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            result.is_err(),
+            "a save that cannot replace the config must report the failure"
+        );
+        assert_eq!(
+            entries,
+            ["daemon.toml"],
+            "a failed save leaves nothing beside the config"
+        );
+    }
+
+    /// The names in `dir`, sorted, so a test can state what a save left behind.
+    fn directory_entry_names(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("list the config directory")
+            .map(|entry| {
+                entry
+                    .expect("read a directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    // --- save_daemon_config writes the whole struct (#326) -----------------
+
+    #[test]
+    fn save_daemon_config_writes_the_whole_serialized_struct_not_a_merge() {
+        // The file becomes the serialization of the config given. The save
+        // does not merge the change into what the file held before, so a
+        // caller can read the file back and get the config it saved.
+        let path =
+            std::env::temp_dir().join(format!("da-whole-{}.toml", uuid::Uuid::new_v4().simple()));
+        std::fs::write(
+            &path,
+            "# a hand comment\n[llm]\nconnector = \"ollama\"\nmodel = \"llama3\"\n",
+        )
+        .expect("seed the file");
+
+        let config = super::DaemonConfig::default();
+        super::save_daemon_config(&path, &config).expect("save");
+
+        let written = std::fs::read_to_string(&path).expect("read the config back");
+        std::fs::remove_file(&path).ok();
+        assert_eq!(
+            written,
+            toml::to_string_pretty(&config).expect("serialize"),
+            "the file is the whole config, not the old file with an edit merged in"
+        );
     }
 
     use super::*;

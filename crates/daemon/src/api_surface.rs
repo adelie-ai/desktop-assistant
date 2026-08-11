@@ -4628,19 +4628,19 @@ mod tests {
     }
 
     /// `mutate_config` must drop the data lock before doing its blocking
-    /// file write + registry rebuild. We prove it by pointing the config
-    /// path at a FIFO with no reader: `save_daemon_config`'s `open(O_WRONLY)`
-    /// blocks forever. A concurrent `snapshot_config` read must still
-    /// complete promptly — it would hang if the write lock were held across
-    /// the I/O.
+    /// file I/O + registry rebuild. We prove it by pointing the config path
+    /// at a FIFO with no writer: the pre-write guard's read of the file
+    /// (`parse_daemon_config`) blocks forever on `open(O_RDONLY)`. A
+    /// concurrent `snapshot_config` read must still complete promptly - it
+    /// would hang if the write lock were held across the I/O.
     #[cfg(unix)]
     #[test]
     fn mutate_config_does_not_hold_lock_across_blocking_io() {
         use std::sync::mpsc;
         use std::time::Duration;
 
-        // Build a FIFO path. open(O_WRONLY) on a FIFO blocks until a reader
-        // appears, which never happens here — a deterministic "slow I/O".
+        // Build a FIFO path. open(O_RDONLY) on a FIFO blocks until a writer
+        // appears, which never happens here - a deterministic "slow I/O".
         let dir = std::env::temp_dir();
         let fifo = dir.join(format!(
             "da-test-fifo-{}.toml",
@@ -4654,14 +4654,14 @@ mod tests {
         let registry = build_registry(&cfg);
         let handle = Arc::new(RegistryHandle::new(cfg, registry).with_config_path(fifo.clone()));
 
-        // Writer thread: this mutate will block inside the file write
-        // (open on the readerless FIFO) and never return.
+        // Writer thread: this mutate will block inside its file I/O (the
+        // open on the writerless FIFO) and never return.
         let writer = Arc::clone(&handle);
         std::thread::spawn(move || {
             let _ = writer.set_personality(desktop_assistant_core::prompts::Personality::default());
         });
 
-        // Give the writer time to reach (and block in) the file write.
+        // Give the writer time to reach (and block in) the file I/O.
         std::thread::sleep(Duration::from_millis(200));
 
         // Reader: must complete promptly. If the write lock were held across
