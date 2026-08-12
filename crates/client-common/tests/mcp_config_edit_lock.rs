@@ -12,11 +12,10 @@
 //! test that races threads inside one process passes whether or not the lock is
 //! there. So the load-bearing test here spawns real child processes.
 //!
-//! The children are this same test binary, re-executed with
-//! [`CHILD_TEST`](child) selected by name. `child_process_edit_worker` is
-//! `#[ignore]`d so a normal run never executes it, and it panics when the
-//! environment that drives it is absent, so a mis-selected child fails loudly
-//! rather than exiting 0 with nothing done.
+//! The children are this same test binary, re-executed and selected by name.
+//! `child_process_edit_worker` is `#[ignore]`d so a normal run never executes
+//! it, and it panics when the environment that drives it is absent, so a
+//! mis-selected child fails loudly rather than exiting 0 with nothing done.
 
 #![cfg(feature = "mcp-host")]
 
@@ -93,7 +92,6 @@ fn edit_serializes_concurrent_editors_across_processes() {
             "child_process_edit_worker",
             "--ignored",
             "--test-threads=1",
-            "--nocapture",
         ])
         .env(ENV_CONFIG, &path)
         .env(ENV_CHILD, child.to_string())
@@ -136,7 +134,7 @@ fn edit_serializes_concurrent_editors_across_processes() {
         CHILDREN * EDITS_PER_CHILD
     );
     assert!(
-        present.iter().any(|p| *p == "seed"),
+        present.contains(&"seed"),
         "the seeded definition was overwritten: {present:?}"
     );
 }
@@ -298,7 +296,10 @@ fn edit_on_absent_config_is_a_first_write() {
 /// The sidecar path `edit` locks. Derived here independently of the
 /// implementation so the test pins the contract rather than following it.
 fn lock_path(config: &Path) -> PathBuf {
-    let mut name = config.file_name().expect("config has a file name").to_owned();
+    let mut name = config
+        .file_name()
+        .expect("config has a file name")
+        .to_owned();
     name.push(".lock");
     config.with_file_name(name)
 }

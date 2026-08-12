@@ -13,6 +13,16 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+/// How long [`ClientMcpConfig::edit`] retries for the sidecar lock before it
+/// gives up. Bounded on purpose: one caller is a tokio worker, so parking it
+/// forever on a blocking `lock()` is not an option.
+const LOCK_WAIT: Duration = Duration::from_secs(2);
+
+/// Pause between attempts on the sidecar lock. Short enough that an ordinary
+/// hand-off costs nothing visible, long enough not to spin a core.
+const LOCK_RETRY_PAUSE: Duration = Duration::from_millis(20);
 
 /// The server-definition schema is shared verbatim with the daemon so a local
 /// server is described identically wherever it runs.
@@ -305,6 +315,79 @@ impl ClientMcpConfig {
         }
     }
 
+    /// Change the config under an exclusive lock held for the **whole**
+    /// read-mutate-write transaction. **This is the supported way to change
+    /// `client-mcp.toml`.**
+    ///
+    /// `client-mcp.toml` is machine-wide, so every Adele client on the box is a
+    /// writer. [`save`](Self::save) is atomic against a torn read, but the
+    /// transaction a caller performs is load, mutate, save, and protecting only
+    /// the last step loses an update: two clients read the same bytes, each
+    /// applies its own change, and the second write wins whole. The lock here
+    /// covers the read as well, so the two clients queue instead.
+    ///
+    /// The read is strict ([`from_toml`](Self::from_toml), not
+    /// [`load`](Self::load)): a config that cannot be parsed fails the
+    /// transaction rather than being replaced by an empty one. A config that is
+    /// merely absent is a first write, and the parent directory is created.
+    /// `change` returning `Err` writes nothing and leaves the file untouched.
+    ///
+    /// ```no_run
+    /// use desktop_assistant_client_common::mcp_host::config::{
+    ///     ClientMcpConfig, default_client_mcp_path,
+    /// };
+    ///
+    /// let path = default_client_mcp_path();
+    /// ClientMcpConfig::edit(&path, |config| config.set_server_enabled("git", false))?;
+    /// # Ok::<(), String>(())
+    /// ```
+    ///
+    /// **Blocking.** `edit` is synchronous, and it sleeps while another editor
+    /// holds the lock. Call it from `tokio::task::spawn_blocking` on an async
+    /// runtime. It waits about two seconds and then fails, naming the cause,
+    /// rather than parking the caller indefinitely.
+    ///
+    /// Why a sidecar `<path>.lock` and not the config itself: `save` renames a
+    /// new file over the config, so a lock taken on the config is a lock on an
+    /// unlinked inode, and the next process opens the new inode and serializes
+    /// against nobody. The sidecar is only ever created and locked, never
+    /// replaced. It needs no cleanup - the lock is released when the `File`
+    /// drops, including on an error path or a panic, and by the kernel when the
+    /// process dies, so a leftover lock file blocks nothing.
+    ///
+    /// Readers need no lock and take none: the rename is atomic, so
+    /// [`load`](Self::load) always sees a whole file.
+    ///
+    /// Limitation: on a network home directory (NFS, SMB - macOS especially)
+    /// `flock` can be local to one host, or refused outright. That is accepted
+    /// for a machine-local config.
+    pub fn edit<T>(
+        path: &Path,
+        change: impl FnOnce(&mut ClientMcpConfig) -> Result<T, String>,
+    ) -> Result<T, String> {
+        // Held for the whole transaction; dropped on every exit path.
+        let _guard = EditLock::acquire(path)?;
+        let mut config = Self::read_strict(path)?;
+        let value = change(&mut config)?;
+        config.save(path)?;
+        Ok(value)
+    }
+
+    /// Read `path` strictly for an edit: absent is an empty config, unreadable
+    /// or unparseable is a failure.
+    ///
+    /// Deliberately unlike [`load`](Self::load), whose tolerance is right for a
+    /// client that must still start. Tolerance in an edit means writing an empty
+    /// config over every client's definitions.
+    fn read_strict(path: &Path) -> Result<Self, String> {
+        match std::fs::read_to_string(path) {
+            Ok(contents) => Self::from_toml(&contents)
+                .map_err(|e| format!("refusing to edit {}: {e}", path.display())),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(err) => Err(format!("failed to read {}: {err}", path.display())),
+        }
+    }
+
     /// Serialize to TOML and write to `path` atomically with `0600` permissions.
     ///
     /// Re-runs the duplicate-name validation first and fails closed without
@@ -312,6 +395,11 @@ impl ClientMcpConfig {
     /// private sibling temp file (same directory, so the rename is atomic on one
     /// filesystem), fsyncs it, then renames it over `path` — a reader never sees a
     /// partial or world-readable file.
+    ///
+    /// This is the write half only. It does **not** serialize against another
+    /// process, so a caller that read the file first has a lost-update race:
+    /// use [`edit`](Self::edit) to change a config, and `save` only to write one
+    /// that was not derived from the file's current contents.
     pub fn save(&self, path: &Path) -> Result<(), String> {
         let mut seen = HashSet::new();
         for server in &self.servers {
@@ -346,6 +434,80 @@ impl ClientMcpConfig {
             return Err(format!("failed to write {}: {err}", path.display()));
         }
         Ok(())
+    }
+}
+
+/// The sidecar lock file for a config: `<path>.lock`, in the same directory.
+fn lock_path(config_path: &Path) -> Result<PathBuf, String> {
+    let file_name = config_path
+        .file_name()
+        .ok_or_else(|| format!("invalid config path: {}", config_path.display()))?;
+    let mut lock_name = file_name.to_os_string();
+    lock_name.push(".lock");
+    Ok(config_path.with_file_name(lock_name))
+}
+
+/// An exclusive advisory lock on a config's sidecar file, held for the length of
+/// one [`ClientMcpConfig::edit`] transaction.
+///
+/// The lock is released when the owned `File` drops. That covers every exit
+/// path - the change closure returning `Err`, a write failing, a panic
+/// unwinding through `edit` - so there is nothing to release by hand, and
+/// nothing to leak if a caller forgets.
+struct EditLock {
+    /// Owned only so its `Drop` releases the lock; never read.
+    _file: std::fs::File,
+}
+
+impl EditLock {
+    /// Take the exclusive lock, retrying for up to [`LOCK_WAIT`].
+    ///
+    /// `try_lock` in a loop rather than the blocking `lock`, because one caller
+    /// is a tokio worker and an indefinite park there stalls a whole runtime
+    /// thread. Giving up produces an error that names the cause, which a client
+    /// can put in front of a person.
+    fn acquire(config_path: &Path) -> Result<Self, String> {
+        let lock_path = lock_path(config_path)?;
+        if let Some(parent) = lock_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+        }
+
+        // Created if absent, never truncated or replaced: the lock has to stay
+        // the same inode across the config's own atomic rename, or two
+        // processes lock two different files and serialize against nothing.
+        // `0600` matches the config beside it and applies on creation only.
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let file = opts
+            .open(&lock_path)
+            .map_err(|e| format!("failed to open {}: {e}", lock_path.display()))?;
+
+        let deadline = Instant::now() + LOCK_WAIT;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(Self { _file: file }),
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    if Instant::now() >= deadline {
+                        return Err(format!(
+                            "another Adele client is editing the MCP config ({}); \
+                             it did not finish within {} seconds — try again",
+                            config_path.display(),
+                            LOCK_WAIT.as_secs()
+                        ));
+                    }
+                    std::thread::sleep(LOCK_RETRY_PAUSE);
+                }
+                Err(std::fs::TryLockError::Error(err)) => {
+                    return Err(format!("failed to lock {}: {err}", lock_path.display()));
+                }
+            }
+        }
     }
 }
 
