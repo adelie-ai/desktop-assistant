@@ -12569,9 +12569,13 @@ mod tests {
         );
         let pinned = pinned_tier();
         assert!(
-            rounds[0].starts_with(&pinned) && rounds[1].starts_with(&pinned),
-            "both turns must open with the same pinned tier:\n  one: {:?}\n  two: {:?}",
-            rounds[0],
+            rounds[0].starts_with(&pinned),
+            "the first turn must open with the pinned tier: {:?}",
+            rounds[0]
+        );
+        assert!(
+            rounds[1].starts_with(&pinned),
+            "and so must the second, on a connection hosting other tools: {:?}",
             rounds[1]
         );
     }
