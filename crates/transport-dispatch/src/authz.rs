@@ -216,9 +216,7 @@ fn classify(cmd: &api::Command) -> (&'static str, Capability) {
         api::Command::SetEmbeddingsSettings { .. } => ("set_embeddings_settings", Admin),
         api::Command::GetConnectorDefaults { .. } => ("get_connector_defaults", Tenant),
 
-        // Git persistence, the database, background work, and the auth posture.
-        api::Command::GetPersistenceSettings => ("get_persistence_settings", Tenant),
-        api::Command::SetPersistenceSettings { .. } => ("set_persistence_settings", Admin),
+        // The database, background work, and the auth posture.
         api::Command::GetDatabaseSettings => ("get_database_settings", Tenant),
         api::Command::SetDatabaseSettings { .. } => ("set_database_settings", Admin),
         api::Command::GetBackendTasksSettings => ("get_backend_tasks_settings", Tenant),
@@ -351,10 +349,6 @@ fn config_changes_capability(changes: &api::ConfigChanges) -> Capability {
         embeddings_connector,
         embeddings_model,
         embeddings_base_url,
-        persistence_enabled,
-        persistence_remote_url,
-        persistence_remote_name,
-        persistence_push_on_update,
         personality_professionalism,
         personality_warmth,
         personality_directness,
@@ -367,10 +361,6 @@ fn config_changes_capability(changes: &api::ConfigChanges) -> Capability {
     let touches_service_config = embeddings_connector.is_some()
         || embeddings_model.is_some()
         || embeddings_base_url.is_some()
-        || persistence_enabled.is_some()
-        || persistence_remote_url.is_some()
-        || persistence_remote_name.is_some()
-        || persistence_push_on_update.is_some()
         || personality_professionalism.is_some()
         || personality_warmth.is_some()
         || personality_directness.is_some()

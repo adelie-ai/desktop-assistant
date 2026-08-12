@@ -21,9 +21,8 @@ use crate::purposes::PurposeKind;
 use super::secrets::read_secret_from_backend;
 use super::{
     AZURE_DEFAULT_API_KEY_ENV, ConnectorExtras, DaemonConfig, EmbeddingsSettingsView, LlmConfig,
-    ResolvedLlmConfig, ResolvedPersistenceConfig, SecretConfig, default_api_key_env,
-    default_base_url_env, default_connector, default_database_max_connections,
-    default_git_remote_name, default_model_env, default_push_on_update,
+    ResolvedLlmConfig, SecretConfig, default_api_key_env, default_base_url_env, default_connector,
+    default_database_max_connections, default_model_env,
 };
 
 /// Resolve a value from the connection field first, then a prioritized list of
@@ -204,33 +203,6 @@ fn resolve_purpose_embeddings_view(
         // a connection/model, so this is no longer "the inferred default".
         is_default: false,
     })
-}
-
-pub fn resolve_persistence_config(config: Option<&DaemonConfig>) -> ResolvedPersistenceConfig {
-    let persistence = config.map(|c| &c.persistence.git);
-
-    let enabled = persistence.map(|p| p.enabled).unwrap_or(false);
-    let remote_url = persistence
-        .and_then(|p| p.remote_url.as_deref())
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(ToString::to_string);
-
-    let remote_name = persistence
-        .map(|p| p.remote_name.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(default_git_remote_name);
-
-    let push_on_update = persistence
-        .map(|p| p.push_on_update)
-        .unwrap_or_else(default_push_on_update);
-
-    ResolvedPersistenceConfig {
-        enabled,
-        remote_url,
-        remote_name,
-        push_on_update,
-    }
 }
 
 /// Resolve the database URL from config, then env var fallback.

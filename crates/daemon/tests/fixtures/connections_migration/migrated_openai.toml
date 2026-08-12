@@ -25,11 +25,6 @@ folder = "desktop-assistant"
 
 [embeddings]
 
-[persistence.git]
-enabled = false
-remote_name = "origin"
-push_on_update = true
-
 [database]
 max_connections = 5
 

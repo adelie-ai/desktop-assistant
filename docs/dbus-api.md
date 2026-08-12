@@ -42,9 +42,7 @@ Interface: `org.desktopAssistant.Settings`
   - Empty `connector` clears the override and reverts to defaulting from the LLM connector
 - `GetConnectorDefaults(connector: s) -> (llm_model: s, llm_base_url: s, embeddings_model: s, embeddings_base_url: s, embeddings_available: b)`
   - Returns provider defaults for the requested connector (empty `connector` resolves to the default connector)
-- `GetConfig() -> (llm_connector: s, llm_model: s, llm_base_url: s, llm_has_api_key: b, embeddings_connector: s, embeddings_model: s, embeddings_base_url: s, embeddings_has_api_key: b, embeddings_available: b, embeddings_is_default: b, persistence_enabled: b, persistence_remote_url: s, persistence_remote_name: s, persistence_push_on_update: b)`
-  - `persistence_remote_url` is redacted: an inline password reads `***` (see
-    [Credentials in connection URLs](#credentials-in-connection-urls)).
+- `GetConfig() -> (llm_connector: s, llm_model: s, llm_base_url: s, llm_has_api_key: b, embeddings_connector: s, embeddings_model: s, embeddings_base_url: s, embeddings_has_api_key: b, embeddings_available: b, embeddings_is_default: b)`
 - `SetConfig(changes: ConfigPatchArgs) -> same tuple as GetConfig`
   - `ConfigPatchArgs` is a struct of `(set_*, value)` pairs so callers can change only selected fields.
   - String values are only applied when their corresponding `set_*` flag is `true`.
@@ -52,10 +50,10 @@ Interface: `org.desktopAssistant.Settings`
 
 ### Credentials in connection URLs
 
-Every connection URL the daemon returns — the database `url`, the git
-`persistence_remote_url` — has its password replaced by `***`. The rest of the
-URL (scheme, user, host, port, database, options) is intact, so a settings UI
-can still show what is configured.
+Every connection URL the daemon returns — the database `url` — has its
+password replaced by `***`. The rest of the URL (scheme, user, host, port,
+database, options) is intact, so a settings UI can still show what is
+configured.
 
 Writes round-trip: posting back a URL that still carries the `***` placeholder
 keeps the stored password, provided nothing else in the URL changed. Editing
@@ -92,7 +90,7 @@ the D-Bus error type, which carries only a name and a message (#974). See
 - `ResponseChunk(conversation_id: s, request_id: s, chunk: s)`
 - `ResponseComplete(conversation_id: s, request_id: s, full_response: s)`
 - `ResponseError(conversation_id: s, request_id: s, error: s)`
-- `ConfigChanged(llm_connector: s, llm_model: s, llm_base_url: s, llm_has_api_key: b, embeddings_connector: s, embeddings_model: s, embeddings_base_url: s, embeddings_has_api_key: b, embeddings_available: b, embeddings_is_default: b, persistence_enabled: b, persistence_remote_url: s, persistence_remote_name: s, persistence_push_on_update: b)`
+- `ConfigChanged(llm_connector: s, llm_model: s, llm_base_url: s, llm_has_api_key: b, embeddings_connector: s, embeddings_model: s, embeddings_base_url: s, embeddings_has_api_key: b, embeddings_available: b, embeddings_is_default: b)`
 
 ### Tool-provenance gating (behaviour change)
 

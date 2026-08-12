@@ -26,7 +26,7 @@ Three areas still assume a single human:
 
 **Configuration.** No method on `SettingsService` (`crates/core/src/ports/inbound.rs`)
 accepts a caller identity. `set_llm_settings`, `set_embeddings_settings`,
-`set_api_key`, and `set_persistence_settings` all mutate one global `daemon.toml`.
+and `set_api_key` all mutate one global `daemon.toml`.
 Any client that can reach the daemon reconfigures it for every tenant. This is an
 authorization gap, not only a modeling one.
 

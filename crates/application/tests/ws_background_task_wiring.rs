@@ -31,9 +31,9 @@ use desktop_assistant_core::ports::auth::{current_user_id, with_user_id};
 use desktop_assistant_core::ports::inbound::{
     AssistantService, BackendTasksSettingsView, ConnectionConfigPayload, ConnectionsService,
     ConnectorDefaultsView, ConversationService, DatabaseSettingsView, EmbeddingsSettingsView,
-    KnowledgeService, LlmSettingsView, ModelListing as CoreModelListing, PersistenceSettingsView,
-    PromptDispatchOutcome, PromptSelectionOverride, PurposeConfigPayload, PurposeKind,
-    PurposesView as CorePurposesView, SettingsService, WsAuthSettingsView,
+    KnowledgeService, LlmSettingsView, ModelListing as CoreModelListing, PromptDispatchOutcome,
+    PromptSelectionOverride, PurposeConfigPayload, PurposeKind, PurposesView as CorePurposesView,
+    SettingsService, WsAuthSettingsView,
 };
 use desktop_assistant_core::ports::llm::{ChunkCallback, StatusCallback};
 use tokio::sync::Notify;
@@ -211,23 +211,6 @@ impl SettingsService for FakeSettings {
             embeddings_available: false,
             hosted_tool_search_available: false,
         })
-    }
-    async fn get_persistence_settings(&self) -> Result<PersistenceSettingsView, CoreError> {
-        Ok(PersistenceSettingsView {
-            enabled: false,
-            remote_url: "".into(),
-            remote_name: "origin".into(),
-            push_on_update: false,
-        })
-    }
-    async fn set_persistence_settings(
-        &self,
-        _e: bool,
-        _u: Option<String>,
-        _n: Option<String>,
-        _p: bool,
-    ) -> Result<(), CoreError> {
-        Ok(())
     }
     async fn get_database_settings(&self) -> Result<DatabaseSettingsView, CoreError> {
         Ok(DatabaseSettingsView {

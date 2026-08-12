@@ -20,9 +20,9 @@ use desktop_assistant_core::ports::inbound::{
     AssistantService, BackendTasksSettingsView, ConnectionConfigPayload,
     ConnectionView as CoreConnectionView, ConnectionsService, ConnectorDefaultsView,
     ConversationService, DatabaseSettingsView, EmbeddingsSettingsView, KnowledgeService,
-    LlmSettingsView, ModelListing as CoreModelListing, PersistenceSettingsView,
-    PurposeConfigPayload, PurposeKind as CorePurposeKind, PurposesView as CorePurposesView,
-    SettingsService, WsAuthSettingsView,
+    LlmSettingsView, ModelListing as CoreModelListing, PurposeConfigPayload,
+    PurposeKind as CorePurposeKind, PurposesView as CorePurposesView, SettingsService,
+    WsAuthSettingsView,
 };
 use desktop_assistant_core::ports::llm::{ChunkCallback, StatusCallback};
 
@@ -388,23 +388,6 @@ impl SettingsService for FakeSettings {
             hosted_tool_search_available: false,
         })
     }
-    async fn get_persistence_settings(&self) -> Result<PersistenceSettingsView, CoreError> {
-        Ok(PersistenceSettingsView {
-            enabled: false,
-            remote_url: "".into(),
-            remote_name: "origin".into(),
-            push_on_update: false,
-        })
-    }
-    async fn set_persistence_settings(
-        &self,
-        _enabled: bool,
-        _remote_url: Option<String>,
-        _remote_name: Option<String>,
-        _push_on_update: bool,
-    ) -> Result<(), CoreError> {
-        Ok(())
-    }
     async fn get_database_settings(&self) -> Result<DatabaseSettingsView, CoreError> {
         Ok(DatabaseSettingsView {
             url: String::new(),
@@ -495,7 +478,6 @@ impl SettingsService for FakeSettings {
 struct SettingsState {
     llm: LlmSettingsView,
     embeddings: EmbeddingsSettingsView,
-    persistence: PersistenceSettingsView,
     api_key_set: bool,
 }
 
@@ -525,12 +507,6 @@ impl StatefulSettings {
                     available: true,
                     is_default: true,
                     health: Default::default(),
-                },
-                persistence: PersistenceSettingsView {
-                    enabled: false,
-                    remote_url: String::new(),
-                    remote_name: "origin".into(),
-                    push_on_update: true,
                 },
                 api_key_set: false,
             }),
@@ -623,29 +599,6 @@ impl SettingsService for StatefulSettings {
             embeddings_available: false,
             hosted_tool_search_available: false,
         })
-    }
-
-    async fn get_persistence_settings(&self) -> Result<PersistenceSettingsView, CoreError> {
-        Ok(self.state.lock().unwrap().persistence.clone())
-    }
-
-    async fn set_persistence_settings(
-        &self,
-        enabled: bool,
-        remote_url: Option<String>,
-        remote_name: Option<String>,
-        push_on_update: bool,
-    ) -> Result<(), CoreError> {
-        let mut state = self.state.lock().unwrap();
-        state.persistence.enabled = enabled;
-        if let Some(remote_url) = remote_url {
-            state.persistence.remote_url = remote_url;
-        }
-        if let Some(remote_name) = remote_name {
-            state.persistence.remote_name = remote_name;
-        }
-        state.persistence.push_on_update = push_on_update;
-        Ok(())
     }
 
     async fn get_database_settings(&self) -> Result<DatabaseSettingsView, CoreError> {
@@ -1012,8 +965,6 @@ async fn ws_set_config_roundtrip_emits_config_changed() {
         command: desktop_assistant_api_model::Command::SetConfig {
             changes: desktop_assistant_api_model::ConfigChanges {
                 embeddings_model: Some("text-embedding-3-small".into()),
-                persistence_enabled: Some(true),
-                persistence_remote_name: Some("upstream".into()),
                 ..Default::default()
             },
         },
@@ -1042,7 +993,6 @@ async fn ws_set_config_roundtrip_emits_config_changed() {
         config_from_result.embeddings.model,
         "text-embedding-3-small"
     );
-    assert_eq!(config_from_result.persistence.remote_name, "upstream");
 
     let event_frame =
         serde_json::from_str::<WsFrame>(&ws.next().await.unwrap().unwrap().into_text().unwrap())

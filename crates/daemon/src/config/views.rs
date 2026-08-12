@@ -1,6 +1,6 @@
 //! Settings views — the `get_*` / `set_*` pairs that the inbound API
 //! handler dispatches into when clients edit settings (the `[llm]` block,
-//! embeddings, persistence, database, backend tasks, WS auth).
+//! embeddings, database, backend tasks, WS auth).
 //!
 //! Extracted from `config.rs` (#41). Each pair is a thin wrapper over
 //! `parse_daemon_config` → resolve / mutate → `save_daemon_config`. The
@@ -22,13 +22,12 @@ use crate::connections::Connector;
 
 use super::{
     ConnectorDefaultsView, EmbeddingsSettingsView, LlmSettingsView, OidcConfig, OidcDiscoveryInfo,
-    ResolvedPersistenceConfig, SecretConfig, WsAuthConfig, WsAuthDiscoveryInfo, bucket_secret_len,
-    default_archive_after_days, default_backend_llm_model, default_base_url, default_connector,
-    default_dreaming_interval_secs, default_git_remote_name, default_llm_model,
-    default_oidc_scopes, is_placeholder_secret_value, normalize_optional_value,
+    SecretConfig, WsAuthConfig, WsAuthDiscoveryInfo, bucket_secret_len, default_archive_after_days,
+    default_backend_llm_model, default_base_url, default_connector, default_dreaming_interval_secs,
+    default_llm_model, default_oidc_scopes, is_placeholder_secret_value, normalize_optional_value,
     parse_connector_or_openai, parse_daemon_config, redacted_secret_audit,
     resolve_backend_tasks_llm_config, resolve_database_config, resolve_embeddings_config,
-    resolve_llm_config, resolve_persistence_config, save_daemon_config, write_secret_to_backend,
+    resolve_llm_config, save_daemon_config, write_secret_to_backend,
 };
 
 pub fn get_llm_settings_view(path: &Path) -> anyhow::Result<LlmSettingsView> {
@@ -197,40 +196,6 @@ pub fn set_embeddings_settings(
     if let Some(base_url) = config.embeddings.base_url.as_deref() {
         constrain_settings_base_url(base_url, config.embeddings.connector.as_deref())?;
     }
-
-    save_daemon_config(path, &config)
-}
-
-pub fn get_persistence_settings_view(path: &Path) -> anyhow::Result<ResolvedPersistenceConfig> {
-    let config = parse_daemon_config(path)?;
-    Ok(resolve_persistence_config(config.as_ref()))
-}
-
-pub fn set_persistence_settings(
-    path: &Path,
-    enabled: bool,
-    remote_url: Option<&str>,
-    remote_name: Option<&str>,
-    push_on_update: bool,
-) -> anyhow::Result<()> {
-    let mut config = parse_daemon_config(path)?.unwrap_or_default();
-
-    config.persistence.git.enabled = enabled;
-    // #804/#895 review (deliberately not validated here, recorded rather than
-    // silent): `remote_url` is a git remote, which also accepts `ssh://`,
-    // `git://`, the SCP-like `user@host:path` shorthand, and local paths -
-    // `url_policy`'s http(s)-only scheme allowlist would reject all of those
-    // and break a working install. A plain-http remote with a credential in
-    // its userinfo (`http://user:token@host/repo.git`) still leaks that
-    // credential in the clear; tracked as a git-remote-shaped follow-up in #991
-    // rather than forced into this shape.
-    config.persistence.git.remote_url = normalize_optional_value(remote_url);
-    config.persistence.git.remote_name = remote_name
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(ToString::to_string)
-        .unwrap_or_else(default_git_remote_name);
-    config.persistence.git.push_on_update = push_on_update;
 
     save_daemon_config(path, &config)
 }

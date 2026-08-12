@@ -376,29 +376,6 @@ pub enum Command {
         connector: String,
     },
 
-    /// Read the git-persistence settings. Returns
-    /// [`CommandResult::PersistenceSettings`], whose `remote_url` is redacted
-    /// by [`secret_url`] — an HTTPS remote's token never crosses the wire.
-    GetPersistenceSettings,
-    /// Update the git-persistence settings. `None` for `remote_url` /
-    /// `remote_name` clears that value.
-    SetPersistenceSettings {
-        enabled: bool,
-        /// A `remote_url` still carrying [`secret_url::REDACTED_PASSWORD`] is
-        /// accepted only when it is exactly the redaction of the stored
-        /// remote, and then keeps the stored credential; otherwise the write
-        /// is refused. See [`secret_url::resolve_submitted`].
-        ///
-        /// A [`Secret`]: an HTTPS remote carries a token in its userinfo, and
-        /// this command is on the *write* path, where the plaintext value is
-        /// present. `Secret` is `#[serde(transparent)]`, so the wire form is a
-        /// plain string exactly as before, but a `{:?}` of the command prints
-        /// `Secret(***)` and cannot leak the token into a log line.
-        remote_url: Option<Secret>,
-        remote_name: Option<String>,
-        push_on_update: bool,
-    },
-
     // Database / backend-tasks / WS-auth settings (bridge cutover 2/7, #314).
     //
     // These mirror the in-process D-Bus `org.desktopAssistant.Settings`
@@ -921,7 +898,6 @@ pub enum CommandResult {
 
     EmbeddingsSettings(EmbeddingsSettingsView),
     ConnectorDefaults(ConnectorDefaultsView),
-    PersistenceSettings(PersistenceSettingsView),
 
     /// Response to `GetDatabaseSettings` / `SetDatabaseSettings` (#314).
     DatabaseSettings(DatabaseSettingsView),
@@ -1683,12 +1659,10 @@ pub struct Status {
 /// payload of the `ConfigChanged` event.
 ///
 /// SECURITY: carries no secret value. `embeddings` reports only whether an API
-/// key is set, and `persistence.remote_url` is redacted (see
-/// [`PersistenceSettingsView`]).
+/// key is set.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Config {
     pub embeddings: EmbeddingsSettingsView,
-    pub persistence: PersistenceSettingsView,
     /// Configurable assistant disposition (issue #226). Carries the 7
     /// "Expressive 7" trait levels as a typed struct (see
     /// [`PersonalitySettingsView`]).
@@ -1698,7 +1672,7 @@ pub struct Config {
     /// acting on (#686). Empty means every configured value is live.
     ///
     /// Entries are stable area keys - `"database"`, `"embeddings"`,
-    /// `"persistence"`, `"ws_auth"`, `"tls"` - deliberately an
+    /// `"ws_auth"`, `"tls"` - deliberately an
     /// open set so a daemon that learns a new area does not break an older
     /// client. Clients should render unrecognized keys verbatim rather than
     /// dropping them.
@@ -1753,22 +1727,6 @@ pub struct ConfigChanges {
     pub embeddings_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub embeddings_base_url: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub persistence_enabled: Option<bool>,
-    /// `None` leaves the stored remote (credential included) untouched. A
-    /// value still carrying [`secret_url::REDACTED_PASSWORD`] is accepted only
-    /// when it is exactly the redaction of the stored remote, and then keeps
-    /// the stored credential; otherwise the write is refused. See
-    /// [`secret_url::resolve_submitted`].
-    /// A [`Secret`] for the same reason `SetPersistenceSettings::remote_url`
-    /// is: an HTTPS remote carries a token in its userinfo, and this is a write
-    /// path. Transparent on the wire, redacted in `Debug`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub persistence_remote_url: Option<Secret>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub persistence_remote_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub persistence_push_on_update: Option<bool>,
     // Personality (#226): one optional level per trait. `None` = leave that
     // trait unchanged on `SetConfig`; a present value overrides just that
     // trait. Serializes as the lowercase level string (e.g. `"never"`).
@@ -1942,21 +1900,6 @@ pub struct ConnectorDefaultsView {
     pub embeddings_base_url: String,
     pub embeddings_available: bool,
     pub hosted_tool_search_available: bool,
-}
-
-/// Wire form of the git-persistence settings.
-///
-/// SECURITY: `remote_url` never carries a password. An HTTPS remote can embed
-/// a token inline (`https://user:token@host/repo.git`), so the application
-/// layer redacts it with [`secret_url::redact_password`] on the way out.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PersistenceSettingsView {
-    pub enabled: bool,
-    /// Redacted remote. Empty means no remote is configured; a password
-    /// component reads [`secret_url::REDACTED_PASSWORD`].
-    pub remote_url: String,
-    pub remote_name: String,
-    pub push_on_update: bool,
 }
 
 /// Wire form of a configured MCP server — the per-server *descriptor* the
@@ -3099,7 +3042,9 @@ mod tests {
     ///
     /// Proved by parsing a literal of the OLD payload, not by round-tripping
     /// the new type through itself, which would pass even if the field were
-    /// mandatory.
+    /// mandatory. The literal also carries a `persistence` block, which this
+    /// build has no field for: a key the payload carries and the type does not
+    /// declare is ignored, not a parse error.
     #[test]
     fn an_older_daemons_config_still_parses_and_reports_no_capability() {
         let legacy = r#"{
@@ -3193,17 +3138,31 @@ mod tests {
             "SetApiKey must not print its key: {api_key:?}"
         );
 
-        let patch = Command::SetConfig {
-            changes: ConfigChanges {
-                persistence_remote_url: Some(
-                    "https://user:ghp_patchtoken@git.example.com/repo.git".into(),
-                ),
-                ..ConfigChanges::default()
-            },
+        let dsn = Command::SetDatabaseSettings {
+            url: Secret("postgres://adele:hunter2@db.example.com/adele".to_string()),
+            max_connections: 5,
         };
         assert!(
-            !format!("{patch:?}").contains("ghp_patchtoken"),
-            "ConfigChanges must not print the remote token: {patch:?}"
+            !format!("{dsn:?}").contains("hunter2"),
+            "SetDatabaseSettings must not print the DSN password: {dsn:?}"
+        );
+
+        let connection = Command::SetConnectionSecret {
+            id: "primary".to_string(),
+            credential: Secret("sk-connection-secret".to_string()),
+        };
+        assert!(
+            !format!("{connection:?}").contains("sk-connection-secret"),
+            "SetConnectionSecret must not print its credential: {connection:?}"
+        );
+
+        let mcp = Command::SetMcpSecret {
+            id: "search".to_string(),
+            value: Secret("bearer-mcp-token".to_string()),
+        };
+        assert!(
+            !format!("{mcp:?}").contains("bearer-mcp-token"),
+            "SetMcpSecret must not print its value: {mcp:?}"
         );
     }
 
@@ -3220,34 +3179,22 @@ mod tests {
         );
         assert_eq!(serde_json::to_string(&cmd).unwrap(), json);
 
-        let patch = r#"{"set_config":{"changes":{"persistence_remote_url":"https://h/r.git"}}}"#;
-        let cmd: Command = serde_json::from_str(patch).expect("legacy config patch parses");
-        assert_eq!(serde_json::to_string(&cmd).unwrap(), patch);
-    }
-
-    /// Same for the git remote, whose HTTPS form carries a token.
-    #[test]
-    fn set_persistence_settings_remote_url_is_redacted_in_debug() {
-        let cmd = Command::SetPersistenceSettings {
-            enabled: true,
-            remote_url: Some(Secret(
-                "https://user:ghp_exampletoken@git.example.com/repo.git".to_string(),
-            )),
-            remote_name: Some("origin".to_string()),
-            push_on_update: true,
-        };
-        let rendered = format!("{cmd:?}");
-        assert!(
-            !rendered.contains("ghp_exampletoken"),
-            "the remote token must not reach a log line: {rendered}"
+        let mcp = r#"{"set_mcp_secret":{"id":"search","value":"bearer-mcp-token"}}"#;
+        let cmd: Command = serde_json::from_str(mcp).expect("legacy set_mcp_secret parses");
+        assert_eq!(
+            cmd,
+            Command::SetMcpSecret {
+                id: "search".into(),
+                value: "bearer-mcp-token".into(),
+            }
         );
-        assert!(rendered.contains("Secret(***)"), "{rendered}");
+        assert_eq!(serde_json::to_string(&cmd).unwrap(), mcp);
     }
 
-    /// `Secret` is `#[serde(transparent)]`, so wrapping these two fields is a
+    /// `Secret` is `#[serde(transparent)]`, so wrapping the DSN is a
     /// source-only change: the wire form older clients send is unchanged.
     #[test]
-    fn secret_dsn_fields_keep_their_wire_form() {
+    fn the_secret_dsn_field_keeps_its_wire_form() {
         let db_json =
             r#"{"set_database_settings":{"url":"postgres://u:p@h/d","max_connections":5}}"#;
         let db: Command = serde_json::from_str(db_json).expect("legacy database payload parses");
@@ -3259,35 +3206,6 @@ mod tests {
             }
         );
         assert_eq!(serde_json::to_string(&db).unwrap(), db_json);
-
-        let git_json = r#"{"set_persistence_settings":{"enabled":true,"remote_url":"https://h/r.git","remote_name":"origin","push_on_update":false}}"#;
-        let git: Command =
-            serde_json::from_str(git_json).expect("legacy persistence payload parses");
-        assert_eq!(
-            git,
-            Command::SetPersistenceSettings {
-                enabled: true,
-                remote_url: Some(Secret("https://h/r.git".to_string())),
-                remote_name: Some("origin".to_string()),
-                push_on_update: false,
-            }
-        );
-        assert_eq!(serde_json::to_string(&git).unwrap(), git_json);
-
-        // A cleared remote still crosses as JSON null.
-        let cleared: Command = serde_json::from_str(
-            r#"{"set_persistence_settings":{"enabled":false,"remote_url":null,"remote_name":null,"push_on_update":false}}"#,
-        )
-        .expect("cleared persistence payload parses");
-        assert_eq!(
-            cleared,
-            Command::SetPersistenceSettings {
-                enabled: false,
-                remote_url: None,
-                remote_name: None,
-                push_on_update: false,
-            }
-        );
     }
 
     #[test]
@@ -3448,7 +3366,7 @@ mod tests {
     fn command_json_roundtrip_set_config() {
         let cmd = Command::SetConfig {
             changes: ConfigChanges {
-                persistence_enabled: Some(true),
+                embeddings_connector: Some("ollama".to_string()),
                 ..Default::default()
             },
         };
@@ -4937,12 +4855,6 @@ mod tests {
                 is_default: true,
                 health: EmbeddingHealth::Ok,
             },
-            persistence: PersistenceSettingsView {
-                enabled: false,
-                remote_url: String::new(),
-                remote_name: "origin".into(),
-                push_on_update: false,
-            },
             personality: PersonalitySettingsView::default(),
             restart_required: Vec::new(),
             caller_capability: None,
@@ -4967,12 +4879,6 @@ mod tests {
                 is_default: false,
                 health: EmbeddingHealth::Ok,
             },
-            persistence: PersistenceSettingsView {
-                enabled: false,
-                remote_url: String::new(),
-                remote_name: "origin".into(),
-                push_on_update: false,
-            },
             personality: PersonalitySettingsView::default(),
             restart_required,
             caller_capability: None,
@@ -4982,7 +4888,8 @@ mod tests {
     #[test]
     fn config_restart_required_is_additive_for_older_peers() {
         // A payload from a daemon that predates the field must still
-        // deserialize, as "nothing is waiting on a restart".
+        // deserialize, as "nothing is waiting on a restart". Its `persistence`
+        // block has no field on this build and is ignored.
         let legacy = r#"{
             "embeddings": {
                 "connector": "ollama",

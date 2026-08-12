@@ -979,11 +979,6 @@ where
             .get_embeddings_settings()
             .await
             .map_err(Self::map_core_err)?;
-        let persistence = self
-            .settings
-            .get_persistence_settings()
-            .await
-            .map_err(Self::map_core_err)?;
         let personality = self
             .settings
             .get_personality_settings()
@@ -1016,12 +1011,6 @@ where
                     EmbeddingHealth::Unknown => api::EmbeddingHealth::Unknown,
                 },
             },
-            persistence: api::PersistenceSettingsView {
-                enabled: persistence.enabled,
-                remote_url: api::secret_url::redact_password(&persistence.remote_url),
-                remote_name: persistence.remote_name,
-                push_on_update: persistence.push_on_update,
-            },
             // `PersonalitySettingsView` is the core `Personality` type in both
             // the port and the api-model, so this is the identity conversion.
             personality,
@@ -1040,10 +1029,6 @@ where
             embeddings_connector,
             embeddings_model,
             embeddings_base_url,
-            persistence_enabled,
-            persistence_remote_url,
-            persistence_remote_name,
-            persistence_push_on_update,
             personality_professionalism,
             personality_warmth,
             personality_directness,
@@ -1079,41 +1064,6 @@ where
 
             self.settings
                 .set_embeddings_settings(connector, model, base_url)
-                .await
-                .map_err(Self::map_core_err)?;
-        }
-
-        let persistence_changed = persistence_enabled.is_some()
-            || persistence_remote_url.is_some()
-            || persistence_remote_name.is_some()
-            || persistence_push_on_update.is_some();
-        if persistence_changed {
-            // Read the stored view rather than reusing `current`: the latter
-            // came from `get_config`, whose `remote_url` is redacted, so
-            // carrying it forward would overwrite the credential with the
-            // placeholder.
-            let stored = self
-                .settings
-                .get_persistence_settings()
-                .await
-                .map_err(Self::map_core_err)?;
-
-            let enabled = persistence_enabled.unwrap_or(stored.enabled);
-            let remote_url = match persistence_remote_url {
-                Some(submitted) => Self::normalize_optional_string(Some(
-                    Self::resolve_submitted_url(submitted.as_str(), &stored.remote_url)?,
-                )),
-                None => Some(stored.remote_url.clone()),
-            };
-            let remote_name = if persistence_remote_name.is_some() {
-                Self::normalize_optional_string(persistence_remote_name)
-            } else {
-                Some(stored.remote_name.clone())
-            };
-            let push_on_update = persistence_push_on_update.unwrap_or(stored.push_on_update);
-
-            self.settings
-                .set_persistence_settings(enabled, remote_url, remote_name, push_on_update)
                 .await
                 .map_err(Self::map_core_err)?;
         }
@@ -2019,54 +1969,6 @@ where
                 ))
             }
 
-            api::Command::GetPersistenceSettings => {
-                let p = self
-                    .settings
-                    .get_persistence_settings()
-                    .await
-                    .map_err(Self::map_core_err)?;
-                Ok(api::CommandResult::PersistenceSettings(
-                    api::PersistenceSettingsView {
-                        enabled: p.enabled,
-                        remote_url: api::secret_url::redact_password(&p.remote_url),
-                        remote_name: p.remote_name,
-                        push_on_update: p.push_on_update,
-                    },
-                ))
-            }
-
-            api::Command::SetPersistenceSettings {
-                enabled,
-                remote_url,
-                remote_name,
-                push_on_update,
-            } => {
-                let remote_url = match remote_url {
-                    Some(submitted) => {
-                        let stored = self
-                            .settings
-                            .get_persistence_settings()
-                            .await
-                            .map_err(Self::map_core_err)?;
-                        Some(Self::resolve_submitted_url(
-                            submitted.as_str(),
-                            &stored.remote_url,
-                        )?)
-                    }
-                    None => None,
-                };
-                self.settings
-                    .set_persistence_settings(enabled, remote_url, remote_name, push_on_update)
-                    .await
-                    .map_err(Self::map_core_err)?;
-                Ok(api::CommandResult::Ack)
-            }
-
-            // Database / backend-tasks / WS-auth settings (bridge cutover 2/7,
-            // #314). Each mirrors the in-process D-Bus method of the same name:
-            // the getters return the same fields the D-Bus method returns, and
-            // the setters apply the same `empty-string clears` normalization
-            // the D-Bus methods apply before delegating to `SettingsService`.
             api::Command::GetDatabaseSettings => {
                 let s = self
                     .settings
@@ -4229,8 +4131,7 @@ mod tests {
     use desktop_assistant_core::ports::inbound::{
         BackendTasksSettingsView, ConnectorDefaultsView, DatabaseSettingsView,
         EmbeddingsSettingsView, LlmSettingsView, ModelListing as CoreModelListing,
-        PersistenceSettingsView, PersonalitySettingsView, PurposeKind,
-        PurposesView as CorePurposesView,
+        PersonalitySettingsView, PurposeKind, PurposesView as CorePurposesView,
     };
     use desktop_assistant_core::ports::llm::{ChunkCallback, StatusCallback};
     use std::sync::Mutex;
@@ -4635,23 +4536,6 @@ mod tests {
                 hosted_tool_search_available: false,
             })
         }
-        async fn get_persistence_settings(&self) -> Result<PersistenceSettingsView, CoreError> {
-            Ok(PersistenceSettingsView {
-                enabled: false,
-                remote_url: "".into(),
-                remote_name: "origin".into(),
-                push_on_update: false,
-            })
-        }
-        async fn set_persistence_settings(
-            &self,
-            _enabled: bool,
-            _remote_url: Option<String>,
-            _remote_name: Option<String>,
-            _push_on_update: bool,
-        ) -> Result<(), CoreError> {
-            Ok(())
-        }
         async fn get_database_settings(&self) -> Result<DatabaseSettingsView, CoreError> {
             Ok(DatabaseSettingsView {
                 url: String::new(),
@@ -4748,7 +4632,6 @@ mod tests {
     struct SettingsState {
         llm: LlmSettingsView,
         embeddings: EmbeddingsSettingsView,
-        persistence: PersistenceSettingsView,
         personality: PersonalitySettingsView,
         api_key_set: bool,
         // #314 round-trip state: database / backend-tasks / ws-auth / MCP.
@@ -4786,12 +4669,6 @@ mod tests {
                         available: true,
                         is_default: true,
                         health: EmbeddingHealth::Ok,
-                    },
-                    persistence: PersistenceSettingsView {
-                        enabled: false,
-                        remote_url: String::new(),
-                        remote_name: "origin".into(),
-                        push_on_update: true,
                     },
                     personality: PersonalitySettingsView::default(),
                     api_key_set: false,
@@ -4924,29 +4801,6 @@ mod tests {
                 embeddings_available: false,
                 hosted_tool_search_available: false,
             })
-        }
-
-        async fn get_persistence_settings(&self) -> Result<PersistenceSettingsView, CoreError> {
-            Ok(self.state.lock().unwrap().persistence.clone())
-        }
-
-        async fn set_persistence_settings(
-            &self,
-            enabled: bool,
-            remote_url: Option<String>,
-            remote_name: Option<String>,
-            push_on_update: bool,
-        ) -> Result<(), CoreError> {
-            let mut state = self.state.lock().unwrap();
-            state.persistence.enabled = enabled;
-            if let Some(remote_url) = remote_url {
-                state.persistence.remote_url = remote_url;
-            }
-            if let Some(remote_name) = remote_name {
-                state.persistence.remote_name = remote_name;
-            }
-            state.persistence.push_on_update = push_on_update;
-            Ok(())
         }
 
         async fn get_personality_settings(&self) -> Result<PersonalitySettingsView, CoreError> {
@@ -6219,7 +6073,6 @@ mod tests {
         };
 
         assert_eq!(config.embeddings.model, "text-embedding-3-small");
-        assert_eq!(config.persistence.remote_name, "origin");
     }
 
     #[tokio::test]
@@ -6238,10 +6091,6 @@ mod tests {
                 changes: api::ConfigChanges {
                     embeddings_connector: Some("openai".into()),
                     embeddings_model: Some("text-embedding-3-large".into()),
-                    persistence_enabled: Some(true),
-                    persistence_remote_url: Some("git@example.com/repo.git".into()),
-                    persistence_remote_name: Some("upstream".into()),
-                    persistence_push_on_update: Some(false),
                     ..Default::default()
                 },
             })
@@ -6252,8 +6101,6 @@ mod tests {
             panic!("unexpected result variant");
         };
         assert_eq!(config.embeddings.model, "text-embedding-3-large");
-        assert_eq!(config.persistence.remote_name, "upstream");
-        assert!(!config.persistence.push_on_update);
         assert!(
             config.restart_required.is_empty(),
             "a hot-applicable write must not report a restart requirement"
@@ -6483,158 +6330,6 @@ mod tests {
         assert_eq!(
             settings.snapshot().database.url,
             "postgres://adele:rotated@postgres:5432/adele"
-        );
-    }
-
-    #[tokio::test]
-    async fn get_persistence_settings_never_returns_the_remote_password() {
-        let settings = Arc::new(ConfigurableSettings::new());
-        let h = handler_with(Arc::clone(&settings));
-
-        h.handle_command(api::Command::SetPersistenceSettings {
-            enabled: true,
-            remote_url: Some("https://dave:gh-token@github.com/adelie-ai/memory.git".into()),
-            remote_name: Some("origin".into()),
-            push_on_update: true,
-        })
-        .await
-        .expect("seeding the remote succeeds");
-
-        let res = h
-            .handle_command(api::Command::GetPersistenceSettings)
-            .await
-            .expect("GetPersistenceSettings succeeds");
-        let api::CommandResult::PersistenceSettings(p) = res else {
-            panic!("unexpected result variant");
-        };
-        assert_eq!(
-            p.remote_url,
-            "https://dave:***@github.com/adelie-ai/memory.git"
-        );
-    }
-
-    #[tokio::test]
-    async fn get_config_never_returns_the_persistence_remote_password() {
-        let settings = Arc::new(ConfigurableSettings::new());
-        let h = handler_with(Arc::clone(&settings));
-
-        h.handle_command(api::Command::SetPersistenceSettings {
-            enabled: true,
-            remote_url: Some("https://dave:gh-token@github.com/adelie-ai/memory.git".into()),
-            remote_name: Some("origin".into()),
-            push_on_update: true,
-        })
-        .await
-        .expect("seeding the remote succeeds");
-
-        let res = h
-            .handle_command(api::Command::GetConfig)
-            .await
-            .expect("GetConfig succeeds");
-        let api::CommandResult::Config(config) = res else {
-            panic!("unexpected result variant");
-        };
-        assert!(
-            !config.persistence.remote_url.contains("gh-token"),
-            "the git remote token reached the client: {}",
-            config.persistence.remote_url
-        );
-    }
-
-    #[tokio::test]
-    async fn set_config_keeps_the_persistence_password_when_another_field_changes() {
-        let settings = Arc::new(ConfigurableSettings::new());
-        let h = handler_with(Arc::clone(&settings));
-
-        h.handle_command(api::Command::SetPersistenceSettings {
-            enabled: true,
-            remote_url: Some("https://dave:gh-token@github.com/adelie-ai/memory.git".into()),
-            remote_name: Some("origin".into()),
-            push_on_update: true,
-        })
-        .await
-        .expect("seeding the remote succeeds");
-
-        h.handle_command(api::Command::SetConfig {
-            changes: api::ConfigChanges {
-                persistence_push_on_update: Some(false),
-                ..Default::default()
-            },
-        })
-        .await
-        .expect("SetConfig succeeds");
-
-        let stored = settings.snapshot().persistence;
-        assert_eq!(
-            stored.remote_url, "https://dave:gh-token@github.com/adelie-ai/memory.git",
-            "carrying the redacted remote forward destroyed the stored credential"
-        );
-        assert!(!stored.push_on_update);
-    }
-
-    #[tokio::test]
-    async fn set_config_keeps_the_persistence_password_when_the_client_echoes_the_redacted_remote()
-    {
-        let settings = Arc::new(ConfigurableSettings::new());
-        let h = handler_with(Arc::clone(&settings));
-
-        h.handle_command(api::Command::SetPersistenceSettings {
-            enabled: true,
-            remote_url: Some("https://dave:gh-token@github.com/adelie-ai/memory.git".into()),
-            remote_name: Some("origin".into()),
-            push_on_update: true,
-        })
-        .await
-        .expect("seeding the remote succeeds");
-
-        h.handle_command(api::Command::SetConfig {
-            changes: api::ConfigChanges {
-                persistence_remote_url: Some(
-                    "https://dave:***@github.com/adelie-ai/memory.git".into(),
-                ),
-                persistence_remote_name: Some("upstream".into()),
-                ..Default::default()
-            },
-        })
-        .await
-        .expect("echoing the redacted remote back is accepted");
-
-        let stored = settings.snapshot().persistence;
-        assert_eq!(
-            stored.remote_url,
-            "https://dave:gh-token@github.com/adelie-ai/memory.git"
-        );
-        assert_eq!(stored.remote_name, "upstream");
-    }
-
-    #[tokio::test]
-    async fn set_persistence_settings_refuses_a_redacted_remote_aimed_at_another_host() {
-        let settings = Arc::new(ConfigurableSettings::new());
-        let h = handler_with(Arc::clone(&settings));
-
-        h.handle_command(api::Command::SetPersistenceSettings {
-            enabled: true,
-            remote_url: Some("https://dave:gh-token@github.com/adelie-ai/memory.git".into()),
-            remote_name: Some("origin".into()),
-            push_on_update: true,
-        })
-        .await
-        .expect("seeding the remote succeeds");
-
-        let err = h
-            .handle_command(api::Command::SetPersistenceSettings {
-                enabled: true,
-                remote_url: Some("https://dave:***@attacker.example.com/memory.git".into()),
-                remote_name: Some("origin".into()),
-                push_on_update: true,
-            })
-            .await
-            .expect_err("the stored token must not be spliced into another host");
-        assert!(matches!(err, ApiError::Core(_)));
-        assert_eq!(
-            settings.snapshot().persistence.remote_url,
-            "https://dave:gh-token@github.com/adelie-ai/memory.git",
-            "a refused write must leave the stored remote alone"
         );
     }
 

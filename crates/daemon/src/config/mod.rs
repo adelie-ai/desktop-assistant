@@ -25,10 +25,9 @@ pub use reload::{ReloadPlan, RestartArea, plan_reload};
 pub use views::BackendTasksSettingsViewConfig;
 pub use views::{
     get_backend_tasks_settings_view, get_connector_defaults, get_database_settings_view,
-    get_embeddings_settings_view, get_llm_settings_view, get_persistence_settings_view,
-    get_ws_auth_discovery, get_ws_auth_settings, set_api_key, set_backend_tasks_settings,
-    set_database_settings, set_embeddings_settings, set_llm_settings, set_persistence_settings,
-    set_ws_auth_settings,
+    get_embeddings_settings_view, get_llm_settings_view, get_ws_auth_discovery,
+    get_ws_auth_settings, set_api_key, set_backend_tasks_settings, set_database_settings,
+    set_embeddings_settings, set_llm_settings, set_ws_auth_settings,
 };
 
 // Re-export the JWT + OIDC public API at the `config::` path so existing
@@ -57,7 +56,7 @@ pub use resolution::{
     apply_learned_cap, purpose_max_context_override, resolve_backend_tasks_llm_config,
     resolve_connection_llm_config, resolve_consolidation_llm_config, resolve_context_budget,
     resolve_database_config, resolve_embeddings_config, resolve_llm_config,
-    resolve_persistence_config, resolve_purpose_llm_config,
+    resolve_purpose_llm_config,
 };
 pub(super) use resolution::{
     default_backend_llm_model, default_base_url, default_llm_model, normalize_optional_value,
@@ -119,8 +118,6 @@ pub struct DaemonConfig {
     pub connections: IndexMap<String, ConnectionConfig>,
     #[serde(default)]
     pub embeddings: EmbeddingsConfig,
-    #[serde(default)]
-    pub persistence: PersistenceConfig,
     #[serde(default)]
     pub database: DatabaseConfig,
     /// Backend-tasks (dreaming / titling) overrides. The legacy `llm` field
@@ -938,35 +935,6 @@ pub(super) fn default_database_max_connections() -> u32 {
     5
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
-pub struct PersistenceConfig {
-    #[serde(default)]
-    pub git: GitPersistenceConfig,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct GitPersistenceConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub remote_url: Option<String>,
-    #[serde(default = "default_git_remote_name")]
-    pub remote_name: String,
-    #[serde(default = "default_push_on_update")]
-    pub push_on_update: bool,
-}
-
-impl Default for GitPersistenceConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            remote_url: None,
-            remote_name: default_git_remote_name(),
-            push_on_update: default_push_on_update(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct LlmConfig {
     #[serde(default = "default_connector")]
@@ -1180,28 +1148,12 @@ pub struct ConnectorDefaultsView {
     pub hosted_tool_search_available: bool,
 }
 
-#[derive(Debug, Clone)]
-pub struct ResolvedPersistenceConfig {
-    pub enabled: bool,
-    pub remote_url: Option<String>,
-    pub remote_name: String,
-    pub push_on_update: bool,
-}
-
 pub(super) fn default_connector() -> String {
     "openai".to_string()
 }
 
 fn default_secret_backend() -> String {
     "auto".to_string()
-}
-
-pub(super) fn default_git_remote_name() -> String {
-    "origin".to_string()
-}
-
-pub(super) fn default_push_on_update() -> bool {
-    true
 }
 
 fn default_secret_service() -> String {
@@ -1543,7 +1495,35 @@ fn report_unknown_config_keys(path: &Path, content: &str) {
     );
 }
 
-/// The keys in `content` that deserializing a [`DaemonConfig`] discards.
+/// Config keys this daemon removed on purpose, and therefore says nothing
+/// about.
+///
+/// [`report_unknown_config_keys`] exists to catch a *misspelled* key: the
+/// operator believes it configures something, and it does not. A retired key
+/// is the opposite case. It is spelled correctly, it configured a real feature
+/// in an earlier release, and the project - not the operator - took that
+/// feature away. There is nothing to check and nothing to correct, and the
+/// only available action, deleting the lines, the daemon already performs
+/// itself the next time a settings command rewrites the file. Warning about it
+/// every startup would turn our removal into the operator's recurring chore,
+/// and would train them to read past the warning that does mean a typo.
+///
+/// A prefix match, so `persistence` also covers `persistence.git.enabled`.
+const RETIRED_CONFIG_KEYS: &[&str] = &[
+    // The git-backed history mirror (#765). Removed as a dead feature: the
+    // settings form was wired to no implementation.
+    "persistence",
+];
+
+/// Whether `key` names a table this daemon retired.
+fn is_retired_config_key(key: &str) -> bool {
+    RETIRED_CONFIG_KEYS
+        .iter()
+        .any(|retired| key == *retired || key.starts_with(&format!("{retired}.")))
+}
+
+/// The keys in `content` that deserializing a [`DaemonConfig`] discards, less
+/// the ones this daemon retired (see [`RETIRED_CONFIG_KEYS`]).
 ///
 /// Paths are reported as serde sees them, so a nested key reads as
 /// `purposes.typo`. Returns nothing when `content` is not valid TOML: the
@@ -1558,7 +1538,10 @@ fn unknown_config_keys(content: &str) -> Vec<String> {
     // one owns the error reporting, and repeating it here would report the
     // same fault twice.
     if serde_ignored::deserialize::<_, _, DaemonConfig>(deserializer, |path| {
-        unknown.push(path.to_string())
+        let key = path.to_string();
+        if !is_retired_config_key(&key) {
+            unknown.push(key);
+        }
     })
     .is_err()
     {
@@ -2729,55 +2712,50 @@ uds_socket = "/tmp/adelie.sock"
         .expect("a bedrock region string must not be parsed as an invalid URL");
     }
 
+    /// A `daemon.toml` left over from the release that had `[persistence]`
+    /// still starts the daemon, and says nothing about the section.
+    ///
+    /// Operators have this section in live files. The daemon no longer reads
+    /// it, but a key the project itself retired is not an operator mistake:
+    /// see `RETIRED_CONFIG_KEYS`.
     #[test]
-    fn parse_toml_with_persistence_section() {
-        let config: DaemonConfig = toml::from_str(
-            r#"
-            [persistence.git]
-            enabled = true
-            remote_url = "https://example.com/dave/assistant-memory.git"
-            remote_name = "backup"
-            push_on_update = true
-            "#,
-        )
-        .unwrap();
+    fn stale_persistence_section_loads_and_is_not_reported_as_unknown() {
+        let dir = std::env::temp_dir().join(format!("da-persistence-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("daemon.toml");
+        let src = r#"
+[llm]
+connector = "openai"
 
-        assert!(config.persistence.git.enabled);
-        assert_eq!(
-            config.persistence.git.remote_url.as_deref(),
-            Some("https://example.com/dave/assistant-memory.git")
+[persistence.git]
+enabled = true
+remote_url = "https://example.com/team/assistant-memory.git"
+remote_name = "backup"
+push_on_update = true
+"#;
+        std::fs::write(&path, src).expect("write config");
+
+        // Both readers, because #915 split them: the pure reader answers every
+        // settings read, and the migrating one is what startup uses. A stale
+        // section must be invisible to each. Parse first - the migrating
+        // loader rewrites the file, and the rewrite is what drops the section.
+        let parsed = parse_daemon_config(&path)
+            .expect("a config carrying [persistence.git] parses")
+            .expect("config present");
+        assert_eq!(parsed.llm.connector, "openai");
+
+        let loaded = load_and_migrate_daemon_config(&path)
+            .expect("a config carrying [persistence.git] starts the daemon")
+            .expect("config present");
+        assert_eq!(loaded.llm.connector, "openai");
+
+        assert!(
+            unknown_config_keys(src).is_empty(),
+            "a retired key must not be reported as unrecognised: {:?}",
+            unknown_config_keys(src)
         );
-        assert_eq!(config.persistence.git.remote_name, "backup");
-        assert!(config.persistence.git.push_on_update);
-    }
 
-    #[test]
-    fn resolve_persistence_defaults_when_missing() {
-        let resolved = resolve_persistence_config(None);
-        assert!(!resolved.enabled);
-        assert!(resolved.remote_url.is_none());
-        assert_eq!(resolved.remote_name, "origin");
-        assert!(resolved.push_on_update);
-    }
-
-    #[test]
-    fn resolve_persistence_trims_remote_url() {
-        let config: DaemonConfig = toml::from_str(
-            r#"
-            [persistence.git]
-            enabled = true
-            remote_url = "   "
-            remote_name = "  "
-            push_on_update = false
-            "#,
-        )
-        .unwrap();
-
-        let resolved = resolve_persistence_config(Some(&config));
-        assert!(resolved.enabled);
-        assert!(resolved.remote_url.is_none());
-        assert_eq!(resolved.remote_name, "origin");
-        assert!(!resolved.push_on_update);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

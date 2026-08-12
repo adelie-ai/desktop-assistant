@@ -17,8 +17,8 @@
 //!   rebuild), called out separately so the log explains what changed.
 //!
 //! - **Restart-required** — wired once at process start and not swappable
-//!   live: the database pool/url, embeddings backend, persistence, WS auth,
-//!   TLS, the administrator allowlist, and pre-prompt recall. A
+//!   live: the database pool/url, embeddings backend, WS auth, TLS, the
+//!   administrator allowlist, and pre-prompt recall. A
 //!   reload still applies every hot knob in the same edit; these are flagged in
 //!   the plan so the daemon logs that a restart is needed for them to take
 //!   effect, rather than silently ignoring them.
@@ -61,8 +61,6 @@ pub enum RestartArea {
     /// The embedding backend, whether configured via the legacy `[embeddings]`
     /// block or `[purposes.embedding]`. Removed by #685.
     Embeddings,
-    /// `[persistence]`: the git-backed history mirror is wired once.
-    Persistence,
     /// `[ws_auth]`: the allowed authentication methods, OIDC discovery, and
     /// permitted browser origins are read into the listener once.
     WsAuth,
@@ -86,7 +84,6 @@ impl RestartArea {
             Self::ConfigLoadFailed => "config_load_failed",
             Self::Database => "database",
             Self::Embeddings => "embeddings",
-            Self::Persistence => "persistence",
             Self::WsAuth => "ws_auth",
             Self::Tls => "tls",
             Self::Authz => "authz",
@@ -156,9 +153,6 @@ pub fn plan_reload(old: &DaemonConfig, new: &DaemonConfig) -> ReloadPlan {
     // it is restart-bound. Reported as ONE area because it is one backend.
     if embedding_backend_changed(old, new) {
         plan.restart_required.push(RestartArea::Embeddings);
-    }
-    if !areas_eq(&old.persistence, &new.persistence) {
-        plan.restart_required.push(RestartArea::Persistence);
     }
     if !areas_eq(&old.ws_auth, &new.ws_auth) {
         plan.restart_required.push(RestartArea::WsAuth);
@@ -515,7 +509,6 @@ mod tests {
         // settings UI that matches on them.
         assert_eq!(RestartArea::Database.as_key(), "database");
         assert_eq!(RestartArea::Embeddings.as_key(), "embeddings");
-        assert_eq!(RestartArea::Persistence.as_key(), "persistence");
         assert_eq!(RestartArea::WsAuth.as_key(), "ws_auth");
         assert_eq!(RestartArea::Tls.as_key(), "tls");
         assert_eq!(RestartArea::Authz.as_key(), "authz");
