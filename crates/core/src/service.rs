@@ -11400,6 +11400,431 @@ mod tests {
         );
     }
 
+    // --- #1212: the block carries the core set, and the bound holds it there -
+
+    /// A handler like [`two_sided_handler`], plus a handle on every prompt the
+    /// model was shown. The tool block and the system block are the two halves
+    /// of one cached prefix, so a test that pins the prefix has to read both.
+    #[allow(clippy::type_complexity)]
+    fn advertising_handler(
+        responses: Vec<LlmResponse>,
+        core: Vec<ToolDefinition>,
+        registry: Vec<ToolDefinition>,
+        results: HashMap<String, String>,
+    ) -> (
+        ConversationHandler<MockStore, ToolCallingLlm, RecordingToolExecutor>,
+        Arc<Mutex<Vec<Vec<ToolDefinition>>>>,
+        Arc<Mutex<Vec<Vec<Message>>>>,
+    ) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let llm = ToolCallingLlm::new(responses);
+        let advertised = llm.advertised();
+        let prompts = llm.prompts();
+        let counter = Arc::new(AtomicU64::new(0));
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            llm,
+            RecordingToolExecutor {
+                core,
+                registry,
+                results,
+                executed: Arc::new(Mutex::new(Vec::new())),
+            },
+            Box::new(move || {
+                let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                format!("conv-{n}")
+            }),
+        )
+        .with_host("daemon-host");
+        (handler, advertised, prompts)
+    }
+
+    /// The daemon's discovery tool, which is what makes deferral safe: nothing
+    /// is deferred on a turn that cannot look a name up.
+    fn search_tool() -> ToolDefinition {
+        ToolDefinition::new(
+            "builtin_tool_search",
+            "find tools",
+            serde_json::json!({"type": "object", "properties": {"query": {"type": "string"}}}),
+        )
+    }
+
+    /// A schema with one required argument, so a call that guesses the shape
+    /// wrong is distinguishable from one that gets it right.
+    fn speak_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+        })
+    }
+
+    /// `count` tools of the shape a connected client registers, named so the
+    /// order the connection registered them in is legible in a failure.
+    fn registered_client_tools(count: usize) -> Vec<ToolDefinition> {
+        (0..count)
+            .map(|i| {
+                ToolDefinition::new(
+                    format!("device_tool_{i:02}"),
+                    format!("device tool {i}"),
+                    speak_schema(),
+                )
+            })
+            .collect()
+    }
+
+    fn advertised_names(round: &[ToolDefinition]) -> Vec<&str> {
+        round.iter().map(|t| t.name.as_str()).collect()
+    }
+
+    /// AC1. The measured turn advertised 99 schemas with tool search offered in
+    /// the same request. With discovery available the block is the daemon's
+    /// core plus a bounded slice of the connection's own tools, and the size is
+    /// asserted here rather than left to whatever a client happens to register.
+    #[tokio::test]
+    async fn with_tool_search_offered_round_one_advertises_the_core_set_and_a_bounded_client_slice()
+    {
+        use crate::ports::client_tools::with_client_tools;
+        use crate::tool_advertising::MAX_CLIENT_TOOLS_IN_BLOCK;
+
+        let (handler, advertised, _prompts) = advertising_handler(
+            vec![LlmResponse::text("done")],
+            vec![search_tool()],
+            vec![],
+            HashMap::new(),
+        );
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        with_client_tools(
+            client_port(registered_client_tools(20), &ran),
+            handler.send_prompt(&conv.id, "hello".into(), noop_callback(), noop_status()),
+        )
+        .await
+        .expect("turn completes");
+
+        let rounds = advertised.lock().unwrap().clone();
+        let round_one = rounds.first().expect("the model was called");
+        let mut expected = vec!["daemon_builtin_tool_search".to_string()];
+        expected
+            .extend((0..MAX_CLIENT_TOOLS_IN_BLOCK).map(|i| format!("client_device_tool_{i:02}")));
+        assert_eq!(
+            advertised_names(round_one),
+            expected.iter().map(String::as_str).collect::<Vec<_>>(),
+            "round one carries the daemon core and the connection's bounded slice, \
+             in the order the two were offered"
+        );
+    }
+
+    /// The safety half of the rule above: a name nothing can look up is a name
+    /// the model cannot reach, so a turn with no discovery tool advertises every
+    /// registered tool in full however many there are.
+    #[tokio::test]
+    async fn without_tool_search_offered_every_client_tool_keeps_its_schema() {
+        use crate::ports::client_tools::with_client_tools;
+
+        let (handler, advertised, _prompts) = advertising_handler(
+            vec![LlmResponse::text("done")],
+            vec![daemon_read_file()],
+            vec![],
+            HashMap::new(),
+        );
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        with_client_tools(
+            client_port(registered_client_tools(20), &ran),
+            handler.send_prompt(&conv.id, "hello".into(), noop_callback(), noop_status()),
+        )
+        .await
+        .expect("turn completes");
+
+        let rounds = advertised.lock().unwrap().clone();
+        let round_one = rounds.first().expect("the model was called");
+        assert_eq!(
+            round_one.len(),
+            21,
+            "with nothing to search, deferral would make a tool unreachable; \
+             the block carried {:?}",
+            advertised_names(round_one)
+        );
+    }
+
+    /// The pin: what the block leaves out, the note still names. A schema costs
+    /// roughly 250 estimated tokens and a name about ten, so the model keeps the
+    /// recognition surface at a fortieth of the price.
+    #[tokio::test]
+    async fn the_tool_note_names_the_client_tools_whose_schemas_the_block_left_out() {
+        use crate::ports::client_tools::with_client_tools;
+
+        let (handler, advertised, prompts) = advertising_handler(
+            vec![LlmResponse::text("done")],
+            vec![search_tool()],
+            vec![],
+            HashMap::new(),
+        );
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        with_client_tools(
+            client_port(registered_client_tools(20), &ran),
+            handler.send_prompt(&conv.id, "hello".into(), noop_callback(), noop_status()),
+        )
+        .await
+        .expect("turn completes");
+
+        let rounds = advertised.lock().unwrap().clone();
+        let round_one = rounds.first().expect("the model was called");
+        assert!(
+            !advertised_names(round_one).contains(&"client_device_tool_19"),
+            "precondition: the last registered tool is past the bound"
+        );
+        let seen = prompts.lock().unwrap().clone();
+        let system = &seen[0][0].content;
+        assert!(
+            system.contains("client_device_tool_19"),
+            "a tool whose schema the block left out must still be named, or the \
+             model cannot know it exists: {system}"
+        );
+    }
+
+    /// The pin is only usable if calling it works. A name the block left out is
+    /// still in the round's table, so the call routes to the connection that
+    /// registered it, and the schema joins the block for the rounds that follow.
+    #[tokio::test]
+    async fn a_call_to_a_client_tool_the_block_left_out_runs_on_the_client_and_activates_its_schema()
+     {
+        use crate::ports::client_tools::with_client_tools;
+
+        let responses = vec![
+            LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new(
+                    "c1",
+                    "client_device_tool_19",
+                    r#"{"text":"hello"}"#,
+                )],
+            ),
+            LlmResponse::text("done"),
+        ];
+        let (handler, advertised, _prompts) =
+            advertising_handler(responses, vec![search_tool()], vec![], HashMap::new());
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        with_client_tools(
+            client_port(registered_client_tools(20), &ran),
+            handler.send_prompt(&conv.id, "say it".into(), noop_callback(), noop_status()),
+        )
+        .await
+        .expect("turn completes");
+
+        let on_device: Vec<String> = ran.lock().unwrap().iter().map(|(_, n)| n.clone()).collect();
+        assert_eq!(
+            on_device,
+            vec!["device_tool_19".to_string()],
+            "the call runs on the connection that registered it"
+        );
+        let rounds = advertised.lock().unwrap().clone();
+        assert!(
+            !advertised_names(&rounds[0]).contains(&"client_device_tool_19"),
+            "precondition: the model called a tool whose schema the block left out"
+        );
+        let round_two = rounds.get(1).expect("the model was called again");
+        assert!(
+            advertised_names(round_two).contains(&"client_device_tool_19"),
+            "a tool the turn actually used carries its schema from then on: {:?}",
+            advertised_names(round_two)
+        );
+    }
+
+    /// The edge deferral creates, closed rather than discovered later: the model
+    /// may call a tool whose schema it has never seen and get the arguments
+    /// wrong. A first call whose arguments the schema refuses returns the schema
+    /// instead of running, so a round is spent only when the schema genuinely had
+    /// to be seen - and nothing acts on a guess.
+    #[tokio::test]
+    async fn a_call_to_a_tool_the_block_left_out_with_arguments_its_schema_refuses_returns_the_schema()
+     {
+        use crate::ports::client_tools::with_client_tools;
+
+        let responses = vec![
+            LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new("c1", "client_device_tool_19", r#"{}"#)],
+            ),
+            LlmResponse::text("done"),
+        ];
+        let (handler, advertised, prompts) =
+            advertising_handler(responses, vec![search_tool()], vec![], HashMap::new());
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        with_client_tools(
+            client_port(registered_client_tools(20), &ran),
+            handler.send_prompt(&conv.id, "say it".into(), noop_callback(), noop_status()),
+        )
+        .await
+        .expect("turn completes");
+
+        assert!(
+            ran.lock().unwrap().is_empty(),
+            "a call whose arguments the schema refuses must not run: {:?}",
+            ran.lock().unwrap()
+        );
+        let seen = prompts.lock().unwrap().clone();
+        let second_round = &seen[1];
+        let tool_result = second_round
+            .iter()
+            .rev()
+            .find(|m| m.content.contains("device_tool_19"))
+            .map(|m| m.content.clone())
+            .expect("the refused call left a tool result");
+        assert!(
+            tool_result.contains("\"required\"") && tool_result.contains("text"),
+            "the result must carry the schema the model never saw: {tool_result}"
+        );
+        let rounds = advertised.lock().unwrap().clone();
+        assert!(
+            advertised_names(rounds.get(1).expect("a second round"))
+                .contains(&"client_device_tool_19"),
+            "and the schema joins the block, so the retry is not a second guess"
+        );
+    }
+
+    /// AC5. The measured turn activated ten tools on top of 99 and nothing ever
+    /// retired one, with 200 rounds available. The ledger's bound is what makes
+    /// that finite.
+    #[tokio::test]
+    async fn a_turn_that_keeps_activating_tools_never_advertises_more_than_the_bound() {
+        use crate::tool_advertising::MAX_ACTIVATED_TOOLS;
+
+        let fleet: Vec<ToolDefinition> = (0..40)
+            .map(|i| {
+                ToolDefinition::new(
+                    format!("fleet_tool_{i:02}"),
+                    format!("fleet tool {i}"),
+                    speak_schema(),
+                )
+            })
+            .collect();
+        let hits: Vec<serde_json::Value> = fleet
+            .iter()
+            .map(|t| serde_json::json!({"name": format!("daemon_{}", t.name), "description": t.description, "runs_on": "daemon"}))
+            .collect();
+        let search_result = serde_json::json!({"ok": true, "tools": hits}).to_string();
+
+        let responses = vec![
+            LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new(
+                    "c1",
+                    "daemon_builtin_tool_search",
+                    r#"{"query":"anything"}"#,
+                )],
+            ),
+            LlmResponse::text("done"),
+        ];
+        let (handler, advertised, _prompts) = advertising_handler(
+            responses,
+            vec![search_tool()],
+            fleet,
+            HashMap::from([("builtin_tool_search".to_string(), search_result)]),
+        );
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(
+                &conv.id,
+                "find something".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await
+            .expect("turn completes");
+
+        let rounds = advertised.lock().unwrap().clone();
+        let round_two = rounds.get(1).expect("the model was called again");
+        assert_eq!(
+            round_two.len(),
+            1 + MAX_ACTIVATED_TOOLS,
+            "forty hits may not become forty schemas; the block carried {:?}",
+            advertised_names(round_two)
+        );
+    }
+
+    /// AC4, the half this change is responsible for. A provider's prompt cache
+    /// is a prefix match, so the checkpoint behind the leading system block pays
+    /// only while the bytes in front of it - the tool array, then that block -
+    /// are identical to last round's. `llm-bedrock`'s
+    /// `cache_point_emitted_for_anthropic_model` pins that the checkpoint is
+    /// emitted and where; this pins that what precedes it does not move.
+    #[tokio::test]
+    async fn rounds_that_activate_nothing_send_a_byte_identical_tool_block_and_system_block() {
+        use crate::ports::client_tools::with_client_tools;
+
+        let responses = vec![
+            LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new(
+                    "c1",
+                    "daemon_read_file",
+                    r#"{"path":"/etc/hosts"}"#,
+                )],
+            ),
+            LlmResponse::text("done"),
+        ];
+        let (handler, advertised, prompts) = advertising_handler(
+            responses,
+            vec![daemon_read_file(), search_tool()],
+            vec![],
+            HashMap::from([("read_file".to_string(), "contents".to_string())]),
+        );
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        with_client_tools(
+            client_port(registered_client_tools(20), &ran),
+            handler.send_prompt(&conv.id, "read it".into(), noop_callback(), noop_status()),
+        )
+        .await
+        .expect("turn completes");
+
+        let rounds = advertised.lock().unwrap().clone();
+        // The turn also names the conversation, and that call carries no
+        // tools; the two rounds of the loop are the first two entries.
+        assert!(
+            rounds.len() >= 2 && !rounds[0].is_empty() && !rounds[1].is_empty(),
+            "precondition: the turn ran two rounds that advertised tools; it made \
+             calls of sizes {:?}",
+            rounds.iter().map(Vec::len).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            rounds[0], rounds[1],
+            "a round that activated nothing must send the same tool array, byte \
+             for byte, or the cached prefix behind it is thrown away"
+        );
+        let seen = prompts.lock().unwrap().clone();
+        assert_eq!(
+            seen[0][0].content, seen[1][0].content,
+            "and the same leading system block, which is the rest of that prefix"
+        );
+    }
+
     #[tokio::test]
     async fn turn_routes_registered_client_tool_through_port_and_feeds_result_back() {
         use crate::ports::client_tools::with_client_tools;

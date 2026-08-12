@@ -95,6 +95,17 @@ pub(crate) const TOTAL_FIELD: &str = "prompt.total_tokens";
 /// How many tools this prompt advertised. A count, not a token figure.
 pub(crate) const TOOL_COUNT_FIELD: &str = "prompt.tool_count";
 
+/// The tool-schema cost of the largest tool block any round of the turn sent.
+///
+/// The field above is the turn's opening figure. Within a turn the advertised
+/// set only ever grows, so the opening figure is the floor and this is the
+/// ceiling; a turn whose tool loop doubled its own tool block shows it here and
+/// nowhere else.
+pub(crate) const TOOL_TOKENS_PEAK_FIELD: &str = "prompt.tool_schema_tokens_max";
+
+/// How many tools that largest block carried.
+pub(crate) const TOOL_COUNT_PEAK_FIELD: &str = "prompt.tool_count_max";
+
 // ---------------------------------------------------------------------------
 // The parts.
 // ---------------------------------------------------------------------------
@@ -259,6 +270,36 @@ impl PromptBreakdown {
     }
 }
 
+/// The largest tool block any round of one turn sent.
+///
+/// The pair travels together, from the round whose schemas cost the most: a
+/// schema bill without its tool count says nothing about whether to drop a
+/// server, and two independent maxima would report a count and a cost that no
+/// single round ever sent together.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ToolBlockPeak {
+    count: usize,
+    tokens: u64,
+}
+
+impl ToolBlockPeak {
+    /// Take in what one round's block cost.
+    pub(crate) fn observe(&mut self, count: usize, tokens: u64) {
+        self.count = count;
+        self.tokens = tokens;
+    }
+
+    /// How many tools the costliest round advertised.
+    pub(crate) fn count(self) -> usize {
+        self.count
+    }
+
+    /// What that round's schemas cost.
+    pub(crate) fn tokens(self) -> u64 {
+        self.tokens
+    }
+}
+
 /// Put one prompt's breakdown on the turn span.
 ///
 /// Every part is recorded, including the zeros: see the module header for why
@@ -269,6 +310,13 @@ pub(crate) fn record_on_span(span: &tracing::Span, breakdown: &PromptBreakdown) 
     }
     span.record(TOTAL_FIELD, breakdown.total_tokens());
     span.record(TOOL_COUNT_FIELD, breakdown.tool_count() as u64);
+}
+
+/// Put the turn's largest tool block on its span, beside the opening figure it
+/// is the ceiling of.
+pub(crate) fn record_peak_on_span(span: &tracing::Span, peak: ToolBlockPeak) {
+    span.record(TOOL_COUNT_PEAK_FIELD, peak.count() as u64);
+    span.record(TOOL_TOKENS_PEAK_FIELD, peak.tokens());
 }
 
 /// Accumulate one prompt's breakdown into the metrics facade.
@@ -338,6 +386,42 @@ mod tests {
         assert!(
             !TOOL_COUNT_FIELD.ends_with("_tokens"),
             "the tool count is not a token figure and must not be named as one"
+        );
+        // The per-turn peaks are the same two units, and the same claim.
+        assert!(
+            TOOL_TOKENS_PEAK_FIELD.contains("_tokens"),
+            "`{TOOL_TOKENS_PEAK_FIELD}` leaves its unit to be inferred"
+        );
+        assert!(
+            !TOOL_COUNT_PEAK_FIELD.contains("_tokens"),
+            "`{TOOL_COUNT_PEAK_FIELD}` is a count and must not read as tokens"
+        );
+    }
+
+    #[test]
+    fn the_peak_is_the_largest_block_a_round_sent_not_the_last_one() {
+        // A turn's advertised set grows as its tool loop activates tools, and
+        // the last round is not the largest when the bound retires one. The
+        // figure an operator reads has to be the worst the turn actually sent.
+        let mut peak = ToolBlockPeak::default();
+        peak.observe(10, 1_000);
+        peak.observe(4, 400);
+        assert_eq!(peak.tokens(), 1_000);
+        assert_eq!(peak.count(), 10);
+    }
+
+    #[test]
+    fn the_peak_pair_comes_from_one_round_rather_than_two_separate_maxima() {
+        // Reporting the largest count beside the largest cost would describe a
+        // round that never happened, and the pair is the whole point: a bill
+        // without its count names no server to drop.
+        let mut peak = ToolBlockPeak::default();
+        peak.observe(2, 900);
+        peak.observe(40, 100);
+        assert_eq!(
+            (peak.count(), peak.tokens()),
+            (2, 900),
+            "the costliest round's own pair, not the largest of each"
         );
     }
 

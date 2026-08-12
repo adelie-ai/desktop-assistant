@@ -273,6 +273,11 @@ pub(crate) fn turn_span(
         prompt.tool_schema_tokens = tracing::field::Empty,
         prompt.total_tokens = tracing::field::Empty,
         prompt.tool_count = tracing::field::Empty,
+        // The ceiling of the two figures above, over the turn's rounds
+        // (#1212). The opening figure is the floor of a set that only grows
+        // within a turn, so on its own it cannot show the growth.
+        prompt.tool_schema_tokens_max = tracing::field::Empty,
+        prompt.tool_count_max = tracing::field::Empty,
     );
     // The turn is the root of its trace, so this is where the trace id the
     // client already knows becomes the one a backend indexes by. Everything
@@ -557,6 +562,10 @@ pub(crate) struct TurnGuard {
     /// turn assembles a prompt, which a turn cancelled before its first round
     /// never does - and an unrecorded part is exactly what that is.
     prompt: Option<PromptBreakdown>,
+    /// The largest tool block any of the turn's rounds sent (#1212). The field
+    /// above keeps the turn's opening figure, which is the floor of a set that
+    /// only grows within a turn; this is its ceiling.
+    tool_peak: prompt::ToolBlockPeak,
 }
 
 impl TurnGuard {
@@ -569,6 +578,7 @@ impl TurnGuard {
             outcome: TurnOutcome::Failed,
             tokens: TokenTotals::default(),
             prompt: None,
+            tool_peak: prompt::ToolBlockPeak::default(),
         }
     }
 
@@ -583,6 +593,10 @@ impl TurnGuard {
     /// the pinned notes, the recall offer and the tool fleet. What the rounds
     /// then add to it is a separate measurement.
     pub(crate) fn set_prompt_breakdown(&mut self, breakdown: PromptBreakdown) {
+        self.tool_peak.observe(
+            breakdown.tool_count(),
+            breakdown.tokens(PromptPart::ToolSchemas),
+        );
         self.prompt.get_or_insert(breakdown);
     }
 }
@@ -594,6 +608,7 @@ impl Drop for TurnGuard {
         if let Some(breakdown) = &self.prompt {
             prompt::record_on_span(&self.span, breakdown);
             prompt::record_metrics(breakdown);
+            prompt::record_peak_on_span(&self.span, self.tool_peak);
         }
         self.span.record("rounds", self.rounds);
         self.span.record("outcome", self.outcome.as_label());

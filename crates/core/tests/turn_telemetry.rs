@@ -716,6 +716,9 @@ struct ScriptedTools {
     /// When set, the tool returns a multi-megabyte payload, so the loop's
     /// post-measurement truncation costs measurable time.
     oversized_output: bool,
+    /// When set, every dispatch answers with a tool-search result naming this
+    /// tool, so the turn loop activates it for the rounds that follow.
+    search_hit: Option<&'static str>,
 }
 
 impl ScriptedTools {
@@ -726,6 +729,7 @@ impl ScriptedTools {
             cancel_after_first: false,
             unadvertised: Vec::new(),
             oversized_output: false,
+            search_hit: None,
         }
     }
 
@@ -741,6 +745,7 @@ impl ScriptedTools {
                 serde_json::json!({"type": "object"}),
             )],
             oversized_output: false,
+            search_hit: None,
         }
     }
 
@@ -751,6 +756,7 @@ impl ScriptedTools {
             cancel_after_first: false,
             unadvertised: Vec::new(),
             oversized_output: false,
+            search_hit: None,
         }
     }
 
@@ -763,6 +769,27 @@ impl ScriptedTools {
             cancel_after_first: false,
             unadvertised: Vec::new(),
             oversized_output: true,
+            search_hit: None,
+        }
+    }
+
+    /// An executor whose one advertised tool is the discovery tool, and whose
+    /// search hands back one fleet tool. The turn loop activates it, so round
+    /// two advertises a strictly larger block than round one - the growth
+    /// #1212 bounds, and the only shape that tells a peak apart from an
+    /// opening figure.
+    fn searching() -> Self {
+        Self {
+            tools: vec![tool_search()],
+            failure: None,
+            cancel_after_first: false,
+            unadvertised: vec![ToolDefinition::new(
+                FLEET_TOOL,
+                "a fleet tool reached only through a search",
+                serde_json::json!({"type": "object", "properties": {"q": {"type": "string"}}}),
+            )],
+            oversized_output: false,
+            search_hit: Some(FLEET_TOOL),
         }
     }
 
@@ -775,8 +802,41 @@ impl ScriptedTools {
             cancel_after_first: true,
             unadvertised: Vec::new(),
             oversized_output: false,
+            search_hit: None,
         }
     }
+}
+
+/// The name of the fleet tool [`ScriptedTools::searching`] hands back.
+const FLEET_TOOL: &str = "fleet_lookup";
+
+/// The daemon's discovery tool, by the name the turn loop watches for.
+fn tool_search() -> ToolDefinition {
+    ToolDefinition::new(
+        "builtin_tool_search",
+        "find tools",
+        serde_json::json!({"type": "object", "properties": {"query": {"type": "string"}}}),
+    )
+}
+
+/// One search round then an answer, so round two advertises what round one's
+/// search activated.
+fn search_script() -> Vec<Reply> {
+    vec![
+        LlmResponse::with_tool_calls(
+            "",
+            vec![ToolCall::new(
+                "s1",
+                "daemon_builtin_tool_search",
+                r#"{"query":"anything"}"#,
+            )],
+        )
+        .with_usage(usage(100, 10))
+        .into(),
+        LlmResponse::text(REPLY_SENTINEL)
+            .with_usage(usage(200, 20))
+            .into(),
+    ]
 }
 
 fn write_note() -> ToolDefinition {
@@ -821,6 +881,17 @@ impl ToolExecutor for ScriptedTools {
         }
         if self.oversized_output {
             return Ok("x".repeat(OVERSIZED_TOOL_RESULT_BYTES));
+        }
+        if let Some(hit) = self.search_hit {
+            return Ok(serde_json::json!({
+                "ok": true,
+                "tools": [{
+                    "name": format!("daemon_{hit}"),
+                    "description": "a fleet tool",
+                    "runs_on": "daemon",
+                }],
+            })
+            .to_string());
         }
         match &self.failure {
             Some(message) => Err(CoreError::ToolExecution(message.clone())),
@@ -1709,6 +1780,7 @@ fn a_model_chosen_tool_name_cannot_forge_a_log_line() {
         cancel_after_first: false,
         unadvertised: Vec::new(),
         oversized_output: false,
+        search_hit: None,
     };
     let captured = run(Level::INFO, script, tools);
 
@@ -2462,6 +2534,8 @@ fn prompt_fields() -> Vec<&'static str> {
     let mut all = PROMPT_PART_FIELDS.to_vec();
     all.push(PROMPT_TOTAL_FIELD);
     all.push(PROMPT_TOOL_COUNT_FIELD);
+    all.push(PROMPT_TOOL_TOKENS_PEAK_FIELD);
+    all.push(PROMPT_TOOL_COUNT_PEAK_FIELD);
     all
 }
 
@@ -2553,7 +2627,9 @@ fn every_prompt_figure_on_the_turn_span_names_its_unit() {
         };
         checked += 1;
         assert!(
-            rest.ends_with("_tokens") || key == PROMPT_TOOL_COUNT_FIELD,
+            rest.contains("_tokens")
+                || key == PROMPT_TOOL_COUNT_FIELD
+                || key == PROMPT_TOOL_COUNT_PEAK_FIELD,
             "`{key}` states no unit. A character count and a token count for \
              the same block look equally plausible side by side, so every \
              figure here says which it is"
@@ -2839,7 +2915,12 @@ fn no_prompt_metric_carries_a_conversation_scoped_label() {
     for counter in captured.after.counters.iter().filter(|c| {
         matches!(
             c.name,
-            PROMPT_PART_TOKENS_METRIC | PROMPT_TOOLS_METRIC | PROMPT_MEASURED_METRIC
+            PROMPT_PART_TOKENS_METRIC
+                | PROMPT_TOOLS_METRIC
+                | PROMPT_MEASURED_METRIC
+                | PROMPT_TOOL_SERVER_TOKENS_METRIC
+                | PROMPT_ROUND_TOOLS_METRIC
+                | PROMPT_ROUND_MEASURED_METRIC
         )
     }) {
         checked += 1;
@@ -2848,13 +2929,15 @@ fn no_prompt_metric_carries_a_conversation_scoped_label() {
             // necessarily carry a recognisable value - the id may be unset by
             // the time the turn reports - and the axis is the leak whatever
             // the value turns out to be.
-            assert_eq!(
-                label.key(),
-                "part",
-                "`{}` may carry no axis but the part name; a per-conversation, \
-                 per-user or per-model axis is an unbounded series key in a \
-                 registry that caps a metric at 64 label sets and evicts \
-                 none. It carried {:?}",
+            assert!(
+                // `part` is the closed set of ten prompt parts; `server` is
+                // the connection a schema was offered by, bounded by the
+                // operator's own server list (#1212). Nothing else.
+                matches!(label.key(), "part" | "server"),
+                "`{}` may carry no axis but the part or the server; a \
+                 per-conversation, per-user or per-model axis is an unbounded \
+                 series key in a registry that caps a metric at 64 label sets \
+                 and evicts none. It carried {:?}",
                 counter.name,
                 counter.labels
             );
@@ -2893,10 +2976,20 @@ fn the_docs_state_the_parts_are_estimates_that_do_not_sum_to_the_provider_count(
              docs/logging.md knows it exists"
         );
     }
+    for name in [ROUND_TOOL_COUNT_FIELD, ROUND_TOOL_TOKENS_FIELD] {
+        assert!(
+            doc.contains(name),
+            "`{name}` is recorded on every round span and undocumented, so \
+             nobody reading docs/logging.md knows it exists"
+        );
+    }
     for metric in [
         PROMPT_PART_TOKENS_METRIC,
         PROMPT_TOOLS_METRIC,
         PROMPT_MEASURED_METRIC,
+        PROMPT_TOOL_SERVER_TOKENS_METRIC,
+        PROMPT_ROUND_TOOLS_METRIC,
+        PROMPT_ROUND_MEASURED_METRIC,
     ] {
         assert!(
             doc.contains(metric),
@@ -2913,4 +3006,118 @@ fn the_docs_state_the_parts_are_estimates_that_do_not_sum_to_the_provider_count(
              its accuracy claim reads as a measurement"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// #1212: the tool block, measured per round and per server.
+//
+// #1203 records the breakdown once per turn, on the first assembly. Activation
+// only ever adds within a turn, so round one reports the floor of exactly the
+// growth #1212 bounds - the instrument could show neither the defect nor the
+// fix. These are the two axes it was missing.
+// ---------------------------------------------------------------------------
+
+/// What one round says its own tool block cost.
+const ROUND_TOOL_COUNT_FIELD: &str = "prompt.tool_count";
+const ROUND_TOOL_TOKENS_FIELD: &str = "prompt.tool_schema_tokens";
+
+/// The largest tool block any round of the turn sent, on the turn span.
+const PROMPT_TOOL_COUNT_PEAK_FIELD: &str = "prompt.tool_count_max";
+const PROMPT_TOOL_TOKENS_PEAK_FIELD: &str = "prompt.tool_schema_tokens_max";
+
+const PROMPT_TOOL_SERVER_TOKENS_METRIC: &str = "llm.prompt.tool.tokens";
+const PROMPT_ROUND_TOOLS_METRIC: &str = "llm.prompt.round.tools";
+const PROMPT_ROUND_MEASURED_METRIC: &str = "llm.prompt.round.measured";
+
+#[test]
+fn each_round_span_carries_the_tool_count_and_schema_cost_of_its_own_block() {
+    let _serialised = serialised();
+    let captured = run(Level::INFO, two_round_script(), ScriptedTools::ok());
+
+    let rounds = captured.spans_named("turn.round");
+    assert_eq!(rounds.len(), 2, "the script runs two rounds");
+    for round in rounds {
+        assert_eq!(
+            round.field(ROUND_TOOL_COUNT_FIELD),
+            Some("1"),
+            "every round advertised the one scripted tool, and every round has \
+             to say so - the turn-level figure is only the first round's, which \
+             is the floor of a set that grows; the round recorded {:?}",
+            round.fields
+        );
+        let tokens = round
+            .field(ROUND_TOOL_TOKENS_FIELD)
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or_else(|| {
+                panic!(
+                    "the round carries no `{ROUND_TOOL_TOKENS_FIELD}`; it \
+                     recorded {:?}",
+                    round.fields
+                )
+            });
+        assert!(tokens > 0, "an advertised schema costs prompt tokens");
+    }
+}
+
+#[test]
+fn the_turn_span_reports_the_grown_tool_block_and_not_only_its_opening() {
+    let _serialised = serialised();
+    // Round one advertises the discovery tool alone; its search activates a
+    // fleet tool, so round two advertises two. The turn's opening figure is the
+    // floor of that growth, which is why it cannot be the figure an operator
+    // reads for how large the block got.
+    let captured = run(Level::INFO, search_script(), ScriptedTools::searching());
+    let turn = captured.span("turn");
+
+    assert_eq!(
+        prompt_field(turn, PROMPT_TOOL_COUNT_FIELD),
+        1,
+        "precondition: the turn opened with one advertised tool; it recorded {:?}",
+        turn.fields
+    );
+    assert_eq!(
+        prompt_field(turn, PROMPT_TOOL_COUNT_PEAK_FIELD),
+        2,
+        "the search activated a second tool, and the peak is what says so; the \
+         turn recorded {:?}",
+        turn.fields
+    );
+    assert!(
+        prompt_field(turn, PROMPT_TOOL_TOKENS_PEAK_FIELD)
+            > prompt_field(turn, "prompt.tool_schema_tokens"),
+        "the larger block cost more, and the peak carries that round's own \
+         cost; the turn recorded {:?}",
+        turn.fields
+    );
+}
+
+#[test]
+fn the_tool_schema_cost_is_counted_per_server_so_an_operator_can_see_which_to_drop() {
+    let _serialised = serialised();
+    let captured = run(Level::INFO, two_round_script(), ScriptedTools::ok());
+
+    // The scripted executor's tool is a daemon built-in, so that is the axis
+    // value the turn must attribute its schema bill to. A single aggregate
+    // says 23.7k and names nothing to drop.
+    let by_server = captured.counter_delta(PROMPT_TOOL_SERVER_TOKENS_METRIC, &["daemon"]);
+    assert!(
+        by_server > 0,
+        "`{PROMPT_TOOL_SERVER_TOKENS_METRIC}` must carry a per-server axis; \
+         the run recorded {:?}",
+        captured
+            .after
+            .counters
+            .iter()
+            .map(|c| (c.name, render_labels(&c.labels)))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        captured.counter_delta(PROMPT_ROUND_MEASURED_METRIC, &[]) >= 2,
+        "the per-round denominator counts every round, not every turn"
+    );
+    assert_eq!(
+        captured.counter_delta(PROMPT_ROUND_TOOLS_METRIC, &[]),
+        2,
+        "two rounds advertising one tool each is two, not one"
+    );
 }

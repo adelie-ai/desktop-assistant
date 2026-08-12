@@ -4055,6 +4055,25 @@ mod tests {
         assert!(names.contains(&TOOL_SCRATCHPAD_DELETE.to_string()));
     }
 
+    /// #1212 AC1. Every built-in is advertised in full on every round of every
+    /// turn, so this set is the standing bill a turn opens with. It grew to
+    /// contribute to a 99-tool block because nothing ever said how large it was
+    /// allowed to be. The ceiling is that statement, and the membership rule it
+    /// enforces is in `desktop_assistant_core::tool_advertising`: a tool is core
+    /// when the model needs it to find, or to keep, what the rest of the turn
+    /// depends on.
+    #[test]
+    fn the_always_advertised_builtin_core_stays_under_its_stated_ceiling() {
+        let count = BuiltinToolService::new().tool_definitions().len();
+        assert!(
+            count <= desktop_assistant_core::tool_advertising::CORE_TOOL_CEILING,
+            "the always-advertised core holds {count} tools, past the ceiling of \
+             {}. Either the new tool is discoverable rather than core, or the \
+             ceiling moves deliberately and this comment says why",
+            desktop_assistant_core::tool_advertising::CORE_TOOL_CEILING
+        );
+    }
+
     #[test]
     fn kb_write_tags_description_urges_specific_facets() {
         // Generic tags ("instruction", "memory") make KB entries fragment and
