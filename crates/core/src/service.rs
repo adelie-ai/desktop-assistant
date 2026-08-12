@@ -12298,6 +12298,257 @@ mod tests {
         );
     }
 
+    // --- #1294: the array is emitted most-stable-first ------------------
+
+    /// [`advertising_handler`], plus a scratchpad writer so the turn offers the
+    /// loop's own control surface.
+    ///
+    /// The control tools are the most stable entries in the whole array, and a
+    /// test about where the array grows cannot see anything without them: with
+    /// no tool after the point an activation is inserted at, every insertion
+    /// looks like an append.
+    #[allow(clippy::type_complexity)]
+    fn advertising_handler_with_core_loop(
+        responses: Vec<LlmResponse>,
+        core: Vec<ToolDefinition>,
+        registry: Vec<ToolDefinition>,
+        results: HashMap<String, String>,
+    ) -> (
+        ConversationHandler<MockStore, ToolCallingLlm, RecordingToolExecutor>,
+        Arc<Mutex<Vec<Vec<ToolDefinition>>>>,
+        Arc<Mutex<Vec<Vec<Message>>>>,
+    ) {
+        let (handler, advertised, prompts) =
+            advertising_handler(responses, core, registry, results);
+        let (write, _list, _store) = in_memory_scratchpad();
+        (handler.with_scratchpad_write(write), advertised, prompts)
+    }
+
+    /// Every round that carried tools, by advertised name and in order. The
+    /// turn also names the conversation, and that call carries no tools.
+    fn tool_rounds(advertised: &Arc<Mutex<Vec<Vec<ToolDefinition>>>>) -> Vec<Vec<String>> {
+        advertised
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|block| !block.is_empty())
+            .map(|block| block.iter().map(|t| t.name.clone()).collect())
+            .collect()
+    }
+
+    /// The tools the daemon's own configuration decides, in the order they are
+    /// emitted: the built-in core, then the loop's control surface.
+    fn pinned_tier() -> Vec<String> {
+        vec![
+            "daemon_builtin_tool_search".to_string(),
+            planning::BEGIN_STEP_TOOL.to_string(),
+            planning::COMPLETE_STEP_TOOL.to_string(),
+        ]
+    }
+
+    /// AC1 and AC2 (#1294). Each round's advertised array is a true prefix of
+    /// the next round's, whatever that round activated.
+    ///
+    /// The configuration carries the assertion. The turn offers the loop's
+    /// control surface, and it activates two of the connection's name-only
+    /// tools in the order that exposes an in-place upgrade: the
+    /// latest-registered one first, then an earlier one. A router that upgraded
+    /// a held entry where it stood would put the second promotion *ahead* of
+    /// the first, so round two's array would stop being a prefix of round
+    /// three's. Equality would not catch it either way - the array grows, and
+    /// growing is correct.
+    #[tokio::test]
+    async fn each_advertised_array_is_a_prefix_of_the_next_when_a_tool_activates() {
+        use crate::ports::client_tools::with_client_tools;
+
+        let responses = vec![
+            LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new(
+                    "c1",
+                    "client_device_tool_19",
+                    r#"{"text":"hello"}"#,
+                )],
+            ),
+            LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new(
+                    "c2",
+                    "client_device_tool_10",
+                    r#"{"text":"hello"}"#,
+                )],
+            ),
+            LlmResponse::text("done"),
+        ];
+        let (handler, advertised, _prompts) = advertising_handler_with_core_loop(
+            responses,
+            vec![search_tool()],
+            vec![],
+            HashMap::new(),
+        );
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        with_client_tools(
+            client_port(registered_client_tools(20), &ran),
+            handler.send_prompt(&conv.id, "say it".into(), noop_callback(), noop_status()),
+        )
+        .await
+        .expect("turn completes");
+
+        let rounds = tool_rounds(&advertised);
+        assert_eq!(
+            rounds.len(),
+            3,
+            "precondition: three rounds advertised tools; the turn made calls of \
+             sizes {:?}",
+            rounds.iter().map(Vec::len).collect::<Vec<_>>()
+        );
+        assert!(
+            rounds[0].contains(&planning::BEGIN_STEP_TOOL.to_string()),
+            "precondition: the loop's control surface is in the array, so the \
+             turn is not the one configuration where nothing follows an \
+             insertion point: {:?}",
+            rounds[0]
+        );
+
+        assert!(
+            rounds[1].starts_with(&rounds[0]),
+            "round one's array must be a prefix of round two's:\n  one: {:?}\n  two: {:?}",
+            rounds[0],
+            rounds[1]
+        );
+        assert_eq!(
+            rounds[1].last().map(String::as_str),
+            Some("client_device_tool_19"),
+            "the activated tool takes a position after everything already \
+             advertised: {:?}",
+            rounds[1]
+        );
+
+        assert!(
+            rounds[2].starts_with(&rounds[1]),
+            "round two's array must be a prefix of round three's, so the second \
+             activation cannot displace the first:\n  two: {:?}\n  three: {:?}",
+            rounds[1],
+            rounds[2]
+        );
+        assert_eq!(
+            rounds[2].last().map(String::as_str),
+            Some("client_device_tool_10"),
+            "and the second activation appends too, rather than taking the slot \
+             its name-only entry held: {:?}",
+            rounds[2]
+        );
+    }
+
+    /// #1294: the emission order, most stable first. The daemon's built-ins and
+    /// the loop's control surface change only when the daemon's own
+    /// configuration does; the connection's registered tools change when the
+    /// connection does. So the pinned pair is emitted first, and the
+    /// connection's set follows it.
+    #[tokio::test]
+    async fn the_pinned_tier_is_advertised_before_the_connections_registered_tools() {
+        use crate::ports::client_tools::with_client_tools;
+        use crate::tool_advertising::MAX_CLIENT_TOOLS_IN_BLOCK;
+
+        let (handler, advertised, _prompts) = advertising_handler_with_core_loop(
+            vec![LlmResponse::text("done")],
+            vec![search_tool()],
+            vec![],
+            HashMap::new(),
+        );
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        with_client_tools(
+            client_port(registered_client_tools(20), &ran),
+            handler.send_prompt(&conv.id, "hello".into(), noop_callback(), noop_status()),
+        )
+        .await
+        .expect("turn completes");
+
+        let rounds = tool_rounds(&advertised);
+        let mut expected = pinned_tier();
+        expected
+            .extend((0..MAX_CLIENT_TOOLS_IN_BLOCK).map(|i| format!("client_device_tool_{i:02}")));
+        assert_eq!(
+            rounds.first().expect("the model was called"),
+            &expected,
+            "the pinned tier is emitted first, then the connection's own tools"
+        );
+    }
+
+    /// #1294, the property the ordering exists for. The pinned tier depends on
+    /// nothing a client does, so two turns on two connections that host
+    /// different tools open with the same bytes - which is what a provider that
+    /// caches by longest common prefix charges for once rather than per turn.
+    #[tokio::test]
+    async fn the_pinned_tier_is_identical_across_turns_with_different_client_sets() {
+        use crate::ports::client_tools::with_client_tools;
+
+        let (handler, advertised, _prompts) = advertising_handler_with_core_loop(
+            vec![LlmResponse::text("one"), LlmResponse::text("two")],
+            vec![search_tool()],
+            vec![],
+            HashMap::new(),
+        );
+        let first = handler
+            .create_conversation("a".into(), vec![])
+            .await
+            .unwrap();
+        let second = handler
+            .create_conversation("b".into(), vec![])
+            .await
+            .unwrap();
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        with_client_tools(
+            client_port(registered_client_tools(3), &ran),
+            handler.send_prompt(&first.id, "hello".into(), noop_callback(), noop_status()),
+        )
+        .await
+        .expect("the first turn completes");
+        let other: Vec<ToolDefinition> = (0..4)
+            .map(|i| {
+                ToolDefinition::new(
+                    format!("other_tool_{i:02}"),
+                    "a tool another client hosts",
+                    speak_schema(),
+                )
+            })
+            .collect();
+        with_client_tools(
+            client_port(other, &ran),
+            handler.send_prompt(&second.id, "hello".into(), noop_callback(), noop_status()),
+        )
+        .await
+        .expect("the second turn completes");
+
+        let rounds = tool_rounds(&advertised);
+        assert_eq!(
+            rounds.len(),
+            2,
+            "precondition: two turns advertised tools; the calls carried {:?}",
+            rounds.iter().map(Vec::len).collect::<Vec<_>>()
+        );
+        assert_ne!(
+            rounds[0], rounds[1],
+            "precondition: the two connections host different tools, so the \
+             arrays are not simply equal"
+        );
+        let pinned = pinned_tier();
+        assert!(
+            rounds[0].starts_with(&pinned) && rounds[1].starts_with(&pinned),
+            "both turns must open with the same pinned tier:\n  one: {:?}\n  two: {:?}",
+            rounds[0],
+            rounds[1]
+        );
+    }
+
     #[tokio::test]
     async fn turn_routes_registered_client_tool_through_port_and_feeds_result_back() {
         use crate::ports::client_tools::with_client_tools;
