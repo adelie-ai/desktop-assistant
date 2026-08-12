@@ -71,25 +71,42 @@
 //! - **At the bound, the longest-unused activation is retired.** Refusing
 //!   instead would strand a turn that needs a capability it has not used yet,
 //!   and the bound is what makes the growth finite.
-//!
-//! ## What this does and does not do for a prompt cache
-//!
-//! A provider's prompt cache is a prefix match, and this repository emits one
-//! checkpoint behind the leading system block, which on Bedrock sits behind the
-//! whole `tools` array. So the cache pays exactly when a round's tool array is
-//! **identical** to the round before it, which is what the deterministic build
-//! order buys: every input to the array is fixed for the turn, so a round that
-//! activates nothing sends the same bytes.
-//!
-//! It does not survive a round that changes the set. An appended entry is still
-//! a changed `tools` section, and a change there invalidates every later
-//! section whatever its position (`llm-bedrock`'s `convert_messages` states the
-//! ordering). Activation is a handful of rounds per turn rather than every
-//! round, so most rounds cache; the ones that activate do not, and no ordering
-//! rescues them.
 //! - **An activation used in the current round is never retired**, so a tool the
 //!   model is working with cannot be taken away mid-round. When every entry was
 //!   used this round the activation is refused and the turn keeps its set.
+//!
+//! ## What this does for a prompt cache
+//!
+//! A prompt cache is a prefix match, so what it can pay for is decided by where
+//! the array changes rather than by whether it changed at all. The turn loop
+//! emits the array most-stable-first (#1294) - the daemon's own set and the
+//! loop's control surface, then the connection's tools, then these activations
+//! - and this ledger holds up the last of those three tiers:
+//!
+//! - a round that activates nothing sends a **byte-identical** array;
+//! - a round that activates sends the round before it as a **prefix**, because
+//!   under the bound the ledger only appends and a promoted tool takes a
+//!   position after everything already advertised (`ToolRouter::insert`).
+//!
+//! Three conditions end the prefix rather than extending it. At the bound a
+//! retirement removes an entry from the middle, and retirement is pressure-only,
+//! which is what keeps that rare. A mid-turn demotion of hosted search rebuilds
+//! the core set and unbounds the client's slice, so the round after it
+//! advertises a different set rather than a longer one. And on the hosted-search
+//! path the connector sends its own deferred fleet behind this array, so a
+//! promotion moves a tool between the two sections; the property here is about
+//! the array the turn loop emits. The round loop states all three where they
+//! arise.
+//!
+//! Which of the two a provider charges for depends on the provider. Where the
+//! cache matches the longest common prefix by itself, the stable tiers are paid
+//! for once and only the appended schema is newly charged inside the array.
+//! Where the cache is a checkpoint the request places, this repository emits one
+//! behind the leading system block - `convert_messages` in `llm-bedrock` and in
+//! `llm-anthropic` - so there it is the byte-identical round that pays today,
+//! and the ordering is the prerequisite for a checkpoint at the end of the
+//! stable tiers. Bounding the block is what helps on a model that caches nothing
+//! at all.
 
 use crate::domain::ToolDefinition;
 use crate::tool_routing::ToolConnection;

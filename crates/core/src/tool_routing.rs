@@ -464,8 +464,15 @@ impl ToolRouter {
         self.entries.retain(|e| keep(e.provider_name()));
     }
 
-    /// The definitions the model is shown, in the order they were offered, each
-    /// under its composed name.
+    /// The definitions the model is shown, each under its composed name, in the
+    /// order they were **last** offered - so a tool promoted into the block
+    /// appears after everything already there rather than where its earlier
+    /// entry sat.
+    ///
+    /// This order is load-bearing, not incidental (#1294). The turn loop offers
+    /// most-stable-first, so a round that activates nothing produces the same
+    /// bytes as the round before and a round that activates produces that round
+    /// as a prefix. A caller that re-sorted this would give both away.
     pub fn advertised_definitions(&self) -> Vec<ToolDefinition> {
         self.entries
             .iter()
@@ -475,10 +482,12 @@ impl ToolRouter {
     }
 
     /// The composed names of every tool offered as a name and nothing else
-    /// (#1212), in the order they were offered.
+    /// (#1212), in the order they were last offered.
     ///
     /// What the tool note lists so the model knows they exist. Read from the
-    /// table, so a name the note gives is a name the table routes.
+    /// table, so a name the note gives is a name the table routes. A tool the
+    /// turn promotes into the block leaves this list, because its schema is
+    /// then in front of the model.
     pub fn named_only_names(&self) -> Vec<String> {
         self.entries
             .iter()
@@ -604,6 +613,13 @@ impl ToolRouter {
     /// kept because it is the one whose schema the model reads. Anything else
     /// is a fault: refused, recorded with both claimants, never silently
     /// resolved.
+    ///
+    /// **A promotion moves the entry to the end** rather than upgrading it
+    /// where it stands (#1294). The block's order is what a round-to-round
+    /// comparison reads, and a schema that appeared in the middle of it would
+    /// shift every tool behind it - so a tool the round put in the block takes
+    /// a position after everything already advertised, and the round before
+    /// stays a prefix of this one.
     fn insert(
         &mut self,
         advertised: ToolDefinition,
@@ -617,24 +633,28 @@ impl ToolRouter {
                 connection.map_or("core-loop".to_string(), ToolConnection::label)
             )
         };
-        if let Some(held) = self
+        if let Some(position) = self
             .entries
-            .iter_mut()
-            .find(|e| e.advertised.name == advertised.name)
+            .iter()
+            .position(|e| e.advertised.name == advertised.name)
         {
+            let held = &self.entries[position];
             if held.connection == connection && held.provider_name == provider_name {
                 // One tool, two surfaces. Keep the one the model can read: an
                 // offer that puts the schema in the block wins over one that
                 // leaves it out, whichever arrived first.
                 if !held.surface.in_block() && surface.in_block() {
-                    held.surface = surface;
-                    held.advertised = advertised;
+                    let mut promoted = self.entries.remove(position);
+                    promoted.surface = surface;
+                    promoted.advertised = advertised;
+                    self.entries.push(promoted);
                 }
                 return;
             }
+            let held_by = claimant(held.connection.as_ref(), &held.provider_name);
             self.duplicates.push(DuplicateName {
                 name: advertised.name.clone(),
-                held_by: claimant(held.connection.as_ref(), &held.provider_name),
+                held_by,
                 refused: claimant(connection.as_ref(), &provider_name),
             });
             return;
@@ -940,6 +960,41 @@ mod tests {
             advertised_names(&router),
             vec!["daemon_fileio__read_file".to_string()],
             "once activated, its schema is in the block"
+        );
+    }
+
+    /// #1294: promoting a held entry into the block moves it to the end. The
+    /// round loop offers the stable tiers first and the turn's activations
+    /// last, and a promotion that kept the slot its earlier entry claimed would
+    /// put a schema in the middle and shift every tool behind it - so the round
+    /// before would stop being a prefix of this one.
+    #[test]
+    fn a_tool_promoted_into_the_block_takes_a_position_after_everything_already_offered() {
+        let mut router = ToolRouter::new();
+        let fileio = ToolConnection::daemon_server("fileio");
+        // A deferred tool, then two tools whose schemas the block already
+        // carries, so the promotion below has somewhere to land in the middle.
+        router.offer_deferred(&fileio, &[def("fileio__read_file", "read a file")]);
+        router.offer(
+            &ToolConnection::daemon_builtins(),
+            &[def("builtin_tool_search", "find tools")],
+        );
+        router.offer(
+            &ToolConnection::client_device(),
+            &[def("take_screenshot", "client built-in")],
+        );
+
+        router.offer(&fileio, &[def("fileio__read_file", "read a file")]);
+
+        assert_eq!(
+            advertised_names(&router),
+            vec![
+                "daemon_builtin_tool_search".to_string(),
+                "client_take_screenshot".to_string(),
+                "daemon_fileio__read_file".to_string(),
+            ],
+            "the promoted tool goes last, leaving what was already advertised \
+             where it was"
         );
     }
 

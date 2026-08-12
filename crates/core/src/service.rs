@@ -2991,15 +2991,96 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 .iter()
                 .any(|t| t.name == crate::tool_advertising::DISCOVERY_TOOL);
             //
-            // Every input to the block below is fixed for the turn except the
-            // activation ledger, and the offers run in a fixed order, so a
-            // round that activates nothing sends a byte-identical `tools`
-            // array. That equality is what a provider's prompt cache matches
-            // on: this repository emits one checkpoint behind the leading
-            // system block, which on Bedrock sits behind the whole array, so
-            // an unchanged array serves from cache and a changed one does not
-            // - appended or otherwise (`llm-bedrock`'s `convert_messages`).
+            // The offers below run most-stable-first, and the order is the
+            // contract (#1294). Three tiers change at three rates:
+            //
+            //   pinned      the daemon's built-ins, the servers it reaches and
+            //               the loop's control surface. Changes when the
+            //               daemon's own configuration changes. Only the
+            //               built-ins and the control surface put schemas in the
+            //               array - a daemon server's tools are deferred, and
+            //               reach the array through the activations tier.
+            //   connection  what the client registered. Read once at turn start
+            //               (#1216), so it is fixed for the turn.
+            //   activations what this turn's searches and first calls promoted,
+            //               appended as the turn reaches for them.
+            //
+            // So a round that activates nothing sends a byte-identical `tools`
+            // array, and a round that activates one sends the round before it
+            // as a prefix. The pinned tier is the same bytes across every
+            // connection, because nothing below it can move it - and across
+            // turns too, for as long as the daemon's configuration and the
+            // turn's resolved connector stay put, which is what decides whether
+            // the discovery tool is in the core set at all (`core_tools_for_llm`
+            // above).
+            //
+            // What that is worth depends on the provider. A prompt cache is a
+            // prefix match, so where the provider takes the longest common
+            // prefix by itself, the stable tiers are charged once and only the
+            // appended schema is newly charged inside the array. Where the cache
+            // is a checkpoint the request places, this repository emits one
+            // behind the leading system block - `convert_messages` in
+            // `llm-bedrock` and in `llm-anthropic` - so there an array that
+            // changed at all still misses today, and this order is what a
+            // checkpoint at the end of the pinned tier would need. Not every
+            // connector places it there: `llm-openrouter` marks the *last*
+            // system message (`mark_system_cache_breakpoint`), which sits behind
+            // the per-turn blocks. The ordering costs an ordering decision
+            // either way, so it is held rather than argued per model.
+            //
+            // Three things end the prefix rather than extending it, named here
+            // so none is discovered later:
+            //
+            // - **The activation bound.** At the bound the ledger retires an
+            //   entry from the middle to stay finite. Pressure-only, which is
+            //   what keeps it rare.
+            // - **A mid-turn demotion of hosted search.** It puts the discovery
+            //   tool back in the core set and, because that makes deferral safe,
+            //   stops bounding the client's slice - so the round after a
+            //   demotion advertises a different set, not a longer one. That is
+            //   correct: the model has to be able to look a name up. No ordering
+            //   buys it, and it is a handful of rounds at most (`round < 2`).
+            // - **The connector's own deferred section.** On the hosted-search
+            //   path the connector sends this array and then its own deferred
+            //   fleet behind it, and a promotion moves a tool from that section
+            //   into this one. The property here is about the array this loop
+            //   emits; on that path the request as a whole is not a prefix of
+            //   the round before. Advertising both would put two schemas in
+            //   front of the model for one name, which #1212 refused.
+            //
+            // Two more consequences are correct rather than defects. A turn's
+            // first round cannot hit the previous turn's cache when the client's
+            // set changed in between - the tools really did change. And a tool
+            // registered mid-turn appears from the next turn, which is #1216's
+            // recorded trade and what keeps the within-turn array stable.
             router.offer(&ToolConnection::daemon_builtins(), round_core);
+            // The daemon's deferred fleet, when the provider's own tool search
+            // is carrying it. The model can call these by name, so the table
+            // has to route them, and they count for uniqueness like everything
+            // else. Their schemas travel in the namespaces rather than the
+            // block; `offered_namespaces` below takes the ones still reached
+            // that way.
+            if use_hosted_search && !hosted_search_demoted {
+                for ns in &namespaces {
+                    router.offer_deferred(&ToolConnection::daemon_server(&ns.name), &ns.tools);
+                }
+            }
+            // The step-planning + compaction tools (#240) when a scratchpad
+            // writer is wired. They are the loop's own control surface - it runs
+            // them itself, before any executor - so they have no connection and
+            // take no location root, and nothing but the daemon's own wiring can
+            // change them. Without a writer wired they stay off.
+            if self.scratchpad_write.is_some() {
+                router.offer_core_loop_tool(planning::begin_step_tool());
+                router.offer_core_loop_tool(planning::complete_step_tool());
+                // Keeping a finished plan is a core-loop tool for the same
+                // reason the pair above is: the plan and the turn's messages
+                // are the loop's, and the offer arrives in a step's own
+                // acknowledgement (#1155). Off unless the catalog is wired.
+                if self.skill_write_authored.is_some() {
+                    router.offer_core_loop_tool(skill_promotion::promote_plan_tool());
+                }
+            }
             // The connection's registered client-local tools (#234), which run
             // on the user's own machine. Bounded (#1212): the connection hosts
             // whatever it happens to host, and one measured turn carried 77 of
@@ -3016,38 +3097,13 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
             let device = ToolConnection::client_device();
             router.offer(&device, &client_tool_defs[..client_in_block]);
             router.offer_named(&device, &client_tool_defs[client_in_block..]);
-            // The daemon's deferred fleet, when the provider's own tool search
-            // is carrying it. The model can call these by name, so the table
-            // has to route them, and they count for uniqueness like everything
-            // else. Their schemas travel in the namespaces rather than the
-            // block; `offered_namespaces` below takes the ones still reached
-            // that way.
-            if use_hosted_search && !hosted_search_demoted {
-                for ns in &namespaces {
-                    router.offer_deferred(&ToolConnection::daemon_server(&ns.name), &ns.tools);
-                }
-            }
-            // The step-planning + compaction tools (#240) when a scratchpad
-            // writer is wired. They are the loop's own control surface - it runs
-            // them itself, before any executor - so they have no connection and
-            // take no location root. Without a writer wired they stay off.
-            if self.scratchpad_write.is_some() {
-                router.offer_core_loop_tool(planning::begin_step_tool());
-                router.offer_core_loop_tool(planning::complete_step_tool());
-                // Keeping a finished plan is a core-loop tool for the same
-                // reason the pair above is: the plan and the turn's messages
-                // are the loop's, and the offer arrives in a step's own
-                // acknowledgement (#1155). Off unless the catalog is wired.
-                if self.skill_write_authored.is_some() {
-                    router.offer_core_loop_tool(skill_promotion::promote_plan_tool());
-                }
-            }
             // What this turn's tool searches and first calls activated (#1212),
             // each under the connection the activation recorded. Bounded by
-            // `MAX_ACTIVATED_TOOLS`, and gone when the turn ends. Offered after
-            // the fixed sets so the growth reads at the end of the block for
-            // anyone comparing two rounds - not as a cache property, which no
-            // ordering can buy on a round whose array changed at all.
+            // `MAX_ACTIVATED_TOOLS`, and gone when the turn ends. Last, and
+            // genuinely appended: a tool promoted from a name-only or deferred
+            // entry takes a position after everything already advertised rather
+            // than the slot that entry held (`ToolRouter::insert`), so the round
+            // before stays a prefix of this one.
             for (connection, def) in activations.offers() {
                 router.offer(connection, std::slice::from_ref(def));
             }
@@ -12295,6 +12351,271 @@ mod tests {
         assert_eq!(
             seen[0][0].content, seen[1][0].content,
             "and the same leading system block, which is the rest of that prefix"
+        );
+    }
+
+    // --- #1294: the array is emitted most-stable-first ------------------
+
+    /// [`advertising_handler`], plus a scratchpad writer so the turn offers the
+    /// loop's own control surface.
+    ///
+    /// The control tools are the most stable entries in the whole array, and
+    /// where they sit is what the two ordering tests below are about. They are
+    /// also the tools a turn carries in production, so a turn without them is
+    /// not the configuration this ordering has to hold for.
+    #[allow(clippy::type_complexity)]
+    fn advertising_handler_with_core_loop(
+        responses: Vec<LlmResponse>,
+        core: Vec<ToolDefinition>,
+        registry: Vec<ToolDefinition>,
+        results: HashMap<String, String>,
+    ) -> (
+        ConversationHandler<MockStore, ToolCallingLlm, RecordingToolExecutor>,
+        Arc<Mutex<Vec<Vec<ToolDefinition>>>>,
+        Arc<Mutex<Vec<Vec<Message>>>>,
+    ) {
+        let (handler, advertised, prompts) =
+            advertising_handler(responses, core, registry, results);
+        let (write, _list, _store) = in_memory_scratchpad();
+        (handler.with_scratchpad_write(write), advertised, prompts)
+    }
+
+    /// Every round that carried tools, by advertised name and in order. The
+    /// turn also names the conversation, and that call carries no tools.
+    fn tool_rounds(advertised: &Arc<Mutex<Vec<Vec<ToolDefinition>>>>) -> Vec<Vec<String>> {
+        advertised
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|block| !block.is_empty())
+            .map(|block| block.iter().map(|t| t.name.clone()).collect())
+            .collect()
+    }
+
+    /// The tools the daemon's own configuration decides, in the order they are
+    /// emitted: the built-in core, then the loop's control surface.
+    fn pinned_tier() -> Vec<String> {
+        vec![
+            "daemon_builtin_tool_search".to_string(),
+            planning::BEGIN_STEP_TOOL.to_string(),
+            planning::COMPLETE_STEP_TOOL.to_string(),
+        ]
+    }
+
+    /// AC1 and AC2 (#1294). Each round's advertised array is a true prefix of
+    /// the next round's, whatever that round activated.
+    ///
+    /// Equality would not catch this either way - the array grows, and growing
+    /// is correct. What makes the test discriminate is the pair of activations
+    /// and their order: the turn activates the connection's *last* name-only
+    /// tool and then an *earlier* one. A router that upgraded a held entry where
+    /// it stood would put the second promotion ahead of the first, because the
+    /// second tool's name-only entry sits in front of the first tool's, so round
+    /// two's array would stop being a prefix of round three's.
+    ///
+    /// The turn carries the loop's control surface throughout, which is the
+    /// configuration this ordering has to hold for - and the one the test the
+    /// ticket replaced did not have.
+    #[tokio::test]
+    async fn each_advertised_array_is_a_prefix_of_the_next_when_a_tool_activates() {
+        use crate::ports::client_tools::with_client_tools;
+        use crate::tool_advertising::MAX_CLIENT_TOOLS_IN_BLOCK;
+
+        // Two tools past the block's bound, so both are name-only and both have
+        // an entry for a promotion to move. Derived from the bound rather than
+        // written out, so raising it cannot quietly stop the test discriminating.
+        const REGISTERED: usize = MAX_CLIENT_TOOLS_IN_BLOCK * 2 + 4;
+        let later = format!("client_device_tool_{:02}", REGISTERED - 1);
+        let earlier = format!("client_device_tool_{MAX_CLIENT_TOOLS_IN_BLOCK:02}");
+
+        let responses = vec![
+            LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new("c1", &later, r#"{"text":"hello"}"#)],
+            ),
+            LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new("c2", &earlier, r#"{"text":"hello"}"#)],
+            ),
+            LlmResponse::text("done"),
+        ];
+        let (handler, advertised, _prompts) = advertising_handler_with_core_loop(
+            responses,
+            vec![search_tool()],
+            vec![],
+            HashMap::new(),
+        );
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        with_client_tools(
+            client_port(registered_client_tools(REGISTERED), &ran),
+            handler.send_prompt(&conv.id, "say it".into(), noop_callback(), noop_status()),
+        )
+        .await
+        .expect("turn completes");
+
+        let rounds = tool_rounds(&advertised);
+        assert_eq!(
+            rounds.len(),
+            3,
+            "precondition: three rounds advertised tools; the turn made calls of \
+             sizes {:?}",
+            rounds.iter().map(Vec::len).collect::<Vec<_>>()
+        );
+        assert!(
+            rounds[0].contains(&planning::BEGIN_STEP_TOOL.to_string()),
+            "precondition: the turn carries the loop's control surface: {:?}",
+            rounds[0]
+        );
+        assert!(
+            !rounds[0].contains(&later) && !rounds[0].contains(&earlier),
+            "precondition: both tools start name-only, so each has a held entry \
+             a promotion could take the slot of: {:?}",
+            rounds[0]
+        );
+
+        assert!(
+            rounds[1].starts_with(&rounds[0]),
+            "round one's array must be a prefix of round two's:\n  one: {:?}\n  two: {:?}",
+            rounds[0],
+            rounds[1]
+        );
+        assert_eq!(
+            rounds[1].last(),
+            Some(&later),
+            "the activated tool takes a position after everything already \
+             advertised: {:?}",
+            rounds[1]
+        );
+
+        // The discriminating pair. `earlier`'s name-only entry sits in front of
+        // `later`'s, so an in-place upgrade lands it ahead of the tool round two
+        // already advertised.
+        assert!(
+            rounds[2].starts_with(&rounds[1]),
+            "round two's array must be a prefix of round three's, so the second \
+             activation cannot displace the first:\n  two: {:?}\n  three: {:?}",
+            rounds[1],
+            rounds[2]
+        );
+        assert_eq!(
+            rounds[2].last(),
+            Some(&earlier),
+            "and the second activation appends too, rather than taking the slot \
+             its name-only entry held: {:?}",
+            rounds[2]
+        );
+    }
+
+    /// #1294: the emission order, most stable first. The daemon's built-ins and
+    /// the loop's control surface change only when the daemon's own
+    /// configuration does; the connection's registered tools change when the
+    /// connection does. So the pinned pair is emitted first, and the
+    /// connection's set follows it.
+    #[tokio::test]
+    async fn the_pinned_tier_is_advertised_before_the_connections_registered_tools() {
+        use crate::ports::client_tools::with_client_tools;
+        use crate::tool_advertising::MAX_CLIENT_TOOLS_IN_BLOCK;
+
+        let (handler, advertised, _prompts) = advertising_handler_with_core_loop(
+            vec![LlmResponse::text("done")],
+            vec![search_tool()],
+            vec![],
+            HashMap::new(),
+        );
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        with_client_tools(
+            client_port(registered_client_tools(20), &ran),
+            handler.send_prompt(&conv.id, "hello".into(), noop_callback(), noop_status()),
+        )
+        .await
+        .expect("turn completes");
+
+        let rounds = tool_rounds(&advertised);
+        let mut expected = pinned_tier();
+        expected
+            .extend((0..MAX_CLIENT_TOOLS_IN_BLOCK).map(|i| format!("client_device_tool_{i:02}")));
+        assert_eq!(
+            rounds.first().expect("the model was called"),
+            &expected,
+            "the pinned tier is emitted first, then the connection's own tools"
+        );
+    }
+
+    /// #1294, the property the ordering exists for. The pinned tier depends on
+    /// nothing a client does, so two turns on two connections that host
+    /// different tools open with the same bytes - which is what a provider that
+    /// caches by longest common prefix charges for once rather than per turn.
+    #[tokio::test]
+    async fn the_pinned_tier_is_identical_across_turns_with_different_client_sets() {
+        use crate::ports::client_tools::with_client_tools;
+
+        let (handler, advertised, _prompts) = advertising_handler_with_core_loop(
+            vec![LlmResponse::text("one"), LlmResponse::text("two")],
+            vec![search_tool()],
+            vec![],
+            HashMap::new(),
+        );
+        let first = handler
+            .create_conversation("a".into(), vec![])
+            .await
+            .unwrap();
+        let second = handler
+            .create_conversation("b".into(), vec![])
+            .await
+            .unwrap();
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        with_client_tools(
+            client_port(registered_client_tools(3), &ran),
+            handler.send_prompt(&first.id, "hello".into(), noop_callback(), noop_status()),
+        )
+        .await
+        .expect("the first turn completes");
+        let other: Vec<ToolDefinition> = (0..4)
+            .map(|i| {
+                ToolDefinition::new(
+                    format!("other_tool_{i:02}"),
+                    "a tool another client hosts",
+                    speak_schema(),
+                )
+            })
+            .collect();
+        with_client_tools(
+            client_port(other, &ran),
+            handler.send_prompt(&second.id, "hello".into(), noop_callback(), noop_status()),
+        )
+        .await
+        .expect("the second turn completes");
+
+        let rounds = tool_rounds(&advertised);
+        assert_eq!(
+            rounds.len(),
+            2,
+            "precondition: two turns advertised tools; the calls carried {:?}",
+            rounds.iter().map(Vec::len).collect::<Vec<_>>()
+        );
+        assert_ne!(
+            rounds[0], rounds[1],
+            "precondition: the two connections host different tools, so the \
+             arrays are not simply equal"
+        );
+        let pinned = pinned_tier();
+        assert!(
+            rounds[0].starts_with(&pinned),
+            "the first turn must open with the pinned tier: {:?}",
+            rounds[0]
+        );
+        assert!(
+            rounds[1].starts_with(&pinned),
+            "and so must the second, on a connection hosting other tools: {:?}",
+            rounds[1]
         );
     }
 
