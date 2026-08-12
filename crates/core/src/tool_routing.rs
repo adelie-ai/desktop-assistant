@@ -7,6 +7,29 @@
 //! they are unique there is nothing to resolve between: a composed name
 //! identifies exactly one tool, and there is no override behaviour anywhere.
 //!
+//! ## The connection is the unit of locality
+//!
+//! Every tool belongs to exactly one connection - a client device, an MCP
+//! server, or the daemon's own built-ins - and is addressed as
+//! (connection, tool name). A coarse daemon/device axis cannot express "invoke
+//! this on *that* connection", and one production turn reported six devices, so
+//! "the device" identifies nothing. The composed name derives from the pair,
+//! which is why uniqueness is a consequence of connections being distinct
+//! rather than a rule enforced on top of them.
+//!
+//! ## The prefix is temporary, and stays removable
+//!
+//! It is a uniqueness device for the daemon's own bookkeeping that happens to
+//! surface in the advertised name. It is not how the model is told about
+//! topology, and it is not the answer to locality - a structural field beside
+//! the tool is, and this buys time for it.
+//!
+//! **So nothing derives locality by parsing a name.** Location is read from the
+//! entry's connection, here, today, and from that field tomorrow. If any layer
+//! started reading the prefix, removing it would stop being a rename and become
+//! a behaviour change, and the stopgap would be permanent by accident. The one
+//! thing that may look at the prefix is [`strip_location`], which removes it.
+//!
 //! ## How a name composes
 //!
 //! The location is the root namespace, and a provider's namespace nests
