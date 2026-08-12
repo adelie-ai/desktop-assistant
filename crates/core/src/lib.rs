@@ -19,6 +19,7 @@ pub mod system_id;
 pub mod tag_normalize;
 pub(crate) mod telemetry;
 pub mod tool_provenance;
+pub mod tool_routing;
 pub mod tools;
 
 use thiserror::Error;

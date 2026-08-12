@@ -37,6 +37,7 @@ use desktop_assistant_core::ports::transport::{
     current_client_context, current_client_label, current_co_location, current_transport_kind,
 };
 use desktop_assistant_core::tag_normalize::normalize_tag;
+use desktop_assistant_core::tool_routing::{ToolLocation, compose_name};
 
 use crate::executor::McpControlHandle;
 
@@ -2690,6 +2691,18 @@ impl BuiltinToolService {
     }
 
     async fn tool_search(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
+        /// The name the model must call for this hit (#1216).
+        ///
+        /// A search result is a discovery surface: the model calls what it
+        /// reads, so a hit carries the composed name the turn's tool table
+        /// advertises, not the provider's own. One composing function serves
+        /// both, so the two can never disagree. A name that cannot compose is
+        /// left as it is - the hit is then unreachable, which the turn's table
+        /// reports as a refused offer rather than this payload guessing.
+        fn composed(location: ToolLocation, provider_name: &str) -> String {
+            compose_name(location, provider_name).unwrap_or_else(|| provider_name.to_string())
+        }
+
         let search_fn = self
             .tool_search_fn
             .as_ref()
@@ -2749,7 +2762,7 @@ impl BuiltinToolService {
                 .unwrap_or(ToolRunner::Daemon);
             runners_present.insert(runner);
             tools.push(serde_json::json!({
-                "name": tool.name,
+                "name": composed(ToolLocation::Daemon, &tool.name),
                 "description": tool.description,
                 "runs_on": runner.as_str(),
             }));
@@ -2757,7 +2770,7 @@ impl BuiltinToolService {
         for tool in &device_hits {
             runners_present.insert(ToolRunner::Device);
             tools.push(serde_json::json!({
-                "name": tool.name,
+                "name": composed(ToolLocation::Client, &tool.name),
                 "description": tool.description,
                 "runs_on": ToolRunner::Device.as_str(),
             }));
@@ -8527,7 +8540,7 @@ mod tests {
         assert_eq!(json["ok"], true);
         let tools = json["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0]["name"], "jira__create_issue");
+        assert_eq!(tools[0]["name"], "daemon_jira__create_issue");
     }
 
     // --- Runner on search results (#1082) ---------------------------------
@@ -8552,9 +8565,6 @@ mod tests {
     impl desktop_assistant_core::ports::client_tools::ClientToolPort for FakeClientTools {
         async fn tool_definitions(&self) -> Vec<ToolDefinition> {
             self.0.clone()
-        }
-        async fn is_registered(&self, name: &str) -> bool {
-            self.0.iter().any(|t| t.name == name)
         }
         async fn execute(
             &self,
@@ -8677,8 +8687,8 @@ mod tests {
             .iter()
             .map(|t| (t["name"].as_str().unwrap(), t["runs_on"].as_str().unwrap()))
             .collect();
-        assert_eq!(by_name["calendar__list_events"], "remote-service");
-        assert_eq!(by_name["fileio__read_file"], "daemon");
+        assert_eq!(by_name["daemon_calendar__list_events"], "remote-service");
+        assert_eq!(by_name["daemon_fileio__read_file"], "daemon");
         assert!(
             json["runs_on"]["remote-service"]
                 .as_str()
@@ -8701,13 +8711,52 @@ mod tests {
             )],
         )
         .await;
-        assert_eq!(json["tools"][0]["name"], "device__read_file");
+        assert_eq!(json["tools"][0]["name"], "client_device__read_file");
         assert_eq!(json["tools"][0]["runs_on"], "device");
         assert!(
             json["runs_on"]["device"]
                 .as_str()
                 .is_some_and(|l| l.contains("the user's own")),
             "the device legend must say whose machine it is: {json}"
+        );
+    }
+
+    /// #1216: a hit carries the name the model must call. The advertised set
+    /// composes a location root onto every provider name, so a hit reporting
+    /// the provider's own name would offer the model a name that does not
+    /// resolve.
+    #[tokio::test]
+    async fn tool_search_reports_the_composed_name_of_each_hit() {
+        let service = BuiltinToolService::new()
+            .with_tool_registry(
+                fixed_search(vec![ToolDefinition::new(
+                    "fileio__read_file",
+                    "Read a file from disk",
+                    serde_json::json!({}),
+                )]),
+                noop_definition_fn(),
+            )
+            .with_topology("daemon-host", false);
+        let json = search_with_client_tools(
+            &service,
+            "read a file",
+            vec![ToolDefinition::new(
+                "device__read_file",
+                "Read a file on the user's own computer",
+                serde_json::json!({}),
+            )],
+        )
+        .await;
+        let names: Vec<&str> = json["tools"]
+            .as_array()
+            .expect("hits")
+            .iter()
+            .map(|t| t["name"].as_str().expect("a name"))
+            .collect();
+        assert_eq!(
+            names,
+            vec!["daemon_fileio__read_file", "client_device__read_file"],
+            "a hit names the tool as the model must call it: {json}"
         );
     }
 
@@ -8747,11 +8796,12 @@ mod tests {
             .filter_map(|t| t["name"].as_str())
             .collect();
         assert!(
-            names.contains(&"fileio__read_file") && names.contains(&"device__read_file"),
-            "both machines' answers must be offered: {names:?}"
+            names.contains(&"daemon_fileio__read_file")
+                && names.contains(&"client_device__read_file"),
+            "both connections' answers must be offered, each under its own name: {names:?}"
         );
         assert!(
-            !names.contains(&"device__play_music"),
+            !names.contains(&"client_device__play_music"),
             "an unrelated client tool must not be returned: {names:?}"
         );
     }

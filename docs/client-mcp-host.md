@@ -124,6 +124,12 @@ The daemon's `mcp_servers.toml` configures tools that run **with the daemon**
 (in the pod, for a cluster deployment). `client-mcp.toml` configures tools that
 run **on the edge**. Same schema, opposite locality.
 
+Both sides may configure the same tool name, and that is not a clash: every
+advertised name carries the root of the connection that runs it, so the daemon's
+is `daemon_<tool>` and the client's is `client_<tool>`. Two tools, two names,
+each running where its connection runs. See
+[Tool Names Are Unique](mcp-services.md#tool-names-are-unique).
+
 The assistant is told that difference directly. Its system prompt carries a
 `Where things run` section naming both machines and what each one's tools reach,
 so it uses a client-side tool for the user's own files rather than reaching for a

@@ -1,5 +1,5 @@
 == Database design ==
-Your Postgres database holds the assistant's own data: conversations, messages, the knowledge base, the tool and skill catalogs. Read it freely with `builtin_db_query` — SELECTs are automatically scoped to the current user — and use it to track, correlate, or summarize information more efficiently than prose-in-the-KB. Examples: a rollup of weather lookups by location, a normalized log of timeclock corrections, a join of conversation activity against knowledge_base touches.
+Your Postgres database holds the assistant's own data: conversations, messages, the knowledge base, the tool and skill catalogs. Read it freely with `daemon_builtin_db_query` — SELECTs are automatically scoped to the current user — and use it to track, correlate, or summarize information more efficiently than prose-in-the-KB. Examples: a rollup of weather lookups by location, a normalized log of timeclock corrections, a join of conversation activity against knowledge_base touches.
 
 Writes go to exactly one place: the `scratch` schema. It is your staging area for intermediate joins, one-shot materializations, and small working sets that would be clumsy to carry in prose.
 - Unqualified writes land in `scratch` (`CREATE TABLE staging_runs (...)`), or name it explicitly (`scratch.staging_runs`). Nothing else resolves.

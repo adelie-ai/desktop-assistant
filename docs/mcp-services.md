@@ -484,6 +484,11 @@ description do not say which machine it acts on. Each result carries a
 | `remote-service` | An MCP server the daemon reaches over HTTP. Acts on that service, and on no local files. |
 | `device` | A tool the connected client registered. Acts on the user's own machine. |
 
+Each hit carries the name the model must call it by - the composed name
+described in [Tool Names Are Unique](#tool-names-are-unique) - rather than the
+provider's own, so a name read out of a search result resolves when it is
+called.
+
 The daemon and remote-service split is read live from the routing table and the
 server configuration, so a server added since startup classifies correctly. A
 name the executor does not route is a built-in, which runs inside the daemon
@@ -504,6 +509,60 @@ collision.
 
 A search that matched more client tools than it returned reports the count it
 dropped in `more_device_tools_matched`.
+
+## Tool Names Are Unique
+
+A tool belongs to exactly one **connection** - a client device, an MCP server,
+or the daemon's own built-ins - and the daemon addresses it as
+(connection, tool name). The name the model is offered is composed from that
+pair, so no two tools can share a name:
+
+```
+daemon built-in              daemon_<tool>
+daemon MCP server "fileio"   daemon_fileio__<tool>
+client built-in              client_<tool>
+client MCP server "fileio"   client_fileio__<tool>
+```
+
+The location root is applied by the daemon, never by the provider. A client
+connection configured as `daemon` composes to `client_daemon__<tool>`, and a
+daemon MCP server configured as `client` composes to `daemon_client__<tool>`.
+This is a security property rather than a formatting rule: a name that escaped
+its root would be presented to the model as running somewhere it does not. The
+rule is symmetric - a daemon server's namespace is a string in a configuration
+file, and is sanitised exactly like a client's.
+
+Because names are unique there is nothing to resolve between. The same
+capability on a client and on the daemon is two tools with two names, and each
+runs where its connection runs. There is no override, no precedence and no
+policy choosing between them.
+
+**A duplicate composed name is a fault, not a case with a defined winner.** The
+turn refuses the second claimant and logs both, so an operator can see which
+connection to rename:
+
+```
+WARN two connections claim one tool name; the second is not offered.
+     Give one of them a namespace of its own
+     name="daemon_read_file" held_by="daemon:built-ins/read_file"
+     refused="daemon:files/read_file"
+```
+
+Two devices running the same MCP server collide only if their connections carry
+the same configured name, which is why the namespace is the connection's own
+name - chosen by a person, and already unique within one host's configuration.
+
+Two consequences worth stating:
+
+- **The prefix is the daemon's bookkeeping, not a fact the model is told.**
+  Nothing decides where a tool runs by reading its name: the location comes from
+  the routing table, and one day from a structural field beside the tool. That
+  is what keeps the prefix removable - if anything parsed it, taking it out
+  would stop being a rename.
+- **The prefix never reaches a tool or a learning key.** It is stripped before
+  execution, so a tool is called by the name its provider gave it, and before
+  the negative-memory digest, so a lesson learned about a tool on one machine
+  still applies to the same tool on another.
 
 ## Startup Behaviour
 

@@ -6,7 +6,7 @@
 Before responding, plan what you need, then gather it efficiently:
 - Break the request into distinct pieces of knowledge and capability.
 - Search the knowledge base for each piece. Use multiple targeted queries if the request spans topics. Prefer project-scoped entries (tagged "project:<name>") over global ones.
-- Search for tools (builtin_tool_search) for each capability you lack.
+- Search for tools (daemon_builtin_tool_search) for each capability you lack.
 - Search for skills (skills_search_skills) before any complex or multi-step workflow.
 - Once you have enough to proceed, ACT. Prefer fewer rounds over maximum thoroughness.
 - Current-turn instructions override stored data. If unclear after searching, ask one brief question rather than guess.

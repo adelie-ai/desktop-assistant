@@ -48,15 +48,13 @@ use crate::domain::ToolDefinition;
 #[async_trait::async_trait]
 pub trait ClientToolPort: Send + Sync {
     /// Tool definitions registered as client-local for the current user.
-    /// These are merged into the tool set offered to the LLM for the turn
-    /// so the model can actually pick them.
+    ///
+    /// This is the turn's one read of the client's set. The turn loop builds
+    /// its tool table from it, and that table decides both what the model is
+    /// shown and where each call goes - so there is no second question to ask
+    /// this port at dispatch time, and no second answer that could disagree
+    /// with the first (#1216).
     async fn tool_definitions(&self) -> Vec<ToolDefinition>;
-
-    /// True iff `name` is a client-local tool registered for the current
-    /// user. The dispatch loop consults this before each tool execution:
-    /// a match routes to [`ClientToolPort::execute`] (client-side
-    /// suspension) instead of the server-side [`crate::ports::tools::ToolExecutor`].
-    async fn is_registered(&self, name: &str) -> bool;
 
     /// Suspend the turn on a client-local tool call: emit the
     /// `client_tool_call` event and await the matching `client_tool_result`.
@@ -117,9 +115,6 @@ mod tests {
                 serde_json::json!({}),
             )]
         }
-        async fn is_registered(&self, name: &str) -> bool {
-            name == "fs_read"
-        }
         async fn execute(
             &self,
             _tool_call_id: &str,
@@ -138,16 +133,13 @@ mod tests {
     #[tokio::test]
     async fn current_client_tools_inside_scope_returns_installed_port() {
         let port: Arc<dyn ClientToolPort> = Arc::new(FakePort);
-        let (registered, defs_len) = with_client_tools(port, async {
+        let defs = with_client_tools(port, async {
             let p = current_client_tools().expect("port installed");
-            (
-                p.is_registered("fs_read").await,
-                p.tool_definitions().await.len(),
-            )
+            p.tool_definitions().await
         })
         .await;
-        assert!(registered);
-        assert_eq!(defs_len, 1);
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].name, "fs_read");
     }
 
     #[tokio::test]
