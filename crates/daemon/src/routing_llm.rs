@@ -1316,11 +1316,14 @@ mod tests {
         let offered = overridden.offered();
         let first = offered.first().expect("the turn dispatched to the LLM");
         assert!(
-            first.iter().any(|n| n == "builtin_tool_search"),
-            "a connection without hosted search keeps builtin_tool_search; got {first:?}"
+            first.iter().any(|n| n == "daemon_builtin_tool_search"),
+            "a connection without hosted search keeps the discovery tool; got {first:?}"
         );
         assert!(
-            !offered.iter().flatten().any(|n| n.starts_with("fleet_")),
+            !offered
+                .iter()
+                .flatten()
+                .any(|n| n.starts_with("daemon_fleet_")),
             "the namespaced fleet must not be flattened into a request; got {offered:?}"
         );
     }

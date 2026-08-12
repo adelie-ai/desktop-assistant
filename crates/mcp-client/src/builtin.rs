@@ -8801,7 +8801,7 @@ mod tests {
             "both connections' answers must be offered, each under its own name: {names:?}"
         );
         assert!(
-            !names.contains(&"device__play_music"),
+            !names.contains(&"client_device__play_music"),
             "an unrelated client tool must not be returned: {names:?}"
         );
     }
