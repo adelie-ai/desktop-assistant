@@ -10,6 +10,11 @@
 //! `[surfaces.<name>]`. That is deliberate: which local tools exist is a
 //! property of the *machine* (the edge), while which surface exposes them is a
 //! per-client choice.
+//!
+//! Because the file has many writers, [`ClientMcpConfig::edit`] is the supported
+//! way to change it. It holds an exclusive lock across the whole
+//! read-mutate-write transaction, so two clients editing at once queue instead
+//! of losing one of the two changes. Readers take no lock.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -358,9 +363,22 @@ impl ClientMcpConfig {
     /// Readers need no lock and take none: the rename is atomic, so
     /// [`load`](Self::load) always sees a whole file.
     ///
-    /// Limitation: on a network home directory (NFS, SMB - macOS especially)
-    /// `flock` can be local to one host, or refused outright. That is accepted
-    /// for a machine-local config.
+    /// **Never call `edit` from inside a change closure.** The lock is not
+    /// re-entrant, so the inner call contends with the outer one, waits out the
+    /// whole retry, and then reports that another client is editing.
+    ///
+    /// Three limitations, all accepted for a machine-local config:
+    ///
+    /// - On a network home directory (NFS, SMB - macOS especially) `flock` can
+    ///   be local to one host, or refused outright.
+    /// - The sidecar path is derived from `path` as it is written, so two
+    ///   editors serialize only while they name the config the same way. Every
+    ///   client reaches it through [`default_client_mcp_path`], which is what
+    ///   makes that hold.
+    /// - Deleting the sidecar while an edit is in flight de-serializes the
+    ///   editors, because the next one creates a new file and locks that. It
+    ///   lives beside the config in the user's config directory, which nothing
+    ///   sweeps, so this needs somebody to remove it by hand.
     pub fn edit<T>(
         path: &Path,
         change: impl FnOnce(&mut ClientMcpConfig) -> Result<T, String>,
@@ -477,12 +495,19 @@ impl EditLock {
         // the same inode across the config's own atomic rename, or two
         // processes lock two different files and serialize against nothing.
         // `0600` matches the config beside it and applies on creation only.
+        //
+        // `O_NOFOLLOW` refuses a sidecar that is a symlink, the same concern
+        // `write_private` closes with `create_new`. A planted symlink would
+        // otherwise redirect the lock to an inode of somebody else's choosing,
+        // and two clients pointed at two inodes serialize against nothing.
+        // `create_new` cannot be used here, because the sidecar is meant to
+        // outlive one edit and be re-locked by the next.
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create(true).truncate(false);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
+            opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
         }
         let file = opts
             .open(&lock_path)
@@ -496,7 +521,7 @@ impl EditLock {
                     if Instant::now() >= deadline {
                         return Err(format!(
                             "another Adele client is editing the MCP config ({}); \
-                             it did not finish within {} seconds — try again",
+                             it did not finish within {} seconds - try again",
                             config_path.display(),
                             LOCK_WAIT.as_secs()
                         ));
