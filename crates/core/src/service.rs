@@ -2697,13 +2697,11 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
         );
 
         // What this turn's searches and first calls activated (#1212). Ordered
-        // by activation and bounded: under the bound it only appends, so each
-        // round's tool block is a byte-identical prefix of the next one's -
-        // the block is the outermost section a provider hashes for its prompt
-        // cache, and a reorder throws the cache away for the system block
-        // behind it too. At the bound the longest-unused entry retires, which
-        // is what makes a 200-round turn's tool block finite. The lifetime is
-        // this turn: a new turn builds a new ledger.
+        // by activation and bounded: under the bound it only appends, so
+        // nothing the turn already reached for is disturbed. At the bound the
+        // longest-unused entry retires, which is what makes a 200-round turn's
+        // tool block finite. The lifetime is this turn: a new turn builds a
+        // new ledger.
         let mut activations = crate::tool_advertising::ActivationLedger::new();
         // Track whether hosted search has been demoted to local fallback.
         let mut hosted_search_demoted = false;
@@ -2993,11 +2991,14 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 .iter()
                 .any(|t| t.name == crate::tool_advertising::DISCOVERY_TOOL);
             //
-            // Everything constant for the turn is offered first and the
-            // activations last, so each round's block is a byte-identical
-            // prefix of the next one's. That is what a provider's prompt cache
-            // matches on, and a set that reordered would throw the cache away
-            // for the system block behind it too.
+            // Every input to the block below is fixed for the turn except the
+            // activation ledger, and the offers run in a fixed order, so a
+            // round that activates nothing sends a byte-identical `tools`
+            // array. That equality is what a provider's prompt cache matches
+            // on: this repository emits one checkpoint behind the leading
+            // system block, which on Bedrock sits behind the whole array, so
+            // an unchanged array serves from cache and a changed one does not
+            // - appended or otherwise (`llm-bedrock`'s `convert_messages`).
             router.offer(&ToolConnection::daemon_builtins(), round_core);
             // The connection's registered client-local tools (#234), which run
             // on the user's own machine. Bounded (#1212): the connection hosts
@@ -3041,10 +3042,12 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                     router.offer_core_loop_tool(skill_promotion::promote_plan_tool());
                 }
             }
-            // Last, and only ever appended to (#1212): what this turn's tool
-            // searches and first calls activated, each under the connection the
-            // activation recorded. Bounded by `MAX_ACTIVATED_TOOLS`, and gone
-            // when the turn ends.
+            // What this turn's tool searches and first calls activated (#1212),
+            // each under the connection the activation recorded. Bounded by
+            // `MAX_ACTIVATED_TOOLS`, and gone when the turn ends. Offered after
+            // the fixed sets so the growth reads at the end of the block for
+            // anyone comparing two rounds - not as a cache property, which no
+            // ordering can buy on a round whose array changed at all.
             for (connection, def) in activations.offers() {
                 router.offer(connection, std::slice::from_ref(def));
             }
@@ -3266,8 +3269,15 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
             // the `server` axis (#1212). Per round because the turn-level
             // figure is the first round's and cannot show the growth; per
             // connection because one aggregate of 23.7k names nothing an
-            // operator can drop. Denominated in the same estimator the budget
-            // check reads, so the two can never disagree about a block's cost.
+            // operator can drop. Both use the estimator the budget check reads,
+            // so no two figures here disagree about what one schema costs.
+            //
+            // The per-connection figures do **not** sum to
+            // `prompt.tool_schema_tokens`, and the difference is a real one
+            // rather than rounding: the aggregate also charges for the deferred
+            // namespaces' name-and-description stubs, which belong to the
+            // request and not to any block entry. Read the axis for which
+            // connection to drop, and the aggregate for what the prompt paid.
             round_report.set_tool_cost(
                 assembled.breakdown.tool_count(),
                 assembled.breakdown.tool_schema_tokens(),
@@ -4400,7 +4410,14 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                                 .flatten()
                                 .map(|def| (activation_connection(&namespaces, &def.name), def))
                         };
-                        if let Some((connection, def)) = found {
+                        // A hit whose schema this round already carries costs a
+                        // ledger slot and buys nothing - the offer is a no-op
+                        // (#1212). Ten hits of which six are already advertised
+                        // would otherwise spend ten of the bound's slots on four
+                        // capabilities.
+                        if let Some((connection, def)) = found
+                            && !router.advertises(&connection, &def.name)
+                        {
                             record_activation(
                                 &mut activations,
                                 connection,
@@ -4431,11 +4448,18 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 {
                     for ns in &namespaces {
                         if ns.tools.iter().any(|t| t.name == call_name) {
+                            let connection = ToolConnection::daemon_server(&ns.name);
                             for t in &ns.tools {
-                                if !core_tools.iter().any(|ct| ct.name == t.name) {
+                                // Same rule as the search branch: a slot spent
+                                // on a schema the block already carries is a
+                                // slot the turn cannot spend on a capability it
+                                // lacks (#1212).
+                                if !core_tools.iter().any(|ct| ct.name == t.name)
+                                    && !router.advertises(&connection, &t.name)
+                                {
                                     record_activation(
                                         &mut activations,
-                                        ToolConnection::daemon_server(&ns.name),
+                                        connection.clone(),
                                         t.clone(),
                                         round,
                                         "activated a deferred tool from its namespace",
@@ -11895,6 +11919,81 @@ mod tests {
         );
     }
 
+    /// The bound is finite, so a slot spent on a schema the block already
+    /// carries is a capability the turn cannot reach later. A device hit for a
+    /// tool inside the client's advertised slice is exactly that: offering it
+    /// again is a no-op, and before this the ledger took a row for it anyway.
+    ///
+    /// Measured where it shows: the search names the eight already-advertised
+    /// device tools first, then a full bound's worth of fleet tools. A ledger
+    /// that admits the eight has only sixteen slots left for the fleet.
+    #[tokio::test]
+    async fn a_search_hit_whose_schema_the_block_already_carries_costs_no_activation_slot() {
+        use crate::ports::client_tools::with_client_tools;
+        use crate::tool_advertising::{MAX_ACTIVATED_TOOLS, MAX_CLIENT_TOOLS_IN_BLOCK};
+
+        let fleet: Vec<ToolDefinition> = (0..MAX_ACTIVATED_TOOLS)
+            .map(|i| {
+                ToolDefinition::new(format!("fleet_tool_{i:02}"), "a fleet tool", speak_schema())
+            })
+            .collect();
+        let mut hits: Vec<serde_json::Value> = (0..MAX_CLIENT_TOOLS_IN_BLOCK)
+            .map(|i| {
+                serde_json::json!({
+                    "name": format!("client_device_tool_{i:02}"),
+                    "description": "a device tool",
+                    "runs_on": crate::domain::ToolRunner::Device.as_str(),
+                })
+            })
+            .collect();
+        hits.extend(fleet.iter().map(|t| {
+            serde_json::json!({
+                "name": format!("daemon_{}", t.name),
+                "description": "a fleet tool",
+                "runs_on": "daemon",
+            })
+        }));
+        let search_result = serde_json::json!({"ok": true, "tools": hits}).to_string();
+
+        let responses = vec![
+            LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new(
+                    "c1",
+                    "daemon_builtin_tool_search",
+                    r#"{"query":"anything"}"#,
+                )],
+            ),
+            LlmResponse::text("done"),
+        ];
+        let (handler, advertised, _prompts) = advertising_handler(
+            responses,
+            vec![search_tool()],
+            fleet.clone(),
+            HashMap::from([("builtin_tool_search".to_string(), search_result)]),
+        );
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        with_client_tools(
+            client_port(registered_client_tools(20), &ran),
+            handler.send_prompt(&conv.id, "find it".into(), noop_callback(), noop_status()),
+        )
+        .await
+        .expect("turn completes");
+
+        let rounds = advertised.lock().unwrap().clone();
+        let after = advertised_names(&rounds[1]);
+        let fleet_shown = after.iter().filter(|n| n.contains("fleet_tool_")).count();
+        assert_eq!(
+            fleet_shown, MAX_ACTIVATED_TOOLS,
+            "every slot must go to a capability the block did not already carry; \
+             the round advertised {after:?}"
+        );
+    }
+
     /// AC5. The measured turn activated ten tools on top of 99 and nothing ever
     /// retired one, with 200 rounds available. The ledger's bound is what makes
     /// that finite.
@@ -11958,81 +12057,193 @@ mod tests {
         );
     }
 
-    /// The other half of the prefix property, and the one a round that grows
-    /// can break: what round one sent must still be there, in the same order,
-    /// at the front of round two's block. An activation offered anywhere but
-    /// last would move the tools behind it and cost the cached prefix on the
-    /// round that already pays for a search.
+    /// The measurement #1212 is judged by, reproducible from the tree:
+    ///
+    /// ```text
+    /// cargo test -p desktop-assistant-core --lib da1212_tool_block_before_and_after \
+    ///     -- --ignored --nocapture
+    /// ```
+    ///
+    /// Ignored by default because it is a report rather than a check of one
+    /// behaviour, and it prints a table. It still asserts, so a later change
+    /// that erodes the saving fails here instead of going unnoticed.
+    ///
+    /// **The model.** The diagnosed production turn carried 99 tools for about
+    /// 23.7k estimated tokens: 19 daemon built-ins, 77 tools registered by the
+    /// connected client, and the turn loop's own 3 control tools. The control
+    /// tools are core under either policy, so the harness models the 96 this
+    /// change acts on. Sizes are calibrated from the real built-in set, which
+    /// measures 5,932 estimated tokens over the 15 an unwired service holds -
+    /// 395 each - which leaves the client's 77 at about 210 each.
+    ///
+    /// **The two arms.** Both run the shipped loop. The "before" arm withholds
+    /// the discovery tool, which is the condition under which this code still
+    /// advertises every registered tool in full - the behaviour `main` had
+    /// unconditionally. It therefore still carries this change's activation
+    /// bound, so it understates the old cost; the unbounded figure it would
+    /// have reached is printed beside it as arithmetic.
     #[tokio::test]
-    async fn a_round_that_activates_a_tool_appends_it_and_leaves_the_earlier_block_unchanged() {
+    #[ignore = "a measurement report, not a behaviour check; run with --ignored"]
+    async fn da1212_tool_block_before_and_after() {
         use crate::ports::client_tools::with_client_tools;
+        use crate::tool_advertising::{CORE_TOOL_COUNT, MAX_ACTIVATED_TOOLS};
 
-        let search_result = serde_json::json!({
-            "ok": true,
-            "tools": [{"name": "daemon_fleet_lookup", "description": "a fleet tool", "runs_on": "daemon"}],
-        })
-        .to_string();
-        let responses = vec![
-            LlmResponse::with_tool_calls(
-                "",
-                vec![ToolCall::new(
-                    "c1",
-                    "daemon_builtin_tool_search",
-                    r#"{"query":"anything"}"#,
-                )],
-            ),
-            LlmResponse::text("done"),
-        ];
-        let (handler, advertised, _prompts) = advertising_handler(
-            responses,
-            vec![search_tool()],
-            vec![ToolDefinition::new(
-                "fleet_lookup",
-                "a fleet tool",
-                speak_schema(),
-            )],
-            HashMap::from([("builtin_tool_search".to_string(), search_result)]),
-        );
-        let conv = handler
-            .create_conversation("t".into(), vec![])
-            .await
-            .unwrap();
-        let ran = Arc::new(Mutex::new(Vec::new()));
-        with_client_tools(
-            client_port(registered_client_tools(20), &ran),
-            handler.send_prompt(&conv.id, "find it".into(), noop_callback(), noop_status()),
-        )
-        .await
-        .expect("turn completes");
+        /// Estimated tokens per built-in, from the real set: 5,932 over 15.
+        const BUILTIN_TOKENS: u64 = 395;
+        /// The remainder of the diagnosed turn's 23.7k over 77 client tools.
+        const CLIENT_TOKENS: u64 = 210;
+        /// A registry hit, at the diagnosed turn's overall mean.
+        const FLEET_TOKENS: u64 = 239;
+        const CLIENT_TOOLS: usize = 77;
+        const SEARCH_HITS: usize = 40;
 
-        let rounds = advertised.lock().unwrap().clone();
-        let (before, after) = (&rounds[0], &rounds[1]);
-        assert_eq!(
-            after.len(),
-            before.len() + 1,
-            "the search activated exactly one tool; the block went from {:?} to {:?}",
-            advertised_names(before),
-            advertised_names(after)
+        let estimate = |t: &str| (t.chars().count() as u64).div_ceil(4);
+        let cost = |t: &ToolDefinition| crate::context::tool_definition_cost(t, &estimate);
+        // A tool whose estimated cost is `target`, padded in its description.
+        let sized = |name: String, target: u64| {
+            let schema = speak_schema();
+            let fixed = estimate(&name) + estimate(&schema.to_string());
+            let pad = "d".repeat((target.saturating_sub(fixed) * 4) as usize);
+            ToolDefinition::new(name, pad, schema)
+        };
+
+        let mut daemon: Vec<ToolDefinition> = (1..CORE_TOOL_COUNT)
+            .map(|i| sized(format!("builtin_tool_{i:02}"), BUILTIN_TOKENS))
+            .collect();
+        daemon.push(sized(
+            crate::tool_advertising::DISCOVERY_TOOL.to_string(),
+            BUILTIN_TOKENS,
+        ));
+        let client: Vec<ToolDefinition> = (0..CLIENT_TOOLS)
+            .map(|i| sized(format!("device_tool_{i:02}"), CLIENT_TOKENS))
+            .collect();
+        let fleet: Vec<ToolDefinition> = (0..SEARCH_HITS)
+            .map(|i| sized(format!("fleet_tool_{i:02}"), FLEET_TOKENS))
+            .collect();
+        let hits: Vec<serde_json::Value> = fleet
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "name": format!("daemon_{}", t.name),
+                    "description": "a fleet tool",
+                    "runs_on": "daemon",
+                })
+            })
+            .collect();
+        let search_result = serde_json::json!({"ok": true, "tools": hits}).to_string();
+
+        println!("\n#1212: what one round advertises, before and after");
+        println!(
+            "  model: {CORE_TOOL_COUNT} built-ins, {CLIENT_TOOLS} client-registered tools, a search returning {SEARCH_HITS} hits"
         );
-        assert_eq!(
-            &after[..before.len()],
-            &before[..],
-            "an activation appends; everything the round before sent stays where it \
-             was, or the cached prefix behind it is thrown away"
+        let mut measured: Vec<(usize, u64)> = Vec::new();
+        for advertise_everything in [true, false] {
+            let responses = vec![
+                LlmResponse::with_tool_calls(
+                    "",
+                    vec![ToolCall::new(
+                        "c1",
+                        "daemon_builtin_tool_search",
+                        r#"{"query":"anything"}"#,
+                    )],
+                ),
+                LlmResponse::text("done"),
+            ];
+            // Withholding the discovery tool is what turns deferral off, so the
+            // arms differ in exactly the condition under test.
+            let core: Vec<ToolDefinition> = if advertise_everything {
+                daemon
+                    .iter()
+                    .filter(|t| t.name != crate::tool_advertising::DISCOVERY_TOOL)
+                    .cloned()
+                    .collect()
+            } else {
+                daemon.clone()
+            };
+            let (handler, advertised, prompts) = advertising_handler(
+                responses,
+                core,
+                fleet.clone(),
+                HashMap::from([
+                    ("builtin_tool_search".to_string(), search_result.clone()),
+                    ("builtin_tool_00".to_string(), search_result.clone()),
+                ]),
+            );
+            let conv = handler
+                .create_conversation("t".into(), vec![])
+                .await
+                .unwrap();
+            let ran = Arc::new(Mutex::new(Vec::new()));
+            let _ = with_client_tools(
+                client_port(client.clone(), &ran),
+                handler.send_prompt(&conv.id, "go".into(), noop_callback(), noop_status()),
+            )
+            .await;
+
+            let rounds = advertised.lock().unwrap().clone();
+            let seen = prompts.lock().unwrap().clone();
+            println!(
+                "  --- {}",
+                if advertise_everything {
+                    "BEFORE: every registered tool advertised in full"
+                } else {
+                    "AFTER: core set plus a bounded client slice"
+                }
+            );
+            for (i, block) in rounds.iter().enumerate().filter(|(_, b)| !b.is_empty()) {
+                let tools: u64 = block.iter().map(cost).sum();
+                let system = estimate(&seen[i][0].content);
+                println!(
+                    "      round {}: tools={:<4} tool_tokens={:<7} system_tokens={:<7} total={}",
+                    i + 1,
+                    block.len(),
+                    tools,
+                    system,
+                    tools + system
+                );
+                if i < 2 {
+                    measured.push((block.len(), tools));
+                }
+            }
+        }
+
+        let (before_open, before_open_tokens) = measured[0];
+        let (before_grown, before_grown_tokens) = measured[1];
+        let (after_open, after_open_tokens) = measured[2];
+        let (after_grown, after_grown_tokens) = measured[3];
+        println!(
+            "  the BEFORE arm carries this change's activation bound, so it \
+             understates: unbounded, round 2 would have been {} tools at about \
+             {} tool tokens",
+            before_open + SEARCH_HITS,
+            before_open_tokens + SEARCH_HITS as u64 * FLEET_TOKENS
         );
-        assert_eq!(
-            after[before.len()].name,
-            "daemon_fleet_lookup",
-            "and the new tool is the one on the end"
+
+        // The claim, as a check rather than a print.
+        assert!(
+            after_open_tokens * 2 < before_open_tokens,
+            "the opening block must cost less than half what it did: {before_open_tokens} \
+             ({before_open} tools) -> {after_open_tokens} ({after_open} tools)"
+        );
+        assert!(
+            after_grown_tokens * 3 < before_grown_tokens * 2,
+            "and a round that has activated must still be a third cheaper: \
+             {before_grown_tokens} ({before_grown} tools) -> {after_grown_tokens} \
+             ({after_grown} tools)"
+        );
+        assert!(
+            after_grown - after_open <= MAX_ACTIVATED_TOOLS,
+            "growth within the turn is bounded by the ledger"
         );
     }
 
-    /// AC4, the half this change is responsible for. A provider's prompt cache
-    /// is a prefix match, so the checkpoint behind the leading system block pays
-    /// only while the bytes in front of it - the tool array, then that block -
-    /// are identical to last round's. `llm-bedrock`'s
+    /// AC4, the half this change is responsible for. The one cache checkpoint
+    /// sits behind the leading system block, which on Bedrock sits behind the
+    /// whole `tools` array, so it pays exactly while that array and that block
+    /// are identical to last round's - an appended array is a changed array and
+    /// misses either way. `llm-bedrock`'s
     /// `cache_point_emitted_for_anthropic_model` pins that the checkpoint is
-    /// emitted and where; this pins that what precedes it does not move.
+    /// emitted and where; this pins the equality it depends on.
     #[tokio::test]
     async fn rounds_that_activate_nothing_send_a_byte_identical_tool_block_and_system_block() {
         use crate::ports::client_tools::with_client_tools;

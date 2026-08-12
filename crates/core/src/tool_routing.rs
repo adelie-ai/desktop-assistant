@@ -335,6 +335,11 @@ impl RoutedTool {
         self.surface == ToolSurface::Named
     }
 
+    /// Whether this round's tool block already carries this tool's schema.
+    pub fn is_in_block(&self) -> bool {
+        self.surface.in_block()
+    }
+
     /// Whether it runs on the connected client's machine, read from the
     /// connection rather than from the name.
     pub fn is_client(&self) -> bool {
@@ -437,6 +442,17 @@ impl ToolRouter {
             .iter()
             .find(|e| e.connection.as_ref() == Some(connection) && e.provider_name == tool_name)
             .map_or(Route::Unrouted, Route::Found)
+    }
+
+    /// Whether this round's block already carries the schema `connection`
+    /// offers under `tool_name`.
+    ///
+    /// What activation asks before spending a slot (#1212): a tool already in
+    /// the block gains nothing from being activated, because the offer is a
+    /// no-op, and the ledger row would bound out a capability the turn does not
+    /// yet have.
+    pub fn advertises(&self, connection: &ToolConnection, tool_name: &str) -> bool {
+        matches!(self.resolve_on(connection, tool_name), Route::Found(entry) if entry.is_in_block())
     }
 
     /// Drop every entry whose provider name `keep` rejects.

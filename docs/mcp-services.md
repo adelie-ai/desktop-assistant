@@ -530,9 +530,9 @@ back.
 
 **What is only named.** A connected client registers whatever it happens to
 host, and one measured connection registered 77 tools. The first eight keep
-their schemas, in the order the connection registered them, and the rest appear
-in the tool note as names. A client that wants a tool's schema in the block
-registers it early.
+their schemas and the rest appear in the tool note as names. The slice is the
+front of the list the connection sent, and the daemon preserves that order, so
+a client that needs a tool's schema in every round registers it first.
 
 **This applies only when the model can look a name up.** A round that does not
 offer `builtin_tool_search` advertises every registered tool in full, however
@@ -546,11 +546,23 @@ schema instead of running the tool - so a round is spent only when the schema
 genuinely had to be seen, and nothing acts on a guess.
 
 **What a tool search activates is bounded and lasts one turn.** A turn holds at
-most 24 activated tools. Under that bound activations only ever append, which is
-what keeps each round's tool block a byte-identical prefix of the next one's -
-the property a provider's prompt cache matches on. At the bound, the activation
-unused longest is retired, and never one the model used in the current round. A
-new turn starts with none.
+most 24 activated tools. Under that bound activations only append, so nothing
+the turn already reached for is disturbed. At the bound, the activation unused
+longest is retired, and never one the model used in the current round. A new
+turn starts with none.
+
+**What that means for a prompt cache.** The daemon emits one cache checkpoint
+behind the leading system block, which on Bedrock sits behind the whole `tools`
+array, so the cache pays exactly when a round's tool array is *identical* to the
+one before it. Every input to the array is fixed for the turn except the
+activation ledger, so a round that activates nothing sends the same bytes and
+serves from cache. A round that activates does not - an appended entry is still
+a changed `tools` section, and no ordering rescues that. Activation happens a
+handful of times per turn rather than every round, so most rounds cache.
+
+Prompt caching is a per-model capability: Bedrock supports it on the Claude and
+Nova families only, so on a model outside them there is nothing to cache and the
+whole prefix is re-sent every round. Bounding the block is what helps there.
 
 Operators can see the cost per round and per connection: `llm.prompt.tool.tokens`
 carries a `server` label, and every `turn.round` span carries its own

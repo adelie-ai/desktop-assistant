@@ -825,9 +825,15 @@ fn build_full_tool_note(
 fn build_demoted_tool_note(
     tool_defs: &[ToolDefinition],
     deferred_namespaces: &[ToolNamespace],
+    tools_named_only: &[String],
     locality: Option<&ToolLocalityContext>,
 ) -> String {
+    // Every tool the turn can reach, including the ones offered as names only
+    // (#1212). The demoted note deliberately does not list them - it exists
+    // because the listing was too large - but a count that left them out would
+    // tell the model there is less behind the search than there is.
     let total_tools: usize = tool_defs.len()
+        + tools_named_only.len()
         + deferred_namespaces
             .iter()
             .map(|ns| ns.tools.len())
@@ -1056,8 +1062,12 @@ fn system_block(
         return system_instruction;
     }
 
-    let demoted_note =
-        build_demoted_tool_note(tools.tool_defs, tools.deferred_namespaces, tools.locality);
+    let demoted_note = build_demoted_tool_note(
+        tools.tool_defs,
+        tools.deferred_namespaces,
+        tools.named_only,
+        tools.locality,
+    );
     let demoted_system = assemble_system_instruction(demoted_note, topology, ambient);
     let system_tokens_after = estimate(&demoted_system);
     tracing::warn!(
@@ -2148,7 +2158,7 @@ mod tests {
             &["terminal"],
             &["device_terminal", "device_read_file"],
         );
-        let note = build_demoted_tool_note(&[], &[], Some(&ctx));
+        let note = build_demoted_tool_note(&[], &[], &[], Some(&ctx));
         assert!(
             note.contains("device_terminal") && note.contains("device_read_file"),
             "the demoted note must name the user's own tools: {note}"
@@ -2159,26 +2169,48 @@ mod tests {
         );
     }
 
+    /// #1212: the demoted note deliberately stops listing tools, but its count
+    /// is the one thing it still tells the model, and a count that left out the
+    /// name-only tools would describe a smaller world than the search can
+    /// reach.
+    #[test]
+    fn the_demoted_note_counts_the_tools_it_offers_by_name_only() {
+        let named: Vec<String> = (0..5).map(|i| format!("client_tool_{i}")).collect();
+        let advertised = [ToolDefinition::new(
+            "builtin_tool_search",
+            "find tools",
+            serde_json::json!({"type": "object"}),
+        )];
+        let note = build_demoted_tool_note(&advertised, &[], &named, None);
+        assert!(
+            note.starts_with("There are 6 tools"),
+            "one advertised plus five offered by name is six reachable: {note}"
+        );
+    }
+
     #[test]
     fn the_demoted_note_is_unchanged_when_the_daemon_and_client_are_one_machine() {
         // One machine draws no per-machine distinction, so the summary stays
         // exactly what it was, and costs no extra tokens on the turns that are
         // already over budget.
-        let plain = build_demoted_tool_note(&[], &[], None);
+        let plain = build_demoted_tool_note(&[], &[], &[], None);
         let co_located = locality_ctx(
             TransportKind::Uds,
             "daemon-host",
             &["terminal"],
             &["device_terminal"],
         );
-        assert_eq!(build_demoted_tool_note(&[], &[], Some(&co_located)), plain);
+        assert_eq!(
+            build_demoted_tool_note(&[], &[], &[], Some(&co_located)),
+            plain
+        );
 
         // A remote connection that registered no client tools has nothing extra
         // to say either.
         let no_client_tools =
             locality_ctx(TransportKind::WebSocket, "daemon-host", &["terminal"], &[]);
         assert_eq!(
-            build_demoted_tool_note(&[], &[], Some(&no_client_tools)),
+            build_demoted_tool_note(&[], &[], &[], Some(&no_client_tools)),
             plain
         );
     }

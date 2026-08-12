@@ -48,9 +48,11 @@
 //! A connected client registers whatever it happens to host, so the daemon
 //! cannot know which of its tools a session actually needs. What it can do is
 //! bound the cost: [`MAX_CLIENT_TOOLS_IN_BLOCK`] of them keep their schemas and
-//! the rest are named. The slice is taken in the order the connection
-//! registered them, which is the only priority signal that crosses the wire
-//! today - a client that wants a tool schema'd registers it early.
+//! the rest are named. The slice is the front of the list the connection sent,
+//! which is the only priority signal that crosses the wire today - so a client
+//! that needs a tool schema'd in every round registers it early, and the
+//! registry preserves that order rather than a hash order
+//! (`application::client_tools`).
 //!
 //! **Deferral is conditional on discovery actually being offered.** A turn with
 //! no `builtin_tool_search` in its block advertises every client tool in full,
@@ -63,14 +65,28 @@
 //! - **The lifetime is the turn.** A new turn builds a new ledger, so nothing
 //!   carries over. This is where the epic's eviction argument lands for tools:
 //!   the turn is the scope, exactly as it is for the provenance gate.
-//! - **Under the bound it only ever appends.** Round N's tool block stays a
-//!   byte-identical prefix of round N+1's, which is what lets a provider's
-//!   prompt cache serve the block instead of reprocessing it. A set that
-//!   reordered between rounds would throw that away for nothing.
+//! - **Under the bound it only appends**, so nothing the turn already has is
+//!   disturbed by a new activation and the block reads, round to round, as the
+//!   history of what the turn reached for.
 //! - **At the bound, the longest-unused activation is retired.** Refusing
 //!   instead would strand a turn that needs a capability it has not used yet,
-//!   and the bound is what makes the growth finite. Retirement moves the block,
-//!   so it is deliberately the exception rather than a per-round sweep.
+//!   and the bound is what makes the growth finite.
+//!
+//! ## What this does and does not do for a prompt cache
+//!
+//! A provider's prompt cache is a prefix match, and this repository emits one
+//! checkpoint behind the leading system block, which on Bedrock sits behind the
+//! whole `tools` array. So the cache pays exactly when a round's tool array is
+//! **identical** to the round before it, which is what the deterministic build
+//! order buys: every input to the array is fixed for the turn, so a round that
+//! activates nothing sends the same bytes.
+//!
+//! It does not survive a round that changes the set. An appended entry is still
+//! a changed `tools` section, and a change there invalidates every later
+//! section whatever its position (`llm-bedrock`'s `convert_messages` states the
+//! ordering). Activation is a handful of rounds per turn rather than every
+//! round, so most rounds cache; the ones that activate do not, and no ordering
+//! rescues them.
 //! - **An activation used in the current round is never retired**, so a tool the
 //!   model is working with cannot be taken away mid-round. When every entry was
 //!   used this round the activation is refused and the turn keeps its set.
@@ -85,14 +101,22 @@ use crate::tool_routing::ToolConnection;
 /// round that does not offer this tool advertises everything in full.
 pub const DISCOVERY_TOOL: &str = "builtin_tool_search";
 
+/// How many built-ins the daemon ships as its always-advertised core.
+///
+/// Counted against the fully-wired service, not the bare one: four of the set
+/// are capability-gated on a wired closure and are absent until it is present,
+/// so a figure taken from `BuiltinToolService::new()` describes a core four
+/// smaller than the one a turn actually carries.
+pub const CORE_TOOL_COUNT: usize = 19;
+
 /// The most tools the always-advertised built-in core may hold.
 ///
 /// Not a configuration value: it is the assertion that keeps the core a
-/// decision. The set stood at 22 when this was written, so the ceiling leaves
-/// room to add a faculty and none to drift back to 99. A change that pushes
+/// decision. The set stands at [`CORE_TOOL_COUNT`], so the ceiling leaves room
+/// for a few more faculties and none to drift back to 99. A change that pushes
 /// past it fails a test by name, and the answer is either the membership rule
 /// in this module's header or a deliberate, recorded move of the ceiling.
-pub const CORE_TOOL_CEILING: usize = 32;
+pub const CORE_TOOL_CEILING: usize = 24;
 
 /// The most tools one connected client may put in the round's block, with the
 /// rest named and reachable by name.
@@ -272,9 +296,9 @@ mod tests {
 
     #[test]
     fn under_the_bound_an_activation_only_appends_and_retires_nothing() {
-        // The property a provider's prompt cache depends on: round N's tool
-        // block is a byte-identical prefix of round N+1's, so the cached
-        // prefix survives instead of being rebuilt.
+        // Nothing the turn already reached for is disturbed by a new
+        // activation. The bound is pressure-only, so an ordinary turn never
+        // loses a tool it activated.
         let mut ledger = ActivationLedger::with_bound(4);
         for (i, name) in ["a", "b", "c"].iter().enumerate() {
             assert_eq!(

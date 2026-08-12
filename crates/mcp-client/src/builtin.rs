@@ -4062,15 +4062,40 @@ mod tests {
     /// enforces is in `desktop_assistant_core::tool_advertising`: a tool is core
     /// when the model needs it to find, or to keep, what the rest of the turn
     /// depends on.
+    ///
+    /// Measured against the wired service, because the bare one is missing the
+    /// four capability-gated tools and would leave the guard carrying slack it
+    /// does not admit to.
     #[test]
     fn the_always_advertised_builtin_core_stays_under_its_stated_ceiling() {
-        let count = BuiltinToolService::new().tool_definitions().len();
+        let count = fully_wired_service().tool_definitions().len();
         assert!(
             count <= desktop_assistant_core::tool_advertising::CORE_TOOL_CEILING,
             "the always-advertised core holds {count} tools, past the ceiling of \
              {}. Either the new tool is discoverable rather than core, or the \
              ceiling moves deliberately and this comment says why",
             desktop_assistant_core::tool_advertising::CORE_TOOL_CEILING
+        );
+    }
+
+    /// The ceiling is only a decision if the distance to it is known. This
+    /// pins the count itself, so a change that adds a built-in has to say so
+    /// here rather than quietly spending the guard's slack.
+    #[test]
+    fn the_wired_builtin_core_is_the_size_the_advertising_rule_states() {
+        let wired = fully_wired_service().tool_definitions();
+        let bare = BuiltinToolService::new().tool_definitions();
+        assert_eq!(
+            bare.len(),
+            desktop_assistant_core::tool_advertising::CORE_TOOL_COUNT - 4,
+            "four built-ins are capability-gated; the bare service holds {:?}",
+            bare.iter().map(|t| t.name.as_str()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            wired.len(),
+            desktop_assistant_core::tool_advertising::CORE_TOOL_COUNT,
+            "the shipped core holds {:?}",
+            wired.iter().map(|t| t.name.as_str()).collect::<Vec<_>>()
         );
     }
 
