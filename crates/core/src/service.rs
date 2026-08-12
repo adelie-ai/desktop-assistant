@@ -2996,32 +2996,61 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
             //
             //   pinned      the daemon's built-ins, the servers it reaches and
             //               the loop's control surface. Changes when the
-            //               daemon's own configuration changes, and depends on
-            //               nothing any client does.
+            //               daemon's own configuration changes. Only the
+            //               built-ins and the control surface put schemas in the
+            //               array - a daemon server's tools are deferred, and
+            //               reach the array through the activations tier.
             //   connection  what the client registered. Read once at turn start
             //               (#1216), so it is fixed for the turn.
             //   activations what this turn's searches and first calls promoted,
             //               appended as the turn reaches for them.
             //
             // So a round that activates nothing sends a byte-identical `tools`
-            // array, a round that activates one sends the round before it as a
-            // prefix, and the pinned tier is the same bytes across every turn
-            // and every connection, because nothing below it can move it.
+            // array, and a round that activates one sends the round before it
+            // as a prefix. The pinned tier is the same bytes across every
+            // connection, because nothing below it can move it - and across
+            // turns too, for as long as the daemon's configuration and the
+            // turn's resolved connector stay put, which is what decides whether
+            // the discovery tool is in the core set at all (`core_tools_for_llm`
+            // above).
             //
             // What that is worth depends on the provider. A prompt cache is a
-            // prefix match; where the provider takes the longest common prefix
-            // by itself, the pinned tier is charged once and an appended tool
-            // costs only itself. Where the cache is a checkpoint the request
-            // places, this repository emits one, behind the leading system
-            // block - so on the two connectors that emit one (`convert_messages`
-            // in `llm-bedrock` and in `llm-anthropic`) an array that changed at
-            // all still misses today, and this order is what a checkpoint at the
-            // end of the pinned tier would need. It costs an ordering decision
+            // prefix match, so where the provider takes the longest common
+            // prefix by itself, the stable tiers are charged once and only the
+            // appended schema is newly charged inside the array. Where the cache
+            // is a checkpoint the request places, this repository emits one
+            // behind the leading system block - `convert_messages` in
+            // `llm-bedrock` and in `llm-anthropic` - so there an array that
+            // changed at all still misses today, and this order is what a
+            // checkpoint at the end of the pinned tier would need. Not every
+            // connector places it there: `llm-openrouter` marks the *last*
+            // system message (`mark_system_cache_breakpoint`), which sits behind
+            // the per-turn blocks. The ordering costs an ordering decision
             // either way, so it is held rather than argued per model.
             //
-            // Two consequences are correct rather than defects. A turn's first
-            // round cannot hit the previous turn's cache when the client's set
-            // changed in between - the tools really did change. And a tool
+            // Three things end the prefix rather than extending it, named here
+            // so none is discovered later:
+            //
+            // - **The activation bound.** At the bound the ledger retires an
+            //   entry from the middle to stay finite. Pressure-only, which is
+            //   what keeps it rare.
+            // - **A mid-turn demotion of hosted search.** It puts the discovery
+            //   tool back in the core set and, because that makes deferral safe,
+            //   stops bounding the client's slice - so the round after a
+            //   demotion advertises a different set, not a longer one. That is
+            //   correct: the model has to be able to look a name up. No ordering
+            //   buys it, and it is a handful of rounds at most (`round < 2`).
+            // - **The connector's own deferred section.** On the hosted-search
+            //   path the connector sends this array and then its own deferred
+            //   fleet behind it, and a promotion moves a tool from that section
+            //   into this one. The property here is about the array this loop
+            //   emits; on that path the request as a whole is not a prefix of
+            //   the round before. Advertising both would put two schemas in
+            //   front of the model for one name, which #1212 refused.
+            //
+            // Two more consequences are correct rather than defects. A turn's
+            // first round cannot hit the previous turn's cache when the client's
+            // set changed in between - the tools really did change. And a tool
             // registered mid-turn appears from the next turn, which is #1216's
             // recorded trade and what keeps the within-turn array stable.
             router.offer(&ToolConnection::daemon_builtins(), round_core);
@@ -12330,10 +12359,10 @@ mod tests {
     /// [`advertising_handler`], plus a scratchpad writer so the turn offers the
     /// loop's own control surface.
     ///
-    /// The control tools are the most stable entries in the whole array, and a
-    /// test about where the array grows cannot see anything without them: with
-    /// no tool after the point an activation is inserted at, every insertion
-    /// looks like an append.
+    /// The control tools are the most stable entries in the whole array, and
+    /// where they sit is what the two ordering tests below are about. They are
+    /// also the tools a turn carries in production, so a turn without them is
+    /// not the configuration this ordering has to hold for.
     #[allow(clippy::type_complexity)]
     fn advertising_handler_with_core_loop(
         responses: Vec<LlmResponse>,
@@ -12376,34 +12405,37 @@ mod tests {
     /// AC1 and AC2 (#1294). Each round's advertised array is a true prefix of
     /// the next round's, whatever that round activated.
     ///
-    /// The configuration carries the assertion. The turn offers the loop's
-    /// control surface, and it activates two of the connection's name-only
-    /// tools in the order that exposes an in-place upgrade: the
-    /// latest-registered one first, then an earlier one. A router that upgraded
-    /// a held entry where it stood would put the second promotion *ahead* of
-    /// the first, so round two's array would stop being a prefix of round
-    /// three's. Equality would not catch it either way - the array grows, and
-    /// growing is correct.
+    /// Equality would not catch this either way - the array grows, and growing
+    /// is correct. What makes the test discriminate is the pair of activations
+    /// and their order: the turn activates the connection's *last* name-only
+    /// tool and then an *earlier* one. A router that upgraded a held entry where
+    /// it stood would put the second promotion ahead of the first, because the
+    /// second tool's name-only entry sits in front of the first tool's, so round
+    /// two's array would stop being a prefix of round three's.
+    ///
+    /// The turn carries the loop's control surface throughout, which is the
+    /// configuration this ordering has to hold for - and the one the test the
+    /// ticket replaced did not have.
     #[tokio::test]
     async fn each_advertised_array_is_a_prefix_of_the_next_when_a_tool_activates() {
         use crate::ports::client_tools::with_client_tools;
+        use crate::tool_advertising::MAX_CLIENT_TOOLS_IN_BLOCK;
+
+        // Two tools past the block's bound, so both are name-only and both have
+        // an entry for a promotion to move. Derived from the bound rather than
+        // written out, so raising it cannot quietly stop the test discriminating.
+        const REGISTERED: usize = MAX_CLIENT_TOOLS_IN_BLOCK * 2 + 4;
+        let later = format!("client_device_tool_{:02}", REGISTERED - 1);
+        let earlier = format!("client_device_tool_{MAX_CLIENT_TOOLS_IN_BLOCK:02}");
 
         let responses = vec![
             LlmResponse::with_tool_calls(
                 "",
-                vec![ToolCall::new(
-                    "c1",
-                    "client_device_tool_19",
-                    r#"{"text":"hello"}"#,
-                )],
+                vec![ToolCall::new("c1", &later, r#"{"text":"hello"}"#)],
             ),
             LlmResponse::with_tool_calls(
                 "",
-                vec![ToolCall::new(
-                    "c2",
-                    "client_device_tool_10",
-                    r#"{"text":"hello"}"#,
-                )],
+                vec![ToolCall::new("c2", &earlier, r#"{"text":"hello"}"#)],
             ),
             LlmResponse::text("done"),
         ];
@@ -12419,7 +12451,7 @@ mod tests {
             .unwrap();
         let ran = Arc::new(Mutex::new(Vec::new()));
         with_client_tools(
-            client_port(registered_client_tools(20), &ran),
+            client_port(registered_client_tools(REGISTERED), &ran),
             handler.send_prompt(&conv.id, "say it".into(), noop_callback(), noop_status()),
         )
         .await
@@ -12435,9 +12467,13 @@ mod tests {
         );
         assert!(
             rounds[0].contains(&planning::BEGIN_STEP_TOOL.to_string()),
-            "precondition: the loop's control surface is in the array, so the \
-             turn is not the one configuration where nothing follows an \
-             insertion point: {:?}",
+            "precondition: the turn carries the loop's control surface: {:?}",
+            rounds[0]
+        );
+        assert!(
+            !rounds[0].contains(&later) && !rounds[0].contains(&earlier),
+            "precondition: both tools start name-only, so each has a held entry \
+             a promotion could take the slot of: {:?}",
             rounds[0]
         );
 
@@ -12448,13 +12484,16 @@ mod tests {
             rounds[1]
         );
         assert_eq!(
-            rounds[1].last().map(String::as_str),
-            Some("client_device_tool_19"),
+            rounds[1].last(),
+            Some(&later),
             "the activated tool takes a position after everything already \
              advertised: {:?}",
             rounds[1]
         );
 
+        // The discriminating pair. `earlier`'s name-only entry sits in front of
+        // `later`'s, so an in-place upgrade lands it ahead of the tool round two
+        // already advertised.
         assert!(
             rounds[2].starts_with(&rounds[1]),
             "round two's array must be a prefix of round three's, so the second \
@@ -12463,8 +12502,8 @@ mod tests {
             rounds[2]
         );
         assert_eq!(
-            rounds[2].last().map(String::as_str),
-            Some("client_device_tool_10"),
+            rounds[2].last(),
+            Some(&earlier),
             "and the second activation appends too, rather than taking the slot \
              its name-only entry held: {:?}",
             rounds[2]

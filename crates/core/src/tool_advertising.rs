@@ -86,19 +86,27 @@
 //! - a round that activates nothing sends a **byte-identical** array;
 //! - a round that activates sends the round before it as a **prefix**, because
 //!   under the bound the ledger only appends and a promoted tool takes a
-//!   position after everything already advertised (`ToolRouter::insert`);
-//! - at the bound a retirement removes an entry from the middle, so the prefix
-//!   ends there. Retirement is pressure-only, which is what keeps that rare.
+//!   position after everything already advertised (`ToolRouter::insert`).
+//!
+//! Three conditions end the prefix rather than extending it. At the bound a
+//! retirement removes an entry from the middle, and retirement is pressure-only,
+//! which is what keeps that rare. A mid-turn demotion of hosted search rebuilds
+//! the core set and unbounds the client's slice, so the round after it
+//! advertises a different set rather than a longer one. And on the hosted-search
+//! path the connector sends its own deferred fleet behind this array, so a
+//! promotion moves a tool between the two sections; the property here is about
+//! the array the turn loop emits. The round loop states all three where they
+//! arise.
 //!
 //! Which of the two a provider charges for depends on the provider. Where the
 //! cache matches the longest common prefix by itself, the stable tiers are paid
-//! for once and an appended tool costs only itself. Where the cache is a
-//! checkpoint the request places, this repository emits one, behind the leading
-//! system block - so on the two connectors that emit one (`convert_messages` in
-//! `llm-bedrock` and in `llm-anthropic`) it is the byte-identical round that
-//! pays today, and the ordering is the prerequisite for a checkpoint at the end
-//! of the stable tiers. Bounding the block is what helps on a model that caches
-//! nothing at all.
+//! for once and only the appended schema is newly charged inside the array.
+//! Where the cache is a checkpoint the request places, this repository emits one
+//! behind the leading system block - `convert_messages` in `llm-bedrock` and in
+//! `llm-anthropic` - so there it is the byte-identical round that pays today,
+//! and the ordering is the prerequisite for a checkpoint at the end of the
+//! stable tiers. Bounding the block is what helps on a model that caches nothing
+//! at all.
 
 use crate::domain::ToolDefinition;
 use crate::tool_routing::ToolConnection;

@@ -560,30 +560,47 @@ most-stable-first, in three tiers:
 | connection | what the connected client registered | the connection changes, or the client registers or drops a tool |
 | activations | what this turn's searches and first calls promoted | a search promotes a tool, per round |
 
+Of the pinned tier, only the built-ins and the control surface put schemas in
+the array: a daemon MCP server's tools are deferred, so they travel in the
+namespaces and reach the array through the activations tier if the turn uses
+one.
+
 Two properties follow. A round that activates nothing sends a **byte-identical**
 array. A round that activates sends the round before it as a **prefix**: the
 tiers above it cannot move, and a promoted tool takes a position after
 everything already advertised rather than the slot its name-only entry held. The
 pinned tier depends on nothing a client does, so it is the same bytes across
-turns and across connections too.
+connections - and across turns too, for as long as the daemon's configuration
+and the turn's resolved connector stay put.
 
 **What that is worth depends on the provider.** A prompt cache is a prefix
 match. Where the provider takes the longest common prefix by itself, the pinned
-tier is charged once however many connections and turns follow, and an appended
-tool costs only itself. Where the cache is a checkpoint the request places, the
-daemon emits one, behind the leading system block - so on Bedrock and on the
-Anthropic connector it is the byte-identical round that serves from cache today,
-and this ordering is the prerequisite for a checkpoint at the end of the pinned
-tier. Activation happens a handful of times per turn rather than every round, so
-most rounds are byte-identical either way.
+tier is charged once however many connections and turns follow, and only the
+appended schema is newly charged inside the array. Where the cache is a
+checkpoint the request places, the daemon emits one behind the leading system
+block - so on Bedrock and on the Anthropic connector it is the byte-identical
+round that serves from cache today, and this ordering is the prerequisite for a
+checkpoint at the end of the pinned tier. Not every connector places it there:
+the OpenRouter path marks the last system message instead, which sits behind the
+per-turn blocks. Activation happens a handful of times per turn rather than
+every round, so most rounds are byte-identical either way.
 
 Prompt caching is also a per-model capability: Bedrock supports it on the Claude
 and Nova families only, so on a model outside them there is nothing to cache and
 the whole prefix is re-sent every round. Bounding the block is what helps there.
 
-Two consequences are correct rather than defects. A turn's first round cannot
-hit the previous turn's cache when the client's set changed in between - the
-tools really did change, and advertising the old set would offer a schema
+**Three conditions end the prefix** rather than extending it. At the activation
+bound the ledger retires an entry from the middle to stay finite. A mid-turn
+demotion of hosted tool search puts the discovery tool back in the core set and
+stops bounding the client's slice, so the round after it advertises a different
+set rather than a longer one - correct, because the model has to be able to look
+a name up. And on the hosted-search path the connector sends its own deferred
+fleet behind this array, so a promotion moves a tool from that section into this
+one; the property is about the array the daemon emits.
+
+Two further consequences are correct rather than defects. A turn's first round
+cannot hit the previous turn's cache when the client's set changed in between -
+the tools really did change, and advertising the old set would offer a schema
 nothing can run. And a tool registered mid-turn appears from the next turn,
 which is what keeps the within-turn array stable.
 

@@ -464,8 +464,15 @@ impl ToolRouter {
         self.entries.retain(|e| keep(e.provider_name()));
     }
 
-    /// The definitions the model is shown, in the order they were offered, each
-    /// under its composed name.
+    /// The definitions the model is shown, each under its composed name, in the
+    /// order they were **last** offered - so a tool promoted into the block
+    /// appears after everything already there rather than where its earlier
+    /// entry sat.
+    ///
+    /// This order is load-bearing, not incidental (#1294). The turn loop offers
+    /// most-stable-first, so a round that activates nothing produces the same
+    /// bytes as the round before and a round that activates produces that round
+    /// as a prefix. A caller that re-sorted this would give both away.
     pub fn advertised_definitions(&self) -> Vec<ToolDefinition> {
         self.entries
             .iter()
@@ -475,10 +482,12 @@ impl ToolRouter {
     }
 
     /// The composed names of every tool offered as a name and nothing else
-    /// (#1212), in the order they were offered.
+    /// (#1212), in the order they were last offered.
     ///
     /// What the tool note lists so the model knows they exist. Read from the
-    /// table, so a name the note gives is a name the table routes.
+    /// table, so a name the note gives is a name the table routes. A tool the
+    /// turn promotes into the block leaves this list, because its schema is
+    /// then in front of the model.
     pub fn named_only_names(&self) -> Vec<String> {
         self.entries
             .iter()
