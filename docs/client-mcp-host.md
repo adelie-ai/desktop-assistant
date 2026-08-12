@@ -20,6 +20,30 @@ choice. Clients on different machines (desktop, a Raspberry Pi, a laptop) each
 have their own file, so the same remote brain gets different local reach
 depending on which edge is connected.
 
+## Concurrent edits
+
+Because every client on the machine writes this one file, two clients that save
+at the same moment can lose one of the two changes. `ClientMcpConfig::edit` is
+the supported way to change the file, and it removes that race: it takes an
+exclusive lock for the whole read-mutate-write transaction, so a second editor
+waits instead of overwriting.
+
+- The lock is an advisory `flock` on a sidecar file, `client-mcp.toml.lock`,
+  created `0600` beside the config. The config itself is replaced by rename on
+  every save, so a lock held on it would be a lock on an unlinked file.
+- The read inside `edit` is strict. A config that cannot be parsed fails the
+  edit and is left untouched, rather than being replaced by an empty one. An
+  absent config is a first write.
+- **Readers are never blocked.** Each save is an atomic rename, so a reader
+  always sees a whole file and takes no lock.
+- An editor that waits more than about two seconds gives up and reports that
+  another Adele client is editing the file. Nothing hangs.
+- A lock file left behind by a client that exited blocks nothing: the kernel
+  releases the lock when the process ends.
+
+Limitation: on a network home directory (NFS or SMB, macOS especially) `flock`
+can be local to one host, or refused. That is accepted for a machine-local file.
+
 ## Schema
 
 - `[[servers]]` — server *definitions*, mirroring the daemon's `mcp_servers.toml`
