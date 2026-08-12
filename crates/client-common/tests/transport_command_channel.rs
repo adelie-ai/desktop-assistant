@@ -68,13 +68,14 @@ async fn as_commands_returns_some_for_ws_transport() {
 #[cfg(feature = "dbus")]
 #[tokio::test]
 async fn as_commands_returns_some_for_dbus_transport() {
-    let client = match desktop_assistant_client_common::dbus_client::DbusClient::connect().await {
-        Ok(client) => client,
-        Err(e) => {
-            eprintln!("skipping: no usable session bus ({e})");
-            return;
-        }
-    };
+    let client =
+        match desktop_assistant_client_common::dbus_client::DbusClient::connect(false).await {
+            Ok(client) => client,
+            Err(e) => {
+                eprintln!("skipping: no usable session bus ({e})");
+                return;
+            }
+        };
 
     let transport = TransportClient::Dbus(client);
     assert!(

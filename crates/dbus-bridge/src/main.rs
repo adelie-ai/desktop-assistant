@@ -1,10 +1,12 @@
 //! `adelie-dbus-bridge` — standalone D-Bus bridge binary (issue #106).
 //!
 //! At startup:
-//! 1. Build a UDS [`ConnectionConfig`] pointing at the daemon socket and open a
+//! 1. Build the bridge's daemon config ([`bridge_daemon_config`]) and open a
 //!    client-common [`Connector`] (#316). The daemon authenticates the local UDS
 //!    connection by kernel peer-cred (#407) — no token — and the Connector owns
-//!    reconnect on every drop.
+//!    reconnect on every drop. That config withholds the client context: the
+//!    bridge speaks for no declared caller, and a caller that wants its context
+//!    shared says so for itself (#782).
 //! 2. Stand up zbus adapters at the canonical object paths over a transport that
 //!    forwards each command through the Connector.
 //! 3. Forward the daemon's signal stream to D-Bus signals (auto-resubscribing
@@ -23,9 +25,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use clap::Parser;
-use desktop_assistant_client_common::{
-    ConnectionConfig, Connector, TransportMode, default_desktop_socket_path,
-};
+use desktop_assistant_client_common::{Connector, default_desktop_socket_path};
 use desktop_assistant_dbus_bridge::adapter::{
     DBUS_SERVICE_NAME, DbusBackgroundTasksAdapter, DbusCommandsAdapter, DbusConnectionsAdapter,
     DbusConversationsAdapter, DbusKnowledgeAdapter, DbusReloadAdapter, DbusSettingsAdapter,
@@ -34,7 +34,7 @@ use desktop_assistant_dbus_bridge::adapter::{
 use desktop_assistant_dbus_bridge::session::{
     ConnectorSessionFactory, SessionRegistry, spawn_name_owner_watcher,
 };
-use desktop_assistant_dbus_bridge::transport::ConnectorBridgeTransport;
+use desktop_assistant_dbus_bridge::transport::{ConnectorBridgeTransport, bridge_daemon_config};
 use tokio::signal::unix::{SignalKind, signal};
 
 // The bridge is the live D-Bus surface as of the cutover's name flip (#318):
@@ -96,12 +96,7 @@ async fn main() -> anyhow::Result<()> {
         daemon = %daemon_socket.display(),
         "connecting to daemon UDS via the client-common Connector",
     );
-    let config = ConnectionConfig {
-        transport_mode: TransportMode::Uds,
-        socket_path: Some(daemon_socket.clone()),
-        ws_jwt: None,
-        ..ConnectionConfig::default()
-    };
+    let config = bridge_daemon_config(daemon_socket.clone());
     let connector = Connector::connect(&config).await.with_context(|| {
         format!(
             "failed to connect to the daemon at {} — is desktop-assistant-daemon running?",

@@ -379,6 +379,12 @@ trait Knowledge {
 #[zbus::proxy(interface = "org.desktopAssistant.Commands")]
 trait Commands {
     async fn send_command(&self, command_json: &str) -> zbus::fdo::Result<String>;
+
+    /// Declare whether this caller shares its device context with the assistant
+    /// (#782) — the D-Bus counterpart of the socket transports' handshake field.
+    /// The bridge records it against this caller's bus name and builds that
+    /// caller's daemon session from it.
+    async fn set_share_client_context(&self, enabled: bool) -> zbus::fdo::Result<()>;
 }
 
 fn resolve_dbus_service_name() -> String {
@@ -409,7 +415,19 @@ pub struct DbusClient {
 }
 
 impl DbusClient {
-    pub async fn connect() -> Result<Self> {
+    /// Connect to the bridge and declare the client-context sharing preference
+    /// (#782).
+    ///
+    /// The declaration is best-effort by necessity, and the failure it cannot
+    /// cover is worth stating plainly: a bridge too old to know the method
+    /// answers `UnknownMethod`, and **that bridge does not withhold** — it
+    /// predates the fail-closed default and resolves its own environment for
+    /// every session. A client and a bridge from this workspace ship together,
+    /// but a merge is not a rebuild, so the two can be out of step on a machine
+    /// where only one was reinstalled. All this client can do is say so;
+    /// refusing to connect would leave the user with no assistant rather than a
+    /// private one.
+    pub async fn connect(share_client_context: bool) -> Result<Self> {
         let connection = Connection::session().await?;
         let service_name = resolve_dbus_service_name();
         let proxy = ConversationsProxy::builder(&connection)
@@ -432,6 +450,29 @@ impl DbusClient {
             .path(DBUS_BACKGROUND_TASKS_PATH)?
             .build()
             .await?;
+        // Declare before any command runs, so the caller's first session-scoped
+        // call already builds a session carrying the right preference.
+        if let Err(e) = commands
+            .set_share_client_context(share_client_context)
+            .await
+        {
+            if share_client_context {
+                tracing::warn!(
+                    "the bridge did not accept the client-context sharing preference \
+                     ({e}); a bridge that understands it treats an undeclared caller as \
+                     withholding, so device context may not be shared on this connection"
+                );
+            } else {
+                tracing::warn!(
+                    "the bridge REFUSED the request to withhold device context ({e}); a \
+                     bridge too old to understand this resolves its own environment and \
+                     sends the user's name, login, home directory and hostname whatever \
+                     the setting says - reinstall the bridge to make the preference \
+                     effective"
+                );
+            }
+        }
+
         Ok(Self {
             proxy,
             knowledge,

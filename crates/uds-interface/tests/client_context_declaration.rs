@@ -263,3 +263,64 @@ async fn declining_the_client_context_keeps_peer_cred_authentication() {
     );
     let _ = harness.shutdown.send(());
 }
+
+/// The guard against a gate that withholds everything (#782). The two cases
+/// above both assert an ABSENCE, so a daemon that dropped every client context
+/// unconditionally would satisfy them and break the feature. This one can only
+/// pass when a reported context actually survives to the prompt, and survives
+/// as the client's own values rather than anything the daemon substituted.
+#[tokio::test]
+async fn a_reported_context_reaches_the_prompt_as_the_clients_own_values() {
+    let signing_key = "deadbeef".repeat(8);
+    let mut harness = start_server(Arc::new(JwtOnlyAuth {
+        signing_key: signing_key.clone(),
+    }));
+    let handshake = serde_json::json!({
+        "jwt": mint_test_jwt(&signing_key, "desktop"),
+        "client_context": {
+            "real_name": "Ada Lovelace",
+            "username": "ada",
+            "home_dir": "/home/ada",
+            "hostname": "analytical-engine",
+            "timezone": "Europe/London",
+            "os": "TestOS 9000",
+        },
+    });
+
+    let section = client_context_block_for_one_turn(&mut harness, handshake)
+        .await
+        .expect("a reported context must render a client-context block");
+
+    // The client's values, not the connecting process's. `ada` is nobody on this
+    // machine, so a peer-cred substitution could not have produced it.
+    assert!(section.contains("Ada Lovelace"), "section: {section}");
+    assert!(section.contains("analytical-engine"), "section: {section}");
+    assert!(section.contains("Europe/London"), "section: {section}");
+    let _ = harness.shutdown.send(());
+}
+
+/// `share_client_context: true` is documented to behave exactly as an absent
+/// field, and only the absent case was covered. This pins the explicit arm, so
+/// the equivalence is enforced rather than merely stated - and so that a later
+/// change making an absent field fail closed cannot silently take explicit
+/// consent down with it.
+#[tokio::test]
+async fn an_explicit_consent_grounds_the_prompt_exactly_as_an_absent_field_does() {
+    let signing_key = "deadbeef".repeat(8);
+    let mut harness = start_server(Arc::new(JwtOnlyAuth {
+        signing_key: signing_key.clone(),
+    }));
+    let handshake = serde_json::json!({
+        "jwt": mint_test_jwt(&signing_key, "desktop"),
+        "share_client_context": true,
+    });
+
+    let section = client_context_block_for_one_turn(&mut harness, handshake).await;
+
+    assert!(
+        section.is_some(),
+        "an explicitly consenting client that reported no context must keep the #558 \
+         peer-identity grounding, exactly as an undeclared one does"
+    );
+    let _ = harness.shutdown.send(());
+}

@@ -44,6 +44,16 @@ pub enum DaemonScript {
 pub struct StubDaemonHandle {
     #[allow(dead_code)] // recorded for handshake-assertion tests (now in client-common)
     pub handshakes: Arc<Mutex<Vec<String>>>,
+    /// Every handshake frame the daemon read, verbatim, as parsed JSON.
+    ///
+    /// The daemon is the receiving end of the client-context privacy preference
+    /// (#782), so a test that must prove the preference *arrived* asserts on
+    /// this rather than on what the client believes it sent.
+    #[allow(dead_code)] // only the #782 preference tests read it
+    pub handshake_frames: Arc<Mutex<Vec<Value>>>,
+    // Each integration-test binary compiles this fixture on its own, so a field
+    // no single binary happens to read still has to build.
+    #[allow(dead_code)]
     pub requests: Arc<Mutex<Vec<api::WsRequest>>>,
     #[allow(dead_code)] // surfaced for future tests that push events dynamically
     pub event_tx: mpsc::UnboundedSender<api::Event>,
@@ -57,11 +67,13 @@ pub async fn spawn_stub_daemon(path: &Path, script: DaemonScript) -> StubDaemonH
     let _ = std::fs::remove_file(path);
     let listener = UnixListener::bind(path).expect("bind daemon socket");
     let handshakes = Arc::new(Mutex::new(Vec::<String>::new()));
+    let handshake_frames = Arc::new(Mutex::new(Vec::<Value>::new()));
     let requests = Arc::new(Mutex::new(Vec::<api::WsRequest>::new()));
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<api::Event>();
     let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
 
     let handshakes_clone = Arc::clone(&handshakes);
+    let handshake_frames_clone = Arc::clone(&handshake_frames);
     let requests_clone = Arc::clone(&requests);
     tokio::spawn(async move {
         // Track live connection tasks so stopping the daemon closes their
@@ -81,6 +93,7 @@ pub async fn spawn_stub_daemon(path: &Path, script: DaemonScript) -> StubDaemonH
                     let Ok((stream, _)) = accept else { continue };
                     let script = script.clone();
                     let handshakes_clone = Arc::clone(&handshakes_clone);
+                    let handshake_frames_clone = Arc::clone(&handshake_frames_clone);
                     let requests_clone = Arc::clone(&requests_clone);
                     // We rebuild a receiver per connection by passing a sub-channel.
                     let (sub_tx, mut sub_rx) = mpsc::unbounded_channel::<api::Event>();
@@ -95,6 +108,7 @@ pub async fn spawn_stub_daemon(path: &Path, script: DaemonScript) -> StubDaemonH
                             stream,
                             script,
                             handshakes_clone,
+                            handshake_frames_clone,
                             requests_clone,
                             &mut sub_rx,
                         ).await;
@@ -108,6 +122,7 @@ pub async fn spawn_stub_daemon(path: &Path, script: DaemonScript) -> StubDaemonH
 
     StubDaemonHandle {
         handshakes,
+        handshake_frames,
         requests,
         event_tx,
         stop_tx,
@@ -118,6 +133,7 @@ async fn handle_daemon_connection(
     stream: UnixStream,
     script: DaemonScript,
     handshakes: Arc<Mutex<Vec<String>>>,
+    handshake_frames: Arc<Mutex<Vec<Value>>>,
     requests: Arc<Mutex<Vec<api::WsRequest>>>,
     events: &mut mpsc::UnboundedReceiver<api::Event>,
 ) {
@@ -137,6 +153,7 @@ async fn handle_daemon_connection(
         .map(|s| s.to_string())
         .unwrap_or_default();
     handshakes.lock().await.push(token);
+    handshake_frames.lock().await.push(handshake.clone());
 
     if let DaemonScript::RejectHandshake { ref error } = script {
         let frame = api::WsFrame::error(String::new(), error.clone());

@@ -358,6 +358,24 @@ fn decode_client_context_header(headers: &HeaderMap) -> Option<api::ClientContex
     api::decode_client_context(&raw)
 }
 
+/// Resolve the client context to attach for a WebSocket connection.
+///
+/// The counterpart of the local UDS door's `resolve_local_client_context`, and
+/// deliberately the whole rule in one named place so it can be held to it: this
+/// door attaches **exactly** what the client sent and substitutes nothing
+/// (#782/#783). It has nothing to substitute - a WebSocket connection may terminate
+/// on another host, so there is no kernel peer identity to read and no
+/// daemon-host value that would be the user's. An absent or malformed header is
+/// therefore already the whole refusal, which is why this transport needs no
+/// separate preference field.
+///
+/// Keep this the only path from the upgrade headers to the connection's context.
+/// A fallback added at the call site instead of here would not be covered by
+/// this function's tests.
+fn resolve_ws_client_context(headers: &HeaderMap) -> Option<api::ClientContext> {
+    decode_client_context_header(headers)
+}
+
 async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<WsServerState>,
@@ -414,7 +432,7 @@ async fn ws_handler(
     // Self-reported client context (#549) from its own base64(JSON) upgrade
     // header. Fail-closed: a missing or malformed header yields no context (the
     // connection is never rejected on it — it is a hint, not a trust boundary).
-    let client_context = decode_client_context_header(&headers);
+    let client_context = resolve_ws_client_context(&headers);
 
     ws.max_message_size(MAX_WS_MESSAGE_BYTES)
         .max_frame_size(MAX_WS_MESSAGE_BYTES)
@@ -987,6 +1005,41 @@ mod client_context_header_tests {
     #[test]
     fn absent_header_yields_no_context() {
         assert_eq!(decode_client_context_header(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn the_ws_door_substitutes_nothing_for_a_client_that_sent_no_context() {
+        // #782/#783: the three doors differ in exactly one place - whether the
+        // daemon substitutes something of its own for a client that sent no
+        // context. The local UDS door can (kernel peer-cred names the caller),
+        // so #783 gave it a handshake field to be told when not to. This door has nothing to
+        // substitute and must never invent one, which is why this transport needs
+        // no separate preference field: an absent header IS the refusal.
+        //
+        // This calls the resolver the upgrade handler itself calls, so a fallback
+        // added to that one path fails here.
+        assert_eq!(resolve_ws_client_context(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn the_ws_door_attaches_a_sent_context_verbatim() {
+        // The other half of the same rule: exactly what the client sent, neither
+        // widened nor narrowed.
+        let ctx = api::ClientContext {
+            username: Some("ada".into()),
+            timezone: Some("Europe/London".into()),
+            ..api::ClientContext::default()
+        };
+        let headers = header_map(&api::encode_client_context(&ctx));
+        assert_eq!(resolve_ws_client_context(&headers), Some(ctx));
+    }
+
+    #[test]
+    fn the_ws_door_substitutes_nothing_for_a_malformed_header() {
+        assert_eq!(
+            resolve_ws_client_context(&header_map("not base64 !!")),
+            None
+        );
     }
 
     #[test]

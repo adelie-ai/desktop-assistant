@@ -423,7 +423,14 @@ pub async fn connect_transport(
     match config.transport_mode {
         #[cfg(feature = "dbus")]
         TransportMode::Dbus => {
-            let client = crate::dbus_client::DbusClient::connect().await?;
+            // The bridge, not this process, holds the daemon connection, so the
+            // #549 context cannot ride a handshake here and the #783 refusal has
+            // no frame to sit on. The client declares the PREFERENCE to the
+            // bridge instead (#782), and the bridge builds its per-caller daemon
+            // session from it; without this the "share device info" control had
+            // no transport at all on D-Bus.
+            let client =
+                crate::dbus_client::DbusClient::connect(config.share_client_context).await?;
             let signal_rx = client.subscribe_signals().await?;
             Ok((TransportClient::Dbus(client), signal_rx, None))
         }

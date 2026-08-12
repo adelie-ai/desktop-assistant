@@ -328,3 +328,75 @@ async fn the_client_context_refusal_is_stated_on_connect_and_restated_on_reconne
         "a sharing client must send no declaration at all"
     );
 }
+
+#[tokio::test]
+async fn a_caller_set_host_label_is_still_cleared_when_sharing_is_off() {
+    // #782: `host_label` is the machine's hostname under another name - the same
+    // `local_hostname()` that fills the client context's `hostname` - so it has
+    // to go when the user withholds device context, or the fact leaves anyway.
+    //
+    // `stamp_system_id` otherwise respects a caller-supplied label. It does not
+    // here: a privacy decision must not be overridable by a config field the
+    // user cannot see. This is the only test that sets BOTH, so it is the only
+    // one exercising the clearing branch; the others leave `host_label` unset,
+    // where the pre-existing "fill it in if absent" path was already correct.
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("labelled-optout.sock");
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    spawn_handshake_capture_server(path.clone(), tx);
+    wait_for_socket(&path).await;
+
+    let config = ConnectionConfig {
+        transport_mode: TransportMode::Uds,
+        socket_path: Some(path.clone()),
+        host_label: Some("a-machine-name".to_string()),
+        share_client_context: false,
+        ..ConnectionConfig::default()
+    };
+    let _connector = Connector::connect(&config)
+        .await
+        .expect("connector connects");
+
+    let frame = timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("handshake captured")
+        .expect("handshake present");
+    assert_eq!(
+        frame.host_label, None,
+        "an explicitly-configured host label must not survive the opt-out"
+    );
+    assert!(
+        frame.system_id.is_some(),
+        "the per-machine co-location id is not the hostname and must still be \
+         sent, or the daemon mis-routes tools for a user who only asked for privacy"
+    );
+}
+
+#[tokio::test]
+async fn a_caller_set_host_label_survives_when_sharing_is_on() {
+    // The other half of the same branch: with sharing on, a caller's own label is
+    // respected rather than overwritten by the resolved hostname. Without this, a
+    // clearing bug that also broke the respect-the-caller path would look correct.
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("labelled-optin.sock");
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    spawn_handshake_capture_server(path.clone(), tx);
+    wait_for_socket(&path).await;
+
+    let config = ConnectionConfig {
+        transport_mode: TransportMode::Uds,
+        socket_path: Some(path.clone()),
+        host_label: Some("a-machine-name".to_string()),
+        share_client_context: true,
+        ..ConnectionConfig::default()
+    };
+    let _connector = Connector::connect(&config)
+        .await
+        .expect("connector connects");
+
+    let frame = timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("handshake captured")
+        .expect("handshake present");
+    assert_eq!(frame.host_label.as_deref(), Some("a-machine-name"));
+}
