@@ -78,7 +78,7 @@
 mod prompt;
 mod tokens;
 
-pub(crate) use prompt::{PromptBreakdown, PromptPart};
+pub(crate) use prompt::{PromptBreakdown, PromptPart, record_round_tool_cost};
 pub(crate) use tokens::{
     Count, TokenTotals, record_genai_tokens_on_span, record_token_usage, record_tokens_on_span,
 };
@@ -296,6 +296,11 @@ pub(crate) fn round_span(round: usize) -> tracing::Span {
         round = round,
         conversation_id = %Safe::name(crate::ports::turn_telemetry::current_conversation_id()),
         tools = tracing::field::Empty,
+        // What this round's own tool block cost (#1212). The turn span carries
+        // the first round's figures and the turn's peak; only the round says
+        // what each round in between sent.
+        prompt.tool_count = tracing::field::Empty,
+        prompt.tool_schema_tokens = tracing::field::Empty,
         outcome = tracing::field::Empty,
         input_tokens = tracing::field::Empty,
         output_tokens = tracing::field::Empty,
@@ -656,6 +661,10 @@ pub(crate) struct RoundGuard {
     llm_called: bool,
     usage: Option<TokenUsage>,
     route: TurnRoute,
+    /// What this round advertised, and what its schemas cost (#1212). `None`
+    /// for a round that stopped before it assembled a prompt, which is an
+    /// unmeasured round rather than one that advertised nothing.
+    tool_cost: Option<(usize, u64)>,
 }
 
 impl RoundGuard {
@@ -669,7 +678,13 @@ impl RoundGuard {
             llm_called: false,
             usage: None,
             route,
+            tool_cost: None,
         }
+    }
+
+    /// Note how many tools this round advertised and what their schemas cost.
+    pub(crate) fn set_tool_cost(&mut self, count: usize, schema_tokens: u64) {
+        self.tool_cost = Some((count, schema_tokens));
     }
 
     /// The round's span, for hanging the provider call and each tool dispatch
@@ -723,6 +738,11 @@ impl Drop for RoundGuard {
     fn drop(&mut self) {
         let elapsed = self.started.elapsed();
         self.span.record("outcome", self.outcome.as_label());
+        if let Some((count, schema_tokens)) = self.tool_cost {
+            self.span.record(prompt::TOOL_COUNT_FIELD, count as u64);
+            self.span
+                .record(PromptPart::ToolSchemas.as_span_field(), schema_tokens);
+        }
         record_round(elapsed, self.outcome);
         if self.llm_called {
             record_token_usage(self.usage.as_ref(), &self.route);

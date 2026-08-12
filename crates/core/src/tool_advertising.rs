@@ -78,6 +78,13 @@
 use crate::domain::ToolDefinition;
 use crate::tool_routing::ToolConnection;
 
+/// The daemon's own discovery tool, by the name the model calls it under.
+///
+/// Named here rather than at each use because it is the condition deferral
+/// depends on: a name the model cannot look up is a name it cannot use, so a
+/// round that does not offer this tool advertises everything in full.
+pub const DISCOVERY_TOOL: &str = "builtin_tool_search";
+
 /// The most tools the always-advertised built-in core may hold.
 ///
 /// Not a configuration value: it is the assertion that keeps the core a
@@ -190,12 +197,42 @@ impl ActivationLedger {
         def: ToolDefinition,
         round: usize,
     ) -> Activated {
+        if let Some(entry) = self.entries.iter_mut().find(|e| e.def.name == def.name) {
+            // One tool is one entry, on whichever surface it arrived by. The
+            // refresh is what keeps the retirement order honest: a tool the
+            // turn keeps reaching for must not read as unused.
+            entry.last_used_round = round;
+            return Activated::AlreadyHeld;
+        }
+
+        let mut retired = None;
+        if self.entries.len() >= self.bound {
+            // The longest unused, and the earliest of those when several tie,
+            // so the choice is deterministic rather than whatever the scan
+            // happened to meet first.
+            let victim = self
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(index, entry)| (entry.last_used_round, *index))
+                .map(|(index, entry)| (index, entry.last_used_round));
+            match victim {
+                // Never one this round is working with: a tool taken away
+                // mid-round is a schema the model just read and can no longer
+                // call.
+                Some((index, last_used)) if last_used < round => {
+                    retired = Some(self.entries.remove(index).def.name);
+                }
+                _ => return Activated::Refused,
+            }
+        }
+
         self.entries.push(Activation {
             connection,
             def,
             last_used_round: round,
         });
-        Activated::Admitted { retired: None }
+        Activated::Admitted { retired }
     }
 
     /// Note that the model called this tool in `round`, so the ledger retires
@@ -255,19 +292,22 @@ mod tests {
         ledger.activate(registry(), tool("a"), 0);
         ledger.activate(registry(), tool("b"), 0);
         ledger.activate(registry(), tool("c"), 0);
-        // `b` and `c` are used later; `a` is the one nothing has touched since
-        // round 0.
+        // Every entry is used, at a different round, and the one used longest
+        // ago is deliberately not the one added first - otherwise "longest
+        // unused" and "oldest" would be the same answer and this would not
+        // tell them apart.
+        ledger.mark_used("a", 3);
         ledger.mark_used("b", 1);
         ledger.mark_used("c", 2);
 
         assert_eq!(
-            ledger.activate(registry(), tool("d"), 3),
+            ledger.activate(registry(), tool("d"), 4),
             Activated::Admitted {
-                retired: Some("a".to_string())
+                retired: Some("b".to_string())
             },
             "the bound retires the tool unused longest, not the one added first"
         );
-        assert_eq!(names(&ledger), vec!["b", "c", "d"]);
+        assert_eq!(names(&ledger), vec!["a", "c", "d"]);
         assert_eq!(ledger.len(), 3, "the bound is a ceiling, not a suggestion");
     }
 

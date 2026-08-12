@@ -323,12 +323,31 @@ prompt the turn opened with, part by part.
 | `prompt.tool_schema_tokens` | the tool schemas, sent out of band in the request's `tools` array |
 | `prompt.total_tokens` | every part above, summed |
 | `prompt.tool_count` | how many tools those schemas describe |
+| `prompt.tool_schema_tokens_max` | the tool-schema cost of the largest block any of the turn's rounds sent |
+| `prompt.tool_count_max` | how many tools that largest block carried |
 
 Every part sums to `prompt.total_tokens` and nothing is left over, so a figure
 that looks wrong can be checked rather than guessed at. `prompt.tool_count` is
 the one figure that is not a token count, and it is named as the count it is:
 the tool bill is a pair, because a schema cost without a tool count says
 nothing about whether to drop a server.
+
+**The tool figures come in three places, because one of them cannot answer the
+question.** The parts above are the prompt the turn *opened* with. Within a turn
+the advertised tool set only grows - a tool search activates what it found, and
+nothing retires until the bound forces it - so the opening figure is the floor
+of that growth. `prompt.tool_schema_tokens_max` and `prompt.tool_count_max` are
+its ceiling, taken from the round whose schemas cost the most, and the pair
+travels from that one round rather than being two independent maxima. Every
+round's own pair is on its own `turn.round` span:
+
+| field | span | what it counts |
+|---|---|---|
+| `prompt.tool_count` | `turn.round` | how many tools this round advertised |
+| `prompt.tool_schema_tokens` | `turn.round` | what this round's schemas cost |
+
+A round that stopped before it assembled a prompt carries neither, which is an
+unmeasured round rather than one that advertised nothing.
 
 **These are estimates, and they will not sum exactly to the provider's own
 input count.** They come from this daemon's estimator - the same one the
@@ -472,6 +491,9 @@ report a user files.
 | `llm.prompt.part.tokens` | counter | `part` |
 | `llm.prompt.tools` | counter | none |
 | `llm.prompt.measured` | counter | none |
+| `llm.prompt.tool.tokens` | counter | `server` |
+| `llm.prompt.round.tools` | counter | none |
+| `llm.prompt.round.measured` | counter | none |
 | `dreaming.scan.duration` | histogram | `outcome` |
 | `dreaming.facts.written` | counter | none |
 | `consolidation.scan.duration` | histogram | `outcome` |
@@ -499,6 +521,16 @@ what fraction of the input one part is spending, which needs no such axis, and
 one of them would burn the label budget. `llm.prompt.measured` counts the
 prompts measured and is the denominator that turns the other two back into a
 per-turn mean.
+
+`llm.prompt.tool.tokens` is the tool schema bill on a per-connection axis, and
+it exists because the aggregate cannot be acted on: an operator reading 23.7k
+spent on tools has no way to tell which server to drop. `server` is the
+connection's own label - `daemon:built-ins`, `client:built-ins`, and
+`daemon:<name>` for each configured MCP server - so it is bounded by the
+operator's configuration the way `model` and `provider` are, and unlike a
+conversation id. It is recorded **per round**, so a set that grows within a turn
+shows the growth; `llm.prompt.round.tools` and `llm.prompt.round.measured` are
+its count and its denominator on the same per-round basis.
 
 They are counters rather than histograms because the facade's only histogram is
 a *duration* histogram - fixed millisecond buckets, a millisecond sum, and an

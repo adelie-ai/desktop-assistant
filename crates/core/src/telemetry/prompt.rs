@@ -81,6 +81,28 @@ pub(crate) const PROMPT_TOOLS: &str = "llm.prompt.tools";
 /// above.
 pub(crate) const PROMPT_MEASURED: &str = "llm.prompt.measured";
 
+/// Estimated tokens spent on the tool schemas one connection put in a round's
+/// block, by that connection (#1212).
+///
+/// The `part` axis above reports one aggregate, and an operator reading 23.7k
+/// on tools cannot tell which server to drop - which is the remedy the
+/// measurement exists to support. The `server` label is the connection's own
+/// label: the daemon's built-ins, the client's, and one value per configured
+/// MCP server. Bounded by the operator's configuration, which is what makes it
+/// safe where a conversation id would not be.
+pub(crate) const PROMPT_TOOL_SERVER_TOKENS: &str = "llm.prompt.tool.tokens";
+
+/// Tool schemas advertised, summed over rounds rather than over turns.
+///
+/// [`PROMPT_TOOLS`] counts a turn's opening block once. Within a turn the set
+/// only grows, so that figure is the floor of exactly the growth this counter
+/// exists to show. Read against [`PROMPT_ROUND_MEASURED`].
+pub(crate) const PROMPT_ROUND_TOOLS: &str = "llm.prompt.round.tools";
+
+/// Rounds whose tool block was measured: the denominator for the two counters
+/// above.
+pub(crate) const PROMPT_ROUND_MEASURED: &str = "llm.prompt.round.measured";
+
 // ---------------------------------------------------------------------------
 // Span field names. Each is a literal in the `turn` span's declaration too,
 // because a span fixes its field set when it opens and a `record` against a
@@ -262,6 +284,11 @@ impl PromptBreakdown {
         self.tool_count
     }
 
+    /// What those schemas cost, in estimated tokens.
+    pub(crate) fn tool_schema_tokens(&self) -> u64 {
+        self.tokens(PromptPart::ToolSchemas)
+    }
+
     /// Every part summed: the whole prompt, plus its out-of-band schemas.
     pub(crate) fn total_tokens(&self) -> u64 {
         self.tokens
@@ -284,9 +311,16 @@ pub(crate) struct ToolBlockPeak {
 
 impl ToolBlockPeak {
     /// Take in what one round's block cost.
+    ///
+    /// The costliest round wins, and its count travels with its cost. Keeping
+    /// the last round's figure instead would under-report every turn whose
+    /// bound retired an activation, and keeping two independent maxima would
+    /// report a pair no round ever sent.
     pub(crate) fn observe(&mut self, count: usize, tokens: u64) {
-        self.count = count;
-        self.tokens = tokens;
+        if tokens > self.tokens {
+            self.count = count;
+            self.tokens = tokens;
+        }
     }
 
     /// How many tools the costliest round advertised.
@@ -317,6 +351,20 @@ pub(crate) fn record_on_span(span: &tracing::Span, breakdown: &PromptBreakdown) 
 pub(crate) fn record_peak_on_span(span: &tracing::Span, peak: ToolBlockPeak) {
     span.record(TOOL_COUNT_PEAK_FIELD, peak.count() as u64);
     span.record(TOOL_TOKENS_PEAK_FIELD, peak.tokens());
+}
+
+/// Accumulate one round's tool block into the metrics facade: what it cost per
+/// connection, how many tools it carried, and that a round was measured.
+pub(crate) fn record_round_tool_cost(count: usize, by_server: &[(String, u64)]) {
+    for (server, tokens) in by_server {
+        metrics::add(
+            PROMPT_TOOL_SERVER_TOKENS,
+            *tokens,
+            &[Label::new("server", server.clone())],
+        );
+    }
+    metrics::add(PROMPT_ROUND_TOOLS, count as u64, &[]);
+    metrics::increment(PROMPT_ROUND_MEASURED, &[]);
 }
 
 /// Accumulate one prompt's breakdown into the metrics facade.

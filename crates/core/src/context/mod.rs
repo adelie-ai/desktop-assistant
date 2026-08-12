@@ -218,6 +218,10 @@ pub(crate) struct ConversationView<'a> {
 pub(crate) struct ToolContext<'a> {
     pub tool_defs: &'a [ToolDefinition],
     pub deferred_namespaces: &'a [ToolNamespace],
+    /// Tools the model is given the name of and no schema (#1212). The round's
+    /// table routes a call to one, so the name is enough to use it; the schema
+    /// arrives the first time the turn actually needs it.
+    pub named_only: &'a [String],
     pub locality: Option<&'a ToolLocalityContext>,
 }
 
@@ -456,18 +460,20 @@ pub(crate) fn assemble_turn_within_budget(
 /// Estimation reuses the same `estimate` closure as message bodies so the
 /// units agree. We serialize each tool's parameters once and weigh name +
 /// description + schema together.
+pub(crate) fn tool_definition_cost(tool: &ToolDefinition, estimate: &dyn Fn(&str) -> u64) -> u64 {
+    // Name and description are short; the schema dominates. Serialize the
+    // parameters compactly — the absolute count only needs to track the
+    // real payload's order of magnitude for the budget check.
+    let schema = tool.parameters.to_string();
+    estimate(&tool.name) + estimate(&tool.description) + estimate(&schema)
+}
+
 fn tool_schema_estimate(
     tool_defs: &[ToolDefinition],
     deferred_namespaces: &[ToolNamespace],
     estimate: &dyn Fn(&str) -> u64,
 ) -> u64 {
-    let tool_cost = |t: &ToolDefinition| -> u64 {
-        // Name and description are short; the schema dominates. Serialize the
-        // parameters compactly — the absolute count only needs to track the
-        // real payload's order of magnitude for the budget check.
-        let schema = t.parameters.to_string();
-        estimate(&t.name) + estimate(&t.description) + estimate(&schema)
-    };
+    let tool_cost = |t: &ToolDefinition| -> u64 { tool_definition_cost(t, estimate) };
 
     let active: u64 = tool_defs.iter().map(tool_cost).sum();
 
@@ -728,9 +734,10 @@ fn assemble_for_test(
 fn build_full_tool_note(
     tool_defs: &[ToolDefinition],
     deferred_namespaces: &[ToolNamespace],
+    tools_named_only: &[String],
     locality: Option<&ToolLocalityContext>,
 ) -> String {
-    if tool_defs.is_empty() && deferred_namespaces.is_empty() {
+    if tool_defs.is_empty() && deferred_namespaces.is_empty() && tools_named_only.is_empty() {
         return "No tools are available in this turn.".to_string();
     }
 
@@ -762,6 +769,24 @@ fn build_full_tool_note(
         } else {
             note = format!("Available tools in this turn: {names}.");
         }
+    }
+
+    // What the block left out but the model may still call (#1212). A name
+    // costs about ten estimated tokens and a schema roughly 250, so the
+    // existence of a capability is nearly free where its body is not. The
+    // model calls one by name; the round's table routes it, and the schema
+    // arrives the first time the turn needs it.
+    if !tools_named_only.is_empty() {
+        if !note.is_empty() {
+            note.push('\n');
+        }
+        note.push_str(&format!(
+            "Also callable by name, with their arguments not listed here: {}. \
+             Call one directly when its name says what it does; a call whose \
+             arguments do not fit is answered with the tool's schema rather \
+             than run, and builtin_tool_search describes any of them.",
+            tools_named_only.join(", ")
+        ));
     }
 
     // When deferred namespaces exist (hosted or not), append a compact
@@ -1000,8 +1025,12 @@ fn system_block(
     budget: Option<ContextBudget>,
     estimate: &dyn Fn(&str) -> u64,
 ) -> String {
-    let tool_note =
-        build_full_tool_note(tools.tool_defs, tools.deferred_namespaces, tools.locality);
+    let tool_note = build_full_tool_note(
+        tools.tool_defs,
+        tools.deferred_namespaces,
+        tools.named_only,
+        tools.locality,
+    );
     // Rendered once and reused by both the full and the demoted assembly: the
     // topology is a fact about the connection, not about the tool listing, so
     // demoting the listing must not change it.
@@ -2058,6 +2087,7 @@ mod tests {
             &ToolContext {
                 tool_defs: &tool_defs,
                 deferred_namespaces: &[],
+                named_only: &[],
                 locality,
             },
             &AmbientContext::default(),
@@ -4463,6 +4493,7 @@ mod tests {
             &ToolContext {
                 tool_defs: &tools,
                 deferred_namespaces: &[],
+                named_only: &[],
                 locality: None,
             },
             &TurnAnchors {
@@ -6391,7 +6422,7 @@ mod tests {
             &["terminal", "kb_search"],
             &[],
         );
-        let note = build_full_tool_note(&tools, &[], Some(&ctx));
+        let note = build_full_tool_note(&tools, &[], &[], Some(&ctx));
         assert!(note.contains("Available tools in this turn: terminal, kb_search."));
         assert!(!note.contains("server 'daemon-host'"), "note: {note}");
         assert!(!note.contains("your device"), "note: {note}");
@@ -6412,7 +6443,7 @@ mod tests {
             &["terminal"],
             &["device_terminal"],
         );
-        let note = build_full_tool_note(&tools, &[], Some(&ctx));
+        let note = build_full_tool_note(&tools, &[], &[], Some(&ctx));
         assert!(
             note.contains("terminal — server 'daemon-host'"),
             "note: {note}"
@@ -6440,7 +6471,7 @@ mod tests {
             &[],
             &["voice_stop"],
         );
-        let note = build_full_tool_note(&tools, &[], Some(&ctx));
+        let note = build_full_tool_note(&tools, &[], &[], Some(&ctx));
         assert!(note.contains("voice_stop — your device"), "note: {note}");
         assert!(
             !note.contains("ask which machine"),
@@ -6456,9 +6487,9 @@ mod tests {
             "run",
             serde_json::json!({}),
         )];
-        let with_none = build_full_tool_note(&tools, &[], None);
+        let with_none = build_full_tool_note(&tools, &[], &[], None);
         let co_located = locality_ctx(TransportKind::Uds, "daemon-host", &["terminal"], &[]);
-        let with_local = build_full_tool_note(&tools, &[], Some(&co_located));
+        let with_local = build_full_tool_note(&tools, &[], &[], Some(&co_located));
         assert_eq!(
             with_none, with_local,
             "co-located note must match the no-context plain list"

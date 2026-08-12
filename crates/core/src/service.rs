@@ -733,6 +733,76 @@ fn turn_messages(messages: &[Message], turn_start: usize) -> &[Message] {
     messages.get(turn_start..).unwrap_or(&[])
 }
 
+/// The connection an activated daemon tool belongs to (#1216).
+///
+/// The server that offers it where this turn can name one; the registry as a
+/// whole otherwise, which is a distinct connection so that a collision with a
+/// built-in is still reported as the fault it is.
+fn activation_connection(namespaces: &[ToolNamespace], tool_name: &str) -> ToolConnection {
+    namespaces
+        .iter()
+        .find(|ns| ns.tools.iter().any(|t| t.name == tool_name))
+        .map_or_else(ToolConnection::daemon_registry, |ns| {
+            ToolConnection::daemon_server(&ns.name)
+        })
+}
+
+/// Put a tool in the turn's block for the rounds that follow, and say what the
+/// bound did about it (#1212).
+///
+/// A refusal and a retirement both change what the model can reach, so neither
+/// is silent: an operator reading a turn that stopped finding tools has the
+/// line that says why.
+fn record_activation(
+    activations: &mut crate::tool_advertising::ActivationLedger,
+    connection: ToolConnection,
+    def: ToolDefinition,
+    round: usize,
+    reason: &'static str,
+) {
+    let name = def.name.clone();
+    match activations.activate(connection, def, round) {
+        crate::tool_advertising::Activated::Admitted { retired } => {
+            tracing::info!(tool = %Safe::name(&name), activated = activations.len(), reason);
+            if let Some(retired) = retired {
+                tracing::info!(
+                    tool = %Safe::name(&retired),
+                    bound = activations.bound(),
+                    "retired the longest-unused activated tool to stay inside the bound"
+                );
+            }
+        }
+        crate::tool_advertising::Activated::AlreadyHeld => {}
+        crate::tool_advertising::Activated::Refused => tracing::warn!(
+            tool = %Safe::name(&name),
+            bound = activations.bound(),
+            "the turn already holds its bound of activated tools, all of them in use \
+             this round; this one was not activated"
+        ),
+    }
+}
+
+/// What a schema says is wrong with arguments the model wrote without reading
+/// it (#1212).
+///
+/// Deliberately narrow. It reports the one fault a guess from a name actually
+/// makes - a required argument that is not there - and judges nothing else. A
+/// full JSON Schema validation here would refuse calls the tool itself would
+/// have accepted, and a refusal the tool would not have made is worse than the
+/// guess: it costs a round and teaches the model nothing true.
+fn missing_required_argument(
+    schema: &serde_json::Value,
+    arguments: &serde_json::Value,
+) -> Option<String> {
+    let required = schema.get("required")?.as_array()?;
+    let supplied = arguments.as_object();
+    required
+        .iter()
+        .filter_map(|name| name.as_str())
+        .find(|name| supplied.is_none_or(|args| !args.contains_key(*name)))
+        .map(str::to_string)
+}
+
 /// What a step note stores, and whether the turn writing it had already read
 /// content from outside the trust boundary (#1247).
 ///
@@ -2626,16 +2696,15 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
             "tool discovery mode resolved"
         );
 
-        // Insertion-ordered, and a `Vec` for exactly that reason. A map
-        // iterates in an order nothing guarantees, so the advertised tool block
-        // could reorder between rounds with nothing activated - and the block
-        // is the outermost section a provider hashes for its prompt cache, so
-        // a reorder throws the cache away for the system block behind it too.
-        // Appending keeps each round's block a byte-identical prefix of the
-        // next, which is what lets a cache checkpoint move forward instead of
-        // being rebuilt (#1212). Activation counts are in the tens, so the
-        // linear membership checks below cost nothing worth measuring.
-        let mut activated_tools: Vec<ToolDefinition> = Vec::new();
+        // What this turn's searches and first calls activated (#1212). Ordered
+        // by activation and bounded: under the bound it only appends, so each
+        // round's tool block is a byte-identical prefix of the next one's -
+        // the block is the outermost section a provider hashes for its prompt
+        // cache, and a reorder throws the cache away for the system block
+        // behind it too. At the bound the longest-unused entry retires, which
+        // is what makes a 200-round turn's tool block finite. The lifetime is
+        // this turn: a new turn builds a new ledger.
+        let mut activations = crate::tool_advertising::ActivationLedger::new();
         // Track whether hosted search has been demoted to local fallback.
         let mut hosted_search_demoted = false;
         // Tool-provenance gating (#741). A plain local of the turn: once a
@@ -2908,27 +2977,44 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
             let mut router = ToolRouter::new();
             // When hosted search has been demoted, offer the full core set
             // (which includes the discovery tool) instead of the filtered one.
-            router.offer(
-                &ToolConnection::daemon_builtins(),
-                if hosted_search_demoted {
-                    &core_tools
-                } else {
-                    &core_tools_for_llm
-                },
-            );
-            // Anything a tool search activated, attributed to the server that
-            // offers it where this turn can name one. A tool the turn cannot
-            // attribute belongs to the registry as a whole, which is a distinct
-            // connection so that a collision with a built-in is still reported.
-            for def in &activated_tools {
-                let connection = namespaces
-                    .iter()
-                    .find(|ns| ns.tools.iter().any(|t| t.name == def.name))
-                    .map_or_else(ToolConnection::daemon_registry, |ns| {
-                        ToolConnection::daemon_server(&ns.name)
-                    });
-                router.offer(&connection, std::slice::from_ref(def));
-            }
+            let round_core: &[ToolDefinition] = if hosted_search_demoted {
+                &core_tools
+            } else {
+                &core_tools_for_llm
+            };
+            // Whether the model can look a name up this round, which is what
+            // makes leaving a schema out safe (#1212). A name nothing can
+            // describe is a name the model cannot use, so a turn without the
+            // discovery tool advertises every registered tool in full however
+            // many there are. Read from the set actually offered, not from the
+            // capability flags, because demotion changes it part-way through a
+            // turn.
+            let discovery_offered = round_core
+                .iter()
+                .any(|t| t.name == crate::tool_advertising::DISCOVERY_TOOL);
+            //
+            // Everything constant for the turn is offered first and the
+            // activations last, so each round's block is a byte-identical
+            // prefix of the next one's. That is what a provider's prompt cache
+            // matches on, and a set that reordered would throw the cache away
+            // for the system block behind it too.
+            router.offer(&ToolConnection::daemon_builtins(), round_core);
+            // The connection's registered client-local tools (#234), which run
+            // on the user's own machine. Bounded (#1212): the connection hosts
+            // whatever it happens to host, and one measured turn carried 77 of
+            // them at roughly 19k estimated tokens. The first
+            // `MAX_CLIENT_TOOLS_IN_BLOCK` keep their schemas and the rest are
+            // offered as names, which the tool note lists and the table routes.
+            let client_in_block = if discovery_offered {
+                client_tool_defs
+                    .len()
+                    .min(crate::tool_advertising::MAX_CLIENT_TOOLS_IN_BLOCK)
+            } else {
+                client_tool_defs.len()
+            };
+            let device = ToolConnection::client_device();
+            router.offer(&device, &client_tool_defs[..client_in_block]);
+            router.offer_named(&device, &client_tool_defs[client_in_block..]);
             // The daemon's deferred fleet, when the provider's own tool search
             // is carrying it. The model can call these by name, so the table
             // has to route them, and they count for uniqueness like everything
@@ -2940,9 +3026,6 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                     router.offer_deferred(&ToolConnection::daemon_server(&ns.name), &ns.tools);
                 }
             }
-            // The connection's registered client-local tools (#234), which run
-            // on the user's own machine.
-            router.offer(&ToolConnection::client_device(), &client_tool_defs);
             // The step-planning + compaction tools (#240) when a scratchpad
             // writer is wired. They are the loop's own control surface - it runs
             // them itself, before any executor - so they have no connection and
@@ -2957,6 +3040,13 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 if self.skill_write_authored.is_some() {
                     router.offer_core_loop_tool(skill_promotion::promote_plan_tool());
                 }
+            }
+            // Last, and only ever appended to (#1212): what this turn's tool
+            // searches and first calls activated, each under the connection the
+            // activation recorded. Bounded by `MAX_ACTIVATED_TOOLS`, and gone
+            // when the turn ends.
+            for (connection, def) in activations.offers() {
+                router.offer(connection, std::slice::from_ref(def));
             }
 
             // Two connections claiming one name is a configuration fault, not a
@@ -3001,6 +3091,10 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 router.advertised_names_at(crate::tool_routing::ToolLocation::Client);
 
             let tool_defs: Vec<ToolDefinition> = router.advertised_definitions();
+            // What the block left out and the note names instead (#1212). Read
+            // from the table, so a name the model is given is a name the table
+            // routes.
+            let named_only: Vec<String> = router.named_only_names();
 
             // What the provider's tool search may carry this round: the
             // deferred fleet minus every name an advertised tool already
@@ -3087,6 +3181,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
             let tool_ctx = ToolContext {
                 tool_defs: &tool_defs,
                 deferred_namespaces: deferred_ns,
+                named_only: &named_only,
                 locality: Some(&tool_locality),
             };
             let anchors = TurnAnchors {
@@ -3164,7 +3259,25 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
             // ships, and only the first round's - the guard keeps the first
             // and ignores the rest, so the turn span reports the standing bill
             // the turn opened with rather than the tail of its own tool loop.
+            // It also carries the turn's peak, because within a turn the
+            // advertised set only grows and the opening figure is its floor.
             report.set_prompt_breakdown(assembled.breakdown);
+            // The same pair on this round's own span, and per connection on
+            // the `server` axis (#1212). Per round because the turn-level
+            // figure is the first round's and cannot show the growth; per
+            // connection because one aggregate of 23.7k names nothing an
+            // operator can drop. Denominated in the same estimator the budget
+            // check reads, so the two can never disagree about a block's cost.
+            round_report.set_tool_cost(
+                assembled.breakdown.tool_count(),
+                assembled.breakdown.tool_schema_tokens(),
+            );
+            crate::telemetry::record_round_tool_cost(
+                assembled.breakdown.tool_count(),
+                &router.advertised_cost_by_connection(&|def| {
+                    crate::context::tool_definition_cost(def, &estimate)
+                }),
+            );
             // What the `[Recall]` block put in front of the model, recorded as
             // an offer (#698). Only on a turn's first round, because that is
             // the only round the block renders on - recording an empty list on
@@ -3922,6 +4035,70 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                     continue;
                 }
 
+                // A tool the block advertised by name and no schema (#1212).
+                // The model wrote this call from the name alone, so two things
+                // happen here, in this order.
+                //
+                // First the arguments are checked against the schema it never
+                // read. A guess that leaves out a required argument is answered
+                // with the schema rather than run - a round is spent only when
+                // the schema genuinely had to be seen, and nothing acts on a
+                // guess. Then the schema joins the block, so the retry is not a
+                // second guess and every later use is free of this.
+                //
+                // Scoped to names, never to the deferred fleet: a deferred
+                // tool's schema does reach the model, through the provider's
+                // own tool search, so the model has read it and a check here
+                // would refuse a call it wrote from the real thing.
+                if let Some(entry) = routed.filter(|e| e.is_named_only()) {
+                    let def = entry.definition().clone();
+                    let connection = entry.connection().cloned();
+                    let refusal = missing_required_argument(&def.parameters, &arguments);
+                    if let Some(connection) = connection {
+                        record_activation(
+                            &mut activations,
+                            connection,
+                            ToolDefinition::new(
+                                entry.provider_name(),
+                                def.description.clone(),
+                                def.parameters.clone(),
+                            ),
+                            round,
+                            "activated a tool the model called by name",
+                        );
+                    }
+                    if let Some(missing) = refusal {
+                        tracing::info!(
+                            tool = %Safe::name(&tool_call.name),
+                            argument = %Safe::name(&missing),
+                            "a call written from a tool's name alone is missing a required \
+                             argument; answering with the schema instead of running it"
+                        );
+                        let answer = format!(
+                            "Error: this call is missing the required argument '{missing}'. \
+                             You had this tool's name but not its arguments. Its schema is \
+                             {}. Call it again with arguments that match.",
+                            def.parameters
+                        );
+                        notify_tool_event(ToolEvent::Started {
+                            name: summarize_tool_name(&tool_call.name),
+                            args: summarize_tool_value(&arguments),
+                        });
+                        notify_tool_event(ToolEvent::Finished {
+                            name: summarize_tool_name(&tool_call.name),
+                            ok: false,
+                            output: "answered with the tool's schema".to_string(),
+                        });
+                        conv.messages
+                            .push(Message::tool_result(&tool_call.id, &answer));
+                        continue;
+                    }
+                }
+
+                // The turn keeps its activations by last use (#1212), so a tool
+                // the model is working with is the last one the bound retires.
+                activations.mark_used(call_name, round);
+
                 notify_tool_event(ToolEvent::Started {
                     name: summarize_tool_name(&tool_call.name),
                     args: summarize_tool_value(&arguments),
@@ -4189,32 +4366,48 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                     && let Some(tools_arr) = found.get("tools").and_then(|v| v.as_array())
                 {
                     for tool_entry in tools_arr {
-                        // A hit that runs on the user's own machine is already
-                        // in the round's table, offered by the client (#1216).
-                        // Activating the daemon's tool of the same name would
-                        // add a second host to the name and, by the routing
-                        // policy, make the daemon the default - moving a
-                        // capability the search just told the model runs on its
-                        // own machine onto another one, part-way through the
-                        // turn.
-                        if tool_entry.get("runs_on").and_then(|v| v.as_str())
-                            == Some(crate::domain::ToolRunner::Device.as_str())
-                        {
-                            continue;
-                        }
-                        if let Some(name) = tool_entry
+                        let Some(name) = tool_entry
                             .get("name")
                             .and_then(|v| v.as_str())
                             .map(strip_location)
-                            && !activated_tools.iter().any(|t| t.name == name)
-                            && !core_tools.iter().any(|t| t.name == name)
-                            && let Ok(Some(def)) = self.tools.tool_definition(name).await
-                        {
-                            tracing::info!(
-                                tool = %Safe::name(&def.name),
-                                "dynamically activated a tool"
+                        else {
+                            continue;
+                        };
+                        // A hit that runs on the user's own machine belongs to
+                        // the client's own connection (#1216). Activating the
+                        // daemon's tool of the same name would add a second
+                        // host to the name and, by the routing policy, make the
+                        // daemon the default - moving a capability the search
+                        // just told the model runs on its own machine onto
+                        // another one, part-way through the turn. The client's
+                        // own definition is a different matter: the search told
+                        // the model the tool exists, so giving it the schema is
+                        // what saves the guess the name alone would be (#1212).
+                        let on_device = tool_entry.get("runs_on").and_then(|v| v.as_str())
+                            == Some(crate::domain::ToolRunner::Device.as_str());
+                        let found = if on_device {
+                            client_tool_defs
+                                .iter()
+                                .find(|t| t.name == name)
+                                .map(|def| (ToolConnection::client_device(), def.clone()))
+                        } else if core_tools.iter().any(|t| t.name == name) {
+                            None
+                        } else {
+                            self.tools
+                                .tool_definition(name)
+                                .await
+                                .ok()
+                                .flatten()
+                                .map(|def| (activation_connection(&namespaces, &def.name), def))
+                        };
+                        if let Some((connection, def)) = found {
+                            record_activation(
+                                &mut activations,
+                                connection,
+                                def,
+                                round,
+                                "dynamically activated a tool",
                             );
-                            activated_tools.push(def);
                         }
                     }
                 }
@@ -4233,21 +4426,20 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 if use_hosted_search
                     && !hosted_search_demoted
                     && routed.is_none_or(|entry| !entry.is_client())
-                    && !activated_tools.iter().any(|t| t.name == call_name)
+                    && !activations.holds(call_name)
                     && !core_tools.iter().any(|t| t.name == call_name)
                 {
                     for ns in &namespaces {
                         if ns.tools.iter().any(|t| t.name == call_name) {
                             for t in &ns.tools {
-                                if !activated_tools.iter().any(|a| a.name == t.name)
-                                    && !core_tools.iter().any(|ct| ct.name == t.name)
-                                {
-                                    tracing::info!(
-                                        namespace = %Safe::name(&ns.name),
-                                        tool = %Safe::name(&t.name),
-                                        "activated a deferred tool from its namespace"
+                                if !core_tools.iter().any(|ct| ct.name == t.name) {
+                                    record_activation(
+                                        &mut activations,
+                                        ToolConnection::daemon_server(&ns.name),
+                                        t.clone(),
+                                        round,
+                                        "activated a deferred tool from its namespace",
                                     );
-                                    activated_tools.push(t.clone());
                                 }
                             }
                             break;
@@ -4428,6 +4620,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 },
                 &ToolContext {
                     tool_defs: &[],
+                    named_only: &[],
                     deferred_namespaces: &[],
                     locality: None,
                 },
@@ -11687,7 +11880,7 @@ mod tests {
         let tool_result = second_round
             .iter()
             .rev()
-            .find(|m| m.content.contains("device_tool_19"))
+            .find(|m| m.role == Role::Tool)
             .map(|m| m.content.clone())
             .expect("the refused call left a tool result");
         assert!(
@@ -11762,6 +11955,75 @@ mod tests {
             1 + MAX_ACTIVATED_TOOLS,
             "forty hits may not become forty schemas; the block carried {:?}",
             advertised_names(round_two)
+        );
+    }
+
+    /// The other half of the prefix property, and the one a round that grows
+    /// can break: what round one sent must still be there, in the same order,
+    /// at the front of round two's block. An activation offered anywhere but
+    /// last would move the tools behind it and cost the cached prefix on the
+    /// round that already pays for a search.
+    #[tokio::test]
+    async fn a_round_that_activates_a_tool_appends_it_and_leaves_the_earlier_block_unchanged() {
+        use crate::ports::client_tools::with_client_tools;
+
+        let search_result = serde_json::json!({
+            "ok": true,
+            "tools": [{"name": "daemon_fleet_lookup", "description": "a fleet tool", "runs_on": "daemon"}],
+        })
+        .to_string();
+        let responses = vec![
+            LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new(
+                    "c1",
+                    "daemon_builtin_tool_search",
+                    r#"{"query":"anything"}"#,
+                )],
+            ),
+            LlmResponse::text("done"),
+        ];
+        let (handler, advertised, _prompts) = advertising_handler(
+            responses,
+            vec![search_tool()],
+            vec![ToolDefinition::new(
+                "fleet_lookup",
+                "a fleet tool",
+                speak_schema(),
+            )],
+            HashMap::from([("builtin_tool_search".to_string(), search_result)]),
+        );
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        with_client_tools(
+            client_port(registered_client_tools(20), &ran),
+            handler.send_prompt(&conv.id, "find it".into(), noop_callback(), noop_status()),
+        )
+        .await
+        .expect("turn completes");
+
+        let rounds = advertised.lock().unwrap().clone();
+        let (before, after) = (&rounds[0], &rounds[1]);
+        assert_eq!(
+            after.len(),
+            before.len() + 1,
+            "the search activated exactly one tool; the block went from {:?} to {:?}",
+            advertised_names(before),
+            advertised_names(after)
+        );
+        assert_eq!(
+            &after[..before.len()],
+            &before[..],
+            "an activation appends; everything the round before sent stays where it \
+             was, or the cached prefix behind it is thrown away"
+        );
+        assert_eq!(
+            after[before.len()].name,
+            "daemon_fleet_lookup",
+            "and the new tool is the one on the end"
         );
     }
 

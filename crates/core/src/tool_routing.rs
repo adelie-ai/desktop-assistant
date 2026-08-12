@@ -150,8 +150,13 @@ impl ToolConnection {
         self.namespace.as_deref()
     }
 
-    /// How the connection is named in a log line and in a duplicate report.
-    fn label(&self) -> String {
+    /// How the connection is named in a log line, a duplicate report, and the
+    /// `server` axis of the per-connection schema cost (#1212).
+    ///
+    /// Bounded by the operator's own configuration - the daemon's built-ins,
+    /// the client's, and one value per configured MCP server - which is what
+    /// makes it safe as a metric label where a conversation id would not be.
+    pub fn label(&self) -> String {
         match &self.namespace {
             Some(ns) => format!("{}:{ns}", self.location.as_str()),
             None => format!("{}:built-ins", self.location.as_str()),
@@ -259,6 +264,22 @@ pub enum ToolSurface {
     /// it can be routed and counted for uniqueness; its schema travels in the
     /// namespaces rather than the block.
     Deferred,
+    /// Advertised as a name and nothing else (#1212): the tool note says it
+    /// exists, no schema is shown anywhere, and the table routes a call to it.
+    ///
+    /// Distinct from [`ToolSurface::Deferred`] because the difference decides
+    /// whether the model has read the schema. A deferred tool's schema reaches
+    /// the model through the provider's own tool search; a named one's reaches
+    /// nothing, so a first call to it is a guess from the name, and the loop
+    /// treats it as one.
+    Named,
+}
+
+impl ToolSurface {
+    /// Whether the round's tool block carries this tool's schema.
+    pub(crate) fn in_block(self) -> bool {
+        matches!(self, Self::CoreLoop | Self::Block)
+    }
 }
 
 /// One entry: the name the model reads, the name everything else uses, and
@@ -306,6 +327,12 @@ impl RoutedTool {
     /// executor.
     pub fn is_core_loop(&self) -> bool {
         self.surface == ToolSurface::CoreLoop
+    }
+
+    /// Whether the model was offered this tool's name with no schema anywhere
+    /// (#1212), so a call to it was written from the name alone.
+    pub fn is_named_only(&self) -> bool {
+        self.surface == ToolSurface::Named
     }
 
     /// Whether it runs on the connected client's machine, read from the
@@ -382,6 +409,17 @@ impl ToolRouter {
         self.admit(connection, defs, ToolSurface::Deferred);
     }
 
+    /// Offer a connection's capabilities as names only: the tool note says they
+    /// exist, no schema is shown, and a call to one is routed all the same.
+    ///
+    /// This is what keeps a large connection off the bill (#1212). A schema
+    /// costs roughly 250 estimated tokens and a name about ten, so the model
+    /// keeps the recognition surface at a fortieth of the price and pays for a
+    /// body only when it uses one.
+    pub fn offer_named(&mut self, connection: &ToolConnection, defs: &[ToolDefinition]) {
+        self.admit(connection, defs, ToolSurface::Named);
+    }
+
     /// Offer one of the turn loop's own control tools, which has no location
     /// and takes no root: the loop runs it itself and no executor sees it.
     pub fn offer_core_loop_tool(&mut self, def: ToolDefinition) {
@@ -415,9 +453,47 @@ impl ToolRouter {
     pub fn advertised_definitions(&self) -> Vec<ToolDefinition> {
         self.entries
             .iter()
-            .filter(|e| e.surface != ToolSurface::Deferred)
+            .filter(|e| e.surface.in_block())
             .map(|e| e.advertised.clone())
             .collect()
+    }
+
+    /// The composed names of every tool offered as a name and nothing else
+    /// (#1212), in the order they were offered.
+    ///
+    /// What the tool note lists so the model knows they exist. Read from the
+    /// table, so a name the note gives is a name the table routes.
+    pub fn named_only_names(&self) -> Vec<String> {
+        self.entries
+            .iter()
+            .filter(|e| e.surface == ToolSurface::Named)
+            .map(|e| e.advertised.name.clone())
+            .collect()
+    }
+
+    /// What each connection's advertised schemas cost this round, by the label
+    /// an operator reads (#1212).
+    ///
+    /// One aggregate figure says the tools cost 23.7k and names nothing to
+    /// drop; this says which connection to look at. Only what the block
+    /// actually carries is counted, because that is what was paid for.
+    pub fn advertised_cost_by_connection(
+        &self,
+        cost: &dyn Fn(&ToolDefinition) -> u64,
+    ) -> Vec<(String, u64)> {
+        let mut totals: Vec<(String, u64)> = Vec::new();
+        for entry in self.entries.iter().filter(|e| e.surface.in_block()) {
+            let label = entry
+                .connection
+                .as_ref()
+                .map_or_else(|| "core-loop".to_string(), ToolConnection::label);
+            let spent = cost(&entry.advertised);
+            match totals.iter_mut().find(|(name, _)| name == &label) {
+                Some((_, total)) => *total = total.saturating_add(spent),
+                None => totals.push((label, spent)),
+            }
+        }
+        totals
     }
 
     /// The deferred namespaces as the model may be offered them: every tool
@@ -531,8 +607,10 @@ impl ToolRouter {
             .find(|e| e.advertised.name == advertised.name)
         {
             if held.connection == connection && held.provider_name == provider_name {
-                // One tool, two surfaces. Keep the one the model can read.
-                if held.surface == ToolSurface::Deferred && surface != ToolSurface::Deferred {
+                // One tool, two surfaces. Keep the one the model can read: an
+                // offer that puts the schema in the block wins over one that
+                // leaves it out, whichever arrived first.
+                if !held.surface.in_block() && surface.in_block() {
                     held.surface = surface;
                     held.advertised = advertised;
                 }
