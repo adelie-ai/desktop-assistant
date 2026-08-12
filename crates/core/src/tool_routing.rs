@@ -954,6 +954,41 @@ mod tests {
         );
     }
 
+    /// #1294: promoting a held entry into the block moves it to the end. The
+    /// round loop offers the stable tiers first and the turn's activations
+    /// last, and a promotion that kept the slot its earlier entry claimed would
+    /// put a schema in the middle and shift every tool behind it - so the round
+    /// before would stop being a prefix of this one.
+    #[test]
+    fn a_tool_promoted_into_the_block_takes_a_position_after_everything_already_offered() {
+        let mut router = ToolRouter::new();
+        let fileio = ToolConnection::daemon_server("fileio");
+        // A deferred tool, then two tools whose schemas the block already
+        // carries, so the promotion below has somewhere to land in the middle.
+        router.offer_deferred(&fileio, &[def("fileio__read_file", "read a file")]);
+        router.offer(
+            &ToolConnection::daemon_builtins(),
+            &[def("builtin_tool_search", "find tools")],
+        );
+        router.offer(
+            &ToolConnection::client_device(),
+            &[def("take_screenshot", "client built-in")],
+        );
+
+        router.offer(&fileio, &[def("fileio__read_file", "read a file")]);
+
+        assert_eq!(
+            advertised_names(&router),
+            vec![
+                "daemon_builtin_tool_search".to_string(),
+                "client_take_screenshot".to_string(),
+                "daemon_fileio__read_file".to_string(),
+            ],
+            "the promoted tool goes last, leaving what was already advertised \
+             where it was"
+        );
+    }
+
     /// A deferred tool is routable but not advertised: its schema reaches the
     /// model through the provider's own tool search, under its composed name.
     #[test]
