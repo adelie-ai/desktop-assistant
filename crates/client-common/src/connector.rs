@@ -257,12 +257,35 @@ fn jittered_backoff(current: Duration) -> Duration {
 /// handshake (#248), unless the caller already set them (respected so tests can
 /// inject a specific id). Reads the local id once (cached). Returns the
 /// (possibly) updated config — stored by the Connector and re-read by the
-/// reconnect supervisor, so the id rides both connect AND reconnect.
+/// reconnect supervisor, so both ride connect AND reconnect.
+///
+/// The two fields are treated differently when the user withholds device context
+/// (#782), because they are different kinds of fact:
+///
+/// - `host_label` is the machine's **hostname**, resolved by the same function
+///   that fills [`ClientContext::hostname`](desktop_assistant_api_model::ClientContext::hostname).
+///   It exists only to make a tool note read nicely (`your device 'laptop'`), so
+///   it fails the same test the context does and is cleared - and cleared even
+///   when a caller set one, because a privacy decision must not be overridable
+///   by a field the user cannot see.
+/// - `system_id` is compared against the daemon's own to decide whether a tool
+///   runs on the same machine as the client (#248), so dropping it would
+///   silently mis-route tools rather than protect anything. It is sent either
+///   way. It carries no name and no hostname, but it is not nothing: it is
+///   `/etc/machine-id` verbatim (#248), a stable per-installation identifier
+///   that correlates every connection from this machine. On a local socket that
+///   is unremarkable - the daemon already knows the machine it runs on. Over a
+///   WebSocket to a daemon elsewhere it is a linkable identifier travelling from
+///   a user who asked for device context to be withheld. Left as it is here
+///   because the routing depends on it and changing it is #248's decision, not
+///   this one's.
 fn stamp_system_id(mut config: ConnectionConfig) -> ConnectionConfig {
     if config.system_id.is_none() {
         config.system_id = crate::system_id::local_system_id();
     }
-    if config.host_label.is_none() {
+    if !config.share_client_context {
+        config.host_label = None;
+    } else if config.host_label.is_none() {
         config.host_label = crate::client_context::local_hostname();
     }
     config

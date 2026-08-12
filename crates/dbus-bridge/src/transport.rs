@@ -16,11 +16,34 @@
 //! [`crate::adapter::event_forwarder`], which consumes the Connector's signal
 //! stream directly.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use desktop_assistant_api_model as api;
-use desktop_assistant_client_common::Connector;
+use desktop_assistant_client_common::{ConnectionConfig, Connector, TransportMode};
+
+/// The daemon connection the bridge opens on its own behalf, and the template
+/// each per-sender session is built from.
+///
+/// It **withholds the client context** (#782). The bridge runs as the user, on
+/// the user's machine, so resolving its own environment would hand the daemon the
+/// user's name, login, home directory, hostname and timezone - by a route no
+/// caller ever consented to, and one the "share device info" control does not
+/// reach. A D-Bus caller that wants its context shared declares that for itself
+/// (`org.desktopAssistant.Commands.SetShareClientContext`), and the per-sender
+/// session factory turns the declaration back on for that session alone.
+///
+/// The local UDS hop is peer-cred authenticated (#407), so no token is minted.
+pub fn bridge_daemon_config(daemon_socket: PathBuf) -> ConnectionConfig {
+    ConnectionConfig {
+        transport_mode: TransportMode::Uds,
+        socket_path: Some(daemon_socket),
+        ws_jwt: None,
+        share_client_context: false,
+        ..ConnectionConfig::default()
+    }
+}
 
 /// Errors surfaced to the D-Bus adapters. The Connector reports failures as
 /// `anyhow::Error`; the bridge collapses them into [`Self::Daemon`] (message

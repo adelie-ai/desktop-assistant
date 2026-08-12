@@ -179,6 +179,13 @@ const ADDITIONS: &[(&str, &str)] = &[
         "org.desktopAssistant.Settings",
         "method RemoveServiceAccount(in:s:id)",
     ),
+    // #782 — the client-context privacy preference over D-Bus. A D-Bus caller
+    // cannot put it on a daemon handshake itself (the bridge holds that
+    // connection), so it declares the preference here instead.
+    (
+        "org.desktopAssistant.Commands",
+        "method SetShareClientContext(in:b:enabled)",
+    ),
     // #1007 — per-conversation override for the tool-provenance gate.
     (
         "org.desktopAssistant.Conversations",

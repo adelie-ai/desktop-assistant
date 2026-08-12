@@ -34,6 +34,35 @@ Interface: `org.desktopAssistant.Settings`
   - Per-conversation override for the tool-provenance gate (see "Tool-provenance
     gating" below). Returns the stored value after the write.
 
+### Command channel
+
+Object path: `/org/desktopAssistant/Commands`
+Interface: `org.desktopAssistant.Commands`
+
+- `SendCommand(command_json: s) -> result_json: s`
+  - One JSON-in / JSON-out method carrying the whole request/response command
+    surface, the D-Bus counterpart of the socket transports' frame round trip.
+- `SetShareClientContext(enabled: b) -> ()`
+  - Declares whether this caller shares its device context - the user's name,
+    login, home directory, hostname, timezone and OS - with the assistant.
+  - Call it before any session-scoped command. The bridge holds the daemon
+    connection, so a D-Bus caller cannot put the preference on a daemon
+    handshake itself. The bridge records the declaration against the caller's
+    unique bus name and builds that caller's daemon session from it - a refusal
+    becomes the `share_client_context: false` the daemon reads off that
+    session's UDS handshake (#783), which is what stops it substituting the
+    kernel peer identity.
+  - **A caller that never calls this shares nothing.** Silence is not consent,
+    so a client too old to know the method is not treated as consenting.
+  - Re-declaring the same value is free. Changing it drops the caller's open
+    daemon session, so the next session-scoped call opens one carrying the new
+    decision. A caller with no bus sender is refused, because there is no
+    session to attach the preference to.
+  - The bridge's own shared connection - the one that serves stateless commands
+    on behalf of no declared caller - always withholds. It runs as the user on
+    the user's machine, so resolving its own environment would hand the daemon
+    the same facts by a route nobody consented to.
+
 ### Settings Methods
 
 - `SetApiKey(api_key: s) -> ()`

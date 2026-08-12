@@ -102,9 +102,42 @@ pub struct ConnectionConfig {
     /// timezone, OS) with the assistant so it can personalize; unchecked, the
     /// client sends nothing (#549). Default **on**: an absent field in an
     /// existing config still means on (`#[serde(default)]` routes through
-    /// [`Default`]). When on, the Connector resolves the context best-effort and
-    /// attaches it to the connect handshake on every transport (and re-sends it
-    /// on reconnect); when off, no context field / header is attached at all.
+    /// [`Default`]).
+    ///
+    /// How the daemon learns of it differs by transport (#782/#783):
+    ///
+    /// - **UDS**: the resolved context rides the connect handshake, and a
+    ///   REFUSAL is stated outright beside it - `share_client_context: false`
+    ///   (#783). Only the refusal is stated, because it is the one case the
+    ///   daemon cannot infer: this door can substitute the kernel peer identity
+    ///   for a client that reported nothing, so it must be told when not to. A
+    ///   sharing client sends no such field and its handshake stays
+    ///   byte-identical to the pre-#783 shape. Both survive reconnect.
+    /// - **WebSocket**: only the resolved context travels, in a base64 upgrade
+    ///   header. That door substitutes nothing of its own, so an absent header is
+    ///   already the whole refusal and a field would say nothing new.
+    ///   `resolve_ws_client_context` in the ws-interface crate is where that
+    ///   rule lives and is tested; a fallback added inside it fails those tests.
+    ///   Keeping it the single route from the upgrade headers to the
+    ///   connection's context is a convention, not something the compiler
+    ///   enforces - a fallback bolted on at its call site would need such a
+    ///   field.
+    /// - **D-Bus**: the bridge holds the daemon connection, so neither the
+    ///   context nor the refusal has a handshake to ride here. This client
+    ///   declares the decision to the bridge
+    ///   (`org.desktopAssistant.Commands.SetShareClientContext`) and the bridge
+    ///   builds this caller's daemon session from it, which is where the
+    ///   handshake above is then written (#782).
+    ///
+    /// When it is off, the machine's hostname is withheld too: it also rides the
+    /// handshake as the `host_label` tool-note hint, resolved by the same
+    /// function that fills the context's `hostname`. The per-machine `system_id`
+    /// still travels, because tool routing depends on it; see `stamp_system_id`
+    /// for what that does and does not cost.
+    ///
+    /// This governs the client's own self-report. It does not reach facts the
+    /// daemon reports about the machine it runs on; those are governed
+    /// separately, where they are produced.
     pub share_client_context: bool,
 }
 

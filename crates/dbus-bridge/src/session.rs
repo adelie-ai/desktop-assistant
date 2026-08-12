@@ -113,7 +113,15 @@ impl Drop for SenderSession {
 #[async_trait::async_trait]
 pub trait SessionFactory: Send + Sync {
     /// Create a session whose forwarder unicasts to `sender` (a unique bus name).
-    async fn create(&self, sender: &str) -> Result<SenderSession, BridgeTransportError>;
+    ///
+    /// `share_client_context` is the caller's declared "share device info"
+    /// decision (#782). It is a per-session property because the daemon reads it
+    /// off the handshake, so a change can only take effect on a new session.
+    async fn create(
+        &self,
+        sender: &str,
+        share_client_context: bool,
+    ) -> Result<SenderSession, BridgeTransportError>;
 }
 
 /// Production factory: each session is its own authenticated `Connector` to the
@@ -137,11 +145,39 @@ impl ConnectorSessionFactory {
     pub fn new(config: ConnectionConfig, connection: Arc<std::sync::OnceLock<Connection>>) -> Self {
         Self { config, connection }
     }
+
+    /// Open one sender's authenticated daemon session, carrying its declared
+    /// client-context sharing (#782) into the handshake.
+    ///
+    /// Split out of [`create`](SessionFactory::create) so a test can drive the
+    /// real connect — the part the preference travels on — without a bus for the
+    /// unicast forwarder to emit on.
+    pub async fn connect_session(
+        &self,
+        share_client_context: bool,
+    ) -> Result<Arc<Connector>, BridgeTransportError> {
+        let config = ConnectionConfig {
+            share_client_context,
+            ..self.config.clone()
+        };
+        Connector::connect(&config)
+            .await
+            .map(Arc::new)
+            .map_err(|e| {
+                BridgeTransportError::Daemon(format!(
+                    "failed to open a per-sender daemon session: {e}"
+                ))
+            })
+    }
 }
 
 #[async_trait::async_trait]
 impl SessionFactory for ConnectorSessionFactory {
-    async fn create(&self, sender: &str) -> Result<SenderSession, BridgeTransportError> {
+    async fn create(
+        &self,
+        sender: &str,
+        share_client_context: bool,
+    ) -> Result<SenderSession, BridgeTransportError> {
         let connection = self
             .connection
             .get()
@@ -155,9 +191,7 @@ impl SessionFactory for ConnectorSessionFactory {
 
         // A private, authenticated daemon session for this sender: mints its own
         // JWT, handshakes, and owns reconnect + re-minting from here on.
-        let connector = Arc::new(Connector::connect(&self.config).await.map_err(|e| {
-            BridgeTransportError::Daemon(format!("failed to open a per-sender daemon session: {e}"))
-        })?);
+        let connector = self.connect_session(share_client_context).await?;
         let transport = Arc::new(ConnectorBridgeTransport::new(Arc::clone(&connector)));
         let forwarder = tokio::spawn(event_forwarder::run_unicast(
             connector,
@@ -168,10 +202,27 @@ impl SessionFactory for ConnectorSessionFactory {
     }
 }
 
+/// A sender's open daemon session together with the client-context sharing it
+/// was built with (#782).
+///
+/// The daemon reads the preference off the handshake, so what a session carries
+/// is fixed the moment it is opened. Recording it here is what lets the registry
+/// *notice* a session whose sharing no longer matches its sender's declaration
+/// and rebuild it, instead of assuming the two cannot drift apart.
+struct LiveSession {
+    session: Arc<SenderSession>,
+    share_client_context: bool,
+}
+
 /// Registry of live per-sender sessions, keyed by the caller's unique bus name.
 pub struct SessionRegistry {
     factory: Arc<dyn SessionFactory>,
-    sessions: Mutex<HashMap<String, Arc<SenderSession>>>,
+    sessions: Mutex<HashMap<String, LiveSession>>,
+    /// Each sender's declared "share device info" decision (#782), keyed by its
+    /// unique bus name. A sender that is absent from this map has declared
+    /// nothing, which is not consent — see
+    /// [`declared_client_context_sharing`](Self::declared_client_context_sharing).
+    sharing: Mutex<HashMap<String, bool>>,
 }
 
 impl SessionRegistry {
@@ -179,7 +230,70 @@ impl SessionRegistry {
         Self {
             factory,
             sessions: Mutex::new(HashMap::new()),
+            sharing: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Whether `sender` has declared that it shares its device context (#782).
+    ///
+    /// **Absent means withhold.** A caller that never declared - including one
+    /// too old to know the method - is not treated as consenting, because a
+    /// control the user turned off must not be undone by a client that simply
+    /// said nothing.
+    pub fn declared_client_context_sharing(&self, sender: &str) -> bool {
+        self.sharing
+            .lock()
+            .expect("SessionRegistry sharing poisoned")
+            .get(sender)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// Record `sender`'s client-context sharing decision (#782), returning
+    /// whether an open session was dropped as a result.
+    ///
+    /// The daemon reads the preference off the session handshake, so a changed
+    /// decision cannot be applied to a session that is already open. The open
+    /// one is dropped instead, and the sender's next session-scoped call builds a
+    /// fresh session carrying the new decision. An unchanged declaration leaves
+    /// the session alone, so a client that re-declares on every connect does not
+    /// churn its daemon session.
+    ///
+    /// **Declare before the sender's first session-scoped call.** A declaration
+    /// that lands while that sender's very first
+    /// [`session_for`](Self::session_for) is still opening its connection finds
+    /// no session to drop, so that one command can run on a session built from
+    /// the older decision. Every client here declares and awaits the reply inside
+    /// its connect, before it can issue any command, so the window is not
+    /// reachable in production; and it is bounded to that one command, because
+    /// [`session_for`](Self::session_for) compares each session against the
+    /// current declaration and rebuilds on a mismatch. Closing it completely
+    /// would mean holding a lock across the connect, which is exactly what
+    /// [`session_for`](Self::session_for) is built to avoid.
+    pub fn declare_client_context_sharing(&self, sender: &str, enabled: bool) -> bool {
+        // Lock order: `sharing` before `sessions`, the same order
+        // `session_for` takes them, so the two can never deadlock against
+        // each other.
+        self.sharing
+            .lock()
+            .expect("SessionRegistry sharing poisoned")
+            .insert(sender.to_string(), enabled);
+        // Compare against what the open SESSION carries, not against the previous
+        // declaration. A session that drifted from its sender's decision is then
+        // cleared by a re-declaration of an unchanged value too, rather than
+        // surviving because the declaration itself did not change.
+        let mut sessions = self.lock();
+        let stale = sessions
+            .get(sender)
+            .is_some_and(|live| live.share_client_context != enabled);
+        if stale {
+            sessions.remove(sender);
+            debug!(
+                "client-context sharing for {sender} is now {enabled}; \
+                 dropped its daemon session so the next one carries the new decision"
+            );
+        }
+        stale
     }
 
     /// Get the session for `sender`, creating it on first use. Idempotent: a
@@ -189,20 +303,40 @@ impl SessionRegistry {
     /// blocks other senders); if a concurrent first-call for the same sender wins
     /// the race, this call adopts the winner and drops its own freshly-built
     /// session (whose `Drop` disconnects it) — at most a wasted connect, never a
-    /// duplicate in the map.
+    /// duplicate in the map. The winner is adopted only when it carries the same
+    /// client-context decision; otherwise it is the stale one and ours replaces
+    /// it.
     pub async fn session_for(
         &self,
         sender: &str,
     ) -> Result<Arc<SenderSession>, BridgeTransportError> {
-        if let Some(existing) = self.lock().get(sender).cloned() {
-            return Ok(existing);
+        // Read the declaration first, and never while holding `sessions` - the
+        // lock order every path here takes.
+        let declared = self.declared_client_context_sharing(sender);
+        if let Some(live) = self.lock().get(sender)
+            && live.share_client_context == declared
+        {
+            return Ok(Arc::clone(&live.session));
         }
-        let session = Arc::new(self.factory.create(sender).await?);
+        let session = Arc::new(self.factory.create(sender, declared).await?);
         let mut sessions = self.lock();
-        Ok(sessions
-            .entry(sender.to_string())
-            .or_insert(session)
-            .clone())
+        match sessions.get(sender) {
+            // A concurrent first call won the race and its session carries the
+            // same decision: adopt it and drop ours, whose `Drop` disconnects it.
+            Some(live) if live.share_client_context == declared => Ok(Arc::clone(&live.session)),
+            // No session, or one built from a decision the sender has since
+            // changed. Ours is the current one, so it replaces whatever is there.
+            _ => {
+                sessions.insert(
+                    sender.to_string(),
+                    LiveSession {
+                        session: Arc::clone(&session),
+                        share_client_context: declared,
+                    },
+                );
+                Ok(session)
+            }
+        }
     }
 
     /// Route `command` to the right daemon connection: the caller's own session
@@ -241,10 +375,20 @@ impl SessionRegistry {
         fallback.request(command).await
     }
 
-    /// Drop `sender`'s session if present, returning whether one was removed.
-    /// Removing the last `Arc` runs [`SenderSession`]'s `Drop` (aborts the
-    /// forwarder, disconnects the daemon session).
+    /// Drop `sender`'s session and its client-context declaration, returning
+    /// whether a session was removed. Removing the last `Arc` runs
+    /// [`SenderSession`]'s `Drop` (aborts the forwarder, disconnects the daemon
+    /// session).
+    ///
+    /// The declaration goes with the session because it is per-connection state
+    /// and must not outlive the connection that made it: a caller that comes back
+    /// starts fail-closed and declares again, rather than inheriting a decision
+    /// nothing on the bus still stands behind.
     pub fn evict(&self, sender: &str) -> bool {
+        self.sharing
+            .lock()
+            .expect("SessionRegistry sharing poisoned")
+            .remove(sender);
         self.lock().remove(sender).is_some()
     }
 
@@ -257,7 +401,7 @@ impl SessionRegistry {
         self.len() == 0
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<SenderSession>>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, LiveSession>> {
         self.sessions.lock().expect("SessionRegistry poisoned")
     }
 }
@@ -350,6 +494,9 @@ mod tests {
     #[derive(Default)]
     struct FakeFactory {
         created: StdMutex<Vec<String>>,
+        /// The client-context sharing each `create` was asked for (#782), in
+        /// call order, so a test can prove what the registry resolved.
+        created_sharing: StdMutex<Vec<(String, bool)>>,
         transports: StdMutex<HashMap<String, Arc<RecordingTransport>>>,
         /// Optional per-sender forwarder probe: the spawned forwarder fires
         /// `started` once it is running (so a test can wait until the abort guard
@@ -358,20 +505,28 @@ mod tests {
         forwarder_probes: StdMutex<HashMap<String, ForwarderProbe>>,
         /// Optional barrier that parks `create` until N racers have arrived, so a
         /// test can deterministically force the concurrent-first-call path
-        /// (create-outside-the-lock then `or_insert`) instead of a sequential
-        /// create-then-reuse.
+        /// (create outside the lock, then adopt the winner) instead of a
+        /// sequential create-then-reuse.
         gate: Option<Arc<tokio::sync::Barrier>>,
     }
 
     #[async_trait::async_trait]
     impl SessionFactory for FakeFactory {
-        async fn create(&self, sender: &str) -> Result<SenderSession, BridgeTransportError> {
+        async fn create(
+            &self,
+            sender: &str,
+            share_client_context: bool,
+        ) -> Result<SenderSession, BridgeTransportError> {
             // Park here until every racer has entered `create`, guaranteeing both
             // passed the empty-map check before either inserts.
             if let Some(gate) = &self.gate {
                 gate.wait().await;
             }
             self.created.lock().unwrap().push(sender.to_string());
+            self.created_sharing
+                .lock()
+                .unwrap()
+                .push((sender.to_string(), share_client_context));
             let transport = Arc::new(RecordingTransport::default());
             self.transports
                 .lock()
@@ -679,8 +834,8 @@ mod tests {
     #[tokio::test]
     async fn concurrent_first_calls_for_one_sender_yield_one_session() {
         // Force both racers to be inside `create` at once (barrier of 2), so this
-        // exercises the real create-outside-the-lock + `or_insert` path rather
-        // than a sequential create-then-reuse.
+        // exercises the real create-outside-the-lock + adopt-the-winner path
+        // rather than a sequential create-then-reuse.
         let factory = Arc::new(FakeFactory {
             gate: Some(Arc::new(tokio::sync::Barrier::new(2))),
             ..Default::default()
@@ -723,12 +878,110 @@ mod tests {
         }));
     }
 
+    // -----------------------------------------------------------------------
+    // Client-context sharing declarations (#782)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn an_undeclared_sender_opens_a_withholding_session() {
+        // Fail-closed: a caller that never declared - including one too old to
+        // know the method - is not treated as consenting.
+        let factory = Arc::new(FakeFactory::default());
+        let registry = SessionRegistry::new(Arc::clone(&factory) as Arc<dyn SessionFactory>);
+
+        registry.session_for(":1.7").await.expect("session opens");
+
+        assert_eq!(
+            factory.created_sharing.lock().unwrap().clone(),
+            vec![(":1.7".to_string(), false)],
+        );
+    }
+
+    #[tokio::test]
+    async fn a_declaration_applies_only_to_the_sender_that_made_it() {
+        let factory = Arc::new(FakeFactory::default());
+        let registry = SessionRegistry::new(Arc::clone(&factory) as Arc<dyn SessionFactory>);
+
+        registry.declare_client_context_sharing(":1.7", true);
+        registry
+            .session_for(":1.7")
+            .await
+            .expect("declared session");
+        registry.session_for(":1.9").await.expect("other session");
+
+        let seen = factory.created_sharing.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![(":1.7".to_string(), true), (":1.9".to_string(), false)],
+            "one sender's consent must not leak to another's session",
+        );
+    }
+
+    #[tokio::test]
+    async fn redeclaring_the_same_preference_keeps_the_open_session() {
+        let factory = Arc::new(FakeFactory::default());
+        let registry = SessionRegistry::new(Arc::clone(&factory) as Arc<dyn SessionFactory>);
+
+        registry.declare_client_context_sharing(":1.7", true);
+        registry.session_for(":1.7").await.expect("first session");
+        registry.declare_client_context_sharing(":1.7", true);
+        registry.session_for(":1.7").await.expect("reused session");
+
+        assert_eq!(
+            factory.created.lock().unwrap().len(),
+            1,
+            "an unchanged declaration must not churn the daemon session",
+        );
+    }
+
+    #[tokio::test]
+    async fn changing_the_preference_drops_the_session_so_the_next_one_carries_it() {
+        let factory = Arc::new(FakeFactory::default());
+        let registry = SessionRegistry::new(Arc::clone(&factory) as Arc<dyn SessionFactory>);
+
+        registry.declare_client_context_sharing(":1.7", true);
+        registry.session_for(":1.7").await.expect("first session");
+        registry.declare_client_context_sharing(":1.7", false);
+        registry.session_for(":1.7").await.expect("rebuilt session");
+
+        assert_eq!(
+            factory.created_sharing.lock().unwrap().clone(),
+            vec![(":1.7".to_string(), true), (":1.7".to_string(), false)],
+        );
+    }
+
+    #[tokio::test]
+    async fn a_departed_sender_loses_its_declaration() {
+        // A declaration is per-connection state and must not outlive the
+        // connection that made it: a caller that comes back declares again,
+        // rather than inheriting a decision nothing on the bus still stands
+        // behind.
+        let factory = Arc::new(FakeFactory::default());
+        let registry = Arc::new(SessionRegistry::new(
+            Arc::clone(&factory) as Arc<dyn SessionFactory>
+        ));
+
+        registry.declare_client_context_sharing(":1.7", true);
+        registry.session_for(":1.7").await.expect("first session");
+        handle_name_owner_change(&registry, ":1.7", None);
+        registry.session_for(":1.7").await.expect("second session");
+
+        assert_eq!(
+            factory.created_sharing.lock().unwrap().clone(),
+            vec![(":1.7".to_string(), true), (":1.7".to_string(), false)],
+        );
+    }
+
     /// A factory whose `create` always fails — to prove a turn whose session
     /// can't be opened surfaces the error instead of silently sharing.
     struct FailingFactory;
     #[async_trait::async_trait]
     impl SessionFactory for FailingFactory {
-        async fn create(&self, _sender: &str) -> Result<SenderSession, BridgeTransportError> {
+        async fn create(
+            &self,
+            _sender: &str,
+            _share_client_context: bool,
+        ) -> Result<SenderSession, BridgeTransportError> {
             Err(BridgeTransportError::Daemon("cannot open session".into()))
         }
     }

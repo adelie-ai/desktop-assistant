@@ -126,6 +126,41 @@ impl<T: BridgeTransport + 'static> DbusCommandsAdapter<T> {
         serde_json::to_string(&result)
             .map_err(|e| fdo::Error::Failed(format!("serialize command result: {e}")))
     }
+
+    /// Record `caller`'s client-context sharing decision (#782). The testable
+    /// core of `set_share_client_context`; `caller` is the D-Bus sender's unique
+    /// name, taken directly so the policy is exercisable without a bus.
+    ///
+    /// A caller with no bus name is refused rather than silently accepted: there
+    /// is no session to attach the preference to, and a client that believes it
+    /// declared a preference nothing recorded is exactly the failure this whole
+    /// change exists to remove.
+    pub fn declare_client_context_sharing(
+        &self,
+        caller: Option<&str>,
+        enabled: bool,
+    ) -> fdo::Result<()> {
+        let sender = caller.ok_or_else(|| {
+            fdo::Error::Failed(
+                "declaring the client-context sharing preference requires a D-Bus sender \
+                 (none on the message)"
+                    .to_string(),
+            )
+        })?;
+        // Refused for the same reason as a missing sender: an adapter with no
+        // registry has nowhere to put the decision, and answering `Ok` would tell
+        // the caller its preference was recorded when nothing recorded it.
+        // Production always wires one.
+        let registry = self.sessions.as_ref().ok_or_else(|| {
+            fdo::Error::Failed(
+                "this bridge has no per-sender session registry, so it cannot honour a \
+                 client-context sharing preference"
+                    .to_string(),
+            )
+        })?;
+        registry.declare_client_context_sharing(sender, enabled);
+        Ok(())
+    }
 }
 
 #[interface(name = "org.desktopAssistant.Commands")]
@@ -146,6 +181,29 @@ impl<T: BridgeTransport + 'static> DbusCommandsAdapter<T> {
     ) -> fdo::Result<String> {
         let caller = hdr.sender().map(|s| s.as_str());
         self.run_command(caller, command_json).await
+    }
+
+    /// Declare whether this caller shares its device context - the user's name,
+    /// login, home directory, hostname, timezone and OS - with the assistant
+    /// (#782). This is the D-Bus form of the preference the socket transports
+    /// carry in their connect handshake.
+    ///
+    /// Call it before any session-scoped command. The bridge holds the daemon
+    /// connection, so a D-Bus caller cannot put the preference on a handshake
+    /// itself; the bridge records it against this caller's bus name and builds
+    /// that caller's daemon session from it. Re-declaring the same value is free;
+    /// changing it drops the caller's open session so the next one carries the
+    /// new decision.
+    ///
+    /// **A caller that never calls this shares nothing.** The bridge does not
+    /// treat silence as consent.
+    async fn set_share_client_context(
+        &self,
+        #[zbus(header)] hdr: zbus::message::Header<'_>,
+        enabled: bool,
+    ) -> fdo::Result<()> {
+        let caller = hdr.sender().map(|s| s.as_str());
+        self.declare_client_context_sharing(caller, enabled)
     }
 }
 
@@ -209,6 +267,21 @@ mod tests {
 
     fn adapter(transport: Arc<FakeTransport>) -> DbusCommandsAdapter<FakeTransport> {
         DbusCommandsAdapter::new(transport)
+    }
+
+    /// A factory the declaration tests must never reach: declaring a preference
+    /// records it, it does not open a daemon session.
+    struct NeverFactory;
+
+    #[async_trait::async_trait]
+    impl crate::session::SessionFactory for NeverFactory {
+        async fn create(
+            &self,
+            _sender: &str,
+            _share_client_context: bool,
+        ) -> Result<crate::session::SenderSession, BridgeTransportError> {
+            panic!("declaring a preference must not open a daemon session");
+        }
     }
 
     #[tokio::test]
@@ -338,6 +411,40 @@ mod tests {
             format!("{err}").contains("boom: connection refused"),
             "daemon message must be preserved: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn declaring_client_context_sharing_records_it_for_the_caller() {
+        // #782: the declaration is what the caller's per-sender daemon session is
+        // then built from, so it must land against that caller's bus name.
+        let transport = FakeTransport::replying(api::CommandResult::Ack);
+        let registry = Arc::new(SessionRegistry::new(Arc::new(NeverFactory)));
+        let adapter = adapter(transport).with_sessions(Arc::clone(&registry));
+
+        adapter
+            .declare_client_context_sharing(Some(":1.7"), true)
+            .expect("a caller may declare its preference");
+
+        assert!(registry.declared_client_context_sharing(":1.7"));
+        assert!(
+            !registry.declared_client_context_sharing(":1.9"),
+            "a declaration must not apply to any other caller"
+        );
+    }
+
+    #[tokio::test]
+    async fn declaring_client_context_sharing_without_a_caller_is_rejected() {
+        // With no bus sender there is no session to attach the preference to.
+        // Accepting it silently would leave a caller believing it had opted in
+        // (or out) when nothing recorded the choice.
+        let transport = FakeTransport::replying(api::CommandResult::Ack);
+        let registry = Arc::new(SessionRegistry::new(Arc::new(NeverFactory)));
+        let adapter = adapter(transport).with_sessions(Arc::clone(&registry));
+
+        let err = adapter
+            .declare_client_context_sharing(None, true)
+            .expect_err("a senderless declaration must be refused");
+        assert!(matches!(err, fdo::Error::Failed(_)), "got {err:?}");
     }
 
     #[tokio::test]
