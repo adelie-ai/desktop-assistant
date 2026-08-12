@@ -510,6 +510,65 @@ collision.
 A search that matched more client tools than it returned reports the count it
 dropped in `more_device_tools_matched`.
 
+## What a Round Advertises, and What It Only Names
+
+A tool schema costs roughly 250 estimated tokens in every request of every
+round. A tool *name* costs about ten. So a round carries the schemas it needs
+and the names of everything else, and a name is enough: the round's tool table
+routes a call whether or not the schema was in the block.
+
+One production turn carried 99 schemas - about 23.7k estimated tokens, 17.9% of
+that model's input budget - in front of a 254-character prompt, before the turn
+did anything, and then grew as its tool search activated more.
+
+**What keeps its schema.** The daemon's own built-in tools, and the turn loop's
+step-planning tools. The rule is that a tool is advertised in full when the
+model needs it to find, or to keep, what the rest of the turn depends on:
+discovery itself, the knowledge base, the scratchpad, skills. Everything else is
+discovered. A test holds the built-in set to a stated ceiling so it cannot drift
+back.
+
+**What is only named.** A connected client registers whatever it happens to
+host, and one measured connection registered 77 tools. The first eight keep
+their schemas and the rest appear in the tool note as names. The slice is the
+front of the list the connection sent, and the daemon preserves that order, so
+a client that needs a tool's schema in every round registers it first.
+
+**This applies only when the model can look a name up.** A round that does not
+offer `builtin_tool_search` advertises every registered tool in full, however
+many there are: a name nothing can describe is a name the model cannot use.
+
+**Calling a named tool works, and a wrong guess is answered rather than run.**
+The model may call a tool it has only ever seen the name of. The call routes
+normally and the schema joins the block for the rest of the turn. If the call
+leaves out an argument the schema marks required, the daemon answers with the
+schema instead of running the tool - so a round is spent only when the schema
+genuinely had to be seen, and nothing acts on a guess.
+
+**What a tool search activates is bounded and lasts one turn.** A turn holds at
+most 24 activated tools. Under that bound activations only append, so nothing
+the turn already reached for is disturbed. At the bound, the activation unused
+longest is retired, and never one the model used in the current round. A new
+turn starts with none.
+
+**What that means for a prompt cache.** The daemon emits one cache checkpoint
+behind the leading system block, which on Bedrock sits behind the whole `tools`
+array, so the cache pays exactly when a round's tool array is *identical* to the
+one before it. Every input to the array is fixed for the turn except the
+activation ledger, so a round that activates nothing sends the same bytes and
+serves from cache. A round that activates does not - an appended entry is still
+a changed `tools` section, and no ordering rescues that. Activation happens a
+handful of times per turn rather than every round, so most rounds cache.
+
+Prompt caching is a per-model capability: Bedrock supports it on the Claude and
+Nova families only, so on a model outside them there is nothing to cache and the
+whole prefix is re-sent every round. Bounding the block is what helps there.
+
+Operators can see the cost per round and per connection: `llm.prompt.tool.tokens`
+carries a `server` label, and every `turn.round` span carries its own
+`prompt.tool_count` and `prompt.tool_schema_tokens`. See
+[Logging and telemetry](logging.md).
+
 ## Tool Names Are Unique
 
 A tool belongs to exactly one **connection** - a client device, an MCP server,

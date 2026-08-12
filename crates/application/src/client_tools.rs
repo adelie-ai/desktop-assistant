@@ -152,10 +152,20 @@ fn current_client_tool_timeout() -> Duration {
 /// inside the mutex critical sections, so blocking is bounded.
 pub struct ClientToolCoordinator {
     /// Currently-registered client-local tools, keyed by [`RegistrationKey`]
-    /// (the `(user_id, session_id)` of the registering connection) → tool name
-    /// → full registration (description + input schema). The full registration
-    /// (not just the name) is retained so the turn loop can offer the tool's
-    /// schema to the LLM (#234).
+    /// (the `(user_id, session_id)` of the registering connection) → the
+    /// connection's registrations, **in the order the connection sent them**.
+    /// The full registration (not just the name) is retained so the turn loop
+    /// can offer the tool's schema to the LLM (#234).
+    ///
+    /// A `Vec` and not a map, and the order is a contract rather than an
+    /// accident (#1212). The turn advertises a bounded slice of a connection's
+    /// tools in full and offers the rest by name, and it takes that slice from
+    /// the front of this list - so a client that needs a tool's schema in
+    /// every round registers it early. A `HashMap` here made "early" mean
+    /// "wherever this process's hash seed happened to put it", re-rolled on
+    /// every restart, which is a decision nobody can act on. The set is tens
+    /// of tools per connection, so the linear lookups below cost nothing
+    /// worth measuring.
     ///
     /// Keying on the **login session**, not just the user, is the #261 fix:
     /// each client connection registers its own tools, so the voice daemon's
@@ -164,7 +174,7 @@ pub struct ClientToolCoordinator {
     /// sets). The `user_id` component is retained in the key so cross-user
     /// isolation holds even in the unscoped fallback bucket, where every
     /// connection would otherwise share a single sentinel session id.
-    registrations: Mutex<HashMap<RegistrationKey, HashMap<String, api::ClientToolRegistration>>>,
+    registrations: Mutex<HashMap<RegistrationKey, Vec<api::ClientToolRegistration>>>,
     /// In-flight suspensions, keyed by task_id. Each entry holds the
     /// expected `tool_call_id` so the resolver can refuse mismatches
     /// without consulting the DB, and the oneshot sender used to wake
@@ -215,7 +225,13 @@ impl ClientToolCoordinator {
         let entry = regs.entry(key).or_default();
         entry.clear();
         for t in tools {
-            entry.insert(t.name.clone(), t.clone());
+            // One name is one tool. A repeated name keeps the position its
+            // first mention claimed and takes the later definition, so the
+            // order a connection sent survives a set that repeats itself.
+            match entry.iter_mut().find(|held| held.name == t.name) {
+                Some(held) => *held = t.clone(),
+                None => entry.push(t.clone()),
+            }
         }
         u32::try_from(entry.len()).unwrap_or(u32::MAX)
     }
@@ -225,8 +241,7 @@ impl ClientToolCoordinator {
         let key = current_registration_key();
         let regs = self.registrations.lock().unwrap();
         regs.get(&key)
-            .map(|set| set.contains_key(name))
-            .unwrap_or(false)
+            .is_some_and(|set| set.iter().any(|t| t.name == name))
     }
 
     /// Test/diagnostic helper: true iff `name` is registered in **any**
@@ -239,11 +254,12 @@ impl ClientToolCoordinator {
     /// a caller outside that connection's request scope.
     pub async fn is_registered_in_any_session(&self, name: &str) -> bool {
         let regs = self.registrations.lock().unwrap();
-        regs.values().any(|set| set.contains_key(name))
+        regs.values().any(|set| set.iter().any(|t| t.name == name))
     }
 
     /// The tool definitions registered as client-local for the current
-    /// connection's session, in the shape the LLM tool list expects (#234).
+    /// connection's session, in the shape the LLM tool list expects (#234),
+    /// and in the order the connection registered them (#1212).
     /// Maps each [`api::ClientToolRegistration`] to a core [`ToolDefinition`]
     /// so the turn loop can offer them to the model without `core` depending
     /// on `api-model`. A turn only ever sees the tools registered by the
@@ -253,7 +269,7 @@ impl ClientToolCoordinator {
         let regs = self.registrations.lock().unwrap();
         regs.get(&key)
             .map(|set| {
-                set.values()
+                set.iter()
                     .map(|r| {
                         ToolDefinition::new(
                             r.name.clone(),
@@ -815,6 +831,87 @@ mod tests {
         async fn emit(&self, _event: api::Event) -> bool {
             true
         }
+    }
+
+    fn registration(name: &str) -> api::ClientToolRegistration {
+        api::ClientToolRegistration {
+            name: name.to_string(),
+            description: format!("tool {name}"),
+            input_schema: serde_json::json!({"type": "object"}),
+        }
+    }
+
+    /// #1212: the turn advertises a bounded slice of a connection's tools in
+    /// full and takes that slice from the front of this list, so the order has
+    /// to be the one the connection chose. It used to be `HashMap` iteration
+    /// order - stable within a process, re-rolled on every restart - which
+    /// made "register the tool you need schema'd first" advice that did
+    /// nothing.
+    ///
+    /// Twenty tools, because that is enough that a hash order and an insertion
+    /// order cannot coincide by chance.
+    #[tokio::test]
+    async fn registered_definitions_come_back_in_the_order_the_connection_sent_them() {
+        let coord = ClientToolCoordinator::new();
+        let sent: Vec<api::ClientToolRegistration> = (0..20)
+            .map(|i| registration(&format!("device_tool_{i:02}")))
+            .collect();
+
+        coord.register(&sent).await;
+        let got: Vec<String> = coord
+            .registered_definitions()
+            .await
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+
+        assert_eq!(
+            got,
+            sent.iter().map(|t| t.name.clone()).collect::<Vec<_>>(),
+            "the front of this list is what keeps its schema, so its order is \
+             the connection's decision and not this process's hash seed"
+        );
+    }
+
+    /// The same set registered twice is the same order, and a name repeated
+    /// within one registration keeps the place its first mention claimed.
+    /// Otherwise a client that re-registers - which every reconnect does -
+    /// could shuffle which of its tools carry a schema.
+    #[tokio::test]
+    async fn re_registering_keeps_the_order_and_a_repeated_name_keeps_its_place() {
+        let coord = ClientToolCoordinator::new();
+        let sent: Vec<api::ClientToolRegistration> = (0..20)
+            .map(|i| registration(&format!("device_tool_{i:02}")))
+            .collect();
+
+        coord.register(&sent).await;
+        let first: Vec<String> = coord
+            .registered_definitions()
+            .await
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        coord.register(&sent).await;
+        let second: Vec<String> = coord
+            .registered_definitions()
+            .await
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        assert_eq!(first, second, "a reconnect must not reshuffle the slice");
+
+        let mut repeated = sent.clone();
+        let mut late = registration("device_tool_00");
+        late.description = "the later definition".to_string();
+        repeated.push(late);
+        coord.register(&repeated).await;
+        let defs = coord.registered_definitions().await;
+        assert_eq!(defs.len(), 20, "one name is one tool");
+        assert_eq!(defs[0].name, "device_tool_00", "and it keeps its place");
+        assert_eq!(
+            defs[0].description, "the later definition",
+            "while taking the later definition"
+        );
     }
 
     /// #440 (`client_tools.rs:447-465`): an `Ok` result body larger than

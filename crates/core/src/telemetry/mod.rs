@@ -78,7 +78,7 @@
 mod prompt;
 mod tokens;
 
-pub(crate) use prompt::{PromptBreakdown, PromptPart};
+pub(crate) use prompt::{PromptBreakdown, PromptPart, record_round_tool_cost};
 pub(crate) use tokens::{
     Count, TokenTotals, record_genai_tokens_on_span, record_token_usage, record_tokens_on_span,
 };
@@ -273,6 +273,11 @@ pub(crate) fn turn_span(
         prompt.tool_schema_tokens = tracing::field::Empty,
         prompt.total_tokens = tracing::field::Empty,
         prompt.tool_count = tracing::field::Empty,
+        // The ceiling of the two figures above, over the turn's rounds
+        // (#1212). The opening figure is the floor of a set that only grows
+        // within a turn, so on its own it cannot show the growth.
+        prompt.tool_schema_tokens_max = tracing::field::Empty,
+        prompt.tool_count_max = tracing::field::Empty,
     );
     // The turn is the root of its trace, so this is where the trace id the
     // client already knows becomes the one a backend indexes by. Everything
@@ -291,6 +296,11 @@ pub(crate) fn round_span(round: usize) -> tracing::Span {
         round = round,
         conversation_id = %Safe::name(crate::ports::turn_telemetry::current_conversation_id()),
         tools = tracing::field::Empty,
+        // What this round's own tool block cost (#1212). The turn span carries
+        // the first round's figures and the turn's peak; only the round says
+        // what each round in between sent.
+        prompt.tool_count = tracing::field::Empty,
+        prompt.tool_schema_tokens = tracing::field::Empty,
         outcome = tracing::field::Empty,
         input_tokens = tracing::field::Empty,
         output_tokens = tracing::field::Empty,
@@ -557,6 +567,10 @@ pub(crate) struct TurnGuard {
     /// turn assembles a prompt, which a turn cancelled before its first round
     /// never does - and an unrecorded part is exactly what that is.
     prompt: Option<PromptBreakdown>,
+    /// The largest tool block any of the turn's rounds sent (#1212). The field
+    /// above keeps the turn's opening figure, which is the floor of a set that
+    /// only grows within a turn; this is its ceiling.
+    tool_peak: prompt::ToolBlockPeak,
 }
 
 impl TurnGuard {
@@ -569,6 +583,7 @@ impl TurnGuard {
             outcome: TurnOutcome::Failed,
             tokens: TokenTotals::default(),
             prompt: None,
+            tool_peak: prompt::ToolBlockPeak::default(),
         }
     }
 
@@ -583,6 +598,10 @@ impl TurnGuard {
     /// the pinned notes, the recall offer and the tool fleet. What the rounds
     /// then add to it is a separate measurement.
     pub(crate) fn set_prompt_breakdown(&mut self, breakdown: PromptBreakdown) {
+        self.tool_peak.observe(
+            breakdown.tool_count(),
+            breakdown.tokens(PromptPart::ToolSchemas),
+        );
         self.prompt.get_or_insert(breakdown);
     }
 }
@@ -594,6 +613,7 @@ impl Drop for TurnGuard {
         if let Some(breakdown) = &self.prompt {
             prompt::record_on_span(&self.span, breakdown);
             prompt::record_metrics(breakdown);
+            prompt::record_peak_on_span(&self.span, self.tool_peak);
         }
         self.span.record("rounds", self.rounds);
         self.span.record("outcome", self.outcome.as_label());
@@ -641,6 +661,10 @@ pub(crate) struct RoundGuard {
     llm_called: bool,
     usage: Option<TokenUsage>,
     route: TurnRoute,
+    /// What this round advertised, and what its schemas cost (#1212). `None`
+    /// for a round that stopped before it assembled a prompt, which is an
+    /// unmeasured round rather than one that advertised nothing.
+    tool_cost: Option<(usize, u64)>,
 }
 
 impl RoundGuard {
@@ -654,7 +678,13 @@ impl RoundGuard {
             llm_called: false,
             usage: None,
             route,
+            tool_cost: None,
         }
+    }
+
+    /// Note how many tools this round advertised and what their schemas cost.
+    pub(crate) fn set_tool_cost(&mut self, count: usize, schema_tokens: u64) {
+        self.tool_cost = Some((count, schema_tokens));
     }
 
     /// The round's span, for hanging the provider call and each tool dispatch
@@ -708,6 +738,11 @@ impl Drop for RoundGuard {
     fn drop(&mut self) {
         let elapsed = self.started.elapsed();
         self.span.record("outcome", self.outcome.as_label());
+        if let Some((count, schema_tokens)) = self.tool_cost {
+            self.span.record(prompt::TOOL_COUNT_FIELD, count as u64);
+            self.span
+                .record(PromptPart::ToolSchemas.as_span_field(), schema_tokens);
+        }
         record_round(elapsed, self.outcome);
         if self.llm_called {
             record_token_usage(self.usage.as_ref(), &self.route);
