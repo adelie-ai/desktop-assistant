@@ -551,18 +551,41 @@ the turn already reached for is disturbed. At the bound, the activation unused
 longest is retired, and never one the model used in the current round. A new
 turn starts with none.
 
-**What that means for a prompt cache.** The daemon emits one cache checkpoint
-behind the leading system block, which on Bedrock sits behind the whole `tools`
-array, so the cache pays exactly when a round's tool array is *identical* to the
-one before it. Every input to the array is fixed for the turn except the
-activation ledger, so a round that activates nothing sends the same bytes and
-serves from cache. A round that activates does not - an appended entry is still
-a changed `tools` section, and no ordering rescues that. Activation happens a
-handful of times per turn rather than every round, so most rounds cache.
+**The array is ordered by how fast each part changes.** It is emitted
+most-stable-first, in three tiers:
 
-Prompt caching is a per-model capability: Bedrock supports it on the Claude and
-Nova families only, so on a model outside them there is nothing to cache and the
-whole prefix is re-sent every round. Bounding the block is what helps there.
+| tier | what it holds | changes when |
+|---|---|---|
+| pinned | the daemon's built-ins, the MCP servers it reaches, and the turn loop's own control surface | the daemon's own configuration changes |
+| connection | what the connected client registered | the connection changes, or the client registers or drops a tool |
+| activations | what this turn's searches and first calls promoted | a search promotes a tool, per round |
+
+Two properties follow. A round that activates nothing sends a **byte-identical**
+array. A round that activates sends the round before it as a **prefix**: the
+tiers above it cannot move, and a promoted tool takes a position after
+everything already advertised rather than the slot its name-only entry held. The
+pinned tier depends on nothing a client does, so it is the same bytes across
+turns and across connections too.
+
+**What that is worth depends on the provider.** A prompt cache is a prefix
+match. Where the provider takes the longest common prefix by itself, the pinned
+tier is charged once however many connections and turns follow, and an appended
+tool costs only itself. Where the cache is a checkpoint the request places, the
+daemon emits one, behind the leading system block - so on Bedrock and on the
+Anthropic connector it is the byte-identical round that serves from cache today,
+and this ordering is the prerequisite for a checkpoint at the end of the pinned
+tier. Activation happens a handful of times per turn rather than every round, so
+most rounds are byte-identical either way.
+
+Prompt caching is also a per-model capability: Bedrock supports it on the Claude
+and Nova families only, so on a model outside them there is nothing to cache and
+the whole prefix is re-sent every round. Bounding the block is what helps there.
+
+Two consequences are correct rather than defects. A turn's first round cannot
+hit the previous turn's cache when the client's set changed in between - the
+tools really did change, and advertising the old set would offer a schema
+nothing can run. And a tool registered mid-turn appears from the next turn,
+which is what keeps the within-turn array stable.
 
 Operators can see the cost per round and per connection: `llm.prompt.tool.tokens`
 carries a `server` label, and every `turn.round` span carries its own

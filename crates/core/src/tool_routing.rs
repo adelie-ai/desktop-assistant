@@ -604,6 +604,13 @@ impl ToolRouter {
     /// kept because it is the one whose schema the model reads. Anything else
     /// is a fault: refused, recorded with both claimants, never silently
     /// resolved.
+    ///
+    /// **A promotion moves the entry to the end** rather than upgrading it
+    /// where it stands (#1294). The block's order is what a round-to-round
+    /// comparison reads, and a schema that appeared in the middle of it would
+    /// shift every tool behind it - so a tool the round put in the block takes
+    /// a position after everything already advertised, and the round before
+    /// stays a prefix of this one.
     fn insert(
         &mut self,
         advertised: ToolDefinition,
@@ -617,24 +624,28 @@ impl ToolRouter {
                 connection.map_or("core-loop".to_string(), ToolConnection::label)
             )
         };
-        if let Some(held) = self
+        if let Some(position) = self
             .entries
-            .iter_mut()
-            .find(|e| e.advertised.name == advertised.name)
+            .iter()
+            .position(|e| e.advertised.name == advertised.name)
         {
+            let held = &self.entries[position];
             if held.connection == connection && held.provider_name == provider_name {
                 // One tool, two surfaces. Keep the one the model can read: an
                 // offer that puts the schema in the block wins over one that
                 // leaves it out, whichever arrived first.
                 if !held.surface.in_block() && surface.in_block() {
-                    held.surface = surface;
-                    held.advertised = advertised;
+                    let mut promoted = self.entries.remove(position);
+                    promoted.surface = surface;
+                    promoted.advertised = advertised;
+                    self.entries.push(promoted);
                 }
                 return;
             }
+            let held_by = claimant(held.connection.as_ref(), &held.provider_name);
             self.duplicates.push(DuplicateName {
                 name: advertised.name.clone(),
-                held_by: claimant(held.connection.as_ref(), &held.provider_name),
+                held_by,
                 refused: claimant(connection.as_ref(), &provider_name),
             });
             return;

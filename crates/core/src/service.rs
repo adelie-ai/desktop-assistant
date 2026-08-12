@@ -2991,15 +2991,67 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 .iter()
                 .any(|t| t.name == crate::tool_advertising::DISCOVERY_TOOL);
             //
-            // Every input to the block below is fixed for the turn except the
-            // activation ledger, and the offers run in a fixed order, so a
-            // round that activates nothing sends a byte-identical `tools`
-            // array. That equality is what a provider's prompt cache matches
-            // on: this repository emits one checkpoint behind the leading
-            // system block, which on Bedrock sits behind the whole array, so
-            // an unchanged array serves from cache and a changed one does not
-            // - appended or otherwise (`llm-bedrock`'s `convert_messages`).
+            // The offers below run most-stable-first, and the order is the
+            // contract (#1294). Three tiers change at three rates:
+            //
+            //   pinned      the daemon's built-ins, the servers it reaches and
+            //               the loop's control surface. Changes when the
+            //               daemon's own configuration changes, and depends on
+            //               nothing any client does.
+            //   connection  what the client registered. Read once at turn start
+            //               (#1216), so it is fixed for the turn.
+            //   activations what this turn's searches and first calls promoted,
+            //               appended as the turn reaches for them.
+            //
+            // So a round that activates nothing sends a byte-identical `tools`
+            // array, a round that activates one sends the round before it as a
+            // prefix, and the pinned tier is the same bytes across every turn
+            // and every connection, because nothing below it can move it.
+            //
+            // What that is worth depends on the provider. A prompt cache is a
+            // prefix match; where the provider takes the longest common prefix
+            // by itself, the pinned tier is charged once and an appended tool
+            // costs only itself. Where the cache is a checkpoint the request
+            // places, this repository emits one, behind the leading system
+            // block - so on the two connectors that emit one (`convert_messages`
+            // in `llm-bedrock` and in `llm-anthropic`) an array that changed at
+            // all still misses today, and this order is what a checkpoint at the
+            // end of the pinned tier would need. It costs an ordering decision
+            // either way, so it is held rather than argued per model.
+            //
+            // Two consequences are correct rather than defects. A turn's first
+            // round cannot hit the previous turn's cache when the client's set
+            // changed in between - the tools really did change. And a tool
+            // registered mid-turn appears from the next turn, which is #1216's
+            // recorded trade and what keeps the within-turn array stable.
             router.offer(&ToolConnection::daemon_builtins(), round_core);
+            // The daemon's deferred fleet, when the provider's own tool search
+            // is carrying it. The model can call these by name, so the table
+            // has to route them, and they count for uniqueness like everything
+            // else. Their schemas travel in the namespaces rather than the
+            // block; `offered_namespaces` below takes the ones still reached
+            // that way.
+            if use_hosted_search && !hosted_search_demoted {
+                for ns in &namespaces {
+                    router.offer_deferred(&ToolConnection::daemon_server(&ns.name), &ns.tools);
+                }
+            }
+            // The step-planning + compaction tools (#240) when a scratchpad
+            // writer is wired. They are the loop's own control surface - it runs
+            // them itself, before any executor - so they have no connection and
+            // take no location root, and nothing but the daemon's own wiring can
+            // change them. Without a writer wired they stay off.
+            if self.scratchpad_write.is_some() {
+                router.offer_core_loop_tool(planning::begin_step_tool());
+                router.offer_core_loop_tool(planning::complete_step_tool());
+                // Keeping a finished plan is a core-loop tool for the same
+                // reason the pair above is: the plan and the turn's messages
+                // are the loop's, and the offer arrives in a step's own
+                // acknowledgement (#1155). Off unless the catalog is wired.
+                if self.skill_write_authored.is_some() {
+                    router.offer_core_loop_tool(skill_promotion::promote_plan_tool());
+                }
+            }
             // The connection's registered client-local tools (#234), which run
             // on the user's own machine. Bounded (#1212): the connection hosts
             // whatever it happens to host, and one measured turn carried 77 of
@@ -3016,38 +3068,13 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
             let device = ToolConnection::client_device();
             router.offer(&device, &client_tool_defs[..client_in_block]);
             router.offer_named(&device, &client_tool_defs[client_in_block..]);
-            // The daemon's deferred fleet, when the provider's own tool search
-            // is carrying it. The model can call these by name, so the table
-            // has to route them, and they count for uniqueness like everything
-            // else. Their schemas travel in the namespaces rather than the
-            // block; `offered_namespaces` below takes the ones still reached
-            // that way.
-            if use_hosted_search && !hosted_search_demoted {
-                for ns in &namespaces {
-                    router.offer_deferred(&ToolConnection::daemon_server(&ns.name), &ns.tools);
-                }
-            }
-            // The step-planning + compaction tools (#240) when a scratchpad
-            // writer is wired. They are the loop's own control surface - it runs
-            // them itself, before any executor - so they have no connection and
-            // take no location root. Without a writer wired they stay off.
-            if self.scratchpad_write.is_some() {
-                router.offer_core_loop_tool(planning::begin_step_tool());
-                router.offer_core_loop_tool(planning::complete_step_tool());
-                // Keeping a finished plan is a core-loop tool for the same
-                // reason the pair above is: the plan and the turn's messages
-                // are the loop's, and the offer arrives in a step's own
-                // acknowledgement (#1155). Off unless the catalog is wired.
-                if self.skill_write_authored.is_some() {
-                    router.offer_core_loop_tool(skill_promotion::promote_plan_tool());
-                }
-            }
             // What this turn's tool searches and first calls activated (#1212),
             // each under the connection the activation recorded. Bounded by
-            // `MAX_ACTIVATED_TOOLS`, and gone when the turn ends. Offered after
-            // the fixed sets so the growth reads at the end of the block for
-            // anyone comparing two rounds - not as a cache property, which no
-            // ordering can buy on a round whose array changed at all.
+            // `MAX_ACTIVATED_TOOLS`, and gone when the turn ends. Last, and
+            // genuinely appended: a tool promoted from a name-only or deferred
+            // entry takes a position after everything already advertised rather
+            // than the slot that entry held (`ToolRouter::insert`), so the round
+            // before stays a prefix of this one.
             for (connection, def) in activations.offers() {
                 router.offer(connection, std::slice::from_ref(def));
             }
