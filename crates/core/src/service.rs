@@ -3513,7 +3513,8 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                     conv.messages.push(Message::new(
                         Role::System,
                         "The server-side tool search was unable to surface the \
-                         tools you need. You now have access to `builtin_tool_search` \
+                         tools you need. You now have access to \
+                         `daemon_builtin_tool_search` \
                          — call it with a query describing what you need.",
                     ));
                     continue;
@@ -11411,7 +11412,7 @@ mod tests {
                 "",
                 vec![ToolCall::new(
                     "call-1",
-                    "fs_read",
+                    "client_fs_read",
                     r#"{"path":"/etc/hosts"}"#,
                 )],
             ),
@@ -11453,7 +11454,11 @@ mod tests {
         assert_eq!(result, "The file says: 127.0.0.1 localhost");
         // The client-tool port — not the server-side executor — ran `fs_read`.
         let ran = executed.lock().unwrap().clone();
-        assert_eq!(ran, vec![("call-1".to_string(), "fs_read".to_string())]);
+        assert_eq!(
+            ran,
+            vec![("call-1".to_string(), "fs_read".to_string())],
+            "the client is asked for the tool by its own name, not the composed one"
+        );
 
         // The client's result was threaded into history as the tool result so
         // the LLM saw it on the next round.
@@ -11479,7 +11484,7 @@ mod tests {
             "",
             vec![ToolCall::new(
                 "call-1",
-                "fs_read",
+                "client_fs_read",
                 r#"{"path":"/etc/hosts"}"#,
             )],
         )];
@@ -11516,12 +11521,12 @@ mod tests {
 
         let starts = events
             .iter()
-            .filter(|e| matches!(e, ToolEvent::Started { name, .. } if name == "fs_read"))
+            .filter(|e| matches!(e, ToolEvent::Started { name, .. } if name == "client_fs_read"))
             .count();
         let finishes: Vec<bool> = events
             .iter()
             .filter_map(|e| match e {
-                ToolEvent::Finished { name, ok, .. } if name == "fs_read" => Some(*ok),
+                ToolEvent::Finished { name, ok, .. } if name == "client_fs_read" => Some(*ok),
                 _ => None,
             })
             .collect();
@@ -11541,7 +11546,7 @@ mod tests {
         use crate::ports::client_tools::with_client_tools;
 
         let responses = vec![
-            LlmResponse::with_tool_calls("", vec![ToolCall::new("call-1", "fs_read", "{}")]),
+            LlmResponse::with_tool_calls("", vec![ToolCall::new("call-1", "client_fs_read", "{}")]),
             LlmResponse::text("recovered"),
         ];
         let handler = make_tool_handler(responses, vec![], HashMap::new());
@@ -11571,12 +11576,12 @@ mod tests {
         assert_eq!(result.unwrap(), "recovered");
         let starts = events
             .iter()
-            .filter(|e| matches!(e, ToolEvent::Started { name, .. } if name == "fs_read"))
+            .filter(|e| matches!(e, ToolEvent::Started { name, .. } if name == "client_fs_read"))
             .count();
         let finishes: Vec<bool> = events
             .iter()
             .filter_map(|e| match e {
-                ToolEvent::Finished { name, ok, .. } if name == "fs_read" => Some(*ok),
+                ToolEvent::Finished { name, ok, .. } if name == "client_fs_read" => Some(*ok),
                 _ => None,
             })
             .collect();
@@ -12520,7 +12525,7 @@ mod tests {
         assert!(
             messages[0]
                 .content
-                .contains("Available tools in this turn: terminal.")
+                .contains("Available tools in this turn: daemon_terminal.")
         );
     }
 
@@ -12586,13 +12591,13 @@ mod tests {
         let messages = seen.lock().unwrap();
         let system = &messages[0].content;
         assert!(
-            system.contains("terminal — server 'daemon-host'"),
+            system.contains("daemon_terminal — server 'daemon-host'"),
             "remote note must label the server tool: {system}"
         );
         assert!(
-            !system.contains("terminal — your device"),
-            "the shadowed client twin is not offered to the model, so the note \
-             must not name it: {system}"
+            system.contains("client_terminal — your device"),
+            "the client's tool has a name of its own now, so it is offered and the note \
+             names it: {system}"
         );
         assert!(
             !system.contains("(alternative)"),
@@ -12673,8 +12678,8 @@ mod tests {
             .find(|l| l.starts_with("Available tools in this turn:"))
             .expect("a tool-availability line");
         assert!(
-            tool_line.contains("Available tools in this turn: terminal."),
-            "co-located note must be a plain single entry: {tool_line}"
+            tool_line.contains("Available tools in this turn: daemon_terminal, client_terminal."),
+            "one machine or two, each connection's tool has its own name: {tool_line}"
         );
         assert!(
             !tool_line.contains("your device") && !tool_line.contains("server 'daemon-host'"),
@@ -14214,7 +14219,7 @@ mod tests {
 
         assert_eq!(
             handler.llm.observed_namespace_tools(),
-            vec!["tool_3".to_string()],
+            vec!["daemon_tool_3".to_string()],
             "a restricted subagent must not be shown the names, descriptions \
              and schemas of tools outside its allowlist"
         );
@@ -14321,7 +14326,7 @@ mod tests {
 
         assert_eq!(
             handler.llm.observed_tools(),
-            vec!["builtin_tool_search".to_string()],
+            vec!["daemon_builtin_tool_search".to_string()],
             "nothing was deferred, so local discovery must stay on offer"
         );
     }
@@ -16077,7 +16082,7 @@ mod tests {
             "",
             vec![ToolCall::new(
                 "call-1",
-                "fs_read",
+                "client_fs_read",
                 r#"{"path":"/etc/hosts"}"#,
             )],
         )];

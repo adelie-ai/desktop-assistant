@@ -240,7 +240,7 @@ async fn turn_loop_suspends_on_client_tool_then_resumes_on_result() {
             "",
             vec![ToolCall::new(
                 "call-1",
-                "fs_read",
+                "client_fs_read",
                 r#"{"path":"/etc/hosts"}"#,
             )],
         ),
@@ -320,7 +320,11 @@ async fn turn_loop_suspends_on_client_tool_then_resumes_on_result() {
         } => {
             assert_eq!(t, &task_id);
             assert_eq!(tool_call_id, "call-1");
-            assert_eq!(tool_name, "fs_read");
+            assert_eq!(
+                tool_name, "fs_read",
+                "the client is asked for its own name; the location root is the daemon's \
+                 bookkeeping and is stripped before the call leaves (#1216)"
+            );
         }
         other => panic!("unexpected event: {other:?}"),
     }
@@ -394,7 +398,7 @@ async fn session_b_tool_not_offered_or_callable_under_session_a() {
     // The model (ignoring what it was offered) tries to call session B's tool,
     // then answers. Under session A that call must not reach the client.
     let responses = vec![
-        LlmResponse::with_tool_calls("", vec![ToolCall::new("call-b", "tool_b", r#"{}"#)]),
+        LlmResponse::with_tool_calls("", vec![ToolCall::new("call-b", "client_tool_b", r#"{}"#)]),
         LlmResponse::text("answered without tool_b"),
     ];
     let (handler, offered) = make_handler_recording(responses);
@@ -511,11 +515,11 @@ async fn session_b_tool_not_offered_or_callable_under_session_a() {
     // And tool_b was never advertised to the model under session A.
     let offered_names = offered.lock().unwrap().clone();
     assert!(
-        offered_names.iter().any(|n| n == "tool_a"),
+        offered_names.iter().any(|n| n == "client_tool_a"),
         "session A's own tool was advertised, got {offered_names:?}"
     );
     assert!(
-        !offered_names.iter().any(|n| n == "tool_b"),
+        !offered_names.iter().any(|n| n == "client_tool_b"),
         "session B's tool must never be advertised under session A, got {offered_names:?}"
     );
 }

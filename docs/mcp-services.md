@@ -484,13 +484,10 @@ description do not say which machine it acts on. Each result carries a
 | `remote-service` | An MCP server the daemon reaches over HTTP. Acts on that service, and on no local files. |
 | `device` | A tool the connected client registered. Acts on the user's own machine. |
 
-Each hit also carries `host`, the name of the machine that issues the call: the
-daemon's own label for a `daemon` or `remote-service` hit, and the connected
-client's label for a `device` hit (`your device` when the client reported none).
-The two fields answer different questions. `runs_on` says what a tool reaches,
-which is what stops a model believing a remote calendar tool can read local
-files. `host` says which machine issues it, which is what a request about a
-particular machine - "read that file on the laptop" - is matched against.
+Each hit carries the name the model must call it by - the composed name
+described in [Tool Names Are Unique](#tool-names-are-unique) - rather than the
+provider's own, so a name read out of a search result resolves when it is
+called.
 
 The daemon and remote-service split is read live from the routing table and the
 server configuration, so a server added since startup classifies correctly. A
@@ -513,42 +510,59 @@ collision.
 A search that matched more client tools than it returned reports the count it
 dropped in `more_device_tools_matched`.
 
-## One Name, Two Machines
+## Tool Names Are Unique
 
-A tool is identified by the pair (capability name, host). The name says what the
-tool does and never says where it runs, so a machine that is renamed or replaced
-changes no tool name - and what the assistant learned about a tool on one
-machine still applies to the same tool on another.
+A tool belongs to exactly one **connection** - a client device, an MCP server,
+or the daemon's own built-ins - and the daemon addresses it as
+(connection, tool name). The name the model is offered is composed from that
+pair, so no two tools can share a name:
 
-Each turn builds one table of every tool it can reach, keyed by that pair. The
-table decides both what the model is shown and where each call goes, so the
-schema the model reads and the machine that runs the call are one decision
-rather than two that can disagree.
+```
+daemon built-in              daemon_<tool>
+daemon MCP server "fileio"   daemon_fileio__<tool>
+client built-in              client_<tool>
+client MCP server "fileio"   client_fileio__<tool>
+```
 
-When the daemon and the connected client both offer a capability under one name:
+The location root is applied by the daemon, never by the provider. A client
+connection configured as `daemon` composes to `client_daemon__<tool>`, and a
+daemon MCP server configured as `client` composes to `daemon_client__<tool>`.
+This is a security property rather than a formatting rule: a name that escaped
+its root would be presented to the model as running somewhere it does not. The
+rule is symmetric - a daemon server's namespace is a string in a configuration
+file, and is sanitised exactly like a client's.
 
-- The advertised schema gains an optional `__host` argument, whose values are
-  the `runs_on` tokens of the hosts that offer it (`daemon`, `device`). The
-  model sets it when the task is about a particular machine. A hit that reports
-  `runs_on: remote-service` is issued from the daemon, so `daemon` names it -
-  that value says what a tool reaches, not which machine makes the call.
-- With no `__host` stated, the routing policy chooses. The policy is
-  `prefer-co-located`: the call stays on the daemon, which is the process
-  running the turn, rather than crossing a socket to a client that may
-  disconnect mid-turn.
-- `__host` is the harness's field, not the tool's. It is removed before the tool
-  runs, so no tool receives it.
-- A capability only one host offers carries no `__host` argument: there is
-  nothing to choose.
+Because names are unique there is nothing to resolve between. The same
+capability on a client and on the daemon is two tools with two names, and each
+runs where its connection runs. There is no override, no precedence and no
+policy choosing between them.
 
-Where a connector carries the daemon's fleet through its own tool search, the
-same table decides what that search may offer: a name a client-registered tool
-already answers for is left out of it, so the model is never shown two schemas
-for one name.
+**A duplicate composed name is a fault, not a case with a defined winner.** The
+turn refuses the second claimant and logs both, so an operator can see which
+connection to rename:
 
-An operator who wants a client-registered tool to be the default for a name the
-daemon also holds should give it a name of its own - a namespace on the client's
-MCP entry does that. The daemon logs the shared names once per turn.
+```
+WARN two connections claim one tool name; the second is not offered.
+     Give one of them a namespace of its own
+     name="daemon_read_file" held_by="daemon:built-ins/read_file"
+     refused="daemon:files/read_file"
+```
+
+Two devices running the same MCP server collide only if their connections carry
+the same configured name, which is why the namespace is the connection's own
+name - chosen by a person, and already unique within one host's configuration.
+
+Two consequences worth stating:
+
+- **The prefix is the daemon's bookkeeping, not a fact the model is told.**
+  Nothing decides where a tool runs by reading its name: the location comes from
+  the routing table, and one day from a structural field beside the tool. That
+  is what keeps the prefix removable - if anything parsed it, taking it out
+  would stop being a rename.
+- **The prefix never reaches a tool or a learning key.** It is stripped before
+  execution, so a tool is called by the name its provider gave it, and before
+  the negative-memory digest, so a lesson learned about a tool on one machine
+  still applies to the same tool on another.
 
 ## Startup Behaviour
 

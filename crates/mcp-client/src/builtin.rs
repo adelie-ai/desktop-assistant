@@ -8540,7 +8540,7 @@ mod tests {
         assert_eq!(json["ok"], true);
         let tools = json["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0]["name"], "jira__create_issue");
+        assert_eq!(tools[0]["name"], "daemon_jira__create_issue");
     }
 
     // --- Runner on search results (#1082) ---------------------------------
@@ -8687,8 +8687,8 @@ mod tests {
             .iter()
             .map(|t| (t["name"].as_str().unwrap(), t["runs_on"].as_str().unwrap()))
             .collect();
-        assert_eq!(by_name["calendar__list_events"], "remote-service");
-        assert_eq!(by_name["fileio__read_file"], "daemon");
+        assert_eq!(by_name["daemon_calendar__list_events"], "remote-service");
+        assert_eq!(by_name["daemon_fileio__read_file"], "daemon");
         assert!(
             json["runs_on"]["remote-service"]
                 .as_str()
@@ -8711,7 +8711,7 @@ mod tests {
             )],
         )
         .await;
-        assert_eq!(json["tools"][0]["name"], "device__read_file");
+        assert_eq!(json["tools"][0]["name"], "client_device__read_file");
         assert_eq!(json["tools"][0]["runs_on"], "device");
         assert!(
             json["runs_on"]["device"]
@@ -8796,8 +8796,9 @@ mod tests {
             .filter_map(|t| t["name"].as_str())
             .collect();
         assert!(
-            names.contains(&"fileio__read_file") && names.contains(&"device__read_file"),
-            "both machines' answers must be offered: {names:?}"
+            names.contains(&"daemon_fileio__read_file")
+                && names.contains(&"client_device__read_file"),
+            "both connections' answers must be offered, each under its own name: {names:?}"
         );
         assert!(
             !names.contains(&"device__play_music"),

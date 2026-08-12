@@ -56,9 +56,10 @@
 
 use crate::domain::{ToolDefinition, ToolNamespace};
 
-/// The separator between a provider's namespace and its tool name, as both
-/// sides already compose it (`{namespace}__{tool}`).
-pub const NAMESPACE_SEPARATOR: &str = "__";
+/// Longest provider segment a composed name will carry. A provider names
+/// itself, and the name is rendered into every round's tool block, so the
+/// length is bounded here rather than trusted.
+const MAX_SEGMENT_CHARS: usize = 120;
 
 /// The connection a tool belongs to: a client device, an MCP server, or the
 /// daemon's own built-ins.
@@ -166,6 +167,10 @@ impl ToolLocation {
             Self::Client => "client",
         }
     }
+
+    /// Every location, so a caller that must consider all of them cannot miss
+    /// one when a third appears.
+    const ALL: [Self; 2] = [Self::Daemon, Self::Client];
 }
 
 /// Compose the name the model is offered: this code's root, then the provider's
@@ -177,10 +182,8 @@ impl ToolLocation {
 /// legible survives, which the caller reports as a refused offer rather than
 /// advertising an unnamed tool.
 pub fn compose_name(location: ToolLocation, provider_name: &str) -> Option<String> {
-    // Placeholder: no root, no sanitising - the name as the provider gave it,
-    // which is what the turn advertised before this ticket.
-    let _ = location;
-    Some(provider_name.to_string())
+    let segment = sanitize_segment(provider_name)?;
+    Some(format!("{}{segment}", location.root()))
 }
 
 /// The provider's own name, with the location root removed.
@@ -191,8 +194,32 @@ pub fn compose_name(location: ToolLocation, provider_name: &str) -> Option<Strin
 /// `daemon_read` composes to `client_daemon_read`, and a second strip would
 /// read the provider's own word as a root.
 pub fn strip_location(name: &str) -> &str {
-    // Placeholder: nothing to strip while nothing composes a root.
-    name
+    ToolLocation::ALL
+        .into_iter()
+        .find_map(|location| name.strip_prefix(location.root()))
+        .unwrap_or(name)
+}
+
+/// Keep only what a tool name may carry, and refuse a segment with nothing
+/// legible left.
+///
+/// A provider names itself, and both sides are equally untrusted here: a client
+/// is a separate process the daemon does not control, and a daemon server's
+/// namespace is a string in a configuration file. So this drops anything that
+/// is not a tool-name character, trims the separators from both ends - a
+/// leading one would read as a root's own separator - and bounds the length,
+/// because the name is rendered into every round's tool block.
+///
+/// It cannot climb out: the root is applied by [`compose_name`] afterwards, and
+/// nothing this returns can precede it.
+fn sanitize_segment(raw: &str) -> Option<String> {
+    let kept: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .take(MAX_SEGMENT_CHARS)
+        .collect();
+    let trimmed = kept.trim_matches(|c| c == '_' || c == '-');
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 /// Which surface offered a tool, which decides where its schema is shown -
@@ -475,11 +502,10 @@ impl ToolRouter {
                 connection.map_or("core-loop".to_string(), ToolConnection::label)
             )
         };
-        let _ = &claimant;
         if let Some(held) = self
             .entries
             .iter_mut()
-            .find(|e| false && e.advertised.name == advertised.name)
+            .find(|e| e.advertised.name == advertised.name)
         {
             if held.connection == connection && held.provider_name == provider_name {
                 // One tool, two surfaces. Keep the one the model can read.

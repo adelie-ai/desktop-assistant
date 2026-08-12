@@ -436,12 +436,23 @@ fn server_tool_failure_capturing(level: Level) -> String {
 /// preferred one of two hosts that both offered it (#1216).
 const CLIENT_ONLY_TOOL: &str = "write_note_on_device";
 
+/// The same tool as the model is offered it: every advertised name carries the
+/// root of the connection that runs it (#1216).
+const CLIENT_ONLY_TOOL_AS_ADVERTISED: &str = "client_write_note_on_device";
+
 /// The model's script for the client-tool arm: one call to the name only the
 /// client holds, then an answer.
 fn client_tool_call_script() -> Vec<LlmResponse> {
     let arguments = serde_json::json!({ "note": TOOL_ARGUMENT_SENTINEL }).to_string();
     vec![
-        LlmResponse::with_tool_calls("", vec![ToolCall::new("c1", CLIENT_ONLY_TOOL, arguments)]),
+        LlmResponse::with_tool_calls(
+            "",
+            vec![ToolCall::new(
+                "c1",
+                CLIENT_ONLY_TOOL_AS_ADVERTISED,
+                arguments,
+            )],
+        ),
         LlmResponse::text("saved"),
     ]
 }
