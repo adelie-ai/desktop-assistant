@@ -80,7 +80,7 @@ fn shipped_default_seeds_and_parses_to_the_expected_fleet() {
 }
 
 #[test]
-fn every_shipped_server_is_a_bundled_stdio_binary() {
+fn every_shipped_server_declares_an_absolute_stdio_command() {
     let dir = tempfile::tempdir().expect("tempdir");
     let src = staged_source(dir.path());
     let dest = dir.path().join("mcp_servers.toml");
@@ -179,9 +179,9 @@ fn seeding_never_clobbers_an_existing_config() {
 
 // --- The image actually carries what the config offers -----------------------
 //
-// `every_shipped_server_is_a_bundled_stdio_binary` above checks the SHAPE of
-// each command path. It cannot check that the binary exists, because the binary
-// is produced by `Dockerfile.fleet` in another stage entirely. That gap let the
+// `every_shipped_server_declares_an_absolute_stdio_command` above checks the
+// SHAPE of each command path. It cannot check that the binary exists, because
+// the binary is produced by `Dockerfile.fleet` in another stage entirely. That gap let the
 // shipped config offer `homeassistant`, whose repository is private and so was
 // removed from the build context (#1235), for as long as the server existed:
 // enabling it from the settings UI spawned a path that was never in the image
@@ -248,6 +248,20 @@ fn fleet_in_the_image() -> Vec<String> {
         loops[0],
         "every fleet source COPYed into the build stage must be built, and every \
          server built must have had its source COPYed"
+    );
+    // Everything above maps a config command basename onto a Dockerfile
+    // DIRECTORY name, which only holds while the collect step names the binary
+    // after its directory. Pin that step rather than assume it.
+    assert!(
+        dockerfile.contains(r#"cp "$d/target/release/$d" "/out/mcp/$d""#),
+        "the collect step must copy $d/target/release/$d to /out/mcp/$d. If it \
+         stops naming the binary after its directory, a config command can point \
+         at a path the image does not carry while these tests still pass"
+    );
+    assert!(
+        dockerfile.contains("COPY --from=builder /out/mcp/ /opt/adele/mcp/"),
+        "the runtime stage must place /out/mcp at /opt/adele/mcp, or the paths \
+         the shipped config names are not the paths the image carries"
     );
     loops.into_iter().next().expect("checked non-empty above")
 }

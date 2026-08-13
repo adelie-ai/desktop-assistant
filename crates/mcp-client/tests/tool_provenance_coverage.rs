@@ -90,9 +90,11 @@ fn the_classification_table_names_no_mcp_server_that_is_not_shipped() {
     // `ResultProvenance::Trusted` and so does not taint the turn. Home
     // Assistant entity names and attributes are written by whoever set the
     // devices up, and the table grades them `ExternallyControlled` today.
-    // Dropping the entry would silently regrade them as trusted for every
-    // operator running the server from a derived image, which is worse than
-    // carrying a name here (#1290).
+    // Dropping the entry would regrade them as trusted for every operator
+    // running the server from a derived image, which is worse than carrying a
+    // name here (#1290). Two tests beside the table in `tool_provenance.rs`
+    // would catch that deletion, so it is not a silent loss - but they catch it
+    // by naming the same tools, which is the thing this list keeps alive.
     const CLASSIFIED_FOR_A_DERIVED_IMAGE: [&str; 1] = ["homeassistant"];
 
     let servers = load_mcp_configs(&shipped_default()).expect("load the shipped fleet config");
@@ -101,11 +103,18 @@ fn the_classification_table_names_no_mcp_server_that_is_not_shipped() {
     // The allowance is for servers the base image genuinely does not ship. If
     // one returns to the fleet, it must leave this list rather than sit in
     // both, or the list stops describing anything.
+    let classified: Vec<&str> = CLASSIFIED_SOURCES.iter().map(|s| s.source).collect();
     for name in CLASSIFIED_FOR_A_DERIVED_IMAGE {
         assert!(
             !shipped.contains(&name),
             "{name:?} is shipped in the base fleet now, so remove it from \
              CLASSIFIED_FOR_A_DERIVED_IMAGE and let the ordinary check cover it"
+        );
+        assert!(
+            classified.contains(&name),
+            "{name:?} is named in CLASSIFIED_FOR_A_DERIVED_IMAGE but no longer \
+             appears in CLASSIFIED_SOURCES, so the allowance excuses nothing. \
+             Drop it from this list, or restore the classification it exists for"
         );
     }
 
