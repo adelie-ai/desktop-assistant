@@ -98,18 +98,6 @@ command = "/opt/adele/mcp/fileio-mcp"
 args = ["serve"]
 enabled = false
 
-# Home Assistant control. Needs HOMEASSISTANT_URL + HOMEASSISTANT_TOKEN in the
-# environment to be useful (it starts, but tool calls fail until configured).
-# Prefer env_secrets for the token (seed a secret, then reference it here).
-[[servers]]
-name = "homeassistant"
-description = "Read and control Home Assistant devices, entities, scenes, and automations."
-command = "/opt/adele/mcp/homeassistant-mcp"
-args = ["serve"]
-enabled = false
-# [servers.env]
-# HOMEASSISTANT_URL = "http://homeassistant.local:8123"
-
 # Headless web browsing/scraping. Chromium is bundled in the base runtime image
 # (see Dockerfile.fleet) with WEB_CHROME_PATH pointing web-mcp at it, so this is
 # enabled by default. In a container Chrome must run with --no-sandbox, and

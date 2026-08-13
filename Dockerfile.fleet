@@ -15,7 +15,7 @@
 #                                              boot (#491) via
 #                                              DESKTOP_ASSISTANT_MCP_DEFAULT_CONFIG
 #
-# BUILD CONTEXT: a staged dir with `desktop-assistant/` + the 13 `*-mcp` fleet
+# BUILD CONTEXT: a staged dir with `desktop-assistant/` + the 12 `*-mcp` fleet
 # repos as SIBLINGS (each builds from its own source). See deploy/mcp/README.md.
 
 # ---- Builder ----------------------------------------------------------------

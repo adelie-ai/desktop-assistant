@@ -53,7 +53,7 @@ podman build -t localhost/adele-daemon:dev -f Dockerfile .
 ### Telemetry export: one build argument, off by default
 
 Both Dockerfiles take `--build-arg OTEL=1`, which compiles the OTLP exporter
-into the daemon - and, for the fleet image, into all 13 bundled MCP servers as
+into the daemon - and, for the fleet image, into all 12 bundled MCP servers as
 well. Without it the image contains no exporter, and the `OTEL_*` variables the
 manifests set do nothing at all.
 
@@ -90,7 +90,7 @@ CTX=$(mktemp -d)/fleet-ctx
 mkdir -p "$CTX"
 
 for repo in desktop-assistant command-mcp cve-mcp fileio-mcp geocode-mcp \
-            homeassistant-mcp internet-radio-mcp openstreetmap-mcp skills-mcp \
+            internet-radio-mcp openstreetmap-mcp skills-mcp \
             tasks-mcp terminal-mcp timeclock-mcp weather-forecast-mcp web-mcp; do
   rsync -aL --exclude target --exclude .git --exclude build \
         --exclude '.flatpak-builder' --exclude .venv --exclude .worktrees \

@@ -82,12 +82,50 @@ fn the_classification_table_names_no_mcp_server_that_is_not_shipped() {
     // honest about what it is skipping.
     const NON_SERVER_SOURCES: [&str; 3] = ["builtin", "subagent", "client"];
 
+    // Servers the BASE image does not carry, but whose tools this build still
+    // classifies because a derived image can carry them (deploy/mcp/README.md).
+    //
+    // Removing such a classification is not neutral. An unnamed tool is
+    // `ToolTier::Unclassified`, whose result counts as
+    // `ResultProvenance::Trusted` and so does not taint the turn. Home
+    // Assistant entity names and attributes are written by whoever set the
+    // devices up, and the table grades them `ExternallyControlled` today.
+    // Dropping the entry would regrade them as trusted for every operator
+    // running the server from a derived image, which is worse than carrying a
+    // name here (#1290). Two tests beside the table in `tool_provenance.rs`
+    // would catch that deletion, so it is not a silent loss - but they catch it
+    // by naming the same tools, which is the thing this list keeps alive.
+    const CLASSIFIED_FOR_A_DERIVED_IMAGE: [&str; 1] = ["homeassistant"];
+
     let servers = load_mcp_configs(&shipped_default()).expect("load the shipped fleet config");
     let shipped: Vec<&str> = servers.iter().map(|s| s.name.as_str()).collect();
+
+    // The allowance is for servers the base image genuinely does not ship. If
+    // one returns to the fleet, it must leave this list rather than sit in
+    // both, or the list stops describing anything.
+    let classified: Vec<&str> = CLASSIFIED_SOURCES.iter().map(|s| s.source).collect();
+    for name in CLASSIFIED_FOR_A_DERIVED_IMAGE {
+        assert!(
+            !shipped.contains(&name),
+            "{name:?} is shipped in the base fleet now, so remove it from \
+             CLASSIFIED_FOR_A_DERIVED_IMAGE and let the ordinary check cover it"
+        );
+        assert!(
+            classified.contains(&name),
+            "{name:?} is named in CLASSIFIED_FOR_A_DERIVED_IMAGE but no longer \
+             appears in CLASSIFIED_SOURCES, so the allowance excuses nothing. \
+             Drop it from this list, or restore the classification it exists for"
+        );
+    }
+
     let stale: Vec<&str> = CLASSIFIED_SOURCES
         .iter()
         .map(|s| s.source)
-        .filter(|name| !NON_SERVER_SOURCES.contains(name) && !shipped.contains(name))
+        .filter(|name| {
+            !NON_SERVER_SOURCES.contains(name)
+                && !CLASSIFIED_FOR_A_DERIVED_IMAGE.contains(name)
+                && !shipped.contains(name)
+        })
         .collect();
     assert!(
         stale.is_empty(),
