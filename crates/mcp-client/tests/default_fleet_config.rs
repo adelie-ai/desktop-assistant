@@ -180,3 +180,142 @@ fn seeding_never_clobbers_an_existing_config() {
         "the pre-existing (empty) config must survive untouched"
     );
 }
+
+// --- The image actually carries what the config offers -----------------------
+//
+// `every_shipped_server_is_a_bundled_stdio_binary` above checks the SHAPE of
+// each command path. It cannot check that the binary exists, because the binary
+// is produced by `Dockerfile.fleet` in another stage entirely. That gap let the
+// shipped config offer `homeassistant`, whose repository is private and so was
+// removed from the build context (#1235), for as long as the server existed:
+// enabling it from the settings UI spawned a path that was never in the image
+// (#1290). These tests close the gap by reading the Dockerfile.
+
+/// The repo root, from this crate (`crates/mcp-client`).
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+fn read_repo_file(relative: &str) -> String {
+    let path = repo_root().join(relative);
+    fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+}
+
+/// Every `for d in <dirs>; do` list in `Dockerfile.fleet`, in file order.
+///
+/// The Dockerfile names the fleet twice - once to build and once to collect the
+/// binaries into `/out/mcp/` - and the runtime stage copies that directory to
+/// `/opt/adele/mcp/`. Both lists must agree, so both are returned.
+fn dockerfile_fleet_loops(dockerfile: &str) -> Vec<Vec<String>> {
+    // Undo shell line continuations so a list can be read as one span.
+    let joined = dockerfile.replace("\\\n", " ");
+    joined
+        .match_indices("for d in ")
+        .map(|(at, marker)| {
+            let rest = &joined[at + marker.len()..];
+            let end = rest
+                .find("; do")
+                .expect("a `for d in` list must be terminated by `; do`");
+            rest[..end].split_whitespace().map(str::to_string).collect()
+        })
+        .collect()
+}
+
+/// The `*-mcp` source trees `Dockerfile.fleet` copies into the build stage.
+fn dockerfile_fleet_copies(dockerfile: &str) -> Vec<String> {
+    dockerfile
+        .lines()
+        .filter_map(|l| l.strip_prefix("COPY "))
+        .filter_map(|rest| rest.split_whitespace().next())
+        .filter_map(|src| src.strip_suffix('/'))
+        .filter(|src| src.ends_with("-mcp"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The fleet the image is built from and ships: the single agreed list.
+fn fleet_in_the_image() -> Vec<String> {
+    let dockerfile = read_repo_file("Dockerfile.fleet");
+    let loops = dockerfile_fleet_loops(&dockerfile);
+    assert_eq!(
+        loops.len(),
+        2,
+        "Dockerfile.fleet should name the fleet exactly twice (build, then collect)"
+    );
+    assert_eq!(
+        loops[0], loops[1],
+        "the build loop and the collect loop must name the same servers, or the \
+         image builds a binary it never copies (or copies one it never built)"
+    );
+    assert_eq!(
+        dockerfile_fleet_copies(&dockerfile),
+        loops[0],
+        "every fleet source COPYed into the build stage must be built, and every \
+         server built must have had its source COPYed"
+    );
+    loops.into_iter().next().expect("checked non-empty above")
+}
+
+/// The property `every_shipped_server_is_a_bundled_stdio_binary` names but
+/// cannot reach: the command is not merely shaped like a bundled path, the
+/// image really does put a binary there.
+#[test]
+fn every_command_in_the_shipped_config_is_a_binary_the_image_builds() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let src = staged_source(dir.path());
+    let dest = dir.path().join("mcp_servers.toml");
+    ensure_mcp_config_exists(&dest, Some(&src)).expect("seed");
+    let servers = load_mcp_configs(&dest).expect("load");
+
+    let built = fleet_in_the_image();
+    for s in &servers {
+        let binary = s
+            .command
+            .strip_prefix("/opt/adele/mcp/")
+            .unwrap_or_else(|| panic!("{}: command is not a bundled path", s.name));
+        assert!(
+            built.iter().any(|d| d == binary),
+            "{}: the shipped config offers {:?}, but Dockerfile.fleet never builds \
+             {binary}. Enabling it from the settings UI spawns a path that is not \
+             in the image. Either build it, or drop the server from the shipped \
+             default. Built: {built:?}",
+            s.name,
+            s.command,
+        );
+    }
+}
+
+/// The docs tell a reader which sources to stage into the build context. Stage
+/// too few and the build fails loudly; stage one the Dockerfile ignores and it
+/// succeeds while quietly producing an image without that server - which is how
+/// #1290 survived two images built five weeks apart.
+#[test]
+fn the_documented_staging_lists_name_exactly_the_sources_the_image_needs() {
+    let mut expected = vec!["desktop-assistant".to_string()];
+    expected.extend(fleet_in_the_image());
+    expected.sort();
+
+    for doc in ["docs/k8s-deployment.md", "deploy/mcp/README.md"] {
+        let text = read_repo_file(doc);
+        let (at, marker) = text
+            .match_indices("for r in ")
+            .chain(text.match_indices("for repo in "))
+            .next()
+            .unwrap_or_else(|| panic!("{doc}: no staging loop found"));
+        let rest = &text[at + marker.len()..];
+        let end = rest
+            .find("; do")
+            .unwrap_or_else(|| panic!("{doc}: staging loop is not terminated by `; do`"));
+        let mut listed: Vec<String> = rest[..end]
+            .replace('\\', " ")
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        listed.sort();
+        assert_eq!(
+            listed, expected,
+            "{doc}: the staging list and Dockerfile.fleet disagree. A source \
+             staged but never built yields an image silently missing that server"
+        );
+    }
+}
