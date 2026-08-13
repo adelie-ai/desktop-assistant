@@ -266,9 +266,9 @@ fn fleet_in_the_image() -> Vec<String> {
     loops.into_iter().next().expect("checked non-empty above")
 }
 
-/// The property `every_shipped_server_is_a_bundled_stdio_binary` names but
-/// cannot reach: the command is not merely shaped like a bundled path, the
-/// image really does put a binary there.
+/// The property `every_shipped_server_declares_an_absolute_stdio_command` fell
+/// short of: the command is not merely shaped like a bundled path, the image
+/// really does put a binary there.
 #[test]
 fn every_command_in_the_shipped_config_is_a_binary_the_image_builds() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -307,11 +307,22 @@ fn the_documented_staging_lists_name_exactly_the_sources_the_image_needs() {
 
     for doc in ["docs/k8s-deployment.md", "deploy/mcp/README.md"] {
         let text = read_repo_file(doc);
-        let (at, marker) = text
+        let mut loops: Vec<(usize, &str)> = text
             .match_indices("for r in ")
             .chain(text.match_indices("for repo in "))
-            .next()
-            .unwrap_or_else(|| panic!("{doc}: no staging loop found"));
+            .collect();
+        loops.sort_by_key(|(at, _)| *at);
+        // Exactly one, like the Dockerfile check. With `.next()` alone, a second
+        // shell example added to the doc later would never be inspected, and
+        // this test would report on whichever loop happened to come first.
+        assert_eq!(
+            loops.len(),
+            1,
+            "{doc}: expected exactly one staging loop, found {}. Checking only \
+             the first would leave the others free to drift",
+            loops.len()
+        );
+        let (at, marker) = loops[0];
         let rest = &text[at + marker.len()..];
         let end = rest
             .find("; do")
@@ -328,4 +339,58 @@ fn the_documented_staging_lists_name_exactly_the_sources_the_image_needs() {
              staged but never built yields an image silently missing that server"
         );
     }
+}
+
+/// The fleet size also appears written out in prose, in four files across two
+/// directories. The staging-list test above holds the LISTS to the Dockerfile,
+/// but a number in a sentence is a separate claim and drifts on its own: when
+/// the fleet lost a server, three of the four sentences went stale, and a
+/// hand search for them still missed one.
+///
+/// This check is deliberately narrow - it matches two phrasings, not English -
+/// so it asserts that it matched something. A doc that rephrases its way out of
+/// the pattern fails here rather than passing vacuously.
+#[test]
+fn every_written_out_fleet_size_matches_the_fleet() {
+    const DOCS: [&str; 4] = [
+        "Dockerfile.fleet",
+        "docs/k8s-deployment.md",
+        "deploy/mcp/README.md",
+        "deploy/k8s/README.md",
+    ];
+    let expected = fleet_in_the_image().len();
+    let mut found = 0usize;
+
+    for doc in DOCS {
+        let text = read_repo_file(doc);
+        for (idx, _) in text
+            .match_indices("bundled MCP servers")
+            .chain(text.match_indices("`*-mcp`"))
+        {
+            // The count is the last number before the phrase.
+            let before = &text[..idx];
+            let number: String = before
+                .trim_end()
+                .rsplit(|c: char| !c.is_ascii_digit())
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            let Ok(stated) = number.parse::<usize>() else {
+                continue; // the phrase without a count in front of it
+            };
+            found += 1;
+            assert_eq!(
+                stated, expected,
+                "{doc}: says {stated} servers, but Dockerfile.fleet builds {expected}"
+            );
+        }
+    }
+
+    assert!(
+        found >= DOCS.len(),
+        "expected a written-out fleet size in each of {} files, matched {found}. \
+         A doc that rephrases past this check stops being checked, so widen the \
+         match rather than leaving it silently vacuous",
+        DOCS.len()
+    );
 }

@@ -157,7 +157,7 @@ podman build --build-arg OTEL=1 -t localhost/adele-daemon:otel -f Dockerfile .
 ```
 
 `Dockerfile.fleet` takes the same argument, and applies it to the daemon **and**
-to all 13 bundled MCP servers, so a tool call is instrumented too:
+to all 12 bundled MCP servers, so a tool call is instrumented too:
 
 ```sh
 podman build --build-arg OTEL=1 -t localhost/adele-daemon:fleet-otel \
