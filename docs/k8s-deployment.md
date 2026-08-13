@@ -90,7 +90,7 @@ CTX=$(mktemp -d)/fleet-ctx
 mkdir -p "$CTX"
 
 for repo in desktop-assistant command-mcp cve-mcp fileio-mcp geocode-mcp \
-            homeassistant-mcp internet-radio-mcp openstreetmap-mcp skills-mcp \
+            internet-radio-mcp openstreetmap-mcp skills-mcp \
             tasks-mcp terminal-mcp timeclock-mcp weather-forecast-mcp web-mcp; do
   rsync -aL --exclude target --exclude .git --exclude build \
         --exclude '.flatpak-builder' --exclude .venv --exclude .worktrees \

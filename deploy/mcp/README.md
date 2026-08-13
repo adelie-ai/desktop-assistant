@@ -29,10 +29,11 @@ once and survives restarts.
 Curated in `deploy/mcp/mcp_servers.default.toml` by **danger x usefulness**:
 
 - **Enabled** (safe, useful, zero config): `weather-forecast`, `geocode`,
-  `openstreetmap`, `cve`, `tasks`, `timeclock`, `skills`.
+  `openstreetmap`, `cve`, `tasks`, `timeclock`, `skills`, `web` (Chromium is
+  bundled in the base image, so it needs no configuration).
 - **Configured-but-disabled** (opt-in): `terminal` (shell exec), `command`
-  (needs a `--config`), `fileio` (filesystem writes), `homeassistant` (needs a
-  URL + token), `web` (needs Chromium), `internet-radio` (needs `mpv` + audio).
+  (needs a `--config`), `fileio` (filesystem writes), `internet-radio` (needs
+  `mpv` + audio).
 
 Enable a disabled server from the settings UI (or by editing the config), after
 providing whatever it needs.
@@ -40,7 +41,7 @@ providing whatever it needs.
 ## Build
 
 The daemon and the fleet servers path-build from sibling source trees, so the
-build context is a **staged dir** with `desktop-assistant/` and the 13 `*-mcp`
+build context is a **staged dir** with `desktop-assistant/` and the 12 `*-mcp`
 repos as siblings. Stage clean copies (no `target/`, `.git/`, packaging cruft):
 
 ```sh
@@ -49,7 +50,7 @@ ADELE=<path-to-your-adelie-ai-checkout>
 CTX=$(mktemp -d)/fleet-ctx
 mkdir -p "$CTX"
 for r in desktop-assistant command-mcp cve-mcp fileio-mcp geocode-mcp \
-         homeassistant-mcp internet-radio-mcp openstreetmap-mcp skills-mcp \
+         internet-radio-mcp openstreetmap-mcp skills-mcp \
          tasks-mcp terminal-mcp timeclock-mcp weather-forecast-mcp web-mcp; do
   rsync -aL --exclude target --exclude .git --exclude build \
         --exclude '.flatpak-builder' --exclude .venv --exclude .worktrees \
@@ -77,17 +78,32 @@ COPY my-new-mcp /opt/adele/mcp/my-new-mcp
 COPY mcp_servers.toml /opt/adele/mcp_servers.default.toml
 ```
 
-Enable a dependency-needing server, e.g. `web` (needs Chromium):
+Enable a dependency-needing server, e.g. `internet-radio` (needs `mpv`):
 
 ```dockerfile
 FROM registry.example.com:5000/adele/adele-daemon:fleet-<tag>
 USER root
-RUN apt-get update && apt-get install -y --no-install-recommends chromium \
+RUN apt-get update && apt-get install -y --no-install-recommends mpv \
     && rm -rf /var/lib/apt/lists/*
 USER assistant
-# then set `web` enabled = true (args = ["serve", "--chrome-arg=--no-sandbox"])
-# in the config you COPY over /opt/adele/mcp_servers.default.toml.
+# then set `internet-radio` enabled = true in the config you COPY over
+# /opt/adele/mcp_servers.default.toml.
 ```
+
+### A server built from a private source
+
+The base image is built from public repositories only, because the in-cluster
+build and the poller that triggers it hold no credential. A server whose source
+is private therefore cannot be in the base build context, and must arrive as a
+prebuilt binary in a derived image built somewhere that does hold the
+credential. `homeassistant-mcp` is the example: it was removed from
+`Dockerfile.fleet` for this reason.
+
+Do not add such a server to `deploy/mcp/mcp_servers.default.toml`. A config
+entry whose binary the image does not carry looks enabled in the settings UI and
+fails on spawn with `No such file or directory`, which reads as a broken server
+rather than an absent one. Ship the entry in the derived image's own default
+config, beside the binary it names.
 
 The default config in your derived image must keep the same rules: `command`
 values are **absolute** `/opt/adele/mcp/<name>` paths, and the file is owned by

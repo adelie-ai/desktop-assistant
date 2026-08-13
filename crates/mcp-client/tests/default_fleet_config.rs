@@ -43,7 +43,7 @@ fn shipped_default_seeds_and_parses_to_the_expected_fleet() {
     assert!(dest.exists(), "seed must create the dest file");
 
     let servers = load_mcp_configs(&dest).expect("load seeded config");
-    assert_eq!(servers.len(), 13, "expected the full 13-server fleet");
+    assert_eq!(servers.len(), 12, "expected the full 12-server fleet");
 
     let enabled: Vec<&str> = servers
         .iter()
@@ -72,14 +72,10 @@ fn shipped_default_seeds_and_parses_to_the_expected_fleet() {
     );
     assert_eq!(
         disabled,
-        [
-            "terminal",
-            "command",
-            "fileio",
-            "homeassistant",
-            "internet-radio"
-        ],
-        "the dangerous / dependency-needing servers ship disabled"
+        ["terminal", "command", "fileio", "internet-radio"],
+        "the dangerous / dependency-needing servers ship disabled; \
+         `homeassistant` is not among them because the image cannot build it \
+         (#1235, #1290)"
     );
 }
 
