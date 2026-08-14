@@ -4549,7 +4549,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                                 original_bytes = result.len(),
                                 kept_bytes = bounded.len(),
                                 cap_bytes = self.max_stored_tool_result_bytes,
-                                "tool result exceeded the storage cap — the tail was dropped"
+                                "tool result exceeded the storage cap - the tail was dropped"
                             );
                             bounded
                         }
@@ -4608,13 +4608,10 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 // it. A head no smaller than what it replaces is no saving, so
                 // the round reads the row instead. A pointer row is already an
                 // address, so only a stored row can need a head at all.
-                let head = matches!(
-                    disposition,
-                    crate::tool_repeat::ResultDisposition::Store
-                )
-                .then(|| cap_tool_result(&content, &tool_msg.id, self.max_tool_result_bytes))
-                .flatten()
-                .filter(|head| head.len() < content.len());
+                let head = matches!(disposition, crate::tool_repeat::ResultDisposition::Store)
+                    .then(|| cap_tool_result(&content, &tool_msg.id, self.max_tool_result_bytes))
+                    .flatten()
+                    .filter(|head| head.len() < content.len());
                 if let Some(head) = &head {
                     tracing::warn!(
                         tool = %Safe::name(&tool_call.name),
@@ -4622,7 +4619,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                         stored_bytes = stored.len(),
                         head_bytes = head.len(),
                         cap_bytes = self.max_tool_result_bytes,
-                        "tool result exceeded the ingestion cap — the round reads its head"
+                        "tool result exceeded the ingestion cap - the round reads its head"
                     );
                 }
 
@@ -13625,21 +13622,32 @@ mod tests {
         );
     }
 
-    /// AC6 (#1302): above the storage cap the tail genuinely is gone, so the
-    /// notice must say that and nothing more. Issue #174 is what the cap is
-    /// for - a runaway tool returned 124 MB across 8 messages and wedged the
-    /// conversation - and it still holds here. Offering a reader with nothing
-    /// behind it would recreate the defect this ticket fixes.
+    /// AC6 (#1302): above the storage cap the tail genuinely is gone, so what
+    /// the model READS must say that and must not offer a reader for it.
+    /// Issue #174 is what the cap is for - a runaway tool returned 124 MB
+    /// across 8 messages and wedged the conversation - and it still holds.
+    ///
+    /// Asserted on the projected text, not only on the row. The row is not
+    /// what the model reads, so a claim about the row proves nothing about the
+    /// property in this test's name; an earlier version of this test checked
+    /// the row alone and passed while the text the round read offered the
+    /// reader unconditionally and named the wrong byte count.
     #[tokio::test]
     async fn a_result_over_the_storage_cap_is_bounded_and_its_notice_offers_no_reader() {
         const STORAGE_CAP: usize = 8_192;
         let page = fixture_page(TEST_PAGE_BYTES);
         let mut results = HashMap::new();
         results.insert(PAGE_FETCH_TOOL.to_string(), page.clone());
-        let handler =
-            make_tool_handler(page_fetch_turn(), vec![tool_def(PAGE_FETCH_TOOL)], results)
-                .with_max_tool_result_bytes(TEST_CONTEXT_CAP)
-                .with_max_stored_tool_result_bytes(STORAGE_CAP);
+        let llm = ToolCallingLlm::new(page_fetch_turn());
+        let prompts = llm.prompts();
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            llm,
+            MockToolExecutor::new(vec![tool_def(PAGE_FETCH_TOOL)], results),
+            id_gen(),
+        )
+        .with_max_tool_result_bytes(TEST_CONTEXT_CAP)
+        .with_max_stored_tool_result_bytes(STORAGE_CAP);
         let conv = handler
             .create_conversation("Test".into(), vec![])
             .await
@@ -13649,6 +13657,7 @@ mod tests {
             .await
             .unwrap();
 
+        // What is stored: bounded, still paired, and the tail is not in it.
         let row = stored_tool_row(&handler, &conv.id, "c1").await;
         assert_eq!(
             row.tool_call_id.as_deref(),
@@ -13661,26 +13670,85 @@ mod tests {
             row.content.len()
         );
         assert!(
-            row.content.starts_with(PAGE_HEAD_MARK),
-            "what is kept is the head of what the tool returned"
-        );
-        assert!(
             !row.content.contains(PAGE_TAIL_MARK),
             "above the storage cap the tail is not kept"
         );
-        let notice = row
-            .content
-            .split_once("<tool output")
-            .map(|(_, rest)| rest)
-            .expect("the stored row must carry the storage notice");
+
+        // What the MODEL reads. This is the property in the test's name.
+        let read_by_model = last_prompt_result(&prompts, "c1");
         assert!(
-            !notice.contains(crate::ports::transcript::TRANSCRIPT_GET_TOOL),
-            "the storage notice must not offer a reader that has nothing to give: {notice}"
+            read_by_model.contains(&format!("{TEST_PAGE_BYTES} bytes")),
+            "the model must be told what the TOOL produced, not only what was kept"
         );
         assert!(
-            notice.contains("dropped"),
-            "the storage notice must say the tail is gone: {notice}"
+            read_by_model.contains("dropped"),
+            "the model must be told the tail was destroyed"
         );
+        assert!(
+            read_by_model.contains("no reader can hand back the dropped ones"),
+            "the model must be told nothing can give the dropped bytes back"
+        );
+        assert!(
+            read_by_model.contains(PAGE_HEAD_MARK),
+            "the kept bytes still reach the model"
+        );
+        assert!(
+            !read_by_model.contains(PAGE_TAIL_MARK),
+            "the tail reaches neither the row nor the prompt"
+        );
+
+        // The destruction is the FIRST thing in view, not something the model
+        // meets after paging the whole remnant back.
+        let loss_at = read_by_model
+            .find("too large to keep")
+            .expect("the loss must be stated in what the model reads");
+        let reader_at = read_by_model
+            .find(crate::ports::transcript::TRANSCRIPT_GET_TOOL)
+            .expect("the reader is still offered for the bytes that ARE held");
+        assert!(
+            loss_at < reader_at,
+            "the model must learn the tail is gone before it is offered a reader"
+        );
+        assert!(
+            loss_at < 200,
+            "the loss must be at the top of the message, not {loss_at} bytes in"
+        );
+    }
+
+    /// A projection that grows the prompt is the one thing this may not do,
+    /// and the turn loop makes the same check the projection pass makes.
+    /// Reachable with a cap of zero: the notice is several hundred bytes, the
+    /// result is two, so the round must read the row. Deleting the filter at
+    /// the append site leaves every other turn-level test green.
+    #[tokio::test]
+    async fn a_head_that_would_grow_the_prompt_is_not_projected() {
+        let mut results = HashMap::new();
+        results.insert(PAGE_FETCH_TOOL.to_string(), "42".to_string());
+        let llm = ToolCallingLlm::new(page_fetch_turn());
+        let prompts = llm.prompts();
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            llm,
+            MockToolExecutor::new(vec![tool_def(PAGE_FETCH_TOOL)], results),
+            id_gen(),
+        )
+        .with_max_tool_result_bytes(0);
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "fetch it".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+
+        let read_by_model = last_prompt_result(&prompts, "c1");
+        assert_eq!(
+            read_by_model, "42",
+            "a head bigger than the row is no saving, so the round reads the row"
+        );
+        let row = stored_tool_row(&handler, &conv.id, "c1").await;
+        assert_eq!(row.content, "42");
     }
 
     #[tokio::test]

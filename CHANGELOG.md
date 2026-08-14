@@ -20,9 +20,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
   **For operators.** Tool-result rows in the `messages` table can now reach
   1 MiB each, where they were previously bounded at 256 KiB. An absolute
-  storage cap still applies at 1 MiB, above which the tail is dropped and the
-  notice says so; that cap is what stops a runaway tool from stalling the
-  `messages` INSERT.
+  storage cap still applies at 1 MiB, above which the tail is dropped; that cap
+  is what stops a runaway tool from stalling the `messages` INSERT. A row cut
+  that way opens with a note saying how many bytes the tool produced and how
+  many were dropped, so both the model and a person reading the transcript meet
+  the loss first rather than after paging to the end.
 
 ### Removed
 

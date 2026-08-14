@@ -1076,11 +1076,13 @@ impl BuiltinToolService {
                 TOOL_TRANSCRIPT_GET,
                 format!(
                     "Read one message of THIS conversation back by its id, exactly as it was \
-                     stored. Use it when a tool result has left your working view and a \
-                     pointer names its message id - a \"<compacted to scratchpad ...>\" \
-                     pointer or an \"<earlier tool output omitted ...>\" notice - instead of \
-                     running the tool again. Re-running is the wrong move when the tool \
-                     changes something, when its answer moves with time, or when the call was \
+                     stored. Use it when a tool result has left your working view, or arrived \
+                     larger than your view can hold, and a notice names its message id - a \
+                     \"<compacted to scratchpad ...>\" pointer, an \"<earlier tool output \
+                     omitted ...>\" notice, or a \"<tool output truncated ...>\" notice - \
+                     instead of running the tool again. Re-running is the wrong move when \
+                     the tool changes something, when its answer moves with time, or when \
+                     the call was \
                      slow or expensive; this returns the very bytes the earlier round \
                      reasoned about. Reads are partial and you page through them: give \
                      `offset` and `length`, and the response carries `total_bytes`, the \

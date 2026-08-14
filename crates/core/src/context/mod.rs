@@ -102,7 +102,7 @@ pub(crate) const MIN_TRUNCATION_TOKENS: u64 = 1024;
 ///
 /// Why a byte cap rather than a token cap: it's deterministic, O(1) to
 /// check, and requires no estimator pass over a huge string. 256 KiB is
-/// ~64K tokens at the chars/4 default — far above any legitimate tool
+/// ~64K tokens at the chars/4 default - far above any legitimate tool
 /// result, so honest tools are never projected.
 pub(crate) const DEFAULT_MAX_TOOL_RESULT_BYTES: usize = 256 * 1024;
 
@@ -131,8 +131,11 @@ pub(crate) const DEFAULT_MAX_TOOL_RESULT_BYTES: usize = 256 * 1024;
 /// would make its conversation unreadable by any client: the read is rejected
 /// before allocation, and the client's reader loop breaks on the error rather
 /// than failing the one request. So the row has to stay well inside the
-/// frame, which is a stricter bound than the INSERT ever was. Raising this
-/// means bounding that response first.
+/// frame, which is a stricter bound than the INSERT ever was.
+///
+/// This bounds one row and not the response. Several rows at this size still
+/// exceed the frame between them, which is a defect of its own and belongs to
+/// issue #1303; raising this constant means bounding that response first.
 pub(crate) const DEFAULT_MAX_STORED_TOOL_RESULT_BYTES: usize = 1024 * 1024;
 
 /// The frame cap every transport into and out of the daemon enforces:
@@ -142,45 +145,72 @@ pub(crate) const DEFAULT_MAX_STORED_TOOL_RESULT_BYTES: usize = 1024 * 1024;
 /// transport crate.
 const TRANSPORT_FRAME_CAP_BYTES: usize = 4 * 1024 * 1024;
 
-/// What bounds the storage cap is the transport, not the database.
+/// ONE stored tool result must fit inside ONE transport frame.
+///
 /// `GetConversation` answers with every message of the conversation, tool rows
-/// included and content whole, so a row that alone cleared the frame cap would
-/// make its conversation unreadable by every client - the read is rejected
-/// before allocation, and the client's reader loop breaks on the error rather
-/// than failing the one request.
+/// included and content whole, and an oversize answer is not a failed request
+/// but a dropped connection - the read is rejected before allocation, and the
+/// client's reader loop breaks on the error rather than failing the one call.
+/// This keeps a single row from being able to do that on its own.
+///
+/// **It does not bound the conversation.** The frame carries the SUM of the
+/// rows, and nothing here or anywhere else holds that sum below the cap: four
+/// rows at this size already reach it, and so do many smaller messages. That
+/// gap is real, it predates this constant, and issue #1303 is where the
+/// response-level byte bound belongs. Read this assert as "no row can blow the
+/// frame by itself", never as "the response fits".
 ///
 /// A compile-time check rather than a test, because the failure it prevents is
-/// a change to a constant and the build is where that change is made. What it
-/// holds and what it does not: raising [`DEFAULT_MAX_STORED_TOOL_RESULT_BYTES`]
-/// past the frame cap fails to compile; lowering the frame cap in the transport
-/// crates does not, because the number above is restated rather than imported.
-/// Bounding that response by bytes is the fix that would let either move
-/// freely.
+/// a change to a constant and the build is where that change is made. Three
+/// further things it does not hold:
+///
+/// - lowering the frame cap in the transport crates, because
+///   [`TRANSPORT_FRAME_CAP_BYTES`] is restated above rather than imported;
+/// - a per-handler override through
+///   `ConversationHandler::with_max_stored_tool_result_bytes`, which is `pub`
+///   and takes any value (no production caller sets it today, so this is a
+///   path left open rather than a hole in use);
+/// - anything about how many rows a conversation accumulates.
 const _: () = assert!(
     DEFAULT_MAX_STORED_TOOL_RESULT_BYTES < TRANSPORT_FRAME_CAP_BYTES,
-    "a stored tool result must stay inside the transport frame cap, or its \
-     conversation becomes unreadable by every client"
+    "one stored tool result must fit inside one transport frame, or a single \
+     row can make its conversation unreadable on its own"
 );
 
+/// Opening of [`tool_result_storage_notice`], and the mark that says a stored
+/// tool result is a remnant rather than the whole of what the tool returned.
+///
+/// A row beginning with this was cut by the storage cap before it was written,
+/// so the bytes past it are in no message and behind no reader.
+/// [`cap_tool_result`] reads the mark to decide which notice the round gets.
+/// That is how a later turn - which loads the row back and never saw the tool
+/// run - still tells the model the truth about it, without recording anything
+/// on the row and without parsing prose back into numbers.
+pub(crate) const STORAGE_CAP_NOTICE_PREFIX: &str = "<tool output too large to keep:";
+
 /// Replacement tail appended when the round reads only the head of a tool
-/// result (issue #1302).
+/// result whose whole content is stored (issue #1302).
 ///
 /// Shaped like [`overflow_truncation_notice`], and for the same reason: the
 /// bytes are still stored under `message_id`, so the move that works for
 /// *every* tool is to page them back rather than to run the tool again.
-/// Asking for less is offered second, because a whole class of tools — a page
-/// fetch takes a URL and nothing else — has no narrowing parameter to use,
+/// Asking for less is offered second, because a whole class of tools - a page
+/// fetch takes a URL and nothing else - has no narrowing parameter to use,
 /// and telling one of those to ask for less leaves it only the identical
 /// call.
-pub(crate) fn tool_result_truncation_notice(message_id: &str, original_bytes: usize) -> String {
+///
+/// Only for a row that is whole. A row the storage cap already cut gets
+/// [`remnant_truncation_notice`], which must not say what this one says.
+pub(crate) fn tool_result_truncation_notice(message_id: &str, stored_bytes: usize) -> String {
     let tool = crate::ports::transcript::TRANSCRIPT_GET_TOOL;
     format!(
-        "\n\n<tool output truncated: {original_bytes} bytes exceeded the per-result \
-         context cap, so only the beginning is shown here. Read the stored output \
-         back in ranges with {tool} message_id=\"{message_id}\" rather than running \
-         the tool again - it reports how many bytes it holds. Where the tool does \
-         take a narrowing parameter, asking for less next time is still worth doing — a smaller \
-         byte/line range, a filtered listing, or only the fields you need.>"
+        "\n\n<tool output truncated: {stored_bytes} bytes exceeded the per-result \
+         context cap, so only the beginning is shown here. The whole of it is stored \
+         under this message: read the rest back in ranges with {tool} \
+         message_id=\"{message_id}\" rather than running the tool again. Where the \
+         tool does take a narrowing parameter, asking for less next time is still \
+         worth doing - a smaller byte/line range, a filtered listing, or only the \
+         fields you need.>"
     )
 }
 
@@ -200,27 +230,66 @@ pub(crate) fn tool_result_truncation_notice(message_id: &str, original_bytes: us
 pub(crate) const EMPTY_TOOL_RESULT_NOTICE: &str =
     "<the tool call succeeded and returned no output.>";
 
-/// Replacement tail appended when a tool result was too large to store
+/// Replacement tail appended when the round reads only the head of a row the
+/// storage cap had ALREADY cut (issues #174 and #1302).
+///
+/// Two facts have to reach the model together here, and
+/// [`tool_result_truncation_notice`] gets one of them wrong. What is stored is
+/// not the whole of what the tool returned, so the reader may be offered for
+/// the stored bytes only. And the bytes past them are gone for good, which the
+/// model has to learn before it spends rounds hunting for them - offering a
+/// reader that cannot produce them is the defect #1302 exists to remove.
+///
+/// The two counts are not repeated here. They are in the note at the top of
+/// this same message, which [`cap_stored_tool_result`] puts there rather than
+/// at the end precisely so a head carries them: a notice at the end would be
+/// reached only after paging the whole row back, which in the runaway case the
+/// storage cap exists for is dozens of reads. The one bound: at a context cap
+/// so small that the head cannot hold that note, the pointer to it dangles -
+/// which is why the destruction itself is stated here too, and not only there.
+pub(crate) fn remnant_truncation_notice(message_id: &str, stored_bytes: usize) -> String {
+    let tool = crate::ports::transcript::TRANSCRIPT_GET_TOOL;
+    format!(
+        "\n\n<tool output truncated twice: the tool returned more than could be \
+         stored, so part of it was dropped for good before this message was written - \
+         the note at the top of this message says how many bytes the tool produced \
+         and how many were dropped. Of the {stored_bytes} bytes that were kept, only \
+         the beginning is shown here. Read the KEPT bytes back in ranges with {tool} \
+         message_id=\"{message_id}\" - that is all there is, and no reader can hand \
+         back the dropped ones. To see what was dropped, re-run the tool with a \
+         narrower request - a smaller byte/line range, a filtered listing, or only \
+         the fields you need.>"
+    )
+}
+
+/// Header written at the FRONT of a tool result that was too large to store
 /// (issue #174), so the dropped bytes are in no message and behind no reader.
+///
+/// At the front, not the end. The model meets the loss on its first read of
+/// the row, on this turn and on every later one, rather than after paging the
+/// whole remnant back; and because a head is a prefix, the head the round
+/// reads carries it by construction, with nothing recorded on the row and no
+/// prose parsed back into numbers.
 ///
 /// Deliberately offers nothing to read back. A notice naming a reader with
 /// nothing behind it is worse than one naming none, because the model spends
 /// rounds asking for bytes that do not exist.
 pub(crate) fn tool_result_storage_notice(original_bytes: usize, dropped_bytes: usize) -> String {
     format!(
-        "\n\n<tool output too large to keep: {original_bytes} bytes exceeded the \
-         per-result storage cap, so the last {dropped_bytes} bytes were dropped and \
-         are stored nowhere. Only what is above survives, and no reader can hand \
-         back the rest. Re-run the tool with a narrower request — e.g. a smaller \
-         byte/line range, a filtered listing, or only the fields you need — to see \
-         what is missing.>"
+        "{STORAGE_CAP_NOTICE_PREFIX} the tool produced {original_bytes} bytes, and the \
+         last {dropped_bytes} of them were past the per-result storage cap. Those \
+         bytes were dropped before this message was written - they are in no message, \
+         in no store, and behind no reader, so nothing can hand them back. What \
+         follows is the beginning of the output. Re-run the tool with a narrower \
+         request - e.g. a smaller byte/line range, a filtered listing, or only the \
+         fields you need - to see what is missing.>\n\n"
     )
 }
 
 /// Longest UTF-8 prefix of `content` that fits in `max_bytes` alongside
 /// `notice`, with `notice` appended.
 ///
-/// If the cap is so small the notice alone would not fit, no prefix is kept —
+/// If the cap is so small the notice alone would not fit, no prefix is kept -
 /// the notice still tells the model what happened (a pathological case; real
 /// caps dwarf the notice).
 fn head_with_notice(content: &str, max_bytes: usize, notice: &str) -> String {
@@ -243,11 +312,17 @@ fn head_with_notice(content: &str, max_bytes: usize, notice: &str) -> String {
 /// What the round reads of a tool result stored under `message_id`, where
 /// that is less than the whole of it.
 ///
-/// Returns `None` when `content` already fits (the common case — no
+/// Returns `None` when `content` already fits (the common case - no
 /// allocation, the round reads the stored row). Returns `Some(head)` when it
-/// is over the cap: the longest UTF-8 prefix that, together with
-/// [`tool_result_truncation_notice`], stays within `max_bytes`. The cut
-/// always lands on a `char` boundary so the result is valid UTF-8.
+/// is over the cap: the longest UTF-8 prefix that, together with the notice,
+/// stays within `max_bytes`. The cut always lands on a `char` boundary so the
+/// result is valid UTF-8.
+///
+/// Which notice depends on what the row is. A row the storage cap already cut
+/// carries [`STORAGE_CAP_NOTICE_PREFIX`], and it gets
+/// [`remnant_truncation_notice`], because offering the reader for bytes that
+/// were destroyed is the very thing this ticket removes. Every other row is
+/// whole and gets [`tool_result_truncation_notice`].
 ///
 /// The caller puts the answer in the round's [`ContextProjection`]. Nothing
 /// here writes to a message.
@@ -255,24 +330,30 @@ pub(crate) fn cap_tool_result(content: &str, message_id: &str, max_bytes: usize)
     if content.len() <= max_bytes {
         return None;
     }
-    let notice = tool_result_truncation_notice(message_id, content.len());
+    let notice = if content.starts_with(STORAGE_CAP_NOTICE_PREFIX) {
+        remnant_truncation_notice(message_id, content.len())
+    } else {
+        tool_result_truncation_notice(message_id, content.len())
+    };
     Some(head_with_notice(content, max_bytes, &notice))
 }
 
 /// Bound what is written to the database for one tool result (issue #174).
 ///
-/// Returns `None` when `content` fits, which is every honest tool. Returns
-/// `Some(bounded)` when it does not: the longest UTF-8 prefix that stays
-/// within `max_bytes` alongside [`tool_result_storage_notice`]. Unlike
-/// [`cap_tool_result`], this one destroys bytes, so the notice it appends
-/// offers no reader.
+/// Returns `None` when `content` fits, which is every honest tool - including
+/// one that lands exactly on the cap, which is not over it. Returns
+/// `Some(bounded)` when it does not: [`tool_result_storage_notice`] followed
+/// by the longest UTF-8 prefix that stays within `max_bytes` alongside it.
+/// Unlike [`cap_tool_result`], this one destroys bytes, so the notice it
+/// writes offers no reader and goes at the front where the model cannot miss
+/// it.
 pub(crate) fn cap_stored_tool_result(content: &str, max_bytes: usize) -> Option<String> {
     if content.len() <= max_bytes {
         return None;
     }
     // The notice states how much was dropped, and how much was dropped
     // depends on how much room the notice takes. Reserve by the widest the
-    // notice can be — every byte dropped — so the real one, which has no more
+    // notice can be - every byte dropped - so the real one, which has no more
     // digits, always fits.
     let widest = tool_result_storage_notice(content.len(), content.len());
     let body_budget = max_bytes.saturating_sub(widest.len());
@@ -281,9 +362,9 @@ pub(crate) fn cap_stored_tool_result(content: &str, max_bytes: usize) -> Option<
         cut -= 1;
     }
     let notice = tool_result_storage_notice(content.len(), content.len() - cut);
-    let mut bounded = String::with_capacity(cut + notice.len());
-    bounded.push_str(&content[..cut]);
+    let mut bounded = String::with_capacity(notice.len() + cut);
     bounded.push_str(&notice);
+    bounded.push_str(&content[..cut]);
     Some(bounded)
 }
 
@@ -291,14 +372,15 @@ pub(crate) fn cap_stored_tool_result(content: &str, max_bytes: usize) -> Option<
 /// for the rest of the turn (issue #1302). Answers how many were projected.
 ///
 /// Run once per turn, at the projection's construction point. The rule is a
-/// pure function of the stored content's length, so it is deterministic,
-/// idempotent and costs no storage: nothing is recorded on the row, and the
-/// next turn derives the same answer from the same bytes.
+/// pure function of the stored content's length and its first bytes, so it is
+/// deterministic, idempotent and costs no storage: nothing is recorded on the
+/// row, and the next turn derives the same answer from the same bytes.
 ///
 /// Two rows are left alone. One the projection already replaces, because a
 /// distilled-note pointer says more in fewer bytes than a head does. And one
 /// whose head would not be smaller than what it replaces, which is the
-/// pathological cap where the notice outgrows the payload.
+/// pathological cap where the notice outgrows the payload - a projection that
+/// grows the prompt is the one thing this may not do.
 pub(crate) fn project_oversized_tool_results(
     messages: &[Message],
     projection: &mut ContextProjection,
@@ -3885,6 +3967,16 @@ mod tests {
         assert_eq!(cap_stored_tool_result("small output", 1024), None);
     }
 
+    /// The boundary of the one cap that DESTROYS bytes. A result of exactly
+    /// the cap is not over it, so it is stored whole; turning `<=` into `<`
+    /// here would silently drop the tail of an exactly-sized result, and every
+    /// other test in this file stays green while it does.
+    #[test]
+    fn cap_stored_tool_result_exactly_at_cap_is_unchanged() {
+        let content = "x".repeat(1024);
+        assert_eq!(cap_stored_tool_result(&content, 1024), None);
+    }
+
     #[test]
     fn cap_stored_tool_result_stays_within_byte_cap_across_sizes() {
         for cap in [1024usize, 4096, 50_000] {
@@ -3895,7 +3987,11 @@ mod tests {
                 "cap {cap}: stored result {} exceeds cap",
                 out.len()
             );
-            assert!(out.starts_with("yyyy"));
+            assert!(
+                out.starts_with(STORAGE_CAP_NOTICE_PREFIX),
+                "the loss is stated at the front, where a head cannot miss it"
+            );
+            assert!(out.ends_with("yyyy"), "the kept body follows the notice");
         }
     }
 
@@ -3904,7 +4000,11 @@ mod tests {
         let content = "🚀".repeat(2_000); // 8_000 bytes
         let out = cap_stored_tool_result(&content, 2048).expect("over-cap must truncate");
         assert!(out.len() <= 2048);
-        assert!(out.starts_with('🚀'));
+        assert!(out.starts_with(STORAGE_CAP_NOTICE_PREFIX));
+        assert!(
+            out.ends_with('🚀'),
+            "the cut lands on a char boundary, so the kept body ends on a whole rocket"
+        );
     }
 
     /// #1302: a later turn re-derives the projection from the stored length
@@ -3932,6 +4032,70 @@ mod tests {
             4_000,
             "the pass must not write to the message it projects"
         );
+    }
+
+    /// A projection that grows the prompt is the one thing this may not do.
+    /// Reachable with a cap of zero and a result shorter than the notice: the
+    /// head would be several hundred bytes standing in for a few, so the round
+    /// reads the row. Deleting the guard leaves every other test green.
+    #[test]
+    fn project_oversized_tool_results_leaves_a_row_a_notice_would_only_grow() {
+        let tiny = Message::new(Role::Tool, "42");
+        let messages = vec![tiny.clone()];
+        let mut projection = ContextProjection::default();
+
+        // Over the cap by construction, so the length guard is the only thing
+        // that can decline it.
+        assert!(cap_tool_result(&tiny.content, &tiny.id, 0).is_some());
+        let projected = project_oversized_tool_results(&messages, &mut projection, 0);
+
+        assert_eq!(projected, 0, "a head bigger than the row is no saving");
+        assert!(!projection.is_replaced(&tiny));
+        assert_eq!(projection.content(&tiny), "42");
+    }
+
+    /// #1302: where the storage cap already destroyed the tail, the notice the
+    /// ROUND reads must not offer the reader for it. The reader holds the kept
+    /// bytes and nothing else, and the model has to learn that before it
+    /// spends rounds hunting for the rest.
+    #[test]
+    fn a_head_of_a_storage_capped_row_says_the_tail_is_gone_and_scopes_the_reader() {
+        let produced = "z".repeat(40_000);
+        let stored = cap_stored_tool_result(&produced, 8_192).expect("over the storage cap");
+        let head = cap_tool_result(&stored, "m-9", 4_096).expect("over the context cap");
+
+        assert!(
+            head.starts_with(STORAGE_CAP_NOTICE_PREFIX),
+            "the loss must be the first thing the round reads"
+        );
+        assert!(
+            head.contains("40000 bytes"),
+            "the round must be told what the TOOL produced, not only what was kept"
+        );
+        assert!(
+            head.contains("truncated twice"),
+            "the tail notice must say the row is itself a remnant"
+        );
+        assert!(
+            head.contains("no reader can hand back the dropped ones"),
+            "the round must be told the dropped bytes are behind no reader"
+        );
+        assert!(
+            head.contains(crate::ports::transcript::TRANSCRIPT_GET_TOOL),
+            "the reader is still offered - for the bytes that ARE held"
+        );
+    }
+
+    /// The ordinary case must keep saying the ordinary thing: a whole row is
+    /// wholly readable, and the remnant wording must not leak into it.
+    #[test]
+    fn a_head_of_a_whole_row_offers_the_reader_for_all_of_it() {
+        let content = "w".repeat(40_000);
+        let head = cap_tool_result(&content, "m-9", 4_096).expect("over the context cap");
+
+        assert!(!head.starts_with(STORAGE_CAP_NOTICE_PREFIX));
+        assert!(head.contains("The whole of it is stored under this message"));
+        assert!(!head.contains("truncated twice"));
     }
 
     /// A distilled-note pointer is smaller and says more than a head plus a
