@@ -13,9 +13,10 @@
 //!
 //! ## The rule
 //!
-//! Per key, the ledger records how many times the call has executed in this
-//! turn, the message id of the first result, and whether every result so far
-//! has been byte-identical.
+//! Per key, the ledger records how many times the model has made the call, how
+//! many of those actually ran, the message id of the first result, and whether
+//! every result so far has been byte-identical. The rule reads the runs; the
+//! model is told the asks.
 //!
 //! - First call - execute.
 //! - Second call - execute, and tell the model in the result it gets back that
@@ -40,10 +41,12 @@
 //!
 //! ## What the rule does not hold, stated plainly
 //!
-//! The evidence is gathered from the first two runs and never gathered again.
-//! A suppressed call does not execute, so it records nothing, so `all_identical`
-//! can never go back to false. Suppression is therefore terminal for the rest
-//! of the turn, and three cases fall outside the rule:
+//! Once a key is suppressed, no further evidence is gathered about it. A
+//! suppressed call does not execute, so it records nothing, so `all_identical`
+//! can never become false. Suppression is therefore terminal for the rest of
+//! the turn, and three cases fall outside the rule. (A key that keeps executing
+//! keeps gathering: a tool whose third run differs from its first is judged on
+//! that run like any other.)
 //!
 //! - **A value that changes late.** Two runs that answer the same, then a third
 //!   that would answer differently. A subagent poll reads `running` twice
@@ -105,24 +108,38 @@ impl RepeatKey {
     }
 }
 
+/// What the first execution of a key left behind. One value rather than two
+/// fields, so the half-built state cannot be written: an id without a digest
+/// would make every later comparison take the "nothing to compare with" arm,
+/// `all_identical` would stay true whatever the tool returned, and the rule
+/// would suppress a tool whose answer changes.
+struct First {
+    /// The message the first result is stored under, which is what the model
+    /// is told to read back.
+    message_id: String,
+    /// Digest of that result. Compared rather than kept in full: the bytes are
+    /// already in the transcript, and a large result would otherwise be held
+    /// twice.
+    digest: [u8; 32],
+}
+
 /// What the ledger holds about one key.
 struct Record {
-    /// How many times the model has made this call this turn, whether it ran or
-    /// was answered from the transcript. This is the number the model is told,
-    /// because the number it must reason from is how often it has asked - not
-    /// how often the daemon obliged.
+    /// How many dispatches of this call have reached the ledger this turn,
+    /// whether they ran or were answered from the transcript. This is the
+    /// number the model is told, because what it must reason from is how often
+    /// it has asked - not how often the daemon obliged.
+    ///
+    /// A call refused before dispatch - malformed argument JSON, a burn hold, a
+    /// named-only call missing a required argument - never reaches here and is
+    /// not counted.
     attempts: u32,
     /// How many times this call has actually reached a tool this turn. A
     /// suppressed call does not count: nothing ran. This is what the rule
     /// reads.
     executions: u32,
-    /// The message the first result is stored under, which is what the model
-    /// is told to read back. `None` until something has run.
-    first_message_id: Option<String>,
-    /// Digest of the first execution's output. Compared rather than kept in
-    /// full: the bytes are already in the transcript, and a large result would
-    /// otherwise be held twice.
-    first_digest: Option<[u8; 32]>,
+    /// What the first execution left behind. `None` until something has run.
+    first: Option<First>,
     /// Whether every execution so far returned the same bytes as the first.
     all_identical: bool,
 }
@@ -132,8 +149,7 @@ impl Default for Record {
         Self {
             attempts: 0,
             executions: 0,
-            first_message_id: None,
-            first_digest: None,
+            first: None,
             // Nothing has run, so nothing has differed yet.
             all_identical: true,
         }
@@ -176,7 +192,7 @@ impl RepeatLedger {
     pub(crate) fn observe_dispatch(&mut self, key: &RepeatKey) -> RepeatVerdict {
         let record = self.seen.entry(key.clone()).or_default();
         record.attempts = record.attempts.saturating_add(1);
-        let Some(first_message_id) = record.first_message_id.clone() else {
+        let Some(first_message_id) = record.first.as_ref().map(|f| f.message_id.clone()) else {
             return RepeatVerdict::Execute;
         };
         if record.executions <= 1 {
@@ -203,12 +219,14 @@ impl RepeatLedger {
         let digest: [u8; 32] = Sha256::digest(output.as_bytes()).into();
         let record = self.seen.entry(key.clone()).or_default();
         record.executions = record.executions.saturating_add(1);
-        match record.first_digest {
+        match &record.first {
             None => {
-                record.first_message_id = Some(message_id.to_string());
-                record.first_digest = Some(digest);
+                record.first = Some(First {
+                    message_id: message_id.to_string(),
+                    digest,
+                });
             }
-            Some(first) => record.all_identical &= first == digest,
+            Some(first) => record.all_identical &= first.digest == digest,
         }
     }
 }
@@ -410,5 +428,13 @@ mod tests {
             skipped.contains("msg-1") && skipped.contains(tool),
             "{skipped}"
         );
+    }
+
+    #[test]
+    fn the_suppressed_notice_carries_the_attempt_count_it_is_given() {
+        // The count is the whole point of counting attempts, and the ledger
+        // holding the right number buys nothing if the sentence drops it.
+        assert!(suppressed_notice("msg-1", 7).contains('7'));
+        assert!(suppressed_notice("msg-1", 12).contains("12"));
     }
 }

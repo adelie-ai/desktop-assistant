@@ -18972,6 +18972,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_later_suppressed_repeat_tells_the_model_how_many_times_it_has_asked() {
+        // A suppressed call never reaches the recording site, so a ledger that
+        // counted only executions would tell the fourth identical call it was
+        // the second - the number stops counting where it starts mattering.
+        let args = r#"{"q":"how big"}"#;
+        let (handler, calls) = repeat_handler(
+            probe_rounds(&[args, args, args, args]),
+            vec![
+                Ok("42".to_string()),
+                Ok("42".to_string()),
+                Ok("42".to_string()),
+                Ok("42".to_string()),
+            ],
+        );
+        let conv = handler
+            .create_conversation("Chat".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "how big".into(), noop_callback(), noop_status())
+            .await
+            .expect("turn completes");
+        assert_eq!(calls.lock().unwrap().len(), 2, "only the first two run");
+
+        let stored = handler.get_conversation(&conv.id).await.unwrap();
+        let results = stored_tool_results(&stored);
+        assert_eq!(results.len(), 4, "every call still gets a tool result");
+        assert!(
+            results[3].content.contains("4 times"),
+            "the fourth call must be told it is the fourth; got: {}",
+            results[3].content
+        );
+    }
+
+    #[tokio::test]
     async fn a_suppressed_repeat_does_not_append_the_result_bytes_again() {
         let args = r#"{"q":"the page"}"#;
         let payload = format!("PAYLOAD-MARKER{}", "x".repeat(8000));
