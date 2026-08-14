@@ -3257,6 +3257,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 pinned: surfaces.pinned.as_deref(),
                 recall: recall_surface,
                 tool_rounds_since_anchor,
+                tool_round_budget: u32::try_from(MAX_TOOL_ROUNDS).unwrap_or(u32::MAX),
             };
             // Assembly is a pure function of its inputs, and this round may run
             // it twice, so it takes the conversation as an argument rather than
@@ -4784,6 +4785,10 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                     // the turn asked at its start and has long since acted on.
                     recall: None,
                     tool_rounds_since_anchor: u32::MAX,
+                    // No budget line: the round count here is a sentinel that
+                    // forces the anchor to re-surface, and the wind-down is not
+                    // deciding whether to spend another round (#1301).
+                    tool_round_budget: 0,
                 },
                 &projection,
                 target_window,
