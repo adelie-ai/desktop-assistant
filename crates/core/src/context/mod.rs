@@ -21,7 +21,10 @@
 //! - **Projection** (`ContextProjection`): what the round reads where that
 //!   differs from what is stored. Seeded at turn entry from the eviction
 //!   decisions earlier turns recorded, so a distilled result costs a pointer
-//!   rather than its payload on every later turn too.
+//!   rather than its payload on every later turn too - and from the stored
+//!   lengths themselves (`project_oversized_tool_results`), so a tool result
+//!   too large to read inline is stored whole and read as its head plus a
+//!   notice naming the reader that pages the rest back.
 //! - **Summarisation** (`generate_context_summary`, `compact_into_summary`):
 //!   Asks the LLM for a bullet-point summary of dropped messages and merges it
 //!   with any existing rolling summary, so windowed-out history is not lost.
@@ -88,29 +91,96 @@ pub(crate) const MAX_OVERFLOW_RETRIES: u32 = 3;
 /// avoid the "notice larger than payload" pathology, not to be precise.
 pub(crate) const MIN_TRUNCATION_TOKENS: u64 = 1024;
 
-/// Maximum byte length a single tool result may occupy before it is
-/// truncated at ingestion (issue #174). A misbehaving tool can return a
-/// multi-megabyte payload (observed: 124 MB across 8 messages); stored
-/// verbatim it wedges the conversation against the model's context window
-/// on *every* subsequent turn and stalls the `messages` INSERT. Capping at
-/// ingestion bounds the blast radius of any single tool call.
+/// Maximum byte length of a tool result the model reads inline, before the
+/// round is shown its head and a notice instead (issue #1302).
+///
+/// This is a **projection**, not a write: the row keeps every byte, the
+/// notice names the row, and [`crate::ports::transcript::TRANSCRIPT_GET_TOOL`]
+/// pages the rest back. What bounds the database is
+/// [`DEFAULT_MAX_STORED_TOOL_RESULT_BYTES`], which is a different job and a
+/// far larger number.
 ///
 /// Why a byte cap rather than a token cap: it's deterministic, O(1) to
-/// check, requires no estimator pass over a huge string, and directly
-/// bounds what is written to the database. 256 KiB is ~64K tokens at the
-/// chars/4 default — far above any legitimate tool result, so honest tools
-/// are never touched.
+/// check, and requires no estimator pass over a huge string. 256 KiB is
+/// ~64K tokens at the chars/4 default — far above any legitimate tool
+/// result, so honest tools are never projected.
 pub(crate) const DEFAULT_MAX_TOOL_RESULT_BYTES: usize = 256 * 1024;
 
-/// Replacement tail appended when a tool result is truncated at ingestion.
-/// Addressed to the model so it learns to re-run the tool with a narrower
-/// request instead of assuming the output was complete.
-pub(crate) fn tool_result_truncation_notice(original_bytes: usize) -> String {
+/// Absolute maximum byte length a single tool result may occupy in storage
+/// (issue #174). Above this the tail is dropped and no reader can hand it
+/// back, so the bound is set where only a misbehaving tool reaches it.
+///
+/// Why it exists: a runaway tool can return a multi-megabyte payload
+/// (observed: 124 MB across 8 messages), which stalls the `messages` INSERT
+/// and wedges the conversation against the model's context window on every
+/// later turn. Capping at ingestion bounds the blast radius of any single
+/// tool call.
+///
+/// Why larger than the 256 KiB the model reads: the two caps answer
+/// different questions. What the model reads has to fit a context window on
+/// every turn; what storage keeps has only to be recoverable, and a 400 KB
+/// page is an ordinary result the reader can page through. Destroying it to
+/// protect an INSERT that only a runaway payload threatens is the trade this
+/// split undoes.
+///
+/// Why 1 MiB and not more: every transport into and out of the daemon caps a
+/// single message at 4 MiB - `desktop_assistant_frame_codec::MAX_FRAME_LEN`
+/// for UDS and the D-Bus bridge, `MAX_WS_MESSAGE_BYTES` for WebSocket - and
+/// `GetConversation` answers with every message of the conversation, tool
+/// rows included and content whole. A row that alone cleared the frame cap
+/// would make its conversation unreadable by any client: the read is rejected
+/// before allocation, and the client's reader loop breaks on the error rather
+/// than failing the one request. So the row has to stay well inside the
+/// frame, which is a stricter bound than the INSERT ever was. Raising this
+/// means bounding that response first.
+pub(crate) const DEFAULT_MAX_STORED_TOOL_RESULT_BYTES: usize = 1024 * 1024;
+
+/// The frame cap every transport into and out of the daemon enforces:
+/// `desktop_assistant_frame_codec::MAX_FRAME_LEN` for UDS and the D-Bus
+/// bridge, `MAX_WS_MESSAGE_BYTES` for WebSocket. Restated rather than
+/// imported, because this crate holds domain logic and must not depend on a
+/// transport crate.
+const TRANSPORT_FRAME_CAP_BYTES: usize = 4 * 1024 * 1024;
+
+/// What bounds the storage cap is the transport, not the database.
+/// `GetConversation` answers with every message of the conversation, tool rows
+/// included and content whole, so a row that alone cleared the frame cap would
+/// make its conversation unreadable by every client - the read is rejected
+/// before allocation, and the client's reader loop breaks on the error rather
+/// than failing the one request.
+///
+/// A compile-time check rather than a test, because the failure it prevents is
+/// a change to a constant and the build is where that change is made. What it
+/// holds and what it does not: raising [`DEFAULT_MAX_STORED_TOOL_RESULT_BYTES`]
+/// past the frame cap fails to compile; lowering the frame cap in the transport
+/// crates does not, because the number above is restated rather than imported.
+/// Bounding that response by bytes is the fix that would let either move
+/// freely.
+const _: () = assert!(
+    DEFAULT_MAX_STORED_TOOL_RESULT_BYTES < TRANSPORT_FRAME_CAP_BYTES,
+    "a stored tool result must stay inside the transport frame cap, or its \
+     conversation becomes unreadable by every client"
+);
+
+/// Replacement tail appended when the round reads only the head of a tool
+/// result (issue #1302).
+///
+/// Shaped like [`overflow_truncation_notice`], and for the same reason: the
+/// bytes are still stored under `message_id`, so the move that works for
+/// *every* tool is to page them back rather than to run the tool again.
+/// Asking for less is offered second, because a whole class of tools — a page
+/// fetch takes a URL and nothing else — has no narrowing parameter to use,
+/// and telling one of those to ask for less leaves it only the identical
+/// call.
+pub(crate) fn tool_result_truncation_notice(message_id: &str, original_bytes: usize) -> String {
+    let tool = crate::ports::transcript::TRANSCRIPT_GET_TOOL;
     format!(
         "\n\n<tool output truncated: {original_bytes} bytes exceeded the per-result \
-         storage cap; only the beginning is shown. Re-run the tool with a narrower \
-         request — e.g. a smaller byte/line range, a filtered listing, or only the \
-         fields you need — to see the rest.>"
+         context cap, so only the beginning is shown here. Read the stored output \
+         back in ranges with {tool} message_id=\"{message_id}\" rather than running \
+         the tool again - it reports how many bytes it holds. Where the tool does \
+         take a narrowing parameter, asking for less next time is still worth doing — a smaller \
+         byte/line range, a filtered listing, or only the fields you need.>"
     )
 }
 
@@ -130,22 +200,30 @@ pub(crate) fn tool_result_truncation_notice(original_bytes: usize) -> String {
 pub(crate) const EMPTY_TOOL_RESULT_NOTICE: &str =
     "<the tool call succeeded and returned no output.>";
 
-/// Cap a tool result to `max_bytes` before it is stored as a message.
+/// Replacement tail appended when a tool result was too large to store
+/// (issue #174), so the dropped bytes are in no message and behind no reader.
 ///
-/// Returns `None` when `content` already fits (the common case — no
-/// allocation, caller stores the original). Returns `Some(truncated)` when
-/// it is over the cap: the longest UTF-8 prefix that, together with
-/// [`tool_result_truncation_notice`], stays within `max_bytes`. Truncation
-/// always lands on a `char` boundary so the result is valid UTF-8.
-pub(crate) fn cap_tool_result(content: &str, max_bytes: usize) -> Option<String> {
-    if content.len() <= max_bytes {
-        return None;
-    }
+/// Deliberately offers nothing to read back. A notice naming a reader with
+/// nothing behind it is worse than one naming none, because the model spends
+/// rounds asking for bytes that do not exist.
+pub(crate) fn tool_result_storage_notice(original_bytes: usize, dropped_bytes: usize) -> String {
+    format!(
+        "\n\n<tool output too large to keep: {original_bytes} bytes exceeded the \
+         per-result storage cap, so the last {dropped_bytes} bytes were dropped and \
+         are stored nowhere. Only what is above survives, and no reader can hand \
+         back the rest. Re-run the tool with a narrower request — e.g. a smaller \
+         byte/line range, a filtered listing, or only the fields you need — to see \
+         what is missing.>"
+    )
+}
 
-    let notice = tool_result_truncation_notice(content.len());
-    // Reserve room for the notice. If the cap is so small the notice alone
-    // would not fit, keep no prefix — the notice still tells the model what
-    // happened (a pathological case; real caps dwarf the notice).
+/// Longest UTF-8 prefix of `content` that fits in `max_bytes` alongside
+/// `notice`, with `notice` appended.
+///
+/// If the cap is so small the notice alone would not fit, no prefix is kept —
+/// the notice still tells the model what happened (a pathological case; real
+/// caps dwarf the notice).
+fn head_with_notice(content: &str, max_bytes: usize, notice: &str) -> String {
     let body_budget = max_bytes.saturating_sub(notice.len());
 
     // Largest char boundary at or below the body budget. `is_char_boundary`
@@ -156,10 +234,91 @@ pub(crate) fn cap_tool_result(content: &str, max_bytes: usize) -> Option<String>
         cut -= 1;
     }
 
-    let mut truncated = String::with_capacity(cut + notice.len());
-    truncated.push_str(&content[..cut]);
-    truncated.push_str(&notice);
-    Some(truncated)
+    let mut head = String::with_capacity(cut + notice.len());
+    head.push_str(&content[..cut]);
+    head.push_str(notice);
+    head
+}
+
+/// What the round reads of a tool result stored under `message_id`, where
+/// that is less than the whole of it.
+///
+/// Returns `None` when `content` already fits (the common case — no
+/// allocation, the round reads the stored row). Returns `Some(head)` when it
+/// is over the cap: the longest UTF-8 prefix that, together with
+/// [`tool_result_truncation_notice`], stays within `max_bytes`. The cut
+/// always lands on a `char` boundary so the result is valid UTF-8.
+///
+/// The caller puts the answer in the round's [`ContextProjection`]. Nothing
+/// here writes to a message.
+pub(crate) fn cap_tool_result(content: &str, message_id: &str, max_bytes: usize) -> Option<String> {
+    if content.len() <= max_bytes {
+        return None;
+    }
+    let notice = tool_result_truncation_notice(message_id, content.len());
+    Some(head_with_notice(content, max_bytes, &notice))
+}
+
+/// Bound what is written to the database for one tool result (issue #174).
+///
+/// Returns `None` when `content` fits, which is every honest tool. Returns
+/// `Some(bounded)` when it does not: the longest UTF-8 prefix that stays
+/// within `max_bytes` alongside [`tool_result_storage_notice`]. Unlike
+/// [`cap_tool_result`], this one destroys bytes, so the notice it appends
+/// offers no reader.
+pub(crate) fn cap_stored_tool_result(content: &str, max_bytes: usize) -> Option<String> {
+    if content.len() <= max_bytes {
+        return None;
+    }
+    // The notice states how much was dropped, and how much was dropped
+    // depends on how much room the notice takes. Reserve by the widest the
+    // notice can be — every byte dropped — so the real one, which has no more
+    // digits, always fits.
+    let widest = tool_result_storage_notice(content.len(), content.len());
+    let body_budget = max_bytes.saturating_sub(widest.len());
+    let mut cut = body_budget.min(content.len());
+    while cut > 0 && !content.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let notice = tool_result_storage_notice(content.len(), content.len() - cut);
+    let mut bounded = String::with_capacity(cut + notice.len());
+    bounded.push_str(&content[..cut]);
+    bounded.push_str(&notice);
+    Some(bounded)
+}
+
+/// Read every oversized tool result in `messages` as its head plus a notice
+/// for the rest of the turn (issue #1302). Answers how many were projected.
+///
+/// Run once per turn, at the projection's construction point. The rule is a
+/// pure function of the stored content's length, so it is deterministic,
+/// idempotent and costs no storage: nothing is recorded on the row, and the
+/// next turn derives the same answer from the same bytes.
+///
+/// Two rows are left alone. One the projection already replaces, because a
+/// distilled-note pointer says more in fewer bytes than a head does. And one
+/// whose head would not be smaller than what it replaces, which is the
+/// pathological cap where the notice outgrows the payload.
+pub(crate) fn project_oversized_tool_results(
+    messages: &[Message],
+    projection: &mut ContextProjection,
+    max_bytes: usize,
+) -> usize {
+    let mut projected = 0;
+    for msg in messages {
+        if msg.role != Role::Tool || projection.is_replaced(msg) {
+            continue;
+        }
+        let Some(head) = cap_tool_result(&msg.content, &msg.id, max_bytes) else {
+            continue;
+        };
+        if head.len() >= msg.content.len() {
+            continue;
+        }
+        projection.replace(msg, head);
+        projected += 1;
+    }
+    projected
 }
 
 /// Fraction of the prompt-token budget the system instruction (static
@@ -3787,7 +3946,10 @@ mod tests {
         let projected = project_oversized_tool_results(&messages, &mut projection, 1_024);
 
         assert_eq!(projected, 0);
-        assert_eq!(projection.content(&big), "<compacted to scratchpad outcome:1>");
+        assert_eq!(
+            projection.content(&big),
+            "<compacted to scratchpad outcome:1>"
+        );
     }
 
     /// PINS CURRENT BEHAVIOUR (possible defect — see PR #445 design triage).

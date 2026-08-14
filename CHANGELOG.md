@@ -8,6 +8,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## Unreleased
 
+### Changed
+
+- A tool result too large for the model to read inline is now stored whole
+  instead of being cut down to 256 KiB before the row is written. The model
+  still reads only the first 256 KiB, followed by a notice naming the message
+  the whole output is stored under; `builtin_transcript_get` pages the rest
+  back. A result that has no narrowing parameter - a page fetch takes a URL
+  and nothing else - therefore has a way to reach its own output for the first
+  time.
+
+  **For operators.** Tool-result rows in the `messages` table can now reach
+  1 MiB each, where they were previously bounded at 256 KiB. An absolute
+  storage cap still applies at 1 MiB, above which the tail is dropped and the
+  notice says so; that cap is what stops a runaway tool from stalling the
+  `messages` INSERT.
+
 ### Removed
 
 - The `[persistence]` git-backed history mirror. The settings form had no

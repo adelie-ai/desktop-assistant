@@ -1,10 +1,11 @@
 use crate::CoreError;
 use crate::context::{
-    COMPACTION_TOKEN_RATIO, ContextProjection, ConversationView, DEFAULT_MAX_TOOL_RESULT_BYTES,
-    MAX_CONTEXT_MESSAGES, MAX_OVERFLOW_RETRIES, MIN_CONTEXT_MESSAGES, PreflightFold,
-    RecoveryOutcome, ToolContext, ToolLocalityContext, TurnAnchors, assemble_turn_within_budget,
-    cap_tool_result, compact_into_summary, compact_preflight_shrink, recover_from_overflow,
-    window_start,
+    COMPACTION_TOKEN_RATIO, ContextProjection, ConversationView,
+    DEFAULT_MAX_STORED_TOOL_RESULT_BYTES, DEFAULT_MAX_TOOL_RESULT_BYTES, MAX_CONTEXT_MESSAGES,
+    MAX_OVERFLOW_RETRIES, MIN_CONTEXT_MESSAGES, PreflightFold, RecoveryOutcome, ToolContext,
+    ToolLocalityContext, TurnAnchors, assemble_turn_within_budget, cap_stored_tool_result,
+    cap_tool_result, compact_into_summary, compact_preflight_shrink,
+    project_oversized_tool_results, recover_from_overflow, window_start,
 };
 use crate::domain::negative_memory::{
     NegativeMemory, PendingAction, WITHHELD_BURN_OUTCOME, burns_that_fire, clamp_outcome,
@@ -618,11 +619,16 @@ pub struct ConversationHandler<S, L, T = NoopToolExecutor> {
     /// same call succeeding is what extinguishes it, so this is wired with the
     /// other two or with neither.
     extinguish_burns: Option<ExtinguishBurnsFn>,
-    /// Maximum byte length a single tool result may occupy before it is
-    /// truncated at ingestion (issue #174). Defaults to
-    /// [`DEFAULT_MAX_TOOL_RESULT_BYTES`]; override via
-    /// [`Self::with_max_tool_result_bytes`].
+    /// Maximum byte length of a tool result the model reads inline (issue
+    /// #1302). Over this the round reads the head and a notice, and the row
+    /// keeps every byte. Defaults to [`DEFAULT_MAX_TOOL_RESULT_BYTES`];
+    /// override via [`Self::with_max_tool_result_bytes`].
     max_tool_result_bytes: usize,
+    /// Absolute maximum byte length a single tool result may occupy in
+    /// storage (issue #174). Over this the tail is dropped and nothing can
+    /// give it back. Defaults to [`DEFAULT_MAX_STORED_TOOL_RESULT_BYTES`];
+    /// override via [`Self::with_max_stored_tool_result_bytes`].
+    max_stored_tool_result_bytes: usize,
     /// The daemon's self-identity label, used as the `host` of a server-side
     /// [`crate::domain::ToolLocality`] in the per-turn tool note (issue #243).
     /// The daemon sets this to its hostname via [`Self::with_host`]; the
@@ -702,6 +708,7 @@ impl<S, L> ConversationHandler<S, L, NoopToolExecutor> {
             knowledge_offered: None,
             skill_offered: None,
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
+            max_stored_tool_result_bytes: DEFAULT_MAX_STORED_TOOL_RESULT_BYTES,
             host: DEFAULT_HOST_LABEL.to_string(),
             on_workstation: true,
             hard_withhold: false,
@@ -924,6 +931,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             knowledge_offered: None,
             skill_offered: None,
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
+            max_stored_tool_result_bytes: DEFAULT_MAX_STORED_TOOL_RESULT_BYTES,
             host: DEFAULT_HOST_LABEL.to_string(),
             on_workstation: true,
             hard_withhold: false,
@@ -1119,11 +1127,19 @@ impl<S, L, T> ConversationHandler<S, L, T> {
         self
     }
 
-    /// Override the per-tool-result ingestion cap (issue #174). Results
-    /// larger than this are truncated with a notice before being stored so a
-    /// single runaway tool call can't wedge the conversation or the database.
+    /// Override the per-tool-result context cap (issue #1302). A result
+    /// larger than this reaches the model as its head plus a notice naming
+    /// the message the whole of it is stored under.
     pub fn with_max_tool_result_bytes(mut self, max_bytes: usize) -> Self {
         self.max_tool_result_bytes = max_bytes;
+        self
+    }
+
+    /// Override the per-tool-result storage cap (issue #174). A result larger
+    /// than this has its tail dropped before the row is built, so a single
+    /// runaway tool call can't wedge the conversation or the database.
+    pub fn with_max_stored_tool_result_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_stored_tool_result_bytes = max_bytes;
         self
     }
 
@@ -2531,6 +2547,32 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
         let mut projection = ContextProjection::default();
         self.carry_recorded_evictions(conversation_id, &conv, &mut projection)
             .await;
+        // A result too large to read inline is stored whole and read as its
+        // head (#1302). The projection is turn-scoped, so this turn re-derives
+        // that from the stored length rather than from anything recorded - the
+        // rule is a pure function of the bytes, so every turn reaches the same
+        // answer at no storage cost.
+        //
+        // After the carry, not before, and the order is load-bearing in the
+        // opposite direction to the one `ContextProjection::replace` suggests.
+        // A distilled-note pointer says more in fewer bytes than a head plus a
+        // notice does, so it has to win - and `planning::carry_evictions`
+        // skips any row the projection already replaces, so a head written
+        // first would keep the pointer out rather than being overwritten by
+        // it. This pass makes the same check, so whichever ran first stands.
+        let headed = project_oversized_tool_results(
+            &conv.messages[window_start(&conv.messages, MAX_CONTEXT_MESSAGES)..],
+            &mut projection,
+            self.max_tool_result_bytes,
+        );
+        if headed > 0 {
+            tracing::debug!(
+                conversation_id = %conversation_id.0,
+                headed,
+                cap_bytes = self.max_tool_result_bytes,
+                "reading oversized tool results as their heads for this turn"
+            );
+        }
 
         // The other side of the projection: what the model can read back when
         // it needs the bytes the projection stopped showing it (#1226). The
@@ -4491,33 +4533,37 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                     round_report.set_outcome(crate::telemetry::RoundOutcome::ToolError);
                 }
 
-                // Cap the result at ingestion (issue #174): a runaway tool can
-                // return a multi-megabyte payload that, stored verbatim, wedges
-                // the conversation against the model's context window on every
-                // later turn and stalls the messages INSERT. Truncate with a
-                // notice so the model still sees what ran and how to narrow it.
-                // Computed before the `Finished` event so the activity feed
-                // mirrors exactly what the model is shown (issue #257), rather
-                // than summarizing a pre-cap payload the turn never used.
-                let stored = match cap_tool_result(&result, self.max_tool_result_bytes) {
-                    Some(truncated) => {
-                        tracing::warn!(
-                            tool = %Safe::name(&tool_call.name),
-                            original_bytes = result.len(),
-                            kept_bytes = truncated.len(),
-                            cap_bytes = self.max_tool_result_bytes,
-                            "tool result exceeded the ingestion cap — truncated"
-                        );
-                        truncated
-                    }
-                    None => result.clone(),
-                };
-
+                // Two caps, two jobs (#1302). The storage cap (issue #174)
+                // bounds what is written to the database: a runaway tool can
+                // return a multi-megabyte payload that stalls the messages
+                // INSERT and wedges the conversation, and above that bound the
+                // tail genuinely is dropped. The context cap bounds only what
+                // the model reads inline, and it is applied as a projection -
+                // the row keeps every byte and the notice names the reader
+                // that pages them back.
+                let stored =
+                    match cap_stored_tool_result(&result, self.max_stored_tool_result_bytes) {
+                        Some(bounded) => {
+                            tracing::warn!(
+                                tool = %Safe::name(&tool_call.name),
+                                original_bytes = result.len(),
+                                kept_bytes = bounded.len(),
+                                cap_bytes = self.max_stored_tool_result_bytes,
+                                "tool result exceeded the storage cap — the tail was dropped"
+                            );
+                            bounded
+                        }
+                        None => result.clone(),
+                    };
                 // An empty success is not an empty result (#1301). A tool that
                 // ran, succeeded and had nothing to say used to reach the model
                 // as a blank string, which reads exactly like a malformed
                 // request - so the model retried the same call verbatim. Say
                 // which of the two happened.
+                //
+                // Before the row is minted, not after: the row is what the
+                // reader pages and what a later turn loads, so a marker applied
+                // afterwards would be read by this round and by nothing else.
                 //
                 // Empty output only. A payload that carries the emptiness
                 // INSIDE the tool's own JSON is that tool's private shape, and
@@ -4535,10 +4581,59 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                     stored
                 };
 
+                // A result that repeats the one before it is not appended
+                // again (#1301). The tool RAN, so this is not a refusal and
+                // nothing here is stale - the model is pointed at the message
+                // carrying exactly these bytes, and told so in those words.
+                //
+                // Judged on the TOOL's own output, never on the message
+                // content: a pointer is shorter than the bytes it names, so
+                // digesting that instead would make every repeat read as a
+                // change. The ledger's own floor decides whether the saving is
+                // worth having.
+                let digest = crate::tool_repeat::ResultDigest::of(&stored);
+                let disposition = repeats.disposition(&repeat_key, digest, stored.len());
+                let content = match &disposition {
+                    crate::tool_repeat::ResultDisposition::SameAs { message_id } => {
+                        crate::tool_repeat::same_bytes_notice(message_id)
+                    }
+                    crate::tool_repeat::ResultDisposition::Store => stored.clone(),
+                };
+
+                // The row this result becomes, minted here rather than at the
+                // append below, because the notice the model reads has to name
+                // the id the reader is addressed by.
+                let tool_msg = Message::tool_result(&tool_call.id, &content);
+                // What the round reads of it, where that is less than all of
+                // it. A head no smaller than what it replaces is no saving, so
+                // the round reads the row instead. A pointer row is already an
+                // address, so only a stored row can need a head at all.
+                let head = matches!(
+                    disposition,
+                    crate::tool_repeat::ResultDisposition::Store
+                )
+                .then(|| cap_tool_result(&content, &tool_msg.id, self.max_tool_result_bytes))
+                .flatten()
+                .filter(|head| head.len() < content.len());
+                if let Some(head) = &head {
+                    tracing::warn!(
+                        tool = %Safe::name(&tool_call.name),
+                        message_id = %tool_msg.id,
+                        stored_bytes = stored.len(),
+                        head_bytes = head.len(),
+                        cap_bytes = self.max_tool_result_bytes,
+                        "tool result exceeded the ingestion cap — the round reads its head"
+                    );
+                }
+
+                // The activity feed follows what the model was shown, not the
+                // bytes behind it (issue #257): a pre-projection payload the
+                // turn never used would put a number in the feed that appears
+                // nowhere in the round.
                 notify_tool_event(ToolEvent::Finished {
                     name: summarize_tool_name(&tool_call.name),
                     ok: tool_ok,
-                    output: summarize_tool_text(&stored),
+                    output: summarize_tool_text(head.as_deref().unwrap_or(&content)),
                 });
 
                 // Dynamic activation: if tool_search returned results,
@@ -4744,32 +4839,18 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                     }
                 }
 
-                // A result that repeats the one before it is not appended
-                // again (#1301). The tool RAN, so this is not a refusal and
-                // nothing here is stale - the model is pointed at the message
-                // carrying exactly these bytes, and told so in those words.
-                //
-                // Only where the bytes dwarf the address that replaces them.
-                // The ledger holds that line - `disposition` takes the size and
-                // stands aside below its floor - because "is the pointer
-                // shorter" alone starts pointing at 308 bytes, where the saving
-                // is 93 and one read-back round costs several times that.
-                // `planning`'s eviction refuses a pointer on the same grounds.
-                //
-                // Judged on the TOOL's own output, never on the message
-                // content: a pointer is shorter than the bytes it names, so
-                // digesting that instead would make every repeat read as a
-                // change.
-                let digest = crate::tool_repeat::ResultDigest::of(&stored);
-                let content = match repeats.disposition(&repeat_key, digest, stored.len()) {
-                    crate::tool_repeat::ResultDisposition::SameAs { message_id } => {
-                        crate::tool_repeat::same_bytes_notice(&message_id)
-                    }
-                    crate::tool_repeat::ResultDisposition::Store => stored.clone(),
-                };
-                let result = Message::tool_result(&tool_call.id, content);
-                repeats.record(&repeat_key, &result.id, digest, stored.len());
-                conv.messages.push(result);
+                // The ledger keeps the id of the message that HOLDS these
+                // bytes, so a later repeat is pointed at the row carrying them
+                // rather than at a row carrying another pointer.
+                repeats.record(&repeat_key, &tool_msg.id, digest, stored.len());
+                // The row carries every byte; the round reads the head.
+                // Replacing the row's content here instead would write the
+                // truncation into the user's stored transcript, which is the
+                // defect #1302 fixes.
+                if let Some(head) = head {
+                    projection.replace(&tool_msg, head);
+                }
+                conv.messages.push(tool_msg);
             }
 
             // The identities this round met take effect now, and not one tool
@@ -8551,6 +8632,73 @@ mod tests {
             result.distilled_into,
             vec!["outcome:1".to_string()],
             "the row carries the decision that rebuilt the pointer"
+        );
+    }
+
+    /// Two replacements can want the same row, and the pointer has to win
+    /// (#1144 against #1302). It names the note that distilled the result, so
+    /// it says more in fewer bytes than a head plus a notice does.
+    ///
+    /// The order that produces it is not the one it looks like:
+    /// `planning::carry_evictions` skips any row the projection already
+    /// replaces, so a head written first would keep the pointer out rather
+    /// than being overwritten by it. The oversize pass therefore runs second.
+    #[tokio::test]
+    async fn a_distilled_result_reads_as_its_pointer_and_not_as_its_head() {
+        let (big, tools, tool_results, responses) = carry_fixture(CLEAN_TOOL);
+
+        let (write, list, sp) = in_memory_scratchpad();
+        let llm = ToolCallingLlm::new(responses);
+        let prompts = llm.prompts();
+        // A context cap far below the payload, so the row is oversized on
+        // every turn and both replacements are in play for it.
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            llm,
+            MockToolExecutor::new(tools, tool_results),
+            id_gen(),
+        )
+        .with_max_tool_result_bytes(1_024)
+        .with_scratchpad_write(write)
+        .with_scratchpad_list(list)
+        .with_scratchpad_get_many(scratchpad_get_many_over(Arc::clone(&sp)));
+
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "search?".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+        handler
+            .send_prompt(
+                &conv.id,
+                "and again?".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await
+            .unwrap();
+
+        let read_by_model = last_prompt_result(&prompts, "t1");
+        assert!(
+            read_by_model.starts_with("<compacted to scratchpad"),
+            "the pointer must win over the head, got: {read_by_model}"
+        );
+        assert!(
+            read_by_model.contains("outcome:1"),
+            "the pointer must still name the note: {read_by_model}"
+        );
+        let stored = handler.get_conversation(&conv.id).await.unwrap();
+        let result = stored
+            .messages
+            .iter()
+            .find(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some("t1"))
+            .expect("the tool result message must still exist");
+        assert_eq!(
+            result.content, big,
+            "the stored transcript must keep what the tool returned"
         );
     }
 
@@ -13488,13 +13636,10 @@ mod tests {
         let page = fixture_page(TEST_PAGE_BYTES);
         let mut results = HashMap::new();
         results.insert(PAGE_FETCH_TOOL.to_string(), page.clone());
-        let handler = make_tool_handler(
-            page_fetch_turn(),
-            vec![tool_def(PAGE_FETCH_TOOL)],
-            results,
-        )
-        .with_max_tool_result_bytes(TEST_CONTEXT_CAP)
-        .with_max_stored_tool_result_bytes(STORAGE_CAP);
+        let handler =
+            make_tool_handler(page_fetch_turn(), vec![tool_def(PAGE_FETCH_TOOL)], results)
+                .with_max_tool_result_bytes(TEST_CONTEXT_CAP)
+                .with_max_stored_tool_result_bytes(STORAGE_CAP);
         let conv = handler
             .create_conversation("Test".into(), vec![])
             .await
