@@ -19265,6 +19265,398 @@ mod tests {
             "an empty success must not read as an error; got: {result}"
         );
     }
+
+    // --- #1301: bounded backoff, and a pointer instead of repeated bytes ----
+
+    #[tokio::test]
+    async fn a_key_at_its_suppression_threshold_runs_again_and_the_threshold_doubles() {
+        // Suppression must never be terminal. Two identical runs make the key
+        // suppressible; from there the tool runs again every time the
+        // suppression counter reaches the threshold, and the threshold doubles.
+        // Ten identical calls therefore run the tool on calls 1, 2, 5 and 10.
+        let args = r#"{"q":"how big"}"#;
+        let calls_in: Vec<&str> = std::iter::repeat_n(args, 10).collect();
+        let (handler, calls) = repeat_handler(
+            probe_rounds(&calls_in),
+            std::iter::repeat_n(Ok("42".to_string()), 10).collect(),
+        );
+        let conv = handler
+            .create_conversation("Chat".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "how big".into(), noop_callback(), noop_status())
+            .await
+            .expect("turn completes");
+
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            4,
+            "ten identical calls must run the tool on 1, 2, 5 and 10 - the \
+             threshold starts at two and doubles each time it fires"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_poll_whose_value_changes_after_two_identical_results_reaches_the_model() {
+        // The case the terminal rule broke, and the most important test here. A
+        // subagent poll reads "running" twice, is answered from the transcript
+        // for a bounded number of rounds, and then runs again - and the model
+        // gets the new value inside the same turn.
+        let args = r#"{"task_id":"t1"}"#;
+        let calls_in: Vec<&str> = std::iter::repeat_n(args, 5).collect();
+        let (handler, calls) = repeat_handler(
+            probe_rounds(&calls_in),
+            vec![
+                Ok(r#"{"status":"running"}"#.to_string()),
+                Ok(r#"{"status":"running"}"#.to_string()),
+                Ok(r#"{"status":"completed","result":"THE-ANSWER"}"#.to_string()),
+            ],
+        );
+        let conv = handler
+            .create_conversation("Chat".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "poll it".into(), noop_callback(), noop_status())
+            .await
+            .expect("turn completes");
+
+        assert_eq!(calls.lock().unwrap().len(), 3, "the poll must run again");
+        let stored = handler.get_conversation(&conv.id).await.unwrap();
+        assert!(
+            stored
+                .messages
+                .iter()
+                .any(|m| m.content.contains("THE-ANSWER")),
+            "the changed value must reach the model in this turn; the turn held: {:?}",
+            stored
+                .messages
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A tool pair over one mutable value: `read` returns it, `write` replaces
+    /// it. The point is the bytes the model receives, not what ran.
+    struct FileToolExecutor {
+        tools: Vec<ToolDefinition>,
+        content: Mutex<String>,
+    }
+
+    impl ToolExecutor for FileToolExecutor {
+        async fn core_tools(&self) -> Vec<ToolDefinition> {
+            self.tools.clone()
+        }
+        async fn search_tools(&self, _query: &str) -> Result<Vec<ToolDefinition>, CoreError> {
+            Ok(vec![])
+        }
+        async fn tool_definition(&self, name: &str) -> Result<Option<ToolDefinition>, CoreError> {
+            Ok(self.tools.iter().find(|t| t.name == name).cloned())
+        }
+        async fn execute_tool(
+            &self,
+            name: &str,
+            arguments: serde_json::Value,
+        ) -> Result<String, CoreError> {
+            match name {
+                "read" => Ok(self.content.lock().unwrap().clone()),
+                "write" => {
+                    let text = arguments
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    *self.content.lock().unwrap() = text;
+                    Ok("written".to_string())
+                }
+                other => Err(CoreError::ToolExecution(format!("unknown tool: {other}"))),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_read_after_a_write_reaches_the_model_within_the_backoff_bound() {
+        // Read, read, write, then read until the model has the written bytes.
+        // Reads three and four are answered from the transcript and carry the
+        // pre-write text; read five runs and carries the write. The bound is
+        // what makes this finite - it is not that no read is ever answered from
+        // the transcript.
+        let tools = vec![
+            ToolDefinition::new(
+                "read",
+                "read the file",
+                serde_json::json!({"type":"object"}),
+            ),
+            ToolDefinition::new(
+                "write",
+                "write the file",
+                serde_json::json!({"type":"object","properties":{"text":{"type":"string"}}}),
+            ),
+        ];
+        let read = |i: usize| {
+            LlmResponse::with_tool_calls("", vec![ToolCall::new(format!("r{i}"), "read", "{}")])
+        };
+        let responses = vec![
+            read(1),
+            read(2),
+            LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new(
+                    "w1",
+                    "write",
+                    r#"{"text":"AFTER-THE-WRITE"}"#,
+                )],
+            ),
+            read(3),
+            read(4),
+            read(5),
+            LlmResponse::text("done"),
+        ];
+        let counter = Arc::new(AtomicU32::new(0));
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            ToolCallingLlm::new(responses),
+            FileToolExecutor {
+                tools,
+                content: Mutex::new("BEFORE-THE-WRITE".to_string()),
+            },
+            Box::new(move || {
+                let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                format!("conv-rw-{n}")
+            }),
+        );
+        let conv = handler
+            .create_conversation("Chat".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "edit it".into(), noop_callback(), noop_status())
+            .await
+            .expect("turn completes");
+
+        let stored = handler.get_conversation(&conv.id).await.unwrap();
+        let last_read = stored_tool_results(&stored)
+            .last()
+            .expect("the turn stored tool results")
+            .content
+            .clone();
+        assert!(
+            last_read.contains("AFTER-THE-WRITE"),
+            "the last read must carry the written bytes; got: {last_read}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_executed_call_returning_identical_bytes_appends_a_pointer_not_the_bytes() {
+        // The context fix, and it stands on its own: the tool RAN, so nothing
+        // here is stale. Appending the same bytes twice is what fed the
+        // fetch/evict/refetch loop, and it does not need suppression to stop.
+        let args = r#"{"q":"the page"}"#;
+        let payload = format!("PAYLOAD-MARKER{}", "x".repeat(8000));
+        let (handler, calls) = repeat_handler(
+            probe_rounds(&[args, args]),
+            vec![Ok(payload.clone()), Ok(payload.clone())],
+        );
+        let conv = handler
+            .create_conversation("Chat".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "read it".into(), noop_callback(), noop_status())
+            .await
+            .expect("turn completes");
+
+        assert_eq!(calls.lock().unwrap().len(), 2, "both calls ran");
+        let stored = handler.get_conversation(&conv.id).await.unwrap();
+        let copies = stored
+            .messages
+            .iter()
+            .filter(|m| m.content.contains("PAYLOAD-MARKER"))
+            .count();
+        assert_eq!(
+            copies, 1,
+            "the second run returned the same bytes, so the transcript must \
+             hold them once and point at them the second time"
+        );
+        let results = stored_tool_results(&stored);
+        assert_eq!(results.len(), 2);
+        assert!(
+            results[1].content.contains(&results[0].id),
+            "the pointer must name the message holding the bytes; got: {}",
+            results[1].content
+        );
+        assert!(
+            results[1].content.len() * 4 < payload.len(),
+            "the pointer must be a pointer, not a copy"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_suppressed_result_says_the_tool_did_not_run_and_a_pointer_does_not() {
+        // Three results now exist and the model must tell them apart: bytes it
+        // has not seen, a pointer to bytes a run just reproduced, and a pointer
+        // to an earlier run that did not happen again. Only the last may be
+        // stale, and only the last says so.
+        let args = r#"{"q":"how big"}"#;
+        let (handler, _calls) = repeat_handler(
+            probe_rounds(&[args, args, args]),
+            vec![
+                Ok("42".to_string()),
+                Ok("42".to_string()),
+                Ok("42".to_string()),
+            ],
+        );
+        let conv = handler
+            .create_conversation("Chat".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "how big".into(), noop_callback(), noop_status())
+            .await
+            .expect("turn completes");
+
+        let stored = handler.get_conversation(&conv.id).await.unwrap();
+        let results = stored_tool_results(&stored);
+        assert_eq!(results.len(), 3);
+        assert!(
+            results[2].content.contains("did not run"),
+            "a suppressed result must say the tool did not run; got: {}",
+            results[2].content
+        );
+        assert!(
+            !results[1].content.contains("did not run"),
+            "a pointer from a call that DID run must not claim otherwise; got: {}",
+            results[1].content
+        );
+    }
+
+    #[tokio::test]
+    async fn the_same_provider_tool_on_two_hosts_is_two_keys() {
+        // Reading a path on the daemon says nothing about the same path on the
+        // user's own machine. Merging them can serve one host's bytes as the
+        // other's, which is a wrong answer rather than waste.
+        use crate::ports::client_tools::with_client_tools;
+
+        let daemon_call = |i: usize| {
+            LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new(
+                    format!("d{i}"),
+                    "daemon_read_file",
+                    r#"{"path":"/etc/hosts"}"#,
+                )],
+            )
+        };
+        let responses = vec![
+            daemon_call(1),
+            daemon_call(2),
+            daemon_call(3),
+            LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new(
+                    "c1",
+                    "client_read_file",
+                    r#"{"path":"/etc/hosts"}"#,
+                )],
+            ),
+            LlmResponse::text("done"),
+        ];
+        let daemon_ran = Arc::new(Mutex::new(Vec::new()));
+        let (handler, _advertised) = two_sided_handler(
+            responses,
+            vec![daemon_read_file()],
+            vec![],
+            HashMap::from([("read_file".to_string(), "daemon result".to_string())]),
+            Arc::clone(&daemon_ran),
+        );
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
+        let device_ran = Arc::new(Mutex::new(Vec::new()));
+        with_client_tools(
+            client_port(vec![device_read_file()], &device_ran),
+            handler.send_prompt(&conv.id, "read it".into(), noop_callback(), noop_status()),
+        )
+        .await
+        .expect("turn completes");
+
+        assert_eq!(
+            device_ran.lock().unwrap().len(),
+            1,
+            "the client's read is the first call of its own key and must run, \
+             however many times the daemon's read has been made"
+        );
+    }
+
+    #[tokio::test]
+    async fn builtin_tool_search_is_never_suppressed_and_still_activates_what_it_finds() {
+        // The loop reads this tool's RESULT to activate what it found, so a
+        // call answered from the transcript would silently skip the activation.
+        let fleet = vec![ToolDefinition::new(
+            "fleet_tool_00",
+            "a fleet tool",
+            serde_json::json!({"type": "object"}),
+        )];
+        let hits: Vec<serde_json::Value> = fleet
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "name": format!("daemon_{}", t.name),
+                    "description": t.description,
+                    "runs_on": "daemon",
+                })
+            })
+            .collect();
+        let search_result = serde_json::json!({"ok": true, "tools": hits}).to_string();
+        let search = |i: usize| {
+            LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new(
+                    format!("s{i}"),
+                    "daemon_builtin_tool_search",
+                    r#"{"query":"anything"}"#,
+                )],
+            )
+        };
+        let executed = Arc::new(Mutex::new(Vec::new()));
+        let (handler, advertised) = two_sided_handler(
+            vec![search(1), search(2), search(3), LlmResponse::text("done")],
+            vec![search_tool()],
+            fleet,
+            HashMap::from([("builtin_tool_search".to_string(), search_result)]),
+            Arc::clone(&executed),
+        );
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "find it".into(), noop_callback(), noop_status())
+            .await
+            .expect("turn completes");
+
+        let searches = executed
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(name, _)| name == "builtin_tool_search")
+            .count();
+        assert_eq!(
+            searches, 3,
+            "every search must run - the loop reads the result to activate"
+        );
+        let rounds = advertised.lock().unwrap().clone();
+        let last = rounds.last().expect("a final advertised set");
+        assert!(
+            last.iter().any(|t| t.name.contains("fleet_tool_00")),
+            "the repeated search must still activate what it found; the last \
+             round advertised {:?}",
+            last.iter().map(|t| t.name.as_str()).collect::<Vec<_>>()
+        );
+    }
 }
 
 /// Concurrency tests for per-conversation turn serialization (DA-1, #282).
