@@ -4723,10 +4723,16 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                     }
                 }
 
-                // Bytes the transcript already holds are never appended twice
-                // (#1301). The tool RAN, so this is not a refusal and nothing
-                // here is stale - the model is pointed at the message carrying
-                // exactly these bytes, and told so in those words.
+                // A result that repeats the one before it is not appended
+                // again (#1301). The tool RAN, so this is not a refusal and
+                // nothing here is stale - the model is pointed at the message
+                // carrying exactly these bytes, and told so in those words.
+                //
+                // Only where the pointer is smaller than what it stands in for.
+                // A short result replaced by a 300-byte address makes the
+                // context bigger, which is the one thing a rule that exists to
+                // stop the context refilling may not do; `planning`'s eviction
+                // refuses a pointer on the same test, and says so where it does.
                 //
                 // Judged on the TOOL's own output, never on the message
                 // content: a pointer is shorter than the bytes it names, so
@@ -4735,12 +4741,17 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 let digest = crate::tool_repeat::ResultDigest::of(&stored);
                 let content = match repeats.disposition(&repeat_key, digest) {
                     crate::tool_repeat::ResultDisposition::SameAs { message_id } => {
-                        crate::tool_repeat::same_bytes_notice(&message_id)
+                        let pointer = crate::tool_repeat::same_bytes_notice(&message_id);
+                        if pointer.len() < stored.len() {
+                            pointer
+                        } else {
+                            stored.clone()
+                        }
                     }
                     crate::tool_repeat::ResultDisposition::Store => stored.clone(),
                 };
                 let result = Message::tool_result(&tool_call.id, content);
-                repeats.record(&repeat_key, &result.id, digest);
+                repeats.record(&repeat_key, &result.id, digest, stored.len());
                 conv.messages.push(result);
             }
 
@@ -18930,6 +18941,14 @@ mod tests {
         (handler, calls)
     }
 
+    /// A tool result the repeat rule applies to. Below its size floor a result
+    /// is left alone, because answering it from the transcript would cost more
+    /// context than the bytes it stands in for - so a test driving a two-byte
+    /// answer would exercise nothing.
+    fn big_result(label: &str) -> String {
+        format!("{label}{}", "x".repeat(1024))
+    }
+
     /// One tool-calling round per entry, then a closing text answer.
     fn probe_rounds(args: &[&str]) -> Vec<LlmResponse> {
         let mut responses: Vec<LlmResponse> = args
@@ -18963,9 +18982,9 @@ mod tests {
         let (handler, calls) = repeat_handler(
             probe_rounds(&[args, args, args]),
             vec![
-                Ok("42".to_string()),
-                Ok("42".to_string()),
-                Ok("42".to_string()),
+                Ok(big_result("42")),
+                Ok(big_result("42")),
+                Ok(big_result("42")),
             ],
         );
         let conv = handler
@@ -18985,14 +19004,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_suppressed_repeat_names_the_first_result_message_and_the_readback_tool() {
+    async fn a_repeat_result_names_the_message_holding_the_bytes_and_the_readback_tool() {
         let args = r#"{"q":"how big"}"#;
         let (handler, calls) = repeat_handler(
             probe_rounds(&[args, args, args]),
             vec![
-                Ok("42".to_string()),
-                Ok("42".to_string()),
-                Ok("42".to_string()),
+                Ok(big_result("42")),
+                Ok(big_result("42")),
+                Ok(big_result("42")),
             ],
         );
         let conv = handler
@@ -19029,10 +19048,10 @@ mod tests {
         let (handler, calls) = repeat_handler(
             probe_rounds(&[args, args, args, args]),
             vec![
-                Ok("42".to_string()),
-                Ok("42".to_string()),
-                Ok("42".to_string()),
-                Ok("42".to_string()),
+                Ok(big_result("42")),
+                Ok(big_result("42")),
+                Ok(big_result("42")),
+                Ok(big_result("42")),
             ],
         );
         let conv = handler
@@ -19056,7 +19075,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_suppressed_repeat_does_not_append_the_result_bytes_again() {
+    async fn repeated_bytes_land_in_the_transcript_once_however_the_call_is_answered() {
         // Three calls: two run and one is answered from the transcript. The
         // bytes land once between them, because a run that reproduces them
         // points at them and a suppressed call never had them to append.
@@ -19122,9 +19141,9 @@ mod tests {
                 "{ \"a\" : 1 ,\n  \"b\" : 2 }",
             ]),
             vec![
-                Ok("42".to_string()),
-                Ok("42".to_string()),
-                Ok("42".to_string()),
+                Ok(big_result("42")),
+                Ok(big_result("42")),
+                Ok(big_result("42")),
             ],
         );
         let conv = handler
@@ -19145,15 +19164,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_tool_whose_output_changes_on_its_first_repeat_is_never_suppressed() {
-        // The polling guard, and the name says exactly how far it reaches. A
-        // tool that answers differently by its second run is time-varying for
-        // the rest of the turn and always runs again.
+        // The polling guard at its simplest: a tool that answers differently by
+        // its second run never becomes suppressible at all, so it runs every
+        // time it is called, however many times that is.
         //
-        // What this does NOT cover, because the rule does not hold it: a tool
-        // that answers identically twice and only then changes. Two matching
-        // runs freeze the key, and a suppressed call records nothing, so
-        // nothing can thaw it. See #1301 for the case that meets this - a
-        // subagent poll that reads "running" twice before it completes.
+        // The harder case - a tool that answers identically twice and only then
+        // changes - is held by
+        // `a_poll_whose_value_changes_after_two_identical_results_reaches_the_model`,
+        // because the backoff is what makes it recoverable rather than lost.
         let args = r#"{"task_id":"t1"}"#;
         let (handler, calls) = repeat_handler(
             probe_rounds(&[args, args, args, args]),
@@ -19190,8 +19208,8 @@ mod tests {
         let (handler, calls) = repeat_handler(
             probe_rounds(&[args, args]),
             vec![
-                Ok("TOOL-OUTPUT-42".to_string()),
-                Ok("TOOL-OUTPUT-42".to_string()),
+                Ok(big_result("TOOL-OUTPUT-42")),
+                Ok(big_result("TOOL-OUTPUT-42")),
             ],
         );
         let conv = handler
@@ -19239,10 +19257,10 @@ mod tests {
         let (handler, calls) = repeat_handler(
             responses,
             vec![
-                Ok("42".to_string()),
-                Ok("42".to_string()),
-                Ok("42".to_string()),
-                Ok("42".to_string()),
+                Ok(big_result("42")),
+                Ok(big_result("42")),
+                Ok(big_result("42")),
+                Ok(big_result("42")),
             ],
         );
         let conv = handler
@@ -19336,12 +19354,16 @@ mod tests {
         // Suppression must never be terminal. Two identical runs make the key
         // suppressible; from there the tool runs again every time the
         // suppression counter reaches the threshold, and the threshold doubles.
-        // Ten identical calls therefore run the tool on calls 1, 2, 5 and 10.
+        //
+        // Twenty-one calls, because ten cannot tell the doubling from a fixed
+        // bound of two: both run the tool four times over ten calls. Over
+        // twenty-one a fixed bound runs it eight times and the doubling runs it
+        // five - on calls 1, 2, 5, 10 and 19.
         let args = r#"{"q":"how big"}"#;
-        let calls_in: Vec<&str> = std::iter::repeat_n(args, 10).collect();
+        let calls_in: Vec<&str> = std::iter::repeat_n(args, 21).collect();
         let (handler, calls) = repeat_handler(
             probe_rounds(&calls_in),
-            std::iter::repeat_n(Ok("42".to_string()), 10).collect(),
+            std::iter::repeat_n(Ok(big_result("42")), 21).collect(),
         );
         let conv = handler
             .create_conversation("Chat".into(), vec![])
@@ -19354,10 +19376,47 @@ mod tests {
 
         assert_eq!(
             calls.lock().unwrap().len(),
-            4,
-            "ten identical calls must run the tool on 1, 2, 5 and 10 - the \
+            5,
+            "twenty-one identical calls must run the tool five times - the \
              threshold starts at two and doubles each time it fires"
         );
+    }
+
+    #[tokio::test]
+    async fn a_small_repeated_result_costs_the_transcript_no_more_than_its_own_bytes() {
+        // The inversion this rule must not have. Both notices run to hundreds
+        // of bytes, so answering a short result with one makes the context
+        // BIGGER - and short results are also where a stale answer costs most,
+        // a poll's status line being a few dozen bytes. Below the floor the
+        // rule stands aside on both counts.
+        let args = r#"{"task_id":"t1"}"#;
+        let small = r#"{"status":"running"}"#;
+        let calls_in: Vec<&str> = std::iter::repeat_n(args, 6).collect();
+        let (handler, calls) = repeat_handler(
+            probe_rounds(&calls_in),
+            std::iter::repeat_n(Ok(small.to_string()), 6).collect(),
+        );
+        let conv = handler
+            .create_conversation("Chat".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "poll it".into(), noop_callback(), noop_status())
+            .await
+            .expect("turn completes");
+
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            6,
+            "a result too small to be worth replacing must never be withheld"
+        );
+        let stored = handler.get_conversation(&conv.id).await.unwrap();
+        for r in stored_tool_results(&stored) {
+            assert_eq!(
+                r.content, small,
+                "every result must be its own bytes, not a longer address for them"
+            );
+        }
     }
 
     #[tokio::test]
@@ -19371,9 +19430,11 @@ mod tests {
         let (handler, calls) = repeat_handler(
             probe_rounds(&calls_in),
             vec![
-                Ok(r#"{"status":"running"}"#.to_string()),
-                Ok(r#"{"status":"running"}"#.to_string()),
-                Ok(r#"{"status":"completed","result":"THE-ANSWER"}"#.to_string()),
+                Ok(big_result(r#"{"status":"running"}"#)),
+                Ok(big_result(r#"{"status":"running"}"#)),
+                Ok(big_result(
+                    r#"{"status":"completed","result":"THE-ANSWER"}"#,
+                )),
             ],
         );
         let conv = handler
@@ -19483,7 +19544,7 @@ mod tests {
             ToolCallingLlm::new(responses),
             FileToolExecutor {
                 tools,
-                content: Mutex::new("BEFORE-THE-WRITE".to_string()),
+                content: Mutex::new(big_result("BEFORE-THE-WRITE")),
             },
             Box::new(move || {
                 let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
@@ -19500,14 +19561,31 @@ mod tests {
             .expect("turn completes");
 
         let stored = handler.get_conversation(&conv.id).await.unwrap();
-        let last_read = stored_tool_results(&stored)
-            .last()
-            .expect("the turn stored tool results")
-            .content
-            .clone();
+        let results = stored_tool_results(&stored);
+        let reads: Vec<&str> = results
+            .iter()
+            .filter(|m| !m.content.contains("written"))
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(reads.len(), 5, "five reads, one result each");
+        // The middle of the shape, or this passes with suppression deleted: the
+        // third read is answered from the transcript, and what it points at is
+        // the pre-write text. That is the cost the bound exists to cap.
         assert!(
-            last_read.contains("AFTER-THE-WRITE"),
-            "the last read must carry the written bytes; got: {last_read}"
+            reads[2].contains("did not run"),
+            "the third read must be answered from the transcript; got: {}",
+            reads[2]
+        );
+        assert!(
+            !reads[2].contains("AFTER-THE-WRITE"),
+            "and it must not carry the write it cannot have seen; got: {}",
+            reads[2]
+        );
+        // And the end of it: the bound fires and the model gets the write.
+        assert!(
+            reads[4].contains("AFTER-THE-WRITE"),
+            "the last read must carry the written bytes; got: {}",
+            reads[4]
         );
     }
 
@@ -19566,9 +19644,9 @@ mod tests {
         let (handler, _calls) = repeat_handler(
             probe_rounds(&[args, args, args]),
             vec![
-                Ok("42".to_string()),
-                Ok("42".to_string()),
-                Ok("42".to_string()),
+                Ok(big_result("42")),
+                Ok(big_result("42")),
+                Ok(big_result("42")),
             ],
         );
         let conv = handler
@@ -19655,9 +19733,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn builtin_tool_search_is_never_suppressed_and_still_activates_what_it_finds() {
+    async fn builtin_tool_search_is_never_suppressed() {
         // The loop reads this tool's RESULT to activate what it found, so a
-        // call answered from the transcript would silently skip the activation.
+        // call answered from the transcript would return the right text and
+        // activate nothing.
+        //
+        // The run count is what this test holds. The activation check below is
+        // a consequence, not a second enforcer: activations from the first two
+        // searches persist whether or not the third runs, so it would pass
+        // without the exemption.
         let fleet = vec![ToolDefinition::new(
             "fleet_tool_00",
             "a fleet tool",

@@ -13,16 +13,25 @@
 //!
 //! ## Two separate answers, and only one of them withholds anything
 //!
-//! **Repeated bytes are never appended twice.** When a call runs and returns
-//! exactly what that key returned before, the turn appends a pointer to the
-//! message already holding those bytes instead of a second copy. The tool ran,
-//! so nothing here can be stale, and this is what actually breaks the
-//! fetch/evict/refetch loop. It applies to every key, always.
+//! **A result that repeats the one before it is not appended again.** When a
+//! call runs and returns exactly what that key returned on its previous run,
+//! the turn appends a pointer to the message already holding those bytes
+//! instead of a second copy - provided the pointer is smaller than the bytes.
+//! The tool ran, so nothing here can be stale, and this is what actually breaks
+//! the fetch/evict/refetch loop.
 //!
-//! **Suppression is an execution saving on top of that.** Two matching runs
-//! make a key suppressible; from there the loop answers some calls from the
-//! transcript without running the tool. That one CAN be stale, so it is
-//! bounded - see below - and it says so in the result the model reads.
+//! It compares against the previous result and not against every result the key
+//! has ever produced, so a tool that alternates between two answers - A, B, A,
+//! B - stores both of them every time and saves nothing. Nothing is wrong in
+//! that case; there is simply nothing here for it.
+//!
+//! **Suppression is an execution saving on top of that.** Two matching runs of
+//! at least [`MIN_SUPPRESSIBLE_BYTES`] make a key suppressible; from there the
+//! loop answers some calls from the transcript without running the tool. That
+//! one CAN be stale, so it is bounded - see below - and it says so in the
+//! result the model reads. A suppressed call still costs its round, so what it
+//! saves is the execution, which is why a result too small to be worth
+//! replacing is never suppressed at all.
 //!
 //! ## The backoff, and why suppression must never be terminal
 //!
@@ -77,6 +86,32 @@ use crate::tool_routing::ToolConnection;
 /// evidence and the bound are the same size, so the first thing the rule does
 /// after concluding "this is not changing" is to go and check.
 const INITIAL_THRESHOLD: u32 = 2;
+
+/// The largest the threshold may grow to.
+///
+/// Doubling without a ceiling makes the property "no key can freeze" true only
+/// in the limit, and a turn is not the limit: unbounded, the runs land on calls
+/// 1, 2, 5, 10, 19, 36, 69, 134, 263, so a key asked for 134 times is not
+/// re-checked before `MAX_TOOL_ROUNDS` ends the turn. A child that finished at
+/// round 80 would go unnoticed to the end. Capped, a key is re-checked at least
+/// every sixteen calls for as long as the turn lasts, and the first several
+/// fires are unchanged - 21 identical calls still run the tool five times.
+const MAX_THRESHOLD: u32 = 16;
+
+/// The smallest result this rule will answer from the transcript.
+///
+/// A tool answered from the transcript still costs its round; what it saves is
+/// the execution and the bytes. Below this size it saves neither. Both notices
+/// render to under 512 bytes with a UUIDv7 message id, so a shorter result
+/// replaced by one makes the context BIGGER - which is the one thing a rule
+/// that exists to stop the context refilling may not do.
+///
+/// The same line is held either side of this module: `planning`'s
+/// `COMPACTION_MIN_EVICT_BYTES` is 512 for the same reason, and its eviction
+/// refuses any pointer no smaller than what it replaces. Small results are also
+/// where a stale answer costs most - a poll's `{"status":"running"}` is a few
+/// dozen bytes - so leaving them alone is the safe direction twice over.
+const MIN_SUPPRESSIBLE_BYTES: usize = 512;
 
 /// The digest of one tool result. Computed once per execution and passed
 /// between the ledger's calls, so a multi-megabyte payload is hashed once.
@@ -265,7 +300,7 @@ impl RepeatLedger {
             // The bound is up. Run it, start the count again, and give the key
             // twice as long before the next check.
             record.suppressions = 0;
-            record.threshold = record.threshold.saturating_mul(2);
+            record.threshold = record.threshold.saturating_mul(2).min(MAX_THRESHOLD);
             return RepeatVerdict::Execute;
         }
         let message_id = held.message_id.clone();
@@ -295,7 +330,13 @@ impl RepeatLedger {
     /// `digest` is of the TOOL's own output, never of the message content. A
     /// message carrying a pointer is shorter than the bytes it names, and
     /// digesting that instead would make every repeat look like a change.
-    pub(crate) fn record(&mut self, key: &RepeatKey, message_id: &str, digest: ResultDigest) {
+    pub(crate) fn record(
+        &mut self,
+        key: &RepeatKey,
+        message_id: &str,
+        digest: ResultDigest,
+        output_bytes: usize,
+    ) {
         let record = self.seen.entry(key.clone()).or_default();
         match &record.held {
             None => {
@@ -305,10 +346,12 @@ impl RepeatLedger {
                 });
             }
             Some(held) if held.digest == digest => {
-                // The same bytes, so the message just appended is a pointer and
-                // `held` must keep naming the message that carries them. Two
-                // runs in a row agreeing is what makes the key suppressible.
-                record.suppressible = true;
+                // The same bytes, so the message just appended points at them
+                // and `held` must keep naming the message that carries them.
+                // Two runs in a row agreeing is what makes the key
+                // suppressible - but only above the size where answering from
+                // the transcript is cheaper than answering with the bytes.
+                record.suppressible = output_bytes >= MIN_SUPPRESSIBLE_BYTES;
             }
             Some(_) => {
                 // Something changed. The key is not repeating itself after all,
@@ -353,7 +396,7 @@ pub(crate) fn suppressed_notice(message_id: &str, attempts: u32) -> String {
     format!(
         "<not run: you have now made this exact call {attempts} times in this \
          turn, and the last runs all returned the same output. The tool did \
-         not run this time, so what follows is NOT a fresh answer: it is the \
+         not run this time, so what follows is not a fresh answer: it is the \
          result of an earlier run, stored as message {message_id}, and it may \
          be out of date. Read it with {tool} message_id=\"{message_id}\". This \
          call runs again on its own after a few more attempts; to get a fresh \
@@ -373,6 +416,13 @@ mod tests {
         )
     }
 
+    /// A result the rule applies to: at or above the size where answering from
+    /// the transcript is cheaper than answering with the bytes. `label`
+    /// distinguishes one from another.
+    fn big(label: &str) -> String {
+        format!("{label}{}", "x".repeat(MIN_SUPPRESSIBLE_BYTES))
+    }
+
     /// Drive one call the way the turn loop does: ask, run it if allowed, then
     /// record what it returned. Returns what the model would be handed.
     fn dispatch(ledger: &mut RepeatLedger, args: &str, message_id: &str, output: &str) -> String {
@@ -384,11 +434,18 @@ mod tests {
             } => suppressed_notice(&message_id, attempts),
             RepeatVerdict::Execute => {
                 let digest = ResultDigest::of(output);
+                let pointer_wins = matches!(
+                    ledger.disposition(&k, digest),
+                    ResultDisposition::SameAs { ref message_id }
+                        if same_bytes_notice(message_id).len() < output.len()
+                );
                 let content = match ledger.disposition(&k, digest) {
-                    ResultDisposition::SameAs { message_id } => same_bytes_notice(&message_id),
-                    ResultDisposition::Store => output.to_string(),
+                    ResultDisposition::SameAs { message_id } if pointer_wins => {
+                        same_bytes_notice(&message_id)
+                    }
+                    _ => output.to_string(),
                 };
-                ledger.record(&k, message_id, digest);
+                ledger.record(&k, message_id, digest, output.len());
                 content
             }
         }
@@ -446,15 +503,15 @@ mod tests {
     #[test]
     fn the_first_two_calls_both_run() {
         let mut ledger = RepeatLedger::new();
-        assert!(ran(&mut ledger, r#"{"a":1}"#, "msg-1", "same"));
-        assert!(ran(&mut ledger, r#"{"a":1}"#, "msg-2", "same"));
+        assert!(ran(&mut ledger, r#"{"a":1}"#, "msg-1", &big("same")));
+        assert!(ran(&mut ledger, r#"{"a":1}"#, "msg-2", &big("same")));
     }
 
     #[test]
     fn a_run_that_reproduces_earlier_bytes_points_at_them_instead() {
         let mut ledger = RepeatLedger::new();
-        dispatch(&mut ledger, r#"{"a":1}"#, "msg-1", "same");
-        let second = dispatch(&mut ledger, r#"{"a":1}"#, "msg-2", "same");
+        dispatch(&mut ledger, r#"{"a":1}"#, "msg-1", &big("same"));
+        let second = dispatch(&mut ledger, r#"{"a":1}"#, "msg-2", &big("same"));
         assert!(second.contains("msg-1"), "{second}");
         assert!(
             !second.contains("did not run"),
@@ -468,9 +525,61 @@ mod tests {
         // decide it repeats, then a check after 2, 4 and 8 suppressions.
         let mut ledger = RepeatLedger::new();
         let ran_on: Vec<usize> = (1..=21)
-            .filter(|i| ran(&mut ledger, r#"{"a":1}"#, &format!("msg-{i}"), "same"))
+            .filter(|i| ran(&mut ledger, r#"{"a":1}"#, &format!("msg-{i}"), &big("same")))
             .collect();
         assert_eq!(ran_on, vec![1, 2, 5, 10, 19]);
+    }
+
+    #[test]
+    fn a_result_too_small_to_be_worth_replacing_is_never_suppressed() {
+        // Both notices are hundreds of bytes. A twenty-byte poll answered with
+        // one costs more context than running the tool, which inverts the whole
+        // point - so below the floor the rule stands aside.
+        let mut ledger = RepeatLedger::new();
+        let small = r#"{"status":"running"}"#;
+        assert!(small.len() < MIN_SUPPRESSIBLE_BYTES);
+        for i in 1..=20 {
+            assert!(
+                ran(&mut ledger, r#"{"a":1}"#, &format!("msg-{i}"), small),
+                "call {i} must run"
+            );
+        }
+    }
+
+    #[test]
+    fn a_small_repeated_result_is_stored_rather_than_replaced_by_a_longer_pointer() {
+        let mut ledger = RepeatLedger::new();
+        let small = "ok";
+        dispatch(&mut ledger, r#"{"a":1}"#, "msg-1", small);
+        let second = dispatch(&mut ledger, r#"{"a":1}"#, "msg-2", small);
+        assert_eq!(
+            second, small,
+            "a pointer longer than the bytes it names must not replace them"
+        );
+    }
+
+    #[test]
+    fn the_threshold_stops_doubling_so_a_key_stays_re_checked_within_one_turn() {
+        // Unbounded doubling puts the ninth run at call 263, past
+        // `MAX_TOOL_ROUNDS`, so a key asked for often enough would not be
+        // re-checked again inside the turn - frozen in every sense that
+        // matters. The cap is what makes "no key can freeze" true in a turn
+        // rather than in the limit.
+        let mut ledger = RepeatLedger::new();
+        let ran_on: Vec<usize> = (1..=400)
+            .filter(|i| ran(&mut ledger, r#"{"a":1}"#, &format!("msg-{i}"), &big("same")))
+            .collect();
+        let widest = ran_on
+            .windows(2)
+            .map(|w| w[1] - w[0])
+            .max()
+            .expect("the tool ran more than once");
+        assert!(
+            widest <= MAX_THRESHOLD as usize + 1,
+            "a key must be re-checked at least every {} calls; the widest gap \
+             was {widest} (ran on {ran_on:?})",
+            MAX_THRESHOLD + 1
+        );
     }
 
     #[test]
@@ -479,10 +588,10 @@ mod tests {
         // always a bounded number of calls away.
         let mut ledger = RepeatLedger::new();
         for i in 1..=200 {
-            dispatch(&mut ledger, r#"{"a":1}"#, &format!("msg-{i}"), "same");
+            dispatch(&mut ledger, r#"{"a":1}"#, &format!("msg-{i}"), &big("same"));
         }
         let further: Vec<usize> = (201..=600)
-            .filter(|i| ran(&mut ledger, r#"{"a":1}"#, &format!("msg-{i}"), "same"))
+            .filter(|i| ran(&mut ledger, r#"{"a":1}"#, &format!("msg-{i}"), &big("same")))
             .collect();
         assert!(
             !further.is_empty(),
@@ -495,13 +604,14 @@ mod tests {
         // The case the terminal rule lost: two identical polls, then a value
         // the model must see.
         let mut ledger = RepeatLedger::new();
-        dispatch(&mut ledger, r#"{"a":1}"#, "msg-1", "running");
-        dispatch(&mut ledger, r#"{"a":1}"#, "msg-2", "running");
-        assert!(!ran(&mut ledger, r#"{"a":1}"#, "msg-3", "running"));
-        assert!(!ran(&mut ledger, r#"{"a":1}"#, "msg-4", "running"));
-        let fifth = dispatch(&mut ledger, r#"{"a":1}"#, "msg-5", "completed");
+        dispatch(&mut ledger, r#"{"a":1}"#, "msg-1", &big("running"));
+        dispatch(&mut ledger, r#"{"a":1}"#, "msg-2", &big("running"));
+        assert!(!ran(&mut ledger, r#"{"a":1}"#, "msg-3", &big("running")));
+        assert!(!ran(&mut ledger, r#"{"a":1}"#, "msg-4", &big("running")));
+        let fifth = dispatch(&mut ledger, r#"{"a":1}"#, "msg-5", &big("completed"));
         assert_eq!(
-            fifth, "completed",
+            fifth,
+            big("completed"),
             "the bound must fire and hand the model the new value"
         );
     }
@@ -512,11 +622,21 @@ mod tests {
         // next call cannot be suppressed however long the key was repeating.
         let mut ledger = RepeatLedger::new();
         for i in 1..=4 {
-            dispatch(&mut ledger, r#"{"a":1}"#, &format!("msg-{i}"), "same");
+            dispatch(&mut ledger, r#"{"a":1}"#, &format!("msg-{i}"), &big("same"));
         }
-        assert!(ran(&mut ledger, r#"{"a":1}"#, "msg-5", "changed"));
-        assert!(ran(&mut ledger, r#"{"a":1}"#, "msg-6", "changed again"));
-        assert!(ran(&mut ledger, r#"{"a":1}"#, "msg-7", "changed once more"));
+        assert!(ran(&mut ledger, r#"{"a":1}"#, "msg-5", &big("changed")));
+        assert!(ran(
+            &mut ledger,
+            r#"{"a":1}"#,
+            "msg-6",
+            &big("changed again")
+        ));
+        assert!(ran(
+            &mut ledger,
+            r#"{"a":1}"#,
+            "msg-7",
+            &big("changed once more")
+        ));
     }
 
     #[test]
@@ -529,8 +649,9 @@ mod tests {
                 RepeatVerdict::Execute,
                 "call {i} must run"
             );
-            let digest = ResultDigest::of("same");
-            ledger.record(&k, &format!("msg-{i}"), digest);
+            let output = big("same");
+            let digest = ResultDigest::of(&output);
+            ledger.record(&k, &format!("msg-{i}"), digest, output.len());
         }
     }
 
@@ -539,9 +660,10 @@ mod tests {
         // Exemption gives up the execution saving, not the context saving.
         let mut ledger = RepeatLedger::new();
         let k = key(r#"{"a":1}"#);
-        let digest = ResultDigest::of("same");
+        let output = big("same");
+        let digest = ResultDigest::of(&output);
         ledger.observe_dispatch(&k, false);
-        ledger.record(&k, "msg-1", digest);
+        ledger.record(&k, "msg-1", digest, output.len());
         ledger.observe_dispatch(&k, false);
         assert_eq!(
             ledger.disposition(&k, digest),
@@ -555,9 +677,9 @@ mod tests {
     fn one_key_does_not_answer_for_another() {
         let mut ledger = RepeatLedger::new();
         for i in 1..=4 {
-            dispatch(&mut ledger, r#"{"a":1}"#, &format!("msg-{i}"), "same");
+            dispatch(&mut ledger, r#"{"a":1}"#, &format!("msg-{i}"), &big("same"));
         }
-        assert!(ran(&mut ledger, r#"{"a":2}"#, "msg-9", "same"));
+        assert!(ran(&mut ledger, r#"{"a":2}"#, "msg-9", &big("same")));
     }
 
     #[test]
@@ -566,9 +688,9 @@ mod tests {
         // only runs would tell the fourth identical call it was the second.
         let mut ledger = RepeatLedger::new();
         for i in 1..=3 {
-            dispatch(&mut ledger, r#"{"a":1}"#, &format!("msg-{i}"), "same");
+            dispatch(&mut ledger, r#"{"a":1}"#, &format!("msg-{i}"), &big("same"));
         }
-        let fourth = dispatch(&mut ledger, r#"{"a":1}"#, "msg-4", "same");
+        let fourth = dispatch(&mut ledger, r#"{"a":1}"#, "msg-4", &big("same"));
         assert!(fourth.contains("4 times"), "{fourth}");
     }
 
@@ -588,6 +710,25 @@ mod tests {
     fn only_the_suppressed_notice_says_the_tool_did_not_run() {
         assert!(suppressed_notice("msg-1", 3).contains("did not run"));
         assert!(!same_bytes_notice("msg-1").contains("did not run"));
+    }
+
+    #[test]
+    fn a_suppressed_result_warns_that_it_may_be_out_of_date() {
+        // "The tool did not run" alone leaves the model to infer the
+        // consequence. This is the one result it holds that may be wrong, so
+        // the warning is part of the contract and not decoration.
+        let skipped = suppressed_notice("msg-1", 3);
+        assert!(skipped.contains("out of date"), "{skipped}");
+        assert!(skipped.contains("not a fresh answer"), "{skipped}");
+    }
+
+    #[test]
+    fn a_pointer_from_a_run_says_the_call_ran_and_the_bytes_are_current() {
+        // The other half of the same contract: not saying "did not run" is not
+        // the same as saying it did.
+        let same = same_bytes_notice("msg-1");
+        assert!(same.contains("this call ran"), "{same}");
+        assert!(same.contains("current"), "{same}");
     }
 
     #[test]
