@@ -3257,7 +3257,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 pinned: surfaces.pinned.as_deref(),
                 recall: recall_surface,
                 tool_rounds_since_anchor,
-                tool_round_budget: u32::try_from(MAX_TOOL_ROUNDS).unwrap_or(u32::MAX),
+                tool_round_budget: Some(u32::try_from(MAX_TOOL_ROUNDS).unwrap_or(u32::MAX)),
             };
             // Assembly is a pure function of its inputs, and this round may run
             // it twice, so it takes the conversation as an argument rather than
@@ -4186,19 +4186,18 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 // the message the first result is stored under, which
                 // `builtin_transcript_get` reads back (#1226).
                 let repeat_key = crate::tool_repeat::RepeatKey::new(call_name, &arguments);
-                let repeat_verdict = repeats.verdict(&repeat_key);
+                let repeat_verdict = repeats.observe_dispatch(&repeat_key);
                 if let crate::tool_repeat::RepeatVerdict::Suppress {
                     first_message_id,
-                    executions,
+                    attempts,
                 } = &repeat_verdict
                 {
                     tracing::info!(
                         tool = %Safe::name(&tool_call.name),
-                        executions,
+                        attempts,
                         "a repeated tool call was answered from the transcript instead of run"
                     );
-                    let answer =
-                        crate::tool_repeat::suppressed_notice(first_message_id, *executions);
+                    let answer = crate::tool_repeat::suppressed_notice(first_message_id, *attempts);
                     // Both halves of the pair, like the named-only branch
                     // above: the feed never strands a started-but-never-
                     // finished row (#252). Not a failure - nothing went wrong,
@@ -4713,7 +4712,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 // text, so folding it in would make the second result differ
                 // from the first by construction and no third call could ever
                 // be answered from the transcript.
-                repeats.record(repeat_key, &result.id, &stored);
+                repeats.record(&repeat_key, &result.id, &stored);
                 conv.messages.push(result);
             }
 
@@ -4804,7 +4803,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                     // No budget line: the round count here is a sentinel that
                     // forces the anchor to re-surface, and the wind-down is not
                     // deciding whether to spend another round (#1301).
-                    tool_round_budget: 0,
+                    tool_round_budget: None,
                 },
                 &projection,
                 target_window,

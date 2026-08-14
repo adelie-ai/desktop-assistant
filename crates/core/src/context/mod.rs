@@ -270,15 +270,15 @@ pub(crate) struct TurnAnchors<'a> {
     /// a fuller block covers on this particular turn.
     pub working_state: crate::planning::WorkingState,
     pub tool_rounds_since_anchor: u32,
-    /// How many tool rounds the turn may spend in total (#1301), or 0 when the
-    /// caller does not bound them.
+    /// How many tool rounds the turn may spend in total (#1301), or `None` when
+    /// the caller does not bound them.
     ///
     /// Carried beside the round count because the count alone says nothing: a
     /// model cannot ration what it cannot measure against. Surfaced by the
     /// `[Current task]` block, which already re-renders on a long agentic loop,
     /// so a long turn learns where it stands without a second periodic
     /// mechanism.
-    pub tool_round_budget: u32,
+    pub tool_round_budget: Option<u32>,
 }
 
 /// The per-turn "ambient" context: the standing personality, the ambient
@@ -1223,15 +1223,15 @@ fn surfaced_blocks(
             // the remainder deliberately. It is the same "you are deep in a
             // loop" moment the anchor answers, so it costs no extra block and
             // no second counter.
-            let budget = if anchors.tool_round_budget == 0 {
-                String::new()
-            } else {
-                format!(
-                    "\nYou have used {} of {} tool rounds in this turn. Answer from what you \
-                     have already collected where you can.",
-                    anchors.tool_rounds_since_anchor, anchors.tool_round_budget
-                )
-            };
+            let budget = anchors
+                .tool_round_budget
+                .map_or_else(String::new, |budget| {
+                    format!(
+                        "\nYou have used {} of {budget} tool rounds in this turn. Answer from what \
+                     you have already collected where you can.",
+                        anchors.tool_rounds_since_anchor
+                    )
+                });
             blocks.push(SurfacedBlock::new(
                 PromptPart::CurrentTask,
                 format!("[Current task] {task}{budget}"),
@@ -4578,7 +4578,7 @@ mod tests {
                 recall: Some(surface),
                 working_state: crate::planning::WorkingState::default(),
                 tool_rounds_since_anchor: 0,
-                tool_round_budget: 0,
+                tool_round_budget: None,
             },
             &ContextProjection::default(),
             MAX_CONTEXT_MESSAGES,
@@ -5325,7 +5325,7 @@ mod tests {
                 pinned: None,
                 recall: None,
                 tool_rounds_since_anchor: ACTIVE_TASK_ROUND_THRESHOLD + 1,
-                tool_round_budget: 0,
+                tool_round_budget: None,
             },
             None,
             &default_estimate,

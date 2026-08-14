@@ -33,17 +33,33 @@
 //! This rule distinguishes the two cases from evidence the tool supplies
 //! itself, so it needs no tool taxonomy, no annotations and no allowlist:
 //!
-//! - A poll whose value changes is never suppressed. A poll that returns the
-//!   same bytes twice has reported no change, and the third read of no change
-//!   is answered from the transcript.
-//! - Re-reading a file after writing it is never suppressed, because the write
-//!   changed the bytes and the second read differs from the first.
+//! - A poll whose value has already changed once is never suppressed.
+//! - A file re-read after a write is never suppressed, when the write landed
+//!   before the second read: the write changed the bytes, so the two runs
+//!   differ.
 //!
-//! What it does not distinguish is a side effect that leaves no trace in the
-//! output. A call that appends a line and answers `""` every time looks
-//! identical to a call that reads and answers `""` every time, so the third
-//! append is not made. Changing the arguments - which the notice asks for -
-//! is the way through.
+//! ## What the rule does not hold, stated plainly
+//!
+//! The evidence is gathered from the first two runs and never gathered again.
+//! A suppressed call does not execute, so it records nothing, so `all_identical`
+//! can never go back to false. Suppression is therefore terminal for the rest
+//! of the turn, and three cases fall outside the rule:
+//!
+//! - **A value that changes late.** Two runs that answer the same, then a third
+//!   that would answer differently. A subagent poll reads `running` twice
+//!   before the child completes, and a file read twice before the write is the
+//!   same shape. The model is told to read the first result back, and the first
+//!   result is now stale.
+//! - **A failure that is fixed mid-turn.** An error is recorded like any other
+//!   output, so a server that is restarting answers identically twice and the
+//!   third call is answered from the transcript - even after the model has
+//!   repaired the cause.
+//! - **A side effect that leaves no trace in the output.** A call that appends a
+//!   line and answers `""` every time looks exactly like one that reads and
+//!   answers `""` every time, so the third append is not made.
+//!
+//! Changing the arguments is the only way through, and for the first two cases
+//! there are no arguments to change. This is the rule's known cost. See #1301.
 //!
 //! ## Scope
 //!
@@ -69,35 +85,59 @@ use sha2::{Digest, Sha256};
 /// insignificant whitespace. `{"b":2,"a":1}` and `{ "a" : 1, "b" : 2 }` are
 /// therefore one key. An over-strict comparison - the raw argument string -
 /// would silently do nothing, and the feature would look done.
+///
+/// The key holds the digest of that normalized text rather than the text, for
+/// the same reason the ledger digests an output: the bytes are already in the
+/// transcript, and a turn that writes a large document through a tool would
+/// otherwise hold every version of it twice.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct RepeatKey {
     name: String,
-    arguments: String,
+    arguments: [u8; 32],
 }
 
 impl RepeatKey {
     pub(crate) fn new(call_name: &str, arguments: &serde_json::Value) -> Self {
         Self {
             name: call_name.to_string(),
-            arguments: arguments.to_string(),
+            arguments: Sha256::digest(arguments.to_string().as_bytes()).into(),
         }
     }
 }
 
 /// What the ledger holds about one key.
 struct Record {
+    /// How many times the model has made this call this turn, whether it ran or
+    /// was answered from the transcript. This is the number the model is told,
+    /// because the number it must reason from is how often it has asked - not
+    /// how often the daemon obliged.
+    attempts: u32,
     /// How many times this call has actually reached a tool this turn. A
-    /// suppressed call does not count: nothing ran.
+    /// suppressed call does not count: nothing ran. This is what the rule
+    /// reads.
     executions: u32,
     /// The message the first result is stored under, which is what the model
-    /// is told to read back.
-    first_message_id: String,
+    /// is told to read back. `None` until something has run.
+    first_message_id: Option<String>,
     /// Digest of the first execution's output. Compared rather than kept in
     /// full: the bytes are already in the transcript, and a large result would
     /// otherwise be held twice.
-    first_digest: [u8; 32],
+    first_digest: Option<[u8; 32]>,
     /// Whether every execution so far returned the same bytes as the first.
     all_identical: bool,
+}
+
+impl Default for Record {
+    fn default() -> Self {
+        Self {
+            attempts: 0,
+            executions: 0,
+            first_message_id: None,
+            first_digest: None,
+            // Nothing has run, so nothing has differed yet.
+            all_identical: true,
+        }
+    }
 }
 
 /// What the loop should do with a call it is about to dispatch.
@@ -110,7 +150,8 @@ pub(crate) enum RepeatVerdict {
     /// Do not run it. Answer from the transcript.
     Suppress {
         first_message_id: String,
-        executions: u32,
+        /// How many times the model has now made this call, including this one.
+        attempts: u32,
     },
 }
 
@@ -126,20 +167,25 @@ impl RepeatLedger {
         }
     }
 
-    /// What to do with `key`, given what this turn has already run.
-    pub(crate) fn verdict(&self, key: &RepeatKey) -> RepeatVerdict {
-        let Some(record) = self.seen.get(key) else {
+    /// Count one dispatch of `key`, and say what to do with it.
+    ///
+    /// Counting and deciding are one call because the count is part of the
+    /// answer: a suppressed call never reaches [`RepeatLedger::record`], so a
+    /// ledger that only counted executions would tell the tenth identical call
+    /// that it was the second.
+    pub(crate) fn observe_dispatch(&mut self, key: &RepeatKey) -> RepeatVerdict {
+        let record = self.seen.entry(key.clone()).or_default();
+        record.attempts = record.attempts.saturating_add(1);
+        let Some(first_message_id) = record.first_message_id.clone() else {
             return RepeatVerdict::Execute;
         };
         if record.executions <= 1 {
-            return RepeatVerdict::ExecuteAsRepeat {
-                first_message_id: record.first_message_id.clone(),
-            };
+            return RepeatVerdict::ExecuteAsRepeat { first_message_id };
         }
         if record.all_identical {
             RepeatVerdict::Suppress {
-                first_message_id: record.first_message_id.clone(),
-                executions: record.executions,
+                first_message_id,
+                attempts: record.attempts,
             }
         } else {
             RepeatVerdict::Execute
@@ -153,20 +199,17 @@ impl RepeatLedger {
     /// notice a second call carries is the daemon's own text; folding it into
     /// the comparison would make the second result differ from the first by
     /// construction, and no third call could ever be suppressed.
-    pub(crate) fn record(&mut self, key: RepeatKey, message_id: &str, output: &str) {
+    pub(crate) fn record(&mut self, key: &RepeatKey, message_id: &str, output: &str) {
         let digest: [u8; 32] = Sha256::digest(output.as_bytes()).into();
-        self.seen
-            .entry(key)
-            .and_modify(|record| {
-                record.executions = record.executions.saturating_add(1);
-                record.all_identical &= record.first_digest == digest;
-            })
-            .or_insert(Record {
-                executions: 1,
-                first_message_id: message_id.to_string(),
-                first_digest: digest,
-                all_identical: true,
-            });
+        let record = self.seen.entry(key.clone()).or_default();
+        record.executions = record.executions.saturating_add(1);
+        match record.first_digest {
+            None => {
+                record.first_message_id = Some(message_id.to_string());
+                record.first_digest = Some(digest);
+            }
+            Some(first) => record.all_identical &= first == digest,
+        }
     }
 }
 
@@ -189,11 +232,11 @@ pub(crate) fn repeat_notice(first_message_id: &str) -> String {
 ///
 /// Every tool call still needs a `tool_result` for provider pairing, so the
 /// suppressed path pushes this one.
-pub(crate) fn suppressed_notice(first_message_id: &str, executions: u32) -> String {
+pub(crate) fn suppressed_notice(first_message_id: &str, attempts: u32) -> String {
     let tool = crate::ports::transcript::TRANSCRIPT_GET_TOOL;
     format!(
-        "<not run: you already made this exact call {executions} times in this \
-         turn, and every run returned the same output, so it was not run \
+        "<not run: you have now made this exact call {attempts} times in this \
+         turn. Every run of it returned the same output, so it was not run \
          again. The output is stored as message {first_message_id}. Read it \
          with {tool} message_id=\"{first_message_id}\". To get a different \
          answer, change the arguments.>"
@@ -240,18 +283,36 @@ mod tests {
         assert_ne!(a, b);
     }
 
+    /// Drive one call the way the turn loop does: ask, then record what ran.
+    fn dispatch(
+        ledger: &mut RepeatLedger,
+        args: &str,
+        message_id: &str,
+        output: &str,
+    ) -> RepeatVerdict {
+        let k = key(args);
+        let verdict = ledger.observe_dispatch(&k);
+        if !matches!(verdict, RepeatVerdict::Suppress { .. }) {
+            ledger.record(&k, message_id, output);
+        }
+        verdict
+    }
+
     #[test]
     fn the_first_call_of_a_turn_executes_unannounced() {
-        let ledger = RepeatLedger::new();
-        assert_eq!(ledger.verdict(&key(r#"{"a":1}"#)), RepeatVerdict::Execute);
+        let mut ledger = RepeatLedger::new();
+        assert_eq!(
+            dispatch(&mut ledger, r#"{"a":1}"#, "msg-1", "same"),
+            RepeatVerdict::Execute
+        );
     }
 
     #[test]
     fn the_second_call_executes_and_names_the_first_result() {
         let mut ledger = RepeatLedger::new();
-        ledger.record(key(r#"{"a":1}"#), "msg-1", "same");
+        dispatch(&mut ledger, r#"{"a":1}"#, "msg-1", "same");
         assert_eq!(
-            ledger.verdict(&key(r#"{"a":1}"#)),
+            dispatch(&mut ledger, r#"{"a":1}"#, "msg-2", "same"),
             RepeatVerdict::ExecuteAsRepeat {
                 first_message_id: "msg-1".to_string()
             }
@@ -261,37 +322,79 @@ mod tests {
     #[test]
     fn the_third_call_is_suppressed_when_both_runs_returned_the_same_bytes() {
         let mut ledger = RepeatLedger::new();
-        ledger.record(key(r#"{"a":1}"#), "msg-1", "same");
-        ledger.record(key(r#"{"a":1}"#), "msg-2", "same");
+        dispatch(&mut ledger, r#"{"a":1}"#, "msg-1", "same");
+        dispatch(&mut ledger, r#"{"a":1}"#, "msg-2", "same");
         assert_eq!(
-            ledger.verdict(&key(r#"{"a":1}"#)),
+            dispatch(&mut ledger, r#"{"a":1}"#, "msg-3", "same"),
             RepeatVerdict::Suppress {
                 first_message_id: "msg-1".to_string(),
-                executions: 2,
+                attempts: 3,
             }
         );
     }
 
     #[test]
-    fn a_call_whose_output_changed_keeps_executing() {
+    fn a_suppressed_call_still_counts_toward_what_the_model_is_told() {
+        // A suppressed call never reaches `record`, so a ledger that counted
+        // only executions would tell the tenth identical call it was the
+        // second. The number the model reasons from is how often it has asked.
         let mut ledger = RepeatLedger::new();
-        ledger.record(key(r#"{"a":1}"#), "msg-1", "running");
-        ledger.record(key(r#"{"a":1}"#), "msg-2", "done");
-        assert_eq!(ledger.verdict(&key(r#"{"a":1}"#)), RepeatVerdict::Execute);
-        ledger.record(key(r#"{"a":1}"#), "msg-3", "done");
+        for i in 1..=3 {
+            dispatch(&mut ledger, r#"{"a":1}"#, &format!("msg-{i}"), "same");
+        }
         assert_eq!(
-            ledger.verdict(&key(r#"{"a":1}"#)),
+            dispatch(&mut ledger, r#"{"a":1}"#, "msg-4", "same"),
+            RepeatVerdict::Suppress {
+                first_message_id: "msg-1".to_string(),
+                attempts: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn a_call_whose_output_changed_on_its_first_repeat_keeps_executing() {
+        let mut ledger = RepeatLedger::new();
+        dispatch(&mut ledger, r#"{"a":1}"#, "msg-1", "running");
+        dispatch(&mut ledger, r#"{"a":1}"#, "msg-2", "done");
+        assert_eq!(
+            dispatch(&mut ledger, r#"{"a":1}"#, "msg-3", "done"),
+            RepeatVerdict::Execute
+        );
+        assert_eq!(
+            dispatch(&mut ledger, r#"{"a":1}"#, "msg-4", "done"),
             RepeatVerdict::Execute,
             "one changed output makes the tool time-varying for the rest of the turn"
         );
     }
 
     #[test]
+    fn two_matching_runs_freeze_the_key_even_though_the_answer_would_change() {
+        // The rule's known cost, pinned so it cannot change by accident. Two
+        // identical runs suppress every later call, and a suppressed call
+        // records nothing, so no later answer can reopen the key. #1301 holds
+        // the case this loses.
+        let mut ledger = RepeatLedger::new();
+        dispatch(&mut ledger, r#"{"a":1}"#, "msg-1", "running");
+        dispatch(&mut ledger, r#"{"a":1}"#, "msg-2", "running");
+        assert!(matches!(
+            dispatch(&mut ledger, r#"{"a":1}"#, "msg-3", "done"),
+            RepeatVerdict::Suppress { .. }
+        ));
+        assert!(matches!(
+            dispatch(&mut ledger, r#"{"a":1}"#, "msg-4", "done"),
+            RepeatVerdict::Suppress { .. }
+        ));
+    }
+
+    #[test]
     fn one_key_does_not_answer_for_another() {
         let mut ledger = RepeatLedger::new();
-        ledger.record(key(r#"{"a":1}"#), "msg-1", "same");
-        ledger.record(key(r#"{"a":1}"#), "msg-2", "same");
-        assert_eq!(ledger.verdict(&key(r#"{"a":2}"#)), RepeatVerdict::Execute);
+        dispatch(&mut ledger, r#"{"a":1}"#, "msg-1", "same");
+        dispatch(&mut ledger, r#"{"a":1}"#, "msg-2", "same");
+        assert_eq!(
+            dispatch(&mut ledger, r#"{"a":2}"#, "msg-3", "same"),
+            RepeatVerdict::Execute
+        );
     }
 
     #[test]
@@ -302,7 +405,7 @@ mod tests {
             repeat.contains("msg-1") && repeat.contains(tool),
             "{repeat}"
         );
-        let skipped = suppressed_notice("msg-1", 2);
+        let skipped = suppressed_notice("msg-1", 3);
         assert!(
             skipped.contains("msg-1") && skipped.contains(tool),
             "{skipped}"
