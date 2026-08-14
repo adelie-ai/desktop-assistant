@@ -174,27 +174,42 @@ fn cancellation_token_or_default() -> CancellationToken {
 }
 
 /// Maximum number of tool-calling rounds before giving up.
-const MAX_TOOL_ROUNDS: usize = 200;
+///
+/// `pub(crate)` so `tool_repeat`'s backoff ceiling can be measured against the
+/// turn it claims to bound. A ceiling asserted against its own constant passes
+/// for any value whatever, including one that puts the next run past this
+/// number - which is the freeze it exists to prevent.
+pub(crate) const MAX_TOOL_ROUNDS: usize = 200;
 
 /// Whether the repeat ledger may answer this tool's call from the transcript
 /// rather than running it (#1301).
 ///
-/// False for a tool whose RESULT this loop parses for a side effect of its own.
-/// `builtin_tool_search` is the case: the loop reads the tools it found and
-/// activates them for the rounds that follow, so a search answered from the
-/// transcript would return the right text and quietly activate nothing - and
-/// the model would be left calling a tool the next round no longer advertises.
+/// Two names are exempt, for two different reasons.
 ///
-/// Scoped to the result-parsing branches in this file, and to nothing wider. A
-/// tool whose own side effects live inside the tool is not listed here: the
-/// ledger cannot see those, and the backoff - not an exemption list - is what
-/// bounds what they lose. Add a name here only when THIS loop reads its output.
+/// `builtin_tool_search` because this loop parses its RESULT for a side effect
+/// of its own: it reads the tools the search found and activates them for the
+/// rounds that follow, so a search answered from the transcript would return
+/// the right text and quietly activate nothing - leaving the model calling a
+/// tool the next round no longer advertises.
 ///
-/// Exemption gives up the execution saving alone. The bytes of a repeated
-/// search still become a pointer, so the context saving is unaffected, and a
-/// tool search is a local call.
+/// `spawn_subagent` because it creates something. A repeat there is not waste
+/// to be saved but an action not taken, which is wrong in kind rather than in
+/// degree. Its detached form (`wait: false`) returns a fresh child id and can
+/// never repeat its own bytes, but `wait` DEFAULTS TO TRUE and the blocking
+/// form returns the child's answer verbatim - no id, no nonce - so two spawns
+/// of one prompt that agree make the key suppressible and the third would
+/// create no child at all.
+///
+/// Nothing wider. A tool whose side effects live inside the tool and whose
+/// output does not identify the call it came from cannot be recognised from
+/// here; the backoff, not an exemption list, is what bounds what those lose.
+/// Add a name only when this loop reads its output, or when the call itself
+/// makes something.
+///
+/// Exemption gives up the execution saving alone. A repeated result still
+/// becomes a pointer, so the context saving is unaffected.
 fn may_suppress(call_name: &str) -> bool {
-    call_name != TOOL_SEARCH_TOOL
+    call_name != TOOL_SEARCH_TOOL && call_name != SPAWN_SUBAGENT_TOOL
 }
 
 /// The name of the loop's own tool-search built-in, whose result the loop reads
@@ -4508,6 +4523,12 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 // INSIDE the tool's own JSON is that tool's private shape, and
                 // guessing at it here would misread every server that spells it
                 // differently.
+                //
+                // `tool_ok` is defensive and no test can reach it false here:
+                // both failure arms above build `Error: {e}`, which is never
+                // blank. It stays because the marker's whole job is to say the
+                // call SUCCEEDED, so the day a failure arm learns to return
+                // nothing this must not call it a success.
                 let stored = if tool_ok && stored.trim().is_empty() {
                     crate::context::EMPTY_TOOL_RESULT_NOTICE.to_string()
                 } else {
@@ -4728,25 +4749,21 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 // nothing here is stale - the model is pointed at the message
                 // carrying exactly these bytes, and told so in those words.
                 //
-                // Only where the pointer is smaller than what it stands in for.
-                // A short result replaced by a 300-byte address makes the
-                // context bigger, which is the one thing a rule that exists to
-                // stop the context refilling may not do; `planning`'s eviction
-                // refuses a pointer on the same test, and says so where it does.
+                // Only where the bytes dwarf the address that replaces them.
+                // The ledger holds that line - `disposition` takes the size and
+                // stands aside below its floor - because "is the pointer
+                // shorter" alone starts pointing at 308 bytes, where the saving
+                // is 93 and one read-back round costs several times that.
+                // `planning`'s eviction refuses a pointer on the same grounds.
                 //
                 // Judged on the TOOL's own output, never on the message
                 // content: a pointer is shorter than the bytes it names, so
                 // digesting that instead would make every repeat read as a
                 // change.
                 let digest = crate::tool_repeat::ResultDigest::of(&stored);
-                let content = match repeats.disposition(&repeat_key, digest) {
+                let content = match repeats.disposition(&repeat_key, digest, stored.len()) {
                     crate::tool_repeat::ResultDisposition::SameAs { message_id } => {
-                        let pointer = crate::tool_repeat::same_bytes_notice(&message_id);
-                        if pointer.len() < stored.len() {
-                            pointer
-                        } else {
-                            stored.clone()
-                        }
+                        crate::tool_repeat::same_bytes_notice(&message_id)
                     }
                     crate::tool_repeat::ResultDisposition::Store => stored.clone(),
                 };
@@ -5921,7 +5938,7 @@ mod tests {
             serde_json::json!({}),
         )];
         let calls: Vec<ToolCall> = (0..10)
-            .map(|i| ToolCall::new(format!("c{i}"), "notes_search", format!(r#"{{"q":"{i}"}}"#)))
+            .map(|i| ToolCall::new(format!("c{i}"), "notes_search", "{}"))
             .collect();
         let responses = vec![
             LlmResponse::with_tool_calls("", calls),
@@ -10961,11 +10978,7 @@ mod tests {
             .map(|i| {
                 LlmResponse::with_tool_calls(
                     "",
-                    vec![ToolCall::new(
-                        format!("t{i}"),
-                        "notes_search",
-                        format!(r#"{{"q":"{i}"}}"#),
-                    )],
+                    vec![ToolCall::new(format!("t{i}"), "notes_search", "{}")],
                 )
             })
             .collect();
@@ -11021,11 +11034,7 @@ mod tests {
             ));
             responses.push(LlmResponse::with_tool_calls(
                 "",
-                vec![ToolCall::new(
-                    format!("t{i}"),
-                    "notes_search",
-                    format!(r#"{{"q":"{i}"}}"#),
-                )],
+                vec![ToolCall::new(format!("t{i}"), "notes_search", "{}")],
             ));
         }
         responses.push(LlmResponse::text("All set"));
@@ -11164,7 +11173,7 @@ mod tests {
                     vec![ToolCall::new(
                         format!("t{i}"),
                         "vault_fetch",
-                        format!(r#"{{"api_key":"{SECRET}","n":{i}}}"#),
+                        format!(r#"{{"api_key":"{SECRET}"}}"#),
                     )],
                 )
             })
@@ -11241,11 +11250,7 @@ mod tests {
         for i in 0..6 {
             responses.push(LlmResponse::with_tool_calls(
                 "",
-                vec![ToolCall::new(
-                    format!("t{i}"),
-                    "notes_search",
-                    format!(r#"{{"q":"{i}"}}"#),
-                )],
+                vec![ToolCall::new(format!("t{i}"), "notes_search", "{}")],
             ));
         }
         responses.push(LlmResponse::text("All set"));
@@ -13207,11 +13212,7 @@ mod tests {
             .map(|i| {
                 LlmResponse::with_tool_calls(
                     "",
-                    vec![ToolCall::new(
-                        format!("c{i}"),
-                        "loop_tool",
-                        format!(r#"{{"q":"{i}"}}"#),
-                    )],
+                    vec![ToolCall::new(format!("c{i}"), "loop_tool", "{}")],
                 )
             })
             .collect();
@@ -14438,11 +14439,7 @@ mod tests {
             }
             Ok(LlmResponse::with_tool_calls(
                 "",
-                vec![ToolCall::new(
-                    format!("r{left}"),
-                    CLEAN_TOOL,
-                    format!(r#"{{"q":"{left}"}}"#),
-                )],
+                vec![ToolCall::new(format!("r{left}"), CLEAN_TOOL, "{}")],
             ))
         }
     }
@@ -16706,11 +16703,7 @@ mod tests {
             .map(|i| {
                 LlmResponse::with_tool_calls(
                     "",
-                    vec![ToolCall::new(
-                        format!("c{i}"),
-                        "loop_tool",
-                        format!(r#"{{"q":"{i}"}}"#),
-                    )],
+                    vec![ToolCall::new(format!("c{i}"), "loop_tool", "{}")],
                 )
             })
             .collect();
@@ -19350,6 +19343,62 @@ mod tests {
     // --- #1301: bounded backoff, and a pointer instead of repeated bytes ----
 
     #[tokio::test]
+    async fn a_turn_of_identical_suppressed_calls_still_winds_down_and_persists() {
+        // The round cap is exercised elsewhere by 201 DISTINCT calls, which is
+        // the easy shape: every round dispatches. This is the shape the repeat
+        // rule creates - one identical call over the whole budget, most of its
+        // rounds answered from the transcript and never reaching a tool - and
+        // nothing covered it. A turn that spends its rounds this way must still
+        // reach the wind-down and keep everything it did.
+        let args = r#"{"q":"the page"}"#;
+        // Exactly the budget in tool rounds, so the cap fires; the response
+        // after them is the one the wind-down call reads.
+        let calls_in: Vec<&str> = std::iter::repeat_n(args, MAX_TOOL_ROUNDS).collect();
+        let mut responses = probe_rounds(&calls_in);
+        responses.pop();
+        responses.push(LlmResponse::text("I hit the tool-call limit."));
+        let (handler, calls) = repeat_handler(
+            responses,
+            std::iter::repeat_n(Ok(big_result("the page")), MAX_TOOL_ROUNDS).collect(),
+        );
+        let conv = handler
+            .create_conversation("Chat".into(), vec![])
+            .await
+            .unwrap();
+
+        let closing = handler
+            .send_prompt(&conv.id, "read it".into(), noop_callback(), noop_status())
+            .await
+            .expect("a suppressed turn winds down to Ok, not Err");
+        assert!(
+            closing.starts_with("I hit the tool-call limit"),
+            "the wind-down closing is returned, got: {closing}"
+        );
+        // Most rounds were answered from the transcript, and the tool still ran
+        // often enough that the key never froze.
+        let ran = calls.lock().unwrap().len();
+        assert!(
+            ran > 10 && ran < MAX_TOOL_ROUNDS / 4,
+            "the rule must save most of the executions and none of the rounds; \
+             the tool ran {ran} times in {} rounds",
+            MAX_TOOL_ROUNDS
+        );
+        let persisted = handler.get_conversation(&conv.id).await.unwrap();
+        assert!(
+            persisted.messages.iter().any(|m| m.content == "read it"),
+            "the user's prompt must survive a turn spent on suppressed calls"
+        );
+        assert_eq!(
+            persisted
+                .messages
+                .last()
+                .expect("non-empty history")
+                .content,
+            closing
+        );
+    }
+
+    #[tokio::test]
     async fn a_key_at_its_suppression_threshold_runs_again_and_the_threshold_doubles() {
         // Suppression must never be terminal. Two identical runs make the key
         // suppressible; from there the tool runs again every time the
@@ -19674,6 +19723,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn spawn_subagent_is_never_suppressed() {
+        // A repeat here is not waste to be saved but a child not created. The
+        // detached form returns a fresh id and can never repeat its own bytes,
+        // but `wait` defaults to TRUE and the blocking form returns the child's
+        // answer verbatim - no id, no nonce - so two spawns of one prompt that
+        // agree would make the key suppressible and the third would create
+        // nothing.
+        let tools = vec![tool_def(SPAWN_SUBAGENT_TOOL)];
+        let answer = big_result("the child's answer: ");
+        let executor = ScriptedToolExecutor::new(
+            tools,
+            vec![
+                Ok(answer.clone()),
+                Ok(answer.clone()),
+                Ok(answer.clone()),
+                Ok(answer.clone()),
+            ],
+        );
+        let spawns = executor.calls();
+        let counter = Arc::new(AtomicU32::new(0));
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            ToolCallingLlm::new(vec![
+                calls("s1", SPAWN_SUBAGENT_TOOL),
+                calls("s2", SPAWN_SUBAGENT_TOOL),
+                calls("s3", SPAWN_SUBAGENT_TOOL),
+                calls("s4", SPAWN_SUBAGENT_TOOL),
+                LlmResponse::text("all away"),
+            ]),
+            executor,
+            Box::new(move || {
+                let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                format!("conv-spawn-rep-{n}")
+            }),
+        );
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(
+                &conv.id,
+                "research it".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await
+            .expect("turn completes");
+
+        assert_eq!(
+            spawns.lock().unwrap().len(),
+            4,
+            "every spawn must reach the tool - a suppressed one creates no child"
+        );
+    }
+
+    #[tokio::test]
     async fn the_same_provider_tool_on_two_hosts_is_two_keys() {
         // Reading a path on the daemon says nothing about the same path on the
         // user's own machine. Merging them can serve one host's bytes as the
@@ -19704,12 +19810,16 @@ mod tests {
             ),
             LlmResponse::text("done"),
         ];
+        // A file worth re-reading. Below the rule's size floor the daemon's key
+        // never becomes suppressible, and this test would pass with the
+        // connection stripped from the key - the wrong-answer case it exists to
+        // catch.
         let daemon_ran = Arc::new(Mutex::new(Vec::new()));
         let (handler, _advertised) = two_sided_handler(
             responses,
             vec![daemon_read_file()],
             vec![],
-            HashMap::from([("read_file".to_string(), "daemon result".to_string())]),
+            HashMap::from([("read_file".to_string(), big_result("daemon result"))]),
             Arc::clone(&daemon_ran),
         );
         let conv = handler
@@ -19742,9 +19852,12 @@ mod tests {
         // a consequence, not a second enforcer: activations from the first two
         // searches persist whether or not the third runs, so it would pass
         // without the exemption.
+        // A description long enough that the search result clears the rule's
+        // size floor, as a real fleet search does. Below it the key never
+        // becomes suppressible and this test passes with the exemption deleted.
         let fleet = vec![ToolDefinition::new(
             "fleet_tool_00",
-            "a fleet tool",
+            big_result("a fleet tool that "),
             serde_json::json!({"type": "object"}),
         )];
         let hits: Vec<serde_json::Value> = fleet

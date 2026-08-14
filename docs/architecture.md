@@ -107,12 +107,44 @@ their own section below.
    the situation this prompt arrived in
 4. Core requests LLM streaming completion
 5. If tool calls are requested, core checks each one against the caller's tool
-   allowlist, the turn's provenance gate, and what this user has been burned by
-   before - see [negative memory](features/negative-memory.md) - then executes
-   the permitted ones through the MCP executor
+   allowlist, the turn's provenance gate, what this user has been burned by
+   before - see [negative memory](features/negative-memory.md) - and whether
+   this turn has already made the same call, which can answer it from the
+   transcript instead of running it - see
+   [repeated tool calls](features/repeated-tool-calls.md). It then executes the
+   permitted ones through the MCP executor
 6. The dispatcher streams chunk / complete / error events back over the same
    connection; for a D-Bus caller the bridge re-emits them as D-Bus signals
 7. Client renders updates incrementally
+
+### Repeated tool calls
+
+A turn that calls one tool with one set of arguments over and over used to run
+it every time and append the same bytes every time. With context eviction that
+is a loop with an engine: a large result forces an eviction, the evicted result
+is the one the model still needs, so it fetches it again. `core::tool_repeat`
+keeps a per-turn ledger keyed on the provider name UNDER its connection plus the
+normalized arguments, and answers that in two parts.
+
+A run that returns exactly what its key returned on the previous run appends a
+pointer to the message already holding those bytes, rather than a second copy.
+The tool ran, so nothing there is stale.
+
+On top of that, two matching runs make a key suppressible, and some later calls
+of it are answered from the transcript without running the tool at all. That one
+can be stale, so it is bounded: a suppression counter, a threshold that starts
+at two and doubles up to a ceiling, and an outright reset whenever a run returns
+something different. A key called on every round of a full turn is re-checked at
+least ten times, so nothing freezes.
+
+Neither part applies below 512 bytes, where the pointer would cost more context
+than the bytes it stands in for, and where a stale answer costs most - a poll's
+status line is a few dozen bytes. `builtin_tool_search` and `spawn_subagent` are
+never suppressed: the loop parses the first one's result to activate what it
+found, and the second one creates something, so a repeat there is an action not
+taken rather than waste avoided.
+
+See [repeated tool calls](features/repeated-tool-calls.md).
 
 ### Tool-provenance gating
 

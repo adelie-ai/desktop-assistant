@@ -58,10 +58,13 @@
 //! ## What the rule still does not hold
 //!
 //! A side effect that leaves no trace in the output. A call that appends a line
-//! and answers `""` looks exactly like one that reads and answers `""`, so some
-//! of its runs are answered from the transcript and the appends do not happen.
-//! Changing the arguments is the way through, and the backoff bounds how many
-//! are lost.
+//! and answers `""` looks exactly like one that reads and answers `""`. The
+//! floor covers the worst of this by accident and then on purpose: an empty
+//! success renders to a 49-byte marker, far under
+//! [`MIN_SUPPRESSIBLE_BYTES`], so a side effect that says nothing is never
+//! suppressible at all. What remains is a call that changes something AND
+//! returns half a kilobyte of unchanging text, where the text is itself
+//! evidence that nothing observable moved. The backoff bounds that too.
 //!
 //! An error is recorded like any other output, so a server that answers
 //! identically twice while it restarts is suppressed for a bounded run of calls
@@ -93,9 +96,15 @@ const INITIAL_THRESHOLD: u32 = 2;
 /// in the limit, and a turn is not the limit: unbounded, the runs land on calls
 /// 1, 2, 5, 10, 19, 36, 69, 134, 263, so a key asked for 134 times is not
 /// re-checked before `MAX_TOOL_ROUNDS` ends the turn. A child that finished at
-/// round 80 would go unnoticed to the end. Capped, a key is re-checked at least
-/// every sixteen calls for as long as the turn lasts, and the first several
-/// fires are unchanged - 21 identical calls still run the tool five times.
+/// round 80 would go unnoticed to the end. Capped, a key called on every round
+/// of a full turn is re-checked at least ten times - no stretch exceeding a
+/// tenth of the round budget, the tail after the last run included - and the
+/// first several fires are unchanged: 21 identical calls still run the tool
+/// five times.
+///
+/// Nineteen is the largest value that still holds it, and the test that states
+/// it goes red above that - so this is a choice with margin rather than the
+/// edge of one.
 const MAX_THRESHOLD: u32 = 16;
 
 /// The smallest result this rule will answer from the transcript.
@@ -315,7 +324,23 @@ impl RepeatLedger {
     ///
     /// Asked before the result message is built, because the answer decides
     /// what that message carries.
-    pub(crate) fn disposition(&self, key: &RepeatKey, digest: ResultDigest) -> ResultDisposition {
+    ///
+    /// Held to the same floor as suppression, and not merely to "is the pointer
+    /// shorter". A pointer is 307 bytes, so a size comparison alone starts
+    /// pointing at 308: a 400-byte result becomes a 307-byte address, saving 93
+    /// bytes, and if the model spends a round on
+    /// [`crate::ports::transcript::TRANSCRIPT_GET_TOOL`] to get it back the turn
+    /// pays an LLM call and some 460 bytes to save those 93. The trade is only
+    /// worth making where the bytes dwarf the address.
+    pub(crate) fn disposition(
+        &self,
+        key: &RepeatKey,
+        digest: ResultDigest,
+        output_bytes: usize,
+    ) -> ResultDisposition {
+        if output_bytes < MIN_SUPPRESSIBLE_BYTES {
+            return ResultDisposition::Store;
+        }
         match self.seen.get(key).and_then(|record| record.held.as_ref()) {
             Some(held) if held.digest == digest => ResultDisposition::SameAs {
                 message_id: held.message_id.clone(),
@@ -434,16 +459,9 @@ mod tests {
             } => suppressed_notice(&message_id, attempts),
             RepeatVerdict::Execute => {
                 let digest = ResultDigest::of(output);
-                let pointer_wins = matches!(
-                    ledger.disposition(&k, digest),
-                    ResultDisposition::SameAs { ref message_id }
-                        if same_bytes_notice(message_id).len() < output.len()
-                );
-                let content = match ledger.disposition(&k, digest) {
-                    ResultDisposition::SameAs { message_id } if pointer_wins => {
-                        same_bytes_notice(&message_id)
-                    }
-                    _ => output.to_string(),
+                let content = match ledger.disposition(&k, digest, output.len()) {
+                    ResultDisposition::SameAs { message_id } => same_bytes_notice(&message_id),
+                    ResultDisposition::Store => output.to_string(),
                 };
                 ledger.record(&k, message_id, digest, output.len());
                 content
@@ -559,26 +577,50 @@ mod tests {
     }
 
     #[test]
-    fn the_threshold_stops_doubling_so_a_key_stays_re_checked_within_one_turn() {
-        // Unbounded doubling puts the ninth run at call 263, past
-        // `MAX_TOOL_ROUNDS`, so a key asked for often enough would not be
-        // re-checked again inside the turn - frozen in every sense that
-        // matters. The cap is what makes "no key can freeze" true in a turn
-        // rather than in the limit.
+    fn a_result_between_the_pointer_length_and_the_floor_is_still_stored() {
+        // The band a "is the pointer shorter" test would have taken: 400 bytes
+        // replaced by a 307-byte address saves 93 and risks a whole round to
+        // read them back.
         let mut ledger = RepeatLedger::new();
-        let ran_on: Vec<usize> = (1..=400)
+        let middling = "x".repeat(400);
+        assert!(middling.len() > same_bytes_notice("msg-1").len());
+        assert!(middling.len() < MIN_SUPPRESSIBLE_BYTES);
+        dispatch(&mut ledger, r#"{"a":1}"#, "msg-1", &middling);
+        assert_eq!(
+            dispatch(&mut ledger, r#"{"a":1}"#, "msg-2", &middling),
+            middling
+        );
+    }
+
+    #[test]
+    fn a_key_called_every_round_of_a_turn_is_re_checked_at_least_ten_times() {
+        // The ceiling's claim is about a TURN, so measure it against the turn.
+        //
+        // Two traps here, and the second is why the obvious test is useless.
+        // Asserting the gap against `MAX_THRESHOLD` is circular - it passes for
+        // any ceiling, including one that never fires. And measuring only the
+        // gaps BETWEEN runs misses the tail: with the ceiling raised to a
+        // million the runs land on calls 1, 2, 5, 10, 19, 36, 69, 134 and the
+        // ninth would be call 263, so the widest gap between runs is 65 while
+        // the last 66 calls of the turn get no check at all. The turn ending is
+        // the widest gap of all, and it is the one that matters.
+        let mut ledger = RepeatLedger::new();
+        let ran_on: Vec<usize> = (1..=crate::service::MAX_TOOL_ROUNDS)
             .filter(|i| ran(&mut ledger, r#"{"a":1}"#, &format!("msg-{i}"), &big("same")))
             .collect();
+        let last = *ran_on.last().expect("the tool ran at least once");
         let widest = ran_on
             .windows(2)
             .map(|w| w[1] - w[0])
+            .chain(std::iter::once(crate::service::MAX_TOOL_ROUNDS - last))
             .max()
-            .expect("the tool ran more than once");
+            .expect("at least one gap");
         assert!(
-            widest <= MAX_THRESHOLD as usize + 1,
-            "a key must be re-checked at least every {} calls; the widest gap \
-             was {widest} (ran on {ran_on:?})",
-            MAX_THRESHOLD + 1
+            widest * 10 <= crate::service::MAX_TOOL_ROUNDS,
+            "a key called every round must be re-checked at least ten times in \
+             a {}-round turn, so no stretch may exceed a tenth of it; the \
+             widest was {widest} (ran on {ran_on:?})",
+            crate::service::MAX_TOOL_ROUNDS
         );
     }
 
@@ -614,6 +656,21 @@ mod tests {
             big("completed"),
             "the bound must fire and hand the model the new value"
         );
+    }
+
+    #[test]
+    fn a_pointer_names_the_message_that_actually_holds_those_bytes() {
+        // A, then B, then B again. The pointer the third run gets must name the
+        // message carrying B - not the one carrying A, which `held` named until
+        // the change. Getting this wrong tells the model bytes are "stored as
+        // message A, and they are current" when message A holds something else,
+        // which is the one thing this feature must never do.
+        let mut ledger = RepeatLedger::new();
+        dispatch(&mut ledger, r#"{"a":1}"#, "msg-a", &big("A"));
+        dispatch(&mut ledger, r#"{"a":1}"#, "msg-b", &big("B"));
+        let third = dispatch(&mut ledger, r#"{"a":1}"#, "msg-c", &big("B"));
+        assert!(third.contains("msg-b"), "{third}");
+        assert!(!third.contains("msg-a"), "{third}");
     }
 
     #[test]
@@ -666,7 +723,7 @@ mod tests {
         ledger.record(&k, "msg-1", digest, output.len());
         ledger.observe_dispatch(&k, false);
         assert_eq!(
-            ledger.disposition(&k, digest),
+            ledger.disposition(&k, digest, output.len()),
             ResultDisposition::SameAs {
                 message_id: "msg-1".to_string()
             }
