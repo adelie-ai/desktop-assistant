@@ -3614,28 +3614,33 @@ mod tests {
         assert!(!notice.contains("prompt was"));
     }
 
-    // --- Tool-result ingestion cap (issue #174) ---
+    // --- Tool-result caps (issues #174 and #1302) ---
+
+    /// The id a capped result names in its notice. Any stable string does; the
+    /// notice only has to hand it back.
+    const CAP_MESSAGE_ID: &str = "m-cap";
 
     #[test]
     fn cap_tool_result_returns_none_when_under_cap() {
-        assert_eq!(cap_tool_result("small output", 1024), None);
+        assert_eq!(cap_tool_result("small output", CAP_MESSAGE_ID, 1024), None);
     }
 
     #[test]
     fn cap_tool_result_empty_is_unchanged() {
-        assert_eq!(cap_tool_result("", 1024), None);
+        assert_eq!(cap_tool_result("", CAP_MESSAGE_ID, 1024), None);
     }
 
     #[test]
     fn cap_tool_result_exactly_at_cap_is_unchanged() {
         let content = "x".repeat(1024);
-        assert_eq!(cap_tool_result(&content, 1024), None);
+        assert_eq!(cap_tool_result(&content, CAP_MESSAGE_ID, 1024), None);
     }
 
     #[test]
     fn cap_tool_result_truncates_when_over_cap_with_notice() {
         let content = "x".repeat(10_000);
-        let out = cap_tool_result(&content, 1024).expect("over-cap result must truncate");
+        let out =
+            cap_tool_result(&content, CAP_MESSAGE_ID, 1024).expect("over-cap result must truncate");
         assert!(
             out.len() <= 1024,
             "truncated result {} > cap 1024",
@@ -3654,7 +3659,8 @@ mod tests {
     fn cap_tool_result_stays_within_byte_cap_across_sizes() {
         for cap in [512usize, 1024, 4096, 50_000] {
             let content = "y".repeat(cap * 4);
-            let out = cap_tool_result(&content, cap).expect("over-cap must truncate");
+            let out =
+                cap_tool_result(&content, CAP_MESSAGE_ID, cap).expect("over-cap must truncate");
             assert!(
                 out.len() <= cap,
                 "cap {cap}: result {} exceeds cap",
@@ -3669,11 +3675,119 @@ mod tests {
         // would land mid-codepoint and panic; the cap must snap to a
         // boundary and always yield valid UTF-8.
         let content = "🚀".repeat(2_000); // 8_000 bytes
-        let out = cap_tool_result(&content, 1024).expect("over-cap must truncate");
+        let out = cap_tool_result(&content, CAP_MESSAGE_ID, 1024).expect("over-cap must truncate");
         assert!(out.len() <= 1024);
         // Valid UTF-8 by construction (String), and the kept prefix is whole rockets.
         assert!(out.starts_with('🚀'));
         assert!(out.contains("truncated"));
+    }
+
+    /// #1302: the context notice must give every tool a next step, including
+    /// the ones with no narrowing parameter. The reader and the message id are
+    /// that step, and "ask for less" is the secondary offer behind them.
+    #[test]
+    fn tool_result_truncation_notice_names_the_reader_and_the_message() {
+        let notice = tool_result_truncation_notice("m-77", 12_345);
+        assert!(notice.contains(crate::ports::transcript::TRANSCRIPT_GET_TOOL));
+        assert!(notice.contains("message_id=\"m-77\""));
+        assert!(
+            notice.contains("12345 bytes"),
+            "the notice must state the original size: {notice}"
+        );
+        let reader_at = notice
+            .find(crate::ports::transcript::TRANSCRIPT_GET_TOOL)
+            .expect("the reader is named");
+        let narrower_at = notice.find("narrow").expect("asking for less is offered");
+        assert!(
+            reader_at < narrower_at,
+            "the reader is the primary offer and must come first: {notice}"
+        );
+    }
+
+    /// #1302: above the storage cap the bytes really are gone, so the notice
+    /// must not point at a reader that cannot produce them.
+    #[test]
+    fn tool_result_storage_notice_offers_no_reader() {
+        let notice = tool_result_storage_notice(9_000_000, 1_000_000);
+        assert!(
+            !notice.contains(crate::ports::transcript::TRANSCRIPT_GET_TOOL),
+            "nothing holds the dropped bytes, so nothing may be offered: {notice}"
+        );
+        assert!(notice.contains("9000000 bytes"));
+        assert!(
+            notice.contains("1000000"),
+            "the notice must say how much was dropped: {notice}"
+        );
+        assert!(notice.contains("narrow"));
+    }
+
+    #[test]
+    fn cap_stored_tool_result_returns_none_when_under_cap() {
+        assert_eq!(cap_stored_tool_result("small output", 1024), None);
+    }
+
+    #[test]
+    fn cap_stored_tool_result_stays_within_byte_cap_across_sizes() {
+        for cap in [1024usize, 4096, 50_000] {
+            let content = "y".repeat(cap * 4);
+            let out = cap_stored_tool_result(&content, cap).expect("over-cap must truncate");
+            assert!(
+                out.len() <= cap,
+                "cap {cap}: stored result {} exceeds cap",
+                out.len()
+            );
+            assert!(out.starts_with("yyyy"));
+        }
+    }
+
+    #[test]
+    fn cap_stored_tool_result_truncates_on_char_boundary_no_panic() {
+        let content = "🚀".repeat(2_000); // 8_000 bytes
+        let out = cap_stored_tool_result(&content, 2048).expect("over-cap must truncate");
+        assert!(out.len() <= 2048);
+        assert!(out.starts_with('🚀'));
+    }
+
+    /// #1302: a later turn re-derives the projection from the stored length
+    /// alone, so the pass must pick exactly the oversized tool rows.
+    #[test]
+    fn project_oversized_tool_results_replaces_only_oversized_tool_rows() {
+        let big = Message::new(Role::Tool, "b".repeat(4_000));
+        let small = Message::new(Role::Tool, "s".repeat(10));
+        let user = Message::new(Role::User, "u".repeat(4_000));
+        let messages = vec![big.clone(), small.clone(), user.clone()];
+
+        let mut projection = ContextProjection::default();
+        let projected = project_oversized_tool_results(&messages, &mut projection, 1_024);
+
+        assert_eq!(projected, 1, "only the oversized tool row is projected");
+        assert!(projection.is_replaced(&big));
+        assert!(!projection.is_replaced(&small));
+        assert!(
+            !projection.is_replaced(&user),
+            "the cap governs tool results, not the conversation"
+        );
+        assert!(projection.content(&big).contains(&big.id));
+        assert_eq!(
+            big.content.len(),
+            4_000,
+            "the pass must not write to the message it projects"
+        );
+    }
+
+    /// A distilled-note pointer is smaller and says more than a head plus a
+    /// notice, so a replacement already recorded must win.
+    #[test]
+    fn project_oversized_tool_results_leaves_an_existing_replacement_alone() {
+        let big = Message::new(Role::Tool, "b".repeat(4_000));
+        let messages = vec![big.clone()];
+        let mut projection = ContextProjection::default();
+        projection.replace(&big, "<compacted to scratchpad outcome:1>".to_string());
+
+        let projected = project_oversized_tool_results(&messages, &mut projection, 1_024);
+
+        assert_eq!(projected, 0);
+        assert_eq!(projection.content(&big), "<compacted to scratchpad outcome:1>");
     }
 
     /// PINS CURRENT BEHAVIOUR (possible defect — see PR #445 design triage).
@@ -3688,10 +3802,11 @@ mod tests {
     fn cap_tool_result_smaller_than_notice_is_pinned() {
         let content = "z".repeat(50);
         let max_bytes = 10; // far smaller than the notice
-        let out = cap_tool_result(&content, max_bytes).expect("over-cap must truncate");
+        let out =
+            cap_tool_result(&content, CAP_MESSAGE_ID, max_bytes).expect("over-cap must truncate");
 
         // No body prefix survives — the result is exactly the notice.
-        let notice = tool_result_truncation_notice(content.len());
+        let notice = tool_result_truncation_notice(CAP_MESSAGE_ID, content.len());
         assert_eq!(out, notice);
         // ...and that notice is LONGER than the requested cap. This is the
         // pinned overflow: the output does NOT stay within `max_bytes`.

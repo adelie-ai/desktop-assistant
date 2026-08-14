@@ -13086,41 +13086,456 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn oversized_tool_result_is_truncated_at_ingestion_and_stays_paired() {
-        // Issue #174: a tool returning a huge payload must be truncated before
-        // it is stored, so it can't wedge the conversation on later turns. The
-        // tool_call_id pairing must survive truncation.
-        let tool_def = ToolDefinition::new("dump", "Dumps a lot", serde_json::json!({}));
-        let responses = vec![
-            LlmResponse::with_tool_calls("", vec![ToolCall::new("call-1", "dump", "{}")]),
-            LlmResponse::text("ok"),
-        ];
-        let mut tool_results = HashMap::new();
-        tool_results.insert("dump".to_string(), "A".repeat(5_000));
+    // --- #1302: an oversized tool result is stored whole, and read as a head ---
 
-        let handler = make_tool_handler(responses, vec![tool_def], tool_results)
-            .with_max_tool_result_bytes(1_024);
+    /// A tool with no narrowing parameter. A page fetch takes a URL and nothing
+    /// else, so "ask for less" is not a move it has - which is the case the
+    /// ingestion notice used to send the model back into.
+    const PAGE_FETCH_TOOL: &str = "web_fetch";
+
+    /// Marks the first bytes of the fixture page.
+    const PAGE_HEAD_MARK: &str = "HEAD-OF-PAGE";
+
+    /// Marks the last bytes of the fixture page. A claim about the head passes
+    /// on the old behaviour too, so every claim about the tail is made against
+    /// this.
+    const PAGE_TAIL_MARK: &str = "TAIL-OF-PAGE";
+
+    /// The context cap these fixtures run at: small enough to keep the payload
+    /// cheap, far larger than either notice.
+    const TEST_CONTEXT_CAP: usize = 4_096;
+
+    /// Bytes of fixture page. Ten times the context cap, so a head-only prompt
+    /// is unmistakable.
+    const TEST_PAGE_BYTES: usize = 40_960;
+
+    /// A page whose first and last bytes are distinguishable from its filler.
+    fn fixture_page(bytes: usize) -> String {
+        let filler = bytes - PAGE_HEAD_MARK.len() - PAGE_TAIL_MARK.len();
+        format!("{PAGE_HEAD_MARK}{}{PAGE_TAIL_MARK}", "p".repeat(filler))
+    }
+
+    /// The `message_id="..."` a notice names, read the way a model reads it
+    /// rather than handed to the test.
+    fn message_id_in(notice: &str) -> Option<String> {
+        let rest = notice.split_once("message_id=\"")?.1;
+        rest.split_once('"').map(|(id, _)| id.to_string())
+    }
+
+    /// One turn that fetches one page, keyed `c1`.
+    fn page_fetch_turn() -> Vec<LlmResponse> {
+        vec![
+            LlmResponse::with_tool_calls("", vec![ToolCall::new("c1", PAGE_FETCH_TOOL, "{}")]),
+            LlmResponse::text("read it"),
+        ]
+    }
+
+    /// A handler over one page-fetch tool returning `page`, at
+    /// [`TEST_CONTEXT_CAP`], plus a handle on the prompts it assembles.
+    #[allow(clippy::type_complexity)]
+    fn page_fetch_fixture(
+        page: &str,
+        responses: Vec<LlmResponse>,
+    ) -> (
+        ConversationHandler<MockStore, ToolCallingLlm, MockToolExecutor>,
+        Arc<Mutex<Vec<Vec<Message>>>>,
+    ) {
+        let mut results = HashMap::new();
+        results.insert(PAGE_FETCH_TOOL.to_string(), page.to_string());
+        let llm = ToolCallingLlm::new(responses);
+        let prompts = llm.prompts();
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            llm,
+            MockToolExecutor::new(vec![tool_def(PAGE_FETCH_TOOL)], results),
+            id_gen(),
+        )
+        .with_max_tool_result_bytes(TEST_CONTEXT_CAP);
+        (handler, prompts)
+    }
+
+    /// The `Role::Tool` row bound to `call_id`.
+    async fn stored_tool_row<S, L, T>(
+        handler: &ConversationHandler<S, L, T>,
+        id: &ConversationId,
+        call_id: &str,
+    ) -> Message
+    where
+        S: ConversationStore,
+        L: LlmClient,
+        T: ToolExecutor,
+    {
+        handler
+            .get_conversation(id)
+            .await
+            .unwrap()
+            .messages
+            .into_iter()
+            .find(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some(call_id))
+            .unwrap_or_else(|| panic!("no stored tool row for {call_id}"))
+    }
+
+    /// AC1 (#1302): a result over the context cap and under the storage cap is
+    /// stored byte for byte. Bytes the model is not shown are still bytes the
+    /// conversation kept, and the call pairing survives with them.
+    #[tokio::test]
+    async fn a_result_over_the_context_cap_is_stored_byte_for_byte() {
+        let page = fixture_page(TEST_PAGE_BYTES);
+        let (handler, _prompts) = page_fetch_fixture(&page, page_fetch_turn());
         let conv = handler
             .create_conversation("Test".into(), vec![])
             .await
             .unwrap();
         handler
-            .send_prompt(&conv.id, "dump it".into(), noop_callback(), noop_status())
+            .send_prompt(&conv.id, "fetch it".into(), noop_callback(), noop_status())
             .await
             .unwrap();
 
-        let updated = handler.get_conversation(&conv.id).await.unwrap();
-        let tool_msg = &updated.messages[2];
-        assert_eq!(tool_msg.role, Role::Tool);
-        assert_eq!(tool_msg.tool_call_id.as_deref(), Some("call-1"));
-        assert!(
-            tool_msg.content.len() <= 1_024,
-            "stored tool result {} exceeds cap",
-            tool_msg.content.len()
+        let row = stored_tool_row(&handler, &conv.id, "c1").await;
+        assert_eq!(
+            row.content, page,
+            "the stored row must keep every byte the tool returned"
         );
-        assert!(tool_msg.content.contains("truncated"));
-        assert!(tool_msg.content.starts_with("AAAA"));
+        assert_eq!(
+            row.tool_call_id.as_deref(),
+            Some("c1"),
+            "the row must stay paired with the call that produced it"
+        );
+    }
+
+    /// AC4 (#1302): storing the whole result must not put the whole result in
+    /// the prompt. The projection is what holds the two apart.
+    #[tokio::test]
+    async fn the_full_result_does_not_reach_the_prompt() {
+        let page = fixture_page(TEST_PAGE_BYTES);
+        let (handler, prompts) = page_fetch_fixture(&page, page_fetch_turn());
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "fetch it".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+
+        let read_by_model = last_prompt_result(&prompts, "c1");
+        assert!(
+            read_by_model.starts_with(PAGE_HEAD_MARK),
+            "the model must read the head of the page"
+        );
+        assert!(
+            !read_by_model.contains(PAGE_TAIL_MARK),
+            "the tail must not reach the prompt"
+        );
+        assert!(
+            read_by_model.len() <= TEST_CONTEXT_CAP,
+            "the prompt copy is {} bytes, over the {TEST_CONTEXT_CAP}-byte context cap",
+            read_by_model.len()
+        );
+    }
+
+    /// AC3 (#1302): a tool with no narrowing parameter is still given a usable
+    /// next step. "Ask for less" is not one for a page fetch; the message id
+    /// and the paging reader are.
+    #[tokio::test]
+    async fn a_tool_with_no_narrowing_parameter_is_pointed_at_the_transcript_reader() {
+        let page = fixture_page(TEST_PAGE_BYTES);
+        let (handler, prompts) = page_fetch_fixture(&page, page_fetch_turn());
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "fetch it".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+
+        let read_by_model = last_prompt_result(&prompts, "c1");
+        let tail = &read_by_model[read_by_model.len().saturating_sub(600)..];
+        assert!(
+            tail.contains(crate::ports::transcript::TRANSCRIPT_GET_TOOL),
+            "the notice must name the paging reader: {tail}"
+        );
+        let row = stored_tool_row(&handler, &conv.id, "c1").await;
+        assert_eq!(
+            message_id_in(&read_by_model).as_deref(),
+            Some(row.id.as_str()),
+            "the notice must name the row the bytes are stored under: {tail}"
+        );
+    }
+
+    /// AC5 (#1302): the projection is turn-scoped, so a later turn has to
+    /// re-derive it. A conversation loaded from storage with an oversized tool
+    /// row must assemble to head plus notice, not to the whole payload.
+    #[tokio::test]
+    async fn a_later_turn_reads_the_head_of_an_oversized_stored_result() {
+        let page = fixture_page(TEST_PAGE_BYTES);
+        let mut responses = page_fetch_turn();
+        responses.push(LlmResponse::text("still read"));
+        let (handler, prompts) = page_fetch_fixture(&page, responses);
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "fetch it".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+        // A second turn, which loads the conversation back from storage and
+        // starts with a projection of its own.
+        handler
+            .send_prompt(
+                &conv.id,
+                "and again?".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await
+            .unwrap();
+
+        let read_by_model = last_prompt_result(&prompts, "c1");
+        assert!(
+            read_by_model.starts_with(PAGE_HEAD_MARK),
+            "a later turn must still read the head"
+        );
+        assert!(
+            !read_by_model.contains(PAGE_TAIL_MARK),
+            "a later turn must not re-inflate the payload into the prompt"
+        );
+        assert!(
+            read_by_model.contains(crate::ports::transcript::TRANSCRIPT_GET_TOOL),
+            "a later turn's notice must still name the reader"
+        );
+        let row = stored_tool_row(&handler, &conv.id, "c1").await;
+        assert_eq!(
+            row.content, page,
+            "the stored row must still hold every byte"
+        );
+    }
+
+    /// AC7 (#1302): a result under the context cap is untouched - stored as it
+    /// came, read as it came, and carrying no notice.
+    #[tokio::test]
+    async fn a_result_under_the_context_cap_is_stored_and_read_unchanged() {
+        let page = fixture_page(200);
+        let (handler, prompts) = page_fetch_fixture(&page, page_fetch_turn());
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "fetch it".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+
+        let row = stored_tool_row(&handler, &conv.id, "c1").await;
+        assert_eq!(row.content, page, "a small result is stored as it came");
+        let read_by_model = last_prompt_result(&prompts, "c1");
+        assert_eq!(
+            read_by_model, page,
+            "a small result reaches the model unchanged"
+        );
+    }
+
+    /// The page-fetch surface plus the transcript reader, dispatched the way
+    /// `BuiltinToolService::transcript_get` dispatches it - take the arguments,
+    /// then read whatever transcript the dispatch loop installed.
+    struct PageFetchWithReader {
+        tools: Vec<ToolDefinition>,
+        page: String,
+    }
+
+    impl ToolExecutor for PageFetchWithReader {
+        async fn core_tools(&self) -> Vec<ToolDefinition> {
+            self.tools.clone()
+        }
+        async fn search_tools(&self, _query: &str) -> Result<Vec<ToolDefinition>, CoreError> {
+            Ok(vec![])
+        }
+        async fn tool_definition(&self, name: &str) -> Result<Option<ToolDefinition>, CoreError> {
+            Ok(self.tools.iter().find(|t| t.name == name).cloned())
+        }
+        async fn execute_tool(
+            &self,
+            name: &str,
+            arguments: serde_json::Value,
+        ) -> Result<String, CoreError> {
+            use crate::ports::transcript::{TranscriptReadRequest, read_transcript_message};
+
+            if name == crate::ports::transcript::TRANSCRIPT_GET_TOOL {
+                return Ok(read_transcript_message(&TranscriptReadRequest {
+                    message_id: arguments["message_id"]
+                        .as_str()
+                        .expect("the driving model always passes an id")
+                        .to_string(),
+                    offset: usize::try_from(arguments["offset"].as_u64().unwrap_or(0))
+                        .expect("the fixture offset fits"),
+                    length: arguments["length"]
+                        .as_u64()
+                        .map(|n| usize::try_from(n).expect("the fixture length fits")),
+                }));
+            }
+            Ok(self.page.clone())
+        }
+    }
+
+    /// A model that does what the notice tells it: fetch the page, read the id
+    /// out of the notice it gets back, then ask the reader for the last bytes.
+    struct TailReadingLlm {
+        /// Where the tail mark starts in the page the tool returned.
+        tail_offset: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for TailReadingLlm {
+        async fn stream_completion(
+            &self,
+            messages: Vec<Message>,
+            _tools: &[ToolDefinition],
+            _reasoning: ReasoningConfig,
+            _on_chunk: ChunkCallback,
+        ) -> Result<LlmResponse, CoreError> {
+            if messages
+                .iter()
+                .any(|m| m.tool_call_id.as_deref() == Some("c2"))
+            {
+                return Ok(LlmResponse::text("done"));
+            }
+            let Some(head) = messages
+                .iter()
+                .find(|m| m.tool_call_id.as_deref() == Some("c1"))
+            else {
+                return Ok(LlmResponse::with_tool_calls(
+                    "",
+                    vec![ToolCall::new("c1", PAGE_FETCH_TOOL, "{}")],
+                ));
+            };
+            let message_id = message_id_in(&head.content)
+                .expect("the notice must name the message the bytes are stored under");
+            Ok(LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new(
+                    "c2",
+                    crate::ports::transcript::TRANSCRIPT_GET_TOOL,
+                    serde_json::json!({
+                        "message_id": message_id,
+                        "offset": self.tail_offset,
+                    })
+                    .to_string(),
+                )],
+            ))
+        }
+    }
+
+    /// AC2 (#1302): the tail the model was not shown reads back through
+    /// `builtin_transcript_get`. Asserting only that the head survived passes
+    /// on the old behaviour and proves nothing.
+    #[tokio::test]
+    async fn the_tail_of_an_oversized_result_reads_back_through_the_transcript_reader() {
+        let page = fixture_page(TEST_PAGE_BYTES);
+        let tail_offset = page.len() - PAGE_TAIL_MARK.len();
+        let object = serde_json::json!({"type": "object"});
+        let executor = PageFetchWithReader {
+            tools: vec![
+                ToolDefinition::new(PAGE_FETCH_TOOL, "fetch a page", object.clone()),
+                ToolDefinition::new(
+                    crate::ports::transcript::TRANSCRIPT_GET_TOOL,
+                    "read a message back",
+                    object,
+                ),
+            ],
+            page: page.clone(),
+        };
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            TailReadingLlm { tail_offset },
+            executor,
+            id_gen(),
+        )
+        .with_max_tool_result_bytes(TEST_CONTEXT_CAP);
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "fetch it".into(), noop_callback(), noop_status())
+            .await
+            .expect("the turn must finish");
+
+        let payload = stored_tool_row(&handler, &conv.id, "c2").await.content;
+        let got: serde_json::Value =
+            serde_json::from_str(&payload).expect("the read-back payload must be JSON");
+        assert_eq!(got["ok"], true, "the reader must answer: {payload}");
+        assert_eq!(
+            got["total_bytes"].as_u64(),
+            Some(page.len() as u64),
+            "the reader must see the whole stored page: {payload}"
+        );
+        assert_eq!(
+            got["content"], PAGE_TAIL_MARK,
+            "the reader must hand back the last bytes the tool produced: {payload}"
+        );
+    }
+
+    /// AC6 (#1302): above the storage cap the tail genuinely is gone, so the
+    /// notice must say that and nothing more. Issue #174 is what the cap is
+    /// for - a runaway tool returned 124 MB across 8 messages and wedged the
+    /// conversation - and it still holds here. Offering a reader with nothing
+    /// behind it would recreate the defect this ticket fixes.
+    #[tokio::test]
+    async fn a_result_over_the_storage_cap_is_bounded_and_its_notice_offers_no_reader() {
+        const STORAGE_CAP: usize = 8_192;
+        let page = fixture_page(TEST_PAGE_BYTES);
+        let mut results = HashMap::new();
+        results.insert(PAGE_FETCH_TOOL.to_string(), page.clone());
+        let handler = make_tool_handler(
+            page_fetch_turn(),
+            vec![tool_def(PAGE_FETCH_TOOL)],
+            results,
+        )
+        .with_max_tool_result_bytes(TEST_CONTEXT_CAP)
+        .with_max_stored_tool_result_bytes(STORAGE_CAP);
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "fetch it".into(), noop_callback(), noop_status())
+            .await
+            .unwrap();
+
+        let row = stored_tool_row(&handler, &conv.id, "c1").await;
+        assert_eq!(
+            row.tool_call_id.as_deref(),
+            Some("c1"),
+            "the row must stay paired with the call that produced it"
+        );
+        assert!(
+            row.content.len() <= STORAGE_CAP,
+            "the stored row is {} bytes, over the {STORAGE_CAP}-byte storage cap",
+            row.content.len()
+        );
+        assert!(
+            row.content.starts_with(PAGE_HEAD_MARK),
+            "what is kept is the head of what the tool returned"
+        );
+        assert!(
+            !row.content.contains(PAGE_TAIL_MARK),
+            "above the storage cap the tail is not kept"
+        );
+        let notice = row
+            .content
+            .split_once("<tool output")
+            .map(|(_, rest)| rest)
+            .expect("the stored row must carry the storage notice");
+        assert!(
+            !notice.contains(crate::ports::transcript::TRANSCRIPT_GET_TOOL),
+            "the storage notice must not offer a reader that has nothing to give: {notice}"
+        );
+        assert!(
+            notice.contains("dropped"),
+            "the storage notice must say the tail is gone: {notice}"
+        );
     }
 
     #[tokio::test]
