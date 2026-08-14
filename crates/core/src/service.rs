@@ -209,6 +209,40 @@ pub(crate) const MAX_TOOL_ROUNDS: usize = 200;
 ///
 /// Exemption gives up the execution saving alone. A repeated result still
 /// becomes a pointer, so the context saving is unaffected.
+/// What the round reads of the row about to be appended, where that is less
+/// than all of it. `None` means the round reads the row itself.
+///
+/// Two rows are never headed, and for different reasons.
+///
+/// A row carrying a repeat pointer (#1301) is already an address. Heading one
+/// would cut that address mid-text and append a notice naming the row being
+/// read rather than the row holding the bytes - the readback chain breaking in
+/// the one direction this seam exists to prevent. That is what `stored` is for.
+///
+/// And a head no smaller than the row it replaces is no saving, which is the
+/// one thing a rule that exists to shrink the prompt may not do.
+///
+/// **The size guard subsumes the pointer guard at today's sizes, and that is a
+/// coincidence rather than a promise.** A pointer renders to 307 bytes and
+/// `tool_result_truncation_notice` to 474, so a headed pointer is always
+/// larger than the pointer and the size guard drops it whatever `stored` says.
+/// Two independent strings happen to sit that way round; neither states it.
+/// `a_pointer_row_is_never_headed_even_where_the_size_guard_would_allow_it`
+/// holds the pointer rule on its own, and
+/// `the_size_guard_covers_the_pointer_case_only_while_the_notice_is_longer`
+/// is the canary for the day the coincidence ends.
+fn head_for_appended_row(
+    stored: bool,
+    content: &str,
+    message_id: &str,
+    max_bytes: usize,
+) -> Option<String> {
+    if !stored {
+        return None;
+    }
+    cap_tool_result(content, message_id, max_bytes).filter(|head| head.len() < content.len())
+}
+
 fn may_suppress(call_name: &str) -> bool {
     call_name != TOOL_SEARCH_TOOL && call_name != SPAWN_SUBAGENT_TOOL
 }
@@ -4608,10 +4642,12 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 // it. A head no smaller than what it replaces is no saving, so
                 // the round reads the row instead. A pointer row is already an
                 // address, so only a stored row can need a head at all.
-                let head = matches!(disposition, crate::tool_repeat::ResultDisposition::Store)
-                    .then(|| cap_tool_result(&content, &tool_msg.id, self.max_tool_result_bytes))
-                    .flatten()
-                    .filter(|head| head.len() < content.len());
+                let head = head_for_appended_row(
+                    matches!(disposition, crate::tool_repeat::ResultDisposition::Store),
+                    &content,
+                    &tool_msg.id,
+                    self.max_tool_result_bytes,
+                );
                 if let Some(head) = &head {
                     tracing::warn!(
                         tool = %Safe::name(&tool_call.name),
@@ -14013,6 +14049,147 @@ mod tests {
         assert!(
             content.contains(&format!("{TEST_PAGE_BYTES} bytes")),
             "and it must say what the TOOL produced"
+        );
+    }
+
+    /// The pointer guard, held on its own.
+    ///
+    /// At the sizes the two notices actually render to, the size guard beside
+    /// it already refuses every headed pointer, so nothing driven through the
+    /// turn loop can reach this rule - replacing the gate with `true` leaves
+    /// the whole suite green. That makes it exactly the kind of guard that
+    /// rots: correct, load-bearing the moment either notice changes length,
+    /// and answerable to nothing.
+    ///
+    /// So it is asked directly, with a content that WOULD be headed. The
+    /// permit case is asserted beside the refusal, because a refusal that
+    /// refuses everything proves nothing about the rule it claims to hold.
+    #[test]
+    fn a_pointer_row_is_never_headed_even_where_the_size_guard_would_allow_it() {
+        let content = "p".repeat(40_960);
+        let id = "01936f2a-0000-7000-8000-000000000000";
+
+        assert_eq!(
+            head_for_appended_row(false, &content, id, TEST_CONTEXT_CAP),
+            None,
+            "a pointer row is an address already; heading it would cut the address \
+             and name the row being read instead of the row holding the bytes"
+        );
+        let permitted = head_for_appended_row(true, &content, id, TEST_CONTEXT_CAP)
+            .expect("the same input IS headed when the row holds bytes");
+        assert!(
+            permitted.len() <= TEST_CONTEXT_CAP,
+            "and the permit case is a real head, so the refusal above is the rule \
+             and not an accident of the input"
+        );
+    }
+
+    /// The canary for the coincidence the rule above rests on.
+    ///
+    /// A repeat pointer is only saved from being headed by the size guard
+    /// because `tool_result_truncation_notice` is LONGER than the pointer: a
+    /// head of a 307-byte pointer is the 474-byte notice with no room for a
+    /// body, and 474 is not smaller than 307. Shorten the notice past the
+    /// pointer, or lengthen the pointer past the notice, and the size guard
+    /// stops covering the case - at which point the `stored` gate in
+    /// [`head_for_appended_row`] becomes the live protection rather than a
+    /// belt beside a brace, and the turn-level test below starts to bite.
+    ///
+    /// This asserts the relation rather than the numbers, so it survives
+    /// ordinary rewording of either string and fires only on the inversion
+    /// that matters.
+    #[test]
+    fn the_size_guard_covers_the_pointer_case_only_while_the_notice_is_longer() {
+        let id = "01936f2a-0000-7000-8000-000000000000";
+        let pointer = crate::tool_repeat::same_bytes_notice(id);
+        let notice = crate::context::tool_result_truncation_notice(id, 40_960);
+        assert!(
+            notice.len() > pointer.len(),
+            "the size guard no longer covers a headed pointer on its own \
+             (notice {} bytes vs pointer {} bytes); the `stored` gate in \
+             head_for_appended_row is now the only thing holding it",
+            notice.len(),
+            pointer.len()
+        );
+    }
+
+    /// The turn-level half, at a context cap BELOW the pointer's own length -
+    /// the only configuration where heading a pointer is even arithmetically
+    /// on the table. The row must be stored and read whole: no cut, no
+    /// truncation notice, and the id it hands the model is the holder's.
+    ///
+    /// Honest about what it proves: today this passes through the size guard,
+    /// so it does not die when the `stored` gate is replaced by `true`. Its
+    /// job is the end-to-end property at a hostile cap, and to be the test
+    /// that starts failing if the notice lengths ever invert.
+    #[tokio::test]
+    async fn a_repeat_pointer_row_is_stored_and_read_whole_below_the_pointers_own_length() {
+        // Far below the 307 bytes a pointer renders to.
+        const TINY_CAP: usize = 100;
+        let page = fixture_page(TEST_PAGE_BYTES);
+        let prompts: Arc<Mutex<Vec<Vec<Message>>>> = Arc::new(Mutex::new(Vec::new()));
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            SeamDrivingLlm {
+                fetches: 2,
+                read_offset: page.len() - PAGE_TAIL_MARK.len(),
+                seen: Arc::clone(&prompts),
+            },
+            SeamExecutor::new(vec![page.clone()]),
+            id_gen(),
+        )
+        .with_max_tool_result_bytes(TINY_CAP);
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(
+                &conv.id,
+                "fetch it twice".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await
+            .expect("the turn must finish");
+
+        let first = stored_tool_row(&handler, &conv.id, "f1").await;
+        let second = stored_tool_row(&handler, &conv.id, "f2").await;
+        assert_eq!(first.content, page, "the holder still keeps every byte");
+        assert!(
+            second.content.starts_with(REPEAT_POINTER_OPENING),
+            "the repeat is still a pointer at this cap"
+        );
+
+        let read_by_model = last_prompt_result(&prompts, "f2");
+        assert_eq!(
+            read_by_model, second.content,
+            "a pointer row must reach the model whole, not cut to a cap smaller \
+             than the address it carries"
+        );
+        assert!(
+            !read_by_model.contains("tool output truncated"),
+            "a pointer must never be given a truncation notice: {read_by_model}"
+        );
+        assert_eq!(
+            message_id_in(&read_by_model).as_deref(),
+            Some(first.id.as_str()),
+            "the id the model is handed must be the holder's, never the row it \
+             is already reading"
+        );
+        assert_ne!(
+            message_id_in(&read_by_model).as_deref(),
+            Some(second.id.as_str()),
+            "a pointer naming its own row is the readback chain broken"
+        );
+
+        // And the chain still runs at this cap: the model followed that
+        // address and got bytes it was never shown.
+        let got = read_back_payload(&handler, &conv.id).await;
+        assert_eq!(got["ok"], true, "the reader must answer: {got}");
+        assert_eq!(
+            got["content"], PAGE_TAIL_MARK,
+            "the pointer must still lead to the tail: {got}"
         );
     }
 
