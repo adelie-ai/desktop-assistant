@@ -13622,6 +13622,512 @@ mod tests {
         );
     }
 
+    // --- #1301 x #1302: where the repeat rule and the caps meet ------------
+    //
+    // Two features rewrote the same append site. Each has its own suite and
+    // both pass; nothing exercised them together, which is where a hand-merge
+    // is least trustworthy. The property the seam has to hold is one sentence:
+    // a pointer must lead to BYTES, never to another pointer and never to a
+    // head. Everything below is a way of asking that.
+
+    /// Opening of `tool_repeat::same_bytes_notice`. Matched here rather than
+    /// imported so a test names what the MODEL sees, in the model's own terms.
+    const REPEAT_POINTER_OPENING: &str = "<same as before";
+
+    /// The page tool plus the transcript reader, with a scripted sequence of
+    /// results: each call takes the next page, and the last page repeats once
+    /// the list runs out. That is how a test says "the same bytes twice" or
+    /// "different bytes the second time" without touching the turn loop.
+    struct SeamExecutor {
+        tools: Vec<ToolDefinition>,
+        pages: Mutex<std::collections::VecDeque<String>>,
+        last: Mutex<String>,
+    }
+
+    impl SeamExecutor {
+        fn new(pages: Vec<String>) -> Self {
+            let object = serde_json::json!({"type": "object"});
+            Self {
+                tools: vec![
+                    ToolDefinition::new(PAGE_FETCH_TOOL, "fetch a page", object.clone()),
+                    ToolDefinition::new(
+                        crate::ports::transcript::TRANSCRIPT_GET_TOOL,
+                        "read a message back",
+                        object,
+                    ),
+                ],
+                pages: Mutex::new(pages.into()),
+                last: Mutex::new(String::new()),
+            }
+        }
+    }
+
+    impl ToolExecutor for SeamExecutor {
+        async fn core_tools(&self) -> Vec<ToolDefinition> {
+            self.tools.clone()
+        }
+        async fn search_tools(&self, _query: &str) -> Result<Vec<ToolDefinition>, CoreError> {
+            Ok(vec![])
+        }
+        async fn tool_definition(&self, name: &str) -> Result<Option<ToolDefinition>, CoreError> {
+            Ok(self.tools.iter().find(|t| t.name == name).cloned())
+        }
+        async fn execute_tool(
+            &self,
+            name: &str,
+            arguments: serde_json::Value,
+        ) -> Result<String, CoreError> {
+            use crate::ports::transcript::{TranscriptReadRequest, read_transcript_message};
+
+            if name == crate::ports::transcript::TRANSCRIPT_GET_TOOL {
+                return Ok(read_transcript_message(&TranscriptReadRequest {
+                    message_id: arguments["message_id"]
+                        .as_str()
+                        .expect("the driving model always passes an id")
+                        .to_string(),
+                    offset: usize::try_from(arguments["offset"].as_u64().unwrap_or(0))
+                        .expect("the fixture offset fits"),
+                    length: arguments["length"]
+                        .as_u64()
+                        .map(|n| usize::try_from(n).expect("the fixture length fits")),
+                }));
+            }
+            let next = self.pages.lock().unwrap().pop_front();
+            match next {
+                Some(page) => {
+                    *self.last.lock().unwrap() = page.clone();
+                    Ok(page)
+                }
+                None => Ok(self.last.lock().unwrap().clone()),
+            }
+        }
+    }
+
+    /// Drives the seam: make `fetches` calls to the page tool with identical
+    /// arguments - so they share one repeat key - and then, only if the last
+    /// one came back as a REPEAT POINTER, follow that pointer with the reader.
+    ///
+    /// Following only a pointer is the point. A head names its own row too, so
+    /// a model that followed any `message_id=` would prove nothing about the
+    /// seam; this one follows the address the repeat rule handed it, which is
+    /// the thing that has to lead to bytes.
+    struct SeamDrivingLlm {
+        fetches: usize,
+        /// Where to start the read-back. The tail of the first page for the
+        /// composition proof; zero where the test is about what leads the row.
+        read_offset: usize,
+        /// Every prompt the handler assembled, so a test can read what the
+        /// MODEL saw - which for this seam differs from what was stored on
+        /// every row that got a head.
+        seen: Arc<Mutex<Vec<Vec<Message>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for SeamDrivingLlm {
+        async fn stream_completion(
+            &self,
+            messages: Vec<Message>,
+            _tools: &[ToolDefinition],
+            _reasoning: ReasoningConfig,
+            _on_chunk: ChunkCallback,
+        ) -> Result<LlmResponse, CoreError> {
+            self.seen.lock().unwrap().push(messages.clone());
+            if messages
+                .iter()
+                .any(|m| m.tool_call_id.as_deref() == Some("read"))
+            {
+                return Ok(LlmResponse::text("done"));
+            }
+            let fetched: Vec<&Message> = messages
+                .iter()
+                .filter(|m| {
+                    m.tool_call_id
+                        .as_deref()
+                        .is_some_and(|id| id.starts_with('f'))
+                })
+                .collect();
+            if fetched.len() < self.fetches {
+                let n = fetched.len() + 1;
+                return Ok(LlmResponse::with_tool_calls(
+                    "",
+                    vec![ToolCall::new(format!("f{n}"), PAGE_FETCH_TOOL, "{}")],
+                ));
+            }
+            let last = fetched.last().expect("at least one fetch by now");
+            if last.content.starts_with(REPEAT_POINTER_OPENING)
+                && let Some(message_id) = message_id_in(&last.content)
+            {
+                return Ok(LlmResponse::with_tool_calls(
+                    "",
+                    vec![ToolCall::new(
+                        "read",
+                        crate::ports::transcript::TRANSCRIPT_GET_TOOL,
+                        serde_json::json!({
+                            "message_id": message_id,
+                            "offset": self.read_offset,
+                            "length": 4_096,
+                        })
+                        .to_string(),
+                    )],
+                ));
+            }
+            Ok(LlmResponse::text("done"))
+        }
+    }
+
+    /// A handler over [`SeamExecutor`] at the test caps, plus a handle on the
+    /// prompts it assembles.
+    #[allow(clippy::type_complexity)]
+    fn seam_fixture(
+        pages: Vec<String>,
+        fetches: usize,
+        read_offset: usize,
+        storage_cap: usize,
+    ) -> (
+        ConversationHandler<MockStore, SeamDrivingLlm, SeamExecutor>,
+        Arc<Mutex<Vec<Vec<Message>>>>,
+    ) {
+        let prompts: Arc<Mutex<Vec<Vec<Message>>>> = Arc::new(Mutex::new(Vec::new()));
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            SeamDrivingLlm {
+                fetches,
+                read_offset,
+                seen: Arc::clone(&prompts),
+            },
+            SeamExecutor::new(pages),
+            id_gen(),
+        )
+        .with_max_tool_result_bytes(TEST_CONTEXT_CAP)
+        .with_max_stored_tool_result_bytes(storage_cap);
+        (handler, prompts)
+    }
+
+    /// The JSON payload the reader returned for call `read`.
+    async fn read_back_payload<S, L, T>(
+        handler: &ConversationHandler<S, L, T>,
+        id: &ConversationId,
+    ) -> serde_json::Value
+    where
+        S: ConversationStore,
+        L: LlmClient,
+        T: ToolExecutor,
+    {
+        let raw = stored_tool_row(handler, id, "read").await.content;
+        serde_json::from_str(&raw)
+            .unwrap_or_else(|e| panic!("read-back payload not JSON: {e}\n{raw}"))
+    }
+
+    /// The seam's headline (#1301 x #1302): an oversized result that repeats
+    /// stores its bytes once, and the pointer the repeat leaves leads to those
+    /// bytes - the WHOLE of them, tail included.
+    ///
+    /// The last assertion is the one that proves the two features compose. A
+    /// pointer that led to another head, or to a second pointer, would satisfy
+    /// every other claim here and still leave the model unable to reach what
+    /// the tool returned.
+    #[tokio::test]
+    async fn an_oversized_result_that_repeats_points_at_the_row_holding_all_its_bytes() {
+        let page = fixture_page(TEST_PAGE_BYTES);
+        let tail_offset = page.len() - PAGE_TAIL_MARK.len();
+        let (handler, _prompts) = seam_fixture(vec![page.clone()], 2, tail_offset, 1024 * 1024);
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(
+                &conv.id,
+                "fetch it twice".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await
+            .expect("the turn must finish");
+
+        // First row: every byte, and the round read only its head.
+        let first = stored_tool_row(&handler, &conv.id, "f1").await;
+        assert_eq!(
+            first.content, page,
+            "the first row must keep every byte the tool returned"
+        );
+
+        // Second row: an address, not a second copy, and not a head either.
+        let second = stored_tool_row(&handler, &conv.id, "f2").await;
+        assert!(
+            second.content.starts_with(REPEAT_POINTER_OPENING),
+            "the repeat must be stored as a pointer: {}",
+            &second.content[..second.content.len().min(120)]
+        );
+        assert!(
+            !second.content.contains(PAGE_HEAD_MARK),
+            "a pointer row carries an address, never the payload"
+        );
+        assert!(
+            !second.content.contains("tool output truncated"),
+            "a pointer is already short, so it must never be headed"
+        );
+        assert_eq!(
+            message_id_in(&second.content).as_deref(),
+            Some(first.id.as_str()),
+            "the pointer must name the row that HOLDS the bytes, not itself"
+        );
+
+        // The composition proof: following that pointer reaches the bytes.
+        let got = read_back_payload(&handler, &conv.id).await;
+        assert_eq!(got["ok"], true, "the reader must answer: {got}");
+        assert_eq!(
+            got["total_bytes"].as_u64(),
+            Some(page.len() as u64),
+            "the pointer must lead to the whole result, not to a head: {got}"
+        );
+        assert_eq!(
+            got["content"], PAGE_TAIL_MARK,
+            "the pointer must lead to bytes the model was never shown: {got}"
+        );
+    }
+
+    /// A result that CHANGES is not a repeat, however large it is. Both rows
+    /// keep their own bytes whole and both are headed; neither becomes a
+    /// pointer, because pointing the model at last round's answer would be a
+    /// lie about what this round returned.
+    #[tokio::test]
+    async fn an_oversized_result_that_changes_is_stored_and_headed_twice() {
+        let first_page = fixture_page(TEST_PAGE_BYTES);
+        let second_page = first_page.replace(PAGE_HEAD_MARK, "SECOND-PAGE-");
+        assert_ne!(first_page, second_page, "the fixture must actually differ");
+        let (handler, prompts) = seam_fixture(
+            vec![first_page.clone(), second_page.clone()],
+            2,
+            0,
+            1024 * 1024,
+        );
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(
+                &conv.id,
+                "fetch it twice".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await
+            .expect("the turn must finish");
+
+        let first = stored_tool_row(&handler, &conv.id, "f1").await;
+        let second = stored_tool_row(&handler, &conv.id, "f2").await;
+        assert_eq!(first.content, first_page, "the first row keeps its bytes");
+        assert_eq!(second.content, second_page, "the second row keeps its own");
+        assert!(
+            !second.content.starts_with(REPEAT_POINTER_OPENING),
+            "a changed result must never be answered with last round's address"
+        );
+
+        // Both are over the context cap, so the round reads a head of each -
+        // and each head names its OWN row.
+        for (call, row) in [("f1", &first), ("f2", &second)] {
+            let read = last_prompt_result(&prompts, call);
+            assert!(
+                read.contains("tool output truncated"),
+                "{call} must reach the model as a head"
+            );
+            assert_eq!(
+                message_id_in(&read).as_deref(),
+                Some(row.id.as_str()),
+                "{call}'s head must name its own row"
+            );
+            assert!(
+                !read.contains(PAGE_TAIL_MARK),
+                "{call}'s tail must not reach the prompt"
+            );
+        }
+    }
+
+    /// The remnant case, stated as it actually behaves.
+    ///
+    /// Above the STORAGE cap the tail is destroyed, and a repeat of that
+    /// result is answered with a pointer like any other. The pointer itself
+    /// does NOT restate the destruction - it is the repeat rule's wording, not
+    /// the cap's - so the name of this test says the loss reaches the model
+    /// through the ROW the pointer names, whose very first bytes are the loss
+    /// notice, and not through the pointer.
+    ///
+    /// That is sound because the notice leads the row: any read of it, from
+    /// offset zero, meets the loss before it meets a byte of output. It would
+    /// not be sound if the notice sat at the end, which is why it does not.
+    #[tokio::test]
+    async fn a_repeat_of_a_storage_capped_result_carries_the_loss_in_the_row_not_the_pointer() {
+        const STORAGE_CAP: usize = 8_192;
+        let page = fixture_page(TEST_PAGE_BYTES);
+        let (handler, prompts) = seam_fixture(vec![page.clone()], 2, 0, STORAGE_CAP);
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(
+                &conv.id,
+                "fetch it twice".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await
+            .expect("the turn must finish");
+
+        let first = stored_tool_row(&handler, &conv.id, "f1").await;
+        assert!(
+            first.content.len() <= STORAGE_CAP,
+            "the holder row is still bounded by the storage cap"
+        );
+        assert!(
+            first.content.starts_with("<tool output too large to keep:"),
+            "the loss must lead the row it happened to"
+        );
+
+        // The repeat is a pointer, and the pointer does not itself say bytes
+        // were destroyed. Asserted, not assumed - a green run must not imply
+        // the destruction notice reached the model on the repeat.
+        let second = stored_tool_row(&handler, &conv.id, "f2").await;
+        assert!(second.content.starts_with(REPEAT_POINTER_OPENING));
+        let read_on_repeat = last_prompt_result(&prompts, "f2");
+        assert!(
+            !read_on_repeat.contains("too large to keep"),
+            "documented behaviour: the repeat pointer does not restate the loss"
+        );
+        assert_eq!(
+            message_id_in(&second.content).as_deref(),
+            Some(first.id.as_str()),
+            "the pointer must name the row holding the kept bytes"
+        );
+
+        // Following it meets the loss first, before any output byte.
+        let got = read_back_payload(&handler, &conv.id).await;
+        assert_eq!(got["ok"], true, "the reader must answer: {got}");
+        let content = got["content"].as_str().expect("the read returns content");
+        assert!(
+            content.starts_with("<tool output too large to keep:"),
+            "a read from offset zero must meet the loss before any output: {content:.160}"
+        );
+        assert!(
+            content.contains(&format!("{TEST_PAGE_BYTES} bytes")),
+            "and it must say what the TOOL produced"
+        );
+    }
+
+    /// The seam decides sameness on what was KEPT, not on what the tool
+    /// returned, and the two can disagree in exactly one place: two results of
+    /// equal length that share every byte the storage cap keeps and differ
+    /// only in the tails it destroys. Both rows would hold identical bytes, so
+    /// the second is answered with a pointer.
+    ///
+    /// That is the right call - two identical remnant rows are precisely the
+    /// context refill #1301 exists to stop, and everything the model can reach
+    /// through the pointer is byte-for-byte what the second row would have
+    /// carried. State the limit rather than let a green run imply more: the
+    /// pointer's wording says the call "returned exactly the bytes it returned
+    /// earlier", which here is true of the kept bytes and not of the tool's
+    /// full output. Nothing reachable by any reader disagrees with it, because
+    /// the tails it glosses over are stored nowhere.
+    ///
+    /// Without this test, digesting the pre-cap output instead survives every
+    /// other test on the branch.
+    #[tokio::test]
+    async fn two_results_with_identical_remnants_are_judged_on_what_was_kept() {
+        const STORAGE_CAP: usize = 8_192;
+        // Equal length, identical far past where the cap cuts, different only
+        // in the bytes the cap destroys.
+        let shared = "s".repeat(20_000);
+        let first_page = format!("{shared}{}", "A".repeat(20_960));
+        let second_page = format!("{shared}{}", "B".repeat(20_960));
+        assert_eq!(
+            first_page.len(),
+            second_page.len(),
+            "equal length by construction"
+        );
+        assert_ne!(first_page, second_page, "different by construction");
+
+        let (handler, _prompts) = seam_fixture(vec![first_page, second_page], 2, 0, STORAGE_CAP);
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(
+                &conv.id,
+                "fetch it twice".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await
+            .expect("the turn must finish");
+
+        let first = stored_tool_row(&handler, &conv.id, "f1").await;
+        let second = stored_tool_row(&handler, &conv.id, "f2").await;
+        assert!(
+            second.content.starts_with(REPEAT_POINTER_OPENING),
+            "identical remnants must not be stored twice: {}",
+            &second.content[..second.content.len().min(120)]
+        );
+        assert_eq!(
+            message_id_in(&second.content).as_deref(),
+            Some(first.id.as_str()),
+            "the pointer must name the row holding those kept bytes"
+        );
+
+        // And the claim the pointer makes is true of everything reachable: the
+        // row it names holds exactly what the second row would have held.
+        let got = read_back_payload(&handler, &conv.id).await;
+        assert_eq!(got["ok"], true, "the reader must answer: {got}");
+        assert_eq!(
+            got["total_bytes"].as_u64(),
+            Some(first.content.len() as u64),
+            "the pointer leads to the whole kept row: {got}"
+        );
+    }
+
+    /// An empty success is 49 bytes, far under the repeat rule's 512-byte
+    /// floor, so it must be stored on every call and never become a pointer.
+    /// Replacing it would make the context bigger, and it is also the one
+    /// result whose sameness says nothing about whether the call had an
+    /// effect.
+    #[tokio::test]
+    async fn an_empty_success_that_repeats_is_stored_both_times_and_never_pointed_at() {
+        let (handler, prompts) = seam_fixture(vec![String::new()], 2, 0, 1024 * 1024);
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(
+                &conv.id,
+                "run it twice".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await
+            .expect("the turn must finish");
+
+        for call in ["f1", "f2"] {
+            let row = stored_tool_row(&handler, &conv.id, call).await;
+            assert_eq!(
+                row.content,
+                crate::context::EMPTY_TOOL_RESULT_NOTICE,
+                "{call} must store the empty-success marker"
+            );
+            assert!(
+                !row.content.starts_with(REPEAT_POINTER_OPENING),
+                "{call} is under the floor, so it may never become a pointer"
+            );
+            assert_eq!(
+                last_prompt_result(&prompts, call),
+                crate::context::EMPTY_TOOL_RESULT_NOTICE,
+                "{call} must reach the model as the marker, unheaded"
+            );
+        }
+    }
+
     /// AC6 (#1302): above the storage cap the tail genuinely is gone, so what
     /// the model READS must say that and must not offer a reader for it.
     /// Issue #174 is what the cap is for - a runaway tool returned 124 MB
