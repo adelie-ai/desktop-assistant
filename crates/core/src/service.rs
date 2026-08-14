@@ -2703,6 +2703,12 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
         // tool block finite. The lifetime is this turn: a new turn builds a
         // new ledger.
         let mut activations = crate::tool_advertising::ActivationLedger::new();
+        // What this turn has already dispatched (#1301). Keyed by the provider
+        // name and the normalized arguments, so an identical call is answered
+        // from the transcript instead of running the tool and appending the
+        // same bytes again. The lifetime is this turn: a new turn builds a new
+        // ledger, and the rule is in `crate::tool_repeat`.
+        let mut repeats = crate::tool_repeat::RepeatLedger::new();
         // Track whether hosted search has been demoted to local fallback.
         let mut hosted_search_demoted = false;
         // Tool-provenance gating (#741). A plain local of the turn: once a
@@ -4165,6 +4171,51 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 // the model is working with is the last one the bound retires.
                 activations.mark_used(call_name, round);
 
+                // A call this turn has already made (#1301). The key is the
+                // PROVIDER name - the location root is the daemon's own
+                // bookkeeping, and a key carrying it would make the same tool
+                // on two hosts two different calls - and the parsed arguments
+                // re-serialized, which sorts object keys and drops
+                // insignificant whitespace for free.
+                //
+                // The third identical call is answered from the transcript
+                // rather than run, but only once every earlier run returned the
+                // same bytes: a tool whose answer varies with time supplies its
+                // own evidence of that, and keeps running. Both notices name
+                // the message the first result is stored under, which
+                // `builtin_transcript_get` reads back (#1226).
+                let repeat_key = crate::tool_repeat::RepeatKey::new(call_name, &arguments);
+                let repeat_verdict = repeats.verdict(&repeat_key);
+                if let crate::tool_repeat::RepeatVerdict::Suppress {
+                    first_message_id,
+                    executions,
+                } = &repeat_verdict
+                {
+                    tracing::info!(
+                        tool = %Safe::name(&tool_call.name),
+                        executions,
+                        "a repeated tool call was answered from the transcript instead of run"
+                    );
+                    let answer =
+                        crate::tool_repeat::suppressed_notice(first_message_id, *executions);
+                    // Both halves of the pair, like the named-only branch
+                    // above: the feed never strands a started-but-never-
+                    // finished row (#252). Not a failure - nothing went wrong,
+                    // and the model gets its answer's address.
+                    notify_tool_event(ToolEvent::Started {
+                        name: summarize_tool_name(&tool_call.name),
+                        args: summarize_tool_value(&arguments),
+                    });
+                    notify_tool_event(ToolEvent::Finished {
+                        name: summarize_tool_name(&tool_call.name),
+                        ok: true,
+                        output: "answered from the transcript".to_string(),
+                    });
+                    conv.messages
+                        .push(Message::tool_result(&tool_call.id, &answer));
+                    continue;
+                }
+
                 notify_tool_event(ToolEvent::Started {
                     name: summarize_tool_name(&tool_call.name),
                     args: summarize_tool_value(&arguments),
@@ -4626,8 +4677,27 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                     }
                 }
 
-                conv.messages
-                    .push(Message::tool_result(&tool_call.id, &stored));
+                // The second identical call runs, and says so (#1301): a model
+                // that cannot tell "I did this" from "I did not" does it again.
+                // The notice sits above the tool's own output, which the model
+                // still gets.
+                let content = match &repeat_verdict {
+                    crate::tool_repeat::RepeatVerdict::ExecuteAsRepeat { first_message_id } => {
+                        format!(
+                            "{}\n{stored}",
+                            crate::tool_repeat::repeat_notice(first_message_id)
+                        )
+                    }
+                    _ => stored.clone(),
+                };
+                let result = Message::tool_result(&tool_call.id, content);
+                // Byte-identity is judged on the TOOL's own output, never on
+                // the message content: the notice above is the daemon's own
+                // text, so folding it in would make the second result differ
+                // from the first by construction and no third call could ever
+                // be answered from the transcript.
+                repeats.record(repeat_key, &result.id, &stored);
+                conv.messages.push(result);
             }
 
             // The identities this round met take effect now, and not one tool
@@ -5792,7 +5862,7 @@ mod tests {
             serde_json::json!({}),
         )];
         let calls: Vec<ToolCall> = (0..10)
-            .map(|i| ToolCall::new(format!("c{i}"), "notes_search", "{}"))
+            .map(|i| ToolCall::new(format!("c{i}"), "notes_search", format!(r#"{{"q":"{i}"}}"#)))
             .collect();
         let responses = vec![
             LlmResponse::with_tool_calls("", calls),
@@ -10811,7 +10881,11 @@ mod tests {
             .map(|i| {
                 LlmResponse::with_tool_calls(
                     "",
-                    vec![ToolCall::new(format!("t{i}"), "notes_search", "{}")],
+                    vec![ToolCall::new(
+                        format!("t{i}"),
+                        "notes_search",
+                        format!(r#"{{"q":"{i}"}}"#),
+                    )],
                 )
             })
             .collect();
@@ -10867,7 +10941,11 @@ mod tests {
             ));
             responses.push(LlmResponse::with_tool_calls(
                 "",
-                vec![ToolCall::new(format!("t{i}"), "notes_search", "{}")],
+                vec![ToolCall::new(
+                    format!("t{i}"),
+                    "notes_search",
+                    format!(r#"{{"q":"{i}"}}"#),
+                )],
             ));
         }
         responses.push(LlmResponse::text("All set"));
@@ -11006,7 +11084,7 @@ mod tests {
                     vec![ToolCall::new(
                         format!("t{i}"),
                         "vault_fetch",
-                        format!(r#"{{"api_key":"{SECRET}"}}"#),
+                        format!(r#"{{"api_key":"{SECRET}","n":{i}}}"#),
                     )],
                 )
             })
@@ -11083,7 +11161,11 @@ mod tests {
         for i in 0..6 {
             responses.push(LlmResponse::with_tool_calls(
                 "",
-                vec![ToolCall::new(format!("t{i}"), "notes_search", "{}")],
+                vec![ToolCall::new(
+                    format!("t{i}"),
+                    "notes_search",
+                    format!(r#"{{"q":"{i}"}}"#),
+                )],
             ));
         }
         responses.push(LlmResponse::text("All set"));
@@ -13045,7 +13127,11 @@ mod tests {
             .map(|i| {
                 LlmResponse::with_tool_calls(
                     "",
-                    vec![ToolCall::new(format!("c{i}"), "loop_tool", "{}")],
+                    vec![ToolCall::new(
+                        format!("c{i}"),
+                        "loop_tool",
+                        format!(r#"{{"q":"{i}"}}"#),
+                    )],
                 )
             })
             .collect();
@@ -14272,7 +14358,11 @@ mod tests {
             }
             Ok(LlmResponse::with_tool_calls(
                 "",
-                vec![ToolCall::new(format!("r{left}"), CLEAN_TOOL, "{}")],
+                vec![ToolCall::new(
+                    format!("r{left}"),
+                    CLEAN_TOOL,
+                    format!(r#"{{"q":"{left}"}}"#),
+                )],
             ))
         }
     }
@@ -16536,7 +16626,11 @@ mod tests {
             .map(|i| {
                 LlmResponse::with_tool_calls(
                     "",
-                    vec![ToolCall::new(format!("c{i}"), "loop_tool", "{}")],
+                    vec![ToolCall::new(
+                        format!("c{i}"),
+                        "loop_tool",
+                        format!(r#"{{"q":"{i}"}}"#),
+                    )],
                 )
             })
             .collect();
@@ -18744,6 +18838,7 @@ mod tests {
     /// every call that actually reached the executor. The handle is what these
     /// tests assert on: a reply-shaped assertion passes when the tool runs and
     /// its output is merely deduplicated, which is not the fix.
+    #[allow(clippy::type_complexity)]
     fn repeat_handler(
         responses: Vec<LlmResponse>,
         script: Vec<Result<String, String>>,
@@ -19003,6 +19098,9 @@ mod tests {
     async fn a_repeat_in_a_later_turn_is_not_suppressed_by_the_earlier_turns_ledger() {
         let args = r#"{"q":"how big"}"#;
         let mut responses = probe_rounds(&[args, args, args]);
+        // The first message of a conversation also spends one LLM call on the
+        // generated title, so the second turn's script starts after it.
+        responses.push(LlmResponse::text("A title"));
         responses.extend(probe_rounds(&[args]));
         let (handler, calls) = repeat_handler(
             responses,
