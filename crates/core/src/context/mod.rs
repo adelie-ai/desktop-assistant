@@ -114,6 +114,22 @@ pub(crate) fn tool_result_truncation_notice(original_bytes: usize) -> String {
     )
 }
 
+/// What a tool result becomes when the tool reported success and returned
+/// nothing (#1301).
+///
+/// Today an empty success reads as an ordinary result, so it is
+/// indistinguishable from a malformed request and the model retries the call
+/// verbatim. The marker says which of the two happened.
+///
+/// Scoped deliberately to a genuinely empty or whitespace-only result. The
+/// observed case was a command whose own JSON payload held
+/// `exit_code: 0, stdout: "null"`, which is that tool's private shape and is
+/// not generically detectable. Parsing tool-specific payloads here would guess
+/// at every server's schema and get it wrong, so this handles empty output
+/// only.
+pub(crate) const EMPTY_TOOL_RESULT_NOTICE: &str =
+    "<the tool call succeeded and returned no output.>";
+
 /// Cap a tool result to `max_bytes` before it is stored as a message.
 ///
 /// Returns `None` when `content` already fits (the common case — no

@@ -4469,6 +4469,22 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                     None => result.clone(),
                 };
 
+                // An empty success is not an empty result (#1301). A tool that
+                // ran, succeeded and had nothing to say used to reach the model
+                // as a blank string, which reads exactly like a malformed
+                // request - so the model retried the same call verbatim. Say
+                // which of the two happened.
+                //
+                // Empty output only. A payload that carries the emptiness
+                // INSIDE the tool's own JSON is that tool's private shape, and
+                // guessing at it here would misread every server that spells it
+                // differently.
+                let stored = if tool_ok && stored.trim().is_empty() {
+                    crate::context::EMPTY_TOOL_RESULT_NOTICE.to_string()
+                } else {
+                    stored
+                };
+
                 notify_tool_event(ToolEvent::Finished {
                     name: summarize_tool_name(&tool_call.name),
                     ok: tool_ok,
