@@ -176,6 +176,31 @@ fn cancellation_token_or_default() -> CancellationToken {
 /// Maximum number of tool-calling rounds before giving up.
 const MAX_TOOL_ROUNDS: usize = 200;
 
+/// Whether the repeat ledger may answer this tool's call from the transcript
+/// rather than running it (#1301).
+///
+/// False for a tool whose RESULT this loop parses for a side effect of its own.
+/// `builtin_tool_search` is the case: the loop reads the tools it found and
+/// activates them for the rounds that follow, so a search answered from the
+/// transcript would return the right text and quietly activate nothing - and
+/// the model would be left calling a tool the next round no longer advertises.
+///
+/// Scoped to the result-parsing branches in this file, and to nothing wider. A
+/// tool whose own side effects live inside the tool is not listed here: the
+/// ledger cannot see those, and the backoff - not an exemption list - is what
+/// bounds what they lose. Add a name here only when THIS loop reads its output.
+///
+/// Exemption gives up the execution saving alone. The bytes of a repeated
+/// search still become a pointer, so the context saving is unaffected, and a
+/// tool search is a local call.
+fn may_suppress(call_name: &str) -> bool {
+    call_name != TOOL_SEARCH_TOOL
+}
+
+/// The name of the loop's own tool-search built-in, whose result the loop reads
+/// to activate what it found.
+const TOOL_SEARCH_TOOL: &str = "builtin_tool_search";
+
 /// The longest an interactive turn may run with no narration before the
 /// dispatch loop synthesises a line (#943).
 ///
@@ -4173,22 +4198,27 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 activations.mark_used(call_name, round);
 
                 // A call this turn has already made (#1301). The key is the
-                // PROVIDER name - the location root is the daemon's own
-                // bookkeeping, and a key carrying it would make the same tool
-                // on two hosts two different calls - and the parsed arguments
-                // re-serialized, which sorts object keys and drops
-                // insignificant whitespace for free.
+                // provider name UNDER the connection that runs it, and the
+                // parsed arguments re-serialized, which sorts object keys and
+                // drops insignificant whitespace for free. Keying under the
+                // connection is the opposite choice from `burn_identity` below,
+                // deliberately - `crate::tool_repeat::RepeatKey` records why.
                 //
-                // The third identical call is answered from the transcript
-                // rather than run, but only once every earlier run returned the
-                // same bytes: a tool whose answer varies with time supplies its
-                // own evidence of that, and keeps running. Both notices name
-                // the message the first result is stored under, which
-                // `builtin_transcript_get` reads back (#1226).
-                let repeat_key = crate::tool_repeat::RepeatKey::new(call_name, &arguments);
-                let repeat_verdict = repeats.observe_dispatch(&repeat_key);
+                // Two things come of the ledger, and only one of them withholds
+                // work. A run that returns bytes the transcript already holds
+                // appends a pointer instead of a second copy, which is the
+                // context saving and cannot be stale. On top of that, a key
+                // that has repeated itself has some calls answered without
+                // running the tool at all - bounded by a doubling backoff, so
+                // no key can freeze and a value that changes is always seen.
+                let repeat_key = crate::tool_repeat::RepeatKey::new(
+                    routed.and_then(RoutedTool::connection),
+                    call_name,
+                    &arguments,
+                );
+                let repeat_verdict = repeats.observe_dispatch(&repeat_key, may_suppress(call_name));
                 if let crate::tool_repeat::RepeatVerdict::Suppress {
-                    first_message_id,
+                    message_id,
                     attempts,
                 } = &repeat_verdict
                 {
@@ -4197,7 +4227,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                         attempts,
                         "a repeated tool call was answered from the transcript instead of run"
                     );
-                    let answer = crate::tool_repeat::suppressed_notice(first_message_id, *attempts);
+                    let answer = crate::tool_repeat::suppressed_notice(message_id, *attempts);
                     // Both halves of the pair, like the named-only branch
                     // above: the feed never strands a started-but-never-
                     // finished row (#252). Not a failure - nothing went wrong,
@@ -4494,7 +4524,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 // activate the discovered tools for subsequent rounds.
                 // Skip when hosted search is active (unless demoted to local fallback).
                 if (!use_hosted_search || hosted_search_demoted)
-                    && call_name == "builtin_tool_search"
+                    && call_name == TOOL_SEARCH_TOOL
                     && let Ok(found) = serde_json::from_str::<serde_json::Value>(&result)
                     && let Some(tools_arr) = found.get("tools").and_then(|v| v.as_array())
                 {
@@ -4693,26 +4723,24 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                     }
                 }
 
-                // The second identical call runs, and says so (#1301): a model
-                // that cannot tell "I did this" from "I did not" does it again.
-                // The notice sits above the tool's own output, which the model
-                // still gets.
-                let content = match &repeat_verdict {
-                    crate::tool_repeat::RepeatVerdict::ExecuteAsRepeat { first_message_id } => {
-                        format!(
-                            "{}\n{stored}",
-                            crate::tool_repeat::repeat_notice(first_message_id)
-                        )
+                // Bytes the transcript already holds are never appended twice
+                // (#1301). The tool RAN, so this is not a refusal and nothing
+                // here is stale - the model is pointed at the message carrying
+                // exactly these bytes, and told so in those words.
+                //
+                // Judged on the TOOL's own output, never on the message
+                // content: a pointer is shorter than the bytes it names, so
+                // digesting that instead would make every repeat read as a
+                // change.
+                let digest = crate::tool_repeat::ResultDigest::of(&stored);
+                let content = match repeats.disposition(&repeat_key, digest) {
+                    crate::tool_repeat::ResultDisposition::SameAs { message_id } => {
+                        crate::tool_repeat::same_bytes_notice(&message_id)
                     }
-                    _ => stored.clone(),
+                    crate::tool_repeat::ResultDisposition::Store => stored.clone(),
                 };
                 let result = Message::tool_result(&tool_call.id, content);
-                // Byte-identity is judged on the TOOL's own output, never on
-                // the message content: the notice above is the daemon's own
-                // text, so folding it in would make the second result differ
-                // from the first by construction and no third call could ever
-                // be answered from the transcript.
-                repeats.record(&repeat_key, &result.id, &stored);
+                repeats.record(&repeat_key, &result.id, digest);
                 conv.messages.push(result);
             }
 
@@ -7825,17 +7853,32 @@ mod tests {
         // tainted on the spawn itself would refuse the second as a
         // code-execution tool, capping the shipped workflow at one child.
         let tools = vec![tool_def(SPAWN_SUBAGENT_TOOL)];
-        let mut results = HashMap::new();
-        results.insert(
-            SPAWN_SUBAGENT_TOOL.to_string(),
-            r#"{"child_task_id":"t-1","child_conversation_id":"c-1"}"#.to_string(),
+        // A fresh child per call, because that is what `spawn_subagent` does:
+        // it creates a conversation and registers a task, so two spawns cannot
+        // answer with one id. A fixture that returned a constant would make two
+        // distinct children look like one repeated call (#1301).
+        let executor = ScriptedToolExecutor::new(
+            tools,
+            vec![
+                Ok(r#"{"child_task_id":"t-1","child_conversation_id":"c-1"}"#.to_string()),
+                Ok(r#"{"child_task_id":"t-2","child_conversation_id":"c-2"}"#.to_string()),
+            ],
         );
         let responses = vec![
             calls("s1", SPAWN_SUBAGENT_TOOL),
             calls("s2", SPAWN_SUBAGENT_TOOL),
             LlmResponse::text("both away"),
         ];
-        let handler = make_tool_handler(responses, tools, results);
+        let counter = Arc::new(AtomicU32::new(0));
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            ToolCallingLlm::new(responses),
+            executor,
+            Box::new(move || {
+                let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                format!("conv-spawn-{n}")
+            }),
+        );
         let conv = handler
             .create_conversation("t".into(), vec![])
             .await
@@ -7852,7 +7895,13 @@ mod tests {
             .expect("the turn completes");
 
         assert_eq!(answer, "both away");
-        let results = tool_results(&handler, &conv.id).await;
+        let stored = handler.get_conversation(&conv.id).await.unwrap();
+        let results: Vec<String> = stored
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .map(|m| m.content.clone())
+            .collect();
         assert_eq!(results.len(), 2, "both spawns must record a result");
         for (i, r) in results.iter().enumerate() {
             assert!(
@@ -19008,6 +19057,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_suppressed_repeat_does_not_append_the_result_bytes_again() {
+        // Three calls: two run and one is answered from the transcript. The
+        // bytes land once between them, because a run that reproduces them
+        // points at them and a suppressed call never had them to append.
         let args = r#"{"q":"the page"}"#;
         let payload = format!("PAYLOAD-MARKER{}", "x".repeat(8000));
         let (handler, _calls) = repeat_handler(
@@ -19034,12 +19086,12 @@ mod tests {
             .filter(|m| m.content.contains("PAYLOAD-MARKER"))
             .count();
         assert_eq!(
-            copies, 2,
-            "the third call must not put a third copy of the result in the transcript"
+            copies, 1,
+            "the transcript must hold the bytes once, however often the call is made"
         );
 
-        // The transcript is what assembly draws on, so what the third call adds
-        // to it is what it adds to the context. It adds a pointer, not a copy.
+        // The transcript is what assembly draws on, so what a later call adds
+        // to it is what it adds to the context. Each adds a pointer.
         //
         // Asserted here rather than on a recorded prompt: eviction may already
         // have replaced the first copy with its own read-back notice by the
@@ -19047,13 +19099,15 @@ mod tests {
         // timing rather than this rule.
         let results = stored_tool_results(&stored);
         assert_eq!(results.len(), 3, "every call still gets a tool result");
-        assert!(
-            results[2].content.len() * 4 < payload.len(),
-            "the suppressed result must be a pointer, not a copy; it was {} bytes \
-             against a {}-byte payload",
-            results[2].content.len(),
-            payload.len()
-        );
+        for later in &results[1..] {
+            assert!(
+                later.content.len() * 4 < payload.len(),
+                "a later result must be a pointer, not a copy; it was {} bytes \
+                 against a {}-byte payload",
+                later.content.len(),
+                payload.len()
+            );
+        }
     }
 
     #[tokio::test]
@@ -19127,7 +19181,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_second_identical_call_runs_and_its_result_says_it_is_a_repeat() {
+    async fn a_second_identical_call_runs_and_returns_a_pointer_to_the_first_result() {
+        // The ticket asks that the model be told the call is a repeat and where
+        // the first result is. Both are true of the pointer, and the pointer
+        // also keeps the bytes out of the context - which the note that used to
+        // sit above them did not.
         let args = r#"{"q":"how big"}"#;
         let (handler, calls) = repeat_handler(
             probe_rounds(&[args, args]),
@@ -19148,7 +19206,8 @@ mod tests {
         assert_eq!(
             calls.lock().unwrap().len(),
             2,
-            "the second call still runs — only the third is answered from the transcript"
+            "the second call still runs - two matching runs are what the rule \
+             needs before it withholds anything"
         );
         let stored = handler.get_conversation(&conv.id).await.unwrap();
         let results = stored_tool_results(&stored);
@@ -19157,11 +19216,15 @@ mod tests {
         let second = &results[1].content;
         assert!(
             second.contains(&first_id),
-            "the second result must name where the first result is; got: {second}"
+            "the second result must name where the bytes are; got: {second}"
         );
         assert!(
-            second.contains("TOOL-OUTPUT-42"),
-            "the second result must still carry the tool's own output; got: {second}"
+            !second.contains("TOOL-OUTPUT-42"),
+            "the second result must point at the bytes, not repeat them; got: {second}"
+        );
+        assert!(
+            results[0].content.contains("TOOL-OUTPUT-42"),
+            "the first result must carry the tool's own output"
         );
     }
 
@@ -19648,8 +19711,15 @@ mod tests {
             searches, 3,
             "every search must run - the loop reads the result to activate"
         );
+        // The last recorded set belongs to the first-message title call, which
+        // is offered no tools at all; the turn's own last round is the one
+        // before it.
         let rounds = advertised.lock().unwrap().clone();
-        let last = rounds.last().expect("a final advertised set");
+        let last = rounds
+            .iter()
+            .rev()
+            .find(|set| !set.is_empty())
+            .expect("a round that was offered tools");
         assert!(
             last.iter().any(|t| t.name.contains("fleet_tool_00")),
             "the repeated search must still activate what it found; the last \
