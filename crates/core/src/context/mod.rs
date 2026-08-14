@@ -114,6 +114,22 @@ pub(crate) fn tool_result_truncation_notice(original_bytes: usize) -> String {
     )
 }
 
+/// What a tool result becomes when the tool reported success and returned
+/// nothing (#1301).
+///
+/// Today an empty success reads as an ordinary result, so it is
+/// indistinguishable from a malformed request and the model retries the call
+/// verbatim. The marker says which of the two happened.
+///
+/// Scoped deliberately to a genuinely empty or whitespace-only result. The
+/// observed case was a command whose own JSON payload held
+/// `exit_code: 0, stdout: "null"`, which is that tool's private shape and is
+/// not generically detectable. Parsing tool-specific payloads here would guess
+/// at every server's schema and get it wrong, so this handles empty output
+/// only.
+pub(crate) const EMPTY_TOOL_RESULT_NOTICE: &str =
+    "<the tool call succeeded and returned no output.>";
+
 /// Cap a tool result to `max_bytes` before it is stored as a message.
 ///
 /// Returns `None` when `content` already fits (the common case — no
@@ -254,6 +270,15 @@ pub(crate) struct TurnAnchors<'a> {
     /// a fuller block covers on this particular turn.
     pub working_state: crate::planning::WorkingState,
     pub tool_rounds_since_anchor: u32,
+    /// How many tool rounds the turn may spend in total (#1301), or `None` when
+    /// the caller does not bound them.
+    ///
+    /// Carried beside the round count because the count alone says nothing: a
+    /// model cannot ration what it cannot measure against. Surfaced by the
+    /// `[Current task]` block, which already re-renders on a long agentic loop,
+    /// so a long turn learns where it stands without a second periodic
+    /// mechanism.
+    pub tool_round_budget: Option<u32>,
 }
 
 /// The per-turn "ambient" context: the standing personality, the ambient
@@ -1118,7 +1143,9 @@ struct SurfacedBlocks {
 ///   has begun.
 /// - `[Current task]` — the anchor prompt, re-injected when it has drifted out
 ///   of view (windowed out, or collapsed behind an active summary) or after a
-///   long agentic loop (`> ACTIVE_TASK_ROUND_THRESHOLD` rounds).
+///   long agentic loop (`> ACTIVE_TASK_ROUND_THRESHOLD` rounds). It carries the
+///   turn's round count against its round budget whenever one is set, so a long
+///   loop can see how much of the budget it has spent.
 /// - `[Working state]` — a one-line count of notes and open to-dos, rendered
 ///   every turn either count is non-zero, minus whichever half a fuller block
 ///   below already covers.
@@ -1190,9 +1217,24 @@ fn surfaced_blocks(
                     .is_some_and(|sid| active_summary_ids.contains(sid))
         });
         if !anchor_visible || many_tool_rounds {
+            // The round budget rides with the anchor (#1301). `MAX_TOOL_ROUNDS`
+            // is 200 and the number never used to reach the prompt, so the
+            // model could not tell round 3 from round 40 and could not spend
+            // the remainder deliberately. It is the same "you are deep in a
+            // loop" moment the anchor answers, so it costs no extra block and
+            // no second counter.
+            let budget = anchors
+                .tool_round_budget
+                .map_or_else(String::new, |budget| {
+                    format!(
+                        "\nYou have used {} of {budget} tool rounds in this turn. Answer from what \
+                     you have already collected where you can.",
+                        anchors.tool_rounds_since_anchor
+                    )
+                });
             blocks.push(SurfacedBlock::new(
                 PromptPart::CurrentTask,
-                format!("[Current task] {task}"),
+                format!("[Current task] {task}{budget}"),
             ));
         }
     }
@@ -4536,6 +4578,7 @@ mod tests {
                 recall: Some(surface),
                 working_state: crate::planning::WorkingState::default(),
                 tool_rounds_since_anchor: 0,
+                tool_round_budget: None,
             },
             &ContextProjection::default(),
             MAX_CONTEXT_MESSAGES,
@@ -5282,6 +5325,7 @@ mod tests {
                 pinned: None,
                 recall: None,
                 tool_rounds_since_anchor: ACTIVE_TASK_ROUND_THRESHOLD + 1,
+                tool_round_budget: None,
             },
             None,
             &default_estimate,

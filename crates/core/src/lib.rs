@@ -20,6 +20,7 @@ pub mod tag_normalize;
 pub(crate) mod telemetry;
 pub mod tool_advertising;
 pub mod tool_provenance;
+pub(crate) mod tool_repeat;
 pub mod tool_routing;
 pub mod tools;
 

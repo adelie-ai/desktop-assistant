@@ -174,7 +174,47 @@ fn cancellation_token_or_default() -> CancellationToken {
 }
 
 /// Maximum number of tool-calling rounds before giving up.
-const MAX_TOOL_ROUNDS: usize = 200;
+///
+/// `pub(crate)` so `tool_repeat`'s backoff ceiling can be measured against the
+/// turn it claims to bound. A ceiling asserted against its own constant passes
+/// for any value whatever, including one that puts the next run past this
+/// number - which is the freeze it exists to prevent.
+pub(crate) const MAX_TOOL_ROUNDS: usize = 200;
+
+/// Whether the repeat ledger may answer this tool's call from the transcript
+/// rather than running it (#1301).
+///
+/// Two names are exempt, for two different reasons.
+///
+/// `builtin_tool_search` because this loop parses its RESULT for a side effect
+/// of its own: it reads the tools the search found and activates them for the
+/// rounds that follow, so a search answered from the transcript would return
+/// the right text and quietly activate nothing - leaving the model calling a
+/// tool the next round no longer advertises.
+///
+/// `spawn_subagent` because it creates something. A repeat there is not waste
+/// to be saved but an action not taken, which is wrong in kind rather than in
+/// degree. Its detached form (`wait: false`) returns a fresh child id and can
+/// never repeat its own bytes, but `wait` DEFAULTS TO TRUE and the blocking
+/// form returns the child's answer verbatim - no id, no nonce - so two spawns
+/// of one prompt that agree make the key suppressible and the third would
+/// create no child at all.
+///
+/// Nothing wider. A tool whose side effects live inside the tool and whose
+/// output does not identify the call it came from cannot be recognised from
+/// here; the backoff, not an exemption list, is what bounds what those lose.
+/// Add a name only when this loop reads its output, or when the call itself
+/// makes something.
+///
+/// Exemption gives up the execution saving alone. A repeated result still
+/// becomes a pointer, so the context saving is unaffected.
+fn may_suppress(call_name: &str) -> bool {
+    call_name != TOOL_SEARCH_TOOL && call_name != SPAWN_SUBAGENT_TOOL
+}
+
+/// The name of the loop's own tool-search built-in, whose result the loop reads
+/// to activate what it found.
+const TOOL_SEARCH_TOOL: &str = "builtin_tool_search";
 
 /// The longest an interactive turn may run with no narration before the
 /// dispatch loop synthesises a line (#943).
@@ -2703,6 +2743,12 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
         // tool block finite. The lifetime is this turn: a new turn builds a
         // new ledger.
         let mut activations = crate::tool_advertising::ActivationLedger::new();
+        // What this turn has already dispatched (#1301). Keyed by the provider
+        // name and the normalized arguments, so an identical call is answered
+        // from the transcript instead of running the tool and appending the
+        // same bytes again. The lifetime is this turn: a new turn builds a new
+        // ledger, and the rule is in `crate::tool_repeat`.
+        let mut repeats = crate::tool_repeat::RepeatLedger::new();
         // Track whether hosted search has been demoted to local fallback.
         let mut hosted_search_demoted = false;
         // Tool-provenance gating (#741). A plain local of the turn: once a
@@ -3251,6 +3297,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 pinned: surfaces.pinned.as_deref(),
                 recall: recall_surface,
                 tool_rounds_since_anchor,
+                tool_round_budget: Some(u32::try_from(MAX_TOOL_ROUNDS).unwrap_or(u32::MAX)),
             };
             // Assembly is a pure function of its inputs, and this round may run
             // it twice, so it takes the conversation as an argument rather than
@@ -4165,6 +4212,55 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 // the model is working with is the last one the bound retires.
                 activations.mark_used(call_name, round);
 
+                // A call this turn has already made (#1301). The key is the
+                // provider name UNDER the connection that runs it, and the
+                // parsed arguments re-serialized, which sorts object keys and
+                // drops insignificant whitespace for free. Keying under the
+                // connection is the opposite choice from `burn_identity` below,
+                // deliberately - `crate::tool_repeat::RepeatKey` records why.
+                //
+                // Two things come of the ledger, and only one of them withholds
+                // work. A run that returns bytes the transcript already holds
+                // appends a pointer instead of a second copy, which is the
+                // context saving and cannot be stale. On top of that, a key
+                // that has repeated itself has some calls answered without
+                // running the tool at all - bounded by a doubling backoff, so
+                // no key can freeze and a value that changes is always seen.
+                let repeat_key = crate::tool_repeat::RepeatKey::new(
+                    routed.and_then(RoutedTool::connection),
+                    call_name,
+                    &arguments,
+                );
+                let repeat_verdict = repeats.observe_dispatch(&repeat_key, may_suppress(call_name));
+                if let crate::tool_repeat::RepeatVerdict::Suppress {
+                    message_id,
+                    attempts,
+                } = &repeat_verdict
+                {
+                    tracing::info!(
+                        tool = %Safe::name(&tool_call.name),
+                        attempts,
+                        "a repeated tool call was answered from the transcript instead of run"
+                    );
+                    let answer = crate::tool_repeat::suppressed_notice(message_id, *attempts);
+                    // Both halves of the pair, like the named-only branch
+                    // above: the feed never strands a started-but-never-
+                    // finished row (#252). Not a failure - nothing went wrong,
+                    // and the model gets its answer's address.
+                    notify_tool_event(ToolEvent::Started {
+                        name: summarize_tool_name(&tool_call.name),
+                        args: summarize_tool_value(&arguments),
+                    });
+                    notify_tool_event(ToolEvent::Finished {
+                        name: summarize_tool_name(&tool_call.name),
+                        ok: true,
+                        output: "answered from the transcript".to_string(),
+                    });
+                    conv.messages
+                        .push(Message::tool_result(&tool_call.id, &answer));
+                    continue;
+                }
+
                 notify_tool_event(ToolEvent::Started {
                     name: summarize_tool_name(&tool_call.name),
                     args: summarize_tool_value(&arguments),
@@ -4417,6 +4513,28 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                     None => result.clone(),
                 };
 
+                // An empty success is not an empty result (#1301). A tool that
+                // ran, succeeded and had nothing to say used to reach the model
+                // as a blank string, which reads exactly like a malformed
+                // request - so the model retried the same call verbatim. Say
+                // which of the two happened.
+                //
+                // Empty output only. A payload that carries the emptiness
+                // INSIDE the tool's own JSON is that tool's private shape, and
+                // guessing at it here would misread every server that spells it
+                // differently.
+                //
+                // `tool_ok` is defensive and no test can reach it false here:
+                // both failure arms above build `Error: {e}`, which is never
+                // blank. It stays because the marker's whole job is to say the
+                // call SUCCEEDED, so the day a failure arm learns to return
+                // nothing this must not call it a success.
+                let stored = if tool_ok && stored.trim().is_empty() {
+                    crate::context::EMPTY_TOOL_RESULT_NOTICE.to_string()
+                } else {
+                    stored
+                };
+
                 notify_tool_event(ToolEvent::Finished {
                     name: summarize_tool_name(&tool_call.name),
                     ok: tool_ok,
@@ -4427,7 +4545,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 // activate the discovered tools for subsequent rounds.
                 // Skip when hosted search is active (unless demoted to local fallback).
                 if (!use_hosted_search || hosted_search_demoted)
-                    && call_name == "builtin_tool_search"
+                    && call_name == TOOL_SEARCH_TOOL
                     && let Ok(found) = serde_json::from_str::<serde_json::Value>(&result)
                     && let Some(tools_arr) = found.get("tools").and_then(|v| v.as_array())
                 {
@@ -4626,8 +4744,32 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                     }
                 }
 
-                conv.messages
-                    .push(Message::tool_result(&tool_call.id, &stored));
+                // A result that repeats the one before it is not appended
+                // again (#1301). The tool RAN, so this is not a refusal and
+                // nothing here is stale - the model is pointed at the message
+                // carrying exactly these bytes, and told so in those words.
+                //
+                // Only where the bytes dwarf the address that replaces them.
+                // The ledger holds that line - `disposition` takes the size and
+                // stands aside below its floor - because "is the pointer
+                // shorter" alone starts pointing at 308 bytes, where the saving
+                // is 93 and one read-back round costs several times that.
+                // `planning`'s eviction refuses a pointer on the same grounds.
+                //
+                // Judged on the TOOL's own output, never on the message
+                // content: a pointer is shorter than the bytes it names, so
+                // digesting that instead would make every repeat read as a
+                // change.
+                let digest = crate::tool_repeat::ResultDigest::of(&stored);
+                let content = match repeats.disposition(&repeat_key, digest, stored.len()) {
+                    crate::tool_repeat::ResultDisposition::SameAs { message_id } => {
+                        crate::tool_repeat::same_bytes_notice(&message_id)
+                    }
+                    crate::tool_repeat::ResultDisposition::Store => stored.clone(),
+                };
+                let result = Message::tool_result(&tool_call.id, content);
+                repeats.record(&repeat_key, &result.id, digest, stored.len());
+                conv.messages.push(result);
             }
 
             // The identities this round met take effect now, and not one tool
@@ -4714,6 +4856,10 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                     // the turn asked at its start and has long since acted on.
                     recall: None,
                     tool_rounds_since_anchor: u32::MAX,
+                    // No budget line: the round count here is a sentinel that
+                    // forces the anchor to re-surface, and the wind-down is not
+                    // deciding whether to spend another round (#1301).
+                    tool_round_budget: None,
                 },
                 &projection,
                 target_window,
@@ -7735,17 +7881,32 @@ mod tests {
         // tainted on the spawn itself would refuse the second as a
         // code-execution tool, capping the shipped workflow at one child.
         let tools = vec![tool_def(SPAWN_SUBAGENT_TOOL)];
-        let mut results = HashMap::new();
-        results.insert(
-            SPAWN_SUBAGENT_TOOL.to_string(),
-            r#"{"child_task_id":"t-1","child_conversation_id":"c-1"}"#.to_string(),
+        // A fresh child per call, because that is what `spawn_subagent` does:
+        // it creates a conversation and registers a task, so two spawns cannot
+        // answer with one id. A fixture that returned a constant would make two
+        // distinct children look like one repeated call (#1301).
+        let executor = ScriptedToolExecutor::new(
+            tools,
+            vec![
+                Ok(r#"{"child_task_id":"t-1","child_conversation_id":"c-1"}"#.to_string()),
+                Ok(r#"{"child_task_id":"t-2","child_conversation_id":"c-2"}"#.to_string()),
+            ],
         );
         let responses = vec![
             calls("s1", SPAWN_SUBAGENT_TOOL),
             calls("s2", SPAWN_SUBAGENT_TOOL),
             LlmResponse::text("both away"),
         ];
-        let handler = make_tool_handler(responses, tools, results);
+        let counter = Arc::new(AtomicU32::new(0));
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            ToolCallingLlm::new(responses),
+            executor,
+            Box::new(move || {
+                let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                format!("conv-spawn-{n}")
+            }),
+        );
         let conv = handler
             .create_conversation("t".into(), vec![])
             .await
@@ -7762,7 +7923,13 @@ mod tests {
             .expect("the turn completes");
 
         assert_eq!(answer, "both away");
-        let results = tool_results(&handler, &conv.id).await;
+        let stored = handler.get_conversation(&conv.id).await.unwrap();
+        let results: Vec<String> = stored
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .map(|m| m.content.clone())
+            .collect();
         assert_eq!(results.len(), 2, "both spawns must record a result");
         for (i, r) in results.iter().enumerate() {
             assert!(
@@ -18727,6 +18894,1035 @@ mod tests {
             .expect("turn completes");
 
         assert_eq!(last_prompt_result(&prompts, "c1"), "ok");
+    }
+
+    // --- #1301: a repeated tool call is answered from the transcript --------
+
+    /// The one tool every repeat test calls.
+    fn probe_tool() -> Vec<ToolDefinition> {
+        vec![ToolDefinition::new(
+            "probe",
+            "answers a question",
+            serde_json::json!({"type": "object"}),
+        )]
+    }
+
+    /// A handler whose single tool answers from a script, plus a handle on
+    /// every call that actually reached the executor. The handle is what these
+    /// tests assert on: a reply-shaped assertion passes when the tool runs and
+    /// its output is merely deduplicated, which is not the fix.
+    #[allow(clippy::type_complexity)]
+    fn repeat_handler(
+        responses: Vec<LlmResponse>,
+        script: Vec<Result<String, String>>,
+    ) -> (
+        ConversationHandler<MockStore, ToolCallingLlm, ScriptedToolExecutor>,
+        Arc<Mutex<Vec<serde_json::Value>>>,
+    ) {
+        let executor = ScriptedToolExecutor::new(probe_tool(), script);
+        let calls = executor.calls();
+        let counter = Arc::new(AtomicU32::new(0));
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            ToolCallingLlm::new(responses),
+            executor,
+            Box::new(move || {
+                let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                format!("conv-repeat-{n}")
+            }),
+        );
+        (handler, calls)
+    }
+
+    /// A tool result the repeat rule applies to. Below its size floor a result
+    /// is left alone, because answering it from the transcript would cost more
+    /// context than the bytes it stands in for - so a test driving a two-byte
+    /// answer would exercise nothing.
+    fn big_result(label: &str) -> String {
+        format!("{label}{}", "x".repeat(1024))
+    }
+
+    /// One tool-calling round per entry, then a closing text answer.
+    fn probe_rounds(args: &[&str]) -> Vec<LlmResponse> {
+        let mut responses: Vec<LlmResponse> = args
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                LlmResponse::with_tool_calls(
+                    "",
+                    vec![ToolCall::new(format!("c{}", i + 1), "probe", *a)],
+                )
+            })
+            .collect();
+        responses.push(LlmResponse::text("done"));
+        responses
+    }
+
+    /// Every tool result the turn stored, in order.
+    fn stored_tool_results(conv: &Conversation) -> Vec<&Message> {
+        conv.messages
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_third_identical_call_with_unchanging_output_does_not_reach_the_executor() {
+        // The rule: the first call runs, the second runs and is labelled a
+        // repeat, and the third is answered from the transcript because every
+        // execution so far returned the same bytes.
+        let args = r#"{"q":"how big"}"#;
+        let (handler, calls) = repeat_handler(
+            probe_rounds(&[args, args, args]),
+            vec![
+                Ok(big_result("42")),
+                Ok(big_result("42")),
+                Ok(big_result("42")),
+            ],
+        );
+        let conv = handler
+            .create_conversation("Chat".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "how big".into(), noop_callback(), noop_status())
+            .await
+            .expect("turn completes");
+
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            2,
+            "the third identical call must not reach the tool"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repeat_result_names_the_message_holding_the_bytes_and_the_readback_tool() {
+        let args = r#"{"q":"how big"}"#;
+        let (handler, calls) = repeat_handler(
+            probe_rounds(&[args, args, args]),
+            vec![
+                Ok(big_result("42")),
+                Ok(big_result("42")),
+                Ok(big_result("42")),
+            ],
+        );
+        let conv = handler
+            .create_conversation("Chat".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "how big".into(), noop_callback(), noop_status())
+            .await
+            .expect("turn completes");
+        assert_eq!(calls.lock().unwrap().len(), 2);
+
+        let stored = handler.get_conversation(&conv.id).await.unwrap();
+        let results = stored_tool_results(&stored);
+        assert_eq!(results.len(), 3, "every call still gets a tool result");
+        let first_id = results[0].id.clone();
+        let suppressed = &results[2].content;
+        assert!(
+            suppressed.contains(&first_id),
+            "the suppressed result must name the first result's message id; got: {suppressed}"
+        );
+        assert!(
+            suppressed.contains(crate::ports::transcript::TRANSCRIPT_GET_TOOL),
+            "the suppressed result must say how to read the first result back; got: {suppressed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_later_suppressed_repeat_tells_the_model_how_many_times_it_has_asked() {
+        // A suppressed call never reaches the recording site, so a ledger that
+        // counted only executions would tell the fourth identical call it was
+        // the second - the number stops counting where it starts mattering.
+        let args = r#"{"q":"how big"}"#;
+        let (handler, calls) = repeat_handler(
+            probe_rounds(&[args, args, args, args]),
+            vec![
+                Ok(big_result("42")),
+                Ok(big_result("42")),
+                Ok(big_result("42")),
+                Ok(big_result("42")),
+            ],
+        );
+        let conv = handler
+            .create_conversation("Chat".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "how big".into(), noop_callback(), noop_status())
+            .await
+            .expect("turn completes");
+        assert_eq!(calls.lock().unwrap().len(), 2, "only the first two run");
+
+        let stored = handler.get_conversation(&conv.id).await.unwrap();
+        let results = stored_tool_results(&stored);
+        assert_eq!(results.len(), 4, "every call still gets a tool result");
+        assert!(
+            results[3].content.contains("4 times"),
+            "the fourth call must be told it is the fourth; got: {}",
+            results[3].content
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_bytes_land_in_the_transcript_once_however_the_call_is_answered() {
+        // Three calls: two run and one is answered from the transcript. The
+        // bytes land once between them, because a run that reproduces them
+        // points at them and a suppressed call never had them to append.
+        let args = r#"{"q":"the page"}"#;
+        let payload = format!("PAYLOAD-MARKER{}", "x".repeat(8000));
+        let (handler, _calls) = repeat_handler(
+            probe_rounds(&[args, args, args]),
+            vec![
+                Ok(payload.clone()),
+                Ok(payload.clone()),
+                Ok(payload.clone()),
+            ],
+        );
+        let conv = handler
+            .create_conversation("Chat".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "read it".into(), noop_callback(), noop_status())
+            .await
+            .expect("turn completes");
+
+        let stored = handler.get_conversation(&conv.id).await.unwrap();
+        let copies = stored
+            .messages
+            .iter()
+            .filter(|m| m.content.contains("PAYLOAD-MARKER"))
+            .count();
+        assert_eq!(
+            copies, 1,
+            "the transcript must hold the bytes once, however often the call is made"
+        );
+
+        // The transcript is what assembly draws on, so what a later call adds
+        // to it is what it adds to the context. Each adds a pointer.
+        //
+        // Asserted here rather than on a recorded prompt: eviction may already
+        // have replaced the first copy with its own read-back notice by the
+        // last round, so counting copies in the prompt measures the eviction's
+        // timing rather than this rule.
+        let results = stored_tool_results(&stored);
+        assert_eq!(results.len(), 3, "every call still gets a tool result");
+        for later in &results[1..] {
+            assert!(
+                later.content.len() * 4 < payload.len(),
+                "a later result must be a pointer, not a copy; it was {} bytes \
+                 against a {}-byte payload",
+                later.content.len(),
+                payload.len()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reordered_keys_and_extra_whitespace_land_on_the_same_repeat_key() {
+        // The same call, written three ways. An over-strict comparison treats
+        // these as three different calls, does nothing, and leaves the feature
+        // looking done.
+        let (handler, calls) = repeat_handler(
+            probe_rounds(&[
+                r#"{"a":1,"b":2}"#,
+                r#"{"b":2,"a":1}"#,
+                "{ \"a\" : 1 ,\n  \"b\" : 2 }",
+            ]),
+            vec![
+                Ok(big_result("42")),
+                Ok(big_result("42")),
+                Ok(big_result("42")),
+            ],
+        );
+        let conv = handler
+            .create_conversation("Chat".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "how big".into(), noop_callback(), noop_status())
+            .await
+            .expect("turn completes");
+
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            2,
+            "reordered keys and different whitespace must land on the same key"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tool_whose_output_changes_on_its_first_repeat_is_never_suppressed() {
+        // The polling guard at its simplest: a tool that answers differently by
+        // its second run never becomes suppressible at all, so it runs every
+        // time it is called, however many times that is.
+        //
+        // The harder case - a tool that answers identically twice and only then
+        // changes - is held by
+        // `a_poll_whose_value_changes_after_two_identical_results_reaches_the_model`,
+        // because the backoff is what makes it recoverable rather than lost.
+        let args = r#"{"task_id":"t1"}"#;
+        let (handler, calls) = repeat_handler(
+            probe_rounds(&[args, args, args, args]),
+            vec![
+                Ok("v1".to_string()),
+                Ok("v2".to_string()),
+                Ok("v3".to_string()),
+                Ok("v4".to_string()),
+            ],
+        );
+        let conv = handler
+            .create_conversation("Chat".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "poll it".into(), noop_callback(), noop_status())
+            .await
+            .expect("turn completes");
+
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            4,
+            "a time-varying tool must run every time it is called"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_identical_call_runs_and_returns_a_pointer_to_the_first_result() {
+        // The ticket asks that the model be told the call is a repeat and where
+        // the first result is. Both are true of the pointer, and the pointer
+        // also keeps the bytes out of the context - which the note that used to
+        // sit above them did not.
+        let args = r#"{"q":"how big"}"#;
+        let (handler, calls) = repeat_handler(
+            probe_rounds(&[args, args]),
+            vec![
+                Ok(big_result("TOOL-OUTPUT-42")),
+                Ok(big_result("TOOL-OUTPUT-42")),
+            ],
+        );
+        let conv = handler
+            .create_conversation("Chat".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "how big".into(), noop_callback(), noop_status())
+            .await
+            .expect("turn completes");
+
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            2,
+            "the second call still runs - two matching runs are what the rule \
+             needs before it withholds anything"
+        );
+        let stored = handler.get_conversation(&conv.id).await.unwrap();
+        let results = stored_tool_results(&stored);
+        assert_eq!(results.len(), 2);
+        let first_id = results[0].id.clone();
+        let second = &results[1].content;
+        assert!(
+            second.contains(&first_id),
+            "the second result must name where the bytes are; got: {second}"
+        );
+        assert!(
+            !second.contains("TOOL-OUTPUT-42"),
+            "the second result must point at the bytes, not repeat them; got: {second}"
+        );
+        assert!(
+            results[0].content.contains("TOOL-OUTPUT-42"),
+            "the first result must carry the tool's own output"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repeat_in_a_later_turn_is_not_suppressed_by_the_earlier_turns_ledger() {
+        let args = r#"{"q":"how big"}"#;
+        let mut responses = probe_rounds(&[args, args, args]);
+        // The first message of a conversation also spends one LLM call on the
+        // generated title, so the second turn's script starts after it.
+        responses.push(LlmResponse::text("A title"));
+        responses.extend(probe_rounds(&[args]));
+        let (handler, calls) = repeat_handler(
+            responses,
+            vec![
+                Ok(big_result("42")),
+                Ok(big_result("42")),
+                Ok(big_result("42")),
+                Ok(big_result("42")),
+            ],
+        );
+        let conv = handler
+            .create_conversation("Chat".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "how big".into(), noop_callback(), noop_status())
+            .await
+            .expect("first turn completes");
+        assert_eq!(calls.lock().unwrap().len(), 2, "first turn ran it twice");
+
+        handler
+            .send_prompt(&conv.id, "again".into(), noop_callback(), noop_status())
+            .await
+            .expect("second turn completes");
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            3,
+            "the ledger is scoped to one turn, so a new turn starts clean"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_long_tool_loop_surfaces_the_round_number_and_the_round_budget() {
+        // The model cannot ration what it cannot see. Seven rounds of distinct
+        // calls, so nothing is suppressed and the count is the round count.
+        let args: Vec<String> = (0..7).map(|i| format!(r#"{{"q":"{i}"}}"#)).collect();
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let script: Vec<Result<String, String>> =
+            (0..7).map(|i| Ok(format!("answer-{i}"))).collect();
+        let (handler, _calls) = repeat_handler(probe_rounds(&refs), script);
+        let prompts = handler.llm.prompts();
+        let conv = handler
+            .create_conversation("Chat".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "work it".into(), noop_callback(), noop_status())
+            .await
+            .expect("turn completes");
+
+        let recorded = prompts.lock().unwrap();
+        let last = recorded
+            .iter()
+            .rev()
+            .find(|p| p.len() > 2)
+            .expect("a prompt carrying the turn's history");
+        let wanted = format!("used 7 of {MAX_TOOL_ROUNDS} tool rounds");
+        assert!(
+            last.iter().any(|m| m.content.contains(&wanted)),
+            "the round number and the budget must reach the prompt; looked for {wanted:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_successful_tool_returning_no_output_says_so_instead_of_reading_as_an_error() {
+        let (handler, _calls) = repeat_handler(
+            probe_rounds(&[r#"{"q":"nothing"}"#]),
+            vec![Ok(String::new())],
+        );
+        let prompts = handler.llm.prompts();
+        let conv = handler
+            .create_conversation("Chat".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "ask".into(), noop_callback(), noop_status())
+            .await
+            .expect("turn completes");
+
+        let result = last_prompt_result(&prompts, "c1");
+        assert!(
+            !result.trim().is_empty(),
+            "an empty success must not reach the model as an empty result"
+        );
+        assert!(
+            result.contains("succeeded") && result.contains("no output"),
+            "an empty success must say it succeeded and returned nothing; got: {result}"
+        );
+        assert!(
+            !result.starts_with("Error"),
+            "an empty success must not read as an error; got: {result}"
+        );
+    }
+
+    // --- #1301: bounded backoff, and a pointer instead of repeated bytes ----
+
+    #[tokio::test]
+    async fn a_turn_of_identical_suppressed_calls_still_winds_down_and_persists() {
+        // The round cap is exercised elsewhere by 201 DISTINCT calls, which is
+        // the easy shape: every round dispatches. This is the shape the repeat
+        // rule creates - one identical call over the whole budget, most of its
+        // rounds answered from the transcript and never reaching a tool - and
+        // nothing covered it. A turn that spends its rounds this way must still
+        // reach the wind-down and keep everything it did.
+        let args = r#"{"q":"the page"}"#;
+        // Exactly the budget in tool rounds, so the cap fires; the response
+        // after them is the one the wind-down call reads.
+        let calls_in: Vec<&str> = std::iter::repeat_n(args, MAX_TOOL_ROUNDS).collect();
+        let mut responses = probe_rounds(&calls_in);
+        responses.pop();
+        responses.push(LlmResponse::text("I hit the tool-call limit."));
+        let (handler, calls) = repeat_handler(
+            responses,
+            std::iter::repeat_n(Ok(big_result("the page")), MAX_TOOL_ROUNDS).collect(),
+        );
+        let conv = handler
+            .create_conversation("Chat".into(), vec![])
+            .await
+            .unwrap();
+
+        let closing = handler
+            .send_prompt(&conv.id, "read it".into(), noop_callback(), noop_status())
+            .await
+            .expect("a suppressed turn winds down to Ok, not Err");
+        assert!(
+            closing.starts_with("I hit the tool-call limit"),
+            "the wind-down closing is returned, got: {closing}"
+        );
+        // Most rounds were answered from the transcript, and the tool still ran
+        // often enough that the key never froze.
+        let ran = calls.lock().unwrap().len();
+        assert!(
+            ran > 10 && ran < MAX_TOOL_ROUNDS / 4,
+            "the rule must save most of the executions and none of the rounds; \
+             the tool ran {ran} times in {} rounds",
+            MAX_TOOL_ROUNDS
+        );
+        let persisted = handler.get_conversation(&conv.id).await.unwrap();
+        assert!(
+            persisted.messages.iter().any(|m| m.content == "read it"),
+            "the user's prompt must survive a turn spent on suppressed calls"
+        );
+        assert_eq!(
+            persisted
+                .messages
+                .last()
+                .expect("non-empty history")
+                .content,
+            closing
+        );
+    }
+
+    #[tokio::test]
+    async fn a_key_at_its_suppression_threshold_runs_again_and_the_threshold_doubles() {
+        // Suppression must never be terminal. Two identical runs make the key
+        // suppressible; from there the tool runs again every time the
+        // suppression counter reaches the threshold, and the threshold doubles.
+        //
+        // Twenty-one calls, because ten cannot tell the doubling from a fixed
+        // bound of two: both run the tool four times over ten calls. Over
+        // twenty-one a fixed bound runs it eight times and the doubling runs it
+        // five - on calls 1, 2, 5, 10 and 19.
+        let args = r#"{"q":"how big"}"#;
+        let calls_in: Vec<&str> = std::iter::repeat_n(args, 21).collect();
+        let (handler, calls) = repeat_handler(
+            probe_rounds(&calls_in),
+            std::iter::repeat_n(Ok(big_result("42")), 21).collect(),
+        );
+        let conv = handler
+            .create_conversation("Chat".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "how big".into(), noop_callback(), noop_status())
+            .await
+            .expect("turn completes");
+
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            5,
+            "twenty-one identical calls must run the tool five times - the \
+             threshold starts at two and doubles each time it fires"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_small_repeated_result_costs_the_transcript_no_more_than_its_own_bytes() {
+        // The inversion this rule must not have. Both notices run to hundreds
+        // of bytes, so answering a short result with one makes the context
+        // BIGGER - and short results are also where a stale answer costs most,
+        // a poll's status line being a few dozen bytes. Below the floor the
+        // rule stands aside on both counts.
+        let args = r#"{"task_id":"t1"}"#;
+        let small = r#"{"status":"running"}"#;
+        let calls_in: Vec<&str> = std::iter::repeat_n(args, 6).collect();
+        let (handler, calls) = repeat_handler(
+            probe_rounds(&calls_in),
+            std::iter::repeat_n(Ok(small.to_string()), 6).collect(),
+        );
+        let conv = handler
+            .create_conversation("Chat".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "poll it".into(), noop_callback(), noop_status())
+            .await
+            .expect("turn completes");
+
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            6,
+            "a result too small to be worth replacing must never be withheld"
+        );
+        let stored = handler.get_conversation(&conv.id).await.unwrap();
+        for r in stored_tool_results(&stored) {
+            assert_eq!(
+                r.content, small,
+                "every result must be its own bytes, not a longer address for them"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_poll_whose_value_changes_after_two_identical_results_reaches_the_model() {
+        // The case the terminal rule broke, and the most important test here. A
+        // subagent poll reads "running" twice, is answered from the transcript
+        // for a bounded number of rounds, and then runs again - and the model
+        // gets the new value inside the same turn.
+        let args = r#"{"task_id":"t1"}"#;
+        let calls_in: Vec<&str> = std::iter::repeat_n(args, 5).collect();
+        let (handler, calls) = repeat_handler(
+            probe_rounds(&calls_in),
+            vec![
+                Ok(big_result(r#"{"status":"running"}"#)),
+                Ok(big_result(r#"{"status":"running"}"#)),
+                Ok(big_result(
+                    r#"{"status":"completed","result":"THE-ANSWER"}"#,
+                )),
+            ],
+        );
+        let conv = handler
+            .create_conversation("Chat".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "poll it".into(), noop_callback(), noop_status())
+            .await
+            .expect("turn completes");
+
+        assert_eq!(calls.lock().unwrap().len(), 3, "the poll must run again");
+        let stored = handler.get_conversation(&conv.id).await.unwrap();
+        assert!(
+            stored
+                .messages
+                .iter()
+                .any(|m| m.content.contains("THE-ANSWER")),
+            "the changed value must reach the model in this turn; the turn held: {:?}",
+            stored
+                .messages
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A tool pair over one mutable value: `read` returns it, `write` replaces
+    /// it. The point is the bytes the model receives, not what ran.
+    struct FileToolExecutor {
+        tools: Vec<ToolDefinition>,
+        content: Mutex<String>,
+    }
+
+    impl ToolExecutor for FileToolExecutor {
+        async fn core_tools(&self) -> Vec<ToolDefinition> {
+            self.tools.clone()
+        }
+        async fn search_tools(&self, _query: &str) -> Result<Vec<ToolDefinition>, CoreError> {
+            Ok(vec![])
+        }
+        async fn tool_definition(&self, name: &str) -> Result<Option<ToolDefinition>, CoreError> {
+            Ok(self.tools.iter().find(|t| t.name == name).cloned())
+        }
+        async fn execute_tool(
+            &self,
+            name: &str,
+            arguments: serde_json::Value,
+        ) -> Result<String, CoreError> {
+            match name {
+                "read" => Ok(self.content.lock().unwrap().clone()),
+                "write" => {
+                    let text = arguments
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    *self.content.lock().unwrap() = text;
+                    Ok("written".to_string())
+                }
+                other => Err(CoreError::ToolExecution(format!("unknown tool: {other}"))),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_read_after_a_write_reaches_the_model_within_the_backoff_bound() {
+        // Read, read, write, then read until the model has the written bytes.
+        // Reads three and four are answered from the transcript and carry the
+        // pre-write text; read five runs and carries the write. The bound is
+        // what makes this finite - it is not that no read is ever answered from
+        // the transcript.
+        let tools = vec![
+            ToolDefinition::new(
+                "read",
+                "read the file",
+                serde_json::json!({"type":"object"}),
+            ),
+            ToolDefinition::new(
+                "write",
+                "write the file",
+                serde_json::json!({"type":"object","properties":{"text":{"type":"string"}}}),
+            ),
+        ];
+        let read = |i: usize| {
+            LlmResponse::with_tool_calls("", vec![ToolCall::new(format!("r{i}"), "read", "{}")])
+        };
+        let responses = vec![
+            read(1),
+            read(2),
+            LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new(
+                    "w1",
+                    "write",
+                    r#"{"text":"AFTER-THE-WRITE"}"#,
+                )],
+            ),
+            read(3),
+            read(4),
+            read(5),
+            LlmResponse::text("done"),
+        ];
+        let counter = Arc::new(AtomicU32::new(0));
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            ToolCallingLlm::new(responses),
+            FileToolExecutor {
+                tools,
+                content: Mutex::new(big_result("BEFORE-THE-WRITE")),
+            },
+            Box::new(move || {
+                let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                format!("conv-rw-{n}")
+            }),
+        );
+        let conv = handler
+            .create_conversation("Chat".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "edit it".into(), noop_callback(), noop_status())
+            .await
+            .expect("turn completes");
+
+        let stored = handler.get_conversation(&conv.id).await.unwrap();
+        let results = stored_tool_results(&stored);
+        let reads: Vec<&str> = results
+            .iter()
+            .filter(|m| !m.content.contains("written"))
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(reads.len(), 5, "five reads, one result each");
+        // The middle of the shape, or this passes with suppression deleted: the
+        // third read is answered from the transcript, and what it points at is
+        // the pre-write text. That is the cost the bound exists to cap.
+        assert!(
+            reads[2].contains("did not run"),
+            "the third read must be answered from the transcript; got: {}",
+            reads[2]
+        );
+        assert!(
+            !reads[2].contains("AFTER-THE-WRITE"),
+            "and it must not carry the write it cannot have seen; got: {}",
+            reads[2]
+        );
+        // And the end of it: the bound fires and the model gets the write.
+        assert!(
+            reads[4].contains("AFTER-THE-WRITE"),
+            "the last read must carry the written bytes; got: {}",
+            reads[4]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_executed_call_returning_identical_bytes_appends_a_pointer_not_the_bytes() {
+        // The context fix, and it stands on its own: the tool RAN, so nothing
+        // here is stale. Appending the same bytes twice is what fed the
+        // fetch/evict/refetch loop, and it does not need suppression to stop.
+        let args = r#"{"q":"the page"}"#;
+        let payload = format!("PAYLOAD-MARKER{}", "x".repeat(8000));
+        let (handler, calls) = repeat_handler(
+            probe_rounds(&[args, args]),
+            vec![Ok(payload.clone()), Ok(payload.clone())],
+        );
+        let conv = handler
+            .create_conversation("Chat".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "read it".into(), noop_callback(), noop_status())
+            .await
+            .expect("turn completes");
+
+        assert_eq!(calls.lock().unwrap().len(), 2, "both calls ran");
+        let stored = handler.get_conversation(&conv.id).await.unwrap();
+        let copies = stored
+            .messages
+            .iter()
+            .filter(|m| m.content.contains("PAYLOAD-MARKER"))
+            .count();
+        assert_eq!(
+            copies, 1,
+            "the second run returned the same bytes, so the transcript must \
+             hold them once and point at them the second time"
+        );
+        let results = stored_tool_results(&stored);
+        assert_eq!(results.len(), 2);
+        assert!(
+            results[1].content.contains(&results[0].id),
+            "the pointer must name the message holding the bytes; got: {}",
+            results[1].content
+        );
+        assert!(
+            results[1].content.len() * 4 < payload.len(),
+            "the pointer must be a pointer, not a copy"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_suppressed_result_says_the_tool_did_not_run_and_a_pointer_does_not() {
+        // Three results now exist and the model must tell them apart: bytes it
+        // has not seen, a pointer to bytes a run just reproduced, and a pointer
+        // to an earlier run that did not happen again. Only the last may be
+        // stale, and only the last says so.
+        let args = r#"{"q":"how big"}"#;
+        let (handler, _calls) = repeat_handler(
+            probe_rounds(&[args, args, args]),
+            vec![
+                Ok(big_result("42")),
+                Ok(big_result("42")),
+                Ok(big_result("42")),
+            ],
+        );
+        let conv = handler
+            .create_conversation("Chat".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "how big".into(), noop_callback(), noop_status())
+            .await
+            .expect("turn completes");
+
+        let stored = handler.get_conversation(&conv.id).await.unwrap();
+        let results = stored_tool_results(&stored);
+        assert_eq!(results.len(), 3);
+        assert!(
+            results[2].content.contains("did not run"),
+            "a suppressed result must say the tool did not run; got: {}",
+            results[2].content
+        );
+        assert!(
+            !results[1].content.contains("did not run"),
+            "a pointer from a call that DID run must not claim otherwise; got: {}",
+            results[1].content
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_subagent_is_never_suppressed() {
+        // A repeat here is not waste to be saved but a child not created. The
+        // detached form returns a fresh id and can never repeat its own bytes,
+        // but `wait` defaults to TRUE and the blocking form returns the child's
+        // answer verbatim - no id, no nonce - so two spawns of one prompt that
+        // agree would make the key suppressible and the third would create
+        // nothing.
+        let tools = vec![tool_def(SPAWN_SUBAGENT_TOOL)];
+        let answer = big_result("the child's answer: ");
+        let executor = ScriptedToolExecutor::new(
+            tools,
+            vec![
+                Ok(answer.clone()),
+                Ok(answer.clone()),
+                Ok(answer.clone()),
+                Ok(answer.clone()),
+            ],
+        );
+        let spawns = executor.calls();
+        let counter = Arc::new(AtomicU32::new(0));
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            ToolCallingLlm::new(vec![
+                calls("s1", SPAWN_SUBAGENT_TOOL),
+                calls("s2", SPAWN_SUBAGENT_TOOL),
+                calls("s3", SPAWN_SUBAGENT_TOOL),
+                calls("s4", SPAWN_SUBAGENT_TOOL),
+                LlmResponse::text("all away"),
+            ]),
+            executor,
+            Box::new(move || {
+                let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                format!("conv-spawn-rep-{n}")
+            }),
+        );
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(
+                &conv.id,
+                "research it".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await
+            .expect("turn completes");
+
+        assert_eq!(
+            spawns.lock().unwrap().len(),
+            4,
+            "every spawn must reach the tool - a suppressed one creates no child"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_same_provider_tool_on_two_hosts_is_two_keys() {
+        // Reading a path on the daemon says nothing about the same path on the
+        // user's own machine. Merging them can serve one host's bytes as the
+        // other's, which is a wrong answer rather than waste.
+        use crate::ports::client_tools::with_client_tools;
+
+        let daemon_call = |i: usize| {
+            LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new(
+                    format!("d{i}"),
+                    "daemon_read_file",
+                    r#"{"path":"/etc/hosts"}"#,
+                )],
+            )
+        };
+        let responses = vec![
+            daemon_call(1),
+            daemon_call(2),
+            daemon_call(3),
+            LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new(
+                    "c1",
+                    "client_read_file",
+                    r#"{"path":"/etc/hosts"}"#,
+                )],
+            ),
+            LlmResponse::text("done"),
+        ];
+        // A file worth re-reading. Below the rule's size floor the daemon's key
+        // never becomes suppressible, and this test would pass with the
+        // connection stripped from the key - the wrong-answer case it exists to
+        // catch.
+        let daemon_ran = Arc::new(Mutex::new(Vec::new()));
+        let (handler, _advertised) = two_sided_handler(
+            responses,
+            vec![daemon_read_file()],
+            vec![],
+            HashMap::from([("read_file".to_string(), big_result("daemon result"))]),
+            Arc::clone(&daemon_ran),
+        );
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
+        let device_ran = Arc::new(Mutex::new(Vec::new()));
+        with_client_tools(
+            client_port(vec![device_read_file()], &device_ran),
+            handler.send_prompt(&conv.id, "read it".into(), noop_callback(), noop_status()),
+        )
+        .await
+        .expect("turn completes");
+
+        assert_eq!(
+            device_ran.lock().unwrap().len(),
+            1,
+            "the client's read is the first call of its own key and must run, \
+             however many times the daemon's read has been made"
+        );
+    }
+
+    #[tokio::test]
+    async fn builtin_tool_search_is_never_suppressed() {
+        // The loop reads this tool's RESULT to activate what it found, so a
+        // call answered from the transcript would return the right text and
+        // activate nothing.
+        //
+        // The run count is what this test holds. The activation check below is
+        // a consequence, not a second enforcer: activations from the first two
+        // searches persist whether or not the third runs, so it would pass
+        // without the exemption.
+        // A description long enough that the search result clears the rule's
+        // size floor, as a real fleet search does. Below it the key never
+        // becomes suppressible and this test passes with the exemption deleted.
+        let fleet = vec![ToolDefinition::new(
+            "fleet_tool_00",
+            big_result("a fleet tool that "),
+            serde_json::json!({"type": "object"}),
+        )];
+        let hits: Vec<serde_json::Value> = fleet
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "name": format!("daemon_{}", t.name),
+                    "description": t.description,
+                    "runs_on": "daemon",
+                })
+            })
+            .collect();
+        let search_result = serde_json::json!({"ok": true, "tools": hits}).to_string();
+        let search = |i: usize| {
+            LlmResponse::with_tool_calls(
+                "",
+                vec![ToolCall::new(
+                    format!("s{i}"),
+                    "daemon_builtin_tool_search",
+                    r#"{"query":"anything"}"#,
+                )],
+            )
+        };
+        let executed = Arc::new(Mutex::new(Vec::new()));
+        let (handler, advertised) = two_sided_handler(
+            vec![search(1), search(2), search(3), LlmResponse::text("done")],
+            vec![search_tool()],
+            fleet,
+            HashMap::from([("builtin_tool_search".to_string(), search_result)]),
+            Arc::clone(&executed),
+        );
+        let conv = handler
+            .create_conversation("t".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "find it".into(), noop_callback(), noop_status())
+            .await
+            .expect("turn completes");
+
+        let searches = executed
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(name, _)| name == "builtin_tool_search")
+            .count();
+        assert_eq!(
+            searches, 3,
+            "every search must run - the loop reads the result to activate"
+        );
+        // The last recorded set belongs to the first-message title call, which
+        // is offered no tools at all; the turn's own last round is the one
+        // before it.
+        let rounds = advertised.lock().unwrap().clone();
+        let last = rounds
+            .iter()
+            .rev()
+            .find(|set| !set.is_empty())
+            .expect("a round that was offered tools");
+        assert!(
+            last.iter().any(|t| t.name.contains("fleet_tool_00")),
+            "the repeated search must still activate what it found; the last \
+             round advertised {:?}",
+            last.iter().map(|t| t.name.as_str()).collect::<Vec<_>>()
+        );
     }
 }
 
