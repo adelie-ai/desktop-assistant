@@ -18975,7 +18975,7 @@ mod tests {
     #[tokio::test]
     async fn a_suppressed_repeat_does_not_append_the_result_bytes_again() {
         let args = r#"{"q":"the page"}"#;
-        let payload = format!("PAYLOAD-MARKER{}", "x".repeat(800));
+        let payload = format!("PAYLOAD-MARKER{}", "x".repeat(8000));
         let (handler, _calls) = repeat_handler(
             probe_rounds(&[args, args, args]),
             vec![
@@ -18984,7 +18984,6 @@ mod tests {
                 Ok(payload.clone()),
             ],
         );
-        let prompts = handler.llm.prompts();
         let conv = handler
             .create_conversation("Chat".into(), vec![])
             .await
@@ -19005,14 +19004,21 @@ mod tests {
             "the third call must not put a third copy of the result in the transcript"
         );
 
-        let last = prompts.lock().unwrap().last().cloned().unwrap_or_default();
-        let in_prompt = last
-            .iter()
-            .filter(|m| m.content.contains("PAYLOAD-MARKER"))
-            .count();
+        // The transcript is what assembly draws on, so what the third call adds
+        // to it is what it adds to the context. It adds a pointer, not a copy.
+        //
+        // Asserted here rather than on a recorded prompt: eviction may already
+        // have replaced the first copy with its own read-back notice by the
+        // last round, so counting copies in the prompt measures the eviction's
+        // timing rather than this rule.
+        let results = stored_tool_results(&stored);
+        assert_eq!(results.len(), 3, "every call still gets a tool result");
         assert!(
-            in_prompt <= 2,
-            "the assembled prompt must not carry a third copy of the result; got {in_prompt}"
+            results[2].content.len() * 4 < payload.len(),
+            "the suppressed result must be a pointer, not a copy; it was {} bytes \
+             against a {}-byte payload",
+            results[2].content.len(),
+            payload.len()
         );
     }
 
@@ -19050,9 +19056,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_tool_whose_output_changes_between_calls_is_never_suppressed() {
-        // The polling guard. `get_subagent_status` is polled in a loop in this
-        // codebase; a poll whose value changes must always run.
+    async fn a_tool_whose_output_changes_on_its_first_repeat_is_never_suppressed() {
+        // The polling guard, and the name says exactly how far it reaches. A
+        // tool that answers differently by its second run is time-varying for
+        // the rest of the turn and always runs again.
+        //
+        // What this does NOT cover, because the rule does not hold it: a tool
+        // that answers identically twice and only then changes. Two matching
+        // runs freeze the key, and a suppressed call records nothing, so
+        // nothing can thaw it. See #1301 for the case that meets this - a
+        // subagent poll that reads "running" twice before it completes.
         let args = r#"{"task_id":"t1"}"#;
         let (handler, calls) = repeat_handler(
             probe_rounds(&[args, args, args, args]),
@@ -19084,7 +19097,10 @@ mod tests {
         let args = r#"{"q":"how big"}"#;
         let (handler, calls) = repeat_handler(
             probe_rounds(&[args, args]),
-            vec![Ok("42".to_string()), Ok("42".to_string())],
+            vec![
+                Ok("TOOL-OUTPUT-42".to_string()),
+                Ok("TOOL-OUTPUT-42".to_string()),
+            ],
         );
         let conv = handler
             .create_conversation("Chat".into(), vec![])
@@ -19110,7 +19126,7 @@ mod tests {
             "the second result must name where the first result is; got: {second}"
         );
         assert!(
-            second.contains("42"),
+            second.contains("TOOL-OUTPUT-42"),
             "the second result must still carry the tool's own output; got: {second}"
         );
     }
