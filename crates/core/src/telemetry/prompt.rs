@@ -128,6 +128,51 @@ pub(crate) const TOOL_TOKENS_PEAK_FIELD: &str = "prompt.tool_schema_tokens_max";
 /// How many tools that largest block carried.
 pub(crate) const TOOL_COUNT_PEAK_FIELD: &str = "prompt.tool_count_max";
 
+/// Stored bytes of the turn's tool results, by what eviction did with them
+/// (#1205).
+///
+/// Four label values and no more: `carried`, `evicted`, `reduced`,
+/// `shrunk_elsewhere`. They sum to the stored total.
+///
+/// The three savings are separate because they are separate things: an evicted
+/// result left the turn's view, a reduced one lost only its envelope, and the
+/// third is work by a mechanism this module does not own. Reading them as one
+/// number would say a turn had freed context it is still carrying, or credit a
+/// bucket that did nothing.
+pub(crate) const CONTEXT_TOOL_BYTES: &str = "llm.context.tool.bytes";
+
+/// Turns whose tool bytes were censused: the denominator for the counter
+/// above.
+pub(crate) const CONTEXT_MEASURED: &str = "llm.context.measured";
+
+/// Stored bytes of every tool result the turn held.
+pub(crate) const TOOL_BYTES_FIELD: &str = "context.tool_bytes";
+
+/// Of those, the bytes behind results the turn reads as a pointer.
+pub(crate) const TOOL_BYTES_EVICTED_FIELD: &str = "context.tool_bytes_evicted";
+
+/// Of those, the bytes behind results the turn reads without their envelope.
+pub(crate) const TOOL_BYTES_REDUCED_FIELD: &str = "context.tool_bytes_reduced";
+
+/// What the round actually reads for those same results.
+pub(crate) const TOOL_BYTES_CARRIED_FIELD: &str = "context.tool_bytes_carried";
+
+/// Bytes some other mechanism shrunk away - the oversized-head notice, or
+/// overflow recovery. Reported rather than folded into either bucket above.
+pub(crate) const TOOL_BYTES_ELSEWHERE_FIELD: &str = "context.tool_bytes_shrunk_elsewhere";
+
+/// What fraction of the tool bytes the prompt carries is still there, as whole
+/// percent.
+///
+/// The figure the epic is measured against, and the one that says which model
+/// leaks most - the turn span carries `model`, so per-model needs no label
+/// here. A percent rather than a ratio because the unit is a claim and a bare
+/// `0.34` beside a byte count reads as either.
+///
+/// Deliberately NOT named `..._bytes_..._pct`: a name carrying `_bytes` passes
+/// a unit check by the substring alone, whatever it actually reports.
+pub(crate) const TOOL_CARRIED_PCT_FIELD: &str = "context.tool_carried_pct";
+
 // ---------------------------------------------------------------------------
 // The parts.
 // ---------------------------------------------------------------------------
@@ -365,6 +410,34 @@ pub(crate) fn record_round_tool_cost(count: usize, by_server: &[(String, u64)]) 
     }
     metrics::add(PROMPT_ROUND_TOOLS, count as u64, &[]);
     metrics::increment(PROMPT_ROUND_MEASURED, &[]);
+}
+
+/// Put the turn's tool-byte census on its span, and accumulate it (#1205).
+///
+/// Without this there is no way to see whether the sweep is doing its job, or
+/// which model leaks most - which was the argument for taking eviction off step
+/// discipline in the first place.
+pub(crate) fn record_tool_bytes(span: &tracing::Span, census: &crate::planning::ToolByteCensus) {
+    span.record(TOOL_BYTES_FIELD, census.total as u64);
+    span.record(TOOL_BYTES_EVICTED_FIELD, census.evicted as u64);
+    span.record(TOOL_BYTES_REDUCED_FIELD, census.reduced as u64);
+    span.record(TOOL_BYTES_ELSEWHERE_FIELD, census.shrunk_elsewhere() as u64);
+    span.record(TOOL_BYTES_CARRIED_FIELD, census.carried as u64);
+    span.record(TOOL_CARRIED_PCT_FIELD, census.carried_percent());
+
+    for (state, bytes) in [
+        ("carried", census.carried),
+        ("evicted", census.evicted),
+        ("reduced", census.reduced),
+        ("shrunk_elsewhere", census.shrunk_elsewhere()),
+    ] {
+        metrics::add(
+            CONTEXT_TOOL_BYTES,
+            bytes as u64,
+            &[Label::new("state", state)],
+        );
+    }
+    metrics::increment(CONTEXT_MEASURED, &[]);
 }
 
 /// Accumulate one prompt's breakdown into the metrics facade.

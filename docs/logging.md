@@ -243,7 +243,7 @@ Field summary. Every span carries `conversation_id`.
 
 | span | fields |
 |---|---|
-| `turn` | `request_id`, `trace_id`, `conversation_id`, `user_id`, `connection_id`, `provider`, `model`, then `rounds`, `outcome`, `duration_ms` and the `prompt.*` breakdown below when it ends |
+| `turn` | `request_id`, `trace_id`, `conversation_id`, `user_id`, `connection_id`, `provider`, `model`, then `rounds`, `outcome`, `duration_ms`, the `prompt.*` breakdown and the `context.*` census below when it ends |
 | `turn.round` | `round` (one-based), `conversation_id`, `tools`, `outcome`, and the four token counts the provider reported |
 | `llm.call` | `purpose`, `provider`, `model`, `conversation_id`, `provider_request_id`, the four `gen_ai.usage.*` token counts below, plus `round` and `outcome` for a round's own call |
 | `tool.call` | `tool`, `runner` (`client` or `server`), `conversation_id`, `outcome` |
@@ -370,6 +370,60 @@ so a last-round figure would report the tail of a tool loop under a name that
 reads as the turn's own. What this answers is the standing bill - what the turn
 cost before it did anything. A turn cancelled before its first round assembles
 no prompt and carries none of these fields.
+
+### What eviction did not reach
+
+The breakdown above says what the turn opened with. This says what it was still
+carrying when it ended, and it is the figure the working-memory work is measured
+against: the turn span carries a census of its own tool traffic, taken from the
+stored bytes at the end of the last completed round.
+
+| field | what it counts |
+|---|---|
+| `context.tool_bytes` | stored bytes of every tool result **in the window**, as of the end of the last completed round |
+| `context.tool_bytes_carried` | what the round actually reads for those same results |
+| `context.tool_bytes_evicted` | of the difference, the bytes a compaction pointer saved |
+| `context.tool_bytes_reduced` | of the difference, the bytes a recall reduction saved |
+| `context.tool_bytes_shrunk_elsewhere` | of the difference, what some other mechanism saved |
+| `context.tool_carried_pct` | `carried` as whole percent of `tool_bytes` |
+
+**The window, not the conversation.** A conversation holds every message it ever
+had, and the store loads all of them. Counting those would make this figure
+track how old a conversation is rather than what a turn is carrying.
+
+The census runs at the end of each tool round, so the round's own results are
+already in the window and no prompt has carried them yet. They have no
+projection entry, so they count as fully carried and push
+`context.tool_carried_pct` up - the figure is what the turn is holding at that
+moment, not what the last prompt sent.
+
+**Every figure is stored-minus-read, so a mechanism gets credit for what it
+actually saved.** A reduction saves the ENVELOPE: a 40 KB entry whose
+scaffolding was 1 KB counts 1 KB as reduced and leaves 39 KB in `carried`.
+Counting the stored size instead would report a result the prompt still carries
+whole as fully reached.
+
+**Evicted, reduced and shrunk-elsewhere are three different things.** An evicted
+result left the turn's view and a pointer stands in its place. A reduced one is
+a recall - a knowledge-base or scratchpad read - that kept the entry text and
+lost only its envelope, because nothing else holds what it carried and a pointer
+would send the model back to free recall. The third is the oversized-head notice
+and overflow recovery, which shrink a result without leaving a prefix this
+census owns; their work is reported rather than folded into a bucket that did
+not do it.
+
+`context.tool_carried_pct` carries no `_bytes` in its name on purpose: it is the
+one figure here that is not a byte count, and a unit check by substring would
+pass it regardless.
+
+Per model needs no label: the turn span already carries `model`, so the census
+groups by it like every other field on that span. The four figures below the
+total reach the metrics facade as `llm.context.tool.bytes`, labelled `state`
+with `carried`, `evicted`, `reduced` and `shrunk_elsewhere`, against the
+`llm.context.measured` denominator. The four sum to the total.
+
+A turn that answered without calling a tool carries none of these fields, which
+is a turn that held no tool bytes rather than one that measured none.
 
 ### The two lines an operator greps
 

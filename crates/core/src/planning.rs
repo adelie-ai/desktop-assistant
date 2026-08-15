@@ -45,6 +45,9 @@
 
 use crate::context::ContextProjection;
 use crate::domain::{Message, Role, ToolDefinition};
+use crate::eviction_class::{
+    Disposition, RECALL_REDUCED_PREFIX, eviction_class, reduce_recalled_result,
+};
 use crate::ports::scratchpad::{NOTE_KEY_MAX_CHARS, SCRATCHPAD_GOAL_KEY};
 use crate::ports::transcript::TRANSCRIPT_GET_TOOL;
 
@@ -348,7 +351,8 @@ pub(crate) enum DistilledTrace {
 /// leaving the message structure (role + `tool_call_id`) intact so provider
 /// tool-call/result pairing is never broken.
 ///
-/// Returns `(results_evicted, bytes_freed)`.
+/// Answers an [`EvictionOutcome`]: what became a pointer, what was reduced to
+/// its substance, and what each saved.
 ///
 /// The pointer goes in the round's projection, not in `messages`. The raw
 /// output stays in the conversation's stored transcript, so a user who opens
@@ -373,25 +377,48 @@ pub(crate) fn evict_tool_results(
     note_keys: &[String],
     trace: DistilledTrace,
     reason: EvictReason,
-) -> (usize, usize) {
+) -> EvictionOutcome {
     let from = from.min(messages.len());
     let names = tool_names_by_call_id(messages);
 
-    let mut evicted = 0usize;
-    let mut freed = 0usize;
+    let mut outcome = EvictionOutcome::default();
     for m in &mut messages[from..] {
         let current = projection.content(m);
         if m.role != Role::Tool || current.len() < COMPACTION_MIN_EVICT_BYTES {
             continue;
         }
-        if current.starts_with(COMPACTION_POINTER_PREFIX) {
-            continue; // already compacted by an inner step
+        if current.starts_with(COMPACTION_POINTER_PREFIX)
+            || current.starts_with(RECALL_REDUCED_PREFIX)
+        {
+            continue; // already compacted or reduced by an inner step
         }
         let tool_name = m
             .tool_call_id
             .as_deref()
             .and_then(|id| names.get(id))
             .map(String::as_str);
+
+        // Evict by information content, not by byte count (#1205). A recall
+        // is reduced to the entry text that was the point of fetching it; a
+        // mechanism or external result is replaced by a pointer, as before.
+        if eviction_class(tool_name, current).disposition() == Disposition::ReduceToSubstance {
+            if let Some(reduced) = reduce_recalled_result(tool_name, &m.id, current) {
+                outcome.reduced += 1;
+                outcome.reduced_bytes += current.len() - reduced.len();
+                projection.replace(m, reduced);
+                continue;
+            }
+            // The payload is not a shape the reduction recognises. Under
+            // `Absent` nothing else holds what it carried, so a bare pointer
+            // would send the model back to free recall - the failure the whole
+            // `[Recall]` design exists to remove. Leave it whole and let the
+            // token budget apply its pressure elsewhere. Under `Written` a
+            // note already holds the substance, so the pointer is sound.
+            if trace == DistilledTrace::Absent {
+                continue;
+            }
+        }
+
         let pointer = compaction_pointer(tool_name, &m.id, note_keys, reason);
         // A pointer no smaller than what it replaces makes the prompt bigger,
         // which is the one thing an eviction may not do. `carry_evictions`
@@ -401,14 +428,40 @@ pub(crate) fn evict_tool_results(
         let Some(saving) = current.len().checked_sub(pointer.len()).filter(|s| *s > 0) else {
             continue;
         };
-        freed += saving;
-        evicted += 1;
+        outcome.freed += saving;
+        outcome.evicted += 1;
         if trace == DistilledTrace::Written && !note_keys.is_empty() {
             m.distilled_into = note_keys.to_vec();
         }
         projection.replace(m, pointer);
     }
-    (evicted, freed)
+    outcome
+}
+
+/// What one pass of [`evict_tool_results`] did.
+///
+/// Evicted and reduced are separate counts because they are separate things:
+/// an evicted result left the turn's view and a reduced one did not, it lost
+/// its envelope. Reading them as one number would say a turn had freed context
+/// it is still carrying, and would hide which of the two mechanisms was doing
+/// the work.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct EvictionOutcome {
+    /// Results the round now reads as a [`compaction_pointer`].
+    pub evicted: usize,
+    /// Bytes those pointers saved.
+    pub freed: usize,
+    /// Recall results the round now reads without their envelope.
+    pub reduced: usize,
+    /// Bytes those reductions saved.
+    pub reduced_bytes: usize,
+}
+
+impl EvictionOutcome {
+    /// Whether this pass changed anything the round reads.
+    pub(crate) fn touched_anything(self) -> bool {
+        self.evicted > 0 || self.reduced > 0
+    }
 }
 
 /// Evict every sizeable `Role::Tool` result in `messages[..upto]` that no step
@@ -428,14 +481,17 @@ pub(crate) fn evict_tool_results(
 /// No note is written and nothing is recorded on the row
 /// ([`DistilledTrace::Absent`]), so a later turn reads the stored output rather
 /// than a pointer to a note that never existed. The raw bytes stay in the
-/// conversation's stored transcript either way.
+/// conversation's stored transcript either way. A recall result is the one
+/// exception and [`evict_tool_results`] states it: nothing else holds what it
+/// carried, so it is reduced rather than removed, and left whole when it
+/// cannot be reduced.
 ///
-/// Returns `(results_evicted, bytes_freed)`.
+/// Answers an [`EvictionOutcome`].
 pub(crate) fn evict_superseded_tool_results(
     messages: &mut [Message],
     projection: &mut ContextProjection,
     upto: usize,
-) -> (usize, usize) {
+) -> EvictionOutcome {
     let upto = upto.min(messages.len());
     evict_tool_results(
         &mut messages[..upto],
@@ -522,6 +578,101 @@ pub(crate) fn distilled_note_keys(messages: &[Message]) -> Vec<String> {
     keys
 }
 
+/// What the turn's tool traffic weighs, and how much of it eviction reached.
+///
+/// Counted from the stored bytes rather than accumulated as the sweep runs, so
+/// the figure is a census of the state the turn actually ends in. That takes in
+/// evictions an earlier turn decided and this one rebuilt with
+/// [`carry_evictions`], which a running total of this turn's own sweeps would
+/// miss.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ToolByteCensus {
+    /// Stored bytes of every `Role::Tool` message THE PROMPT CARRIES.
+    ///
+    /// The window, not the conversation. A conversation holds every message it
+    /// ever had - the store reads them all - and counting those would make this
+    /// track how old a conversation is rather than what a turn is carrying.
+    pub total: usize,
+    /// What the round actually reads for those same messages.
+    ///
+    /// **Measured, not derived.** Subtracting the two named savings below would
+    /// miss every other mechanism that shrinks a result - the oversized-head
+    /// notice and overflow recovery both do - and report their work as bytes
+    /// still carried.
+    pub carried: usize,
+    /// Of the difference, the bytes a [`compaction_pointer`] saved.
+    pub evicted: usize,
+    /// Of the difference, the bytes a recall reduction saved. Separate from
+    /// `evicted` because a reduced result kept its substance and an evicted one
+    /// did not.
+    ///
+    /// A reduction saves the ENVELOPE, so a 40 KB entry whose scaffolding was
+    /// 1 KB counts 1 KB here and leaves 39 KB in `carried`. Counting the stored
+    /// size instead would report a result the prompt still carries whole as
+    /// fully reached.
+    pub reduced: usize,
+}
+
+impl ToolByteCensus {
+    /// Bytes shrunk away by a mechanism this census does not name.
+    ///
+    /// `total - carried` is everything every mechanism saved; `evicted` and
+    /// `reduced` are the two this module owns. The remainder is real work by
+    /// somebody else, and it is reported rather than silently folded into
+    /// either bucket.
+    pub(crate) fn shrunk_elsewhere(&self) -> usize {
+        self.total
+            .saturating_sub(self.carried)
+            .saturating_sub(self.evicted + self.reduced)
+    }
+
+    /// What fraction of the tool bytes the prompt carries is still there, as
+    /// whole percent. The figure the epic is measured against.
+    ///
+    /// A turn with no tool traffic answers `0`: nothing was left behind, rather
+    /// than all of nothing.
+    pub(crate) fn carried_percent(&self) -> u64 {
+        if self.total == 0 {
+            return 0;
+        }
+        ((self.carried as u128 * 100) / self.total as u128) as u64
+    }
+}
+
+/// Take the census (#1205), over the messages the prompt carries.
+///
+/// Without it there is no way to see whether the sweep is doing its job, or
+/// which model leaks most - which was the argument for taking eviction off step
+/// discipline in the first place.
+///
+/// **`messages` must be the window, not the conversation.** Every figure here
+/// is about what a turn is carrying; a slice wider than the prompt measures
+/// history the model never sees.
+///
+/// Every figure is the difference between what is STORED and what the round
+/// READS, so a mechanism that shrinks a result by half is credited with half
+/// rather than with all of it or none of it.
+pub(crate) fn tool_byte_census(
+    messages: &[Message],
+    projection: &ContextProjection,
+) -> ToolByteCensus {
+    let mut census = ToolByteCensus::default();
+    for m in messages.iter().filter(|m| m.role == Role::Tool) {
+        let stored = m.content.len();
+        let current = projection.content(m);
+        census.total += stored;
+        census.carried += current.len();
+
+        let saved = stored.saturating_sub(current.len());
+        if current.starts_with(COMPACTION_POINTER_PREFIX) {
+            census.evicted += saved;
+        } else if current.starts_with(RECALL_REDUCED_PREFIX) {
+            census.reduced += saved;
+        }
+    }
+    census
+}
+
 /// A single plan entry for [`render_plan`] (a `todo`-typed scratchpad note).
 pub(crate) struct PlanItem<'a> {
     pub key: &'a str,
@@ -572,6 +723,13 @@ fn chosen_plan_items<'a>(
 /// Returns `None` when there are no steps to show. `current` marks the live
 /// step (you-are-here); `max_items` caps the rendered size so it stays cheap
 /// to re-send every round.
+///
+/// A completed step that carried nothing forward is collapsed into a count
+/// rather than given a line (#1205). It has no finding to offer and it is still
+/// competing for the model's attention and for a place under the cap. Two
+/// things keep such a step listed: an outcome, and being the live step or an
+/// ancestor of it. The collapsed count and the cap's own "… and N more" tail
+/// are stated separately, because they answer different questions.
 pub(crate) fn render_plan(
     items: &[PlanItem<'_>],
     current: Option<&str>,
@@ -582,7 +740,12 @@ pub(crate) fn render_plan(
     }
     let mut sorted: Vec<&PlanItem> = items.iter().collect();
     sorted.sort_by_key(|a| dotted_key(a.key));
-    let chosen = chosen_plan_items(&sorted, current, max_items);
+    // A completed step that carried nothing forward is still competing for
+    // attention, and for a place under the cap. Collapse those to a count
+    // (#1205). The filter runs before the cap so the room goes to steps that
+    // carry something.
+    let (listed, collapsed) = split_collapsible(&sorted, current);
+    let chosen = chosen_plan_items(&listed, current, max_items);
 
     let mut out = String::from(
         "Your plan (steps on the scratchpad, with findings so far — keep working it; \
@@ -605,8 +768,17 @@ pub(crate) fn render_plan(
         }
     }
     let shown = chosen.len();
-    if sorted.len() > shown {
-        out.push_str(&format!("\n… and {} more.", sorted.len() - shown));
+    if listed.len() > shown {
+        out.push_str(&format!("\n… and {} more.", listed.len() - shown));
+    }
+    // Two numbers, stated apart: what carried nothing, and what the cap left
+    // out. They answer different questions and a reader acts on them
+    // differently.
+    if collapsed > 0 {
+        let step = if collapsed == 1 { "step" } else { "steps" };
+        out.push_str(&format!(
+            "\n({collapsed} completed {step} carried nothing forward and are not listed.)"
+        ));
     }
 
     // Wrap-up nudge: when no step is live (the stack has fully unwound) and
@@ -624,6 +796,33 @@ pub(crate) fn render_plan(
         );
     }
     Some(out)
+}
+
+/// Split `sorted` into the steps a rendering lists and a count of the ones it
+/// collapses.
+///
+/// A step collapses when it is done and carried nothing forward. Two things
+/// keep a done step listed: an outcome, which is the finding the step exists to
+/// produce, and being the live step or an ancestor of it, because that is what
+/// says where the model is. [`plan_note_keys`] applies the same split, so what
+/// `[Recall]` treats as already in view is exactly what rendered.
+fn split_collapsible<'a>(
+    sorted: &[&'a PlanItem<'a>],
+    current: Option<&str>,
+) -> (Vec<&'a PlanItem<'a>>, usize) {
+    let mut listed = Vec::with_capacity(sorted.len());
+    let mut collapsed = 0usize;
+    for item in sorted {
+        let carries = item.outcome.is_some_and(|o| !o.is_empty());
+        let is_context =
+            current.is_some_and(|cur| item.key == cur || is_ancestor_of(item.key, cur));
+        if item.done && !carries && !is_context {
+            collapsed += 1;
+        } else {
+            listed.push(*item);
+        }
+    }
+    (listed, collapsed)
 }
 
 /// True when `ancestor` is a proper dotted-key prefix of `key`
@@ -1086,8 +1285,10 @@ pub(crate) fn plan_note_keys(
     let mut sorted: Vec<&PlanItem> = items.iter().collect();
     sorted.sort_by_key(|a| dotted_key(a.key));
 
+    let (listed, _collapsed) = split_collapsible(&sorted, current);
+
     let mut keys = Vec::new();
-    for item in chosen_plan_items(&sorted, current, max_items) {
+    for item in chosen_plan_items(&listed, current, max_items) {
         keys.push(item.key.to_string());
         if item.outcome.is_some_and(|o| !o.is_empty()) {
             keys.push(format!("{OUTCOME_KEY_PREFIX}{}", item.key));
@@ -1298,7 +1499,7 @@ mod tests {
         ];
         let keys = vec!["outcome:1".to_string()];
         let mut projection = ContextProjection::default();
-        let (evicted, freed) = evict_tool_results(
+        let EvictionOutcome { evicted, freed, .. } = evict_tool_results(
             &mut messages,
             &mut projection,
             1,
@@ -1336,7 +1537,11 @@ mod tests {
         ];
         let mut projection = ContextProjection::default();
         // Protect the most recent round: messages[2..].
-        let (swept, freed) = evict_superseded_tool_results(&mut messages, &mut projection, 2);
+        let EvictionOutcome {
+            evicted: swept,
+            freed,
+            ..
+        } = evict_superseded_tool_results(&mut messages, &mut projection, 2);
 
         assert_eq!(swept, 1, "the superseded result must leave the turn's view");
         assert!(freed > 4000, "freed {freed} bytes");
@@ -1400,8 +1605,13 @@ mod tests {
             tool_msg("c1", &big),
         ];
         let mut projection = ContextProjection::default();
-        let (first, _) = evict_superseded_tool_results(&mut messages, &mut projection, 2);
-        let (second, freed) = evict_superseded_tool_results(&mut messages, &mut projection, 2);
+        let EvictionOutcome { evicted: first, .. } =
+            evict_superseded_tool_results(&mut messages, &mut projection, 2);
+        let EvictionOutcome {
+            evicted: second,
+            freed,
+            ..
+        } = evict_superseded_tool_results(&mut messages, &mut projection, 2);
 
         assert_eq!(first, 1);
         assert_eq!(second, 0, "an already-compacted result is skipped");
@@ -1424,7 +1634,8 @@ mod tests {
 
         let mut projection = ContextProjection::default();
         let protected = stack.open_watermark().unwrap_or(messages.len());
-        let (swept, _) = evict_superseded_tool_results(&mut messages, &mut projection, protected);
+        let EvictionOutcome { evicted: swept, .. } =
+            evict_superseded_tool_results(&mut messages, &mut projection, protected);
 
         assert_eq!(swept, 0, "an open step's scope is not the sweep's to take");
     }
@@ -1436,7 +1647,8 @@ mod tests {
             tool_msg("c1", "ok"),
         ];
         let mut projection = ContextProjection::default();
-        let (swept, _) = evict_superseded_tool_results(&mut messages, &mut projection, 2);
+        let EvictionOutcome { evicted: swept, .. } =
+            evict_superseded_tool_results(&mut messages, &mut projection, 2);
         assert_eq!(swept, 0);
         assert_eq!(projection.content(&messages[1]), "ok");
     }
@@ -1449,7 +1661,8 @@ mod tests {
             tool_msg("c1", &big),
         ];
         let mut projection = ContextProjection::default();
-        let (swept, _) = evict_superseded_tool_results(&mut messages, &mut projection, 99);
+        let EvictionOutcome { evicted: swept, .. } =
+            evict_superseded_tool_results(&mut messages, &mut projection, 99);
         assert_eq!(swept, 1, "a boundary past the end must not panic");
     }
 
@@ -1464,7 +1677,7 @@ mod tests {
         ];
         let before = messages.clone();
         let mut projection = ContextProjection::default();
-        let (evicted, _) = evict_tool_results(
+        let EvictionOutcome { evicted, .. } = evict_tool_results(
             &mut messages,
             &mut projection,
             0,
@@ -1537,7 +1750,7 @@ mod tests {
             tool_msg("c1", &big),
         ];
         let mut projection = ContextProjection::default();
-        let (evicted, _) = evict_tool_results(
+        let EvictionOutcome { evicted, .. } = evict_tool_results(
             &mut messages,
             &mut projection,
             0,
@@ -1577,7 +1790,7 @@ mod tests {
         ];
         let keys = vec!["k".to_string()];
         let mut projection = ContextProjection::default();
-        let (evicted, _) = evict_tool_results(
+        let EvictionOutcome { evicted, .. } = evict_tool_results(
             &mut messages,
             &mut projection,
             0,
@@ -1593,7 +1806,11 @@ mod tests {
         );
 
         // Second pass over the same range is a no-op (idempotent).
-        let (evicted2, freed2) = evict_tool_results(
+        let EvictionOutcome {
+            evicted: evicted2,
+            freed: freed2,
+            ..
+        } = evict_tool_results(
             &mut messages,
             &mut projection,
             0,
@@ -1609,7 +1826,7 @@ mod tests {
     fn evict_clamps_out_of_range_watermark() {
         let mut messages = vec![Message::new(Role::User, "hi")];
         let mut projection = ContextProjection::default();
-        let (evicted, freed) = evict_tool_results(
+        let EvictionOutcome { evicted, freed, .. } = evict_tool_results(
             &mut messages,
             &mut projection,
             99,
@@ -1618,6 +1835,162 @@ mod tests {
             EvictReason::StepCompleted,
         );
         assert_eq!((evicted, freed), (0, 0));
+    }
+
+    // -----------------------------------------------------------------------
+    // Eviction by information content (#1205).
+    // -----------------------------------------------------------------------
+
+    /// A recall payload of the shape `builtin_knowledge_base_get` returns.
+    fn kb_payload(entries: usize) -> String {
+        let rows: Vec<serde_json::Value> = (1..=entries)
+            .map(|i| {
+                serde_json::json!({
+                    "id": format!("kb-{i}"),
+                    "content": format!(
+                        "entry {i}: {}",
+                        "the substance the model asked to hold. ".repeat(10)
+                    ),
+                    "summary": "a short recognition line",
+                    "tags": ["ops"],
+                    "metadata": {"source": "dream"},
+                    "created_at": "2026-08-01T00:00:00Z",
+                    "updated_at": "2026-08-02T00:00:00Z",
+                })
+            })
+            .collect();
+        serde_json::json!({"ok": true, "entries": rows, "returned": entries, "not_found": []})
+            .to_string()
+    }
+
+    /// One assistant request plus its result, so the sweep can name the tool.
+    fn call_and_result(call_id: &str, tool: &str, result: &str) -> Vec<Message> {
+        vec![
+            Message::assistant_with_tool_calls(vec![ToolCall::new(call_id, tool, "{}")]),
+            tool_msg(call_id, result),
+        ]
+    }
+
+    #[test]
+    fn a_recalled_result_is_reduced_to_its_entry_text_not_replaced_by_a_pointer() {
+        let payload = kb_payload(4);
+        let mut messages = call_and_result("c1", "builtin_knowledge_base_get", &payload);
+        let mut projection = ContextProjection::default();
+
+        let outcome = evict_superseded_tool_results(&mut messages, &mut projection, 2);
+
+        assert_eq!(outcome.evicted, 0, "a recall must not become a pointer");
+        assert_eq!(outcome.reduced, 1);
+        assert!(outcome.reduced_bytes > 0);
+        let projected = projection.content(&messages[1]);
+        assert!(projected.starts_with(RECALL_REDUCED_PREFIX), "{projected}");
+        assert!(
+            projected.contains("the substance the model asked to hold."),
+            "the substance must survive the reduction: {projected}"
+        );
+        assert!(
+            !projected.contains("updated_at"),
+            "the envelope must not: {projected}"
+        );
+    }
+
+    /// The criterion this ticket turns on: under `Absent` nothing else holds
+    /// what a recall carried, so it is never replaced by a bare pointer. A
+    /// payload the reduction cannot read is left whole rather than dropped.
+    #[test]
+    fn a_recall_the_reduction_cannot_read_is_left_whole_under_an_absent_trace() {
+        let opaque = format!("not json at all — {}", "x".repeat(4000));
+        let mut messages = call_and_result("c1", "builtin_scratchpad_search", &opaque);
+        let mut projection = ContextProjection::default();
+
+        let outcome = evict_superseded_tool_results(&mut messages, &mut projection, 2);
+
+        assert_eq!(outcome.evicted, 0);
+        assert_eq!(outcome.reduced, 0);
+        assert_eq!(
+            projection.content(&messages[1]),
+            opaque,
+            "a bare pointer here sends the model back to free recall"
+        );
+    }
+
+    /// A completed step wrote a note holding the scope, so the pointer is
+    /// sound even for a recall the reduction cannot read.
+    #[test]
+    fn a_recall_the_reduction_cannot_read_still_evicts_under_a_written_trace() {
+        let opaque = format!("not json at all — {}", "x".repeat(4000));
+        let mut messages = call_and_result("c1", "builtin_scratchpad_search", &opaque);
+        let mut projection = ContextProjection::default();
+
+        let outcome = evict_tool_results(
+            &mut messages,
+            &mut projection,
+            0,
+            &["outcome:1".to_string()],
+            DistilledTrace::Written,
+            EvictReason::StepCompleted,
+        );
+
+        assert_eq!(outcome.evicted, 1);
+        assert!(
+            projection
+                .content(&messages[1])
+                .starts_with(COMPACTION_POINTER_PREFIX)
+        );
+    }
+
+    #[test]
+    fn mechanism_output_still_evicts_to_a_pointer() {
+        let log = "x".repeat(4000);
+        let mut messages = call_and_result("c1", "builtin_tool_search", &log);
+        let mut projection = ContextProjection::default();
+
+        let outcome = evict_superseded_tool_results(&mut messages, &mut projection, 2);
+
+        assert_eq!(outcome.evicted, 1);
+        assert_eq!(outcome.reduced, 0);
+        assert!(
+            projection
+                .content(&messages[1])
+                .starts_with(COMPACTION_POINTER_PREFIX)
+        );
+    }
+
+    #[test]
+    fn external_content_still_evicts_to_a_pointer_with_its_grading_untouched() {
+        let page = "<html>".to_string() + &"x".repeat(4000);
+        let mut messages = call_and_result("c1", "web_fetch", &page);
+        let mut projection = ContextProjection::default();
+
+        let outcome = evict_superseded_tool_results(&mut messages, &mut projection, 2);
+
+        assert_eq!(outcome.evicted, 1);
+        assert_eq!(outcome.reduced, 0);
+        assert!(
+            projection
+                .content(&messages[1])
+                .starts_with(COMPACTION_POINTER_PREFIX)
+        );
+        assert_eq!(
+            messages[1].content, page,
+            "the stored bytes, which the grading reads, are untouched"
+        );
+    }
+
+    /// A reduction is not repeated on a later round: a round that already
+    /// reads a reduced result leaves it alone.
+    #[test]
+    fn a_reduced_result_is_not_reduced_again() {
+        let payload = kb_payload(4);
+        let mut messages = call_and_result("c1", "builtin_knowledge_base_get", &payload);
+        let mut projection = ContextProjection::default();
+
+        let first = evict_superseded_tool_results(&mut messages, &mut projection, 2);
+        let second = evict_superseded_tool_results(&mut messages, &mut projection, 2);
+
+        assert_eq!(first.reduced, 1);
+        assert_eq!(second.reduced, 0);
+        assert_eq!(second.evicted, 0);
     }
 
     /// The messages a later turn asks the scratchpad about: one entry per
@@ -1857,7 +2230,7 @@ mod tests {
         );
 
         let mut projection = ContextProjection::default();
-        let (evicted, freed) = evict_tool_results(
+        let EvictionOutcome { evicted, freed, .. } = evict_tool_results(
             &mut messages,
             &mut projection,
             0,
@@ -1987,28 +2360,316 @@ mod tests {
                 key: "1.2.1",
                 goal: "pick crate",
                 done: true,
-                outcome: None,
+                // A done leaf with no outcome collapses into the count, so
+                // this one carries a finding: what is under test here is
+                // ordering, not collapse.
+                outcome: Some("chose serde_json"),
             },
         ];
         let rendered = render_plan(&items, Some("1.2"), 50).unwrap();
         let lines: Vec<&str> = rendered.lines().collect();
-        // Header + 4 items.
-        assert_eq!(lines.len(), 5);
+        // Header + 4 items + the finding nested under 1.2.1.
+        assert_eq!(lines.len(), 6);
         // Numeric (not lexical) ordering: 1, 1.2, 1.2.1, 1.10.
         assert!(lines[1].contains("1 [x] research"));
         assert!(lines[2].contains("1.2 [ ] draft"));
         assert!(lines[2].contains("← you are here"));
         assert!(lines[3].contains("1.2.1 [x] pick crate"));
-        assert!(lines[4].trim_start().starts_with("1.10"));
+        assert!(lines[4].trim_start().starts_with("→ chose serde_json"));
+        assert!(lines[5].trim_start().starts_with("1.10"));
         // Depth-based indentation: 1.2.1 is deeper than 1.2.
         let indent_12 = lines[2].len() - lines[2].trim_start().len();
         let indent_121 = lines[3].len() - lines[3].trim_start().len();
         assert!(indent_121 > indent_12);
     }
 
+    // -----------------------------------------------------------------------
+    // What the sweep did not reach (#1205).
+    // -----------------------------------------------------------------------
+
+    /// Fixture: a `Role::Tool` message of a known stored size.
+    fn tool_result(bytes: usize) -> Message {
+        Message::new(Role::Tool, "x".repeat(bytes))
+    }
+
+    #[test]
+    fn the_census_counts_what_the_prompt_carries_against_what_is_stored() {
+        let messages = vec![
+            Message::new(Role::User, "ask"),
+            tool_result(1000),
+            Message::new(Role::Assistant, "answer"),
+            tool_result(500),
+        ];
+        let census = tool_byte_census(&messages, &ContextProjection::default());
+        assert_eq!(census.total, 1500, "only tool results are counted");
+        assert_eq!(census.carried, 1500, "nothing shrank any of them");
+        assert_eq!(census.evicted, 0);
+        assert_eq!(census.reduced, 0);
+        assert_eq!(census.shrunk_elsewhere(), 0);
+        assert_eq!(census.carried_percent(), 100);
+    }
+
+    #[test]
+    fn the_census_credits_a_pointer_with_the_bytes_it_saved() {
+        let messages = vec![tool_result(1000), tool_result(1000)];
+        let mut projection = ContextProjection::default();
+        let pointer = compaction_pointer(Some("terminal_run"), "m-1", &[], EvictReason::Superseded);
+        let pointer_len = pointer.len();
+        projection.replace(&messages[0], pointer);
+
+        let census = tool_byte_census(&messages, &projection);
+        assert_eq!(census.total, 2000);
+        assert_eq!(census.carried, 1000 + pointer_len);
+        assert_eq!(census.evicted, 1000 - pointer_len);
+    }
+
+    /// A reduction saves the ENVELOPE. Counting the stored size instead would
+    /// report a result the prompt still carries almost whole as fully reached -
+    /// the figure would read 0% carried while 39 KB of a 40 KB entry is still
+    /// in the prompt.
+    #[test]
+    fn a_reduction_is_credited_with_the_envelope_and_not_with_the_entry() {
+        let messages = vec![tool_result(40_000)];
+        let mut projection = ContextProjection::default();
+        // A reduction that kept almost all of it: the entry text survived.
+        let reduced = format!("{RECALL_REDUCED_PREFIX} …>\n{}", "y".repeat(39_000));
+        let reduced_len = reduced.len();
+        projection.replace(&messages[0], reduced);
+
+        let census = tool_byte_census(&messages, &projection);
+        assert_eq!(census.total, 40_000);
+        assert_eq!(census.carried, reduced_len);
+        assert_eq!(census.reduced, 40_000 - reduced_len);
+        assert!(
+            census.carried_percent() > 90,
+            "the prompt still carries nearly all of it, and the figure must say so: {}",
+            census.carried_percent()
+        );
+    }
+
+    /// Reduced and evicted are two different things and must not read as one
+    /// number: a reduced result kept its substance, an evicted one did not.
+    #[test]
+    fn the_census_reports_reduced_bytes_apart_from_evicted_bytes() {
+        let messages = vec![tool_result(1000), tool_result(1000)];
+        let mut projection = ContextProjection::default();
+        projection.replace(
+            &messages[0],
+            compaction_pointer(Some("terminal_run"), "m-1", &[], EvictReason::Superseded),
+        );
+        projection.replace(&messages[1], format!("{RECALL_REDUCED_PREFIX} …>"));
+
+        let census = tool_byte_census(&messages, &projection);
+        assert!(census.evicted > 0 && census.reduced > 0);
+        assert_ne!(
+            census.evicted, census.reduced,
+            "two mechanisms, two figures"
+        );
+    }
+
+    /// Two other mechanisms shrink a tool result - the oversized-head notice
+    /// and overflow recovery - and neither leaves a prefix this module owns.
+    /// Their work is real and must not read as bytes still carried.
+    #[test]
+    fn a_result_shrunk_by_another_mechanism_is_not_reported_as_carried() {
+        let messages = vec![tool_result(500_000)];
+        let mut projection = ContextProjection::default();
+        projection.replace(
+            &messages[0],
+            "<tool output omitted: 500000 bytes>".to_string(),
+        );
+
+        let census = tool_byte_census(&messages, &projection);
+        assert!(
+            census.carried_percent() < 1,
+            "the prompt carries a notice, not half a megabyte: {}",
+            census.carried_percent()
+        );
+        assert_eq!(census.evicted, 0, "no pointer did this");
+        assert_eq!(census.reduced, 0, "and no reduction did");
+        assert!(
+            census.shrunk_elsewhere() > 490_000,
+            "the work belongs to somebody, and the census says so rather than \
+             folding it into a bucket that did not do it"
+        );
+    }
+
+    #[test]
+    fn a_turn_with_no_tool_results_carries_nothing() {
+        let messages = vec![Message::new(Role::User, "ask")];
+        let census = tool_byte_census(&messages, &ContextProjection::default());
+        assert_eq!(census.total, 0);
+        assert_eq!(
+            census.carried_percent(),
+            0,
+            "no tool bytes means none carried, not all of nothing"
+        );
+    }
+
     #[test]
     fn render_plan_empty_is_none() {
         assert!(render_plan(&[], None, 10).is_none());
+    }
+
+    /// Distinct keys for the collapse fixtures, so a rendering can be searched
+    /// for one without matching another's digits.
+    const EMPTY_KEYS: [&str; 8] = ["21", "22", "23", "24", "25", "26", "27", "28"];
+
+    /// Fixture helper: a done step that carried nothing forward.
+    fn done_empty<'a>(key: &'a str, goal: &'a str) -> PlanItem<'a> {
+        PlanItem {
+            key,
+            goal,
+            done: true,
+            outcome: None,
+        }
+    }
+
+    #[test]
+    fn render_plan_collapses_completed_steps_that_carried_nothing() {
+        let items = vec![
+            done_empty("1", "research"),
+            done_empty("2", "draft"),
+            done_empty("3", "review"),
+            PlanItem {
+                key: "4",
+                goal: "ship",
+                done: false,
+                outcome: None,
+            },
+        ];
+        let rendered = render_plan(&items, Some("4"), 50).unwrap();
+
+        for gone in ["research", "draft", "review"] {
+            assert!(
+                !rendered.contains(gone),
+                "a done step that carried nothing must not hold a line: {rendered}"
+            );
+        }
+        assert!(rendered.contains("ship"), "{rendered}");
+        assert!(
+            rendered.contains('3'),
+            "the count must say how many steps it stands for: {rendered}"
+        );
+        assert!(
+            rendered.contains("carried nothing forward"),
+            "the count must say what it collapsed: {rendered}"
+        );
+    }
+
+    #[test]
+    fn render_plan_keeps_a_completed_step_that_carried_an_outcome() {
+        let items = vec![
+            PlanItem {
+                key: "1",
+                goal: "research",
+                done: true,
+                outcome: Some("the sweep runs from the round loop"),
+            },
+            done_empty("2", "draft"),
+        ];
+        let rendered = render_plan(&items, None, 50).unwrap();
+        assert!(rendered.contains("research"), "{rendered}");
+        assert!(
+            rendered.contains("the sweep runs from the round loop"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("draft"), "{rendered}");
+    }
+
+    /// Tree context beats collapse: an ancestor of the live step is what says
+    /// where the model is, so it renders whether or not it carried anything.
+    #[test]
+    fn render_plan_keeps_a_collapsed_ancestor_of_the_current_step() {
+        let items = vec![
+            done_empty("1", "outer"),
+            PlanItem {
+                key: "1.1",
+                goal: "inner",
+                done: false,
+                outcome: None,
+            },
+        ];
+        let rendered = render_plan(&items, Some("1.1"), 50).unwrap();
+        assert!(
+            rendered.contains("outer"),
+            "an ancestor of the live step must stay in view: {rendered}"
+        );
+    }
+
+    /// The collapse is a filter ahead of the cap, so the cap's room goes to
+    /// steps that carry something rather than to steps that carry nothing.
+    #[test]
+    fn render_plan_collapse_frees_the_cap_for_steps_that_carry_something() {
+        let mut items: Vec<PlanItem> = EMPTY_KEYS
+            .iter()
+            .map(|key| done_empty(key, "spent"))
+            .collect();
+        items.push(PlanItem {
+            key: "9",
+            goal: "the one that matters",
+            done: true,
+            outcome: Some("what it found"),
+        });
+        let rendered = render_plan(&items, None, 2).unwrap();
+        assert!(
+            rendered.contains("the one that matters"),
+            "the cap must not be spent on steps that carried nothing: {rendered}"
+        );
+    }
+
+    /// Both numbers are stated. A reader must be able to tell what was
+    /// collapsed from what the cap left out, because the two have different
+    /// answers.
+    #[test]
+    fn render_plan_reports_the_collapsed_count_and_the_cap_tail_separately() {
+        let mut items: Vec<PlanItem> = EMPTY_KEYS[..3]
+            .iter()
+            .map(|key| done_empty(key, "spent"))
+            .collect();
+        for key in ["10", "11", "12"] {
+            items.push(PlanItem {
+                key,
+                goal: "open work",
+                done: false,
+                outcome: None,
+            });
+        }
+        let rendered = render_plan(&items, None, 1).unwrap();
+        assert!(
+            rendered.contains("carried nothing forward"),
+            "the collapsed count is missing: {rendered}"
+        );
+        assert!(
+            rendered.contains("more."),
+            "the cap tail is missing: {rendered}"
+        );
+    }
+
+    /// Every step done and every one collapsed still ends the plan, because
+    /// the nudge is computed over all items and not over what rendered.
+    #[test]
+    fn render_plan_nudges_wrap_up_when_every_done_step_collapsed() {
+        let items = vec![done_empty("1", "research"), done_empty("2", "draft")];
+        let rendered = render_plan(&items, None, 50).unwrap();
+        assert!(rendered.contains("All steps are done."), "{rendered}");
+        assert!(rendered.contains("carried nothing forward"), "{rendered}");
+    }
+
+    /// [`plan_note_keys`] has to name exactly the steps [`render_plan`] showed,
+    /// or `[Recall]` suppresses a note that is no longer in view.
+    #[test]
+    fn plan_note_keys_omits_the_steps_the_collapse_removed() {
+        let notes = vec![
+            raw("1", "research", STEP_NOTE_TYPE, true),
+            raw("2", "draft", STEP_NOTE_TYPE, false),
+        ];
+        let keys = plan_note_keys(&notes, Some("2"), 50);
+        assert!(
+            !keys.iter().any(|k| k == "1"),
+            "a collapsed step is not in view, so it must not be named: {keys:?}"
+        );
+        assert!(keys.iter().any(|k| k == "2"), "{keys:?}");
     }
 
     #[test]
@@ -2102,12 +2763,14 @@ mod tests {
         // Many old DONE steps that sort first, plus the live (open) current
         // step that sorts last. With a tiny cap the naive head-take would drop
         // the current step into the "… and N more" tail; the fix must keep it.
+        // Each done step carries a finding, so the cap - not the collapse - is
+        // what elides them, which is what this test is about.
         let mut items: Vec<PlanItem> = (1..=50)
             .map(|i| PlanItem {
                 key: leak_key(i),
                 goal: "old done step",
                 done: true,
-                outcome: None,
+                outcome: Some("what it found"),
             })
             .collect();
         items.push(PlanItem {

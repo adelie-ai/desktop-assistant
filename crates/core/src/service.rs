@@ -1494,7 +1494,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
         // the conversation's stored transcript keeps the raw output whether or
         // not the note write above succeeded and whether or not the model
         // supplied an outcome.
-        let (evicted, freed) = planning::evict_tool_results(
+        let compaction = planning::evict_tool_results(
             &mut conv.messages,
             projection,
             frame.watermark,
@@ -1504,8 +1504,10 @@ impl<S, L, T> ConversationHandler<S, L, T> {
         );
         tracing::info!(
             step = %frame.key,
-            evicted_results = evicted,
-            freed_bytes = freed,
+            evicted_results = compaction.evicted,
+            freed_bytes = compaction.freed,
+            reduced_results = compaction.reduced,
+            reduced_bytes = compaction.reduced_bytes,
             projected_messages = projection.replaced_count(),
             abandoned,
             "completed step — compacted scope to scratchpad"
@@ -1583,8 +1585,10 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             "action": "complete_step",
             "step": frame.key,
             "status": if abandoned { "abandoned" } else { "done" },
-            "evicted_results": evicted,
-            "freed_bytes": freed,
+            "evicted_results": compaction.evicted,
+            "freed_bytes": compaction.freed,
+            "reduced_results": compaction.reduced,
+            "reduced_bytes": compaction.reduced_bytes,
             "outcome_note": note_keys.first(),
             "note": cascade_note,
             "skill_offer": skill_offer,
@@ -3067,16 +3071,18 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 let protected = step_stack
                     .open_watermark()
                     .map_or(previous_round_start, |w| w.min(previous_round_start));
-                let (swept, freed) = planning::evict_superseded_tool_results(
+                let sweep = planning::evict_superseded_tool_results(
                     &mut conv.messages,
                     &mut projection,
                     protected,
                 );
-                if swept > 0 {
+                if sweep.touched_anything() {
                     tracing::info!(
                         round = round + 1,
-                        swept_results = swept,
-                        freed_bytes = freed,
+                        swept_results = sweep.evicted,
+                        freed_bytes = sweep.freed,
+                        reduced_results = sweep.reduced,
+                        reduced_bytes = sweep.reduced_bytes,
                         "swept tool results no step claimed"
                     );
                 }
@@ -4889,6 +4895,22 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
             // The identities this round met take effect now, and not one tool
             // call sooner - see where the round's set is declared.
             burns_met_this_turn.extend(burns_met_this_round.drain(..));
+
+            // What the sweep did not reach, as of the round that just finished
+            // (#1205). Taken here rather than at each exit because the turn has
+            // several - an answer, a cancellation, an error, an exhausted
+            // budget - and an exit that has to remember to measure is an exit
+            // that will not. The answer path adds no tool results, so the
+            // census this leaves is the one the turn ends holding.
+            //
+            // Over the WINDOW, not the conversation. `conv.messages` is every
+            // message the store loaded, and a conversation carries every tool
+            // result it ever held; censusing those would report how old a
+            // conversation is rather than what this turn is carrying.
+            report.set_tool_byte_census(planning::tool_byte_census(
+                &conv.messages[window_from.min(conv.messages.len())..],
+                &projection,
+            ));
         }
 
         // #453: the tool-round budget is spent. Rather than returning an error
