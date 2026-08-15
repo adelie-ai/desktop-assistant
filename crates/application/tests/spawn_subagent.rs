@@ -281,6 +281,28 @@ impl ConversationService for FakeConversations {
 // Helpers
 // --------------------------------------------------------------------
 
+/// The answer a blocking `spawn_subagent` returned.
+///
+/// The payload carries the child's ids beside its answer (#1206), so a parent
+/// holding a thin answer can open the child's own record and see whether that
+/// is all there was.
+fn subagent_answer(payload: &str) -> String {
+    let got: serde_json::Value =
+        serde_json::from_str(payload).expect("a blocking spawn answers with JSON");
+    assert!(
+        got["child_task_id"].is_string(),
+        "the answer must carry the id that opens the child's record: {payload}"
+    );
+    assert!(
+        got["child_conversation_id"].is_string(),
+        "the answer must carry the child's conversation id: {payload}"
+    );
+    got["result"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the answer must carry the child's text: {payload}"))
+        .to_string()
+}
+
 fn unique_user(label: &str) -> UserId {
     UserId::new(format!("user-{label}-{}", uuid::Uuid::new_v4()))
 }
@@ -442,9 +464,9 @@ async fn spawn_subagent_with_wait_true_returns_child_final_message() {
         .await;
 
     let response = result.expect("tool returned Ok");
-    // The tool returns the child's final assistant text directly (per
-    // the issue's "tool result is 'hello'" acceptance phrasing).
-    assert_eq!(response, "hello");
+    // The tool returns the child's final assistant text, beside the ids that
+    // open the child's own record (#1206).
+    assert_eq!(subagent_answer(&response), "hello");
 }
 
 // --------------------------------------------------------------------
@@ -1457,7 +1479,7 @@ async fn spawn_subagent_allowed_within_recursion_depth_limit() {
     .await;
 
     assert_eq!(
-        result.expect("a spawn within the depth limit must succeed"),
+        subagent_answer(&result.expect("a spawn within the depth limit must succeed")),
         "child text"
     );
 }
@@ -2141,7 +2163,10 @@ async fn subagent_completion_writes_result_note_to_session_pad_under_owner_todo(
         })
         .await;
 
-    assert_eq!(result.expect("tool returned Ok"), "the answer");
+    assert_eq!(
+        subagent_answer(&result.expect("tool returned Ok")),
+        "the answer"
+    );
     let notes = recorded.lock().unwrap();
     let (conv, _key, content, owner) = notes
         .iter()
@@ -2243,7 +2268,7 @@ async fn subagent_that_read_outside_content_stamps_its_answer_on_the_pad() {
     // The parent still gets the full answer through the tool result, which is
     // classified and taints the parent's own turn. Only the pad copy is held
     // back, because nothing classifies that one.
-    assert_eq!(result.expect("tool returned Ok"), PLANTED);
+    assert_eq!(subagent_answer(&result.expect("tool returned Ok")), PLANTED);
 
     let notes = recorded.lock().unwrap();
     let (_key, content) = notes
@@ -2851,7 +2876,7 @@ async fn default_wait_subagent_does_not_wake_the_parent_conversation() {
     .await;
 
     assert_eq!(
-        result.expect("spawn returned Ok"),
+        subagent_answer(&result.expect("spawn returned Ok")),
         "child answer",
         "the parent consumed the child's result inline"
     );

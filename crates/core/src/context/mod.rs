@@ -985,6 +985,29 @@ fn assemble_for_test(
     .messages
 }
 
+/// The `[..]` blocks one assembly surfaced, in order, without the cached system
+/// instruction at index 0.
+///
+/// Tests name a block by its tag rather than by its index, so adding a block
+/// does not shift every positional assertion in the module - and a test that
+/// cares about ORDER still says so, by comparing the tags it expects.
+#[cfg(test)]
+fn surfaced_tags(result: &[Message]) -> Vec<&str> {
+    result
+        .iter()
+        .skip(1)
+        .take_while(|m| m.role == Role::System)
+        .map(|m| m.content.as_str())
+        .collect()
+}
+
+/// Where the conversation history starts in an assembled prompt: past the
+/// cached system instruction and past every block [`surfaced_tags`] returns.
+#[cfg(test)]
+fn history_start(result: &[Message]) -> usize {
+    1 + surfaced_tags(result).len()
+}
+
 /// Build the full tool-availability note enumerating every tool name and
 /// the deferred-namespace index. Returned by default; demoted to a
 /// namespace-only summary by [`build_demoted_tool_note`] when the
@@ -1228,6 +1251,18 @@ fn assemble_turn(
     // Assemble as a pipeline: the cached system instruction, then the per-turn
     // `[..]` re-surfaced context blocks, then the windowed history (with
     // collapsed runs replaced by summary markers).
+    // The index tier (#1206): one line per turn before this one, so a turn the
+    // window dropped is distinguishable from a turn that never happened. Built
+    // here because here is where both halves are in scope - the whole
+    // conversation and the window boundary this assembly chose.
+    // Nothing was dropped means no turn is out of view, so the index has
+    // nothing to say and the segmentation is not worth walking.
+    let turn_index = is_windowed.then(|| {
+        let turns = crate::turn_index::index_turns(conversation.messages, start);
+        crate::turn_index::render_turn_index(&turns)
+    });
+    let turn_index = turn_index.flatten();
+
     let surfaced = surfaced_blocks(
         anchors,
         ambient,
@@ -1235,6 +1270,7 @@ fn assemble_turn(
         is_windowed,
         windowed,
         &active_summary_ids,
+        turn_index.as_deref(),
     );
     // What each part of this prompt costs, measured as the prompt is laid out
     // (#1203). Attribution happens here because here is the only place that
@@ -1382,6 +1418,8 @@ struct SurfacedBlocks {
 /// - `[Now]` — the ambient date/time line, whenever one is installed.
 /// - `[Summary of earlier conversation]` — the rolling summary, once windowing
 ///   has begun.
+/// - `[Earlier turns]` — one line per turn before this one, whenever at least
+///   one of them has left the verbatim window (#1206).
 /// - `[Current task]` — the anchor prompt, re-injected when it has drifted out
 ///   of view (windowed out, or collapsed behind an active summary) or after a
 ///   long agentic loop (`> ACTIVE_TASK_ROUND_THRESHOLD` rounds). It carries the
@@ -1413,6 +1451,7 @@ fn surfaced_blocks(
     is_windowed: bool,
     windowed: &[Message],
     active_summary_ids: &std::collections::HashSet<&str>,
+    turn_index: Option<&str>,
 ) -> SurfacedBlocks {
     let mut blocks = Vec::new();
     let mut recalled_entry_ids = Vec::new();
@@ -1436,6 +1475,16 @@ fn surfaced_blocks(
             PromptPart::Summary,
             format!("[Summary of earlier conversation]\n{context_summary}"),
         ));
+    }
+
+    // The index tier (#1206), beside the summary because both describe what
+    // the window dropped - and they are different tiers of the same answer.
+    // The summary is prose about the content; this is a map of what exists,
+    // with a way back to each of it. Ungated beyond its own rule: it renders
+    // exactly when at least one earlier turn is out of view, which is exactly
+    // when a turn can look to the model like it never happened.
+    if let Some(index) = turn_index.filter(|i| !i.is_empty()) {
+        blocks.push(SurfacedBlock::new(PromptPart::TurnIndex, index.to_string()));
     }
 
     // Shared "context is starting to drop" signal, used by both `[Current task]`
@@ -4201,11 +4250,11 @@ mod tests {
         );
         // The tentative start is count - MAX_CONTEXT_MESSAGES = 20, which is
         // a User message (even index), so the window starts exactly there.
-        // Result: 1 system + MAX_CONTEXT_MESSAGES conversation messages.
-        assert_eq!(result.len(), MAX_CONTEXT_MESSAGES + 1);
+        let history = history_start(&result);
+        assert_eq!(result.len() - history, MAX_CONTEXT_MESSAGES);
         assert_eq!(result[0].role, Role::System);
-        assert_eq!(result[1].role, Role::User);
-        assert_eq!(result[1].content, format!("user-20"));
+        assert_eq!(result[history].role, Role::User);
+        assert_eq!(result[history].content, format!("user-20"));
     }
 
     #[test]
@@ -4242,9 +4291,10 @@ mod tests {
             &default_estimate,
         );
 
-        // The first conversation message (after System) must be a User message.
+        // The first conversation message (past the surfaced blocks) must be a
+        // User message.
         assert_eq!(result[0].role, Role::System);
-        assert_eq!(result[1].role, Role::User);
+        assert_eq!(result[history_start(&result)].role, Role::User);
 
         // The tail must be preserved intact.
         let last = result.last().unwrap();
@@ -4278,8 +4328,8 @@ mod tests {
             &default_estimate,
         );
 
-        // 1 system message + MAX_CONTEXT_MESSAGES conversation messages.
-        assert_eq!(result.len(), MAX_CONTEXT_MESSAGES + 1);
+        // Every windowed message travels: nothing was shrunk away.
+        assert_eq!(result.len() - history_start(&result), MAX_CONTEXT_MESSAGES);
     }
 
     #[test]
@@ -4511,19 +4561,107 @@ mod tests {
             &default_estimate,
         );
 
-        // System prompt, then summary system message, then windowed messages
+        // System prompt, then the summary block, then windowed messages.
         assert_eq!(result[0].role, Role::System);
         assert!(result[0].content.contains("Adele"));
 
-        assert_eq!(result[1].role, Role::System);
-        assert!(
-            result[1]
-                .content
-                .contains("[Summary of earlier conversation]")
-        );
-        assert!(result[1].content.contains("User prefers dark mode"));
+        let summary = surfaced_tags(&result)
+            .into_iter()
+            .find(|b| b.contains("[Summary of earlier conversation]"))
+            .expect("the rolling summary must be surfaced");
+        assert!(summary.contains("User prefers dark mode"));
 
-        assert_eq!(result[2].role, Role::User);
+        assert_eq!(result[history_start(&result)].role, Role::User);
+    }
+
+    // --- The index tier (#1206) ---
+
+    /// A conversation long enough that windowing drops earlier turns.
+    fn many_turns(pairs: usize) -> Vec<Message> {
+        (0..pairs * 2)
+            .map(|i| {
+                if i % 2 == 0 {
+                    Message::new(Role::User, format!("user-{}", i / 2))
+                } else {
+                    Message::new(Role::Assistant, format!("assistant-{}", i / 2))
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_index_tier_renders_once_a_turn_has_left_the_window() {
+        let msgs = many_turns(MAX_CONTEXT_MESSAGES);
+        let result = assemble_for_test(
+            &ConversationView {
+                messages: &msgs,
+                ..Default::default()
+            },
+            &ToolContext::default(),
+            &TurnAnchors::default(),
+            None,
+            &default_estimate,
+        );
+
+        let index = surfaced_tags(&result)
+            .into_iter()
+            .find(|b| b.starts_with("[Earlier turns]"))
+            .expect("turns have left the window, so the index must speak");
+        assert!(
+            index.contains("user-0"),
+            "the earliest turn is the one most in need of an index line: {index}"
+        );
+        assert!(
+            index.contains(&msgs[0].id),
+            "a line must carry the id a read-back addresses: {index}"
+        );
+        assert!(index.contains("not in view"), "{index}");
+    }
+
+    #[test]
+    fn the_index_tier_is_silent_while_the_window_holds_everything() {
+        let msgs = many_turns(3);
+        let result = assemble_for_test(
+            &ConversationView {
+                messages: &msgs,
+                ..Default::default()
+            },
+            &ToolContext::default(),
+            &TurnAnchors::default(),
+            None,
+            &default_estimate,
+        );
+
+        assert!(
+            !surfaced_tags(&result)
+                .iter()
+                .any(|b| b.starts_with("[Earlier turns]")),
+            "an empty index spends tokens saying there is no gap"
+        );
+    }
+
+    /// The index costs tokens, so it is attributed like every other block -
+    /// nothing may hide in an unmeasured remainder.
+    #[test]
+    fn the_index_tier_is_measured_as_its_own_part() {
+        let msgs = many_turns(MAX_CONTEXT_MESSAGES);
+        let assembled = assemble_turn_within_budget(
+            &ConversationView {
+                messages: &msgs,
+                ..Default::default()
+            },
+            &ToolContext::default(),
+            &TurnAnchors::default(),
+            &ContextProjection::default(),
+            MAX_CONTEXT_MESSAGES,
+            None,
+            &default_estimate,
+        );
+
+        assert!(
+            assembled.breakdown.tokens(PromptPart::TurnIndex) > 0,
+            "the block rendered, so its cost must be attributed to it"
+        );
     }
 
     #[test]
@@ -4584,9 +4722,15 @@ mod tests {
             &default_estimate,
         );
 
-        // System prompt directly followed by windowed messages — no summary
+        // No summary block, and the windowed messages follow the blocks there
+        // are.
         assert_eq!(result[0].role, Role::System);
-        assert_eq!(result[1].role, Role::User);
+        assert!(
+            !surfaced_tags(&result)
+                .iter()
+                .any(|b| b.contains("[Summary of earlier conversation]"))
+        );
+        assert_eq!(result[history_start(&result)].role, Role::User);
     }
 
     // --- Active-task anchor tests ---
@@ -4779,20 +4923,23 @@ mod tests {
             &default_estimate,
         );
 
-        // Order: system instruction (0) -> rolling-summary system (1)
-        // -> [Current task] system (2) -> windowed messages start (3..)
+        // Order: the rolling summary comes before `[Current task]`, and both
+        // come before the windowed messages.
         assert_eq!(result[0].role, Role::System);
-        assert!(result[1].role == Role::System);
-        assert!(
-            result[1]
-                .content
-                .contains("[Summary of earlier conversation]")
-        );
-        assert_eq!(result[2].role, Role::System);
-        assert!(result[2].content.starts_with("[Current task]"));
-        assert!(result[2].content.contains(task));
-        // Whatever comes next must not be a System message.
-        assert_ne!(result[3].role, Role::System);
+        let blocks = surfaced_tags(&result);
+        let summary = blocks
+            .iter()
+            .position(|b| b.contains("[Summary of earlier conversation]"))
+            .expect("the rolling summary must be surfaced");
+        let current = blocks
+            .iter()
+            .position(|b| b.starts_with("[Current task]"))
+            .expect("the anchor must be re-injected");
+        assert!(summary < current, "{blocks:?}");
+        assert!(blocks[current].contains(task));
+        // The history follows every block, and starts with a conversation
+        // message rather than another one.
+        assert_ne!(result[history_start(&result)].role, Role::System);
     }
 
     // --- Scratchpad index (#340) ---

@@ -200,6 +200,10 @@ pub(crate) enum PromptPart {
     /// The `[Summary of earlier conversation]` block: what compaction left
     /// behind of the history the window dropped.
     Summary,
+    /// The `[Earlier turns]` index: one line per turn before this one, so a
+    /// turn the window dropped is distinguishable from a turn that never
+    /// happened (#1206).
+    TurnIndex,
     /// The `[Current task]` anchor, re-surfaced when the goal has drifted out
     /// of view.
     CurrentTask,
@@ -225,9 +229,10 @@ pub(crate) enum PromptPart {
 
 impl PromptPart {
     /// Every part, in the order a prompt renders them.
-    pub(crate) const ALL: [PromptPart; 10] = [
+    pub(crate) const ALL: [PromptPart; 11] = [
         Self::System,
         Self::Summary,
+        Self::TurnIndex,
         Self::CurrentTask,
         Self::WorkingState,
         Self::Plan,
@@ -243,6 +248,7 @@ impl PromptPart {
         match self {
             Self::System => "system",
             Self::Summary => "summary",
+            Self::TurnIndex => "turn_index",
             Self::CurrentTask => "current_task",
             Self::WorkingState => "working_state",
             Self::Plan => "plan",
@@ -261,6 +267,7 @@ impl PromptPart {
         match self {
             Self::System => "prompt.system_tokens",
             Self::Summary => "prompt.summary_tokens",
+            Self::TurnIndex => "prompt.turn_index_tokens",
             Self::CurrentTask => "prompt.current_task_tokens",
             Self::WorkingState => "prompt.working_state_tokens",
             Self::Plan => "prompt.plan_tokens",
@@ -277,14 +284,15 @@ impl PromptPart {
         match self {
             Self::System => 0,
             Self::Summary => 1,
-            Self::CurrentTask => 2,
-            Self::WorkingState => 3,
-            Self::Plan => 4,
-            Self::Pinned => 5,
-            Self::Scratchpad => 6,
-            Self::Recall => 7,
-            Self::Transcript => 8,
-            Self::ToolSchemas => 9,
+            Self::TurnIndex => 2,
+            Self::CurrentTask => 3,
+            Self::WorkingState => 4,
+            Self::Plan => 5,
+            Self::Pinned => 6,
+            Self::Scratchpad => 7,
+            Self::Recall => 8,
+            Self::Transcript => 9,
+            Self::ToolSchemas => 10,
         }
     }
 }
@@ -563,7 +571,10 @@ mod tests {
         // `set_tools` assigns rather than adds, so the tool part's `add` above
         // is replaced and not doubled.
         breakdown.set_tools(3, 40);
-        let expected: u64 = (1..=9).sum::<u64>() + 40;
+        // Every part but the last carries its own `i + 1`; the last is
+        // `ToolSchemas`, whose figure `set_tools` replaced.
+        let parts = PromptPart::ALL.len() as u64;
+        let expected: u64 = (1..parts).sum::<u64>() + 40;
         assert_eq!(breakdown.total_tokens(), expected);
         assert_eq!(breakdown.tool_count(), 3);
         assert_eq!(breakdown.tokens(PromptPart::ToolSchemas), 40);
