@@ -182,6 +182,111 @@ pub struct DaemonConfig {
     /// defaults (on).
     #[serde(default, skip_serializing_if = "RecallConfig::is_default")]
     pub recall: RecallConfig,
+    /// `[context]` — how much of the transcript a turn carries verbatim
+    /// (#1208). Absent section => defaults (the token bound off).
+    #[serde(default, skip_serializing_if = "ContextConfig::is_default")]
+    pub context: ContextConfig,
+}
+
+/// `[context]` configuration: what bounds the verbatim window.
+///
+/// The window has always been a count of the most recent messages. A turn is
+/// not a unit of size - one is "thanks" and the next carries 40 KB of tool
+/// output - so a count of them bounds nothing. This section replaces that count
+/// with a token target.
+///
+/// **Off by default.** The failure this can cause presents as "she forgot",
+/// which is the one failure this project says must never happen, so an operator
+/// turns it on rather than remembering to turn it off.
+///
+/// `verbatim_window_tokens = false` leaves THE WINDOW exactly as it was. It is
+/// not a claim that upgrading changes nothing: the `[Earlier turns]` index
+/// (#1206) renders whenever message-count windowing has begun, and it carries
+/// no switch of its own.
+///
+/// Read once, when the conversation handler is built, so an edit needs a
+/// restart.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+pub struct ContextConfig {
+    /// Whether the verbatim window is bounded by tokens rather than by a
+    /// count of messages.
+    #[serde(default)]
+    pub verbatim_window_tokens: bool,
+    /// Fraction of the effective per-turn input budget the window may hold.
+    ///
+    /// "Effective" is the figure the assembler plans against after the learned
+    /// overflow cap, not the model's nominal window and not any ceiling stated
+    /// here. Absent means the built-in default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verbatim_window_ratio: Option<f64>,
+    /// Absolute ceiling on the window, whatever the fraction works out to.
+    ///
+    /// Capacity is not a budget: a third of a million-token window is 330,000
+    /// tokens per turn because the room existed. Absent means the built-in
+    /// default, which is a chosen number rather than a measured one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verbatim_window_ceiling_tokens: Option<u64>,
+    /// Per-model overrides, keyed by the model id the turn route reports.
+    ///
+    /// Per model because both numbers behind the target are per model: what
+    /// the window costs, and how far the model carries a conversation without
+    /// the transcript.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub models: std::collections::BTreeMap<String, ContextModelConfig>,
+}
+
+/// One model's override of the `[context]` defaults.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+pub struct ContextModelConfig {
+    /// This model's fraction, overriding `[context] verbatim_window_ratio`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verbatim_window_ratio: Option<f64>,
+    /// This model's ceiling, overriding
+    /// `[context] verbatim_window_ceiling_tokens`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verbatim_window_ceiling_tokens: Option<u64>,
+}
+
+impl ContextConfig {
+    /// Whether this equals the default section, so a default `[context]` is
+    /// not serialized.
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+
+    /// The policy this section describes, as the core reads it.
+    #[must_use]
+    pub fn policy(&self) -> desktop_assistant_core::verbatim_window::WindowPolicy {
+        use desktop_assistant_core::verbatim_window::{WindowPolicy, WindowTarget};
+
+        let default_target = WindowTarget {
+            ratio: self
+                .verbatim_window_ratio
+                .unwrap_or(desktop_assistant_core::verbatim_window::DEFAULT_WINDOW_RATIO),
+            ceiling_tokens: self
+                .verbatim_window_ceiling_tokens
+                .unwrap_or(desktop_assistant_core::verbatim_window::DEFAULT_WINDOW_CEILING_TOKENS),
+        };
+        WindowPolicy {
+            enabled: self.verbatim_window_tokens,
+            default_target,
+            by_model: self
+                .models
+                .iter()
+                .map(|(model, over)| {
+                    (
+                        model.clone(),
+                        WindowTarget {
+                            ratio: over.verbatim_window_ratio.unwrap_or(default_target.ratio),
+                            ceiling_tokens: over
+                                .verbatim_window_ceiling_tokens
+                                .unwrap_or(default_target.ceiling_tokens),
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
 }
 
 /// `[recall]` configuration: whether a user prompt is looked up against the
@@ -4685,6 +4790,85 @@ max_context_tokens = 1000000
             !serialized.contains("[recall]"),
             "a default section must not be serialized: {serialized}"
         );
+    }
+
+    // --- [context] section (#1208) -----------------------------------------
+
+    #[test]
+    fn the_token_bound_is_off_when_the_section_is_absent() {
+        // Its failure presents as "she forgot", so an install that says
+        // nothing behaves exactly as it did.
+        let config: DaemonConfig = toml::from_str("").unwrap();
+        assert!(!config.context.verbatim_window_tokens);
+        assert!(!config.context.policy().enabled);
+    }
+
+    #[test]
+    fn a_default_context_section_is_not_written_back_out() {
+        let config: DaemonConfig = toml::from_str("").unwrap();
+        let serialized = toml::to_string(&config).unwrap();
+        assert!(
+            !serialized.contains("[context]"),
+            "a default section must not be serialized: {serialized}"
+        );
+    }
+
+    #[test]
+    fn the_context_section_switches_the_bound_on_and_round_trips() {
+        let config: DaemonConfig = toml::from_str(
+            r#"
+            [context]
+            verbatim_window_tokens = true
+            verbatim_window_ratio = 0.25
+            verbatim_window_ceiling_tokens = 40000
+            "#,
+        )
+        .unwrap();
+
+        let policy = config.context.policy();
+        assert!(policy.enabled);
+        assert_eq!(policy.default_target.ratio, 0.25);
+        assert_eq!(policy.default_target.ceiling_tokens, 40_000);
+
+        let serialized = toml::to_string(&config).unwrap();
+        let reparsed: DaemonConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(config.context, reparsed.context);
+    }
+
+    /// Acceptance (#1208): the target is settable per model, because both
+    /// numbers behind it are per model.
+    #[test]
+    fn a_context_target_is_settable_per_model_and_inherits_the_rest() {
+        let config: DaemonConfig = toml::from_str(
+            r#"
+            [context]
+            verbatim_window_tokens = true
+            verbatim_window_ceiling_tokens = 40000
+
+            [context.models."a-small-local-model"]
+            verbatim_window_ceiling_tokens = 4000
+            "#,
+        )
+        .unwrap();
+
+        let policy = config.context.policy();
+        let small = policy
+            .target_for("a-small-local-model")
+            .expect("the bound is on");
+        assert_eq!(small.ceiling_tokens, 4_000);
+        assert_eq!(
+            small.ratio, policy.default_target.ratio,
+            "an override states only what it changes"
+        );
+        assert_eq!(
+            policy.target_for("claude-opus-5").map(|t| t.ceiling_tokens),
+            Some(40_000),
+            "a model nothing names takes the section's own default"
+        );
+
+        let serialized = toml::to_string(&config).unwrap();
+        let reparsed: DaemonConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(config.context, reparsed.context);
     }
 
     // ─────────────────────────────────────────────────────────────────────

@@ -2968,6 +2968,25 @@ async fn main() -> Result<()> {
         );
     }
 
+    // Bound the verbatim window by tokens rather than by a count of messages
+    // (#1208). Off unless an operator turns it on: the failure it can cause
+    // presents as "she forgot", so this is a switch somebody sets rather than
+    // one they must remember to unset. Read once, here, because the window is
+    // decided deep inside the turn loop, which carries no configuration.
+    let window_policy = daemon_config
+        .as_ref()
+        .map(|c| c.context.policy())
+        .unwrap_or_default();
+    if window_policy.enabled {
+        tracing::info!(
+            ratio = window_policy.default_target.ratio,
+            ceiling_tokens = window_policy.default_target.ceiling_tokens,
+            models = window_policy.by_model.len(),
+            "verbatim window bounded by tokens"
+        );
+    }
+    handler = handler.with_verbatim_window(window_policy);
+
     // Pre-prompt recall (#1100): embed the user prompt once before the model's
     // first move and put the memory nearest it in front of the model as a
     // `[Recall]` block. Default-on; `[recall] enabled = false` switches it off.

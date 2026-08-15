@@ -74,6 +74,9 @@ pub enum RestartArea {
     /// its block shows, are both read once when the conversation handler is
     /// built.
     Recall,
+    /// `[context]`: what bounds the verbatim window is read once when the
+    /// conversation handler is built (#1208).
+    Context,
 }
 
 impl RestartArea {
@@ -88,6 +91,7 @@ impl RestartArea {
             Self::Tls => "tls",
             Self::Authz => "authz",
             Self::Recall => "recall",
+            Self::Context => "context",
         }
     }
 }
@@ -165,6 +169,9 @@ pub fn plan_reload(old: &DaemonConfig, new: &DaemonConfig) -> ReloadPlan {
     }
     if old.recall != new.recall {
         plan.restart_required.push(RestartArea::Recall);
+    }
+    if old.context != new.context {
+        plan.restart_required.push(RestartArea::Context);
     }
 
     plan
@@ -513,6 +520,7 @@ mod tests {
         assert_eq!(RestartArea::Tls.as_key(), "tls");
         assert_eq!(RestartArea::Authz.as_key(), "authz");
         assert_eq!(RestartArea::Recall.as_key(), "recall");
+        assert_eq!(RestartArea::Context.as_key(), "context");
     }
 
     /// The admin allowlist is read into the transport validators once, so an
