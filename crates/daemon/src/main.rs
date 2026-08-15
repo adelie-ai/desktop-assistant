@@ -29,6 +29,7 @@ mod provider_reindex;
 mod purposes;
 mod recall;
 mod registry;
+mod replay_eval;
 mod routing_llm;
 mod settings_service;
 mod skill_scanner;
@@ -2695,6 +2696,33 @@ async fn main() -> Result<()> {
     // (the `FixedReasoning` passthrough above is no longer needed to make
     // the two slots' types match, but is left as a harmless no-op).
     let llm: Arc<dyn LlmClient> = Arc::new(llm);
+    // `desktop-assistant --replay-eval <user-id> [model-id]` (#1209): measure,
+    // how much transcript a turn actually needs, then exit without starting the
+    // daemon.
+    //
+    // Placed here because this is the first point where both halves exist: the
+    // conversation store to read from, and the resolved connector to replay
+    // against. The user id is an argument rather than a guess - every store read
+    // is scoped to a user, and a daemon serving several has no default one.
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if let Some(pos) = args.iter().position(|a| a == "--replay-eval") {
+            let user = args.get(pos + 1).ok_or_else(|| {
+                anyhow::anyhow!("--replay-eval requires the user id whose conversations to read")
+            })?;
+            // The model id is optional and only because most connectors name
+            // their own default. What it may not be is guessed: the result is
+            // keyed by it, and a key no config matches is a measurement nobody
+            // reads.
+            let model = args.get(pos + 2).filter(|a| !a.starts_with("--")).cloned();
+            let report =
+                replay_eval::run(&conversation_store, Arc::clone(&llm), user.clone(), model)
+                    .await?;
+            println!("{report}");
+            return Ok(());
+        }
+    }
+
     // #287 slice 7: late-set slot letting the subagent tool executor reach the
     // conversation service. Set (below) to a Weak downgrade of the routing
     // handler the instant it exists; a Weak (not Arc) keeps the executor ->
