@@ -125,6 +125,22 @@ fn by_name<'a>(rows: &'a [ToolUsage], name: &str) -> &'a ToolUsage {
         .unwrap_or_else(|| panic!("no usage row for {name}; got {rows:?}"))
 }
 
+/// Register a `tool_definitions` row carrying the given `provider`, so a
+/// seeded tool call has something for the aggregate's namespace join to
+/// resolve against. Minimal columns only - these tests exercise the join, not
+/// the tool registry itself.
+async fn seed_tool_definition(pool: &PgPool, name: &str, provider: &str) {
+    sqlx::query(
+        "INSERT INTO tool_definitions (name, description, parameters, source, provider) \
+         VALUES ($1, 'test tool', '{}'::jsonb, 'test', $2)",
+    )
+    .bind(name)
+    .bind(provider)
+    .execute(pool)
+    .await
+    .expect("seed tool_definitions");
+}
+
 #[tokio::test]
 async fn tool_usage_counts_per_tool() {
     let Some(fx) = Fixture::try_new().await else {
@@ -302,6 +318,133 @@ async fn tool_usage_counts_the_eviction_marker() {
             "the marker keeps the output, so the bytes stay resident - what \
              shrank is what the model reads, not what the conversation holds"
         );
+    })
+    .await;
+    fx.cleanup().await;
+}
+
+/// #1312 acceptance: two tools registered under different providers report
+/// their own `tool_definitions.provider` value as `namespace`, and a caller
+/// can subtotal by it (the criterion #599 left unmet).
+#[tokio::test]
+async fn tool_usage_groups_by_namespace() {
+    let Some(fx) = Fixture::try_new().await else {
+        eprintln!("skipping: TEST_DATABASE_URL unset");
+        return;
+    };
+    let store = PgToolUsageStore::new(fx.pool.clone());
+    with_user_id(UserId::from("u1"), async {
+        seed(
+            &fx.pool,
+            "c1",
+            &[("a1", "search"), ("a2", "browse"), ("a3", "recall")],
+            &[],
+        )
+        .await
+        .expect("seed");
+        seed_tool_definition(&fx.pool, "search", "mcp:web").await;
+        seed_tool_definition(&fx.pool, "browse", "mcp:web").await;
+        seed_tool_definition(&fx.pool, "recall", "builtin:knowledge").await;
+
+        let rows = store.tool_usage("c1").await.expect("aggregate");
+        assert_eq!(
+            by_name(&rows, "search").namespace.as_deref(),
+            Some("mcp:web")
+        );
+        assert_eq!(
+            by_name(&rows, "browse").namespace.as_deref(),
+            Some("mcp:web")
+        );
+        assert_eq!(
+            by_name(&rows, "recall").namespace.as_deref(),
+            Some("builtin:knowledge")
+        );
+
+        // A caller subtotals by grouping rows on `namespace`; prove the
+        // values actually support it.
+        let web_calls: u32 = rows
+            .iter()
+            .filter(|r| r.namespace.as_deref() == Some("mcp:web"))
+            .map(|r| r.call_count)
+            .sum();
+        assert_eq!(web_calls, 2, "search and browse both belong to mcp:web");
+    })
+    .await;
+    fx.cleanup().await;
+}
+
+/// #1312 acceptance: a tool with no `tool_definitions` row - its MCP server
+/// may since have been removed - is still counted, with a null namespace.
+/// Guards against an accidental inner join dropping the row.
+#[tokio::test]
+async fn tool_usage_namespace_is_null_for_an_unregistered_tool() {
+    let Some(fx) = Fixture::try_new().await else {
+        eprintln!("skipping: TEST_DATABASE_URL unset");
+        return;
+    };
+    let store = PgToolUsageStore::new(fx.pool.clone());
+    with_user_id(UserId::from("u1"), async {
+        seed(&fx.pool, "c1", &[("a1", "ghost")], &[])
+            .await
+            .expect("seed");
+
+        let rows = store.tool_usage("c1").await.expect("aggregate");
+        let ghost = by_name(&rows, "ghost");
+        assert_eq!(
+            ghost.namespace, None,
+            "an unregistered tool reports a null namespace, not an error"
+        );
+        assert_eq!(
+            ghost.call_count, 1,
+            "the LEFT JOIN must not drop a call with no matching definition"
+        );
+    })
+    .await;
+    fx.cleanup().await;
+}
+
+/// #1312 acceptance: joining `tool_definitions` must not change any of the
+/// existing figures. Two definition rows share a non-unique `source` value,
+/// so a join keyed on anything looser than the primary-key `name` column
+/// would match "fetch" twice and double its aggregate - the classic `LEFT
+/// JOIN` fan-out defect.
+#[tokio::test]
+async fn tool_usage_counts_are_unchanged_by_the_join() {
+    let Some(fx) = Fixture::try_new().await else {
+        eprintln!("skipping: TEST_DATABASE_URL unset");
+        return;
+    };
+    let store = PgToolUsageStore::new(fx.pool.clone());
+    with_user_id(UserId::from("u1"), async {
+        seed(
+            &fx.pool,
+            "c1",
+            &[("a1", "fetch"), ("a2", "fetch")],
+            &[("a1", "x".repeat(400)), ("a2", "y".repeat(600))],
+        )
+        .await
+        .expect("seed");
+        seed_tool_definition(&fx.pool, "fetch", "mcp:search").await;
+        seed_tool_definition(&fx.pool, "other_tool", "mcp:search").await;
+
+        let rows = store.tool_usage("c1").await.expect("aggregate");
+        assert_eq!(
+            rows.len(),
+            1,
+            "the join must add no row: one tool called, one row back, got {rows:?}"
+        );
+        let fetch = by_name(&rows, "fetch");
+        assert_eq!(fetch.namespace.as_deref(), Some("mcp:search"));
+        assert_eq!(
+            fetch.call_count, 2,
+            "a fanned-out join would double the call count"
+        );
+        assert_eq!(
+            fetch.result_bytes, 1000,
+            "a fanned-out join would double the byte total"
+        );
+        assert_eq!(fetch.max_result_bytes, 600, "largest single result");
+        assert_eq!(fetch.evicted_results, 0);
     })
     .await;
     fx.cleanup().await;
