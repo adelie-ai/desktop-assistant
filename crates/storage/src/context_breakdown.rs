@@ -22,7 +22,7 @@
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::ports::auth::current_user_id;
 use desktop_assistant_core::ports::context_breakdown::{
-    ContextBreakdown, ContextBreakdownStore, PromptBreakdown, PromptPart,
+    ContextBreakdown, ContextBreakdownStore, MAX_BREAKDOWNS_PER_PAGE, PromptBreakdown, PromptPart,
 };
 use desktop_assistant_core::ports::llm::BudgetSource;
 use sqlx::PgPool;
@@ -39,16 +39,6 @@ use sqlx::Row;
 // `context_breakdown_rows_are_retrievable_for_the_whole_conversation` compares
 // a listed row against the same row read by `get`, field by field, against a
 // real database, so a list that drifted from the get fails there.
-
-/// The most entries one `list` call returns, however many the caller asks for.
-///
-/// A conversation that ran for weeks holds thousands of turns and each entry
-/// carries a ten-part list, so an unbounded `limit` turns one command into one
-/// message holding the whole conversation's accounting. The ceiling matches the
-/// one the knowledge search already applies, and it is stated on the wire, so a
-/// caller pages by how many entries it received rather than by how many it
-/// asked for.
-pub const MAX_BREAKDOWNS_PER_PAGE: u32 = 500;
 
 /// The bound one `list` call actually gives the database.
 ///

@@ -124,6 +124,15 @@ impl ContextBreakdown {
     }
 }
 
+/// The most records one [`ContextBreakdownStore::list`] call returns, however
+/// many the caller asks for.
+///
+/// A conversation that ran for weeks holds thousands of turns and each record
+/// carries a ten-part list, so an unbounded limit turns one command into one
+/// message holding the whole conversation's accounting. Part of the contract
+/// rather than an adapter's own choice, because a caller pages against it.
+pub const MAX_BREAKDOWNS_PER_PAGE: u32 = 500;
+
 /// Outbound port for the per-turn record: one write at the end of a turn, two
 /// reads.
 pub trait ContextBreakdownStore: Send + Sync {
@@ -132,6 +141,17 @@ pub trait ContextBreakdownStore: Send + Sync {
     /// Idempotent on `(user_id, request_id)`: a repeat of the same turn's write
     /// replaces the row rather than adding a second one, so a retried or
     /// re-driven turn cannot double-count itself.
+    ///
+    /// **An implementation must refuse to move a record between
+    /// conversations.** The key holds a value the client chose, where the turn
+    /// adopted the caller's own `turn_id`, so a client that reuses one id for
+    /// two turns of two conversations is writing that key twice on purpose or
+    /// by mistake. Letting the second write win relocates the first
+    /// conversation's record, leaving that conversation short one turn with
+    /// nothing reported anywhere. Keep the record already stored - it is the
+    /// one whose conversation still holds the turn it describes - and say so at
+    /// warn level. This is `Ok(())`, not an error: the turn ran, and its caller
+    /// is owed an answer rather than a failure about its own bookkeeping.
     fn record(
         &self,
         breakdown: &ContextBreakdown,
@@ -143,6 +163,11 @@ pub trait ContextBreakdownStore: Send + Sync {
     /// stay stable while the conversation grows: a new turn appends to the end,
     /// so it changes no page a caller has already read. Scoped by the
     /// task-local user id as well as `conversation_id`.
+    ///
+    /// `limit` is capped at [`MAX_BREAKDOWNS_PER_PAGE`], so a caller pages by
+    /// how many records it received rather than by how many it asked for. A
+    /// `limit` of zero returns an empty page: it is a value a caller chose, and
+    /// widening it to a default would answer a question nobody asked.
     fn list(
         &self,
         conversation_id: &str,

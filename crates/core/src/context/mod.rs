@@ -2256,6 +2256,24 @@ pub(crate) enum RecoveryOutcome {
     Exhausted,
 }
 
+/// What one run of the recovery ladder did.
+///
+/// The outcome decides whether to retry. `compacted` is a separate fact the
+/// caller cannot infer from it: the ladder's last rung shrinks the active
+/// window and folds what that drops into the rolling summary, which is the same
+/// operation the proactive token-pressure path performs, so a turn that reached
+/// it compacted. Without this the turn's own record would say a turn did not
+/// compact while its `[Summary of earlier conversation]` block had just grown -
+/// a summary that appears to have arrived on its own (#588).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Recovery {
+    pub(crate) outcome: RecoveryOutcome,
+    /// Whether the last rung narrowed the window. Keyed on the shrink, exactly
+    /// as the proactive path is, so the two report the same thing: a summariser
+    /// that declined leaves the field alone in both.
+    pub(crate) compacted: bool,
+}
+
 /// Recover from a `ContextOverflow` error by reducing prompt size.
 ///
 /// The ladder runs three steps:
@@ -2298,7 +2316,7 @@ pub(crate) async fn recover_from_overflow<L: LlmClient>(
     target_window: &mut usize,
     task_llm: &L,
     estimate: &(dyn Fn(&str) -> u64 + Send + Sync),
-) -> RecoveryOutcome {
+) -> Recovery {
     // The slice the prompt was built from, as the assembler reported it.
     let window_from = window_from.min(conv.messages.len());
     let window = &conv.messages[window_from..];
@@ -2359,7 +2377,10 @@ pub(crate) async fn recover_from_overflow<L: LlmClient>(
             deficit = ?deficit,
             "context overflow — freed enough to retry without shrinking the window"
         );
-        return RecoveryOutcome::Progressed;
+        return Recovery {
+            outcome: RecoveryOutcome::Progressed,
+            compacted: false,
+        };
     }
 
     // Step 3: shrink the active window and summarise what that drops. Mirrors
@@ -2382,7 +2403,7 @@ pub(crate) async fn recover_from_overflow<L: LlmClient>(
     // A new summary alone is not a smaller prompt. It replaces the summary
     // block rather than dropping messages, and the replacement can be longer
     // than what it replaced, so it does not on its own earn a retry.
-    if freed_tokens > 0 || shrank {
+    let outcome = if freed_tokens > 0 || shrank {
         RecoveryOutcome::Progressed
     } else {
         tracing::warn!(
@@ -2390,6 +2411,10 @@ pub(crate) async fn recover_from_overflow<L: LlmClient>(
             "context overflow — no recovery action available"
         );
         RecoveryOutcome::Exhausted
+    };
+    Recovery {
+        outcome,
+        compacted: shrank,
     }
 }
 
@@ -3544,7 +3569,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(outcome, RecoveryOutcome::Progressed);
+        assert_eq!(outcome.outcome, RecoveryOutcome::Progressed);
         assert_eq!(
             target_window, MAX_CONTEXT_MESSAGES,
             "freeing well past the gap must not also cost the window"
@@ -3581,7 +3606,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(outcome, RecoveryOutcome::Progressed);
+        assert_eq!(outcome.outcome, RecoveryOutcome::Progressed);
         assert!(projection.is_replaced(&conv.messages[2]));
         assert!(
             target_window < MAX_CONTEXT_MESSAGES,
@@ -3654,7 +3679,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(outcome, RecoveryOutcome::Exhausted);
+        assert_eq!(outcome.outcome, RecoveryOutcome::Exhausted);
         assert_eq!(target_window, MIN_CONTEXT_MESSAGES);
         assert_eq!(projection.replaced_count(), 0);
     }

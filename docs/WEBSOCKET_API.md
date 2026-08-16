@@ -397,7 +397,14 @@ verbatim.
 
 Not every turn has an entry. A turn that ran without a correlation id (an agent
 run, a scheduled job) has no key to be recorded under, and a turn cancelled
-before it assembled a prompt measured nothing. A deployment with no database
+before it assembled a prompt measured nothing.
+
+One more case is worth knowing if you mint your own `turn_id`. The entry is
+keyed on that id, so **a client that reuses one id for turns in two different
+conversations gets an entry only for the first**. The daemon refuses to move a
+record between conversations rather than let the later turn overwrite the
+earlier one, and logs a warning naming the id. Mint a fresh `turn_id` per turn -
+not per session - and this cannot arise. A deployment with no database
 keeps no entries at all and answers both commands with an error rather than an
 empty list, so "this conversation has no entries" and "this daemon keeps none"
 stay different answers.

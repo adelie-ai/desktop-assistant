@@ -3938,7 +3938,16 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                         &estimate,
                     )
                     .await;
-                    if outcome == RecoveryOutcome::Exhausted {
+                    if outcome.compacted {
+                        // The ladder's last rung narrowed the window and folded
+                        // what that dropped into the rolling summary - the same
+                        // operation the proactive path performs, so the record
+                        // says the turn compacted (#588). Without this a turn
+                        // that recovered this way reports `compaction_active:
+                        // false` beside a summary block that has just grown.
+                        report.note_compaction();
+                    }
+                    if outcome.outcome == RecoveryOutcome::Exhausted {
                         // The ladder has nothing left to free and the window
                         // is at its floor, so a retry would send the prompt
                         // the provider has just refused. Stop here instead of

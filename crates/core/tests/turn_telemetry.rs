@@ -2786,6 +2786,40 @@ fn every_context_figure_on_the_turn_span_names_its_unit() {
     );
 }
 
+/// A handler whose scratchpad holds a pinned note, an open todo and a
+/// free-form note, so `[Pinned]`, `[Plan]` and `[Scratchpad]` all render.
+///
+/// Three parts carrying real figures rather than one, so a comparison across
+/// two runs can tell a measured figure from a constant in three slots instead
+/// of leaving eight of them zero on both sides.
+fn handler_with_a_full_scratchpad(
+    responses: Vec<Reply>,
+    tools: ScriptedTools,
+) -> ConversationHandler<MemStore, ScriptedLlm, ScriptedTools> {
+    use desktop_assistant_core::domain::ScratchpadNote;
+    use desktop_assistant_core::ports::scratchpad::ScratchpadListFn;
+    let list: ScratchpadListFn = Arc::new(move |conversation_id: String, _note_type, _limit| {
+        let mut pinned = ScratchpadNote::new("sp-1", conversation_id.clone(), "cap", PINNED_NOTE);
+        pinned.pinned = true;
+        let mut todo = ScratchpadNote::new(
+            "sp-2",
+            conversation_id.clone(),
+            "1",
+            "measure the label bounding before widening the metric",
+        );
+        todo.note_type = "todo".to_string();
+        todo.sequence = Some(1);
+        let freeform = ScratchpadNote::new(
+            "sp-3",
+            conversation_id,
+            "registry-eviction",
+            "the registry caps a metric at sixty-four label sets",
+        );
+        Box::pin(async move { Ok(vec![pinned, todo, freeform]) })
+    });
+    handler(responses, tools).with_scratchpad_list(list)
+}
+
 #[test]
 fn turn_span_carries_a_token_figure_for_every_prompt_part() {
     let _serialised = serialised();
@@ -3436,10 +3470,11 @@ fn context_breakdown_persisted_per_turn() {
 fn context_breakdown_parts_match_the_assembler() {
     let _serialised = serialised();
     let (record, recorded) = recording_sink();
-    // A pinned note, so the parts are not all zero and a part written to the
-    // wrong slot has somewhere to show.
+    // A scratchpad holding a pinned note, an open todo and a free-form note, so
+    // three parts carry real figures and a part written to the wrong slot has
+    // somewhere to show.
     let captured = capture(Level::INFO, async move {
-        let handler = handler_with_pinned_note(two_round_script(), ScriptedTools::ok())
+        let handler = handler_with_a_full_scratchpad(two_round_script(), ScriptedTools::ok())
             .with_context_breakdown_recorder(record);
         one_turn(&handler).await;
     });
@@ -3472,17 +3507,31 @@ fn context_breakdown_parts_match_the_assembler() {
         "the estimated total is the sum of the recorded parts, which is the \
          span's total"
     );
-    assert!(
-        row.parts.tokens(PromptPart::Pinned) > 0,
-        "precondition: this turn assembles a `[Pinned]` block, so the \
-         comparison above is against real figures rather than ten zeros"
-    );
+    // The scratchpad this turn reads renders three blocks - `[Pinned]`,
+    // `[Plan]` and the `[Working state]` line - so the comparison below moves
+    // three slots rather than one. The remaining seven stay zero in both runs,
+    // so for those the comparison shows only that the record invented nothing;
+    // what rules out a second measurement path for all ten is the span identity
+    // checked above.
+    let scratchpad_driven = [
+        PromptPart::Pinned,
+        PromptPart::Plan,
+        PromptPart::WorkingState,
+    ];
+    for part in scratchpad_driven {
+        assert!(
+            row.parts.tokens(part) > 0,
+            "precondition: this turn assembles a `{}` block",
+            part.as_label()
+        );
+    }
 
     // The comparison above proves the record and the span read one field. This
-    // proves that field tracks the prompt: the same turn with nothing pinned
-    // records zero for that part and leaves every other part where it was. A
-    // record wired to a constant, or to the wrong part's slot, passes the first
-    // check and fails this one.
+    // proves that field tracks the prompt rather than sitting at a constant:
+    // the same turn with an empty scratchpad records zero for each of those
+    // three parts, and leaves the rest where they were. A record wired to a
+    // constant passes the first check and fails this one, and so does one that
+    // wrote a figure into the wrong slot, in either direction.
     let (bare_record, bare_recorded) = recording_sink();
     capture(Level::INFO, async move {
         let handler = handler(two_round_script(), ScriptedTools::ok())
@@ -3497,19 +3546,22 @@ fn context_breakdown_parts_match_the_assembler() {
         .first()
         .expect("the bare turn recorded its breakdown");
 
-    assert_eq!(
-        bare.parts.tokens(PromptPart::Pinned),
-        0,
-        "with nothing pinned the part is zero, which is a measurement"
-    );
+    for part in scratchpad_driven {
+        assert_eq!(
+            bare.parts.tokens(part),
+            0,
+            "with an empty scratchpad `{}` is zero, which is a measurement",
+            part.as_label()
+        );
+    }
     for part in PromptPart::ALL {
-        if part == PromptPart::Pinned {
+        if scratchpad_driven.contains(&part) {
             continue;
         }
         assert_eq!(
             row.parts.tokens(part),
             bare.parts.tokens(part),
-            "the pinned note changed `{}`, so the parts are not separable the \
+            "the scratchpad changed `{}`, so the parts are not separable the \
              way an operator's fix is",
             part.as_label()
         );
@@ -3650,7 +3702,7 @@ fn a_refused_prompts_parts_are_never_filed_beside_the_retrys_count() {
     // between two different prompts as tokenizer disagreement - which is the
     // one comparison the record exists to support.
     let (record, recorded) = recording_sink();
-    capture(Level::INFO, async move {
+    let captured = capture(Level::INFO, async move {
         let handler = handler(
             vec![
                 Reply::Fail(CoreError::ContextOverflow {
@@ -3675,6 +3727,27 @@ fn a_refused_prompts_parts_are_never_filed_beside_the_retrys_count() {
         .await;
     });
 
+    assert!(
+        captured.console.contains("running recovery ladder"),
+        "precondition: the refusal has to reach the ladder\n--- console ---\n{}",
+        captured.console
+    );
+    let finished = captured
+        .console
+        .lines()
+        .find(|l| l.contains("turn finished"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the turn wrote no completion line\n--- console ---\n{}",
+                captured.console
+            )
+        });
+    assert!(
+        !finished.contains("input_tokens=-"),
+        "precondition: the retry DID report a count, so `None` on the record is \
+         the pairing rule at work rather than a retry that never happened; the \
+         turn reported {finished}"
+    );
     let rows = recorded.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let row = rows.first().expect("the turn recorded its breakdown");
     assert_eq!(
@@ -3748,6 +3821,56 @@ async fn one_turn_on_the_seeded_conversation(
 }
 
 #[test]
+fn a_turn_that_compacted_to_recover_from_an_overflow_records_that_it_compacted() {
+    let _serialised = serialised();
+    // The third rung of the overflow ladder halves the window and folds what
+    // that drops into the rolling summary - the same operation the proactive
+    // path performs. A record reading `compaction_active: false` for such a
+    // turn sits beside a `[Summary of earlier conversation]` block that has
+    // just grown, which reads as a summary that arrived on its own.
+    let (record, recorded) = recording_sink();
+    let captured = capture(Level::INFO, async move {
+        let handler = handler(
+            vec![
+                Reply::Fail(CoreError::ContextOverflow {
+                    prompt_tokens: Some(300_000),
+                    max_tokens: Some(200_000),
+                    detail: "input is too long".to_string(),
+                }),
+                LlmResponse::text(REPLY_SENTINEL)
+                    .with_usage(usage(120_000, 20))
+                    .into(),
+            ],
+            ScriptedTools::ok(),
+        )
+        .with_context_breakdown_recorder(record);
+        with_context_budget(
+            ContextBudget {
+                max_input_tokens: 200_000,
+                source: BudgetSource::ConnectorTable,
+            },
+            one_turn(&handler),
+        )
+        .await;
+    });
+
+    assert!(
+        captured.console.contains("running recovery ladder"),
+        "precondition: the provider's refusal has to reach the ladder, or this \
+         test is measuring an ordinary turn\n--- console ---\n{}",
+        captured.console
+    );
+    let rows = recorded.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let row = rows.first().expect("the turn recorded its breakdown");
+    assert!(
+        row.compaction_active,
+        "the ladder narrowed the window and summarised what it dropped, and \
+         the record has to say so\n--- console ---\n{}",
+        captured.console
+    );
+}
+
+#[test]
 fn a_turn_that_compacted_at_pre_flight_records_that_it_compacted() {
     let _serialised = serialised();
     // The assembler's own budget check can narrow the window and fold what it
@@ -3760,7 +3883,7 @@ fn a_turn_that_compacted_at_pre_flight_records_that_it_compacted() {
     // branch needs a reported input-token count and cannot run at all here, so
     // only the pre-flight fold can set the field.
     let (record, recorded) = recording_sink();
-    capture(Level::INFO, async move {
+    let captured = capture(Level::INFO, async move {
         let handler = handler_with_history(60, Vec::new(), ScriptedTools::ok())
             .with_context_breakdown_recorder(record);
         with_context_budget(
@@ -3773,13 +3896,31 @@ fn a_turn_that_compacted_at_pre_flight_records_that_it_compacted() {
         .await;
     });
 
+    // What isolates the pre-flight path is that NO round reported usage, so the
+    // round-loop branch - which needs a reported input count - could not have
+    // run. The record's own `provider_used_tokens` cannot stand in for that: it
+    // closes at the opening round, so a later round reporting usage would leave
+    // it `None` while the round-loop branch fired. The turn's completion line
+    // sums every round, so it is what says no count arrived at all.
+    let finished = captured
+        .console
+        .lines()
+        .find(|l| l.contains("turn finished"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the turn wrote no completion line\n--- console ---\n{}",
+                captured.console
+            )
+        });
+    assert!(
+        finished.contains("input_tokens=-"),
+        "precondition: no round may report a token count, or the round-loop \
+         compaction branch could have set the field instead; the turn reported \
+         {finished}"
+    );
+
     let rows = recorded.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let row = rows.first().expect("the turn recorded its breakdown");
-    assert_eq!(
-        row.provider_used_tokens, None,
-        "precondition: the provider reported no count, so the round-loop \
-         compaction branch could not have run"
-    );
     assert!(
         row.compaction_active,
         "the turn compacted before its first call, and the record has to say so"
