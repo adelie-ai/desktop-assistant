@@ -319,7 +319,10 @@ Result payloads are typed variants (`pong`, `status`, `conversation_id`, `conver
 
 `list_context_breakdowns` returns one entry per turn of a conversation, oldest
 turn first; `get_context_breakdown` returns the one turn whose `request_id` you
-name, or `null`. Both are tenant reads scoped to the calling user, and a
+name, or `null`. `limit` defaults to 50 when the field is absent and is capped
+at 500, so page by how many entries you received rather than by how many you
+asked for. An explicit `limit` of 0 returns an empty page - it is a value, not
+an absent field, so the default does not apply to it. Both are tenant reads scoped to the calling user, and a
 `request_id` is not a capability: another user's turn reads as absent rather
 than as a refusal.
 
@@ -328,17 +331,26 @@ than as a refusal.
 open the breakdown for a turn straight from its own event log with nothing to
 look up.
 
+One case breaks that, and it is the one worth knowing. When a client re-attaches
+to a turn already running, or replays a completed reply through an
+`idempotency_key`, the daemon re-stamps the events it forwards with the
+*asking* client's `turn_id` - so the id on those events is not the id the turn
+was recorded under, and `get_context_breakdown` answers `null` for it. That is
+an absent record, not a lost one: the entry is filed under the id of the turn
+that actually ran, and `list_context_breakdowns` on the conversation still
+returns it.
+
 Each entry carries:
 
 - `turn_ordinal` - the message ordinal the turn's user prompt took, so the
   entry can be lined up against the transcript.
 - `model` - what the turn actually ran on.
 - `estimated_parts` - a list of `{ part, estimated_tokens }`, in the order a
-  prompt renders them. The names come from a closed set the daemon owns:
-  `system`, `summary`, `current_task`, `working_state`, `plan`, `pinned`,
-  `scratchpad`, `recall`, `transcript`, `tool_schemas`. Render a name you do
-  not recognize as it is - a dropped part is prompt cost that appears to have
-  come from nowhere.
+  prompt renders them. The names come from a closed set the daemon owns, and
+  this document does not repeat that set: a second copy of it would drift, and
+  would then name a part nothing sends. Read the names off a live reply, and
+  render one you do not recognize as it is - a dropped part is prompt cost that
+  appears to have come from nowhere.
 - `estimated_total_tokens` - those parts summed.
 - `advertised_tool_count` - how many tool schemas the prompt carried. A count,
   not a token figure; what the schemas cost is the `tool_schemas` part.
@@ -347,7 +359,7 @@ Each entry carries:
   under, and which tier resolved it.
 - `compaction_active` - whether the turn shrank its own window under token
   pressure and summarised what it dropped.
-- `projected_messages` - how many messages the turn read as a compaction
+- `projected_messages` - how many messages this prompt read as a compaction
   pointer, the head of an oversized result, or a truncation notice, rather than
   as their stored content. The transcript itself still holds every byte.
 - `recorded_at` - when the daemon wrote the entry, RFC3339.
@@ -366,6 +378,14 @@ that reported no count leaves `provider_used_tokens` off the payload entirely,
 because a `0` there would invent a measurement - so treat an absent field as
 "not reported", never as zero. `budget_tokens` and `budget_source` are absent
 together for a turn that ran with no budget installed.
+
+Both figures describe the turn's opening prompt, and only that one. A turn runs
+one prompt per round of its tool loop, and each later prompt carries the tool
+traffic the rounds before it produced; the entry reports the standing bill the
+turn opened with, which is what an operator acts on, not the tail of the loop.
+So `provider_used_tokens` is absent - never borrowed from a later round - when
+the opening round reported no usage, and when the provider refused the opening
+prompt for overflow and the daemon re-assembled a smaller one.
 
 `budget_source` is one of `purpose_override`, `connector_table`,
 `universal_fallback` or `learned_cap`, as a plain string rather than an enum so

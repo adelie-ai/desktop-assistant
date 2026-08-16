@@ -3683,6 +3683,15 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                     PreflightFold::NotNeeded => {}
                     PreflightFold::Folded => {
                         preflight_folded = true;
+                        // Compaction, by the same definition the round-loop
+                        // branch below uses: the window narrowed under token
+                        // pressure and the dropped range went into the rolling
+                        // summary. It reaches the record here because the
+                        // pre-flight check can fire on a turn whose provider
+                        // count never crosses the round-loop threshold, and a
+                        // record reading `false` for such a turn would say the
+                        // summary appeared on its own (#588).
+                        report.note_compaction();
                         assembled = assemble(&conv);
                     }
                     PreflightFold::Declined => preflight_folded = true,
@@ -3949,6 +3958,12 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                         self.persist_turn(conv, turn_start, turn_provenance).await?;
                         return Ok(friendly);
                     }
+                    // The provider refused this prompt and reported no count
+                    // for it, so the record says so (#588). Without this the
+                    // retry's count - taken on the smaller prompt the ladder
+                    // produced - would be filed beside the parts of the prompt
+                    // that was refused.
+                    report.observe_provider_input_tokens(None);
                     continue;
                 }
                 Err(CoreError::Cancelled) => {

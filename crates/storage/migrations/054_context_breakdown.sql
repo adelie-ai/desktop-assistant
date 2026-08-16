@@ -12,11 +12,20 @@
 -- a silent fallback 200k are the same number and a different situation, and
 -- nothing downstream could tell them apart.
 --
--- Keyed on (user_id, request_id), which is the turn's own correlation id and
--- also its trace id. That makes the write idempotent by construction - a
--- retried or re-driven turn replaces its row rather than adding a second one -
--- and gives the single-turn read a key a client already holds, because the
--- same id is on every event the turn streamed.
+-- Keyed on (user_id, request_id): the turn's own correlation id, which is the
+-- id every event of that turn carried, so the single-turn read takes a key a
+-- client already holds. (It seeds the trace id too, but it is not always the
+-- trace id - a caller that sends its own `traceparent` has the daemon continue
+-- that trace instead.)
+--
+-- The key makes a repeat of one turn's write replace its row rather than add a
+-- second. It does NOT make the row count a property of the schema: the value is
+-- the client's own `turn_id` where the client sent a usable uuid, so a client
+-- that reuses one id for two turns is writing the same key twice on purpose or
+-- by mistake. The upsert therefore refuses to move a row between conversations
+-- - see the WHERE on the DO UPDATE in crates/storage/src/context_breakdown.rs -
+-- so a reused id leaves the first conversation's record intact rather than
+-- silently relocating it, and the daemon says so in a warning.
 --
 -- ## Two measurements, and they must not be read as one
 --
@@ -102,8 +111,14 @@ CREATE INDEX IF NOT EXISTS context_breakdowns_conversation_idx
 
 -- Row-level security. Migration 029's list is static and does not reach a table
 -- created later, so each one enables its own. `current_setting('app.user_id',
--- true)` is NULL when the GUC is unset, and `user_id = NULL` is NULL, so a read
--- path that forgot to pin it sees zero rows.
+-- true)` is NULL when the GUC is unset, and `user_id = NULL` is NULL, so an
+-- unpinned read sees zero rows.
+--
+-- As in 029, that backstop binds the un-privileged `adele_query` role the
+-- db_query tool runs as, and NOT the daemon's own connection, which owns the
+-- table and is exempt from a non-FORCE policy. What holds the daemon's reads to
+-- one tenant is the `user_id = $1` predicate each of them binds; the policy is
+-- the second layer, for LLM-supplied SQL.
 DROP POLICY IF EXISTS context_breakdowns_user_isolation ON context_breakdowns;
 ALTER TABLE context_breakdowns ENABLE ROW LEVEL SECURITY;
 CREATE POLICY context_breakdowns_user_isolation ON context_breakdowns

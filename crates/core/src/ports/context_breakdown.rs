@@ -53,9 +53,10 @@ pub use crate::telemetry::prompt::{PromptBreakdown, PromptPart};
 
 /// What filled one turn's prompt, and what the turn was allowed to spend.
 ///
-/// Keyed by `request_id`: the correlation id the client already sees, which is
-/// also the turn's trace id, so one value moves from a client's event stream to
-/// this record to a trace backend with no mapping table in between.
+/// Keyed by `request_id`: the correlation id the client already sees, stamped
+/// on every event the turn streamed, so a client opens a turn's record from its
+/// own event log with nothing to look up. It also seeds the turn's trace id
+/// where the caller supplied no trace of its own to continue.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextBreakdown {
     /// The turn's correlation id. Unique per turn, and the key a caller reads
@@ -70,10 +71,13 @@ pub struct ContextBreakdown {
     /// The model the turn actually ran on, as the route resolved it.
     pub model: String,
     /// Prompt tokens the provider reported for the prompt [`Self::parts`]
-    /// describes.
+    /// describes - the same prompt, counted by the other counter.
     ///
-    /// `None` when the provider reported no count, which is not the same as
-    /// zero: see the module header.
+    /// `None` when the provider reported no count for that prompt, which is
+    /// not the same as zero: see the module header. A provider that reports no
+    /// usage at all, and a prompt the provider refused for overflow, both land
+    /// here as `None` rather than borrowing a figure from a later round, whose
+    /// prompt carries the tool traffic the earlier rounds produced.
     pub provider_used_tokens: Option<u64>,
     /// The input-token budget this turn resolved, or `None` when no budget was
     /// installed (a background job, a test).
@@ -86,10 +90,14 @@ pub struct ContextBreakdown {
     /// What each part of the prompt cost, in estimated tokens, plus how many
     /// tool schemas the prompt advertised. The assembler's own figures.
     pub parts: PromptBreakdown,
-    /// How many messages the turn read as something other than their stored
-    /// content: a compaction pointer for a result an earlier step distilled
-    /// into a note, the head of a result too large to read inline, or a
-    /// truncation notice written by overflow recovery.
+    /// How many messages the prompt [`Self::parts`] describes read as something
+    /// other than their stored content: a compaction pointer for a result an
+    /// earlier step distilled into a note, the head of a result too large to
+    /// read inline, or a truncation notice written by overflow recovery.
+    ///
+    /// The opening prompt's count, like the parts beside it, and not the
+    /// turn's: a later round's overflow recovery projects more, and that
+    /// belongs to a prompt this record does not describe.
     ///
     /// A count of what the transcript part is NOT charging for. The stored
     /// transcript still holds every byte, so this is the gap between what the

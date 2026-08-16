@@ -3477,6 +3477,43 @@ fn context_breakdown_parts_match_the_assembler() {
         "precondition: this turn assembles a `[Pinned]` block, so the \
          comparison above is against real figures rather than ten zeros"
     );
+
+    // The comparison above proves the record and the span read one field. This
+    // proves that field tracks the prompt: the same turn with nothing pinned
+    // records zero for that part and leaves every other part where it was. A
+    // record wired to a constant, or to the wrong part's slot, passes the first
+    // check and fails this one.
+    let (bare_record, bare_recorded) = recording_sink();
+    capture(Level::INFO, async move {
+        let handler = handler(two_round_script(), ScriptedTools::ok())
+            .with_context_breakdown_recorder(bare_record);
+        one_turn(&handler).await;
+    });
+    let bare_rows = bare_recorded
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let bare = bare_rows
+        .first()
+        .expect("the bare turn recorded its breakdown");
+
+    assert_eq!(
+        bare.parts.tokens(PromptPart::Pinned),
+        0,
+        "with nothing pinned the part is zero, which is a measurement"
+    );
+    for part in PromptPart::ALL {
+        if part == PromptPart::Pinned {
+            continue;
+        }
+        assert_eq!(
+            row.parts.tokens(part),
+            bare.parts.tokens(part),
+            "the pinned note changed `{}`, so the parts are not separable the \
+             way an operator's fix is",
+            part.as_label()
+        );
+    }
 }
 
 #[test]
@@ -3561,6 +3598,191 @@ fn a_provider_that_reports_no_count_leaves_the_field_absent() {
         row.estimated_total_tokens() > 0,
         "the parts are measured here, so they do not go missing with the \
          provider's count"
+    );
+}
+
+#[test]
+fn a_later_rounds_count_is_never_recorded_beside_the_first_rounds_parts() {
+    let _serialised = serialised();
+    // A round that reports no usage followed by one that does. The second
+    // round's prompt carries the first round's tool traffic, so filing its
+    // count beside the first round's parts would read as an estimator that is
+    // wildly wrong - the record would show a small prompt and a large bill for
+    // it, and an operator would go looking for a fault that is not there.
+    let (record, recorded) = recording_sink();
+    capture(Level::INFO, async move {
+        let handler = handler(
+            vec![
+                // Round one: a tool call, and the provider says nothing about
+                // what the prompt cost.
+                LlmResponse::with_tool_calls("", vec![tool_call("c1")]).into(),
+                // Round two: an answer, and a count for its own larger prompt.
+                LlmResponse::text(REPLY_SENTINEL)
+                    .with_usage(usage(15_000, 20))
+                    .into(),
+            ],
+            ScriptedTools::ok(),
+        )
+        .with_context_breakdown_recorder(record);
+        one_turn(&handler).await;
+    });
+
+    let rows = recorded.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let row = rows.first().expect("the turn recorded its breakdown");
+    assert_eq!(
+        row.provider_used_tokens, None,
+        "the opening round reported no count, so the record has none - it does \
+         not borrow the second round's figure for the first round's prompt"
+    );
+    assert!(
+        row.estimated_total_tokens() > 0,
+        "the parts are measured here, so they stand whatever the provider said"
+    );
+}
+
+#[test]
+fn a_refused_prompts_parts_are_never_filed_beside_the_retrys_count() {
+    let _serialised = serialised();
+    // The turn this feature gets opened for. The provider refuses the opening
+    // prompt for overflow, the recovery ladder shrinks it, and the retry
+    // succeeds and reports a count for the SMALLER prompt. The record keeps the
+    // refused prompt's parts, so adopting that count would present the gap
+    // between two different prompts as tokenizer disagreement - which is the
+    // one comparison the record exists to support.
+    let (record, recorded) = recording_sink();
+    capture(Level::INFO, async move {
+        let handler = handler(
+            vec![
+                Reply::Fail(CoreError::ContextOverflow {
+                    prompt_tokens: Some(300_000),
+                    max_tokens: Some(200_000),
+                    detail: "input is too long".to_string(),
+                }),
+                LlmResponse::text(REPLY_SENTINEL)
+                    .with_usage(usage(120_000, 20))
+                    .into(),
+            ],
+            ScriptedTools::ok(),
+        )
+        .with_context_breakdown_recorder(record);
+        with_context_budget(
+            ContextBudget {
+                max_input_tokens: 200_000,
+                source: BudgetSource::ConnectorTable,
+            },
+            one_turn(&handler),
+        )
+        .await;
+    });
+
+    let rows = recorded.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let row = rows.first().expect("the turn recorded its breakdown");
+    assert_eq!(
+        row.provider_used_tokens, None,
+        "the provider reported no count for the prompt this record describes, \
+         and the retry's count belongs to a prompt it does not"
+    );
+}
+
+/// A handler whose store already holds a long conversation, so the assembler's
+/// pre-flight budget check has a window to narrow and a range to fold.
+///
+/// The conversation is inserted directly rather than created through the
+/// handler, because `create_conversation` starts an empty one and the pre-flight
+/// fold has nothing to do on an empty conversation.
+fn handler_with_history(
+    messages: usize,
+    responses: Vec<Reply>,
+    tools: ScriptedTools,
+) -> ConversationHandler<MemStore, ScriptedLlm, ScriptedTools> {
+    let store = MemStore::default();
+    let mut conv = Conversation::new(CONVERSATION_ID, "c");
+    for i in 0..messages {
+        conv.messages.push(Message::new(
+            if i % 2 == 0 {
+                desktop_assistant_core::domain::Role::User
+            } else {
+                desktop_assistant_core::domain::Role::Assistant
+            },
+            format!("history message {i}"),
+        ));
+    }
+    store
+        .data
+        .lock()
+        .unwrap()
+        .insert(CONVERSATION_ID.to_string(), conv);
+    ConversationHandler::with_tools(
+        store,
+        ScriptedLlm::new(responses),
+        tools,
+        Box::new(|| CONVERSATION_ID.to_string()),
+    )
+}
+
+/// Run one turn against the conversation `handler_with_history` seeded, without
+/// creating a fresh one first.
+async fn one_turn_on_the_seeded_conversation(
+    handler: &ConversationHandler<MemStore, ScriptedLlm, ScriptedTools>,
+) {
+    with_user_id(
+        UserId::new(USER_ID),
+        with_request_id(
+            REQUEST_ID.to_string(),
+            with_turn_route(route(), async {
+                let _ = handler
+                    .send_prompt_with_override(
+                        &ConversationId(CONVERSATION_ID.to_string()),
+                        PROMPT_SENTINEL.to_string(),
+                        None,
+                        String::new(),
+                        Box::new(|_| true),
+                        Box::new(|_| {}),
+                        CancellationToken::new(),
+                    )
+                    .await;
+            }),
+        ),
+    )
+    .await;
+}
+
+#[test]
+fn a_turn_that_compacted_at_pre_flight_records_that_it_compacted() {
+    let _serialised = serialised();
+    // The assembler's own budget check can narrow the window and fold what it
+    // dropped into the rolling summary before the provider is called at all. A
+    // record reading `compaction_active: false` for such a turn would say the
+    // summary appeared on its own.
+    //
+    // The script is empty, so every provider call answers with plain text and
+    // NO usage. That is what isolates the path: the round-loop compaction
+    // branch needs a reported input-token count and cannot run at all here, so
+    // only the pre-flight fold can set the field.
+    let (record, recorded) = recording_sink();
+    capture(Level::INFO, async move {
+        let handler = handler_with_history(60, Vec::new(), ScriptedTools::ok())
+            .with_context_breakdown_recorder(record);
+        with_context_budget(
+            ContextBudget {
+                max_input_tokens: 1,
+                source: BudgetSource::PurposeOverride,
+            },
+            one_turn_on_the_seeded_conversation(&handler),
+        )
+        .await;
+    });
+
+    let rows = recorded.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let row = rows.first().expect("the turn recorded its breakdown");
+    assert_eq!(
+        row.provider_used_tokens, None,
+        "precondition: the provider reported no count, so the round-loop \
+         compaction branch could not have run"
+    );
+    assert!(
+        row.compaction_active,
+        "the turn compacted before its first call, and the record has to say so"
     );
 }
 

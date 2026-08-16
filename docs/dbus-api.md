@@ -212,6 +212,13 @@ busctl --user call org.desktopAssistant \
   channel or not at all. Nothing an existing D-Bus caller does changes; what
   such a client cannot do without that channel is show a person a skill waiting
   for approval.
+- The per-turn context breakdown has **no typed method here**, and needs none.
+  `list_context_breakdowns` and `get_context_breakdown` say what filled each
+  turn's prompt (see [WEBSOCKET_API.md](WEBSOCKET_API.md)); a D-Bus client
+  reaches both through the generic
+  `org.desktopAssistant.Commands.SendCommand` channel, which forwards any
+  command it does not explicitly refuse. Nothing an existing D-Bus caller does
+  changes.
 - Negative memory is **not on this surface**. The daemon holds a tool call back
   when the same act went badly before, and `list_negative_memories`,
   `get_negative_memory` and `clear_negative_memory` are what let a person see

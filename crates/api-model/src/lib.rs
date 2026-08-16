@@ -1221,8 +1221,8 @@ pub struct TurnCapabilityChange {
 /// the payload, because a zero there would invent a measurement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextBreakdownView {
-    /// The turn's correlation id, which is also its trace id, and the key
-    /// `GetContextBreakdown` reads one turn back by.
+    /// The turn's correlation id: the value stamped on every event that turn
+    /// streamed, and the key `GetContextBreakdown` reads one turn back by.
     pub request_id: String,
     pub conversation_id: String,
     /// Where the turn begins in the conversation: the message ordinal its user
@@ -1266,7 +1266,7 @@ pub struct ContextBreakdownView {
     /// How many tool schemas the prompt advertised. A count, not a token
     /// figure; what those schemas cost is the `tool_schemas` part.
     pub advertised_tool_count: u32,
-    /// How many messages the turn read as something other than their stored
+    /// How many messages this prompt read as something other than their stored
     /// content: a compaction pointer for a result an earlier step distilled
     /// into a note, the head of a result too large to read inline, or a
     /// truncation notice from overflow recovery.
@@ -1283,13 +1283,13 @@ pub struct ContextBreakdownView {
 /// (#588).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PromptPartView {
-    /// The part's stable name, from the daemon's closed set: `system`,
-    /// `summary`, `current_task`, `working_state`, `plan`, `pinned`,
-    /// `scratchpad`, `recall`, `transcript`, `tool_schemas`.
+    /// The part's stable name, from a closed set the daemon owns. The set is
+    /// not repeated here: a second copy of it would be able to drift from the
+    /// one the daemon emits, and would then name a part nothing sends.
     ///
-    /// A client that meets a name it does not know renders it as it is, rather
-    /// than dropping it: an unrendered part is prompt cost that appears to have
-    /// come from nowhere.
+    /// A client renders whatever name it is handed, including one it does not
+    /// recognize. An unrendered part is prompt cost that appears to have come
+    /// from nowhere.
     pub part: String,
     /// What the part cost, in ESTIMATED tokens. Zero means the part rendered
     /// nothing, which is a measurement.

@@ -438,3 +438,52 @@ async fn context_breakdown_record_is_idempotent() {
     .await;
     fx.cleanup().await;
 }
+
+#[tokio::test]
+async fn a_reused_correlation_id_never_moves_a_record_between_conversations() {
+    let Some(fx) = Fixture::try_new().await else {
+        eprintln!("skipping: TEST_DATABASE_URL unset");
+        return;
+    };
+    let store = PgContextBreakdownStore::new(fx.pool.clone());
+    with_user_id(UserId::from("u1"), async {
+        // The key holds a value the CLIENT chose - a turn adopts the caller's
+        // `turn_id` when it is a usable uuid - so a client that reuses one id
+        // for two turns of two conversations writes the same key twice. Letting
+        // the second write win would relocate the first conversation's record
+        // into the second, leaving the first short one turn and reporting
+        // nothing about it.
+        store
+            .record(&record("shared", "c1", 0))
+            .await
+            .expect("first");
+        store
+            .record(&record("shared", "c2", 0))
+            .await
+            .expect("a reused id is refused quietly, not as an error");
+
+        let first = store.list("c1", 50, 0).await.expect("list c1");
+        assert_eq!(
+            first.len(),
+            1,
+            "the conversation that recorded the turn keeps its record"
+        );
+        assert_eq!(first[0].request_id, "shared");
+        assert!(
+            store.list("c2", 50, 0).await.expect("list c2").is_empty(),
+            "the second conversation gains nothing, and takes nothing away"
+        );
+        assert_eq!(
+            store
+                .get("shared")
+                .await
+                .expect("get")
+                .expect("row")
+                .conversation_id,
+            "c1",
+            "the record still names the conversation whose turn it describes"
+        );
+    })
+    .await;
+    fx.cleanup().await;
+}

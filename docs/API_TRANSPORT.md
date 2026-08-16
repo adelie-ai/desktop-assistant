@@ -179,8 +179,9 @@ user's turn reads as absent rather than as a refusal. `docs/WEBSOCKET_API.md`
 documents the payload, including the one rule an integrator must not break -
 the assembler's per-part estimate and the provider's own reported count are two
 measurements of one prompt and are never summed or derived from each other.
-Neither command is on the D-Bus bridge, which exposes a chosen subset; the
-breakdown is a WebSocket and UDS read.
+Both commands reach every transport, D-Bus included, because
+`org.desktopAssistant.Commands.SendCommand` forwards any command it does not
+explicitly refuse.
 
 Every other command is tenant work, including `ClearAllHistory`, which clears
 only the calling user's conversations.

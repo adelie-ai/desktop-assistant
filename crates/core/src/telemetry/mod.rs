@@ -597,10 +597,18 @@ pub(crate) struct TurnGuard {
     /// that answered without calling a tool never does - and having held no
     /// tool bytes is exactly what that is.
     tool_bytes: Option<crate::planning::ToolByteCensus>,
-    /// The first prompt-token count the provider reported (#588). Kept beside
-    /// the estimate above and never merged with it: the provider tokenises its
-    /// own way, so the two are two measurements of one prompt.
+    /// What the provider said the prompt above cost (#588). Kept beside the
+    /// estimate and never merged with it: the provider tokenises its own way,
+    /// so the two are two measurements of one prompt.
     provider_used_tokens: Option<u64>,
+    /// Whether the round carrying the recorded prompt has answered yet.
+    ///
+    /// The count and the estimate must describe the SAME prompt, and the field
+    /// above cannot say so on its own - `None` reads both as "not observed yet"
+    /// and as "observed, and the provider said nothing". Without this the first
+    /// LATER round to report a count would be adopted, and the record would
+    /// show one prompt's parts beside another prompt's total.
+    provider_count_open: bool,
     /// Whether proactive compaction ran on this turn.
     compaction_active: bool,
     /// Where the turn begins in the conversation: the message ordinal its user
@@ -635,6 +643,7 @@ impl TurnGuard {
             tool_peak: prompt::ToolBlockPeak::default(),
             tool_bytes: None,
             provider_used_tokens: None,
+            provider_count_open: false,
             compaction_active: false,
             turn_ordinal: 0,
         }
@@ -667,18 +676,31 @@ impl TurnGuard {
         if self.prompt.is_none() {
             self.prompt = Some(breakdown);
             self.projected_messages = u32::try_from(projected_messages).unwrap_or(u32::MAX);
+            // This prompt is the one the record describes, and the round
+            // sending it has not answered yet.
+            self.provider_count_open = true;
         }
     }
 
-    /// Note the prompt-token count the provider reported for a round.
+    /// Note what the provider reported for the round carrying the recorded
+    /// prompt, and close the question.
     ///
-    /// The first count wins, for the reason the breakdown's first assembly
-    /// does: it is the count for the prompt the breakdown describes. A
-    /// provider that reported nothing leaves the field absent, because zero
-    /// there would invent a measurement.
+    /// The FIRST observation wins, not the first non-empty one, and that is the
+    /// pairing rather than defensiveness. A later round's prompt carries the
+    /// tool traffic the rounds before it produced, so adopting its count would
+    /// put one prompt's parts beside another prompt's total and read as an
+    /// estimator that is wildly wrong.
+    ///
+    /// Call it with `None` on every path where the recorded prompt's round
+    /// ended without a count - a provider that reports no usage, and a prompt
+    /// the provider refused. The field then stays absent, which says the
+    /// provider did not report a count for THIS prompt; a zero would invent a
+    /// measurement, and a later round's figure would answer a question nobody
+    /// asked.
     pub(crate) fn observe_provider_input_tokens(&mut self, input_tokens: Option<u64>) {
-        if self.provider_used_tokens.is_none() {
+        if self.provider_count_open {
             self.provider_used_tokens = input_tokens;
+            self.provider_count_open = false;
         }
     }
 

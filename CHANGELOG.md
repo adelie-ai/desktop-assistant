@@ -17,8 +17,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   its own events carried. Each entry gives the estimated tokens for every part
   of the prompt - system instruction, summary, plan, pinned notes, scratchpad
   index, recall, transcript, tool schemas - beside the count the provider
-  reported, the input-token budget the turn ran under, and which tier resolved
-  that budget. The last of those is what tells a curated limit for the model
+  reported, the input-token budget the turn ran under, which tier resolved that
+  budget, whether the turn compacted itself, and how many of its messages it
+  read as a pointer, a head or a notice instead of as their stored content. The last of those is what tells a curated limit for the model
   apart from the conservative fallback the daemon uses when nothing supplied
   one; the two are the same number and a different situation, and until now
   nothing outside the daemon could tell them apart.

@@ -4347,6 +4347,142 @@ mod tests {
         );
     }
 
+    // --- The per-turn context breakdown on the wire (issue #588) --------
+
+    fn breakdown_record() -> desktop_assistant_core::ports::context_breakdown::ContextBreakdown {
+        use desktop_assistant_core::ports::context_breakdown::{
+            ContextBreakdown, PromptBreakdown, PromptPart,
+        };
+        ContextBreakdown {
+            request_id: "req-1".to_string(),
+            conversation_id: "conv-1".to_string(),
+            turn_ordinal: 6,
+            model: "a-model".to_string(),
+            provider_used_tokens: Some(41_000),
+            budget_tokens: Some(200_000),
+            budget_source: Some(desktop_assistant_core::ports::llm::BudgetSource::ConnectorTable),
+            compaction_active: true,
+            // Every part a different figure, so a figure published under the
+            // wrong part's name is visible rather than hidden behind equal
+            // values.
+            parts: PromptBreakdown::from_parts(
+                PromptPart::ALL
+                    .iter()
+                    .enumerate()
+                    .map(|(i, part)| (*part, (i as u64 + 1) * 100)),
+                7,
+            ),
+            projected_messages: 3,
+            recorded_at: Some("2026-08-16T00:00:00Z".to_string()),
+        }
+    }
+
+    #[test]
+    fn the_wire_view_publishes_every_part_under_its_own_name_and_figure() {
+        use desktop_assistant_core::ports::context_breakdown::PromptPart;
+        let view = context_breakdown_to_view(breakdown_record());
+
+        let published: Vec<(&str, u64)> = view
+            .estimated_parts
+            .iter()
+            .map(|p| (p.part.as_str(), p.estimated_tokens))
+            .collect();
+        let expected: Vec<(&str, u64)> = PromptPart::ALL
+            .iter()
+            .enumerate()
+            .map(|(i, part)| (part.as_label(), (i as u64 + 1) * 100))
+            .collect();
+        assert_eq!(
+            published, expected,
+            "the wire part list is the daemon's own set, in the order a prompt \
+             renders them, with each part's own figure"
+        );
+    }
+
+    #[test]
+    fn the_wire_estimated_total_is_the_parts_and_never_the_providers_count() {
+        // The conflation this record exists to prevent, at the one boundary a
+        // client reads. Publishing the provider's figure under a name that
+        // says "estimated" would make every client report it as the estimate.
+        let record = breakdown_record();
+        let view = context_breakdown_to_view(record.clone());
+
+        let summed: u64 = view
+            .estimated_parts
+            .iter()
+            .map(|p| p.estimated_tokens)
+            .sum();
+        assert_eq!(view.estimated_total_tokens, summed);
+        assert_eq!(view.provider_used_tokens, Some(41_000));
+        assert_ne!(
+            view.estimated_total_tokens, 41_000,
+            "the two figures are separate measurements; a view that made them \
+             agree by construction would be reporting one of them twice"
+        );
+        assert_eq!(
+            view.advertised_tool_count, 7,
+            "the tool count is a count and is published as one, not as tokens"
+        );
+    }
+
+    #[test]
+    fn the_wire_view_publishes_the_resolved_budget_tier() {
+        // A curated limit and the universal fallback are the same number, so
+        // the tier is the only thing that separates them - and a view that
+        // published a constant would pass every other assertion here.
+        use desktop_assistant_core::ports::llm::BudgetSource;
+        for tier in BudgetSource::ALL {
+            let mut record = breakdown_record();
+            record.budget_source = Some(tier);
+            let view = context_breakdown_to_view(record);
+            assert_eq!(
+                view.budget_source.as_deref(),
+                Some(tier.as_label()),
+                "the tier the daemon resolved must reach the wire as itself"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreported_provider_count_is_absent_from_the_wire_rather_than_zero() {
+        // Zero would invent a measurement, and an integrator cannot tell an
+        // invented zero from a prompt that cost nothing.
+        let mut record = breakdown_record();
+        record.provider_used_tokens = None;
+        record.budget_tokens = None;
+        record.budget_source = None;
+        let view = context_breakdown_to_view(record);
+
+        assert_eq!(view.provider_used_tokens, None);
+        assert_eq!(view.budget_tokens, None);
+        assert_eq!(view.budget_source, None);
+        let json = serde_json::to_value(&view).expect("serialize the view");
+        for absent in ["provider_used_tokens", "budget_tokens", "budget_source"] {
+            assert!(
+                json.get(absent).is_none(),
+                "`{absent}` must be omitted from the payload, not sent as null \
+                 or zero"
+            );
+        }
+        assert!(
+            view.estimated_total_tokens > 0,
+            "the estimate is measured by the daemon and stands whatever the \
+             provider said"
+        );
+    }
+
+    #[test]
+    fn the_wire_view_carries_the_turns_own_identity_and_position() {
+        let view = context_breakdown_to_view(breakdown_record());
+        assert_eq!(view.request_id, "req-1");
+        assert_eq!(view.conversation_id, "conv-1");
+        assert_eq!(view.turn_ordinal, 6);
+        assert_eq!(view.model, "a-model");
+        assert!(view.compaction_active);
+        assert_eq!(view.projected_messages, 3);
+        assert_eq!(view.recorded_at.as_deref(), Some("2026-08-16T00:00:00Z"));
+    }
+
     /// The one knowledge id [`FakeKnowledge`] holds an entry for.
     const FAKE_KNOWLEDGE_ID: &str = "kb-fake";
 
