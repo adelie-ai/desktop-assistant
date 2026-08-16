@@ -39,9 +39,13 @@ use desktop_assistant_core::domain::{
     ToolNamespace,
 };
 use desktop_assistant_core::ports::auth::{UserId, with_user_id};
+use desktop_assistant_core::ports::context_breakdown::{
+    ContextBreakdown, ContextBreakdownRecordFn, PromptPart,
+};
 use desktop_assistant_core::ports::inbound::ConversationService;
 use desktop_assistant_core::ports::llm::{
-    ChunkCallback, LlmClient, LlmResponse, ReasoningConfig, TokenUsage,
+    BudgetSource, ChunkCallback, ContextBudget, LlmClient, LlmResponse, ReasoningConfig,
+    TokenUsage, with_context_budget,
 };
 use desktop_assistant_core::ports::store::ConversationStore;
 use desktop_assistant_core::ports::tools::ToolExecutor;
@@ -3308,5 +3312,292 @@ fn the_tool_schema_cost_is_counted_per_server_so_an_operator_can_see_which_to_dr
         captured.counter_delta(PROMPT_ROUND_TOOLS_METRIC, &[]),
         2,
         "two rounds advertising one tool each is two, not one"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #588: the per-turn record.
+//
+// The breakdown above is measured on every turn, put on the span, added to the
+// metrics facade - and then dropped. So is the budget tier the daemon resolved,
+// which is what tells a curated 200k from a silent universal-fallback 200k.
+// These tests are the promise that both reach one durable record per turn, and
+// that the record carries the SAME measurement the span does. A second
+// measurement path is how a record of this shape quietly goes wrong: it keeps
+// reporting, and it reports something else.
+// ---------------------------------------------------------------------------
+
+/// A recorder that keeps what the turn hands it, and the slot to read it from.
+fn recording_sink() -> (ContextBreakdownRecordFn, Arc<Mutex<Vec<ContextBreakdown>>>) {
+    let recorded: Arc<Mutex<Vec<ContextBreakdown>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&recorded);
+    let record: ContextBreakdownRecordFn = Arc::new(move |breakdown: ContextBreakdown| {
+        let sink = Arc::clone(&sink);
+        Box::pin(async move {
+            sink.lock().unwrap_or_else(|e| e.into_inner()).push(breakdown);
+            Ok(())
+        })
+    });
+    (record, recorded)
+}
+
+/// Run one turn per entry in `requests`, all on ONE conversation, each under
+/// its own correlation id - the way a client sends several prompts into a chat.
+async fn turns_on_one_conversation(
+    handler: &ConversationHandler<MemStore, ScriptedLlm, ScriptedTools>,
+    requests: &[&str],
+) {
+    let conv = handler
+        .create_conversation("c".into(), vec![])
+        .await
+        .expect("create the conversation");
+    for request_id in requests {
+        with_user_id(
+            UserId::new(USER_ID),
+            with_request_id(
+                (*request_id).to_string(),
+                with_turn_route(route(), async {
+                    let _ = handler
+                        .send_prompt_with_override(
+                            &conv.id,
+                            PROMPT_SENTINEL.to_string(),
+                            None,
+                            String::new(),
+                            Box::new(|_| true),
+                            Box::new(|_| {}),
+                            CancellationToken::new(),
+                        )
+                        .await;
+                }),
+            ),
+        )
+        .await;
+    }
+}
+
+/// One turn, run with `budget` installed the way the daemon's dispatch wrapper
+/// installs it, and what it recorded.
+fn turn_under_budget(budget: ContextBudget) -> ContextBreakdown {
+    let (record, recorded) = recording_sink();
+    capture(Level::INFO, async move {
+        let handler =
+            handler(two_round_script(), ScriptedTools::ok()).with_context_breakdown_recorder(record);
+        with_context_budget(budget, one_turn(&handler)).await;
+    });
+    let rows = recorded.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    rows.into_iter()
+        .next()
+        .expect("the turn recorded its context breakdown")
+}
+
+#[test]
+fn context_breakdown_persisted_per_turn() {
+    let _serialised = serialised();
+    let (record, recorded) = recording_sink();
+    capture(Level::INFO, async move {
+        let handler =
+            handler(Vec::new(), ScriptedTools::ok()).with_context_breakdown_recorder(record);
+        turns_on_one_conversation(&handler, &["req-first", "req-second"]).await;
+    });
+
+    let rows = recorded.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert_eq!(
+        rows.len(),
+        2,
+        "two turns write two records - one per turn, not one per conversation \
+         and not one per round: {rows:?}"
+    );
+    let ids: Vec<&str> = rows.iter().map(|r| r.request_id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec!["req-first", "req-second"],
+        "each record is keyed by its own turn's correlation id"
+    );
+    for row in &rows {
+        assert_eq!(
+            row.conversation_id, CONVERSATION_ID,
+            "the record names the conversation it belongs to"
+        );
+        assert_eq!(
+            row.model, MODEL,
+            "the record names the model the turn actually ran on"
+        );
+    }
+    assert!(
+        rows[1].turn_ordinal > rows[0].turn_ordinal,
+        "the second turn sits later in the conversation, and the ordinal is \
+         what lets a reader line the record up against the transcript: {rows:?}"
+    );
+}
+
+#[test]
+fn context_breakdown_parts_match_the_assembler() {
+    let _serialised = serialised();
+    let (record, recorded) = recording_sink();
+    // A pinned note, so the parts are not all zero and a part written to the
+    // wrong slot has somewhere to show.
+    let captured = capture(Level::INFO, async move {
+        let handler = handler_with_pinned_note(two_round_script(), ScriptedTools::ok())
+            .with_context_breakdown_recorder(record);
+        one_turn(&handler).await;
+    });
+
+    let rows = recorded.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let row = rows.first().expect("the turn recorded its breakdown");
+    let turn = captured.span("turn");
+
+    // The span fields come from the assembler's own `PromptBreakdown`. If the
+    // record were built by measuring anything a second time - re-reading the
+    // stored prompt, re-estimating the blocks, summing what the rounds sent -
+    // the two would part company here and nowhere else.
+    for (part, field) in PromptPart::ALL.iter().zip(PROMPT_PART_FIELDS) {
+        assert_eq!(
+            row.parts.tokens(*part),
+            prompt_field(turn, field),
+            "the record's `{}` figure is not the one the assembler measured \
+             and put on `{field}`",
+            part.as_label()
+        );
+    }
+    assert_eq!(
+        row.parts.tool_count() as u64,
+        prompt_field(turn, PROMPT_TOOL_COUNT_FIELD),
+        "the advertised tool count is the assembler's own"
+    );
+    assert_eq!(
+        row.estimated_total_tokens(),
+        prompt_field(turn, PROMPT_TOTAL_FIELD),
+        "the estimated total is the sum of the recorded parts, which is the \
+         span's total"
+    );
+    assert!(
+        row.parts.tokens(PromptPart::Pinned) > 0,
+        "precondition: this turn assembles a `[Pinned]` block, so the \
+         comparison above is against real figures rather than ten zeros"
+    );
+}
+
+#[test]
+fn budget_source_surfaced() {
+    let _serialised = serialised();
+    // The case the tier exists for. Both turns resolve the same number, and
+    // only the tier says whether it is a curated limit for this model or the
+    // conservative fallback used when nothing supplied one.
+    let curated = turn_under_budget(ContextBudget {
+        max_input_tokens: 200_000,
+        source: BudgetSource::ConnectorTable,
+    });
+    let fallback = turn_under_budget(ContextBudget {
+        max_input_tokens: 200_000,
+        source: BudgetSource::UniversalFallback,
+    });
+
+    assert_eq!(curated.budget_tokens, Some(200_000));
+    assert_eq!(
+        fallback.budget_tokens, curated.budget_tokens,
+        "precondition: the two turns resolved the same number"
+    );
+    assert_eq!(
+        curated.budget_source,
+        Some(BudgetSource::ConnectorTable),
+        "the resolved tier reaches the record rather than being discarded in \
+         the daemon"
+    );
+    assert_eq!(
+        fallback.budget_source,
+        Some(BudgetSource::UniversalFallback),
+        "a curated limit and the universal fallback must not read alike"
+    );
+}
+
+#[test]
+fn the_provider_count_and_the_estimate_reach_the_record_as_two_figures() {
+    let _serialised = serialised();
+    // `two_round_script` reports 100 input tokens on the first round. The
+    // estimate is measured here, from the blocks the assembler laid out, and
+    // agreeing with the provider is not something either one owes the other.
+    let row = turn_under_budget(ContextBudget {
+        max_input_tokens: 200_000,
+        source: BudgetSource::ConnectorTable,
+    });
+    assert_eq!(
+        row.provider_used_tokens,
+        Some(100),
+        "the record carries the count the provider reported for the prompt the \
+         estimate describes"
+    );
+    assert!(
+        row.estimated_total_tokens() > 0,
+        "the estimate is measured here and stands whatever the provider said"
+    );
+    assert_ne!(
+        row.provider_used_tokens,
+        Some(row.estimated_total_tokens()),
+        "the two are separate measurements of one prompt; a record that made \
+         them agree by construction would be reporting one of them twice"
+    );
+}
+
+#[test]
+fn a_provider_that_reports_no_count_leaves_the_field_absent() {
+    let _serialised = serialised();
+    // Zero would invent a measurement. An absent count is the one thing a
+    // reader must be able to tell apart from a prompt that cost nothing.
+    let (record, recorded) = recording_sink();
+    capture(Level::INFO, async move {
+        let handler = handler(
+            vec![LlmResponse::text(REPLY_SENTINEL).into()],
+            ScriptedTools::ok(),
+        )
+        .with_context_breakdown_recorder(record);
+        one_turn(&handler).await;
+    });
+    let rows = recorded.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let row = rows.first().expect("the turn recorded its breakdown");
+    assert_eq!(row.provider_used_tokens, None);
+    assert!(
+        row.estimated_total_tokens() > 0,
+        "the parts are measured here, so they do not go missing with the \
+         provider's count"
+    );
+}
+
+#[test]
+fn a_turn_with_no_correlation_id_records_nothing_rather_than_a_row_nobody_can_name() {
+    let _serialised = serialised();
+    // An agent run and a scheduled job reach the turn loop without a
+    // correlation id. The record is keyed by that id, so there is no key to
+    // write under, and inventing one would put a row in the log that no client
+    // can ask for and no second write can replace.
+    let (record, recorded) = recording_sink();
+    capture(Level::INFO, async move {
+        let handler =
+            handler(two_round_script(), ScriptedTools::ok()).with_context_breakdown_recorder(record);
+        let conv = handler
+            .create_conversation("c".into(), vec![])
+            .await
+            .expect("create the conversation");
+        with_user_id(
+            UserId::new(USER_ID),
+            with_turn_route(route(), async {
+                let _ = handler
+                    .send_prompt_with_override(
+                        &conv.id,
+                        PROMPT_SENTINEL.to_string(),
+                        None,
+                        String::new(),
+                        Box::new(|_| true),
+                        Box::new(|_| {}),
+                        CancellationToken::new(),
+                    )
+                    .await;
+            }),
+        )
+        .await;
+    });
+    let rows = recorded.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert!(
+        rows.is_empty(),
+        "a turn with no correlation id has no key to record under: {rows:?}"
     );
 }

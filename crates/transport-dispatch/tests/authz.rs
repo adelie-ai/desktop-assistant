@@ -432,6 +432,16 @@ command_table! {
                 conversation_id: "c".to_string(),
             },
             Tenant),
+    ListContextBreakdowns => (api::Command::ListContextBreakdowns {
+                conversation_id: "c".to_string(),
+                limit: 50,
+                offset: 0,
+            },
+            Tenant),
+    GetContextBreakdown => (api::Command::GetContextBreakdown {
+                request_id: "r".to_string(),
+            },
+            Tenant),
     ListKnowledgeEntries => (api::Command::ListKnowledgeEntries {
                 limit: 10,
                 offset: 0,

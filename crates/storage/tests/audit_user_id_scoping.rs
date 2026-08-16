@@ -245,6 +245,9 @@ fn assert_personal_tables_match_audit() {
         "idempotency_keys",
         "background_tasks",
         "scratchpads",
+        // 054 - one row per turn saying what filled its prompt, which names
+        // the conversation and the model this person talks to.
+        "context_breakdowns",
     ] {
         assert!(
             canonical.contains(&required),
