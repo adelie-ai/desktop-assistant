@@ -237,6 +237,11 @@ fn classify(cmd: &api::Command) -> (&'static str, Capability) {
 
         // Knowledge base and cost reporting: the caller's own rows.
         api::Command::GetToolUsage { .. } => ("get_tool_usage", Tenant),
+        // Both read this caller's own turns, scoped by the task-local user id
+        // in storage, so they carry the same tier as the rest of a tenant's
+        // own conversation data.
+        api::Command::ListContextBreakdowns { .. } => ("list_context_breakdowns", Tenant),
+        api::Command::GetContextBreakdown { .. } => ("get_context_breakdown", Tenant),
         api::Command::ListKnowledgeEntries { .. } => ("list_knowledge_entries", Tenant),
         api::Command::GetKnowledgeEntry { .. } => ("get_knowledge_entry", Tenant),
         api::Command::SearchKnowledgeEntries { .. } => ("search_knowledge_entries", Tenant),

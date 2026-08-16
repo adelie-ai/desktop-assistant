@@ -545,6 +545,14 @@ where
     /// configured; the command then reports it is unavailable rather than
     /// pretending the conversation used no tools.
     tool_usage: Option<desktop_assistant_core::ports::tool_usage::ToolUsageFn>,
+    /// The per-turn context breakdown reads (#588). Absent when no Postgres
+    /// pool is configured; the commands then report they are unavailable rather
+    /// than answering that the conversation has no record, which is what a
+    /// conversation whose turns simply were not recorded also looks like.
+    context_breakdown_list:
+        Option<desktop_assistant_core::ports::context_breakdown::ContextBreakdownListFn>,
+    context_breakdown_get:
+        Option<desktop_assistant_core::ports::context_breakdown::ContextBreakdownGetFn>,
     /// Optional idempotency-key store (#204). When attached, a `SendMessage`
     /// carrying an `idempotency_key` whose turn already completed replays the
     /// stored reply instead of re-running the LLM/tools (crash-safe
@@ -661,6 +669,8 @@ where
             scratchpad_delete_many: None,
             scratchpad_clear: None,
             tool_usage: None,
+            context_breakdown_list: None,
+            context_breakdown_get: None,
             idempotency: None,
             inflight: Arc::new(InFlightRegistry::default()),
             client_tools: None,
@@ -738,6 +748,19 @@ where
         tool_usage: desktop_assistant_core::ports::tool_usage::ToolUsageFn,
     ) -> Self {
         self.tool_usage = Some(tool_usage);
+        self
+    }
+
+    /// Wire the per-turn context breakdown reads (#588). Both together, because
+    /// a deployment that can list the turns of a conversation and cannot open
+    /// one of them serves half a view.
+    pub fn with_context_breakdowns(
+        mut self,
+        list: desktop_assistant_core::ports::context_breakdown::ContextBreakdownListFn,
+        get: desktop_assistant_core::ports::context_breakdown::ContextBreakdownGetFn,
+    ) -> Self {
+        self.context_breakdown_list = Some(list);
+        self.context_breakdown_get = Some(get);
         self
     }
 
@@ -1506,6 +1529,41 @@ fn capability_reason_to_view(
     }
 }
 
+/// Map one turn's record to its wire view (#588).
+///
+/// The part list is built from the daemon's own `PromptPart` set, in the order
+/// a prompt renders them, so the wire never carries a second list of parts that
+/// could drift from the one the assembler measures against. The estimated total
+/// is summed here, at the boundary, so every client shows the same figure
+/// rather than each summing the list itself - and so no client is tempted to
+/// reach for the provider's count when it wants a total.
+fn context_breakdown_to_view(
+    b: desktop_assistant_core::ports::context_breakdown::ContextBreakdown,
+) -> api::ContextBreakdownView {
+    use desktop_assistant_core::ports::context_breakdown::PromptPart;
+    api::ContextBreakdownView {
+        estimated_parts: PromptPart::ALL
+            .iter()
+            .map(|part| api::PromptPartView {
+                part: part.as_label().to_string(),
+                estimated_tokens: b.parts.tokens(*part),
+            })
+            .collect(),
+        estimated_total_tokens: b.estimated_total_tokens(),
+        advertised_tool_count: b.advertised_tool_count(),
+        request_id: b.request_id,
+        conversation_id: b.conversation_id,
+        turn_ordinal: b.turn_ordinal,
+        model: b.model,
+        provider_used_tokens: b.provider_used_tokens,
+        budget_tokens: b.budget_tokens,
+        budget_source: b.budget_source.map(|s| s.as_label().to_string()),
+        compaction_active: b.compaction_active,
+        projected_messages: b.projected_messages,
+        recorded_at: b.recorded_at,
+    }
+}
+
 /// Map the domain aggregate to its wire view, computing the token estimate at
 /// the boundary so every client shows the same number rather than each deriving
 /// its own from bytes.
@@ -2100,6 +2158,35 @@ where
                 let rows = usage(conversation_id).await.map_err(Self::map_core_err)?;
                 Ok(api::CommandResult::ToolUsage(
                     rows.into_iter().map(tool_usage_to_view).collect(),
+                ))
+            }
+            api::Command::ListContextBreakdowns {
+                conversation_id,
+                limit,
+                offset,
+            } => {
+                let list = self.context_breakdown_list.as_ref().ok_or_else(|| {
+                    // Explicit unavailability rather than an empty list: "this
+                    // conversation has no records" and "this deployment keeps
+                    // none" are different answers, and the empty list is the
+                    // one a client would render as a finished, empty view.
+                    ApiError::Unsupported
+                })?;
+                let rows = list(conversation_id, limit, offset)
+                    .await
+                    .map_err(Self::map_core_err)?;
+                Ok(api::CommandResult::ContextBreakdowns(
+                    rows.into_iter().map(context_breakdown_to_view).collect(),
+                ))
+            }
+            api::Command::GetContextBreakdown { request_id } => {
+                let get = self
+                    .context_breakdown_get
+                    .as_ref()
+                    .ok_or(ApiError::Unsupported)?;
+                let row = get(request_id).await.map_err(Self::map_core_err)?;
+                Ok(api::CommandResult::ContextBreakdown(
+                    row.map(|b| Box::new(context_breakdown_to_view(b))),
                 ))
             }
             api::Command::ListKnowledgeEntries {

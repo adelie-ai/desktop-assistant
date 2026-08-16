@@ -154,6 +154,17 @@ async fn context_breakdown_rows_are_retrievable_for_the_whole_conversation() {
         let one = one.expect("the row written under r2");
         assert_eq!(one.conversation_id, "c1");
         assert_eq!(one.turn_ordinal, 2);
+
+        // The list and the get read the same row through two separate
+        // statements. A column dropped from one of them would make a field
+        // present in a get and absent in a list, which reads to a client as a
+        // field the daemon sometimes forgets - so the listed row is compared
+        // against the one the get returned, field by field.
+        let listed = rows
+            .iter()
+            .find(|r| r.request_id == "r2")
+            .expect("r2 in the listing");
+        assert_eq!(listed, &one, "the list and the get must read one row alike");
     })
     .await;
     fx.cleanup().await;
@@ -250,7 +261,12 @@ async fn budget_source_survives_the_round_trip() {
             row.budget_source = Some(source);
             store.record(&row).await.expect("record tier");
             assert_eq!(
-                store.get(&id).await.expect("get").expect("row").budget_source,
+                store
+                    .get(&id)
+                    .await
+                    .expect("get")
+                    .expect("row")
+                    .budget_source,
                 Some(source),
                 "tier {source:?} did not survive the round trip"
             );

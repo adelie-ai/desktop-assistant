@@ -357,6 +357,14 @@ number the shrink decision was taken on - while the provider tokenises its own
 way. The provider's reported count stays the authority; this says where that
 number went.
 
+The same figures are kept per turn, so the question can be asked about a turn
+that has already ended and about every earlier turn of the same conversation.
+Read them with `list_context_breakdowns` or `get_context_breakdown`, which take
+the `request_id` these spans carry. The stored record adds what a span cannot
+say on its own: the tier that resolved the turn's input-token budget, which
+tells a curated limit for the model from the conservative fallback the daemon
+uses when nothing supplied one. `docs/WEBSOCKET_API.md` documents the payload.
+
 **Zero is a measurement here, unlike a provider's count.** A turn with nothing
 pinned reports `prompt.pinned_tokens=0` rather than leaving the field off. That
 is the opposite of the rule above for `gen_ai.usage.*`, and deliberately: a

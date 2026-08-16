@@ -19,6 +19,7 @@ use crate::domain::{
 use crate::planning::{self, StepStack};
 use crate::ports::auth::current_user_id;
 use crate::ports::client_tools::current_client_tools;
+use crate::ports::context_breakdown::{ContextBreakdown, ContextBreakdownRecordFn};
 use crate::ports::conversation_ctx::with_conversation_id;
 use crate::ports::inbound::ConversationService;
 use crate::ports::knowledge::KnowledgeGetManyFn;
@@ -658,6 +659,11 @@ pub struct ConversationHandler<S, L, T = NoopToolExecutor> {
     /// same call succeeding is what extinguishes it, so this is wired with the
     /// other two or with neither.
     extinguish_burns: Option<ExtinguishBurnsFn>,
+    /// Optional write for the per-turn context breakdown (#588). Set means
+    /// every turn that assembles a prompt leaves one record of what filled it,
+    /// keyed by the turn's correlation id. `None` - no database - records
+    /// nothing and changes no turn.
+    record_context_breakdown: Option<ContextBreakdownRecordFn>,
     /// Maximum byte length of a tool result the model reads inline (issue
     /// #1302). Over this the round reads the head and a notice, and the row
     /// keeps every byte. Defaults to [`DEFAULT_MAX_TOOL_RESULT_BYTES`];
@@ -739,6 +745,7 @@ impl<S, L> ConversationHandler<S, L, NoopToolExecutor> {
             live_burns: None,
             record_burn: None,
             extinguish_burns: None,
+            record_context_breakdown: None,
             scratchpad_list: None,
             scratchpad_delete_subtree: None,
             scratchpad_release_references: None,
@@ -963,6 +970,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             live_burns: None,
             record_burn: None,
             extinguish_burns: None,
+            record_context_breakdown: None,
             scratchpad_list: None,
             scratchpad_delete_subtree: None,
             scratchpad_release_references: None,
@@ -978,6 +986,17 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             hard_withhold: false,
             turn_locks: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Wire the per-turn context-breakdown record (#588).
+    ///
+    /// Additive: without it the measurement is taken and reported to the span
+    /// and the metrics facade exactly as before, and nothing is kept. A write
+    /// that fails never fails the turn - the record is an account of the turn,
+    /// not part of it.
+    pub fn with_context_breakdown_recorder(mut self, record: ContextBreakdownRecordFn) -> Self {
+        self.record_context_breakdown = Some(record);
+        self
     }
 
     /// Set the daemon's self-identity `host` label used for server-side tool
@@ -1219,6 +1238,70 @@ impl<S, L, T> ConversationHandler<S, L, T> {
     #[cfg(test)]
     fn turn_lock_map_len(&self) -> usize {
         self.turn_locks.lock().unwrap().len()
+    }
+
+    /// Keep what this turn measured about its own prompt (#588).
+    ///
+    /// Records nothing, and changes nothing about the turn, in three cases:
+    ///
+    /// - no writer is wired, which is a deployment with no database;
+    /// - the turn carries no correlation id, which an agent run and a
+    ///   scheduled job do not. The record is keyed by that id, so there is no
+    ///   key to write under, and minting one would put a row in the log that no
+    ///   client can ask for and no second write can replace;
+    /// - the turn assembled no prompt, which one cancelled before its first
+    ///   round never does. That is an unmeasured turn, and a row of zeros would
+    ///   read as a turn that cost nothing.
+    ///
+    /// A failed write is logged and swallowed. The record is an account of the
+    /// turn, not part of it, and a user who got their answer must not be told
+    /// the turn failed because the account of it could not be filed.
+    async fn persist_context_breakdown(
+        &self,
+        conversation_id: &ConversationId,
+        request_id: Option<&str>,
+        report: &crate::telemetry::TurnGuard,
+    ) {
+        let Some(record) = &self.record_context_breakdown else {
+            return;
+        };
+        let Some(request_id) = request_id.map(str::trim).filter(|id| !id.is_empty()) else {
+            tracing::debug!(
+                conversation_id = %conversation_id.0,
+                "the turn carries no correlation id, so its context breakdown \
+                 has no key to be recorded under"
+            );
+            return;
+        };
+        let Some(measured) = report.recorded_prompt() else {
+            return;
+        };
+        // Read once, at the end, from the scope the daemon's dispatch wrapper
+        // installed around this whole call. The budget is frozen for the turn,
+        // so where in the turn it is read does not change the answer.
+        let budget = current_context_budget();
+        let breakdown = ContextBreakdown {
+            request_id: request_id.to_string(),
+            conversation_id: conversation_id.0.clone(),
+            turn_ordinal: measured.turn_ordinal,
+            model: current_turn_route().model().to_string(),
+            provider_used_tokens: measured.provider_used_tokens,
+            budget_tokens: budget.map(|b| b.max_input_tokens),
+            budget_source: budget.map(|b| b.source),
+            compaction_active: measured.compaction_active,
+            parts: measured.parts,
+            projected_messages: measured.projected_messages,
+            recorded_at: None,
+        };
+        if let Err(e) = record(breakdown).await {
+            tracing::warn!(
+                conversation_id = %conversation_id.0,
+                request_id,
+                error = %e,
+                "could not record what filled this turn's prompt; the turn \
+                 itself is unaffected"
+            );
+        }
     }
 
     /// Seed a fresh turn's projection from the eviction decisions earlier turns
@@ -2571,6 +2654,13 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
                 _ => crate::telemetry::TurnOutcome::Failed,
             };
         }
+
+        // What filled this turn's prompt, kept (#588). Here rather than in the
+        // body for the reason the guard itself exists: the body has several
+        // exits, and an exit that has to remember to record is an exit that
+        // will not. A turn that ended badly is the one worth reading.
+        self.persist_context_breakdown(conversation_id, request_id.as_deref(), &report)
+            .await;
         result
     }
 }
@@ -2659,6 +2749,10 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
         // `persist_abandoned_turn` to count what ran before an abandoned turn
         // stopped, without mistaking an earlier turn's tool work for this one's.
         let turn_start = conv.messages.len();
+        // The same figure the durable record carries as the turn's position in
+        // the conversation (#588), so a reader can jump from a record to the
+        // messages it describes.
+        report.set_turn_ordinal(turn_start);
         conv.messages.push(user_msg);
         // Capture the prompt as the active-task anchor for this turn. It is
         // re-injected in `assemble_turn` when conditions indicate
@@ -3604,7 +3698,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
             // the turn opened with rather than the tail of its own tool loop.
             // It also carries the turn's peak, because within a turn the
             // advertised set only grows and the opening figure is its floor.
-            report.set_prompt_breakdown(assembled.breakdown);
+            report.set_prompt_breakdown(assembled.breakdown, projection.replaced_count());
             // The same pair on this round's own span, and per connection on
             // the `server` axis (#1212). Per round because the turn-level
             // figure is the first round's and cannot show the growth; per
@@ -3896,6 +3990,13 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
             if let Some(usage) = &response.usage {
                 report.tokens.add(usage);
             }
+            // The provider's own count for the prompt the breakdown describes
+            // (#588). The first count wins, the same way the first assembly
+            // does; a round that reported nothing leaves it absent rather than
+            // recording a zero the provider never said.
+            report.observe_provider_input_tokens(
+                response.usage.as_ref().and_then(|u| u.input_tokens),
+            );
 
             // Post-stream cancellation check (issue #109): the adapter
             // may have returned a partial response because the chunk
@@ -3953,6 +4054,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                         target_window = new_window;
                         compact_into_summary(&mut conv, target_window, self.task_llm()).await;
                         compaction_active = true;
+                        report.note_compaction();
                     } else {
                         tracing::debug!(
                             input_tokens,

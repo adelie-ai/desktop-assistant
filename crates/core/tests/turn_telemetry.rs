@@ -3334,7 +3334,9 @@ fn recording_sink() -> (ContextBreakdownRecordFn, Arc<Mutex<Vec<ContextBreakdown
     let record: ContextBreakdownRecordFn = Arc::new(move |breakdown: ContextBreakdown| {
         let sink = Arc::clone(&sink);
         Box::pin(async move {
-            sink.lock().unwrap_or_else(|e| e.into_inner()).push(breakdown);
+            sink.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(breakdown);
             Ok(())
         })
     });
@@ -3380,8 +3382,8 @@ async fn turns_on_one_conversation(
 fn turn_under_budget(budget: ContextBudget) -> ContextBreakdown {
     let (record, recorded) = recording_sink();
     capture(Level::INFO, async move {
-        let handler =
-            handler(two_round_script(), ScriptedTools::ok()).with_context_breakdown_recorder(record);
+        let handler = handler(two_round_script(), ScriptedTools::ok())
+            .with_context_breakdown_recorder(record);
         with_context_budget(budget, one_turn(&handler)).await;
     });
     let rows = recorded.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -3571,8 +3573,8 @@ fn a_turn_with_no_correlation_id_records_nothing_rather_than_a_row_nobody_can_na
     // can ask for and no second write can replace.
     let (record, recorded) = recording_sink();
     capture(Level::INFO, async move {
-        let handler =
-            handler(two_round_script(), ScriptedTools::ok()).with_context_breakdown_recorder(record);
+        let handler = handler(two_round_script(), ScriptedTools::ok())
+            .with_context_breakdown_recorder(record);
         let conv = handler
             .create_conversation("c".into(), vec![])
             .await

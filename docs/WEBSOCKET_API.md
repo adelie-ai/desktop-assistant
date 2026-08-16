@@ -310,8 +310,77 @@ Current command variants:
 - `clear_negative_memory { id, note? }`
 - `list_skills { limit? }`
 - `set_skill_approval { name, approved }`
+- `list_context_breakdowns { conversation_id, limit?, offset? }`
+- `get_context_breakdown { request_id }`
 
 Result payloads are typed variants (`pong`, `status`, `conversation_id`, `conversations`, `conversation`, `config`, `ack`, etc.).
+
+### Context breakdown: what filled a turn's prompt
+
+`list_context_breakdowns` returns one entry per turn of a conversation, oldest
+turn first; `get_context_breakdown` returns the one turn whose `request_id` you
+name, or `null`. Both are tenant reads scoped to the calling user, and a
+`request_id` is not a capability: another user's turn reads as absent rather
+than as a refusal.
+
+`request_id` is the same correlation id the turn's own events carried
+(`assistant_delta`, `assistant_completed`, `assistant_status`), so a client can
+open the breakdown for a turn straight from its own event log with nothing to
+look up.
+
+Each entry carries:
+
+- `turn_ordinal` - the message ordinal the turn's user prompt took, so the
+  entry can be lined up against the transcript.
+- `model` - what the turn actually ran on.
+- `estimated_parts` - a list of `{ part, estimated_tokens }`, in the order a
+  prompt renders them. The names come from a closed set the daemon owns:
+  `system`, `summary`, `current_task`, `working_state`, `plan`, `pinned`,
+  `scratchpad`, `recall`, `transcript`, `tool_schemas`. Render a name you do
+  not recognize as it is - a dropped part is prompt cost that appears to have
+  come from nowhere.
+- `estimated_total_tokens` - those parts summed.
+- `advertised_tool_count` - how many tool schemas the prompt carried. A count,
+  not a token figure; what the schemas cost is the `tool_schemas` part.
+- `provider_used_tokens` - what the provider itself reported for the prompt.
+- `budget_tokens` and `budget_source` - the input-token budget the turn ran
+  under, and which tier resolved it.
+- `compaction_active` - whether the turn shrank its own window under token
+  pressure and summarised what it dropped.
+- `projected_messages` - how many messages the turn read as a compaction
+  pointer, the head of an oversized result, or a truncation notice, rather than
+  as their stored content. The transcript itself still holds every byte.
+- `recorded_at` - when the daemon wrote the entry, RFC3339.
+
+**The estimate and the provider's count are two measurements, and a client must
+not merge them.** `estimated_parts` is measured by the daemon's own context
+assembler, with the estimator the context budget uses. `provider_used_tokens`
+is what the provider's tokenizer reported for that same prompt. They do not
+agree, and the difference between them is itself worth showing. Do not add one
+to the other, do not present either as a component of the other, and do not
+compute a percentage of one against the parts of the other. Show both.
+
+Their absence rules differ, deliberately. A part that rendered nothing reports
+`0`, because the daemon always knows whether it emitted the block. A provider
+that reported no count leaves `provider_used_tokens` off the payload entirely,
+because a `0` there would invent a measurement - so treat an absent field as
+"not reported", never as zero. `budget_tokens` and `budget_source` are absent
+together for a turn that ran with no budget installed.
+
+`budget_source` is one of `purpose_override`, `connector_table`,
+`universal_fallback` or `learned_cap`, as a plain string rather than an enum so
+a tier added later does not break a client that has not been rebuilt. It is the
+field that separates a curated limit for this model from the conservative
+fallback the daemon uses when nothing supplied one - the same number, and a
+different situation. Treat the set as open and render an unrecognized value
+verbatim.
+
+Not every turn has an entry. A turn that ran without a correlation id (an agent
+run, a scheduled job) has no key to be recorded under, and a turn cancelled
+before it assembled a prompt measured nothing. A deployment with no database
+keeps no entries at all and answers both commands with an error rather than an
+empty list, so "this conversation has no entries" and "this daemon keeps none"
+stay different answers.
 
 ### Skills: what the library holds, and what may be followed
 
